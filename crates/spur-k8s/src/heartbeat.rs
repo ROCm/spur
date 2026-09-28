@@ -65,6 +65,7 @@ impl HeartbeatManager {
                             node_token: String::new(),
                             wg_pubkey: String::new(), // virtual agents are not on the mesh
                             k0s_status: None,         // virtual agents run no k0s unit
+                            needs_reconcile: false,
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
@@ -118,6 +119,8 @@ mod tests {
             wg_pubkey: String::new(),
             labels: std::collections::HashMap::new(),
             join_token: String::new(),
+            ledger: None,
+            runs_job_epilog: false,
         }
     }
 

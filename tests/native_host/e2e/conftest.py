@@ -342,7 +342,7 @@ def _any_node_has_gpu(nodes: list[SshNode]) -> bool:
 
 
 @pytest.fixture
-def gpu_cluster(request, ssh_nodes, remote_bin_dir):
+def gpu_cluster(request, ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture for GPU tests.
 
@@ -355,7 +355,8 @@ def gpu_cluster(request, ssh_nodes, remote_bin_dir):
         pytest.skip("no GPU device nodes (/dev/kfd, /dev/dri/card*, /dev/dri/renderD*) on any node")
 
     as_root = request.node.get_closest_marker("rootful") is not None
-    c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root)
+    c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root,
+                        config_overrides=cluster_config_overrides)
     yield c
     c.teardown()
 

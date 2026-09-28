@@ -169,6 +169,10 @@ pub struct RunAdmission {
     pub max_launch_expiry_unix_ms: u64,
     #[serde(default)]
     pub lifecycle_owner_step: Option<StepId>,
+    /// The job-level Prolog. An admission-time concern, not a cleanup one --
+    /// it runs before the run's slice is ever used, not after.
+    #[serde(default)]
+    pub prolog: HookState,
     #[serde(default)]
     pub cleanup: CleanupState,
     #[serde(default)]
@@ -204,6 +208,7 @@ impl RunAdmission {
             reject_before_unix_ms: 0,
             max_launch_expiry_unix_ms: 0,
             lifecycle_owner_step: None,
+            prolog: HookState::NotStarted,
             cleanup: CleanupState::default(),
             conflict_hold: None,
             controller_ack: ControllerAck::default(),
@@ -240,6 +245,13 @@ impl RunAdmission {
                 < self
                     .reject_before_unix_ms
                     .saturating_add(LAUNCH_LIFETIME_MS)
+    }
+
+    /// Whether `self` could be the launch `readmitted_at_unix_ms` names, rather
+    /// than a dead job's leftover wearing a recycled numeric key.
+    fn could_be_the_same_launch(&self, readmitted_at_unix_ms: u64) -> bool {
+        self.created_at_unix_ms > 0
+            && readmitted_at_unix_ms.saturating_sub(self.created_at_unix_ms) < LAUNCH_LIFETIME_MS
     }
 }
 
@@ -640,6 +652,32 @@ pub struct LoadedAdmissions {
     pub rejected: Vec<RejectedAdmission>,
 }
 
+/// Which durable hook an owner-loss settle is resolving. Prolog and epilog
+/// obey the identical rule -- only where each lives on `RunAdmission` differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookSlot {
+    Prolog,
+    Epilog,
+}
+
+impl HookSlot {
+    const ALL: [Self; 2] = [Self::Prolog, Self::Epilog];
+
+    fn get(self, run: &RunAdmission) -> HookState {
+        match self {
+            Self::Prolog => run.prolog,
+            Self::Epilog => run.cleanup.epilog,
+        }
+    }
+
+    fn set(self, run: &mut RunAdmission, state: HookState) {
+        match self {
+            Self::Prolog => run.prolog = state,
+            Self::Epilog => run.cleanup.epilog = state,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AdmissionStore {
     root: PathBuf,
@@ -779,32 +817,48 @@ impl AdmissionStore {
         // read failure would silently reset the cutoffs a launch is fenced by.
         match self.load_run(key) {
             Ok(existing) => {
-                run.reject_before_unix_ms = run
-                    .reject_before_unix_ms
-                    .max(existing.reject_before_unix_ms);
-                run.max_launch_expiry_unix_ms = run
-                    .max_launch_expiry_unix_ms
-                    .max(existing.max_launch_expiry_unix_ms);
-                // Cleared only by a write that itself carries a fresh ack.
-                if run.conflict_hold.is_none() && run.controller_ack.release_raft_index.is_none() {
-                    run.conflict_hold = existing.conflict_hold;
-                }
-                // A relaunch is always built fresh; without this, one arriving
-                // after the controller ends this run would un-decide it here.
-                if existing.state == RunState::Cleaned {
-                    run.state = RunState::Cleaned;
-                }
-                // Same reasoning for the epilog debt: only a relaunch's fresh default
-                // is refused, never a caller's own forward move (e.g. record_epilog).
-                if run.cleanup.epilog == HookState::NotStarted
-                    && existing.cleanup.epilog != HookState::NotStarted
-                {
-                    run.cleanup = existing.cleanup;
-                }
-                run.cancelled_by_controller |= existing.cancelled_by_controller;
-                run.slice_released |= existing.slice_released;
-                if run.controller_ack.release_raft_index.is_none() {
-                    run.controller_ack = existing.controller_ack;
+                // A recycled numeric key can wear a dead job's leftover, so every
+                // carry-forward below stays gated on this being the same launch.
+                if existing.could_be_the_same_launch(run.created_at_unix_ms) {
+                    // created_at stays this call's own stamp (not existing's):
+                    // a stale remove_run_if_created_at from an earlier attempt's
+                    // dropped guard must not match a retry's now-current record.
+                    run.reject_before_unix_ms = run
+                        .reject_before_unix_ms
+                        .max(existing.reject_before_unix_ms);
+                    run.max_launch_expiry_unix_ms = run
+                        .max_launch_expiry_unix_ms
+                        .max(existing.max_launch_expiry_unix_ms);
+                    // Cleared only by a write that itself carries a fresh ack.
+                    if run.conflict_hold.is_none()
+                        && run.controller_ack.release_raft_index.is_none()
+                    {
+                        run.conflict_hold = existing.conflict_hold;
+                    }
+                    // A relaunch is always built fresh; without this, one arriving
+                    // after the controller ends this run would un-decide it here.
+                    if existing.state == RunState::Cleaned {
+                        run.state = RunState::Cleaned;
+                    }
+                    // Same reasoning for the epilog debt: only a relaunch's fresh default
+                    // is refused, never a caller's own forward move (e.g. record_epilog).
+                    if run.cleanup.epilog == HookState::NotStarted
+                        && existing.cleanup.epilog != HookState::NotStarted
+                    {
+                        run.cleanup = existing.cleanup;
+                    }
+                    // Prolog carries the identical risk: only a relaunch's fresh
+                    // default is refused, never the caller's own forward move.
+                    if run.prolog == HookState::NotStarted
+                        && existing.prolog != HookState::NotStarted
+                    {
+                        run.prolog = existing.prolog;
+                    }
+                    run.cancelled_by_controller |= existing.cancelled_by_controller;
+                    run.slice_released |= existing.slice_released;
+                    if run.controller_ack.release_raft_index.is_none() {
+                        run.controller_ack = existing.controller_ack;
+                    }
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -1086,8 +1140,8 @@ impl AdmissionStore {
         Ok((AdmittedRun { run, participants }, rejected))
     }
 
-    /// Settle every hook whose owner `owner_is_gone` proves cannot still be running it.
-    /// May call `owner_is_gone` twice per run; keep it cheap and idempotent.
+    /// Settle every hook (Prolog and epilog) whose owner `owner_is_gone` proves
+    /// gone. May call `owner_is_gone` more than once per run; keep it cheap.
     pub fn settle_hooks_whose_owner_is_gone(
         &self,
         owner_is_gone: impl Fn(&AdmittedRun) -> bool,
@@ -1096,18 +1150,24 @@ impl AdmissionStore {
         let mut settled = 0;
         let mut failure = None;
         for admitted in loaded.runs {
-            if !admitted.run.cleanup.epilog.is_in_flight() || !owner_is_gone(&admitted) {
+            let in_flight_slots: Vec<HookSlot> = HookSlot::ALL
+                .into_iter()
+                .filter(|slot| slot.get(&admitted.run).is_in_flight())
+                .collect();
+            if in_flight_slots.is_empty() || !owner_is_gone(&admitted) {
                 continue;
             }
             let Some(run_key) = admitted.run.key() else {
                 continue;
             };
-            // One unwritable record must not leave every other run's hook in
-            // flight: nothing runs this again, so the rest would strand.
-            match self.settle_epilog_if_owner_still_gone(run_key, &owner_is_gone) {
-                Ok(true) => settled += 1,
-                Ok(false) => {}
-                Err(error) => failure = failure.or(Some(error)),
+            for slot in in_flight_slots {
+                // One unwritable record must not leave every other run's hook in
+                // flight: nothing runs this again, so the rest would strand.
+                match self.settle_hook_if_owner_still_gone(run_key, slot, &owner_is_gone) {
+                    Ok(true) => settled += 1,
+                    Ok(false) => {}
+                    Err(error) => failure = failure.or(Some(error)),
+                }
             }
         }
         match failure {
@@ -1118,9 +1178,10 @@ impl AdmissionStore {
 
     /// Re-derives the target from a fresh load under the lock, so a settle that
     /// landed after the caller's unlocked scan is not overwritten by it.
-    fn settle_epilog_if_owner_still_gone(
+    fn settle_hook_if_owner_still_gone(
         &self,
         run_key: RunKey,
+        slot: HookSlot,
         owner_is_gone: &impl Fn(&AdmittedRun) -> bool,
     ) -> io::Result<bool> {
         self.with_run_lock(run_key, || {
@@ -1129,11 +1190,12 @@ impl AdmissionStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
-            if !admitted.run.cleanup.epilog.is_in_flight() || !owner_is_gone(&admitted) {
+            if !slot.get(&admitted.run).is_in_flight() || !owner_is_gone(&admitted) {
                 return Ok(false);
             }
             let mut run = admitted.run;
-            run.cleanup.epilog = run.cleanup.epilog.settled_after_owner_loss();
+            let settled_state = slot.get(&run).settled_after_owner_loss();
+            slot.set(&mut run, settled_state);
             self.admit_run_locked(&run)?;
             Ok(true)
         })
@@ -1203,8 +1265,8 @@ impl AdmissionStore {
         })
     }
 
-    /// Raise a run's cutoff. Monotonic: a lower value is ignored, so a reordered
-    /// or replayed fence can never un-cancel a run.
+    /// Raise a run's cutoff. Monotonic, and not scoped to one launch -- a fence
+    /// must still take even on a recycled key, same as the no-record case below.
     pub fn fence_run(&self, run_key: RunKey, reject_before_unix_ms: u64) -> io::Result<u64> {
         let attempt = addressable_attempt(run_key)?;
         // Agent clock against a controller cutoff: running ahead leaves the strand
@@ -1307,19 +1369,53 @@ impl AdmissionStore {
         })
     }
 
-    /// Record how this run's epilog is going. The gate reads this, so a hook
-    /// whose outcome never lands here is a gate that cannot bite.
-    pub fn record_epilog(&self, run_key: RunKey, state: HookState) -> io::Result<bool> {
+    /// Record how this run's epilog is going. Refuses if `caller_created_at_unix_ms`
+    /// (the run as the caller last observed it) no longer matches -- a recycled key.
+    pub fn record_epilog(
+        &self,
+        run_key: RunKey,
+        caller_created_at_unix_ms: u64,
+        state: HookState,
+    ) -> io::Result<bool> {
         self.with_run_lock(run_key, || {
             let mut run = match self.load_run(run_key) {
                 Ok(run) => run,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
+            if run.created_at_unix_ms != caller_created_at_unix_ms {
+                return Ok(false);
+            }
             if run.cleanup.epilog == state {
                 return Ok(true);
             }
             run.cleanup.epilog = state;
+            self.admit_run_locked(&run)?;
+            Ok(true)
+        })
+    }
+
+    /// Record how this run's Prolog is going. Refuses if `caller_created_at_unix_ms`
+    /// (the run as the caller last observed it) no longer matches -- a recycled key.
+    pub fn record_prolog(
+        &self,
+        run_key: RunKey,
+        caller_created_at_unix_ms: u64,
+        state: HookState,
+    ) -> io::Result<bool> {
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if run.created_at_unix_ms != caller_created_at_unix_ms {
+                return Ok(false);
+            }
+            if run.prolog == state {
+                return Ok(true);
+            }
+            run.prolog = state;
             self.admit_run_locked(&run)?;
             Ok(true)
         })
@@ -2597,7 +2693,9 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
         store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
-        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+        store
+            .record_epilog(key(7, 1), 1, HookState::Running)
+            .unwrap();
 
         let entry = store
             .ledger_cut("session-a")
@@ -2616,7 +2714,7 @@ mod tests {
         );
 
         store
-            .record_epilog(key(7, 1), HookState::Succeeded)
+            .record_epilog(key(7, 1), 1, HookState::Succeeded)
             .unwrap();
         assert!(matches!(
             store.settle_permit(key(7, 1)).unwrap(),
@@ -2656,13 +2754,15 @@ mod tests {
             .unwrap()
             .is_none());
 
-        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+        store
+            .record_epilog(key(7, 1), 1, HookState::Running)
+            .unwrap();
         assert_eq!(
             store.settle_permit(key(7, 1)).unwrap(),
             SettlePermit::NotQuiescent
         );
         store
-            .record_epilog(key(7, 1), HookState::Succeeded)
+            .record_epilog(key(7, 1), 1, HookState::Succeeded)
             .unwrap();
         assert!(matches!(
             store.settle_permit(key(7, 1)).unwrap(),
@@ -2722,7 +2822,9 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
         store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
-        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+        store
+            .record_epilog(key(7, 1), 1, HookState::Running)
+            .unwrap();
 
         store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
 
@@ -2772,9 +2874,13 @@ mod tests {
         store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
         store.admit_run(&run_with(8, 1, 1)).unwrap();
         store.mark_run_cleaned(key(8, 1), EpilogOwed::Yes).unwrap();
-        store.record_epilog(key(8, 1), HookState::Running).unwrap();
+        store
+            .record_epilog(key(8, 1), 1, HookState::Running)
+            .unwrap();
         store.admit_run(&run_with(9, 1, 1)).unwrap();
-        store.record_epilog(key(9, 1), HookState::Failed).unwrap();
+        store
+            .record_epilog(key(9, 1), 1, HookState::Failed)
+            .unwrap();
 
         assert_eq!(
             store
@@ -2794,6 +2900,31 @@ mod tests {
             store.load_run(key(9, 1)).unwrap().cleanup.epilog,
             HookState::Failed,
             "an outcome already recorded is evidence, not something to overwrite"
+        );
+    }
+
+    // Prolog shares the epilog's owner-loss rule: nothing ever re-runs a hook,
+    // so one whose owner is proven gone must settle rather than hold forever.
+    #[test]
+    fn a_prolog_running_when_its_owner_died_settles_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .record_prolog(key(7, 1), 1, HookState::Running)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .settle_hooks_whose_owner_is_gone(no_supervisor_was_recorded)
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().prolog,
+            HookState::Unknown,
+            "a prolog nobody will ever confirm must not block the run forever"
         );
     }
 
@@ -2837,7 +2968,7 @@ mod tests {
                 if !already_raced.get() {
                     already_raced.set(true);
                     store
-                        .record_epilog(key(7, 1), HookState::Succeeded)
+                        .record_epilog(key(7, 1), 1, HookState::Succeeded)
                         .unwrap();
                 }
                 true
@@ -3236,7 +3367,9 @@ mod tests {
         let mut run = run_with(7, 1, 1);
         run.lifecycle_owner_step = Some(STEP_BATCH);
         store.admit_run(&run).unwrap();
-        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+        store
+            .record_epilog(key(7, 1), 1, HookState::Running)
+            .unwrap();
 
         assert!(store
             .record_acknowledged_completion(key(7, 1), STEP_BATCH, 42)
@@ -3331,13 +3464,15 @@ mod tests {
             .record_controller_ack(key(7, 1), STEP_BATCH, 42)
             .unwrap();
 
-        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+        store
+            .record_epilog(key(7, 1), 1, HookState::Running)
+            .unwrap();
         assert!(store
             .release_is_due(key(7, 1), STEP_BATCH)
             .unwrap()
             .is_none());
         store
-            .record_epilog(key(7, 1), HookState::Succeeded)
+            .record_epilog(key(7, 1), 1, HookState::Succeeded)
             .unwrap();
         assert!(store
             .release_is_due(key(7, 1), STEP_BATCH)
@@ -3358,7 +3493,7 @@ mod tests {
             store
                 .record_controller_ack(key(7, 1), STEP_BATCH, 42)
                 .unwrap();
-            store.record_epilog(key(7, 1), settled).unwrap();
+            store.record_epilog(key(7, 1), 1, settled).unwrap();
 
             assert!(
                 store
@@ -3376,7 +3511,9 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
 
-        store.record_epilog(key(7, 1), HookState::Failed).unwrap();
+        store
+            .record_epilog(key(7, 1), 1, HookState::Failed)
+            .unwrap();
         store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
 
         assert_eq!(
@@ -3389,7 +3526,7 @@ mod tests {
     fn an_epilog_outcome_for_an_unknown_run_records_nothing() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!store(&dir)
-            .record_epilog(key(9, 9), HookState::Failed)
+            .record_epilog(key(9, 9), 0, HookState::Failed)
             .unwrap());
     }
 
@@ -3639,6 +3776,73 @@ mod tests {
         );
     }
 
+    // A recycled id draws far outside the window a real retry could land in,
+    // unlike the relaunch tests above (a retry arriving seconds later).
+    #[test]
+    fn a_new_job_reusing_a_recycled_id_is_not_born_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+        assert_eq!(store.load_run(key(7, 1)).unwrap().state, RunState::Cleaned);
+
+        let recycled_created_at = 1 + LAUNCH_LIFETIME_MS + 1;
+        store
+            .admit_run(&run_with(7, 1, recycled_created_at))
+            .unwrap();
+
+        assert_ne!(
+            store.load_run(key(7, 1)).unwrap().state,
+            RunState::Cleaned,
+            "a brand-new admission must not be born dead because a dead \
+             job's leftover record still wears its recycled numeric key"
+        );
+    }
+
+    // An orphaned hook from a dead job must not be able to write into whatever
+    // now occupies its old, recycled key.
+    #[test]
+    fn record_prolog_refuses_a_recycled_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+
+        let recycled_created_at = 1 + LAUNCH_LIFETIME_MS + 1;
+        store
+            .admit_run(&run_with(7, 1, recycled_created_at))
+            .unwrap();
+
+        assert!(!store
+            .record_prolog(key(7, 1), 1, HookState::Running)
+            .unwrap());
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().prolog,
+            HookState::NotStarted,
+            "the orphaned caller's stale created_at must not touch the new job"
+        );
+    }
+
+    #[test]
+    fn record_epilog_refuses_a_recycled_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+
+        let recycled_created_at = 1 + LAUNCH_LIFETIME_MS + 1;
+        store
+            .admit_run(&run_with(7, 1, recycled_created_at))
+            .unwrap();
+
+        assert!(!store
+            .record_epilog(key(7, 1), 1, HookState::Succeeded)
+            .unwrap());
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
+            HookState::NotStarted,
+            "the orphaned caller's stale created_at must not touch the new job"
+        );
+    }
+
     // fence_run's own read-check-write is the case B4 names: two racing
     // callers must not let the lower cutoff's writer clobber the higher one.
     #[test]
@@ -3832,6 +4036,7 @@ mod tests {
             "a legacy in-flight state is not settled"
         );
         assert_eq!(run.allocation.gpu_devices, vec![2]);
+        assert_eq!(run.prolog, HookState::Succeeded);
 
         let participant: ParticipantAdmission =
             serde_json::from_str(FROZEN_PARTICIPANT_V1).unwrap();
@@ -3852,6 +4057,7 @@ mod tests {
                 .unwrap();
         assert_eq!(run.state, RunState::Admitted);
         assert!(run.conflict_hold.is_none());
+        assert_eq!(run.prolog, HookState::NotStarted);
 
         let participant: ParticipantAdmission = serde_json::from_str(
             r#"{"schema_version":1,"job_id":1,"run_attempt":0,"step_id":1,"node":"n1"}"#,

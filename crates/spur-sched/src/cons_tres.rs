@@ -537,6 +537,14 @@ impl NodeAllocation {
         self.owners.get(&job_id).map(|owned| owned.run_attempt)
     }
 
+    /// One owner's held GPU stable_ids, without cloning every other owner's.
+    pub fn owner_gpu_ids(&self, job_id: u32) -> Vec<u64> {
+        self.owners
+            .get(&job_id)
+            .map(|owned| owned.result.gpu_ids.clone())
+            .unwrap_or_default()
+    }
+
     /// Release owned allocations whose job is neither live nor launching within
     /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
     /// or a dropped launch instead of stranding the node until spurd restart.

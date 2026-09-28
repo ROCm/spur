@@ -751,6 +751,15 @@ impl openraft::RaftNetwork<SpurTypeConfig> for SpurNetworkConnection {
     }
 }
 
+/// Whether the state machine has applied every entry this node's log holds. False
+/// after a restart until RaftCore replays the entries logged past the snapshot.
+pub fn state_machine_caught_up(metrics: &openraft::RaftMetrics<NodeId, BasicNode>) -> bool {
+    // The placeholder metrics installed before RaftCore's first report describe an
+    // empty log fully applied. A node naming no leader has reported nothing yet.
+    metrics.current_leader.is_some()
+        && metrics.last_applied.map(|id| id.index) >= metrics.last_log_index
+}
+
 /// Handle to the running Raft node — exposes leadership queries.
 pub struct RaftHandle {
     pub raft: SpurRaft,

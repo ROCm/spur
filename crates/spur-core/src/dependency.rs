@@ -296,10 +296,11 @@ pub fn check_dependencies(
             }
             Dependency::Singleton => {
                 let matching = get_jobs_by_name_user(&job.spec.name, &job.spec.user);
-                let has_active = matching.iter().any(|j| {
-                    j.job_id != job.job_id
-                        && (j.state == JobState::Running || j.state == JobState::Pending)
-                });
+                // Anything short of terminal still owns the name: a run resting
+                // in Preempted is on its way back to Pending, not finished.
+                let has_active = matching
+                    .iter()
+                    .any(|j| j.job_id != job.job_id && !j.state.is_terminal());
                 if has_active {
                     return DependencyResult::Waiting;
                 }
@@ -362,6 +363,35 @@ mod tests {
     fn test_parse_singleton() {
         let deps = parse_dependencies(&["singleton".into()]);
         assert_eq!(deps, vec![Dependency::Singleton]);
+    }
+
+    // A sibling short of terminal has not finished; a preempted one is on its
+    // way back. Releasing now runs two jobs the user said must never overlap.
+    #[test]
+    fn singleton_waits_on_a_sibling_that_has_not_terminated() {
+        for state in [
+            JobState::Preempted,
+            JobState::Completing,
+            JobState::Suspended,
+        ] {
+            let sibling = make_job(100, state);
+            let job = Job::new(
+                1,
+                JobSpec {
+                    name: "test".into(),
+                    user: "alice".into(),
+                    dependency: vec!["singleton".into()],
+                    ..Default::default()
+                },
+            );
+
+            let result = check_dependencies(&job, &|_| None, &|_| Vec::new(), &|name, user| {
+                assert_eq!((name, user), ("test", "alice"));
+                vec![sibling.clone()]
+            });
+
+            assert_eq!(result, DependencyResult::Waiting, "sibling in {state:?}");
+        }
     }
 
     #[test]

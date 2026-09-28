@@ -171,6 +171,8 @@ impl NodeReporter {
                 wg_pubkey: self.wg_pubkey(),
                 labels,
                 join_token: self.join_token.clone(),
+                ledger: None,
+                runs_job_epilog: false,
             })
             .await
             .context("registration failed")?;
@@ -270,6 +272,7 @@ impl NodeReporter {
                                     install_duration_seconds: install_secs,
                                 }
                             }),
+                            needs_reconcile: false,
                         })
                         .await
                     {

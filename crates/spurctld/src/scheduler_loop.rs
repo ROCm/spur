@@ -42,6 +42,39 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
+/// Milliseconds since the epoch, saturating rather than panicking on a clock
+/// set before 1970.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+/// Identifies what a launch asks the node to run, so an exact repeat stays
+/// idempotent and a different command under the same identity is refused.
+fn command_digest(params: &AgentDispatchParams<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let spec = params.spec;
+    let mut hasher = Sha256::new();
+    hasher.update(params.job_id.to_le_bytes());
+    hasher.update(params.run_attempt.to_le_bytes());
+    hasher.update(params.task_offset.to_le_bytes());
+    hasher.update(spec.script.as_deref().unwrap_or_default().as_bytes());
+    for arg in spec.argv.iter().chain(spec.script_args.iter()) {
+        hasher.update([0u8]);
+        hasher.update(arg.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
 /// True on the tick a leadership term begins, so per-term setup runs once rather
 /// than on every tick or on a follower. Advances `was_leader` to the new value.
 fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
@@ -69,13 +102,17 @@ fn should_sweep_orphaned_placements(
     }
 }
 
-/// Drop everything a former leader may no longer speak for.
+/// Drop everything a former leader may no longer speak for. Kept whole so state
+/// that only one term can vouch for is not left behind in one place and not another.
 pub(crate) fn relinquish_leadership(
     cluster: &Arc<ClusterManager>,
     scheduler: &mut BackfillScheduler,
 ) {
     cluster.set_planned_reservations(HashMap::new());
     cluster.set_planned_job_starts(HashMap::new());
+    // Registrations during another term went to that leader, so what is recorded
+    // here may already name a lifetime that has been replaced.
+    cluster.agent_sessions().clear();
     scheduler.clear_outcomes();
 }
 
@@ -157,6 +194,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
     let mut was_leader = false;
     let mut leadership_entered_at: Option<Instant> = None;
+    let mut last_ledger_sweep: Option<Instant> = None;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -180,6 +218,34 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         if entering_term {
             leadership_entered_at = Some(Instant::now());
+        }
+
+        // A promoted follower's totals were maintained across an unknown replay
+        // history; rebuild from the job records before this term's placements.
+        if entering_term {
+            cluster.recompute_node_allocations();
+            // Counts as this term's first routine sweep too: without this, the
+            // `None` starting value below made the very next tick fire a second,
+            // redundant full-cluster pull a moment later instead of waiting out
+            // `LEDGER_SWEEP_INTERVAL` as intended -- doubling, on every leadership
+            // change, the odds of a pull landing inside a completion's own
+            // acknowledgement round trip.
+            last_ledger_sweep = Some(Instant::now());
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                pull_all_node_ledgers(&pull_cluster, "leadership gain").await;
+            });
+        }
+
+        // Routine sweep: drift nothing reported is only found by looking.
+        if !entering_term
+            && last_ledger_sweep.is_none_or(|last| last.elapsed() >= LEDGER_SWEEP_INTERVAL)
+        {
+            last_ledger_sweep = Some(Instant::now());
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                pull_all_node_ledgers(&pull_cluster, "routine sweep").await;
+            });
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
@@ -555,7 +621,7 @@ async fn process_assignment(
             // Both arms tear down identically: with a deadline in play, even "all failed" can mean
             // every node registered and answered too late, so none of them may be left holding one.
             AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
-                cancel_job_on_nodes(&cluster, job_id, run_attempt, &all_nodes, 9).await;
+                cancel_job_on_nodes(&cluster, job_id, run_attempt, &all_nodes, 9, true).await;
                 // The job never left Pending, so plain requeue is a no-op here — the same
                 // Pending-aware backoff the launch path uses is what actually throttles a retry.
                 if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
@@ -640,7 +706,7 @@ async fn process_assignment(
         // activate_job failure here (e.g. the job was cancelled out from
         // under us between assignment and this point) doesn't leave
         // orphans.
-        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0).await;
+        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0, true).await;
         debug!(
             job_id = assignment.job_id,
             error = %e,
@@ -652,14 +718,19 @@ async fn process_assignment(
     // The job is Running and committed, so anything it launches can now be
     // resolved by the controller. Only here is the workload let go.
     if dispatched && !start_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes).await {
-        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0).await;
+        cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 0, true).await;
         // Already Running, so without a transition it would hold its nodes. Both
         // calls name this attempt: the awaits above give a requeue time to land.
         let detail = format!(
             "job started but was not released on every node ({})",
             dispatch_nodes.join(",")
         );
-        if let Err(e) = cluster.evict_job_attempt(job_id, Some(run_attempt), Some(detail)) {
+        if let Err(e) = cluster.evict_job_attempt(
+            job_id,
+            Some(run_attempt),
+            Some(detail),
+            spur_core::job::PendingReason::JobLaunchFailure,
+        ) {
             error!(job_id, error = %e, "failed to evict a job that could not be released");
         }
         return false;
@@ -1207,6 +1278,7 @@ async fn reclaim_for_unplaced(
                         victim.run_attempt,
                         &victim.nodes,
                         0,
+                        true,
                     )
                     .await;
                     freed.extend(victim.nodes.iter().cloned());
@@ -1551,6 +1623,9 @@ enum DispatchError {
     /// The agent explicitly rejected the launch for a reason it does not have
     /// a `LaunchFailureKind` for yet.
     AgentRejected(String),
+    /// The node holds something the controller cannot account for. Retrying
+    /// here is pointless until the two have been reconciled.
+    NeedsReconcile(String),
     Other(anyhow::Error),
 }
 
@@ -1564,6 +1639,7 @@ impl DispatchError {
             Self::Unreachable(_) => "agent unreachable",
             Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
+            Self::NeedsReconcile(_) => "node holds unaccounted resources",
             Self::Other(_) => "dispatch error",
         }
     }
@@ -1581,6 +1657,9 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "agent did not answer within {}s", limit.as_secs())
             }
             Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::NeedsReconcile(reason) => {
+                write!(f, "node holds unaccounted resources: {reason}")
+            }
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -1737,6 +1816,7 @@ async fn dispatch_to_agent(
         submit_line: spec.submit_line.clone().unwrap_or_default(),
     };
 
+    let issued_at = now_unix_ms();
     let response = client
         .launch_job(LaunchJobRequest {
             job_id: params.job_id,
@@ -1753,6 +1833,9 @@ async fn dispatch_to_agent(
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
             execution_credential: params.execution_credential.to_string(),
+            issued_at_unix_ms: issued_at,
+            expires_at_unix_ms: issued_at.saturating_add(spur_core::job::LAUNCH_LIFETIME_MS),
+            command_digest: command_digest(params),
         })
         .await
         .map_err(|s| match s.code() {
@@ -1770,17 +1853,18 @@ async fn dispatch_to_agent(
 
     let inner = response.into_inner();
     if !inner.success {
-        // An agent predating the classification sends UNSPECIFIED, which falls
-        // through to the generic requeue this has always done.
-        return Err(
-            if inner.failure_kind
-                == spur_proto::proto::LaunchFailureKind::LaunchFailureProlog as i32
-            {
-                DispatchError::PrologFailed(inner.error)
-            } else {
-                DispatchError::AgentRejected(inner.error)
-            },
-        );
+        use spur_proto::proto::LaunchFailureKind as Kind;
+        // A named reason lets the controller act in this round trip. An older
+        // agent sends UNSPECIFIED and falls through to the generic requeue.
+        return Err(match Kind::try_from(inner.failure_kind) {
+            Ok(Kind::LaunchFailureProlog) => DispatchError::PrologFailed(inner.error),
+            // Runtime state with no record behind it, or a claim the controller
+            // does not know about: both need a full look at the node.
+            Ok(Kind::LaunchFailureLocalOverlap | Kind::LaunchFailureResidualState) => {
+                DispatchError::NeedsReconcile(inner.error)
+            }
+            _ => DispatchError::AgentRejected(inner.error),
+        });
     }
     info!(
         job_id = params.job_id,
@@ -2368,6 +2452,18 @@ async fn confirm_dispatch_on_nodes(
                     // Held for the deadline it actually burned: while assignments are processed
                     // serially, re-picking this node stalls every job behind it, not just this one.
                     DispatchError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
+                    // The node holds something Raft cannot explain: look before
+                    // sending it anything else, paced so repeat refusals don't storm.
+                    DispatchError::NeedsReconcile(_) => {
+                        cluster.cool_down_node(&node_name);
+                        if cluster.claim_ledger_pull_slot(&node_name) {
+                            let cluster = cluster.clone();
+                            let node = node_name.clone();
+                            tokio::spawn(async move {
+                                pull_node_ledger(&cluster, &node, "dispatch refused").await;
+                            });
+                        }
+                    }
                     DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
                 }
             }
@@ -2421,7 +2517,7 @@ async fn confirm_dispatch_on_nodes(
 
     // Every dispatched node, not just the confirmed ones: a node that timed out may have launched
     // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
-    cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9).await;
+    cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9, true).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
     // of the candidate set on the next scheduling attempt. The drain is issued
@@ -2740,7 +2836,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         let job_id = job.job_id;
         let run_attempt = job.run_attempt;
         tokio::spawn(async move {
-            cancel_job_on_nodes(&cluster, job_id, run_attempt, &missing, 9).await;
+            cancel_job_on_nodes(&cluster, job_id, run_attempt, &missing, 9, true).await;
         });
     }
 
@@ -2886,16 +2982,229 @@ pub async fn send_cancel_to_nodes(
 /// returning so the caller can establish a happens-before ordering against
 /// later actions. Each RPC is bounded by `CANCEL_RPC_TIMEOUT` so an
 /// unreachable agent can't stall the caller indefinitely.
+///
+/// `fence` guards against a stale in-flight `LaunchJob` retry landing after
+/// this teardown -- it is what holds `AdmissionStore::sweep()` off the node's
+/// admission record for `LAUNCH_LIFETIME_MS`. Pass `false` only when the
+/// caller can prove no such retry can still be outstanding (e.g. tearing down
+/// a companion after `confirm_dispatch_on_nodes` already confirmed every
+/// node's original dispatch); every genuine cancel/evict/dispatch-failure
+/// path must keep it `true`.
 pub async fn cancel_job_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
     node_names: &[String],
     signal: i32,
+    fence: bool,
 ) {
+    if fence {
+        fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
+    }
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Refuse every launch for this run attempt issued at or before now, so a
+/// retry already in flight cannot land after the decision that cancelled it.
+async fn fence_run_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+) {
+    // Attempt 0 is the "whichever is tracked" wildcard the cancel below accepts.
+    // A cutoff has no run to live on without an attempt, so there is none to set.
+    if run_attempt == 0 {
+        return;
+    }
+    let cutoff = now_unix_ms();
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(fence_one_agent(agent_addr, job_id, run_attempt, cutoff));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+async fn fence_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    reject_before_unix_ms: u64,
+) {
+    let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
+        Ok(client) => client,
+        // An unreachable node runs nothing the controller can see; its
+        // registration reconcile covers it when it returns.
+        Err(error) => {
+            debug!(job_id, agent = %agent_addr, %error, "could not reach an agent to fence a run");
+            return;
+        }
+    };
+    let fenced = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.fence_run(spur_proto::proto::FenceRunRequest {
+            job_id,
+            run_attempt,
+            reject_before_unix_ms,
+        }),
+    )
+    .await;
+    match fenced {
+        Ok(Ok(_)) => {}
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, agent = %agent_addr, "agent predates run fencing")
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, agent = %agent_addr, %status, "agent refused a run fence")
+        }
+        Err(_) => warn!(job_id, agent = %agent_addr, "timed out fencing a run"),
+    }
+}
+
+/// One node's agent connection, opened on first use and reused for the rest of
+/// that node's pass: a handshake and a minted credential per claim is a tax.
+pub type AgentLink = Option<
+    spur_proto::proto::slurm_agent_client::SlurmAgentClient<crate::agent_client::AgentChannel>,
+>;
+
+/// Tell a node the controller is not accounting for a run it still holds, which
+/// is the acknowledgement that run's slice is waiting on. Whether it went back.
+pub async fn settle_run_on_node(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    run: spur_core::job::RunKey,
+    link: &mut AgentLink,
+) -> bool {
+    let job_id = run.job_id();
+    // A settle names one run's slice; the wildcard key names no slice to free.
+    let Some(run_attempt) = run.attempt() else {
+        return false;
+    };
+    if link.is_none() {
+        let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+            return false;
+        };
+        match crate::agent_client::connect(addr).await {
+            Ok(client) => *link = Some(client),
+            Err(_) => {
+                debug!(job_id, node = %node, "could not reach an agent to settle a run");
+                return false;
+            }
+        }
+    }
+    let Some(client) = link.as_mut() else {
+        return false;
+    };
+    let settled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.settle_run(spur_proto::proto::SettleRunRequest {
+            job_id,
+            run_attempt,
+        }),
+    )
+    .await;
+    match settled {
+        Ok(Ok(response)) => response.into_inner().released,
+        // An agent that predates the settle keeps holding; the next pass retries.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, node = %node, "agent predates run settlement");
+            false
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, node = %node, %status, "agent refused a run settlement");
+            false
+        }
+        Err(_) => {
+            warn!(job_id, node = %node, "timed out settling a run");
+            false
+        }
+    }
+}
+
+/// How often the controller sweeps the cluster for drift nothing reported.
+pub(crate) const LEDGER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Pull a fresh cut of one node's ledger and reconcile it. The heartbeat
+/// carries no inventory, so this is how a controller-side event gets one.
+pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason: &str) {
+    let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+        return;
+    };
+    let Ok(mut client) = crate::agent_client::connect(addr).await else {
+        return;
+    };
+    // Opened before the cut is asked for, so any launch the cut could have
+    // missed is one this watch has seen.
+    let dispatched = cluster.dispatch_tracker().watch(node);
+    // Logged here rather than at each trigger: the controller is otherwise silent
+    // about every pull but one, which reads as a reconciler that never runs.
+    info!(node = %node, reason, "pulling this node's ledger");
+    let pulled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.request_node_ledger(spur_proto::proto::RequestNodeLedgerRequest {
+            reason: reason.to_string(),
+        }),
+    )
+    .await;
+    match pulled {
+        Ok(Ok(response)) => {
+            if let Some(ledger) = response.into_inner().ledger {
+                let outcome = crate::server::reconcile_node_ledger(
+                    cluster,
+                    node,
+                    ledger,
+                    &dispatched,
+                    crate::server::CutProvenance::Pulled,
+                )
+                .await;
+                info!(
+                    node = %node,
+                    reason,
+                    cancelled = outcome.cancelled.len(),
+                    settled = outcome.settled.len(),
+                    released = outcome.released.len(),
+                    unresolved = outcome.unresolved.len(),
+                    "reconciled this node's ledger"
+                );
+            }
+        }
+        // An agent that predates the pull keeps its pre-upgrade behaviour.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {}
+        Ok(Err(status)) => warn!(node = %node, %status, "ledger pull refused"),
+        Err(_) => warn!(node = %node, "ledger pull timed out"),
+    }
+}
+
+/// How many of a node's ledgers this pulls at once. Leadership gain and the
+/// hourly sweep both fire one RPC per node in a single call; on a large
+/// cluster that is a thundering herd without some cap on the fan-out.
+const MAX_CONCURRENT_LEDGER_PULLS: usize = 16;
+
+/// Shared across every call: leadership gain and the routine sweep can fire
+/// back to back, and a semaphore built fresh per call would let each run its
+/// own 16-wide fan-out instead of sharing one cluster-wide cap.
+static LEDGER_PULL_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LEDGER_PULLS)));
+
+/// Pull every node's ledger. Used where the controller has reason to distrust
+/// its own view rather than any one node's: a leader took over, or the sweep.
+pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) {
+    let nodes: Vec<String> = cluster.get_nodes().into_iter().map(|n| n.name).collect();
+    let mut set = tokio::task::JoinSet::new();
+    for node in nodes {
+        let cluster = cluster.clone();
+        let reason = reason.to_string();
+        let permits = LEDGER_PULL_PERMITS.clone();
+        set.spawn(async move {
+            let Ok(_permit) = permits.acquire_owned().await else {
+                return;
+            };
+            pull_node_ledger(&cluster, &node, &reason).await
+        });
     }
     while set.join_next().await.is_some() {}
 }
@@ -4073,6 +4382,7 @@ mod tests {
         /// under a synthetic per-node launch cost rather than estimating it.
         struct MockAgent {
             cancel_calls: Arc<AtomicU32>,
+            fence_calls: Arc<AtomicU32>,
             release_pmix_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
@@ -4090,6 +4400,19 @@ mod tests {
             /// start_job fails, standing in for a node that confirmed its
             /// launch but could not then release the workload.
             reject_start: bool,
+            /// Sleeps inside `request_node_ledger`, standing in for the RPC's
+            /// real network + disk latency so a concurrency bound has something
+            /// to actually bound.
+            ledger_pull_delay: Duration,
+            /// Counted up for the duration of `request_node_ledger` and back
+            /// down after, so a test can read how many calls overlapped.
+            ledger_pull_in_flight: Option<Arc<AtomicU32>>,
+            /// High-water mark of `ledger_pull_in_flight`, so a test can assert
+            /// on the peak without racing to sample the live counter.
+            ledger_pull_max_in_flight: Option<Arc<AtomicU32>>,
+            /// Every `request_node_ledger` call, so a test can assert a refusal
+            /// earned exactly one pull (or none) without racing in-flight state.
+            ledger_pulls_total: Arc<AtomicU32>,
         }
 
         #[tonic::async_trait]
@@ -4098,6 +4421,49 @@ mod tests {
                 tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
             type InteractiveSessionStream =
                 tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
+
+            async fn request_node_ledger(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
+            {
+                self.ledger_pulls_total.fetch_add(1, Ordering::SeqCst);
+                if let (Some(in_flight), Some(max_in_flight)) =
+                    (&self.ledger_pull_in_flight, &self.ledger_pull_max_in_flight)
+                {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(self.ledger_pull_delay).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok(tonic::Response::new(
+                    spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
+                ))
+            }
+
+            async fn fence_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::FenceRunResponse>, tonic::Status>
+            {
+                self.fence_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(tonic::Response::new(spur_proto::proto::FenceRunResponse {
+                    success: true,
+                    error: String::new(),
+                    reject_before_unix_ms: 0,
+                }))
+            }
+
+            async fn settle_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::SettleRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::SettleRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::SettleRunResponse {
+                    released: true,
+                    error: String::new(),
+                }))
+            }
 
             async fn start_job(
                 &self,
@@ -4437,6 +4803,7 @@ mod tests {
             let fanout_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 release_pmix_calls: release_pmix_calls.clone(),
                 reject_launch_as,
                 launch_delay,
@@ -4445,6 +4812,10 @@ mod tests {
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
                 cancel_delay,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4465,6 +4836,7 @@ mod tests {
             let addr = incoming.local_addr().unwrap();
             let agent = MockAgent {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
@@ -4473,6 +4845,10 @@ mod tests {
                 fanout_calls: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4493,6 +4869,7 @@ mod tests {
             let cancel_calls = Arc::new(AtomicU32::new(0));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
@@ -4501,6 +4878,10 @@ mod tests {
                 fanout_calls: None,
                 reject_start: true,
                 cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4513,6 +4894,76 @@ mod tests {
             (addr, cancel_calls)
         }
 
+        /// Mock agent that counts `FenceRunRequest`s it receives, so a test can
+        /// assert whether `cancel_job_on_nodes` asked it to fence a run at all.
+        async fn spawn_mock_agent_capturing_fence() -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let fence_calls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: fence_calls.clone(),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, fence_calls)
+        }
+
+        /// Mock agent whose `request_node_ledger` sleeps `delay` and records how
+        /// many calls (across every agent sharing these counters) were in flight
+        /// at once, so a test can observe whether a fan-out honored its bound.
+        async fn spawn_ledger_pull_probe(
+            delay: Duration,
+            in_flight: Arc<AtomicU32>,
+            max_in_flight: Arc<AtomicU32>,
+        ) -> std::net::SocketAddr {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                ledger_pull_delay: delay,
+                ledger_pull_in_flight: Some(in_flight),
+                ledger_pull_max_in_flight: Some(max_in_flight),
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            addr
+        }
+
         /// Mock agent whose launch_job always rejects with ResourceExhausted,
         /// standing in for a node whose local allocation table already holds the GPUs.
         async fn spawn_mock_agent_rejecting_resources() -> std::net::SocketAddr {
@@ -4520,6 +4971,54 @@ mod tests {
                 "controller-allocated GPUs unavailable on this node",
             ))
             .await
+        }
+
+        /// Mock agent that refuses every launch with `reject_launch_as` and
+        /// counts the ledger pulls that refusal earns it.
+        async fn spawn_mock_agent_counting_pulls(
+            reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let ledger_pulls_total = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
+                ledger_pulls_total: ledger_pulls_total.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, ledger_pulls_total)
+        }
+
+        /// The pull is spawned onto its own task, so an assertion on the count
+        /// has a real async wait behind it rather than a guess.
+        async fn pulls_reaching(counter: &Arc<AtomicU32>, wanted: u32) -> u32 {
+            for _ in 0..200 {
+                let seen = counter.load(Ordering::SeqCst);
+                if seen >= wanted {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            counter.load(Ordering::SeqCst)
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -4637,6 +5136,7 @@ mod tests {
                 NodeSource::NativeHost,
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -4663,6 +5163,7 @@ mod tests {
                 version: String::new(),
                 labels: HashMap::new(),
                 source: NodeSource::NativeHost,
+                runs_job_epilog: false,
             });
             let n = name.to_string();
             wait_for(
@@ -4671,6 +5172,40 @@ mod tests {
                     cm.get_node(&n)
                         .is_some_and(|node| node.comm_addr().is_none())
                 },
+            );
+        }
+
+        /// Proves the peak concurrency the mock agents observe never exceeds
+        /// the cap, while driving well past it to confirm the cap was
+        /// genuinely exercised and not just an accidentally-serial run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn pull_all_node_ledgers_bounds_concurrent_pulls() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let in_flight = Arc::new(AtomicU32::new(0));
+            let max_in_flight = Arc::new(AtomicU32::new(0));
+            let delay = Duration::from_millis(150);
+
+            let node_count = MAX_CONCURRENT_LEDGER_PULLS * 3;
+            for i in 0..node_count {
+                let addr =
+                    spawn_ledger_pull_probe(delay, in_flight.clone(), max_in_flight.clone()).await;
+                register_node_at(&cm, &format!("ledger-node-{i}"), addr);
+            }
+
+            pull_all_node_ledgers(&cm, "test sweep").await;
+
+            let peak = max_in_flight.load(Ordering::SeqCst) as usize;
+            assert!(
+                peak <= MAX_CONCURRENT_LEDGER_PULLS,
+                "observed {peak} concurrent pulls, bound is {MAX_CONCURRENT_LEDGER_PULLS}"
+            );
+            assert!(
+                peak >= MAX_CONCURRENT_LEDGER_PULLS,
+                "peak concurrency was {peak}, well under the bound of \
+                 {MAX_CONCURRENT_LEDGER_PULLS} out of {node_count} nodes; this run never \
+                 exercised the cap, so it cannot tell a real one from an accidental one"
             );
         }
 
@@ -5507,6 +6042,110 @@ mod tests {
             );
         }
 
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_that_says_it_holds_the_resources_gets_looked_at() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("overlap", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a named overlap is the whole reason the reconcile pull exists"
+            );
+            assert!(
+                !cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "drift is for the controller to resolve, not grounds to drain"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn residual_state_is_looked_at_the_same_way_an_overlap_is() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureResidualState,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("residual", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a node that cannot say what it holds is the case a pull answers"
+            );
+        }
+
+        // An ordinary unreachable/timed-out node says nothing about what it
+        // holds, so it must not earn the reconcile pull that overlap does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_unreachable_node_does_not_earn_a_ledger_pull() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", bad_addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("unreachable", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            // The unclaimed slot settles it with no waiting: a pull stamps the
+            // slot before it spawns, so an untaken slot means none was started.
+            assert!(
+                cm.claim_ledger_pull_slot("n1"),
+                "an unreachable node must not have claimed the node's pull slot"
+            );
+        }
+
+        // A node stuck refusing must not earn a pull per dispatch: the pacing is
+        // the only thing between a standing conflict and a pull storm.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_that_keeps_refusing_is_pulled_once_not_once_per_refusal() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            // The requeue backoff would otherwise end the run before the second
+            // refusal; the pacing, not the backoff, is what is under test.
+            config.controller.max_batch_requeue = 10;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("standing-conflict", 1));
+            for _ in 0..4 {
+                let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            }
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "every refusal inside the cooldown must reuse the first pull"
+            );
+            assert!(
+                !cm.claim_ledger_pull_slot("n1"),
+                "the first refusal must still hold the node's only pull slot"
+            );
+        }
+
         // Repeated failures against an unreachable node must cross
         // max_batch_requeue and hold the job, not back off forever.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5703,6 +6342,35 @@ mod tests {
             assert_eq!(dispatch_deadline(&cm), Some(Duration::from_secs(7)));
         }
 
+        /// `fence: false` is for a teardown that structurally cannot be racing an
+        /// in-flight launch retry (e.g. a companion node after the owner's script
+        /// finished, once every node's dispatch was already confirmed) — it must
+        /// skip the `FenceRun` RPC entirely rather than just weakening it, since
+        /// the fence is what keeps a settled run's admission record unsweepable
+        /// for `LAUNCH_LIFETIME_MS`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn cancel_job_on_nodes_fence_flag_gates_the_fence_rpc() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster_with_config(&dir, test_config()).await;
+            let (addr, fence_calls) = spawn_mock_agent_capturing_fence().await;
+            register_node_at(&cm, "n1", addr);
+            let nodes = vec!["n1".to_string()];
+
+            cancel_job_on_nodes(&cm, 1, 1, &nodes, 9, false).await;
+            assert_eq!(
+                fence_calls.load(Ordering::SeqCst),
+                0,
+                "fence: false must not send a FenceRun RPC at all"
+            );
+
+            cancel_job_on_nodes(&cm, 1, 1, &nodes, 9, true).await;
+            assert_eq!(
+                fence_calls.load(Ordering::SeqCst),
+                1,
+                "fence: true must still protect a genuine cancel/evict path"
+            );
+        }
+
         /// The node that timed out is the one most likely to have launched anyway, so it is the one
         /// that must be cancelled — cancelling only the confirmed nodes orphans it.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5858,6 +6526,7 @@ mod tests {
                 },
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -6399,8 +7068,13 @@ mod tests {
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
 
-            cm.evict_job_attempt(job_id, Some(current.wrapping_sub(1)), Some("stale".into()))
-                .expect("a stale eviction must be a no-op, not an error");
+            cm.evict_job_attempt(
+                job_id,
+                Some(current.wrapping_sub(1)),
+                Some("stale".into()),
+                spur_core::job::PendingReason::JobLaunchFailure,
+            )
+            .expect("a stale eviction must be a no-op, not an error");
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(
