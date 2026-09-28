@@ -964,6 +964,24 @@ fn cancelled_epilog_owed(
     }
 }
 
+/// Whether this run's epilog is recorded as still in flight (`Pending` or
+/// `Running`) on the agent's own ledger. Checked before anything ends a
+/// supervisor's life out from under it: the epilog runs inside the same
+/// process as the rest of the run, with no pid of its own ever recorded on
+/// disk, so once that process is killed while the hook is still going,
+/// nothing can ever learn whether — or when — it actually finished. A caller
+/// about to reclaim a supervisor (a wedged-past-the-force-reclaim-window
+/// kill, or a restart's rejection of a run the controller no longer
+/// recognizes) must not do so while this holds and the supervisor is still
+/// genuinely alive; the hook's own natural completion already reports and
+/// releases correctly on its own (the same path a plain, unhurried cancel
+/// uses), so deferring to it here costs nothing but the wait.
+fn epilog_in_flight_for(admissions: &crate::admission::AdmissionStore, run: RunKey) -> bool {
+    admissions
+        .load_run(run)
+        .is_ok_and(|run| run.cleanup.epilog.is_in_flight())
+}
+
 /// Marks a controller-cancelled run's slice as still owing its epilog, if one
 /// is configured and still owed, so the sweep pipeline holds it until the hook clears.
 fn hold_cancelled_run_for_epilog(
@@ -1626,6 +1644,24 @@ fn spawn_wedged_stepd_force_reclaim(
             {
                 continue;
             }
+            // A supervisor still running its own epilog is not wedged, just
+            // slow — killing it here would abandon the hook mid-run with no
+            // way to ever learn its outcome. Let it finish and report on its
+            // own, however long that takes.
+            if let Some(run) = named_run(job_id, run_attempt) {
+                if epilog_in_flight_for(&context.admissions, run) {
+                    warn!(
+                        job_id,
+                        run_attempt,
+                        pid = descriptor.pid,
+                        window_secs = force_reclaim_timeout().as_secs(),
+                        "stepd still alive past the force-reclaim window, but its epilog is \
+                         still recorded in flight; leaving it to finish instead of force-\
+                         reclaiming"
+                    );
+                    continue;
+                }
+            }
             warn!(
                 job_id,
                 run_attempt,
@@ -1801,6 +1837,7 @@ pub struct StepdRecoveryCleanup {
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<StepdMap>>,
+    admissions: crate::admission::AdmissionStore,
 }
 
 #[derive(Clone)]
@@ -1816,7 +1853,33 @@ pub struct CompletionListenerContext {
 }
 
 impl StepdRecoveryCleanup {
+    /// The controller has fenced, or no longer recognizes, this recovered
+    /// run — but that is the controller's job-lifecycle view, not this
+    /// node's own cleanup obligation. A run whose epilog is still recorded
+    /// in flight, with its supervisor confirmed genuinely alive, must be
+    /// left to finish: killing the supervisor here would abandon its hook
+    /// mid-run with no pid of its own ever recorded to learn its outcome
+    /// from. Only proceed once the epilog is not in flight (nothing to
+    /// protect) or the supervisor is already confirmed gone (nothing this
+    /// check would spare).
     pub async fn reject(&self, descriptor: &crate::stepd::StepdDescriptor) {
+        if let Some(run) = RunKey::new(descriptor.job_id, descriptor.run_attempt) {
+            if epilog_in_flight_for(&self.admissions, run)
+                && matches!(
+                    crate::stepd::stepd_liveness(descriptor),
+                    Ok(crate::stepd::StepdLiveness::Live)
+                )
+            {
+                warn!(
+                    job_id = descriptor.job_id,
+                    run_attempt = descriptor.run_attempt,
+                    "controller no longer recognizes this recovered run, but its epilog is \
+                     still recorded in flight and its supervisor is still alive; leaving it \
+                     to finish instead of killing it"
+                );
+                return;
+            }
+        }
         self.finish_rejection(descriptor, stop_stepd_process(descriptor).await)
             .await;
     }
@@ -5133,6 +5196,7 @@ impl AgentService {
             running: self.running.clone(),
             allocation: self.allocation.clone(),
             stepds: self.stepds.clone(),
+            admissions: self.admissions(),
         }
     }
 
@@ -12095,12 +12159,13 @@ mod tests {
             &ResourceSet::default(),
         )));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let state = tempfile::tempdir().expect("runtime state directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            admissions: crate::admission::AdmissionStore::new(state.path(), "test-node"),
         };
-        let state = tempfile::tempdir().expect("runtime state directory");
         let mut descriptor = crate::stepd::StepdDescriptor::new(
             42,
             7,
@@ -12167,12 +12232,13 @@ mod tests {
             &ResourceSet::default(),
         )));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let state = tempfile::tempdir().expect("runtime state directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            admissions: crate::admission::AdmissionStore::new(state.path(), "test-node"),
         };
-        let state = tempfile::tempdir().expect("runtime state directory");
         let descriptor = crate::stepd::StepdDescriptor::new(
             42,
             7,
@@ -12210,6 +12276,124 @@ mod tests {
         );
     }
 
+    // C6: a restart's recovery handshake tells the agent the controller no
+    // longer recognizes this run (fenced, or simply ignored as stale) — but
+    // that is the controller's job-lifecycle view, not this node's own
+    // cleanup obligation. A run whose epilog is still recorded in flight,
+    // with its supervisor confirmed genuinely alive, must be left to finish:
+    // the epilog runs inside the same process with no pid of its own ever
+    // recorded, so killing the supervisor here would abandon the hook
+    // mid-run with no way to ever learn its outcome.
+    #[tokio::test]
+    async fn reject_leaves_a_recovered_stepd_with_an_in_flight_epilog_alone() {
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let admissions = crate::admission::AdmissionStore::new(state.path(), "test-node");
+        let cleanup = StepdRecoveryCleanup {
+            running: running.clone(),
+            allocation,
+            stepds: sessions.clone(),
+            admissions: admissions.clone(),
+        };
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(925, 1).await;
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = descriptor.run_attempt;
+        running.lock().await.insert(descriptor.job_id, tracked);
+
+        let mut admitted = crate::admission::RunAdmission::new(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            "test-node",
+            crate::admission::AdmittedResources::default(),
+            0,
+        );
+        admitted.cleanup.epilog = crate::admission::HookState::Running;
+        admissions
+            .admit_run(&admitted)
+            .expect("admit a run with an in-flight epilog");
+
+        cleanup.reject(&descriptor).await;
+
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a recovered stepd whose epilog is still in flight must not be killed"
+        );
+        assert_eq!(
+            sessions
+                .lock()
+                .await
+                .get(&(descriptor.job_id, descriptor.step_id)),
+            Some(&descriptor),
+            "tracking must stay held while the epilog is still recorded in flight"
+        );
+        assert!(
+            running.lock().await.contains_key(&descriptor.job_id),
+            "the ledger must stay held while the epilog is still recorded in flight"
+        );
+    }
+
+    // Negative case for the fix above: a recovered run with nothing still
+    // owed (no epilog ever recorded in flight) must be rejected exactly as
+    // before — this guard must not reopen a stall for the ordinary case.
+    #[tokio::test]
+    async fn reject_still_kills_a_recovered_stepd_with_no_epilog_owed() {
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let admissions = crate::admission::AdmissionStore::new(state.path(), "test-node");
+        let cleanup = StepdRecoveryCleanup {
+            running: running.clone(),
+            allocation,
+            stepds: sessions.clone(),
+            admissions,
+        };
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(926, 1).await;
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = descriptor.run_attempt;
+        running.lock().await.insert(descriptor.job_id, tracked);
+        // No admission record at all — mirrors a genuinely stale recovered
+        // session (e.g. one that predates the admission ledger).
+
+        cleanup.reject(&descriptor).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !child_has_exited(&mut child).await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            child_has_exited(&mut child).await,
+            "a recovered stepd with no epilog owed must still be rejected promptly"
+        );
+        assert!(
+            !sessions
+                .lock()
+                .await
+                .contains_key(&(descriptor.job_id, descriptor.step_id)),
+            "tracking must still be released when nothing protects it"
+        );
+        assert!(
+            !running.lock().await.contains_key(&descriptor.job_id),
+            "the ledger must still be released when nothing protects it"
+        );
+    }
+
     // A bare `systemctl stop` only signals the supervisor, which by design
     // ignores a raw SIGTERM for its job's cgroup — so the unit stop failing
     // must not be the only signal consulted. If the cgroup kill itself
@@ -12222,12 +12406,13 @@ mod tests {
             &ResourceSet::default(),
         )));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let state = tempfile::tempdir().expect("runtime state directory");
         let cleanup = StepdRecoveryCleanup {
             running: running.clone(),
             allocation,
             stepds: sessions.clone(),
+            admissions: crate::admission::AdmissionStore::new(state.path(), "test-node"),
         };
-        let state = tempfile::tempdir().expect("runtime state directory");
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
         // Named as the real thing: cleanup refuses a path that is not ours.
         let cgroup = TestCgroup::new(&cgroup_root);
@@ -20725,6 +20910,73 @@ mod tests {
             !child_has_exited(&mut child).await,
             "a stepd session whose job no longer appears in `running` must not \
              be force-killed by a force-reclaim task spawned for that job"
+        );
+    }
+
+    // C5: the force-reclaim window existing only to reap a truly wedged
+    // supervisor must not fire against one that is merely still running its
+    // own configured epilog — the epilog runs inside the same process with
+    // no pid of its own ever recorded, so killing the supervisor here would
+    // abandon the hook mid-run with no way to ever learn its outcome.
+    #[tokio::test]
+    async fn force_reclaim_leaves_a_stepd_with_an_in_flight_epilog_alone() {
+        let _shortened = ShortenedForceReclaim::new(FORCE_RECLAIM_TEST_WINDOW);
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(924, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        let run = RunKey::new(descriptor.job_id, descriptor.run_attempt).expect("run key");
+        let mut admitted = crate::admission::RunAdmission::new(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            "test-node",
+            crate::admission::AdmittedResources::default(),
+            0,
+        );
+        admitted.cleanup.epilog = crate::admission::HookState::Running;
+        svc.admissions()
+            .admit_run(&admitted)
+            .expect("admit a run with an in-flight epilog");
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        tokio::time::sleep(FORCE_RECLAIM_TEST_WINDOW).await;
+
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a stepd whose run still has an in-flight epilog must not be force-killed"
+        );
+        assert!(
+            svc.running.lock().await.contains_key(&descriptor.job_id),
+            "the ledger must stay held while the epilog is still recorded in flight"
+        );
+        assert_eq!(
+            svc.admissions()
+                .load_run(run)
+                .expect("run still admitted")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Running,
+            "the recorded epilog state must not be stomped to Unknown by a force-reclaim \
+             that never actually happened"
         );
     }
 
