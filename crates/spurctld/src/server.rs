@@ -869,6 +869,17 @@ fn release_the_owed_epilog(
 /// from an operator's and clear only the former.
 const UNRESOLVED_CLAIM_REASON: &str = "holding claims the controller has no record of";
 
+/// Whether a node's current reason is this pass's own unresolved-claim hold,
+/// rather than an operator's or another subsystem's. Shared with the
+/// short-cycle retry in `scheduler_loop`, which must only re-pull a node this
+/// mechanism itself put on hold -- never one an operator drained for their
+/// own reason.
+pub(crate) fn node_holds_unresolved_claim_reason(node: &spur_core::node::Node) -> bool {
+    node.state_reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with(UNRESOLVED_CLAIM_REASON))
+}
+
 /// Hold a node whose claims nobody can account for out of service: left
 /// schedulable it is picked every cycle and refuses every launch, indefinitely.
 fn name_unresolved_claims_on_node(
@@ -893,7 +904,7 @@ fn name_unresolved_claims_on_node(
     let existing = current.state_reason.as_deref().unwrap_or_default();
     // Authorship, not state: the hold below is itself an admin hold, so without
     // this the pass would be locked out of lifting the one it placed.
-    let mine = existing.starts_with(UNRESOLVED_CLAIM_REASON);
+    let mine = node_holds_unresolved_claim_reason(&current);
     // A reason set anywhere else is somebody's, and its attribution goes with
     // it; an admin hold with no text at all is theirs on the same grounds.
     if !mine && (current.admin_locked || !existing.is_empty()) {
@@ -12804,6 +12815,32 @@ mod tests {
         assert!(
             !svc.cluster.get_node("gate-node").unwrap().reconcile_pending,
             "a registration that never took must not leave the node ungated forever"
+        );
+    }
+
+    #[test]
+    fn node_holds_unresolved_claim_reason_matches_only_its_own_prefix() {
+        fn node() -> spur_core::node::Node {
+            spur_core::node::Node::new("n".into(), spur_core::resource::ResourceSet::default())
+        }
+
+        let mut ours = node();
+        ours.state_reason = Some(format!("{UNRESOLVED_CLAIM_REASON}: 42"));
+        assert!(
+            node_holds_unresolved_claim_reason(&ours),
+            "must recognize its own reason text, including the trailing claim list"
+        );
+
+        let mut operators = node();
+        operators.state_reason = Some("scheduled maintenance".into());
+        assert!(
+            !node_holds_unresolved_claim_reason(&operators),
+            "an operator's own reason must never be mistaken for this pass's hold"
+        );
+
+        assert!(
+            !node_holds_unresolved_claim_reason(&node()),
+            "a node with no reason at all holds nothing of this pass's"
         );
     }
 

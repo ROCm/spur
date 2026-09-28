@@ -195,6 +195,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let mut was_leader = false;
     let mut leadership_entered_at: Option<Instant> = None;
     let mut last_ledger_sweep: Option<Instant> = None;
+    let mut last_unresolved_claim_retry: Option<Instant> = None;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -245,6 +246,24 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             let pull_cluster = cluster.clone();
             tokio::spawn(async move {
                 pull_all_node_ledgers(&pull_cluster, "routine sweep").await;
+            });
+        }
+
+        // A node the controller has itself put on hold for an unresolved claim
+        // is exactly the node most worth re-checking soon: the agent may have
+        // resolved and released that claim seconds after being asked about it,
+        // but a released claim leaves no trace in its own next ordinary
+        // heartbeat, so nothing else would find out short of an operator or
+        // the much slower routine sweep above. Skipped alongside it on a
+        // leadership-gain tick, which already pulls every node.
+        if !entering_term
+            && last_unresolved_claim_retry
+                .is_none_or(|last| last.elapsed() >= UNRESOLVED_CLAIM_RETRY_INTERVAL)
+        {
+            last_unresolved_claim_retry = Some(Instant::now());
+            let retry_cluster = cluster.clone();
+            tokio::spawn(async move {
+                retry_unresolved_claim_nodes(&retry_cluster).await;
             });
         }
 
@@ -3281,6 +3300,36 @@ pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) 
     while set.join_next().await.is_some() {}
 }
 
+/// How often a node still named under `UNRESOLVED_CLAIM_REASON` gets a fresh,
+/// trusted cut, rather than waiting for `LEDGER_SWEEP_INTERVAL`. Matches
+/// `LEDGER_PULL_COOLDOWN`, the per-node floor `claim_ledger_pull_slot` already
+/// enforces: checking any more often would only ever be a no-op.
+pub(crate) const UNRESOLVED_CLAIM_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Re-pull every node currently held under our own unresolved-claim reason.
+/// The agent side may resolve and release a claim within seconds of being
+/// asked about it, but a released claim leaves no trace in that agent's next
+/// ordinary heartbeat -- there is nothing left to report -- so nothing but a
+/// fresh, trusted (`Pulled`) cut ever finds out. Paced by the same per-node
+/// cooldown an agent's own "ask" uses, so a node that stays genuinely broken
+/// is retried, not hammered.
+pub(crate) async fn retry_unresolved_claim_nodes(cluster: &Arc<ClusterManager>) {
+    for node in cluster.get_nodes() {
+        if !crate::server::node_holds_unresolved_claim_reason(&node) {
+            continue;
+        }
+        if !cluster.claim_ledger_pull_slot(&node.name) {
+            continue;
+        }
+        let cluster = cluster.clone();
+        let name = node.name.clone();
+        tokio::spawn(async move {
+            pull_node_ledger(&cluster, &name, "unresolved claim retry").await;
+        });
+    }
+}
+
 /// Give up a reservation whose dispatch never confirmed, or the slice stays
 /// charged to a job that never got past this attempt. A dispatch-confirmation
 /// failure before `activate_job` releases the same charge via
@@ -5316,6 +5365,413 @@ mod tests {
                 "peak concurrency was {peak}, well under the bound of \
                  {MAX_CONCURRENT_LEDGER_PULLS} out of {node_count} nodes; this run never \
                  exercised the cap, so it cannot tell a real one from an accidental one"
+            );
+        }
+
+        /// Minimal `SlurmAgent` that only answers `request_node_ledger`, with a
+        /// canned response swappable after the agent is already spawned --
+        /// standing in for a real agent whose own ledger changes between one
+        /// pull and the next (e.g. it resolves and releases a claim on its
+        /// own). Counts calls so a test can assert whether a pull actually
+        /// happened, and how many times.
+        struct LedgerAnswerAgent {
+            ledger: Arc<std::sync::Mutex<Option<spur_proto::proto::NodeLedger>>>,
+            calls: Arc<AtomicU32>,
+        }
+
+        #[tonic::async_trait]
+        impl spur_proto::proto::slurm_agent_server::SlurmAgent for LedgerAnswerAgent {
+            type StreamJobOutputStream =
+                tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
+            type InteractiveSessionStream =
+                tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
+
+            async fn request_node_ledger(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
+            {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let ledger = self.ledger.lock().unwrap().clone();
+                Ok(tonic::Response::new(
+                    spur_proto::proto::RequestNodeLedgerResponse { ledger },
+                ))
+            }
+            async fn launch_job(
+                &self,
+                _request: tonic::Request<LaunchJobRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::LaunchJobResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn fence_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::FenceRunResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn settle_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::SettleRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::SettleRunResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn ping(
+                &self,
+                _request: tonic::Request<()>,
+            ) -> Result<tonic::Response<spur_proto::proto::PingResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(
+                    spur_proto::proto::PingResponse::default(),
+                ))
+            }
+            async fn start_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AgentStartJobRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
+            }
+            async fn await_step(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AwaitStepRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RunCommandResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn prepare_pmix(
+                &self,
+                _request: tonic::Request<spur_proto::proto::PreparePmixRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::PreparePmixResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn release_pmix(
+                &self,
+                _request: tonic::Request<spur_proto::proto::ReleasePmixRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::ReleasePmixResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn cancel_job(
+                &self,
+                _request: tonic::Request<AgentCancelJobRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
+            }
+            async fn suspend_job(
+                &self,
+                _request: tonic::Request<AgentSuspendJobRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn get_node_resources(
+                &self,
+                _request: tonic::Request<()>,
+            ) -> Result<tonic::Response<spur_proto::proto::NodeResourcesResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn probe_stepd(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StepdProbeRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::StepdProbeResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn exec_in_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::ExecInJobRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::ExecInJobResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn run_command(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RunCommandRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RunCommandResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn cancel_step(
+                &self,
+                _request: tonic::Request<spur_proto::proto::CancelStepRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
+            }
+            async fn register_job_allocation(
+                &self,
+                _request: tonic::Request<RegisterJobAllocationRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::RegisterJobAllocationResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn stream_job_output(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StreamJobOutputRequest>,
+            ) -> Result<tonic::Response<Self::StreamJobOutputStream>, tonic::Status> {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn interactive_session(
+                &self,
+                _request: tonic::Request<tonic::Streaming<spur_proto::proto::InteractiveInput>>,
+            ) -> Result<tonic::Response<Self::InteractiveSessionStream>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn start_cluster_component(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StartClusterComponentRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::StartClusterComponentResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn stop_cluster_component(
+                &self,
+                _request: tonic::Request<spur_proto::proto::StopClusterComponentRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::StopClusterComponentResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn get_cluster_component_status(
+                &self,
+                _request: tonic::Request<spur_proto::proto::GetClusterComponentStatusRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::GetClusterComponentStatusResponse>,
+                tonic::Status,
+            > {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn create_k0s_join_token(
+                &self,
+                _request: tonic::Request<spur_proto::proto::CreateK0sJoinTokenRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::CreateK0sJoinTokenResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn drain_k8s_node(
+                &self,
+                _request: tonic::Request<spur_proto::proto::DrainK8sNodeRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::DrainK8sNodeResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn delete_k8s_node(
+                &self,
+                _request: tonic::Request<spur_proto::proto::DeleteK8sNodeRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::DeleteK8sNodeResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn get_kubeconfig(
+                &self,
+                _request: tonic::Request<spur_proto::proto::GetKubeconfigRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::GetKubeconfigResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+            async fn apply_mesh(
+                &self,
+                _request: tonic::Request<spur_proto::proto::MeshMembership>,
+            ) -> Result<tonic::Response<spur_proto::proto::ApplyMeshResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+        }
+
+        /// Spawns a [`LedgerAnswerAgent`], returning its address, a handle to
+        /// swap its canned `request_node_ledger` response, and a call counter.
+        async fn spawn_ledger_answer_agent() -> (
+            std::net::SocketAddr,
+            Arc<std::sync::Mutex<Option<spur_proto::proto::NodeLedger>>>,
+            Arc<AtomicU32>,
+        ) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let ledger = Arc::new(std::sync::Mutex::new(None));
+            let calls = Arc::new(AtomicU32::new(0));
+            let agent = LedgerAnswerAgent {
+                ledger: ledger.clone(),
+                calls: calls.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, ledger, calls)
+        }
+
+        /// Drives `node` into the exact drain this bug leaves standing: a real
+        /// reconcile pass, under the default `Open` admission mode, seeing an
+        /// unrecorded claim it is licensed only to name, never to act on.
+        async fn drain_node_with_unrecorded_claim(
+            cm: &Arc<ClusterManager>,
+            node: &str,
+            session: &str,
+            job_id: u32,
+        ) {
+            cm.agent_sessions().observe_registration(node, session);
+            let dispatched = cm.dispatch_tracker().watch(node);
+            let ledger = spur_proto::proto::NodeLedger {
+                agent_session_id: session.into(),
+                inventory_complete: true,
+                entries: vec![spur_proto::proto::LedgerEntry {
+                    job_id,
+                    run_attempt: 1,
+                    disposition: "held".into(),
+                    ..Default::default()
+                }],
+            };
+            crate::server::reconcile_node_ledger(
+                cm,
+                node,
+                ledger,
+                &dispatched,
+                crate::server::CutProvenance::Registered,
+            )
+            .await;
+            assert!(
+                crate::server::node_holds_unresolved_claim_reason(&cm.get_node(node).unwrap()),
+                "setup must reproduce the drain this bug leaves standing, or the test below \
+                 proves nothing"
+            );
+        }
+
+        /// Pins the D7 gap: once an agent's own ledger no longer reports a claim
+        /// the controller drained it for -- exactly what happens when the agent
+        /// resolves a stale claim on its own -- nothing about that agent's
+        /// ordinary heartbeat can ever say so, so only a fresh, independently
+        /// triggered pull ever finds out. Before this fix, nothing but an
+        /// operator's `Reconcile=yes` or the hourly sweep ever issued one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unresolved_claim_hold_self_clears_once_the_agent_no_longer_reports_it() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, ledger_response, calls) = spawn_ledger_answer_agent().await;
+            register_node_at(&cm, "reclaim-node", addr);
+
+            drain_node_with_unrecorded_claim(&cm, "reclaim-node", "session-a", 999_999).await;
+
+            // The agent has since resolved the claim on its own; a fresh pull
+            // now sees an empty ledger, same session.
+            *ledger_response.lock().unwrap() = Some(spur_proto::proto::NodeLedger {
+                agent_session_id: "session-a".into(),
+                inventory_complete: true,
+                entries: Vec::new(),
+            });
+
+            retry_unresolved_claim_nodes(&cm).await;
+
+            wait_for("the unresolved-claim hold self-clears", || {
+                cm.get_node("reclaim-node")
+                    .is_some_and(|n| !crate::server::node_holds_unresolved_claim_reason(&n))
+            });
+            assert_eq!(
+                cm.get_node("reclaim-node").unwrap().state,
+                spur_core::node::NodeState::Idle,
+                "the node must be schedulable again, not just missing its reason text"
+            );
+            assert!(
+                calls.load(Ordering::SeqCst) >= 1,
+                "the hold must clear because this mechanism actually pulled a fresh cut, not \
+                 by some other means"
+            );
+        }
+
+        /// A node whose agent genuinely cannot resolve its claim (this is what
+        /// `LedgerDisposition::Unresolved` -- e.g. an agent-side conflict hold --
+        /// means: nothing about it will ever change on its own) must be retried,
+        /// not hammered: two back-to-back sweeps issue at most one pull.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn retry_unresolved_claim_nodes_respects_the_per_node_pull_cooldown() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, ledger_response, calls) = spawn_ledger_answer_agent().await;
+            register_node_at(&cm, "stuck-node", addr);
+
+            cm.agent_sessions()
+                .observe_registration("stuck-node", "session-a");
+            let dispatched = cm.dispatch_tracker().watch("stuck-node");
+            let still_unresolved = spur_proto::proto::NodeLedger {
+                agent_session_id: "session-a".into(),
+                inventory_complete: true,
+                entries: vec![spur_proto::proto::LedgerEntry {
+                    job_id: 111,
+                    run_attempt: 1,
+                    disposition: "unresolved".into(),
+                    ..Default::default()
+                }],
+            };
+            crate::server::reconcile_node_ledger(
+                &cm,
+                "stuck-node",
+                still_unresolved.clone(),
+                &dispatched,
+                crate::server::CutProvenance::Registered,
+            )
+            .await;
+            assert!(crate::server::node_holds_unresolved_claim_reason(
+                &cm.get_node("stuck-node").unwrap()
+            ));
+            *ledger_response.lock().unwrap() = Some(still_unresolved);
+
+            retry_unresolved_claim_nodes(&cm).await;
+            wait_for("first sweep pulls", || calls.load(Ordering::SeqCst) >= 1);
+            // The node is still (and will remain) held, so a second sweep
+            // right behind the first has something to retry -- the cooldown,
+            // not an empty candidate list, is what must stop it.
+            retry_unresolved_claim_nodes(&cm).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "a node that stays broken must be retried on a cadence, not hammered on every tick"
+            );
+        }
+
+        /// This mechanism may only ever re-pull a node it itself put on hold.
+        /// An operator's own drain (or any other subsystem's) must never be
+        /// second-guessed by a background sweep the operator never asked for.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn retry_unresolved_claim_nodes_never_touches_an_operators_drain() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _ledger_response, calls) = spawn_ledger_answer_agent().await;
+            register_node_at(&cm, "maint-node", addr);
+
+            cm.update_node_state(
+                "maint-node",
+                spur_core::node::NodeState::Drain,
+                Some("scheduled maintenance".into()),
+                Some(0),
+            )
+            .unwrap();
+            wait_for("node admin-drained for maintenance", || {
+                cm.get_node("maint-node")
+                    .and_then(|n| n.state_reason)
+                    .as_deref()
+                    == Some("scheduled maintenance")
+            });
+
+            retry_unresolved_claim_nodes(&cm).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "an operator's own drain reason must never trigger this mechanism's pull"
             );
         }
 
