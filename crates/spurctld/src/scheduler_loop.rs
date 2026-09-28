@@ -1623,6 +1623,9 @@ enum DispatchError {
     /// The agent explicitly rejected the launch for a reason it does not have
     /// a `LaunchFailureKind` for yet.
     AgentRejected(String),
+    /// The node holds something the controller cannot account for. Retrying
+    /// here is pointless until the two have been reconciled.
+    NeedsReconcile(String),
     Other(anyhow::Error),
 }
 
@@ -1636,6 +1639,7 @@ impl DispatchError {
             Self::Unreachable(_) => "agent unreachable",
             Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
+            Self::NeedsReconcile(_) => "node holds unaccounted resources",
             Self::Other(_) => "dispatch error",
         }
     }
@@ -1652,7 +1656,9 @@ impl std::fmt::Display for DispatchError {
             Self::TimedOut(limit) => {
                 write!(f, "agent did not answer within {}s", limit.as_secs())
             }
-            Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::AgentRejected(reason) | Self::NeedsReconcile(reason) => {
+                write!(f, "agent rejected job: {reason}")
+            }
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -1846,17 +1852,18 @@ async fn dispatch_to_agent(
 
     let inner = response.into_inner();
     if !inner.success {
-        // An agent predating the classification sends UNSPECIFIED, which falls
-        // through to the generic requeue this has always done.
-        return Err(
-            if inner.failure_kind
-                == spur_proto::proto::LaunchFailureKind::LaunchFailureProlog as i32
-            {
-                DispatchError::PrologFailed(inner.error)
-            } else {
-                DispatchError::AgentRejected(inner.error)
-            },
-        );
+        use spur_proto::proto::LaunchFailureKind as Kind;
+        // A named reason lets the controller act in this round trip. An older
+        // agent sends UNSPECIFIED and falls through to the generic requeue.
+        return Err(match Kind::try_from(inner.failure_kind) {
+            Ok(Kind::LaunchFailureProlog) => DispatchError::PrologFailed(inner.error),
+            // Runtime state with no record behind it, or a claim the controller
+            // does not know about: both need a full look at the node.
+            Ok(Kind::LaunchFailureLocalOverlap | Kind::LaunchFailureResidualState) => {
+                DispatchError::NeedsReconcile(inner.error)
+            }
+            _ => DispatchError::AgentRejected(inner.error),
+        });
     }
     info!(
         job_id = params.job_id,
@@ -2444,6 +2451,18 @@ async fn confirm_dispatch_on_nodes(
                     // Held for the deadline it actually burned: while assignments are processed
                     // serially, re-picking this node stalls every job behind it, not just this one.
                     DispatchError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
+                    // The node holds something Raft cannot explain: look before
+                    // sending it anything else, paced so repeat refusals don't storm.
+                    DispatchError::NeedsReconcile(_) => {
+                        cluster.cool_down_node(&node_name);
+                        if cluster.claim_ledger_pull_slot(&node_name) {
+                            let cluster = cluster.clone();
+                            let node = node_name.clone();
+                            tokio::spawn(async move {
+                                pull_node_ledger(&cluster, &node, "dispatch refused").await;
+                            });
+                        }
+                    }
                     DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
                 }
             }
@@ -4390,6 +4409,9 @@ mod tests {
             /// High-water mark of `ledger_pull_in_flight`, so a test can assert
             /// on the peak without racing to sample the live counter.
             ledger_pull_max_in_flight: Option<Arc<AtomicU32>>,
+            /// Every `request_node_ledger` call, so a test can assert a refusal
+            /// earned exactly one pull (or none) without racing in-flight state.
+            ledger_pulls_total: Arc<AtomicU32>,
         }
 
         #[tonic::async_trait]
@@ -4404,6 +4426,7 @@ mod tests {
                 _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
             ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
             {
+                self.ledger_pulls_total.fetch_add(1, Ordering::SeqCst);
                 if let (Some(in_flight), Some(max_in_flight)) =
                     (&self.ledger_pull_in_flight, &self.ledger_pull_max_in_flight)
                 {
@@ -4791,6 +4814,7 @@ mod tests {
                 ledger_pull_delay: Duration::ZERO,
                 ledger_pull_in_flight: None,
                 ledger_pull_max_in_flight: None,
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4823,6 +4847,7 @@ mod tests {
                 ledger_pull_delay: Duration::ZERO,
                 ledger_pull_in_flight: None,
                 ledger_pull_max_in_flight: None,
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4855,6 +4880,7 @@ mod tests {
                 ledger_pull_delay: Duration::ZERO,
                 ledger_pull_in_flight: None,
                 ledger_pull_max_in_flight: None,
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4887,6 +4913,7 @@ mod tests {
                 ledger_pull_delay: Duration::ZERO,
                 ledger_pull_in_flight: None,
                 ledger_pull_max_in_flight: None,
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4923,6 +4950,7 @@ mod tests {
                 ledger_pull_delay: delay,
                 ledger_pull_in_flight: Some(in_flight),
                 ledger_pull_max_in_flight: Some(max_in_flight),
+                ledger_pulls_total: Arc::new(AtomicU32::new(0)),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4942,6 +4970,54 @@ mod tests {
                 "controller-allocated GPUs unavailable on this node",
             ))
             .await
+        }
+
+        /// Mock agent that refuses every launch with `reject_launch_as` and
+        /// counts the ledger pulls that refusal earns it.
+        async fn spawn_mock_agent_counting_pulls(
+            reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let ledger_pulls_total = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
+                ledger_pulls_total: ledger_pulls_total.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, ledger_pulls_total)
+        }
+
+        /// The pull is spawned onto its own task, so an assertion on the count
+        /// has a real async wait behind it rather than a guess.
+        async fn pulls_reaching(counter: &Arc<AtomicU32>, wanted: u32) -> u32 {
+            for _ in 0..200 {
+                let seen = counter.load(Ordering::SeqCst);
+                if seen >= wanted {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            counter.load(Ordering::SeqCst)
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -5962,6 +6038,110 @@ mod tests {
                 job.state_reason().contains("agent rejected launch"),
                 "an explicit non-prolog rejection must get its own category, got {:?}",
                 job.state_reason()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_that_says_it_holds_the_resources_gets_looked_at() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("overlap", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a named overlap is the whole reason the reconcile pull exists"
+            );
+            assert!(
+                !cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "drift is for the controller to resolve, not grounds to drain"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn residual_state_is_looked_at_the_same_way_an_overlap_is() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureResidualState,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("residual", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a node that cannot say what it holds is the case a pull answers"
+            );
+        }
+
+        // An ordinary unreachable/timed-out node says nothing about what it
+        // holds, so it must not earn the reconcile pull that overlap does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_unreachable_node_does_not_earn_a_ledger_pull() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let bad_addr = unreachable_addr().await;
+            register_node_at(&cm, "n1", bad_addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("unreachable", 1));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            // The unclaimed slot settles it with no waiting: a pull stamps the
+            // slot before it spawns, so an untaken slot means none was started.
+            assert!(
+                cm.claim_ledger_pull_slot("n1"),
+                "an unreachable node must not have claimed the node's pull slot"
+            );
+        }
+
+        // A node stuck refusing must not earn a pull per dispatch: the pacing is
+        // the only thing between a standing conflict and a pull storm.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_that_keeps_refusing_is_pulled_once_not_once_per_refusal() {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            // The requeue backoff would otherwise end the run before the second
+            // refusal; the pacing, not the backoff, is what is under test.
+            config.controller.max_batch_requeue = 10;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (addr, pulls) = spawn_mock_agent_counting_pulls(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("standing-conflict", 1));
+            for _ in 0..4 {
+                let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            }
+
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "every refusal inside the cooldown must reuse the first pull"
+            );
+            assert!(
+                !cm.claim_ledger_pull_slot("n1"),
+                "the first refusal must still hold the node's only pull slot"
             );
         }
 
