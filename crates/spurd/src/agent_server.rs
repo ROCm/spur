@@ -7992,43 +7992,20 @@ impl SlurmAgent for AgentService {
                 req.job_id
             )));
         }
-        let alloc_result = {
-            let mut alloc = self.allocation.lock().await;
-            // Atomic with the bind: the refresh task publishes inventory via
-            // update_capacity under this same lock, so no newer generation can
-            // land between this check and allocate_for_job.
-            if let Some(a) = allocated {
-                check_dispatch_generation(
-                    a.generation,
-                    self.reporter.snapshot_resources().generation,
-                )?;
-            }
-            let result = alloc
-                .allocate_for_job(
-                    req.job_id,
-                    req.run_attempt,
-                    cpus,
-                    memory_mb,
-                    &controller_gpu_ids,
-                )
-                .map_err(|e| match e {
-                    AllocError::GpusUnavailable => Status::resource_exhausted(
-                        "controller-allocated GPUs unavailable on this node",
-                    ),
-                    AllocError::DuplicateJob => Status::already_exists(format!(
-                        "job {} already registered on this node",
-                        req.job_id
-                    )),
-                    AllocError::Superseded => Status::failed_precondition(format!(
-                        "job {} was superseded by a newer attempt on this node",
-                        req.job_id
-                    )),
-                    AllocError::CpusUnavailable => {
-                        Status::resource_exhausted("allocated cores unavailable on this node")
-                    }
-                })?;
-            result
-        };
+        // Shares launch_job's reclaim-then-classify logic, so a genuine local
+        // ledger conflict is reported the same way on both paths instead of
+        // the inert "just retry" bucket a bare resource_exhausted lands in.
+        let alloc_result = self
+            .reserve_local_slice(
+                req.job_id,
+                req.run_attempt,
+                allocated,
+                cpus,
+                memory_mb,
+                &controller_gpu_ids,
+            )
+            .await
+            .map_err(LaunchRejection::into_status)?;
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
         // Shared with the admission record below, so the Drop-deferred cleanup
@@ -10421,6 +10398,12 @@ impl HeldRefusal {
             conflict: self.conflict,
         }
     }
+
+    /// For a response type with no failure-kind field: a status code the
+    /// controller can recognize as reconcile-worthy on its own.
+    pub(crate) fn into_status(self) -> Status {
+        Status::aborted(self.message)
+    }
 }
 
 /// Why a launch could not reserve its slice: something this node is holding,
@@ -10434,6 +10417,15 @@ pub(crate) enum LaunchRejection {
 impl From<Status> for LaunchRejection {
     fn from(status: Status) -> Self {
         Self::Failed(status)
+    }
+}
+
+impl LaunchRejection {
+    pub(crate) fn into_status(self) -> Status {
+        match self {
+            Self::Held(refusal) => refusal.into_status(),
+            Self::Failed(status) => status,
+        }
     }
 }
 
@@ -10593,6 +10585,32 @@ impl AgentService {
             .into());
         }
 
+        let result = self
+            .reserve_local_slice(
+                job_id,
+                run_attempt,
+                allocated,
+                cpus,
+                memory_mb,
+                &controller_gpu_ids,
+            )
+            .await?;
+        Ok((result, controller_gpu_ids))
+    }
+
+    /// Reserve a run's cpu/gpu/memory slice, reclaiming one round of stale
+    /// (no-longer-tracked) GPU owners before giving up. Shared by
+    /// `allocate_local_resources` (launch_job) and `register_job_allocation` so
+    /// both surface the same held-resource classification on a conflict.
+    async fn reserve_local_slice(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        allocated: Option<&ResourceAllocations>,
+        cpus: u32,
+        memory_mb: u64,
+        controller_gpu_ids: &[u64],
+    ) -> Result<AllocationResult, LaunchRejection> {
         // Hold running across the reclaim (running-then-allocation, as in commit)
         // so a concurrent commit can't make a live owner look stale.
         let running = self.running.lock().await;
@@ -10607,19 +10625,13 @@ impl AgentService {
             check_dispatch_generation(a.generation, self.reporter.snapshot_resources().generation)?;
         }
 
-        let result = match alloc.allocate_for_job(
-            job_id,
-            run_attempt,
-            cpus,
-            memory_mb,
-            &controller_gpu_ids,
-        ) {
-            Ok(result) => result,
+        match alloc.allocate_for_job(job_id, run_attempt, cpus, memory_mb, controller_gpu_ids) {
+            Ok(result) => Ok(result),
             Err(AllocError::GpusUnavailable) => {
                 // A conflicting owner absent from the live set is stale (the
                 // controller only re-launches after freeing it); reclaim and retry.
                 let stale: Vec<u32> = alloc
-                    .conflicting_owners(&controller_gpu_ids)
+                    .conflicting_owners(controller_gpu_ids)
                     .into_iter()
                     .filter(|owner| !live.contains(owner))
                     .collect();
@@ -10644,9 +10656,9 @@ impl AgentService {
                     run_attempt,
                     cpus,
                     memory_mb,
-                    &controller_gpu_ids,
+                    controller_gpu_ids,
                 ) {
-                    Ok(result) => result,
+                    Ok(result) => Ok(result),
                     Err(_) => {
                         warn!(
                             job_id,
@@ -10658,10 +10670,10 @@ impl AgentService {
                         // Named (arbitrarily, if more than one) so the controller
                         // can look the holder up rather than guess which is stale.
                         let holder = alloc
-                            .conflicting_owners(&controller_gpu_ids)
+                            .conflicting_owners(controller_gpu_ids)
                             .first()
                             .copied();
-                        return Err(LaunchRejection::Held(match holder {
+                        Err(LaunchRejection::Held(match holder {
                             Some(job_id) => HeldRefusal::named(
                                 job_id,
                                 alloc.owner_attempt(job_id).unwrap_or(0),
@@ -10670,7 +10682,7 @@ impl AgentService {
                             None => HeldRefusal::unattributed(
                                 "controller-allocated GPUs unavailable on this node",
                             ),
-                        }));
+                        }))
                     }
                 }
             }
@@ -10682,10 +10694,10 @@ impl AgentService {
                     job_id,
                     "rejecting duplicate launch: a launch is already in flight for this job"
                 );
-                return Err(Status::already_exists(format!(
+                Err(Status::already_exists(format!(
                     "job {job_id} already has a launch in flight on this node"
                 ))
-                .into());
+                .into())
             }
             Err(AllocError::Superseded) => {
                 // A newer attempt already reserved/committed this job id; this
@@ -10695,23 +10707,21 @@ impl AgentService {
                     run_attempt,
                     "rejecting launch: superseded by a newer attempt already tracked on this node"
                 );
-                return Err(Status::failed_precondition(format!(
+                Err(Status::failed_precondition(format!(
                     "job {job_id} was superseded by a newer attempt on this node"
                 ))
-                .into());
+                .into())
             }
-            // Only a replay of recorded cores can raise this, and this node has
-            // no cheap way to say whose; unattributed is the honest answer.
+            // A ledger disagreement, not true exhaustion: normal dispatch already
+            // had the controller verify the count, so this node's free count
+            // must have drifted from what the controller expects.
             Err(AllocError::CpusUnavailable) => {
                 warn!(job_id, "rejecting launch: allocated cores unavailable");
-                return Err(LaunchRejection::Held(HeldRefusal::unattributed(
+                Err(LaunchRejection::Held(HeldRefusal::unattributed(
                     "allocated cores unavailable on this node",
-                )));
+                )))
             }
-        };
-
-        let gpu_ids = controller_gpu_ids;
-        Ok((result, gpu_ids))
+        }
     }
 
     /// Resolve the per-node budget the way `launch_job` does, then reserve, so
@@ -19556,6 +19566,105 @@ mod tests {
             0,
             "launching owner must be spared"
         );
+    }
+
+    // register_job_allocation (the srun/salloc path) shares launch_job's
+    // reclaim-then-classify logic, so a stale GPU owner self-heals here too
+    // instead of hard-failing the registration.
+    #[tokio::test]
+    async fn register_job_allocation_reclaims_stale_gpu_owner_not_running() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            // Registration resolves the granted GPU against this registry and
+            // hard-fails when it cannot, so device 0 has to be known here.
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Prior job 99 owns GPU 0 (committed) but never entered `running`.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(99, 1);
+        }
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+        let req = Request::new(RegisterJobAllocationRequest {
+            job_id: 100,
+            run_attempt: 1,
+            cpus: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+                generation: 0,
+            }),
+            ..Default::default()
+        });
+
+        svc.register_job_allocation(req)
+            .await
+            .expect("must reclaim the stale owner's GPU and register");
+        assert!(svc.running.lock().await.contains_key(&100));
+    }
+
+    // A conflict the node cannot resolve locally (the holder is still live) must
+    // surface as the same reconcile-worthy signal launch_job's LOCAL_OVERLAP
+    // does, not the inert resource-exhausted status this RPC used to send.
+    #[tokio::test]
+    async fn register_job_allocation_reports_a_live_conflict_as_aborted() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.insert_test_job(99, TrackedJob::dummy(0)).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(99, 1);
+        }
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+        let req = Request::new(RegisterJobAllocationRequest {
+            job_id: 100,
+            run_attempt: 1,
+            cpus: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+                generation: 0,
+            }),
+            ..Default::default()
+        });
+
+        let err = svc
+            .register_job_allocation(req)
+            .await
+            .expect_err("must reject: the conflicting GPU owner is still running");
+        assert_eq!(err.code(), tonic::Code::Aborted);
     }
 
     fn held(rejection: LaunchRejection) -> HeldRefusal {

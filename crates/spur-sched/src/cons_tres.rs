@@ -323,13 +323,9 @@ impl NodeAllocation {
         }
     }
 
-    /// Reserve resources for a job, keyed by job id. GPU stable ids are the
-    /// hard gate (unknown or in-use → `GpusUnavailable`); a launch already in
-    /// flight for the same job id → `DuplicateJob`. CPU is best-effort since the
-    /// controller owns placement. Memory is always accounted so release stays
-    /// symmetric. Marked `launching` until `commit_job`/`release_job` so
-    /// reconcile spares an in-flight launch. `run_attempt` is recorded so a
-    /// later `commit_job` for a different (superseded) attempt is rejected.
+    /// Reserve resources for a job, keyed by job id. GPU ids and CPU count are
+    /// both a hard gate (`GpusUnavailable` / `CpusUnavailable`); marked
+    /// `launching` until `commit_job`/`release_job` so reconcile spares it.
     pub fn allocate_for_job(
         &mut self,
         job_id: u32,
@@ -351,11 +347,14 @@ impl NodeAllocation {
                 return Err(AllocError::Superseded);
             }
         }
-        // Nothing below can refuse, so a launch that is turned away never drops
-        // the reservation it was about to supersede.
-        self.drop_owner(ReleaseWarrant::superseded_by_newer_attempt(
-            RunKey::any_attempt(job_id),
-        ));
+        // What job_id's own about-to-be-superseded reservation holds, so the
+        // checks below judge availability against everyone ELSE, not against
+        // the very reservation this call is about to replace.
+        let (held_cpus, held_gpus): (Vec<u32>, Vec<u64>) = self
+            .owners
+            .get(&job_id)
+            .map(|owned| (owned.result.cpu_ids.clone(), owned.result.gpu_ids.clone()))
+            .unwrap_or_default();
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
         for &id in gpu_device_ids {
@@ -364,11 +363,24 @@ impl NodeAllocation {
                 .iter()
                 .position(|g| g.stable_id == id)
                 .ok_or(AllocError::GpusUnavailable)?;
-            if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
+            if (self.gpu_allocated[idx] && !held_gpus.contains(&id)) || gpu_indices.contains(&idx) {
                 return Err(AllocError::GpusUnavailable);
             }
             gpu_indices.push(idx);
         }
+
+        // Checked before dropping the superseded reservation (if any) or
+        // mutating anything else, so a refusal here leaves the ledger exactly
+        // as it found it instead of stranding job_id with neither reservation.
+        if self.free_cpus() + (held_cpus.len() as u32) < cpus {
+            return Err(AllocError::CpusUnavailable);
+        }
+
+        // Nothing below can refuse now, so it's safe to drop what this call
+        // supersedes.
+        self.drop_owner(ReleaseWarrant::superseded_by_newer_attempt(
+            RunKey::any_attempt(job_id),
+        ));
 
         let mut cpu_ids = Vec::new();
         for (i, allocated) in self.allocated_cpus.iter_mut().enumerate() {
@@ -880,6 +892,56 @@ mod tests {
         assert_eq!(node.free_gpus(None), 1);
         // The failed job left no owner entry.
         assert!(!node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(2))));
+    }
+
+    #[test]
+    fn test_allocate_for_job_rejects_insufficient_cpus() {
+        let mut node = make_node(8, 64_000, 0, "");
+        node.allocate_for_job(1, 1, 6, 16_000, &[]).unwrap();
+        // Only 2 cores free; a request for 4 must be refused outright, not
+        // silently granted a short count.
+        assert_eq!(
+            node.allocate_for_job(2, 1, 4, 8_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(
+            node.free_cpus(),
+            2,
+            "the refused request left no partial claim"
+        );
+        assert_eq!(
+            node.free_memory_mb(),
+            48_000,
+            "memory must not be double-booked either"
+        );
+        assert!(!node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(2))));
+    }
+
+    #[test]
+    fn test_allocate_for_job_leaves_a_refused_supersede_attempt_intact() {
+        // job 7 already holds a valid committed reservation (2 cores). A
+        // same-attempt re-request for MORE cores than that, with no spare
+        // capacity elsewhere, must leave job 7's original 2 cores held, not
+        // discard them on the way to a refusal it never recovers from.
+        let mut node = make_node(8, 64_000, 0, "");
+        node.allocate_for_job(7, 1, 2, 8_000, &[]).unwrap();
+        assert!(node.commit_job(7, 1));
+        node.allocate_for_job(8, 1, 6, 24_000, &[]).unwrap();
+        assert_eq!(node.free_cpus(), 0);
+
+        assert_eq!(
+            node.allocate_for_job(7, 1, 4, 16_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(
+            node.free_cpus(),
+            0,
+            "job 7's original 2-core reservation must still be held, not dropped"
+        );
+        assert!(
+            node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(7))),
+            "job 7 must still have a reservation to release"
+        );
     }
 
     #[test]

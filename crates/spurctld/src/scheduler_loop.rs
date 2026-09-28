@@ -1917,6 +1917,9 @@ pub(crate) enum AllocationRegisterOutcome {
 enum RegisterError {
     Failed(anyhow::Error),
     TimedOut(Duration),
+    /// The node holds something the controller cannot account for — mirrors
+    /// `DispatchError::NeedsReconcile` for the launch_job path.
+    NeedsReconcile(String),
 }
 
 impl std::fmt::Display for RegisterError {
@@ -1925,6 +1928,9 @@ impl std::fmt::Display for RegisterError {
             Self::Failed(e) => write!(f, "{e}"),
             Self::TimedOut(limit) => {
                 write!(f, "allocation register RPC exceeded {}s", limit.as_secs())
+            }
+            Self::NeedsReconcile(reason) => {
+                write!(f, "node holds unaccounted resources: {reason}")
             }
         }
     }
@@ -1948,9 +1954,10 @@ struct AllocationRegisterParams {
 async fn register_allocation_to_agent(
     agent_addr: &str,
     params: &AllocationRegisterParams,
-) -> anyhow::Result<()> {
+) -> Result<(), RegisterError> {
     let mut client = crate::agent_client::connect(agent_addr.to_string())
-        .await?
+        .await
+        .map_err(|e| RegisterError::Failed(e.into()))?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
@@ -1975,7 +1982,13 @@ async fn register_allocation_to_agent(
             user: params.user.clone(),
             run_attempt: params.run_attempt,
         })
-        .await?;
+        .await
+        .map_err(|s| match s.code() {
+            // The agent's local ledger disagrees with this dispatch — the same
+            // condition launch_job resolves with a full node reconcile.
+            tonic::Code::Aborted => RegisterError::NeedsReconcile(s.message().to_string()),
+            _ => RegisterError::Failed(s.into()),
+        })?;
 
     info!(
         job_id = params.job_id,
@@ -2051,11 +2064,10 @@ async fn register_allocation_on_nodes(
             let register = register_allocation_to_agent(&agent_addr, &params);
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, register).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(RegisterError::Failed(e)),
+                    Ok(result) => result,
                     Err(_) => Err(RegisterError::TimedOut(limit)),
                 },
-                None => register.await.map_err(RegisterError::Failed),
+                None => register.await,
             };
             (result_node, result)
         });
@@ -2078,6 +2090,23 @@ async fn register_allocation_on_nodes(
                 match e {
                     RegisterError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
                     RegisterError::Failed(_) => cluster.cool_down_node(&node_name),
+                    // The node holds something Raft cannot explain: look before
+                    // sending it anything else, paced so repeat refusals don't storm.
+                    RegisterError::NeedsReconcile(_) => {
+                        cluster.cool_down_node(&node_name);
+                        if cluster.claim_ledger_pull_slot(&node_name) {
+                            let cluster = cluster.clone();
+                            let node = node_name.clone();
+                            tokio::spawn(async move {
+                                pull_node_ledger(
+                                    &cluster,
+                                    &node,
+                                    "allocation registration refused",
+                                )
+                                .await;
+                            });
+                        }
+                    }
                 }
                 failures += 1;
             }
@@ -4620,6 +4649,9 @@ mod tests {
                 if !self.register_delay.is_zero() {
                     tokio::time::sleep(self.register_delay).await;
                 }
+                if let Some(status) = &self.reject_with_status {
+                    return Err(status.clone());
+                }
                 Ok(tonic::Response::new(Default::default()))
             }
 
@@ -4989,6 +5021,41 @@ mod tests {
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
                 reject_with_status: None,
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                ledger_pull_delay: Duration::ZERO,
+                ledger_pull_in_flight: None,
+                ledger_pull_max_in_flight: None,
+                ledger_pulls_total: ledger_pulls_total.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, ledger_pulls_total)
+        }
+
+        /// Mock agent whose register_job_allocation always rejects with `status`,
+        /// counting the ledger pulls that refusal earns it.
+        async fn spawn_mock_agent_rejecting_register_with_status(
+            status: tonic::Status,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let ledger_pulls_total = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: Some(status),
                 fanout_calls: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
@@ -6803,6 +6870,64 @@ mod tests {
                     .is_some_and(|left| left <= Duration::from_secs(30)),
                 "an unreachable node must take the short reject cooldown — not be re-picked \
                  every tick, and not be held for the whole dispatch deadline"
+            );
+        }
+
+        // A srun/salloc registration hitting the same local ledger conflict
+        // launch_job's LOCAL_OVERLAP/RESIDUAL_STATE already reconcile for must
+        // earn the same look, not the inert "just retry" bucket a bare
+        // resource-exhausted status used to fall into.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn srun_allocation_register_conflict_earns_a_ledger_pull() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, pulls) = spawn_mock_agent_rejecting_register_with_status(
+                tonic::Status::aborted("controller-allocated GPUs unavailable on this node"),
+            )
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-alloc-conflict", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
+
+            assert!(!started);
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+            assert_eq!(
+                pulls_reaching(&pulls, 1).await,
+                1,
+                "a local ledger conflict on register is the whole reason the pull exists"
+            );
+        }
+
+        // A node that merely refuses (e.g. genuine resource exhaustion, no ledger
+        // disagreement) must not earn the reconcile pull an Aborted conflict does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn srun_allocation_register_generic_refusal_does_not_earn_a_ledger_pull() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _pulls) = spawn_mock_agent_rejecting_register_with_status(
+                tonic::Status::failed_precondition("job was superseded by a newer attempt"),
+            )
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-alloc-generic-fail", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
+
+            assert!(!started);
+            // The slot claim itself is synchronous (only the RPC is backgrounded), so
+            // finding it still free after `process_assignment` returns is conclusive.
+            assert!(
+                cm.claim_ledger_pull_slot("n1"),
+                "not every refusal is a ledger conflict"
             );
         }
 
