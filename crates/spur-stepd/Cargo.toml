@@ -15,8 +15,10 @@ path = "src/main.rs"
 # mesh-networking surface — that surface belongs to the node agent, not to
 # a process supervising a single already-admitted job.
 spurd = { path = "../spurd" }
+spur-core = { path = "../spur-core" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]
