@@ -7676,6 +7676,17 @@ impl SlurmAgent for AgentService {
             named => Some(named),
         };
 
+        // A supervised job's own teardown wait (below) can run for several
+        // seconds while its epilog is only just starting, so the cancel and
+        // the epilog hold it leaves owed have to land on the record now --
+        // before that wait, not after it -- or a restart during the wait
+        // finds nothing recorded to protect the hook still running under it.
+        if self.running.lock().await.contains_key(&job_id) {
+            if let Some(run) = pre_cancel_attempt.and_then(|attempt| named_run(job_id, attempt)) {
+                self.mark_controller_cancelled(run).await;
+            }
+        }
+
         if req.signal > 0 {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
                 .await;
@@ -7687,7 +7698,7 @@ impl SlurmAgent for AgentService {
         // reservation so a cancel-during-eviction doesn't strand it until the
         // TTL. Snapshot under the running lock (matching launch_job's commit
         // order) so this can't act on a job that just became running, then
-        // drop it before the settle/mark calls below, which take other locks.
+        // drop it before the settle call below, which takes other locks.
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         let nothing_tracked = !jobs.contains_key(&job_id);
@@ -7701,11 +7712,6 @@ impl SlurmAgent for AgentService {
                 // reservation, so the ground is the controller's own cancel.
                 self.settle_cancelled_run(run).await;
             }
-        } else if let Some(run) = tracked_attempt.and_then(|attempt| named_run(job_id, attempt)) {
-            // Still tracked: its own teardown will settle the run once it
-            // drops it, but the cancel has to land on the record now so a
-            // hook still running under it keeps the slice held.
-            self.mark_controller_cancelled(run).await;
         }
 
         // An allocation ends here rather than through the completion teardown,
@@ -20604,6 +20610,130 @@ mod tests {
             wait_job_reaped(&svc, job_id, 10_000).await,
             "monitor should reap job after SIGKILL escalation"
         );
+    }
+
+    // C6: a job whose SIGTERM is ignored keeps `cancel_job`'s own teardown
+    // wait running for its full CANCEL_REAP_TIMEOUT bound. The epilog hold
+    // that wait's caller owes has to land on the record before that wait
+    // even starts -- not after it gives up -- or a restart landing anywhere
+    // in that multi-second window finds nothing recorded to protect the
+    // hook its supervisor is about to run.
+    #[tokio::test]
+    async fn cancel_job_holds_epilog_before_its_teardown_wait_resolves() {
+        let reporter = test_reporter();
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let admissions = crate::admission::AdmissionStore::new(state_dir.path(), "test-node");
+        reporter.set_admissions(admissions.clone());
+
+        let job_id = 950;
+        let run_attempt = 1;
+        admissions
+            .admit_run(&crate::admission::RunAdmission::new(
+                job_id,
+                run_attempt,
+                "test-node",
+                crate::admission::AdmittedResources::default(),
+                0,
+            ))
+            .expect("admit a run that will owe its epilog on cancel");
+
+        let hooks = HooksConfig {
+            epilog: Some("/nonexistent/epilog.sh".into()),
+            ..Default::default()
+        };
+        let svc = AgentService::new(
+            reporter,
+            hooks,
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Ignores SIGTERM only once the trap is installed, so the child
+        // signals readiness first -- a signal sent during its own exec
+        // would otherwise hit the shell before the trap exists to catch it.
+        let ready = tempfile::NamedTempFile::new().expect("ready file");
+        let ready_path = ready.path().to_path_buf();
+        std::fs::remove_file(&ready_path).expect("clear ready file");
+        let child = tokio::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("trap '' TERM; touch {ready_path:?}; while true; do sleep 1; done"),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn SIGTERM-trapping process");
+        svc.insert_test_job(
+            job_id,
+            TrackedJob {
+                job: executor::RunningJob::Managed { child },
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                stdout_path: "/dev/null".into(),
+                stderr_path: "/dev/null".into(),
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                _pty_master: None,
+                work_dir: "/tmp".into(),
+                uid: 0,
+                gid: 0,
+                user: "testuser".into(),
+                partition: String::new(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+                nodelist: String::new(),
+                mpi: String::new(),
+                run_attempt,
+                cgroup_path: None,
+            },
+        )
+        .await;
+
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready_path.exists() && tokio::time::Instant::now() < ready_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            ready_path.exists(),
+            "child never installed its SIGTERM trap"
+        );
+
+        let run_key = named_run(job_id, run_attempt).expect("valid run key");
+        let cancel = tokio::spawn(async move {
+            svc.cancel_job(Request::new(AgentCancelJobRequest {
+                job_id,
+                run_attempt,
+                signal: 0,
+            }))
+            .await
+        });
+
+        // Well under CANCEL_REAP_TIMEOUT (3s): the hold must already be on
+        // disk long before that wait would give up on its own.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2_500);
+        let mut observed_pending = false;
+        while tokio::time::Instant::now() < deadline {
+            if admissions
+                .load_run(run_key)
+                .expect("run record must still exist")
+                .cleanup
+                .epilog
+                == crate::admission::HookState::Pending
+            {
+                observed_pending = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            observed_pending,
+            "cancel_job must hold the epilog before its teardown wait resolves"
+        );
+        cancel.abort();
     }
 
     #[tokio::test(start_paused = true)]
