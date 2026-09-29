@@ -12413,6 +12413,7 @@ mod tests {
                         reason: None,
                         labels: Default::default(),
                         remove_labels: Vec::new(),
+                        gpu_sharing: None,
                     });
                     r.extensions_mut().insert(viewer("mallory", false));
                     r.extensions_mut().insert(slot.clone());
