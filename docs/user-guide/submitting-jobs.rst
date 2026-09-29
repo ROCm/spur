@@ -177,10 +177,14 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Required node features, e.g. ``mi300x,nvlink``.
    * - ``--nodelist``
      - ``-w``
-     - Request a specific list of nodes.
+     - Request a specific list of nodes. A malformed hostlist, or one that
+       expands to more than 1,000,000 hosts, is rejected at submission rather
+       than accepted and left unschedulable.
    * - ``--exclude``
      - ``-x``
-     - Exclude specific nodes from the allocation.
+     - Exclude specific nodes from the allocation. Validated at submission the
+       same way as ``--nodelist``, so a malformed or over-cap pattern is
+       rejected instead of silently excluding nothing.
    * - ``--exclusive``
      -
      - Do not share allocated nodes with other jobs. Default off.
