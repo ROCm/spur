@@ -55,6 +55,30 @@ def _reserved_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -
     return sessions
 
 
+# The reserved-range floor above also matches the allocation's own
+# batch/extern placeholder, which exists well before a nested `srun --pty`.
+_STEP_INTERACTIVE = 0xFFFFFFFA
+
+
+def _interactive_step_session_for_job(cluster, job_id: int, node_index: int = 0) -> set[str]:
+    return {
+        name
+        for name in _reserved_step_sessions_for_job(cluster, job_id, node_index)
+        if name.rsplit(".", 1)[-1] == str(_STEP_INTERACTIVE)
+    }
+
+
+def _wait_for_interactive_step_session(cluster, job_id: int, timeout: int = 30) -> set[str]:
+    deadline = time.time() + timeout
+    sessions: set[str] = set()
+    while time.time() < deadline:
+        sessions = _interactive_step_session_for_job(cluster, job_id)
+        if sessions:
+            break
+        time.sleep(1)
+    return sessions
+
+
 def _assert_ticks_not_replayed(out: str, ticks: int = 20) -> None:
     """A shell relaunched from scratch after a restart repeats its early
     ticks; a reconnect racing the restart only drops a line or two of a
@@ -195,9 +219,11 @@ class TestSrunPtyStepSupervision:
         def run():
             result["code"], result["out"] = cluster.salloc_run(
                 "srun --pty bash -c '"
-                "for i in $(seq 1 20); do echo tick $i; sleep 1; done; "
+                "for i in $(seq 1 180); do echo tick $i; sleep 1; done; "
                 "echo SURVIVED'\n",
-                salloc_args=["-N", "1", "-w", node, "-t", "0:05", "-J", job_name],
+                # `-t` rounds up to whole minutes (Slurm's MM:SS form, div_ceil) —
+                # 6:00 covers the workload plus worst-case restart/poll overhead.
+                salloc_args=["-N", "1", "-w", node, "-t", "6:00", "-J", job_name],
             )
 
         thread = threading.Thread(target=run)
@@ -213,33 +239,29 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the allocation to appear before the restart"
 
-            before: set[str] = set()
-            while time.time() < deadline:
-                # A bare (non-container) --pty step has no numbered-step
-                # supervisor of its own — only the shared terminal placeholder.
-                before = _reserved_step_sessions_for_job(cluster, job_id)
-                if before:
-                    break
-                time.sleep(1)
-            assert before, "expected a session for the pty step before the restart"
+            before = _wait_for_interactive_step_session(cluster, job_id)
+            assert before, (
+                f"expected a session for the pty step (step id {_STEP_INTERACTIVE:#x}) "
+                "before the restart"
+            )
 
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)
 
             # Identity, not count: a supervisor killed with the agent and
             # respawned afterwards would satisfy any "still one running" check.
-            after = _reserved_step_sessions_for_job(cluster, job_id)
+            after = _interactive_step_session_for_job(cluster, job_id)
             assert before <= after, (
                 "the pty step's supervisor must outlive the agent that spawned it: "
                 f"{sorted(before)} before the restart, {sorted(after)} after"
             )
         finally:
-            thread.join(timeout=60)
+            thread.join(timeout=200)
 
         assert result.get("code") == 0, result.get("out")
         out = str(result.get("out"))
         assert "SURVIVED" in out, out
-        _assert_ticks_not_replayed(out)
+        _assert_ticks_not_replayed(out, ticks=180)
 
     def test_interactive_session_ending_does_not_end_the_allocation(self, cluster):
         # salloc's own $SHELL runs on the client and keeps going regardless,
@@ -293,9 +315,11 @@ class TestSrunPtyStepSupervision:
 
         def run():
             result["code"], result["out"] = cluster.srun_with_exit([
-                "-N", "1", "-w", node, "-t", "0:05", "-J", job_name, "--pty",
+                # "0:05" rounds up to a 60s limit (MM:SS, div_ceil to whole
+                # minutes) — 6:00 covers the workload plus restart overhead.
+                "-N", "1", "-w", node, "-t", "6:00", "-J", job_name, "--pty",
                 "bash", "-c",
-                "for i in $(seq 1 20); do echo tick $i; sleep 1; done; echo SURVIVED",
+                "for i in $(seq 1 180); do echo tick $i; sleep 1; done; echo SURVIVED",
             ])
 
         thread = threading.Thread(target=run)
@@ -311,29 +335,27 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the standalone job to appear before the restart"
 
-            before: set[str] = set()
-            while time.time() < deadline:
-                before = _reserved_step_sessions_for_job(cluster, job_id)
-                if before:
-                    break
-                time.sleep(1)
-            assert before, "expected the job's own supervisor before the restart"
+            before = _wait_for_interactive_step_session(cluster, job_id)
+            assert before, (
+                f"expected the job's own supervisor (step id {_STEP_INTERACTIVE:#x}) "
+                "before the restart"
+            )
 
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)
 
-            after = _reserved_step_sessions_for_job(cluster, job_id)
+            after = _interactive_step_session_for_job(cluster, job_id)
             assert before <= after, (
                 "a standalone --pty job's own supervisor must outlive the agent "
                 f"that spawned it: {sorted(before)} before, {sorted(after)} after"
             )
         finally:
-            thread.join(timeout=60)
+            thread.join(timeout=200)
 
         assert result.get("code") == 0, result.get("out")
         out = str(result.get("out"))
         assert "SURVIVED" in out, out
-        _assert_ticks_not_replayed(out)
+        _assert_ticks_not_replayed(out, ticks=180)
 
     def test_srun_pty_reconnects_after_the_agent_restarts(self, cluster):
         # A dropped mid-session stream (the agent restarting) must be
@@ -345,9 +367,11 @@ class TestSrunPtyStepSupervision:
         def run():
             result["code"], result["out"] = cluster.salloc_run(
                 "srun --pty bash -c '"
-                "for i in $(seq 1 20); do echo tick $i; sleep 1; done; "
+                "for i in $(seq 1 180); do echo tick $i; sleep 1; done; "
                 "echo SURVIVED'\n",
-                salloc_args=["-N", "1", "-w", node, "-t", "0:05", "-J", job_name],
+                # "0:05" rounds up to a 60s limit (MM:SS, div_ceil to whole
+                # minutes) — 6:00 covers the workload plus restart overhead.
+                salloc_args=["-N", "1", "-w", node, "-t", "6:00", "-J", job_name],
             )
 
         thread = threading.Thread(target=run)
@@ -363,21 +387,19 @@ class TestSrunPtyStepSupervision:
                 time.sleep(1)
             assert job_id, "expected the allocation to appear before the restart"
 
-            before: set[str] = set()
-            while time.time() < deadline:
-                before = _reserved_step_sessions_for_job(cluster, job_id)
-                if before:
-                    break
-                time.sleep(1)
-            assert before, "expected a session for the pty step before the restart"
+            before = _wait_for_interactive_step_session(cluster, job_id)
+            assert before, (
+                f"expected a session for the pty step (step id {_STEP_INTERACTIVE:#x}) "
+                "before the restart"
+            )
 
             cluster.restart_agent(0)
             cluster.wait_agent_serving(0)
         finally:
-            thread.join(timeout=60)
+            thread.join(timeout=200)
 
         assert result.get("code") == 0, result.get("out")
         out = str(result.get("out"))
         assert "reconnecting" in out, f"the client must report the dropped stream:\n{out}"
         assert "SURVIVED" in out, out
-        _assert_ticks_not_replayed(out)
+        _assert_ticks_not_replayed(out, ticks=180)
