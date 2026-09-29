@@ -235,12 +235,45 @@ Install the DRA driver
 Spur does not install the DRA driver. Use one of the two procedures that
 follow. In each procedure, the driver must run only on shared nodes.
 
+Also install the DeviceClass ``gpu.amd.com`` with the extended resource
+mapping (see `The DeviceClass`_). Then a pod that requests ``amd.com/gpu``
+gets a GPU on a shared node, with no change to the pod.
+
+The DeviceClass
+~~~~~~~~~~~~~~~
+
+.. code-block:: yaml
+
+   apiVersion: resource.k8s.io/v1
+   kind: DeviceClass
+   metadata:
+     name: gpu.amd.com
+   spec:
+     extendedResourceName: amd.com/gpu
+     selectors:
+       - cel:
+           expression: "device.driver == 'gpu.amd.com'"
+
+The chart of the driver v1.0.1 and the gpu-operator chart 1.5.1 make the same
+class without ``extendedResourceName``. Give the class one owner: set
+``deviceClass.create=false`` in the driver chart, or
+``draDriver.deviceClass.create=false`` in the gpu-operator chart, and apply
+the class above from your own chart or GitOps repository. A manual patch of a
+class that a chart owns can go away at the next sync of the chart.
+
+The mapping needs the Kubernetes feature gate ``DRAExtendedResource`` in the
+API server, the scheduler, the controller manager and the kubelet. It is beta
+and on by default in Kubernetes 1.36. In 1.34 and 1.35 it is alpha and off by
+default. The k0s v1.36.2 of Spur has the gate on. To check a component, read
+its metric ``kubernetes_feature_enabled{name="DRAExtendedResource"}``.
+
 With the Helm chart of the driver
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The chart is a release asset of
 `ROCm/k8s-gpu-dra-driver <https://github.com/ROCm/k8s-gpu-dra-driver>`_,
-release ``v1.0.1``. The chart makes the DeviceClass ``gpu.amd.com``.
+release ``v1.0.1``. Set ``deviceClass.create=false``, because the class of
+the chart has no extended resource mapping (see `The DeviceClass`_).
 
 .. code-block:: bash
 
@@ -248,6 +281,7 @@ release ``v1.0.1``. The chart makes the DeviceClass ``gpu.amd.com``.
        https://github.com/ROCm/k8s-gpu-dra-driver/releases/download/v1.0.1/k8s-gpu-dra-driver-v1.0.1.tgz \
        --namespace kube-amd-gpu --create-namespace \
        --set image.tag=v1.0.1 \
+       --set deviceClass.create=false \
        --set-string 'kubeletPlugin.nodeSelector.spur\.amd\.com/gpu-sharing=true'
 
 Set ``image.tag`` to pin the image. The release chart uses its ``appVersion`` when the tag is empty.
@@ -497,11 +531,24 @@ Other lines:
 Run a pod on a shared node
 --------------------------
 
-The AMD DRA driver v1.0.1 does not map the ``amd.com/gpu`` extended resource.
-Thus a pod that requests ``amd.com/gpu`` cannot go to a shared node. It goes to
-an ordinary GPU node. On a shared node, a pod must request a ``ResourceClaim``.
-This rule applies until a release of the DRA driver supports
-``extendedResourceName``.
+With `The DeviceClass`_, a pod can request ``amd.com/gpu`` as on an ordinary
+GPU node:
+
+.. code-block:: yaml
+
+   resources:
+     limits:
+       amd.com/gpu: 1
+
+kube-scheduler makes a ``ResourceClaim`` for the pod, in the namespace of the
+pod, and allocates a ``gpu.amd.com`` device to it. The name of the claim is
+``<pod>-extended-resources-<suffix>``, and is shorter when the pod name is
+long. The pod field ``status.extendedResourceClaimStatus.resourceClaimName``
+gives the name. ``spurd`` sees this claim as any other claim, and
+``scontrol show node`` shows ``held <ns>/<pod> (claim <name>)``. AIM and
+KServe pods use this path with no change.
+
+A pod can also request a ``ResourceClaim`` directly:
 
 .. code-block:: yaml
 
@@ -598,6 +645,17 @@ Failure cases
        ``must be a string compatible with semver.org``. The node stays
        unshareable. Remove the other card from DRM, for example with
        ``modprobe -r virtio_gpu``.
+   * - A node had the AMD device plugin before it became shared.
+     - The kubelet keeps ``amd.com/gpu`` in the node status, first with
+       allocatable ``0``, and after approximately 5 minutes with capacity
+       ``0``. kube-scheduler ignores it, because the DeviceClass maps
+       ``amd.com/gpu``. aim-engine v0.2.6 does not: it finds no supported
+       AIM profile for the node, and makes no InferenceService. After the
+       5 minutes, remove the two fields with
+       ``kubectl patch node <node> --subresource=status --type=json``
+       and the operations ``remove`` on ``/status/capacity/amd.com~1gpu``
+       and ``/status/allocatable/amd.com~1gpu``. The kubelet does not add
+       them again.
    * - A foreign file or directory is at a kubelet link path.
      - ``spurd`` does not change it. The node is unshareable, and the reason
        names the path.
