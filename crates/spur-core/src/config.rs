@@ -985,12 +985,15 @@ impl Default for NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
-    // Defaulted because `audit_rpcs` gave this section its first reason to exist
-    // in a config file, and requiring the two inert fields alongside it is noise.
+    // Defaulted so `audit_rpcs = true` alone parses. An omitted `format` stays
+    // empty and is resolved at startup: text on a TTY, JSON otherwise.
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// Output format: `"json"`, `"text"`, or empty/unset. Unset resolves at
+    /// startup to text on a TTY and JSON otherwise.
     #[serde(default = "default_log_format")]
     pub format: String,
+    #[serde(default)]
     pub file: Option<String>,
     /// Every authenticated controller RPC, reads included, on the `audit_rpc`
     /// target. Slurm's `DebugFlags=AuditRPCs`; off by default as the largest log.
@@ -1003,7 +1006,7 @@ fn default_log_level() -> String {
 }
 
 fn default_log_format() -> String {
-    "text".into()
+    String::new()
 }
 
 #[cfg(test)]
@@ -1012,12 +1015,12 @@ mod logging_config_tests {
 
     #[test]
     fn audit_rpcs_alone_parses() {
-        // Enabling the audit log must not force an operator to also restate the
-        // two fields no daemon reads.
+        // Enabling the audit log must not force an operator to also set level
+        // and format. An omitted format stays unset for the TTY rule.
         let cfg: LoggingConfig = toml::from_str("audit_rpcs = true").expect("must parse");
         assert!(cfg.audit_rpcs);
         assert_eq!(cfg.level, "info");
-        assert_eq!(cfg.format, "text");
+        assert_eq!(cfg.format, "");
     }
 
     #[test]
