@@ -491,18 +491,21 @@ class TestSrunStepDeviceVisibility:
 
     def test_srun_step_gpu_bind_overrides_allocation_wide_visibility(self, gpu_cluster):
         # The host device plan's env carries the allocation-wide visibility list;
-        # it must not clobber a narrower --gpu-bind selection applied earlier.
+        # it must not clobber a narrower --gpu-bind selection applied earlier. Binds
+        # to an index outside the allocation on purpose: a single-GPU node's own
+        # index would coincide with the (buggy) allocation-wide value too, masking
+        # the clobber this guards against.
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
         _require_rootful(cluster)
 
-        job_id = _hold_job(cluster, "srun-dev-bind", ["--gres=gpu:2"])
+        job_id = _hold_job(cluster, "srun-dev-bind", ["--gres=gpu:1"])
         probe = cluster.write_file(
             "srun-dev-bind-probe.sh", _probe_script('echo "ROCR=$ROCR_VISIBLE_DEVICES"\n')
         )
         try:
             code, out = cluster.srun_in_allocation(
-                job_id, ["--gpu-bind=map_gpu:1", "-n1", probe]
+                job_id, ["--gpu-bind=map_gpu:7", "-n1", probe]
             )
         finally:
             cluster.scancel(str(job_id))
@@ -511,9 +514,9 @@ class TestSrunStepDeviceVisibility:
             f"the step did not run to completion (exit {code})\n"
             f"{cluster.debug_job(job_id)}\noutput:\n{out}"
         )
-        assert "ROCR=1" in out, (
-            f"--gpu-bind=map_gpu:1 must narrow ROCR_VISIBLE_DEVICES to '1', not "
-            f"the allocation's full device list\noutput:\n{out}"
+        assert "ROCR=7" in out, (
+            f"--gpu-bind=map_gpu:7 must set ROCR_VISIBLE_DEVICES to '7', not "
+            f"the allocation's own device visibility\noutput:\n{out}"
         )
 
     def test_srun_step_multi_task_per_node_sees_its_gpu(self, gpu_cluster):
