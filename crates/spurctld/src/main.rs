@@ -213,19 +213,7 @@ async fn main() -> anyhow::Result<()> {
     if config.cluster.enabled {
         let k8s_cluster = cluster.clone();
         let k8s_raft = raft_handle.clone();
-        let k8s_net = cluster_k8s::ClusterNetworking {
-            wg_enabled: config.network.wg_enabled,
-            mesh_cidr: config.network.wg_cidr.clone(),
-            mesh_interface: config.network.wg_interface.clone(),
-            pod_cidr: config.cluster.pod_cidr.clone(),
-            service_cidr: config.cluster.service_cidr.clone(),
-            cni_mtu: config.cluster.cni_mtu,
-            cni: config.cluster.cni.clone(),
-            control_plane_node: config.cluster.control_plane_node.clone(),
-            provisioning_timeout: std::time::Duration::from_secs(
-                config.cluster.k8s_provisioning_timeout_secs,
-            ),
-        };
+        let k8s_net = cluster_k8s::ClusterNetworking::from_config(&config);
         tokio::spawn(async move {
             cluster_k8s::run(k8s_cluster, k8s_raft, k8s_net).await;
         });
