@@ -396,6 +396,61 @@ class TestQosLimitReasons:
             f"blocked job {blocked[0]} reason: {_reason(c, blocked[0])!r}"
         )
 
+    def test_a_job_the_partition_can_never_run_reserves_no_grp_node_quota(
+        self, accounting_cluster
+    ):
+        """A job blocked on PartitionTimeLimit must not hold grp node headroom.
+
+        Reported from a production pool sitting at 29 nodes running against a cap
+        of 32 while fresh jobs were refused with QOSGrpNodeLimit: a job whose
+        --time exceeds the partition MaxTime never starts, but was reserving its
+        nodes every scheduling pass.
+        """
+        c = accounting_cluster
+        if len(c.node_names) < 3:
+            pytest.skip("requires 3 nodes: 1 occupied, 1 phantom, 1 that must stay usable")
+
+        c.sacctmgr(["add", "qos", "name=phantomcap", "grptres=node=2"])
+        time.sleep(15)
+
+        hold = c.write_file("phantom-hold.sh", "#!/bin/bash\nsleep 90\n")
+        occupied = parse_job_id(
+            c.sbatch(["-J", "ph-hold", "-N", "1", "--exclusive", "-t", "5",
+                      "-q", "phantomcap", hold])
+        )
+        assert occupied is not None
+        wait_job_state(c, occupied, "R", timeout=60)
+
+        # Over the partition MaxTime of 24h, so it can never be placed.
+        never = parse_job_id(
+            c.sbatch(["-J", "ph-never", "-N", "1", "--exclusive", "-t", "1500",
+                      "-q", "phantomcap", hold])
+        )
+        assert never is not None
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if _reason(c, never) == "PartitionTimeLimit":
+                break
+            time.sleep(2)
+        assert _reason(c, never) == "PartitionTimeLimit", (
+            f"fixture needs a partition-blocked job, got {_reason(c, never)!r}"
+        )
+
+        # One node running against a cap of two, so this must start. It cannot if
+        # the blocked job is still reserving the second slot.
+        legit = parse_job_id(
+            c.sbatch(["-J", "ph-legit", "-N", "1", "--exclusive", "-t", "5",
+                      "-q", "phantomcap", hold])
+        )
+        assert legit is not None
+        try:
+            wait_job_state(c, legit, "R", timeout=90)
+        except (AssertionError, TimeoutError) as exc:
+            raise AssertionError(
+                f"a job the partition can never run reserved grp node quota: "
+                f"{_reason(c, legit)!r}\n{c.squeue(['-t', 'all', '-o', '%i %j %t %r'])}"
+            ) from exc
+
     def test_grp_node_cap_admits_job_packable_onto_already_used_nodes(self, accounting_cluster):
         # A QOS grp node=2 cap is fully occupied by two 1-cpu jobs pinned to
         # two of the three available nodes, each with plenty of spare CPU. A
