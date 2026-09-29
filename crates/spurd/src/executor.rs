@@ -2178,8 +2178,20 @@ fn spool_dir_error(
                 .position(|(dir, _)| is_node_owned_spool(dir, root))
         })
         .unwrap_or(0);
+    // Every candidate is named, because the one that decides the classification is
+    // often not the one that blocked: a stray file at the temp fallback reads as a
+    // permission failure on the node-owned root, which sends the reader to the wrong
+    // path entirely.
+    let attempts = failures
+        .iter()
+        .map(|(dir, err)| format!("{}: {err}", dir.display()))
+        .collect::<Vec<_>>()
+        .join("; ");
     let (dir, err) = failures.swap_remove(chosen);
-    let err = anyhow::Error::new(err).context(format!("create job spool dir {}", dir.display()));
+    let err = anyhow::Error::new(err).context(format!(
+        "create job spool dir, tried {} candidates: {attempts}",
+        failures.len() + 1
+    ));
     classify_spool_error(&dir, owned_root.unwrap_or(&dir), err)
 }
 
@@ -3147,6 +3159,36 @@ mod tests {
         assert!(
             !is_node_fault_io_error(&flattened),
             "an errno in the message text must not be mistaken for a real source"
+        );
+    }
+
+    #[test]
+    fn every_failed_spool_candidate_is_named() {
+        // The candidate that decides the classification is often not the one that
+        // blocked. A stray file at the temp fallback reads as ENOTDIR there while the
+        // owned root reports EACCES, and naming only the owned root sends the reader
+        // to a path that is merely unwritable-by-design on a rootless agent.
+        let err = spool_dir_error(
+            vec![
+                (
+                    owned_spool(),
+                    std::io::Error::from_raw_os_error(libc::EACCES),
+                ),
+                (
+                    fallback_spool(),
+                    std::io::Error::from_raw_os_error(libc::ENOTDIR),
+                ),
+            ],
+            Some(Path::new(SPOOL_ROOT)),
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&owned_spool().display().to_string()),
+            "the owned root must still be named, got: {text}"
+        );
+        assert!(
+            text.contains(&fallback_spool().display().to_string()),
+            "the fallback that actually blocked must be named too, got: {text}"
         );
     }
 
