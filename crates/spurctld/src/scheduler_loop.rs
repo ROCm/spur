@@ -577,12 +577,7 @@ async fn process_assignment(
             borrowed,
         )
     } else if borrowed {
-        cluster.start_borrowed_job(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-        )
+        cluster.start_borrowed_job(job_id, assignment.nodes.clone(), resources, per_node_alloc)
     } else {
         cluster.start_job(job_id, assignment.nodes.clone(), resources, per_node_alloc)
     };
@@ -3724,12 +3719,15 @@ mod tests {
             nodes: &'a [Node],
             busy: &'a HashMap<String, DateTime<Utc>>,
         ) -> ClusterState<'a> {
+            static NO_HOLDS: std::sync::LazyLock<HashMap<String, Vec<u64>>> =
+                std::sync::LazyLock::new(HashMap::new);
             ClusterState {
                 nodes,
                 partitions: &[],
                 reservations: &[],
                 topology: None,
                 busy_until: busy,
+                held_gpus: &NO_HOLDS,
             }
         }
 
@@ -6048,8 +6046,12 @@ mod tests {
             register_gpu_node_at(&cm, "n1", addr, &[CPX_A, CPX_A + 1, CPX_A + 2, CPX_A + 3]);
             let job_id = submit_and_wait(&cm, batch_spec("cpx", 1));
 
-            let started =
-                process_assignment(cm.clone(), gpu_assignment(job_id, &[CPX_A, CPX_A + 1])).await;
+            let started = process_assignment(
+                cm.clone(),
+                gpu_assignment(job_id, &[CPX_A, CPX_A + 1]),
+                false,
+            )
+            .await;
 
             assert!(started);
             let job = cm.get_job(job_id).unwrap();
@@ -6073,8 +6075,12 @@ mod tests {
             register_gpu_node_at(&cm, "n1", addr, &[CPX_A, CPX_A + 1, CPX_B]);
             let job_id = submit_and_wait(&cm, batch_spec("cpx-wrong-parent", 1));
 
-            let started =
-                process_assignment(cm.clone(), gpu_assignment(job_id, &[CPX_A, CPX_A + 1])).await;
+            let started = process_assignment(
+                cm.clone(),
+                gpu_assignment(job_id, &[CPX_A, CPX_A + 1]),
+                false,
+            )
+            .await;
 
             assert!(!started);
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);

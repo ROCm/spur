@@ -148,6 +148,7 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         // --- Daemon-to-daemon ---
         "RegisterAgent"
         | "Heartbeat"
+        | "GetGpuSharingKubeconfig"
         | "ReportStepdRecovery"
         | "ReportJobStatus"
         | "RecordJobStart"

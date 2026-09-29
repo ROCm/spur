@@ -2576,7 +2576,7 @@ impl SlurmController for ControllerService {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
                 Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
+                    let fwd = Self::forward_request(request)?;
                     return client.get_gpu_sharing_kubeconfig(fwd).await;
                 }
                 Err(e) => {
@@ -12066,6 +12066,7 @@ mod tests {
                         reason: None,
                         labels: Default::default(),
                         remove_labels: Vec::new(),
+                        gpu_sharing: None,
                     });
                     r.extensions_mut().insert(viewer("mallory", false));
                     r.extensions_mut().insert(slot.clone());
