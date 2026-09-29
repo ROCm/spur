@@ -28,6 +28,17 @@ DRA_CHART = ("https://github.com/ROCm/k8s-gpu-dra-driver/releases/download/"
              "v1.0.1/k8s-gpu-dra-driver-v1.0.1.tgz")
 KUBECONFIG = "/tmp/spur-e2e-admin.conf"
 POD = "gs-e2e-pod"
+EXT_POD = "gs-e2e-ext-pod"
+# The chart class has no extendedResourceName, so the test owns the class.
+DEVICE_CLASS = {
+    "apiVersion": "resource.k8s.io/v1",
+    "kind": "DeviceClass",
+    "metadata": {"name": "gpu.amd.com"},
+    "spec": {
+        "extendedResourceName": "amd.com/gpu",
+        "selectors": [{"cel": {"expression": "device.driver == 'gpu.amd.com'"}}],
+    },
+}
 
 
 @pytest.fixture(scope="module")
@@ -56,9 +67,11 @@ def gpu_sharing_node(ssh_nodes, remote_bin_dir):
         out = node.exec(
             f"{c._sudo_prefix()}helm install amd-gpu-dra {DRA_CHART} --kubeconfig {KUBECONFIG} "
             "--namespace kube-amd-gpu --create-namespace --set image.tag=v1.0.1 "
+            "--set deviceClass.create=false "
             "--set-string 'kubeletPlugin.nodeSelector.spur\\.amd\\.com/gpu-sharing=true' 2>&1"
         )
         assert "STATUS: deployed" in out, out
+        _apply(c, [DEVICE_CLASS])
         _wait("ResourceSlice", lambda: _slice_devices(c), timeout=300)
         _wait("hold report", lambda: "GpuUnshareable" not in _show(c)
               and "State=free" in _show(c), timeout=180)
@@ -71,7 +84,8 @@ def gpu_sharing_node(ssh_nodes, remote_bin_dir):
 
 def _teardown(c: SpurCluster) -> None:
     sudo = c._sudo_prefix()
-    _kubectl(c, f"delete pod {POD} --wait=false")
+    _kubectl(c, f"delete pod {POD} {EXT_POD} --wait=false")
+    _kubectl(c, "delete deviceclass gpu.amd.com --wait=false")
     _kubectl(c, f"delete resourceclaim {POD} --wait=false")
     c.nodes[0].exec_allow_fail(
         f"{sudo}helm uninstall amd-gpu-dra -n kube-amd-gpu --kubeconfig {KUBECONFIG}")
@@ -213,3 +227,29 @@ class TestGpuSharingOnHardware:
         _wait("placeholder deleted", lambda: f"spur-job-{one}-" not in _kubectl(
             c, "-n spur-system get pods,resourceclaims -o name"), timeout=120)
         c.scancel(str(full))
+
+    def test_extended_resource_pod_is_held(self, gpu_sharing_node):
+        """A pod that asks for amd.com/gpu gets a GPU through the DeviceClass mapping."""
+        c = gpu_sharing_node
+        pod = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": EXT_POD, "namespace": "default"},
+            "spec": {
+                "nodeSelector": {"kubernetes.io/hostname": c.node_names[0].lower()},
+                "containers": [{
+                    "name": "pause",
+                    "image": "quay.io/k0sproject/pause:3.10.2-0",
+                    "resources": {"limits": {"amd.com/gpu": "1"}},
+                }],
+            },
+        }
+        _apply(c, [pod])
+        claim = _wait("generated claim", lambda: _kubectl(
+            c, f"-n default get pod {EXT_POD} -o "
+            "jsonpath='{.status.extendedResourceClaimStatus.resourceClaimName}'").strip(),
+            timeout=120)
+        gpu = _wait("claim allocated", lambda: _allocated(c, "default", claim), timeout=120)[0]
+        _wait("hold seen", lambda: _gpu_lines(c).get(gpu) == f"held default/{EXT_POD} (claim {claim})")
+        _kubectl(c, f"delete pod {EXT_POD}")
+        _wait("hold released", lambda: _gpu_lines(c).get(gpu) == "free", timeout=120)
