@@ -1141,6 +1141,22 @@ pub struct ClusterConfig {
     /// unaffected.
     #[serde(default)]
     pub allow_admin_kubeconfig: bool,
+    /// Kubelet `serializeImagePulls` on every k0s node. Unset = kubelet default (serial pulls).
+    /// Read by spurctld when it renders the k0s config; a running cluster needs `spur k8s down`/`up`.
+    #[serde(default)]
+    pub serialize_image_pulls: Option<bool>,
+    /// Kubelet `maxParallelImagePulls`. Needs `serialize_image_pulls = false`; unset = no limit.
+    #[serde(default)]
+    pub max_parallel_image_pulls: Option<u32>,
+}
+
+impl ClusterConfig {
+    pub fn kubelet_pulls(&self) -> crate::k0s::KubeletPullConfig {
+        crate::k0s::KubeletPullConfig {
+            serialize_image_pulls: self.serialize_image_pulls,
+            max_parallel_image_pulls: self.max_parallel_image_pulls,
+        }
+    }
 }
 
 fn default_cluster_distro() -> String {
@@ -1194,6 +1210,8 @@ impl Default for ClusterConfig {
             local_path_dir: default_local_path_dir(),
             k8s_provisioning_timeout_secs: default_k8s_provisioning_timeout_secs(),
             allow_admin_kubeconfig: false,
+            serialize_image_pulls: None,
+            max_parallel_image_pulls: None,
         }
     }
 }
@@ -2186,6 +2204,22 @@ impl SlurmConfig {
                     });
                 }
             }
+            if let Some(max) = self.cluster.max_parallel_image_pulls {
+                if max == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cluster.max_parallel_image_pulls".into(),
+                        value: "0 (must be >= 1)".into(),
+                    });
+                }
+                // The kubelet ignores the limit while pulls are serialized; reject it rather than
+                // let the operator believe a limit is in force.
+                if self.cluster.serialize_image_pulls != Some(false) {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cluster.max_parallel_image_pulls".into(),
+                        value: format!("{max} (requires cluster.serialize_image_pulls = false)"),
+                    });
+                }
+            }
         }
 
         // Reject malformed partition time strings at load rather than silently
@@ -3065,6 +3099,32 @@ cni_mtu = 1400
             "cluster_name=\"t\"\n[cluster]\nenabled=false\npod_cidr=\"whatever\"\n"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn image_pull_fields_default_to_unset() {
+        let cfg =
+            SlurmConfig::load_from_str("cluster_name=\"t\"\n[cluster]\nenabled=true\n").unwrap();
+        assert_eq!(cfg.cluster.serialize_image_pulls, None);
+        assert_eq!(cfg.cluster.max_parallel_image_pulls, None);
+        assert!(!cfg.cluster.kubelet_pulls().is_set());
+    }
+
+    #[test]
+    fn image_pull_limit_validation() {
+        let load = |fields: &str| {
+            SlurmConfig::load_from_str(&format!(
+                "cluster_name=\"t\"\n[cluster]\nenabled=true\n{fields}"
+            ))
+        };
+        let cfg = load("serialize_image_pulls=false\nmax_parallel_image_pulls=4\n").unwrap();
+        assert_eq!(cfg.cluster.serialize_image_pulls, Some(false));
+        assert_eq!(cfg.cluster.max_parallel_image_pulls, Some(4));
+        assert!(load("serialize_image_pulls=false\n").is_ok());
+        assert!(load("serialize_image_pulls=true\n").is_ok());
+        assert!(load("serialize_image_pulls=false\nmax_parallel_image_pulls=0\n").is_err());
+        assert!(load("max_parallel_image_pulls=2\n").is_err());
+        assert!(load("serialize_image_pulls=true\nmax_parallel_image_pulls=1\n").is_err());
     }
 
     #[test]

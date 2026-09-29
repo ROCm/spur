@@ -59,6 +59,20 @@ mod local_path_tests {
     }
 }
 
+/// Kubelet image-pull settings (`[cluster]` `serialize_image_pulls` / `max_parallel_image_pulls`),
+/// rendered into the k0s `default` worker profile. All-`None` leaves the kubelet default untouched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KubeletPullConfig {
+    pub serialize_image_pulls: Option<bool>,
+    pub max_parallel_image_pulls: Option<u32>,
+}
+
+impl KubeletPullConfig {
+    pub fn is_set(&self) -> bool {
+        self.serialize_image_pulls.is_some() || self.max_parallel_image_pulls.is_some()
+    }
+}
+
 /// Generates the k0s controller config: `pod_cidr`/`service_cidr` apply to either `cni`; the
 /// `api`/`sans`/Calico/load-balancing blocks are calico-only, and `sans` further needs `api_address`.
 /// `mesh_native` picks Calico's mode — `bird` (native routing over the WireGuard mesh, `api_address`
@@ -69,6 +83,9 @@ mod local_path_tests {
 /// between nodes of the same subnet, and a cloud VNIC (OCI, AWS, ...) drops packets whose source is a
 /// pod address unless source/destination checking is disabled on the interface. Full overlay puts every
 /// pod packet in the IPIP tunnel with the node address outside, which works on any underlay.
+///
+/// `kubelet_pulls` goes into the `default` worker profile: Spur starts every worker without
+/// `--profile`, and `--single` controllers apply it to their own kubelet too.
 #[allow(clippy::too_many_arguments)]
 pub fn k0s_controller_config_yaml(
     cni: &str,
@@ -79,6 +96,7 @@ pub fn k0s_controller_config_yaml(
     sans: &[String],
     cp_count: usize,
     mesh_native: bool,
+    kubelet_pulls: KubeletPullConfig,
 ) -> String {
     let calico = cni == "calico";
     let mut y = String::new();
@@ -117,6 +135,17 @@ pub fn k0s_controller_config_yaml(
         y.push_str("    kuberouter:\n");
         y.push_str("      extraArgs:\n");
         y.push_str("        overlay-type: full\n");
+    }
+    if kubelet_pulls.is_set() {
+        y.push_str("  workerProfiles:\n");
+        y.push_str("    - name: default\n");
+        y.push_str("      values:\n");
+        if let Some(serialize) = kubelet_pulls.serialize_image_pulls {
+            y.push_str(&format!("        serializeImagePulls: {serialize}\n"));
+        }
+        if let Some(max) = kubelet_pulls.max_parallel_image_pulls {
+            y.push_str(&format!("        maxParallelImagePulls: {max}\n"));
+        }
     }
     y
 }
@@ -187,7 +216,73 @@ mod cluster_state_tests {
 
 #[cfg(test)]
 mod k0s_config_tests {
-    use super::k0s_controller_config_yaml;
+    use super::{k0s_controller_config_yaml, KubeletPullConfig};
+
+    fn render(pulls: KubeletPullConfig) -> serde_yaml::Value {
+        let y = k0s_controller_config_yaml(
+            "kuberouter",
+            "192.0.2.0/24",
+            "198.51.100.0/24",
+            None,
+            None,
+            &[],
+            1,
+            false,
+            pulls,
+        );
+        serde_yaml::from_str(&y).expect("generated k0s config must be valid YAML")
+    }
+
+    fn default_profile_values(v: &serde_yaml::Value) -> &serde_yaml::Value {
+        let profile = &v["spec"]["workerProfiles"][0];
+        assert_eq!(profile["name"].as_str(), Some("default"));
+        &profile["values"]
+    }
+
+    #[test]
+    fn no_pull_settings_omit_worker_profiles() {
+        let v = render(KubeletPullConfig::default());
+        assert!(v["spec"].get("workerProfiles").is_none());
+    }
+
+    #[test]
+    fn serialize_false_only_writes_no_limit() {
+        let v = render(KubeletPullConfig {
+            serialize_image_pulls: Some(false),
+            max_parallel_image_pulls: None,
+        });
+        let values = default_profile_values(&v);
+        assert_eq!(values["serializeImagePulls"].as_bool(), Some(false));
+        assert!(values.get("maxParallelImagePulls").is_none());
+    }
+
+    #[test]
+    fn serialize_false_with_limit_writes_both() {
+        let v = render(KubeletPullConfig {
+            serialize_image_pulls: Some(false),
+            max_parallel_image_pulls: Some(4),
+        });
+        let values = default_profile_values(&v);
+        assert_eq!(values["serializeImagePulls"].as_bool(), Some(false));
+        assert_eq!(values["maxParallelImagePulls"].as_u64(), Some(4));
+        // The profile must not displace the network block it follows.
+        assert_eq!(
+            v["spec"]["network"]["provider"].as_str(),
+            Some("kuberouter")
+        );
+    }
+
+    #[test]
+    fn serialize_true_only_writes_the_profile() {
+        let v = render(KubeletPullConfig {
+            serialize_image_pulls: Some(true),
+            max_parallel_image_pulls: None,
+        });
+        assert_eq!(
+            default_profile_values(&v)["serializeImagePulls"].as_bool(),
+            Some(true)
+        );
+    }
 
     #[test]
     fn calico_config_has_mesh_api_and_bird() {
@@ -201,6 +296,7 @@ mod k0s_config_tests {
             &["192.0.2.1".to_string(), "203.0.113.9".to_string()],
             1,
             true,
+            KubeletPullConfig::default(),
         );
         assert!(y.contains("address: 192.0.2.1"));
         assert!(y.contains("      - 203.0.113.9"));
@@ -223,6 +319,7 @@ mod k0s_config_tests {
             &["203.0.113.9".to_string()],
             1,
             false,
+            KubeletPullConfig::default(),
         );
         assert!(y.contains("address: 203.0.113.9"));
         assert!(y.contains("mode: vxlan"));
@@ -244,6 +341,7 @@ mod k0s_config_tests {
             &[],
             3,
             true,
+            KubeletPullConfig::default(),
         );
         assert!(y.contains("provider: kuberouter"));
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
@@ -267,6 +365,7 @@ mod k0s_config_tests {
             &[],
             1,
             true,
+            KubeletPullConfig::default(),
         );
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
         assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
@@ -288,6 +387,7 @@ mod k0s_config_tests {
             &["192.0.2.1".to_string()],
             3,
             true,
+            KubeletPullConfig::default(),
         );
         assert!(y.contains("nodeLocalLoadBalancing:"));
         assert!(y.contains("enabled: true"));
@@ -306,6 +406,7 @@ mod k0s_config_tests {
             &["192.0.2.1".to_string()],
             1,
             true,
+            KubeletPullConfig::default(),
         );
         assert!(!y.contains("nodeLocalLoadBalancing"));
     }

@@ -60,6 +60,8 @@ pub struct ClusterNetworking {
     /// How long a k8s (k0s) node may stay non-`active` during provisioning before the loop
     /// marks the cluster `degraded` (cluster.k8s_provisioning_timeout_secs).
     pub provisioning_timeout: Duration,
+    /// Kubelet image-pull settings (cluster.serialize_image_pulls / max_parallel_image_pulls).
+    pub kubelet_pulls: spur_core::k0s::KubeletPullConfig,
 }
 
 impl ClusterNetworking {
@@ -888,6 +890,7 @@ fn controller_k0s_config(
         &sans,
         cp_count,
         mesh_native,
+        net.kubelet_pulls,
     )
 }
 
@@ -1865,6 +1868,21 @@ mod tests {
     }
 
     #[test]
+    fn controller_k0s_config_carries_kubelet_pulls_for_both_cnis() {
+        for cni in ["kuberouter", "calico"] {
+            let mut net = test_net(true, cni);
+            net.kubelet_pulls = spur_core::k0s::KubeletPullConfig {
+                serialize_image_pulls: Some(false),
+                max_parallel_image_pulls: Some(3),
+            };
+            let node = mesh_node("cp", Some("10.44.0.1"), Some("pk"), None, None);
+            let y = controller_k0s_config(&net, &node, 1);
+            assert!(y.contains("serializeImagePulls: false"), "{cni}: {y}");
+            assert!(y.contains("maxParallelImagePulls: 3"), "{cni}: {y}");
+        }
+    }
+
+    #[test]
     fn controller_k0s_config_carries_cidr_even_without_a_mesh_ip_yet() {
         let net = test_net(true, "calico");
         let node = mesh_node("cp", None, None, None, None);
@@ -1976,6 +1994,7 @@ mod tests {
             cni: cni.into(),
             control_plane_node: None,
             provisioning_timeout: Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         }
     }
 

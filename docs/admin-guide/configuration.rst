@@ -2355,6 +2355,10 @@ lets Spur **own** and provision a k0s cluster.
 Spur-managed k0s cluster. When disabled (the default), ``spurd`` never touches
 systemd or k0s.
 
+Three names are different: ``cluster_name`` is the name of the Spur cluster,
+``[cluster]`` is the k0s Kubernetes cluster that Spur installs and manages, and
+``[kubernetes]`` is for Spur in a Kubernetes cluster that exists already.
+
 This section is split across both daemons: the controller reads the network and
 control-plane fields at startup, while ``spurd`` reads the on-node fields at its
 own startup. Only ``allow_admin_kubeconfig`` is reloadable.
@@ -2424,6 +2428,18 @@ own startup. Only ``allow_admin_kubeconfig`` is reloadable.
      - Live
      - Allow the controller to hand out a cluster-admin kubeconfig. Reloadable,
        so it can be turned off without a restart.
+   * - ``serialize_image_pulls``
+     - bool
+     - none
+     - Restart + ``spur k8s down``/``up``
+     - Kubelet ``serializeImagePulls`` on all k0s nodes. ``false`` lets the kubelet
+       pull more than one image at a time. See `Image pulls`_.
+   * - ``max_parallel_image_pulls``
+     - integer
+     - none (no limit)
+     - Restart + ``spur k8s down``/``up``
+     - Kubelet ``maxParallelImagePulls``. Must be 1 or more, and requires
+       ``serialize_image_pulls = false``. See `Image pulls`_.
    * - ``k0s_version``
      - string
      - pinned
@@ -2448,6 +2464,87 @@ own startup. Only ``allow_admin_kubeconfig`` is reloadable.
        backslashes, whitespace, and control characters.
 
 See :doc:`/deployment/managed-kubernetes` for provisioning a Spur-owned cluster.
+
+.. _image-pulls:
+
+Image pulls
+"""""""""""
+
+By default, the kubelet of a k0s node pulls one image at a time. A small image
+then waits behind all large images that are in the queue before it. On a new GPU
+node with many large model images, this wait can be longer than 10 minutes.
+
+To let the kubelet pull images in parallel, set these fields on all controller
+nodes:
+
+.. code-block:: toml
+
+   [cluster]
+   serialize_image_pulls = false
+   max_parallel_image_pulls = 4  # example only, see the guidance below
+
+.. list-table:: Pull modes
+   :header-rows: 1
+   :widths: 25 25 50
+
+   * - ``serialize_image_pulls``
+     - ``max_parallel_image_pulls``
+     - Result
+   * - not set
+     - not set
+     - Spur does not change the kubelet. One pull at a time.
+   * - ``true``
+     - not set
+     - One pull at a time.
+   * - ``false``
+     - not set
+     - Parallel pulls, no limit.
+   * - ``false``
+     - ``N``
+     - A maximum of ``N`` pulls at the same time.
+   * - not set or ``true``
+     - ``N``
+     - Validation error. ``spurctld`` does not start.
+
+How to select the limit: the limit is a number of slots. When ``N`` large images
+fill all slots, a small image waits until one slot is free. Thus do one of these:
+
+- Set ``N`` larger than the number of large pulls that can run at the same time.
+- Do not set a limit. The disk and the network of the node must then be able to
+  take the load of all pulls at the same time.
+
+``spurctld`` reads the two fields at startup and writes them into the k0s
+worker profile ``default``, which applies to all k0s nodes. ``spurd`` does not
+read them. In a controller HA setup, give the two fields the same values in the
+``spur.conf`` of each ``spurctld``.
+
+Spur writes the k0s configuration only when it starts a k0s controller. To apply
+a change to a running cluster, do these steps. Do not use ``--reset``, because
+it removes ``/var/lib/k0s`` and with it all the images on the node.
+
+1. Change the fields in ``spur.conf`` on each controller node and restart each
+   ``spurctld``.
+2. Run ``spur k8s down``. Wait until ``spur k8s status`` shows no k0s role.
+3. Run ``spur k8s up``.
+4. On a single node, do steps 2 and 3 a second time. The kubelet reads its
+   configuration only when it starts, and on a node that ran before, k0s writes
+   the new configuration after the kubelet started. The kubelet thus gets the
+   new values at its second start.
+5. Make sure that the kubelet uses the values:
+
+   .. code-block:: bash
+
+      k0s kubectl get --raw "/api/v1/nodes/<node>/proxy/configz" \
+        | jq '.kubeletconfig | {serializeImagePulls, maxParallelImagePulls}'
+
+Do the full procedure after each change of the two fields. If a k0s controller
+restarts later with a different configuration, the k0s controllers of an HA
+cluster have different worker profiles.
+
+When one of the two fields is set, ``spur k8s up`` and the ``spurctld`` log show
+a warning about step 4. Spur cannot see the values that the kubelet uses, so the
+warning also shows for a new cluster. Use the ``configz`` check above to know
+if step 4 is necessary.
 
 ``[federation]``, ``[topology]``, ``[burst_buffer]``
 ----------------------------------------------------
