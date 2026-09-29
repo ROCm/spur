@@ -489,6 +489,33 @@ class TestSrunStepDeviceVisibility:
             f"node(s), not an empty /dev/dri\noutput:\n{out}"
         )
 
+    def test_srun_step_gpu_bind_overrides_allocation_wide_visibility(self, gpu_cluster):
+        # The host device plan's env carries the allocation-wide visibility list;
+        # it must not clobber a narrower --gpu-bind selection applied earlier.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+
+        job_id = _hold_job(cluster, "srun-dev-bind", ["--gres=gpu:2"])
+        probe = cluster.write_file(
+            "srun-dev-bind-probe.sh", _probe_script('echo "ROCR=$ROCR_VISIBLE_DEVICES"\n')
+        )
+        try:
+            code, out = cluster.srun_in_allocation(
+                job_id, ["--gpu-bind=map_gpu:1", "-n1", probe]
+            )
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the step did not run to completion (exit {code})\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+        )
+        assert "ROCR=1" in out, (
+            f"--gpu-bind=map_gpu:1 must narrow ROCR_VISIBLE_DEVICES to '1', not "
+            f"the allocation's full device list\noutput:\n{out}"
+        )
+
     def test_srun_step_multi_task_per_node_sees_its_gpu(self, gpu_cluster):
         # Same per-step namespace-wrapper path as the single-task test above
         # (task count alone does not skip it) — a second, independent
@@ -618,6 +645,24 @@ class TestSrunStepDeviceVisibility:
         assert code == 0, f"salloc/pty session failed (exit {code}):\n{out}"
         assert _render_count(out) > 0, (
             f"a standalone interactive --pty session in a job allocated a GPU "
+            f"must see its render node(s)\noutput:\n{out}"
+        )
+
+    def test_standalone_srun_sees_its_gpu(self, gpu_cluster):
+        # Unlike the batch-nested tests above, a bare salloc allocation has no
+        # namespaced parent step to join, so this exercises run_command's own
+        # host_device_plan wiring directly instead of the launch_job path.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_rootful(cluster)
+
+        code, out = cluster.salloc_run(
+            f"srun -n1 bash -c '{_RENDER_COUNT_PROBE}'\n",
+            salloc_args=["-N", "1", "--gres=gpu:1", "-t", "0:05"],
+        )
+        assert code == 0, f"salloc/srun session failed (exit {code}):\n{out}"
+        assert _render_count(out) > 0, (
+            f"a standalone non-pty srun step in a bare allocation with a GPU "
             f"must see its render node(s)\noutput:\n{out}"
         )
 
