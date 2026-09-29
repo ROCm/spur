@@ -65,6 +65,21 @@ pub struct ClusterNetworking {
 }
 
 impl ClusterNetworking {
+    pub fn from_config(config: &spur_core::config::SlurmConfig) -> Self {
+        Self {
+            wg_enabled: config.network.wg_enabled,
+            mesh_cidr: config.network.wg_cidr.clone(),
+            mesh_interface: config.network.wg_interface.clone(),
+            pod_cidr: config.cluster.pod_cidr.clone(),
+            service_cidr: config.cluster.service_cidr.clone(),
+            cni_mtu: config.cluster.cni_mtu,
+            cni: config.cluster.cni.clone(),
+            control_plane_node: config.cluster.control_plane_node.clone(),
+            provisioning_timeout: Duration::from_secs(config.cluster.k8s_provisioning_timeout_secs),
+            kubelet_pulls: config.cluster.kubelet_pulls(),
+        }
+    }
+
     /// Whether pods route natively over the WireGuard mesh. Only Calico (`bird` mode) can; kube-router
     /// always tunnels over the underlay, so a mesh IP must never be advertised to it.
     fn mesh_native(&self) -> bool {
@@ -1865,6 +1880,27 @@ mod tests {
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
         assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
         assert!(y.contains("address: 10.44.0.1"));
+    }
+
+    #[test]
+    fn from_config_carries_cluster_settings() {
+        let config = spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"t\"\n[cluster]\nenabled = true\ncni = \"calico\"\n\
+             pod_cidr = \"192.0.2.0/24\"\nk8s_provisioning_timeout_secs = 42\n\
+             serialize_image_pulls = false\nmax_parallel_image_pulls = 3\n",
+        )
+        .unwrap();
+        let net = ClusterNetworking::from_config(&config);
+        assert_eq!(net.cni, "calico");
+        assert_eq!(net.pod_cidr, "192.0.2.0/24");
+        assert_eq!(net.provisioning_timeout, Duration::from_secs(42));
+        assert_eq!(
+            net.kubelet_pulls,
+            spur_core::k0s::KubeletPullConfig {
+                serialize_image_pulls: Some(false),
+                max_parallel_image_pulls: Some(3),
+            }
+        );
     }
 
     #[test]
