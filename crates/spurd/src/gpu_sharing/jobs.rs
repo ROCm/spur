@@ -151,6 +151,44 @@ impl GpuSharing {
         Ok(chosen)
     }
 
+    /// Tracks the placeholders of the GPU jobs an agent restart recovered, so
+    /// the presence check recreates a lost one. Call before the agent serves
+    /// launches: a launch in flight has a reservation but no placeholder yet.
+    /// The user and account labels of a recreated placeholder stay empty.
+    pub fn adopt_recovered(&self, allocation: &NodeAllocation) {
+        for (job_id, gpu_ids) in allocation.held_job_gpu_ids() {
+            let Some(run_attempt) = allocation.owner_attempt(job_id) else {
+                continue;
+            };
+            if gpu_ids.is_empty() {
+                continue;
+            }
+            let Some(gpus) = gpu_ids
+                .iter()
+                .map(|&sid| self.identity(sid).and_then(|i| requested_gpu(&i)))
+                .collect::<Option<Vec<_>>>()
+            else {
+                warn!(job_id, "recovered job has a GPU that cannot be shared");
+                continue;
+            };
+            let spec = PlaceholderSpec {
+                job_id,
+                run_attempt,
+                user: String::new(),
+                account: String::new(),
+                node_name: self.node_name.clone(),
+                pause_image: placeholder::PAUSE_IMAGE.to_string(),
+                gpus,
+            };
+            lock(&self.placeholders)
+                .entry((job_id, run_attempt))
+                .or_insert(Tracked::Held {
+                    spec,
+                    conflict: None,
+                });
+        }
+    }
+
     /// Stops tracking the placeholder of a job attempt and deletes it in the
     /// background. `None` when there is nothing to delete or no runtime.
     pub fn release_placeholder(
@@ -491,6 +529,49 @@ mod tests {
         let (job_id, reason) = &conflicts[&(1 << 11)];
         assert_eq!(*job_id, 7);
         assert!(reason.contains("gpu-2-130"), "{reason}");
+    }
+
+    /// A recovered job has no tracked placeholder; without adoption the
+    /// presence check never looks at it, so a lost one is never recreated.
+    #[tokio::test]
+    async fn recovered_gpu_job_is_adopted_into_the_presence_check() {
+        let server = placeholder_api(&[], &[]);
+        let sharing = GpuSharing::shared_for_test(&server, vec![spx(1), spx(2)]);
+        let gpu = |n: u64| spur_core::resource::GpuResource {
+            device_id: n as u32,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: spur_core::resource::GpuLinkType::XGMI,
+            stable_id: n << 11,
+        };
+        let total = ResourceSet {
+            gpus: vec![gpu(1), gpu(2)],
+            ..Default::default()
+        };
+        let mut allocation = NodeAllocation::new(NODE.into(), &total);
+        allocation
+            .allocate_for_job(5, 2, 0, 0, &[2 << 11])
+            .expect("reserved");
+        allocation
+            .allocate_for_job(6, 1, 0, 0, &[])
+            .expect("cpu-only job");
+
+        sharing.adopt_recovered(&allocation);
+
+        assert_eq!(held_gpus(&sharing, (5, 2)), Some(vec![2 << 11]));
+        assert_eq!(sharing.live_placeholders(), 1, "a CPU-only job has none");
+        sharing
+            .check_placeholders(&tokio::sync::Mutex::new(allocation))
+            .await;
+        let claim = format!("{CLAIMS}/spur-job-5-2-{NODE}");
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|r| r.method == Method::GET && r.path == claim),
+            "the presence check reads the recovered job's claim"
+        );
     }
 
     #[test]
