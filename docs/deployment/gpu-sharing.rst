@@ -677,7 +677,8 @@ The following checks remain pending:
 - A real ArgoCD deployment and migration of an existing chart-owned
   DeviceClass to the new owner.
 - Kubernetes 1.34 and 1.35 with the alpha extended-resource gate enabled.
-- The interaction between idle-fill reclaim and GPU holds.
+- Idle-fill reclaim with GPU holds on hardware. Reclaim counts the held GPUs
+  of a shared node as allocated; unit tests cover this.
 
 Limits
 ------

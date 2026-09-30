@@ -1279,6 +1279,7 @@ pub(crate) async fn try_preempt(
 
     let now = chrono::Utc::now();
     let reservations = cluster.get_reservations();
+    let held_gpus = cluster.held_gpus(cluster_nodes);
 
     // Only the reservation tier check reads this, so pick the highest tier.
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
@@ -1435,6 +1436,7 @@ pub(crate) async fn try_preempt(
                 },
                 cluster_nodes,
                 &reservations,
+                &held_gpus,
                 now,
             );
             if set.is_some() {
@@ -1931,6 +1933,7 @@ async fn reclaim_for_unplaced(
             },
             cluster_state.nodes,
             cluster_state.reservations,
+            cluster_state.held_gpus,
             now,
         ) else {
             continue;
@@ -2023,6 +2026,7 @@ fn satisfiable_victim_set(
     pool: &VictimPool<'_>,
     nodes: &[spur_core::node::Node],
     reservations: &[spur_core::reservation::Reservation],
+    held_gpus: &HashMap<String, Vec<u64>>,
     now: DateTime<Utc>,
 ) -> Option<HashSet<spur_core::job::JobId>> {
     let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
@@ -2030,10 +2034,17 @@ fn satisfiable_victim_set(
     // Total rather than currently-free resources: an evacuated node is empty, so
     // what matters is whether the whole node can host the job. Same suitability
     // rules the scheduler applies, so reclaim cannot free a node placement would
-    // then refuse — including reservations and the k0s gate.
+    // then refuse — including reservations and the k0s gate. Eviction frees no
+    // GPU that a Kubernetes pod holds on a shared node.
     let suitable = |node: &spur_core::node::Node| {
+        let held = held_gpus
+            .get(&node.name)
+            .map(|ids| spur_core::resource::ResourceAllocations::from_device_ids("gpu", ids))
+            .unwrap_or_default();
         placement.matches_for_reservation(node, reservations, now)
-            && node.total_resources.can_satisfy(&required)
+            && node
+                .total_resources
+                .can_satisfy_with_allocated(&held, &required)
     };
 
     let needed = (reclaimer.spec.num_nodes as usize).max(1);
@@ -5552,6 +5563,7 @@ mod tests {
                     },
                     &nodes,
                     &[],
+                    &HashMap::new(),
                     Utc::now()
                 )
                 .is_none(),
@@ -5572,10 +5584,51 @@ mod tests {
                     },
                     &nodes,
                     &[],
+                    &HashMap::new(),
                     Utc::now()
                 ),
                 Some([7].into_iter().collect())
             );
+        }
+
+        #[test]
+        fn pod_held_gpus_stay_held_on_an_evacuated_shared_node() {
+            let mut shared = node("n1", 16);
+            shared.total_resources.gpus = (1..=8).map(|id| gpu(id, "mi325x")).collect();
+            let nodes = vec![shared];
+            let held: HashMap<String, Vec<u64>> = [("n1".to_string(), vec![1, 2])].into();
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+            let wants_gpus = |count| {
+                let mut job = reclaimer(1, 1);
+                job.spec.gpus_per_node = Some(spur_core::gpu_request::GpuRequest {
+                    count,
+                    gpu_type: None,
+                });
+                job
+            };
+            let victims = |job: &Job| {
+                satisfiable_victim_set(
+                    job,
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &no_priorities(),
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
+                    &held,
+                    Utc::now(),
+                )
+            };
+
+            assert!(
+                victims(&wants_gpus(8)).is_none(),
+                "evicting Spur jobs does not free GPUs that pods hold"
+            );
+            assert_eq!(victims(&wants_gpus(6)), Some([7].into_iter().collect()));
         }
 
         #[test]
@@ -5599,6 +5652,7 @@ mod tests {
                     },
                     &nodes,
                     &[],
+                    &HashMap::new(),
                     Utc::now()
                 )
                 .is_none(),
@@ -5620,6 +5674,7 @@ mod tests {
                 },
                 &nodes,
                 &[],
+                &HashMap::new(),
                 Utc::now(),
             )
             .expect("both nodes recoverable");
@@ -5652,6 +5707,7 @@ mod tests {
                 },
                 &nodes,
                 &[],
+                &HashMap::new(),
                 Utc::now(),
             )
             .expect("one evacuable node is enough");
@@ -5691,6 +5747,7 @@ mod tests {
                 },
                 &nodes,
                 &[],
+                &HashMap::new(),
                 Utc::now(),
             )
             .expect("both nodes recoverable");
@@ -5722,6 +5779,7 @@ mod tests {
                     },
                     &nodes,
                     &[],
+                    &HashMap::new(),
                     Utc::now()
                 )
                 .is_none(),
@@ -5742,6 +5800,7 @@ mod tests {
                     },
                     &nodes,
                     &[],
+                    &HashMap::new(),
                     Utc::now()
                 ),
                 Some([7].into_iter().collect()),
@@ -5772,6 +5831,7 @@ mod tests {
                     },
                     &nodes,
                     &[],
+                    &HashMap::new(),
                     Utc::now()
                 ),
                 Some([9].into_iter().collect()),
@@ -5790,6 +5850,7 @@ mod tests {
                     },
                     &nodes,
                     &[],
+                    &HashMap::new(),
                     Utc::now()
                 )
                 .is_none(),
@@ -5818,6 +5879,7 @@ mod tests {
                 },
                 &nodes,
                 &[],
+                &HashMap::new(),
                 Utc::now(),
             )
             .expect("one evacuable node is enough");
@@ -5847,6 +5909,7 @@ mod tests {
                 },
                 &nodes,
                 &[],
+                &HashMap::new(),
                 Utc::now()
             )
             .is_none());
