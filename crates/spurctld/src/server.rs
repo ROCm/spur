@@ -1138,7 +1138,7 @@ impl ControllerService {
                     .sign(id, dest, term, action, digest, now)
                     .map_err(|e| {
                         warn!("failed to sign forwarded identity envelope: {e}");
-                        Status::internal("failed to sign forwarded identity envelope")
+                        Status::unavailable("failed to sign forwarded identity envelope")
                     })?;
                 let value = token
                     .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
