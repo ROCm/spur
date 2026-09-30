@@ -100,6 +100,18 @@ def _require_rootful(cluster) -> None:
     )
 
 
+def _require_node0_gpu(cluster, min_count: int = 1) -> None:
+    """gpu_preflight only checks that *some* node in the pool has a GPU; every
+    job here is pinned to node_names[0] specifically via -w, so check that one.
+    """
+    count = cluster.node_gpu_count(cluster.node_names[0])
+    if count < min_count:
+        pytest.skip(
+            f"{cluster.node_names[0]} (pinned via -w) reports {count} "
+            f"schedulable GPU(s), need >= {min_count}"
+        )
+
+
 def _require_unfiltered_access(cluster) -> None:
     """Skip unless the test user can already open /dev/kfd: if file permissions
     alone deny it, every deny assertion below passes for the wrong reason.
@@ -472,6 +484,7 @@ class TestSrunStepDeviceVisibility:
     def test_srun_step_single_task_sees_its_gpu(self, gpu_cluster):
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
         _require_rootful(cluster)
 
         job_id = _hold_job(cluster, "srun-dev-single", ["--gres=gpu:1"])
@@ -500,6 +513,7 @@ class TestSrunStepDeviceVisibility:
         # the clobber this guards against.
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
         _require_rootful(cluster)
 
         job_id = _hold_job(cluster, "srun-dev-bind", ["--gres=gpu:1"])
@@ -528,6 +542,7 @@ class TestSrunStepDeviceVisibility:
         # assertion on that path, not a distinct control.
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
         _require_rootful(cluster)
 
         job_id = _hold_job(cluster, "srun-dev-multi", ["--gres=gpu:1"])
@@ -557,6 +572,7 @@ class TestSrunStepDeviceVisibility:
         # tests above. Matches the original bug report's working recipe.
         cluster = gpu_pmix_cluster
         cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
         _require_rootful(cluster)
 
         job_id = _hold_job(cluster, "srun-dev-multi-pmix", ["--gres=gpu:1"])
@@ -582,6 +598,7 @@ class TestSrunStepDeviceVisibility:
     def test_srun_inside_batch_script_single_task_sees_its_gpu(self, gpu_cluster):
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
         _require_rootful(cluster)
 
         probe = cluster.write_file(
@@ -612,6 +629,7 @@ class TestSrunStepDeviceVisibility:
     def test_srun_inside_batch_script_multi_task_sees_its_gpu(self, gpu_cluster):
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
         _require_rootful(cluster)
 
         probe = cluster.write_file(
@@ -642,6 +660,7 @@ class TestSrunStepDeviceVisibility:
     def test_standalone_pty_session_sees_its_gpu(self, gpu_cluster):
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
         _require_rootful(cluster)
 
         code, out = cluster.salloc_run(
@@ -660,6 +679,7 @@ class TestSrunStepDeviceVisibility:
         # host_device_plan wiring directly instead of the launch_job path.
         cluster = gpu_cluster
         cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
         _require_rootful(cluster)
 
         code, out = cluster.salloc_run(
