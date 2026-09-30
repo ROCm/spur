@@ -1,0 +1,84 @@
+# Prometheus recording rules for karma sub-scores and composite.
+# Uses native Spur counters from /metrics/jobs-users-accts (requires
+# metrics.high_cardinality = true). Label key is {username}.
+
+groups:
+  - name: karma_subscores
+    interval: 30s
+    rules:
+      # --- 1. Reliability (25%) ---
+      - record: karma:reliability
+        expr: |
+          increase(spur_user_jobs_completed_total[30d])
+          / (
+            increase(spur_user_jobs_completed_total[30d])
+            + increase(spur_user_jobs_failed_total[30d])
+            + increase(spur_user_jobs_timeout_total[30d])
+          )
+
+      # --- 2. GPU Utilization (25%) ---
+      # Per-user when job_user is populated via Spur prolog hook.
+      - record: karma:gpu_utilization
+        expr: |
+          avg by (job_user) ({__name__=~"(amd_)?gpu_gfx_activity", job_user!=""}) / 100
+
+      # --- 3. Resource Accuracy (20%) ---
+      - record: karma:resource_accuracy
+        expr: |
+          clamp_max(
+            avg by (job_user) ({__name__=~"(amd_)?gpu_gfx_activity", job_user!=""}) / 100,
+            1
+          )
+
+      # --- 4. Wall Time Accuracy (10%) ---
+      - record: karma:walltime_accuracy
+        expr: |
+          clamp(
+            increase(spur_user_walltime_actual_seconds_total[30d])
+            / increase(spur_user_walltime_requested_seconds_total[30d]),
+            0, 1
+          )
+
+      # --- 5. Citizenship (15%) ---
+      # Clamped to [0,1]: overflow_borrows can exceed submitted if a
+      # borrowed job is requeued (each redispatch increments the counter).
+      - record: karma:citizenship
+        expr: |
+          clamp_min(
+            1 - (
+              increase(spur_user_overflow_borrows_total[30d])
+              / increase(spur_user_jobs_submitted_total[30d])
+            ),
+            0
+          )
+
+      # --- 6. Cancellation Rate (5%) ---
+      - record: karma:cancellation_rate
+        expr: |
+          increase(spur_user_jobs_cancelled_total[30d])
+          / increase(spur_user_jobs_submitted_total[30d])
+
+      - record: karma:cancellation_score
+        expr: |
+          1 - (karma:cancellation_rate or karma:reliability * 0)
+
+  - name: karma_composite
+    interval: 30s
+    rules:
+      # Default to 0.5 (neutral) when DME GPU metrics are unavailable.
+      - record: karma:gpu_utilization_or_default
+        expr: |
+          karma:gpu_utilization or on() vector(0.5)
+
+      - record: karma:resource_accuracy_or_default
+        expr: |
+          karma:resource_accuracy or on() vector(0.5)
+
+      - record: karma:score
+        expr: |
+          0.25 * karma:reliability
+          + 0.25 * scalar(karma:gpu_utilization_or_default)
+          + 0.20 * scalar(karma:resource_accuracy_or_default)
+          + 0.15 * karma:citizenship
+          + 0.10 * karma:walltime_accuracy
+          + 0.05 * karma:cancellation_score

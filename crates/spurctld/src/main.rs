@@ -10,6 +10,7 @@ mod cluster;
 mod cluster_k8s;
 mod fairshare_cache;
 mod hooks;
+mod karma_stats;
 mod limits_cache;
 mod metrics_proto;
 mod metrics_server;

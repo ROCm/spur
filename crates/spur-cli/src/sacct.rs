@@ -101,6 +101,7 @@ pub fn sacct_header(spec: char) -> &'static str {
         'm' => "PreemptMode",
         'q' => "PreemptQOS",
         'W' => "Borrowed",
+        'G' => "ReqGPUS",
         _ => "?",
     }
 }
@@ -129,6 +130,7 @@ fn sacct_field_spec(name: &str) -> Option<char> {
         "preemptmode" => Some('m'),
         "preemptqos" => Some('q'),
         "borrowed" => Some('W'),
+        "reqgpus" => Some('G'),
         _ => None,
     }
 }
@@ -268,6 +270,7 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         // Whether the run took borrowed capacity. Same letter as squeue's %W so the
         // two commands agree on how to ask.
         'W' => if job.idle_fill { "yes" } else { "no" }.into(),
+        'G' => job.req_gpus.to_string(),
         _ => "?".into(),
     }
 }

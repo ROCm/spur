@@ -464,6 +464,7 @@ pub struct ClusterManager {
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
+    karma_stats: Arc<crate::karma_stats::KarmaStatsCollector>,
     /// Node -> (job_id, start_time) for a future backfill reservation,
     /// refreshed every cycle. Ephemeral: never persisted, cheap to recompute.
     planned_reservations: RwLock<HashMap<String, (JobId, DateTime<Utc>)>>,
@@ -690,6 +691,7 @@ impl ClusterManager {
             association_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
+            karma_stats: Arc::new(crate::karma_stats::KarmaStatsCollector::new()),
             planned_reservations: RwLock::new(HashMap::new()),
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
@@ -905,6 +907,7 @@ impl ClusterManager {
                 }
             }
 
+            let karma_user = task_spec.user.clone();
             self.propose(WalOperation::JobSubmit {
                 job_id: task_id,
                 spec: Box::new(task_spec),
@@ -913,6 +916,7 @@ impl ClusterManager {
             if let Some(stats) = self.sched_stats.get() {
                 stats.record_submitted(1);
             }
+            self.karma_stats.record_submitted(&karma_user);
         }
 
         self.scheduler_notify.notify_one();
@@ -1299,6 +1303,14 @@ impl ClusterManager {
     pub fn user_acct_metrics(&self) -> UserAcctMetricsSnapshot {
         let jobs = self.jobs.read();
         UserAcctMetricsSnapshot::collect(jobs.values())
+    }
+
+    pub fn karma_metrics(&self) -> spur_metrics::KarmaStatsSnapshot {
+        self.karma_stats.snapshot()
+    }
+
+    pub fn reset_karma_stats(&self) {
+        self.karma_stats.reset();
     }
 
     /// Get jobs matching filters.
@@ -1923,8 +1935,22 @@ impl ClusterManager {
                 start_time: Utc::now(),
                 reservation: spec_for_notify.reservation.clone(),
                 idle_fill,
+                total_gpus: effective_gpus(&spec_for_notify, spec_for_notify.num_nodes) as u32,
+                // Minutes granularity matches the DB schema and sacct output format.
+                time_limit_min: spec_for_notify.time_limit.map(|d| d.num_minutes() as i32),
             });
         }
+
+        self.karma_stats.record_started(
+            job_id,
+            &spec_for_notify.user,
+            effective_gpus(&spec_for_notify, spec_for_notify.num_nodes),
+            spec_for_notify
+                .time_limit
+                .map(|d| d.num_seconds() as u64)
+                .unwrap_or(0),
+            idle_fill,
+        );
 
         debug!(job_id, "job started");
         Ok(run_attempt)
@@ -2151,6 +2177,16 @@ impl ClusterManager {
             // operations that set state=Preempted; Suspend does not.
             if finalized.state == JobState::Preempted {
                 stats.record_preempted();
+            }
+        }
+        {
+            let jobs = self.jobs.read();
+            if let Some(job) = jobs.get(&finalized.job_id) {
+                self.karma_stats.record_finalized(
+                    &job.spec.user,
+                    finalized.state,
+                    finalized.actual_secs,
+                );
             }
         }
         self.run_epilog_slurmctld(finalized.job_id);
@@ -6010,6 +6046,13 @@ impl ClusterManager {
         Self::clear_run_state_for_requeue(job);
     }
 
+    fn job_run_secs(job: &Job) -> u64 {
+        match (job.start_time, job.end_time) {
+            (Some(s), Some(e)) => (e - s).num_seconds().max(0) as u64,
+            _ => 0,
+        }
+    }
+
     /// Evict a single job by ID: transition to NodeFail, then free its
     /// allocations on every node it spans. Transition is validated first
     /// so allocations are never freed for a job that can't be evicted.
@@ -6038,6 +6081,7 @@ impl ClusterManager {
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
 
+        let actual_secs = Self::job_run_secs(job);
         Self::deallocate_job_slices(
             nodes,
             &job.allocated_nodes,
@@ -6051,6 +6095,7 @@ impl ClusterManager {
             job_id,
             state: JobState::NodeFail,
             exit_code: -1,
+            actual_secs,
         })
     }
 
@@ -6176,6 +6221,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let run_secs;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -6183,9 +6229,6 @@ impl ClusterManager {
                     if job.state != JobState::Running {
                         return ClientResponse::default();
                     }
-                    // Route through Preempted so the state machine and accounting
-                    // see a finished run, then requeue to Pending — one atomic
-                    // apply; the intermediate Preempted never escapes the lock.
                     if let Err(e) = job.transition(JobState::Preempted) {
                         warn!(job_id = *job_id, error = %e, "invalid preempt transition in WAL apply");
                         return ClientResponse::default();
@@ -6195,6 +6238,7 @@ impl ClusterManager {
                     if let Some(since) = job.suspended_at.take() {
                         job.suspended_secs += (timestamp - since).num_seconds().max(0);
                     }
+                    run_secs = Self::job_run_secs(job);
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
@@ -6239,6 +6283,7 @@ impl ClusterManager {
                         job_id: *job_id,
                         state: JobState::Preempted,
                         exit_code: -1,
+                        actual_secs: run_secs,
                     }],
                     ..Default::default()
                 };
@@ -6256,6 +6301,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let run_secs;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -6266,6 +6312,7 @@ impl ClusterManager {
                             if let Some(since) = job.suspended_at.take() {
                                 job.suspended_secs += (timestamp - since).num_seconds().max(0);
                             }
+                            run_secs = Self::job_run_secs(job);
                             // The live run still holds its allocation; capture it
                             // to free below (reset clears node_completions).
                             freed_nodes = job.allocated_nodes.clone();
@@ -6273,16 +6320,13 @@ impl ClusterManager {
                             per_node_map = job.per_node_alloc.clone();
                         }
                         s if s.is_terminal() => {
-                            // The slice was already freed at completion; freeing
-                            // again would double-subtract on any shared node.
                             was_live = false;
+                            run_secs = 0;
                             freed_nodes = Vec::new();
                             allocated_resources = None;
                             per_node_map = HashMap::new();
                         }
                         _ => {
-                            // Pending, Completing, or an in-flight finalized
-                            // state: nothing to requeue.
                             return ClientResponse::default();
                         }
                     }
@@ -6328,6 +6372,7 @@ impl ClusterManager {
                             job_id: *job_id,
                             state: JobState::Requeued,
                             exit_code: -1,
+                            actual_secs: run_secs,
                         }],
                         ..Default::default()
                     };
@@ -6342,6 +6387,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let run_secs;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -6371,6 +6417,7 @@ impl ClusterManager {
                     job.preempted_by = *preempted_by;
                     job.preempt_mode = Some("Cancel".to_string());
                     job.preempt_qos = preempt_qos.clone();
+                    run_secs = Self::job_run_secs(job);
                 }
                 if let Some(ref total) = allocated_resources {
                     let node_count = freed_nodes.len().max(1) as u32;
@@ -6407,6 +6454,7 @@ impl ClusterManager {
                         job_id: *job_id,
                         state: JobState::Preempted,
                         exit_code: -1,
+                        actual_secs: run_secs,
                     }],
                     ..Default::default()
                 };
@@ -6623,6 +6671,7 @@ impl ClusterManager {
                 };
 
                 if let Some((final_state, final_exit)) = finalized {
+                    let run_secs = jobs.get(job_id).map(Self::job_run_secs).unwrap_or(0);
                     drop(jobs);
                     drop(nodes);
                     self.complete_job_steps(job_id, final_exit, timestamp);
@@ -6632,6 +6681,7 @@ impl ClusterManager {
                             job_id: *job_id,
                             state: final_state,
                             exit_code: final_exit,
+                            actual_secs: run_secs,
                         }],
                         ..Default::default()
                     };
@@ -6672,10 +6722,15 @@ impl ClusterManager {
                         return ClientResponse::default();
                     }
                     if state.is_terminal() {
+                        let run_secs = job
+                            .start_time
+                            .map(|s| (timestamp - s).num_seconds().max(0) as u64)
+                            .unwrap_or(0);
                         response.jobs_finalized.push(JobFinalized {
                             job_id: *job_id,
                             state: *state,
                             exit_code: *exit_code,
+                            actual_secs: run_secs,
                         });
                     }
                     job.exit_code = Some(*exit_code);
