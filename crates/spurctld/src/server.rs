@@ -39,6 +39,28 @@ enum Route {
     Forward,
 }
 
+/// How a forwarded request carries its caller to the leader.
+enum ForwardAuth<'a> {
+    /// Native plugin with a verified identity: sign an envelope for this caller.
+    /// A signing failure on this path is an error, never a silent downgrade.
+    Envelope(&'a spur_core::auth::Identity),
+    /// Anonymous caller, or the JWT plugin (no peer keys): forward with no
+    /// envelope, preserving any Authorization header.
+    Preserve,
+}
+
+/// Pick the forwarding auth mode. Split out so the anonymous-vs-identity choice
+/// is unit-testable without the process-wide signing key.
+fn forward_auth_decision(
+    peer_present: bool,
+    identity: Option<&spur_core::auth::Identity>,
+) -> ForwardAuth<'_> {
+    match (peer_present, identity) {
+        (true, Some(id)) => ForwardAuth::Envelope(id),
+        _ => ForwardAuth::Preserve,
+    }
+}
+
 /// A tonic codec that sends a request body verbatim from pre-encoded bytes and
 /// decodes the response with prost.
 ///
@@ -434,7 +456,7 @@ impl ControllerService {
             .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
         let body = bytes::Bytes::from(body);
         let digest = spur_core::native_peer::request_digest(&body);
-        let meta = Self::forwarded_metadata_for(orig_meta, identity.as_ref(), digest, path);
+        let meta = Self::forwarded_metadata_for(orig_meta, identity.as_ref(), digest, path)?;
         let fwd = Request::from_parts(meta, http::Extensions::default(), body);
         let mut grpc = tonic::client::Grpc::new(channel)
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
@@ -1096,24 +1118,43 @@ impl ControllerService {
         meta
     }
 
+    #[allow(clippy::result_large_err)]
     fn forwarded_metadata_for(
         orig: &tonic::metadata::MetadataMap,
         identity: Option<&spur_core::auth::Identity>,
         digest: [u8; 32],
         action: &str,
-    ) -> tonic::metadata::MetadataMap {
-        if let (Some(peer), Some(id)) = (crate::native_keys::peer(), identity) {
-            let now = spur_core::native_mint::unix_now().unwrap_or(0);
-            let (dest, term) = crate::native_keys::leader_and_term();
-            if let Ok(token) = peer.sign(id, dest, term, action, digest, now) {
-                if let Ok(value) = token.parse() {
-                    let mut meta = Self::forwarded_metadata();
-                    meta.insert(spur_core::native_peer::IDENTITY_HEADER, value);
-                    return meta;
-                }
+    ) -> Result<tonic::metadata::MetadataMap, Status> {
+        let peer = crate::native_keys::peer();
+        match forward_auth_decision(peer.is_some(), identity) {
+            // Native plugin with a verified identity: sign an envelope. A failure
+            // here must NOT degrade to an unsigned forward, which would silently
+            // drop the caller's identity; surface it so the request fails closed.
+            ForwardAuth::Envelope(id) => {
+                let peer = peer.expect("peer present when the decision is Envelope");
+                let now = spur_core::native_mint::unix_now().unwrap_or(0);
+                let (dest, term) = crate::native_keys::leader_and_term();
+                let token = peer
+                    .sign(id, dest, term, action, digest, now)
+                    .map_err(|e| {
+                        warn!("failed to sign forwarded identity envelope: {e}");
+                        Status::internal("failed to sign forwarded identity envelope")
+                    })?;
+                let value = token
+                    .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+                    .map_err(|e| {
+                        warn!("forwarded identity envelope is not a valid header value: {e}");
+                        Status::internal("failed to encode forwarded identity envelope")
+                    })?;
+                let mut meta = Self::forwarded_metadata();
+                meta.insert(spur_core::native_peer::IDENTITY_HEADER, value);
+                Ok(meta)
             }
+            // Anonymous caller (permissive/disabled), or the JWT plugin (no peer
+            // keys): forward without an envelope, preserving any Authorization
+            // header so the leader authorizes the original caller.
+            ForwardAuth::Preserve => Ok(Self::forwarded_metadata_preserving(orig)),
         }
-        Self::forwarded_metadata_preserving(orig)
     }
 
     fn spawn_cancel_for_evicted(&self, evicted: &[crate::raft::JobFinalized]) {
@@ -11871,6 +11912,36 @@ mod tests {
             .metadata_mut()
             .insert(FORWARDED_HEADER, "true".parse().unwrap());
         assert!(ControllerService::is_already_forwarded(&header_only));
+    }
+
+    /// A verified identity is always signed into an envelope, never quietly
+    /// downgraded to an unsigned forward; anonymous and JWT callers preserve the
+    /// Authorization header instead.
+    #[test]
+    fn forward_auth_signs_an_envelope_only_for_a_verified_identity() {
+        let id = spur_core::auth::Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+            trusted_unix: true,
+        };
+        assert!(matches!(
+            forward_auth_decision(true, Some(&id)),
+            ForwardAuth::Envelope(_)
+        ));
+        assert!(matches!(
+            forward_auth_decision(true, None),
+            ForwardAuth::Preserve
+        ));
+        assert!(matches!(
+            forward_auth_decision(false, Some(&id)),
+            ForwardAuth::Preserve
+        ));
+        assert!(matches!(
+            forward_auth_decision(false, None),
+            ForwardAuth::Preserve
+        ));
     }
 
     /// Ordinary client traffic carries no binding and is exactly what forwarding
