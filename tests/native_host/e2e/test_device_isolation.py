@@ -610,7 +610,10 @@ class TestSrunStepDeviceVisibility:
         )
         out_path = f"{cluster.remote_dir}/srun-batch-single.out"
         sb = cluster.sbatch(
-            ["-J", "srun-batch-single", "-N", "1", "--gres=gpu:1", "-o", out_path, script]
+            [
+                "-J", "srun-batch-single", "-N", "1", "-w", cluster.node_names[0],
+                "--gres=gpu:1", "-o", out_path, script,
+            ]
         )
         job_id = parse_job_id(sb)
         assert job_id is not None, f"sbatch failed: {sb}"
@@ -641,7 +644,10 @@ class TestSrunStepDeviceVisibility:
         )
         out_path = f"{cluster.remote_dir}/srun-batch-multi.out"
         sb = cluster.sbatch(
-            ["-J", "srun-batch-multi", "-N", "1", "--gres=gpu:1", "-o", out_path, script]
+            [
+                "-J", "srun-batch-multi", "-N", "1", "-w", cluster.node_names[0],
+                "--gres=gpu:1", "-o", out_path, script,
+            ]
         )
         job_id = parse_job_id(sb)
         assert job_id is not None, f"sbatch failed: {sb}"
