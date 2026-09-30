@@ -296,7 +296,8 @@ impl ControllerService {
     // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
     #[allow(clippy::result_large_err)]
     fn check_leader<T: prost::Message>(&self, request: &Request<T>) -> Result<(), Status> {
-        Self::enforce_forward_binding(request)?;
+        // The forwarded body digest is verified once, in `auth_middleware`, against the
+        // received wire bytes. A forwarded request that reaches here has already passed it.
         if self.raft.is_leader() {
             // The single point that decides execute-vs-forward, so the audit
             // layer keys off this rather than sampling leadership again.
@@ -304,16 +305,7 @@ impl ControllerService {
             return Ok(());
         }
 
-        if request.metadata().get(FORWARDED_HEADER).is_some() {
-            return Err(self.not_leader_status());
-        }
-
         Err(self.not_leader_status())
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn enforce_forward_binding<T: prost::Message>(request: &Request<T>) -> Result<(), Status> {
-        enforce_forward_binding(request)
     }
 
     // Claims the right to fence an incomplete cohort past its grace period.
@@ -619,12 +611,10 @@ impl ControllerService {
         )
     }
 
-    /// Same digest/action bind as writes: a forwarded read still carries a
-    /// `ForwardedBinding` and must not serve a swapped body.
-    #[allow(clippy::result_large_err)]
-    fn prepare_read<T: prost::Message>(&self, request: &Request<T>) -> Result<bool, Status> {
-        Self::enforce_forward_binding(request)?;
-        Ok(self.read_should_forward(request))
+    /// Whether a read should hop to the leader. The forwarded body digest, if any,
+    /// was already verified in `auth_middleware` against the received wire bytes.
+    fn prepare_read<T: prost::Message>(&self, request: &Request<T>) -> bool {
+        self.read_should_forward(request)
     }
 
     /// Best-effort forward of a read to the leader: `Some(payload)` forwards
@@ -1320,8 +1310,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
@@ -1409,8 +1398,7 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         // Capture identity before the forward so the serving node (leader or read-allowed follower)
         // can scope the record to the caller; the credential is preserved on forward, so a forwarded
@@ -1846,8 +1834,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
@@ -1892,8 +1879,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
@@ -2144,8 +2130,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
@@ -2192,8 +2177,7 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
@@ -2219,8 +2203,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
@@ -2803,7 +2786,6 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListTokensRequest>,
     ) -> Result<Response<ListTokensResponse>, Status> {
-        Self::enforce_forward_binding(&request)?;
         use spur_proto::proto::TokenInfo;
 
         // Admission tokens are cluster secrets; only an admin may enumerate them.
@@ -2859,8 +2841,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
@@ -3530,8 +3511,7 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
-        Self::enforce_forward_binding(&request)?;
-        let forward = self.prepare_read(&request)?;
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
@@ -4686,33 +4666,6 @@ pub(crate) fn rpc_path<T>(request: &Request<T>) -> Option<String> {
         .extensions()
         .get::<spur_core::native_peer::RpcPath>()
         .map(|p| p.0.clone())
-}
-
-/// Every handler reachable with a forwarded identity must call this: the auth
-/// layer verifies the envelope's signature but cannot hash a typed body.
-#[allow(clippy::result_large_err)]
-pub(crate) fn enforce_forward_binding<T: prost::Message>(
-    request: &Request<T>,
-) -> Result<(), Status> {
-    let Some(binding) = request
-        .extensions()
-        .get::<spur_core::native_peer::ForwardedBinding>()
-    else {
-        return Ok(());
-    };
-    let mut buf = Vec::new();
-    request
-        .get_ref()
-        .encode(&mut buf)
-        .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
-    let digest = spur_core::native_peer::request_digest(&buf);
-    // The auth layer already matched this against the wire path; re-checking it
-    // here keeps the digest and action verdicts in one place.
-    let action = rpc_path(request)
-        .ok_or_else(|| Status::internal("forwarded request has no recorded RPC path"))?;
-    binding.require(&action, &digest).map_err(|e| {
-        Status::unauthenticated(format!("forwarded identity does not match this RPC: {e}"))
-    })
 }
 
 /// Keeps an unrecognized value verbatim rather than dropping it, so the audit
@@ -6301,66 +6254,6 @@ mod tests {
         cache.insert_admin_level("carol", "Admin");
         assert!(k0s_admin_allowed(false, false, &cache, "carol"));
         assert!(!k0s_admin_allowed(false, true, &cache, "carol"));
-    }
-
-    #[test]
-    fn enforce_forward_binding_rejects_mismatched_digest_on_submit() {
-        let inner = SubmitJobRequest { spec: None };
-        let mut request = Request::new(inner);
-        request
-            .extensions_mut()
-            .insert(spur_core::native_peer::RpcPath(
-                "/slurm.SlurmController/SubmitJob".into(),
-            ));
-        request
-            .extensions_mut()
-            .insert(spur_core::native_peer::ForwardedBinding {
-                action: "/slurm.SlurmController/SubmitJob".into(),
-                request_digest: [0u8; 32],
-            });
-        let err = ControllerService::enforce_forward_binding(&request).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[test]
-    fn enforce_forward_binding_accepts_matching_digest() {
-        use prost::Message;
-        let inner = SubmitJobRequest { spec: None };
-        let mut buf = Vec::new();
-        inner.encode(&mut buf).unwrap();
-        let digest = spur_core::native_peer::request_digest(&buf);
-        let mut request = Request::new(inner);
-        request
-            .extensions_mut()
-            .insert(spur_core::native_peer::RpcPath(
-                "/slurm.SlurmController/SubmitJob".into(),
-            ));
-        request
-            .extensions_mut()
-            .insert(spur_core::native_peer::ForwardedBinding {
-                action: "/slurm.SlurmController/SubmitJob".into(),
-                request_digest: digest,
-            });
-        ControllerService::enforce_forward_binding(&request).unwrap();
-    }
-
-    #[test]
-    fn enforce_forward_binding_rejects_mismatched_digest_on_get_nodes() {
-        let inner = GetNodesRequest::default();
-        let mut request = Request::new(inner);
-        request
-            .extensions_mut()
-            .insert(spur_core::native_peer::RpcPath(
-                "/slurm.SlurmController/GetNodes".into(),
-            ));
-        request
-            .extensions_mut()
-            .insert(spur_core::native_peer::ForwardedBinding {
-                action: "/slurm.SlurmController/GetNodes".into(),
-                request_digest: [1u8; 32],
-            });
-        let err = ControllerService::enforce_forward_binding(&request).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[test]
@@ -12234,47 +12127,6 @@ mod tests {
         );
     }
 
-    /// Every `Empty` RPC shares one type and one digest, so a type-bound
-    /// envelope for a read also validated as `Reconfigure`.
-    #[test]
-    fn an_empty_bodied_envelope_cannot_be_replayed_onto_another_rpc() {
-        let mut req = Request::new(());
-        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
-            "/slurm.SlurmController/Reconfigure".into(),
-        ));
-        let mut buf = Vec::new();
-        prost::Message::encode(req.get_ref(), &mut buf).unwrap();
-        req.extensions_mut()
-            .insert(spur_core::native_peer::ForwardedBinding {
-                // Signed for a read; the digest is identical to Reconfigure's.
-                action: "/slurm.SlurmController/GetRpcStats".into(),
-                request_digest: spur_core::native_peer::request_digest(&buf),
-            });
-
-        let err = enforce_forward_binding(&req)
-            .expect_err("an envelope bound to GetRpcStats must not authorize Reconfigure");
-        assert_eq!(err.code(), Code::Unauthenticated);
-    }
-
-    /// The same envelope on the RPC it was actually signed for still works, so
-    /// the check above is not just rejecting everything.
-    #[test]
-    fn an_empty_bodied_envelope_validates_on_its_own_rpc() {
-        let mut req = Request::new(());
-        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
-            "/slurm.SlurmController/GetRpcStats".into(),
-        ));
-        let mut buf = Vec::new();
-        prost::Message::encode(req.get_ref(), &mut buf).unwrap();
-        req.extensions_mut()
-            .insert(spur_core::native_peer::ForwardedBinding {
-                action: "/slurm.SlurmController/GetRpcStats".into(),
-                request_digest: spur_core::native_peer::request_digest(&buf),
-            });
-
-        enforce_forward_binding(&req).expect("the bound RPC must still be accepted");
-    }
-
     /// Re-signing would bind the victim's identity to whatever body we now hold,
     /// laundering a tampered request into a validly signed one.
     #[test]
@@ -12309,28 +12161,6 @@ mod tests {
         ));
         let fwd = ControllerService::forward_request(req).expect("first hop must forward");
         assert!(fwd.metadata().get(FORWARDED_HEADER).is_some());
-    }
-
-    /// A mismatched binding is rejected rather than being treated as "not
-    /// leader", which is what previously routed it into the forwarding path.
-    #[test]
-    fn a_mismatched_binding_is_rejected() {
-        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
-            name: "n1".into(),
-            force: false,
-            reason: String::new(),
-        });
-        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
-            "/slurm.SlurmController/DeregisterNode".into(),
-        ));
-        req.extensions_mut()
-            .insert(spur_core::native_peer::ForwardedBinding {
-                action: "/slurm.SlurmController/DeregisterNode".into(),
-                request_digest: [0u8; 32],
-            });
-
-        let err = enforce_forward_binding(&req).expect_err("digest mismatch must be rejected");
-        assert_eq!(err.code(), Code::Unauthenticated);
     }
 
     #[test]
