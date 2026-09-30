@@ -154,7 +154,9 @@ impl InBand {
                 .get::<crate::auth_middleware::Verified>()
                 .is_some(),
             peer: crate::rpc_middleware::peer_addr(request.extensions()),
-            forwarded: request.metadata().contains_key("x-spur-forwarded"),
+            forwarded: request
+                .metadata()
+                .contains_key(spur_core::native_peer::FORWARDED_HEADER),
         }
     }
 

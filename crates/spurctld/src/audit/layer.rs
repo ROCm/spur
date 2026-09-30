@@ -28,9 +28,7 @@ use crate::rpc_middleware::{grpc_operation_name, peer_addr};
 /// the two would leave neither stream filterable.
 const AUDIT_RPC_TARGET: &str = "audit_rpc";
 
-/// Set by a controller forwarding to the Raft leader. Mirrors the constant in
-/// `server`, which owns the forwarding itself.
-const FORWARDED_HEADER: &str = "x-spur-forwarded";
+use spur_core::native_peer::FORWARDED_HEADER;
 
 /// Where finished rows go. Behind a trait so the middleware can be driven as a
 /// plain `Service` in tests, without standing up a `ClusterManager`.
