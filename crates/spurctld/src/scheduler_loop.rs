@@ -1216,10 +1216,18 @@ fn satisfiable_victim_set(
     // Total rather than currently-free resources: an evacuated node is empty, so
     // what matters is whether the whole node can host the job. Same suitability
     // rules the scheduler applies, so reclaim cannot free a node placement would
-    // then refuse — including reservations and the k0s gate.
+    // then refuse — including reservations and the k0s gate. Eviction frees no
+    // GPU that a Kubernetes pod holds on a shared node.
     let suitable = |node: &spur_core::node::Node| {
+        let held = cluster_state
+            .held_gpus
+            .get(&node.name)
+            .map(|ids| spur_core::resource::ResourceAllocations::from_device_ids("gpu", ids))
+            .unwrap_or_default();
         placement.matches_for_reservation(node, cluster_state.reservations, now)
-            && node.total_resources.can_satisfy(&required)
+            && node
+                .total_resources
+                .can_satisfy_with_allocated(&held, &required)
     };
 
     let needed = reclaimer.spec.num_nodes as usize;
@@ -3773,6 +3781,47 @@ mod tests {
                 ),
                 Some([7].into_iter().collect())
             );
+        }
+
+        #[test]
+        fn pod_held_gpus_stay_held_on_an_evacuated_shared_node() {
+            let mut shared = node("n1", 16);
+            shared.total_resources.gpus = (1..=8).map(|id| gpu(id, "mi325x")).collect();
+            let nodes = vec![shared];
+            let busy = HashMap::new();
+            let held: HashMap<String, Vec<u64>> = [("n1".to_string(), vec![1, 2])].into();
+            let state = ClusterState {
+                held_gpus: &held,
+                ..state(&nodes, &busy)
+            };
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+            let wants_gpus = |count| {
+                let mut job = reclaimer(1, 1);
+                job.spec.gpus_per_node = Some(spur_core::gpu_request::GpuRequest {
+                    count,
+                    gpu_type: None,
+                });
+                job
+            };
+            let victims = |job: &Job| {
+                satisfiable_victim_set(
+                    job,
+                    &reclaimable,
+                    &occupants,
+                    &no_priorities(),
+                    None,
+                    &state,
+                    Utc::now(),
+                )
+            };
+
+            assert!(
+                victims(&wants_gpus(8)).is_none(),
+                "evicting Spur jobs does not free GPUs that pods hold"
+            );
+            assert_eq!(victims(&wants_gpus(6)), Some([7].into_iter().collect()));
         }
 
         #[test]
