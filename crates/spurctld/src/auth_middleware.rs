@@ -143,78 +143,91 @@ where
             .headers()
             .get(spur_core::native_peer::FORWARDED_HEADER)
             .is_some();
-        if forwarded {
-            if let Some(peer) = self.peer.clone() {
-                let env = req
-                    .headers()
-                    .get(spur_core::native_peer::IDENTITY_HEADER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-                let Some(env) = env else {
-                    let resp = tonic::Status::unauthenticated(
-                        "forwarded RPC missing signed identity envelope",
-                    )
-                    .into_http();
-                    return Box::pin(async move { Ok(resp) });
-                };
-                let now = spur_core::native_mint::unix_now().unwrap_or(0);
-                match peer.verify(&env, now) {
-                    Ok((identity, binding)) => {
-                        // Stops a captured `Empty`-bodied read from being
-                        // replayed onto another RPC, such as Reconfigure.
-                        let path = req.uri().path().to_owned();
-                        if binding.action != path {
+        // A labeled block so an envelope-less forwarded request under
+        // permissive/disabled can fall through to the normal decide() path below.
+        'forwarded: {
+            if forwarded {
+                if let Some(peer) = self.peer.clone() {
+                    let env = req
+                        .headers()
+                        .get(spur_core::native_peer::IDENTITY_HEADER)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    let Some(env) = env else {
+                        // No envelope on a forwarded request. Under `required` this is a
+                        // hard failure. Under permissive/disabled it is an anonymous
+                        // caller the follower forwarded (see forwarded_metadata_for's
+                        // Preserve path); fall through to decide() for the same anonymous
+                        // outcome a direct call would get, rather than rejecting it.
+                        if config.mode == AuthMode::Required {
+                            let resp = tonic::Status::unauthenticated(
+                                "forwarded RPC missing signed identity envelope",
+                            )
+                            .into_http();
+                            return Box::pin(async move { Ok(resp) });
+                        }
+                        break 'forwarded;
+                    };
+                    let now = spur_core::native_mint::unix_now().unwrap_or(0);
+                    match peer.verify(&env, now) {
+                        Ok((identity, binding)) => {
+                            // Stops a captured `Empty`-bodied read from being
+                            // replayed onto another RPC, such as Reconfigure.
+                            let path = req.uri().path().to_owned();
+                            if binding.action != path {
+                                let resp = tonic::Status::unauthenticated(format!(
+                                    "forwarded identity is bound to {}, not {path}",
+                                    binding.action
+                                ))
+                                .into_http();
+                                return Box::pin(async move { Ok(resp) });
+                            }
+                            let expected = binding.request_digest;
+                            req.extensions_mut().insert(identity);
+                            req.extensions_mut().insert(binding);
+                            req.extensions_mut().insert(Verified);
+                            let mut inner = self.inner.clone();
+                            // The follower signed the digest of the bytes it sent. Verify against the
+                            // received bytes here, once, rather than re-encoding a decoded body in every
+                            // handler (prost maps have no canonical byte order, so a re-encode diverges).
+                            return Box::pin(async move {
+                                let (parts, body) = req.into_parts();
+                                // Same ceiling the gRPC decoder would apply, plus the frame header, so a
+                                // forwarded body costs no more memory here than in the handler.
+                                let limit =
+                                    spur_proto::MAX_GRPC_REQUEST_SIZE + GRPC_FRAME_HEADER_LEN;
+                                let collected = match Limited::new(body, limit).collect().await {
+                                    Ok(buf) => buf.to_bytes(),
+                                    Err(_) => {
+                                        return Ok(tonic::Status::unauthenticated(
+                                            "forwarded request body exceeded the size limit or \
+                                         could not be read",
+                                        )
+                                        .into_http());
+                                    }
+                                };
+                                if let Err(reason) =
+                                    forwarded_body_digest_matches(&collected, &expected)
+                                {
+                                    return Ok(tonic::Status::unauthenticated(format!(
+                                        "forwarded identity does not match this RPC: {reason}"
+                                    ))
+                                    .into_http());
+                                }
+                                let req = Request::from_parts(
+                                    parts,
+                                    tonic::body::Body::new(Full::new(collected)),
+                                );
+                                inner.call(req).await.map_err(Into::into)
+                            });
+                        }
+                        Err(e) => {
                             let resp = tonic::Status::unauthenticated(format!(
-                                "forwarded identity is bound to {}, not {path}",
-                                binding.action
+                                "invalid forwarded identity: {e}"
                             ))
                             .into_http();
                             return Box::pin(async move { Ok(resp) });
                         }
-                        let expected = binding.request_digest;
-                        req.extensions_mut().insert(identity);
-                        req.extensions_mut().insert(binding);
-                        req.extensions_mut().insert(Verified);
-                        let mut inner = self.inner.clone();
-                        // The follower signed the digest of the bytes it sent. Verify against the
-                        // received bytes here, once, rather than re-encoding a decoded body in every
-                        // handler (prost maps have no canonical byte order, so a re-encode diverges).
-                        return Box::pin(async move {
-                            let (parts, body) = req.into_parts();
-                            // Same ceiling the gRPC decoder would apply, plus the frame header, so a
-                            // forwarded body costs no more memory here than in the handler.
-                            let limit = spur_proto::MAX_GRPC_REQUEST_SIZE + GRPC_FRAME_HEADER_LEN;
-                            let collected = match Limited::new(body, limit).collect().await {
-                                Ok(buf) => buf.to_bytes(),
-                                Err(_) => {
-                                    return Ok(tonic::Status::unauthenticated(
-                                        "forwarded request body exceeded the size limit or \
-                                         could not be read",
-                                    )
-                                    .into_http());
-                                }
-                            };
-                            if let Err(reason) =
-                                forwarded_body_digest_matches(&collected, &expected)
-                            {
-                                return Ok(tonic::Status::unauthenticated(format!(
-                                    "forwarded identity does not match this RPC: {reason}"
-                                ))
-                                .into_http());
-                            }
-                            let req = Request::from_parts(
-                                parts,
-                                tonic::body::Body::new(Full::new(collected)),
-                            );
-                            inner.call(req).await.map_err(Into::into)
-                        });
-                    }
-                    Err(e) => {
-                        let resp = tonic::Status::unauthenticated(format!(
-                            "invalid forwarded identity: {e}"
-                        ))
-                        .into_http();
-                        return Box::pin(async move { Ok(resp) });
                     }
                 }
             }
@@ -352,6 +365,7 @@ mod tests {
     struct CountingInner {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         last_body: std::sync::Arc<std::sync::Mutex<Option<bytes::Bytes>>>,
+        saw_identity: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Service<Request<tonic::body::Body>> for CountingInner {
@@ -365,6 +379,12 @@ mod tests {
 
         fn call(&mut self, req: Request<tonic::body::Body>) -> Self::Future {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.saw_identity.store(
+                req.extensions()
+                    .get::<spur_core::auth::Identity>()
+                    .is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             let last_body = self.last_body.clone();
             Box::pin(async move {
                 let bytes = req
@@ -494,9 +514,96 @@ mod tests {
         peer: std::sync::Arc<PeerVerifier>,
         inner: CountingInner,
     ) -> AuthMiddleware<CountingInner> {
-        AuthLayer::from_bearer(cfg(AuthMode::Permissive, "k"))
+        peer_layer_mode(AuthMode::Permissive, peer, inner)
+    }
+
+    fn peer_layer_mode(
+        mode: AuthMode,
+        peer: std::sync::Arc<PeerVerifier>,
+        inner: CountingInner,
+    ) -> AuthMiddleware<CountingInner> {
+        AuthLayer::from_bearer(cfg(mode, "k"))
             .with_peer(peer)
             .layer(inner)
+    }
+
+    /// A forwarded request with no envelope header, framed body on the wire.
+    fn forwarded_no_envelope() -> Request<tonic::body::Body> {
+        Request::builder()
+            .uri(SUBMIT_PATH)
+            .header(spur_core::native_peer::FORWARDED_HEADER, "true")
+            .body(tonic::body::Body::new(Full::new(grpc_frame(
+                &submit_with_env(3),
+            ))))
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn required_rejects_a_forwarded_request_without_an_envelope() {
+        use tower::ServiceExt;
+
+        let inner = CountingInner::default();
+        let response = peer_layer_mode(AuthMode::Required, verifier(), inner.clone())
+            .oneshot(forwarded_no_envelope())
+            .await
+            .expect("middleware must not fail");
+
+        assert_eq!(inner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let status = tonic::Status::from_header_map(response.headers()).expect("grpc-status");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn permissive_forwards_an_envelope_less_request_anonymously() {
+        use tower::ServiceExt;
+
+        // A follower forwards an anonymous caller with no envelope. Under permissive
+        // this reaches the service with no Identity, the same as a direct anonymous
+        // call, rather than being rejected.
+        let inner = CountingInner::default();
+        let response = peer_layer_mode(AuthMode::Permissive, verifier(), inner.clone())
+            .oneshot(forwarded_no_envelope())
+            .await
+            .expect("middleware must not fail");
+
+        assert!(
+            tonic::Status::from_header_map(response.headers()).is_none(),
+            "an anonymous forwarded request must be accepted under permissive"
+        );
+        assert_eq!(inner.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            !inner.saw_identity.load(std::sync::atomic::Ordering::SeqCst),
+            "an envelope-less forward must reach the service with no identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn permissive_rejects_a_forwarded_request_with_a_garbage_envelope() {
+        use tower::ServiceExt;
+
+        // A present-but-invalid envelope is always rejected, even under permissive:
+        // forging one must never be better than sending none.
+        let req = Request::builder()
+            .uri(SUBMIT_PATH)
+            .header(spur_core::native_peer::FORWARDED_HEADER, "true")
+            .header(
+                spur_core::native_peer::IDENTITY_HEADER,
+                "not-a-valid-envelope",
+            )
+            .body(tonic::body::Body::new(Full::new(grpc_frame(
+                &submit_with_env(3),
+            ))))
+            .expect("request");
+
+        let inner = CountingInner::default();
+        let response = peer_layer_mode(AuthMode::Permissive, verifier(), inner.clone())
+            .oneshot(req)
+            .await
+            .expect("middleware must not fail");
+
+        assert_eq!(inner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let status = tonic::Status::from_header_map(response.headers()).expect("grpc-status");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
     }
 
     #[tokio::test]
@@ -598,29 +705,6 @@ mod tests {
 
         let inner = CountingInner::default();
         let response = peer_layer(peer, inner.clone())
-            .oneshot(req)
-            .await
-            .expect("middleware must not fail");
-
-        assert_eq!(inner.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let status = tonic::Status::from_header_map(response.headers()).expect("grpc-status");
-        assert_eq!(status.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[tokio::test]
-    async fn a_forwarded_request_without_an_envelope_is_rejected() {
-        use tower::ServiceExt;
-
-        let req = Request::builder()
-            .uri(SUBMIT_PATH)
-            .header(spur_core::native_peer::FORWARDED_HEADER, "true")
-            .body(tonic::body::Body::new(Full::new(grpc_frame(
-                &submit_with_env(3),
-            ))))
-            .expect("request");
-
-        let inner = CountingInner::default();
-        let response = peer_layer(verifier(), inner.clone())
             .oneshot(req)
             .await
             .expect("middleware must not fail");

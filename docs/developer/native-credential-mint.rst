@@ -88,7 +88,17 @@ token captured on one node cannot be replayed on another.
 
 A Raft follower authenticates the user once, consumes the user nonce, and
 forwards a signed identity envelope (``x-spur-identity`` / ``x-spur-forwarded``)
-instead of the original user credential.
+instead of the original user credential. The envelope binds the destination
+leader id, term, RPC path, and a SHA-256 digest of the request body. The
+follower forwards the exact wire bytes it hashed, and the leader verifies the
+digest against those received bytes, so a re-encode on the leader cannot change
+the result (map field ordering, for example) and reject a valid forward.
+
+When ``auth.mode = required``, a forwarded request must carry a valid envelope;
+one that is missing or invalid is rejected. Under ``permissive`` or
+``disabled``, a forwarded request with no envelope falls through to the same
+anonymous decision a direct call would get, while a present-but-invalid
+envelope is always rejected.
 
 Job and step credentials
 ------------------------
