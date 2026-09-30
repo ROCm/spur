@@ -508,10 +508,9 @@ placeholder, ``spurd`` deletes the pod and the claim. Every 30 seconds
 - While sharing is enabled, it reports a conflict if the claim of a tracked
   running job holds different GPUs from the job.
 
-After a restart, ``spurd`` does these two last steps only for the jobs that it
-started after the restart. It keeps and deletes the placeholders of older
-jobs, but does not restore their presence checks. Recreation is not an atomic
-reservation: another pod can acquire the GPU before the replacement claim.
+After a restart, ``spurd`` also does these two last steps for the GPU jobs that
+it recovers from before the restart. Recreation is not an atomic reservation:
+another pod can acquire the GPU before the replacement claim.
 Do not delete a live job's placeholder or claim.
 
 How Spur sees pod GPUs: holds
@@ -707,9 +706,9 @@ Failure cases
      - Result
    * - A tracked running job loses its placeholder.
      - While sharing is enabled, ``spurd`` tries to recreate it at a presence
-       check. This does not apply to jobs recovered after an agent restart
-       or during opt-out. Another pod can acquire the GPU before repair;
-       conflict reporting does not stop either workload.
+       check. This does not apply during opt-out. Another pod can
+       acquire the GPU before repair; conflict reporting does not stop
+       either workload.
    * - A GPU is in conflict.
      - ``scontrol show node`` shows ``conflict`` and the reason. The job gets
        no comment. The controller gives the GPU to no new job. Spur stops no job and no
