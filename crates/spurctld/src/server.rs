@@ -2572,18 +2572,8 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetGpuSharingKubeconfigRequest>,
     ) -> Result<Response<GetGpuSharingKubeconfigResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request)?;
-                    return client.get_gpu_sharing_kubeconfig(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward GPU sharing kubeconfig request to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
         let req = request.into_inner();
         self.verify_node_identity(&req.hostname, &req.node_token)?;
