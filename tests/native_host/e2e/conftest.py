@@ -360,6 +360,30 @@ def gpu_cluster(request, ssh_nodes, remote_bin_dir):
     c.teardown()
 
 
+@pytest.fixture
+def gpu_pmix_cluster(request, ssh_nodes, remote_bin_dir):
+    """Like gpu_cluster, but also deploys and wires up the pmix plugin."""
+    if len(ssh_nodes) < 1:
+        pytest.skip("GPU tests require at least one node in SPUR_TEST_NODES")
+    if not _any_node_has_gpu(ssh_nodes):
+        pytest.skip("no GPU device nodes (/dev/kfd, /dev/dri/card*, /dev/dri/renderD*) on any node")
+    try:
+        ensure_bins(ssh_nodes, _get_binaries_dir(), remote_bin_dir, with_mpi_plugin=True)
+    except FileNotFoundError as exc:
+        pytest.skip(str(exc))
+
+    plugin_dir = str(Path(remote_bin_dir).parent / "lib" / "spur")
+    as_root = request.node.get_closest_marker("rootful") is not None
+    c = _deploy_cluster(
+        ssh_nodes,
+        remote_bin_dir,
+        agent_as_root=as_root,
+        config_overrides={"mpi": {"plugin_dir": plugin_dir, "pmix_tmpdir": "/tmp/spur-pmix"}},
+    )
+    yield c
+    c.teardown()
+
+
 @pytest.fixture(scope="class")
 def label_cluster(ssh_nodes, remote_bin_dir):
     """Class-scoped cluster for node label and partition selector tests."""

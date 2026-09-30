@@ -547,12 +547,12 @@ class TestSrunStepDeviceVisibility:
             f"render node(s)\noutput:\n{out}"
         )
 
-    def test_srun_step_multi_task_pmix_control_was_never_broken(self, gpu_cluster):
+    def test_srun_step_multi_task_pmix_control_was_never_broken(self, gpu_pmix_cluster):
         # Genuine control: a multi-task `--mpi=pmix` step sets pmix_multi_task,
         # which skips the per-step namespace wrapper entirely (so its server
         # stays reachable) — this path never masked /dev/dri, unlike the two
         # tests above. Matches the original bug report's working recipe.
-        cluster = gpu_cluster
+        cluster = gpu_pmix_cluster
         cluster.gpu_preflight(1)
         _require_rootful(cluster)
 
