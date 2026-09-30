@@ -91,7 +91,8 @@ def _wait(what: str, check, timeout: int = 300, every: int = 5):
 
 
 def _label(c: SpurCluster, node: str) -> str:
-    return _kubectl(c, f"get node {node.lower()} -o jsonpath='{{.metadata.labels.spur\\.amd\\.com/gpu-sharing}}'").strip()
+    jsonpath = "{.metadata.labels.spur\\.amd\\.com/gpu-sharing}"
+    return _kubectl(c, f"get node {node.lower()} -o jsonpath='{jsonpath}'").strip()
 
 
 def _link_target(c: SpurCluster, index: int, path: str) -> str:
