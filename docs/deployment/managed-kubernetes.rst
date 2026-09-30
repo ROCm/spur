@@ -325,6 +325,29 @@ latter is inventory-only (it does not drain pods or stop k0s) and is for
 decommissioning a host from SPUR entirely. Use ``k8s remove-nodes`` first, then
 ``node remove`` if the host is also leaving SPUR.
 
+.. _k0s-membership-drift:
+
+Membership drift
+~~~~~~~~~~~~~~~~
+
+``spurctld`` records which nodes belong to the cluster and the k0s role each one
+runs, and checks that record against what each node's agent reports. Two kinds
+of disagreement are reported:
+
+- ``out_of_scope``: k0s is running on a node outside a scoped cluster's members.
+- ``role_mismatch``: a node runs a different role than the one recorded for it,
+  for example a worker where the controller expects a control plane.
+
+While the cluster is ``ready`` or ``degraded``, every node with a role, and every
+node outside a scoped cluster, is checked at least once every ten minutes. Nodes
+that are down, drained, draining, or in an unknown state are skipped. A
+disagreement is reported only when two successive readings of the same node
+agree, and once per episode: as a warning in the ``spurctld`` log naming the node
+and both roles, and on ``spur_k8s_drift_detected_total`` (see
+:doc:`/user-guide/monitoring-jobs`).
+
+Spur reports drift but does not correct it: nothing is stopped or restarted.
+
 Tear down
 ~~~~~~~~~
 

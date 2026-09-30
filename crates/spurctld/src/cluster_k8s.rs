@@ -82,11 +82,13 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
     // Leader-local provisioning clock: a leader-flip or restart resets it, so the timeout re-arms
     // on the new leader rather than tripping instantly off a persisted start time.
     let mut provisioning_since: Option<Instant> = None;
+    let mut drift = DriftTracker::default();
     loop {
         interval.tick().await;
         if !raft.is_leader() {
             last_mesh.clear(); // forget on leadership loss so a new term re-logs the membership
             provisioning_since = None;
+            drift = DriftTracker::default();
             continue; // only the leader reconciles
         }
         let state = cluster.k0s_state();
@@ -147,6 +149,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         if errored {
             cluster.k8s_metrics().record_reconcile_error(&cluster_name);
         }
+
+        detect_drift(&cluster, &mut drift).await;
     }
 }
 
@@ -628,6 +632,179 @@ pub fn phase_str(p: K0sPhase) -> String {
     .to_string()
 }
 
+/// Reconcile ticks per drift sweep, so every candidate node is visited at least once per ten
+/// minutes however large the fleet.
+const DRIFT_SWEEP_TICKS: usize = (600 / RECONCILE_INTERVAL.as_secs()) as usize;
+
+/// A disagreement between what the controller recorded for a node and what its agent runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drift {
+    None,
+    /// k0s running on a node outside a scoped cluster's members.
+    OutOfScope,
+    RoleMismatch,
+    /// No usable reading, so no conclusion either way.
+    Unknown,
+}
+
+impl Drift {
+    fn label(self) -> &'static str {
+        match self {
+            Drift::None => "none",
+            Drift::OutOfScope => "out_of_scope",
+            Drift::RoleMismatch => "role_mismatch",
+            Drift::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify one node from its recorded role and the agent's `(role, component_state)`.
+///
+/// An in-scope node with no role is not drift: `provision_assignments` assigns it one every tick.
+/// A roled node that is not active is not drift either: `converge_provisioning` starts it.
+fn classify_drift(
+    ledger_role: Option<K0sRole>,
+    in_scope: bool,
+    live: Option<(&str, &str)>,
+) -> Drift {
+    let Some((live_role, live_state)) = live else {
+        return Drift::Unknown;
+    };
+    let active = live_state == "active";
+    let Some(recorded) = ledger_role else {
+        return if active && !in_scope {
+            Drift::OutOfScope
+        } else {
+            Drift::None
+        };
+    };
+    if !active {
+        return Drift::None;
+    }
+    match (recorded, live_role) {
+        (_, "") => Drift::Unknown,
+        // Single and controller share k0scontroller.service, and an agent that is not tracking
+        // its unit names it from the unit alone, so "controller" is all it can say.
+        (K0sRole::Single, "controller") => Drift::Unknown,
+        (recorded, live) if live == role_str(recorded) => Drift::None,
+        _ => Drift::RoleMismatch,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sighting {
+    Once(Drift),
+    Confirmed(Drift),
+}
+
+/// Round-robin drift sweep with two-visit confirmation, so one odd reading never counts.
+/// Leader-local: a new leader starts over and re-observes.
+#[derive(Debug, Default)]
+struct DriftTracker {
+    cursor: usize,
+    seen: HashMap<String, Sighting>,
+}
+
+impl DriftTracker {
+    /// The next slice of `candidates`, sized so the whole list is covered within one sweep.
+    fn next_slice<'a, T>(&mut self, candidates: &'a [T]) -> Vec<&'a T> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let take = candidates.len().div_ceil(DRIFT_SWEEP_TICKS);
+        let start = self.cursor % candidates.len();
+        self.cursor = start + take;
+        candidates.iter().cycle().skip(start).take(take).collect()
+    }
+
+    /// Record one visit. Returns the drift on the visit that confirms it, once per episode.
+    fn observe(&mut self, node: &str, drift: Drift) -> Option<Drift> {
+        match drift {
+            Drift::Unknown => None,
+            Drift::None => {
+                self.seen.remove(node);
+                None
+            }
+            kind => match self.seen.get(node) {
+                Some(Sighting::Once(prev)) if *prev == kind => {
+                    self.seen
+                        .insert(node.to_string(), Sighting::Confirmed(kind));
+                    Some(kind)
+                }
+                Some(Sighting::Confirmed(prev)) if *prev == kind => None,
+                _ => {
+                    self.seen.insert(node.to_string(), Sighting::Once(kind));
+                    None
+                }
+            },
+        }
+    }
+
+    fn forget_absent(&mut self, present: &HashSet<&str>) {
+        self.seen.retain(|name, _| present.contains(name.as_str()));
+    }
+}
+
+/// Nodes worth probing for drift, sorted so the sweep order is stable across ticks. An in-scope
+/// node with no role cannot drift, and a node the controller already considers unhealthy or under
+/// operator maintenance is left alone.
+fn drift_candidates<'a>(
+    nodes: &'a [spur_core::node::Node],
+    state: &K0sClusterState,
+) -> Vec<&'a spur_core::node::Node> {
+    use spur_core::node::NodeState;
+    let mut out: Vec<_> = nodes
+        .iter()
+        .filter(|n| {
+            !matches!(
+                n.state,
+                NodeState::Down | NodeState::Drain | NodeState::Draining | NodeState::Unknown
+            )
+        })
+        .filter(|n| n.k0s_role.is_some() || !state.is_member(&n.name))
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Probe one slice of the fleet and report drift that two successive readings agree on. Detection
+/// only: nothing is stopped or restarted here. Runs in Ready and Degraded; Provisioning is
+/// mid-join by definition, and Down is already tearing everything down.
+async fn detect_drift(cluster: &ClusterManager, tracker: &mut DriftTracker) {
+    let state = cluster.k0s_state();
+    if !matches!(state.phase, K0sPhase::Ready | K0sPhase::Degraded) {
+        return;
+    }
+    let nodes = cluster.get_nodes();
+    tracker.forget_absent(&nodes.iter().map(|n| n.name.as_str()).collect());
+    let candidates = drift_candidates(&nodes, &state);
+    let cluster_name = cluster.config().cluster_name.clone();
+    for node in tracker.next_slice(&candidates) {
+        let live = fetch_component_status(cluster, &node.name).await;
+        let drift = classify_drift(
+            node.k0s_role,
+            state.is_member(&node.name),
+            live.as_ref()
+                .map(|(role, s, _)| (role.as_str(), s.as_str())),
+        );
+        let Some(kind) = tracker.observe(&node.name, drift) else {
+            continue;
+        };
+        let (live_role, live_state, _) = live.unwrap_or_default();
+        warn!(
+            node = %node.name,
+            kind = kind.label(),
+            recorded_role = %node.k0s_role.map(role_str).unwrap_or_default(),
+            live_role = %live_role,
+            live_state = %live_state,
+            "k0s membership drift"
+        );
+        cluster
+            .k8s_metrics()
+            .record_drift_detected(&cluster_name, kind.label());
+    }
+}
+
 fn role_str(r: K0sRole) -> String {
     match r {
         K0sRole::Controller => "controller",
@@ -813,9 +990,12 @@ pub async fn fetch_user_kubeconfig(
     Ok(resp.into_inner().kubeconfig)
 }
 
-/// Query a node's live k0s component state via its agent, with a timeout. Returns None if the node
-/// is unreachable or has no component yet.
-async fn fetch_component_status(cluster: &ClusterManager, node: &str) -> Option<(String, bool)> {
+/// Query a node's live k0s `(role, component_state, enabled)` via its agent, with a timeout. Returns
+/// None if the node is unreachable or has no component yet.
+async fn fetch_component_status(
+    cluster: &ClusterManager,
+    node: &str,
+) -> Option<(String, String, bool)> {
     let endpoint = agent_endpoint(cluster, node)?;
     let fut = async {
         let mut client = crate::agent_client::connect(endpoint).await.ok()?;
@@ -824,7 +1004,7 @@ async fn fetch_component_status(cluster: &ClusterManager, node: &str) -> Option<
             .await
             .ok()?;
         let r = resp.into_inner();
-        Some((r.component_state, r.enabled))
+        Some((r.role, r.component_state, r.enabled))
     };
     tokio::time::timeout(AGENT_TIMEOUT, fut)
         .await
@@ -835,7 +1015,7 @@ async fn fetch_component_status(cluster: &ClusterManager, node: &str) -> Option<
 async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<String> {
     fetch_component_status(cluster, node)
         .await
-        .map(|(state, _)| state)
+        .map(|(_, state, _)| state)
 }
 
 /// The address Calico/kubelet should use for `node`: its mesh IP when the mesh is configured
@@ -1416,9 +1596,9 @@ pub async fn live_node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStat
     for n in cluster.get_nodes() {
         let Some(role) = n.k0s_role else { continue };
         // Report the agent's real (state, enabled) — not a hard-coded enabled=true.
-        let (component_state, enabled) = fetch_component_status(cluster, &n.name)
+        let (_, component_state, enabled) = fetch_component_status(cluster, &n.name)
             .await
-            .unwrap_or_else(|| ("unknown".to_string(), false));
+            .unwrap_or_else(|| (String::new(), "unknown".to_string(), false));
         out.push(ClusterNodeStatus {
             node: n.name,
             role: role_str(role),
@@ -2056,5 +2236,230 @@ mod tests {
         assert!(y.contains("mode: bird"));
         // underlay still carried as an alternate SAN so kubectl works over either address.
         assert!(y.contains("203.0.113.9"));
+    }
+
+    #[test]
+    fn an_in_scope_node_with_no_role_is_not_drift() {
+        assert_eq!(
+            classify_drift(None, true, Some(("worker", "active"))),
+            Drift::None
+        );
+    }
+
+    #[test]
+    fn an_out_of_scope_node_running_k0s_is_drift() {
+        assert_eq!(
+            classify_drift(None, false, Some(("worker", "active"))),
+            Drift::OutOfScope
+        );
+    }
+
+    #[test]
+    fn an_out_of_scope_node_not_running_k0s_is_fine() {
+        assert_eq!(
+            classify_drift(None, false, Some(("", "inactive"))),
+            Drift::None
+        );
+    }
+
+    #[test]
+    fn a_role_that_disagrees_with_the_ledger_is_drift() {
+        for (recorded, live) in [
+            (K0sRole::Controller, "worker"),
+            (K0sRole::Worker, "controller"),
+            (K0sRole::Worker, "single"),
+            (K0sRole::Controller, "single"),
+            (K0sRole::Single, "worker"),
+        ] {
+            assert_eq!(
+                classify_drift(Some(recorded), true, Some((live, "active"))),
+                Drift::RoleMismatch,
+                "recorded {recorded:?}, live {live}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_matching_role_is_not_drift() {
+        for role in [K0sRole::Controller, K0sRole::Worker, K0sRole::Single] {
+            assert_eq!(
+                classify_drift(Some(role), true, Some((&role_str(role), "active"))),
+                Drift::None,
+                "{role:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_node_reported_as_controller_is_unknown_not_mismatched() {
+        assert_eq!(
+            classify_drift(Some(K0sRole::Single), true, Some(("controller", "active"))),
+            Drift::Unknown
+        );
+    }
+
+    #[test]
+    fn an_assigned_but_inactive_node_is_not_drift() {
+        assert_eq!(
+            classify_drift(Some(K0sRole::Worker), true, Some(("worker", "inactive"))),
+            Drift::None
+        );
+    }
+
+    #[test]
+    fn an_unreachable_agent_is_never_drift() {
+        assert_eq!(classify_drift(None, false, None), Drift::Unknown);
+        assert_eq!(
+            classify_drift(Some(K0sRole::Controller), true, None),
+            Drift::Unknown
+        );
+    }
+
+    #[test]
+    fn a_node_that_cannot_name_its_role_is_unknown_not_mismatched() {
+        assert_eq!(
+            classify_drift(Some(K0sRole::Worker), true, Some(("", "active"))),
+            Drift::Unknown
+        );
+    }
+
+    #[test]
+    fn drift_is_reported_on_the_second_visit_and_once_per_episode() {
+        let mut t = DriftTracker::default();
+        assert_eq!(t.observe("n1", Drift::OutOfScope), None);
+        assert_eq!(t.observe("n1", Drift::OutOfScope), Some(Drift::OutOfScope));
+        assert_eq!(t.observe("n1", Drift::OutOfScope), None);
+    }
+
+    #[test]
+    fn a_clean_visit_ends_the_episode() {
+        let mut t = DriftTracker::default();
+        t.observe("n1", Drift::RoleMismatch);
+        t.observe("n1", Drift::RoleMismatch);
+        assert_eq!(t.observe("n1", Drift::None), None);
+        assert_eq!(t.observe("n1", Drift::RoleMismatch), None);
+        assert_eq!(
+            t.observe("n1", Drift::RoleMismatch),
+            Some(Drift::RoleMismatch)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_visit_neither_confirms_nor_clears() {
+        let mut t = DriftTracker::default();
+        t.observe("n1", Drift::OutOfScope);
+        assert_eq!(t.observe("n1", Drift::Unknown), None);
+        assert_eq!(t.observe("n1", Drift::OutOfScope), Some(Drift::OutOfScope));
+        assert_eq!(t.observe("n1", Drift::Unknown), None);
+        assert_eq!(t.observe("n1", Drift::OutOfScope), None);
+    }
+
+    #[test]
+    fn a_different_kind_of_drift_starts_confirmation_over() {
+        let mut t = DriftTracker::default();
+        t.observe("n1", Drift::OutOfScope);
+        assert_eq!(t.observe("n1", Drift::RoleMismatch), None);
+        assert_eq!(
+            t.observe("n1", Drift::RoleMismatch),
+            Some(Drift::RoleMismatch)
+        );
+    }
+
+    #[test]
+    fn sightings_are_per_node() {
+        let mut t = DriftTracker::default();
+        t.observe("n1", Drift::OutOfScope);
+        assert_eq!(t.observe("n2", Drift::OutOfScope), None);
+    }
+
+    #[test]
+    fn a_node_that_left_the_registry_is_forgotten() {
+        let mut t = DriftTracker::default();
+        t.observe("gone", Drift::OutOfScope);
+        t.forget_absent(&HashSet::from(["n1"]));
+        assert_eq!(t.observe("gone", Drift::OutOfScope), None);
+    }
+
+    #[test]
+    fn a_sweep_visits_every_candidate_once() {
+        for len in [1usize, 4, 20, 21, 400] {
+            let nodes: Vec<usize> = (0..len).collect();
+            let mut t = DriftTracker::default();
+            let mut visits = vec![0; len];
+            let ticks = len.min(DRIFT_SWEEP_TICKS);
+            for _ in 0..ticks {
+                for &n in t.next_slice(&nodes) {
+                    visits[n] += 1;
+                }
+            }
+            assert!(
+                visits.iter().all(|&v| v >= 1),
+                "len {len}: unvisited after {ticks} ticks"
+            );
+            assert!(
+                visits.iter().all(|&v| v <= 2),
+                "len {len}: a node was visited more than twice in one sweep"
+            );
+        }
+    }
+
+    #[test]
+    fn the_slice_grows_with_the_fleet() {
+        let mut t = DriftTracker::default();
+        assert_eq!(t.next_slice(&[0; 4]).len(), 1);
+        assert_eq!(t.next_slice(&[0; 400]).len(), 20);
+        assert!(t.next_slice::<u8>(&[]).is_empty());
+    }
+
+    fn drift_node(name: &str, role: Option<K0sRole>) -> spur_core::node::Node {
+        let mut n = spur_core::node::Node::new(name.to_string(), Default::default());
+        n.state = spur_core::node::NodeState::Idle;
+        n.k0s_role = role;
+        n
+    }
+
+    fn candidate_names(nodes: &[spur_core::node::Node], state: &K0sClusterState) -> Vec<String> {
+        drift_candidates(nodes, state)
+            .into_iter()
+            .map(|n| n.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn candidates_skip_in_scope_nodes_without_a_role() {
+        let nodes = [
+            drift_node("cp", Some(K0sRole::Controller)),
+            drift_node("fresh", None),
+            drift_node("outside", None),
+        ];
+        let scoped = K0sClusterState {
+            member_nodes: vec!["cp".into(), "fresh".into()],
+            ..Default::default()
+        };
+        assert_eq!(candidate_names(&nodes, &scoped), ["cp", "outside"]);
+
+        let unscoped = K0sClusterState::default();
+        assert_eq!(candidate_names(&nodes, &unscoped), ["cp"]);
+    }
+
+    #[test]
+    fn candidates_skip_unhealthy_and_maintenance_nodes() {
+        use spur_core::node::NodeState;
+        let mut nodes = Vec::new();
+        for (name, state) in [
+            ("down", NodeState::Down),
+            ("drain", NodeState::Drain),
+            ("draining", NodeState::Draining),
+            ("unknown", NodeState::Unknown),
+            ("busy", NodeState::Allocated),
+        ] {
+            let mut n = drift_node(name, Some(K0sRole::Worker));
+            n.state = state;
+            nodes.push(n);
+        }
+        assert_eq!(
+            candidate_names(&nodes, &K0sClusterState::default()),
+            ["busy"]
+        );
     }
 }

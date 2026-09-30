@@ -911,6 +911,10 @@ cluster lifecycle and per-node health at ``/metrics/k8s``. Every series carries
      - Phase transitions labeled by source and destination.
    * - ``spur_k8s_reconcile_duration_seconds`` / ``spur_k8s_reconcile_errors_total``
      - Reconcile-loop iteration wall time (histogram) and error count.
+   * - ``spur_k8s_drift_detected_total{kind}``
+     - Nodes whose running k0s disagrees with the controller's record
+       (``out_of_scope`` or ``role_mismatch``), counted once per episode. See
+       :ref:`k0s-membership-drift`.
    * - ``spur_k8s_node_up{node}``
      - Whether a node's k0s systemd unit reports active.
    * - ``spur_k8s_node_restart_total{node}`` / ``spur_k8s_install_duration_seconds{node}``

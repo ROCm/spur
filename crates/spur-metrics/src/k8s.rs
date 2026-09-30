@@ -148,6 +148,16 @@ struct TransitionLabel {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct DriftLabel {
+    distribution: String,
+    cluster: String,
+    kind: String,
+}
+
+/// Drift kinds the controller reports, pre-created at zero by `ensure_series`.
+const DRIFT_KINDS: [&str; 2] = ["out_of_scope", "role_mismatch"];
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct NodeBaseLabel {
     distribution: String,
     cluster: String,
@@ -168,6 +178,7 @@ pub struct K8sMetrics {
     phase_transitions: Family<TransitionLabel, Counter>,
     reconcile_errors: Family<BaseLabel, Counter>,
     reconcile_duration: Family<BaseLabel, Histogram>,
+    drift_detected: Family<DriftLabel, Counter>,
     node_up: Family<NodeBaseLabel, Gauge>,
     node_restarts: Family<NodeBaseLabel, Counter>,
     node_install_duration: Family<NodeBaseLabel, Histogram>,
@@ -185,6 +196,7 @@ impl Default for K8sMetrics {
         let reconcile_errors = Family::default();
         let reconcile_duration: Family<BaseLabel, Histogram> =
             Family::new_with_constructor(reconcile_buckets);
+        let drift_detected = Family::default();
         let node_up = Family::default();
         let node_restarts = Family::default();
         let node_install_duration: Family<NodeBaseLabel, Histogram> =
@@ -217,6 +229,11 @@ impl Default for K8sMetrics {
             reconcile_duration.clone(),
         );
         registry.register(
+            "spur_k8s_drift_detected",
+            "Nodes whose running k0s disagrees with the controller's record, once per episode",
+            drift_detected.clone(),
+        );
+        registry.register(
             "spur_k8s_node_up",
             "Whether a node's k0s systemd unit reports active (1) or not (0)",
             node_up.clone(),
@@ -238,6 +255,7 @@ impl Default for K8sMetrics {
             phase_transitions,
             reconcile_errors,
             reconcile_duration,
+            drift_detected,
             node_up,
             node_restarts,
             node_install_duration,
@@ -298,6 +316,21 @@ impl K8sMetrics {
             .observe(seconds);
     }
 
+    /// Record a node's drift, confirmed on two consecutive checks.
+    pub fn record_drift_detected(&self, cluster: &str, kind: &str) {
+        self.drift_detected
+            .get_or_create(&self.drift_label(cluster, kind))
+            .inc();
+    }
+
+    fn drift_label(&self, cluster: &str, kind: &str) -> DriftLabel {
+        DriftLabel {
+            distribution: DEFAULT_DISTRIBUTION.into(),
+            cluster: cluster.to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
     fn node_label(&self, cluster: &str, node: &str) -> NodeBaseLabel {
         NodeBaseLabel {
             distribution: DEFAULT_DISTRIBUTION.into(),
@@ -351,6 +384,11 @@ impl K8sMetrics {
         let _ = self.provision_failures.get_or_create(&base);
         let _ = self.reconcile_errors.get_or_create(&base);
         let _ = self.reconcile_duration.get_or_create(&base);
+        for kind in DRIFT_KINDS {
+            let _ = self
+                .drift_detected
+                .get_or_create(&self.drift_label(cluster, kind));
+        }
     }
 
     /// Encode the accumulator's families from the registry built once at construction — no
@@ -402,5 +440,22 @@ mod tests {
             body.contains("spur_k8s_node_up{distribution=\"k0s\",cluster=\"prod\",node=\"a\"} 1\n")
         );
         assert!(body.ends_with("# EOF\n"));
+    }
+
+    #[test]
+    fn drift_series_start_at_zero_and_count_per_kind() {
+        let metrics = K8sMetrics::new();
+        metrics.ensure_series("prod");
+        let series = |kind: &str| {
+            format!("spur_k8s_drift_detected_total{{distribution=\"k0s\",cluster=\"prod\",kind=\"{kind}\"}}")
+        };
+        let body = metrics.encode();
+        assert!(body.contains(&format!("{} 0\n", series("out_of_scope"))));
+        assert!(body.contains(&format!("{} 0\n", series("role_mismatch"))));
+
+        metrics.record_drift_detected("prod", "role_mismatch");
+        let body = metrics.encode();
+        assert!(body.contains(&format!("{} 0\n", series("out_of_scope"))));
+        assert!(body.contains(&format!("{} 1\n", series("role_mismatch"))));
     }
 }
