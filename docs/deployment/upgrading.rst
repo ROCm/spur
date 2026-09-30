@@ -404,6 +404,18 @@ An agent without them logs ``device filter not installed`` and runs the job with
 device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
 
+GPU ranks in ``ROCR_VISIBLE_DEVICES``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A root ``spurd`` runs each job with a ``/dev/dri`` that holds only the job's own
+GPUs, and ROCr numbers the GPUs it can open from zero. ``ROCR_VISIBLE_DEVICES`` in
+such a job, its ``srun`` steps and its interactive sessions now holds the ranks of
+the job's GPUs (``0`` to *n*-1), not the node-wide ordinals. Before this, a job
+whose GPUs did not start at ordinal 0 saw only some of its GPUs, or none. A script
+that reads the variable to learn which GPUs it holds should read ``SPUR_JOB_GPUS``,
+which keeps the node-wide ordinals. An unprivileged ``spurd`` and container jobs
+are not affected.
+
 Reserved step IDs aligned to Slurm
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

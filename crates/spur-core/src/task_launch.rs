@@ -561,18 +561,25 @@ fn bash_export_block(env: &HashMap<String, String>, indent: &str) -> String {
         .collect()
 }
 
+/// Runs before the task loop, because each task overwrites `ROCR_VISIBLE_DEVICES`.
+const JOB_ROCR_BASH: &str = "_JOB_ROCR=$ROCR_VISIBLE_DEVICES\n";
+
 /// Bash that narrows one task's GPU visibility to its slice of `SPUR_JOB_GPUS`.
 ///
+/// `ROCR_VISIBLE_DEVICES` takes the same slice of the job's own value, which
+/// behind the /dev/dri tmpfs of a root `spurd` holds ranks, not node-wide ids.
 /// `HIP_VISIBLE_DEVICES` is renumbered because `ROCR_VISIBLE_DEVICES` has already
 /// filtered and renumbered the driver-visible set by the time HIP applies its own
 /// selector; see `hip_relative_indices`.
 const PER_TASK_GPU_VISIBILITY_BASH: &str = r#"  if [ -n "$SPUR_JOB_GPUS" ]; then
     IFS=',' read -ra _ALL_GPUS <<< "$SPUR_JOB_GPUS"
+    IFS=',' read -ra _ALL_ROCR <<< "$_JOB_ROCR"
+    [ ${#_ALL_ROCR[@]} -eq ${#_ALL_GPUS[@]} ] || _ALL_ROCR=("${_ALL_GPUS[@]}")
     _GPUS_PER_TASK=$(( ${#_ALL_GPUS[@]} / _TASKS_ON_NODE ))
     if [ $_GPUS_PER_TASK -gt 0 ]; then
       _START=$((SPUR_LOCALID * _GPUS_PER_TASK))
       _TASK_GPUS=$(echo "${_ALL_GPUS[@]:$_START:$_GPUS_PER_TASK}" | tr ' ' ',')
-      export ROCR_VISIBLE_DEVICES=$_TASK_GPUS
+      export ROCR_VISIBLE_DEVICES=$(echo "${_ALL_ROCR[@]:$_START:$_GPUS_PER_TASK}" | tr ' ' ',')
       export CUDA_VISIBLE_DEVICES=$_TASK_GPUS
       export GPU_DEVICE_ORDINAL=$_TASK_GPUS
       export HIP_VISIBLE_DEVICES=$(seq -s, 0 $((_GPUS_PER_TASK - 1)))
@@ -614,6 +621,7 @@ pub fn build_multi_task_pmix_wrapper(
     wrapper.push_str(&format!(
         "_TASKS_ON_NODE={tasks_on_node}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n"
     ));
+    wrapper.push_str(JOB_ROCR_BASH);
     wrapper.push_str("for SPUR_LOCALID in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
     wrapper.push_str("  export SPUR_LOCALID\n");
     wrapper.push_str(SpurEnv::per_task_bash_exports());
@@ -669,6 +677,7 @@ pub fn build_multi_task_wrapper(
     wrapper.push_str(&format!(
         "_TASKS_ON_NODE={tasks_on_node}\nSPUR_TASK_OFFSET=${{SPUR_TASK_OFFSET:-0}}\n"
     ));
+    wrapper.push_str(JOB_ROCR_BASH);
     wrapper.push_str("for SPUR_LOCALID in $(seq 0 $((_TASKS_ON_NODE - 1))); do\n");
     wrapper.push_str("  export SPUR_LOCALID\n");
     wrapper.push_str(SpurEnv::per_task_bash_exports());
@@ -1060,17 +1069,53 @@ mod tests {
         );
     }
 
+    /// Runs the real two-task wrapper under `env` and returns what each task saw.
+    fn per_task_gpu_env(env: &[(&str, &str)]) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let task = dir.path().join("task.sh");
+        std::fs::write(
+            &task,
+            "echo \"$SPUR_LOCALID ROCR=$ROCR_VISIBLE_DEVICES HIP=$HIP_VISIBLE_DEVICES \
+             CUDA=$CUDA_VISIBLE_DEVICES\"\n",
+        )
+        .unwrap();
+        let wrapper = build_multi_task_wrapper(task.to_str().unwrap(), 2, None);
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&wrapper)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        let mut lines: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        lines
+    }
+
     #[test]
-    fn per_task_gpu_visibility_renumbers_for_hip() {
-        let wrapper = build_multi_task_wrapper("/tmp/step.sh", 2, None);
-        assert!(
-            wrapper.contains("export ROCR_VISIBLE_DEVICES=$_TASK_GPUS"),
-            "ROCR must carry the absolute ids the task was granted"
+    fn per_task_rocr_is_a_slice_of_the_ranks_behind_the_dri_tmpfs() {
+        let seen = per_task_gpu_env(&[
+            ("SPUR_JOB_GPUS", "4,5,6,7"),
+            ("ROCR_VISIBLE_DEVICES", "0,1,2,3"),
+        ]);
+        assert_eq!(
+            seen,
+            ["0 ROCR=0,1 HIP=0,1 CUDA=4,5", "1 ROCR=2,3 HIP=0,1 CUDA=6,7"]
         );
-        assert!(
-            wrapper.contains("export HIP_VISIBLE_DEVICES=$(seq -s, 0 $((_GPUS_PER_TASK - 1)))"),
-            "HIP must be renumbered, or a task granted a non-zero device sees none"
-        );
+    }
+
+    #[test]
+    fn per_task_rocr_keeps_node_wide_ids_without_isolation() {
+        let expected = ["0 ROCR=4 HIP=0 CUDA=4", "1 ROCR=5 HIP=0 CUDA=5"];
+        let same = per_task_gpu_env(&[("SPUR_JOB_GPUS", "4,5"), ("ROCR_VISIBLE_DEVICES", "4,5")]);
+        assert_eq!(same, expected);
+        let unset = per_task_gpu_env(&[("SPUR_JOB_GPUS", "4,5")]);
+        assert_eq!(unset, expected);
     }
 
     #[test]

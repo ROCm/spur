@@ -226,7 +226,9 @@ the allocated device ordinals so GPU runtimes find the right devices:
    * - Variable
      - Meaning
    * - ``ROCR_VISIBLE_DEVICES``
-     - Allocated GPU ordinals.
+     - Allocated GPU ordinals. Under a root ``spurd`` the job's ``/dev/dri`` holds
+       only its own GPUs, which ROCr numbers from zero, so there this holds their
+       ranks (``0`` to *n*-1) instead.
    * - ``CUDA_VISIBLE_DEVICES``
      - Allocated GPU ordinals.
    * - ``GPU_DEVICE_ORDINAL``

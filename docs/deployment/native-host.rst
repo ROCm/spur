@@ -1058,6 +1058,11 @@ Spur restricts a job to its allocated GPUs in two layers:
   every GPU on the node again. A root ``spurd`` additionally runs the batch payload
   in a mount namespace where ``/dev/dri`` is replaced by a tmpfs carrying only the
   job's own render nodes, so a job allocated no GPUs finds that directory empty.
+  ROCr counts only the GPUs it can open, so in that namespace, and in the ``srun``
+  steps and interactive sessions that run in it, ``ROCR_VISIBLE_DEVICES`` holds the
+  ranks of the job's GPUs on the node (``0`` to *n*-1) and ``SPUR_JOB_GPUS`` keeps
+  the node-wide ordinals. A ``--gpu-bind=map_gpu`` id that is not one of the job's
+  GPUs stays as given.
   Every mount there is best-effort and none of it is a boundary — that is the next
   layer's job.
 - **Access.** With ``[cgroup] constrain_devices`` (on by default) the job's cgroup

@@ -236,7 +236,10 @@ class TestNativeInjection:
             assert "PROBE_OK" in content
             rocr = set(parsed.get("ROCR_VISIBLE_DEVICES", "").split(",")) - {""}
             spur = set(parsed.get("SPUR_JOB_GPUS", "").split(",")) - {""}
-            assert rocr == spur, f"ROCR {rocr} != SPUR_JOB_GPUS {spur}\n{content}"
+            # Behind the /dev/dri tmpfs of a root spurd, ROCr counts only the
+            # job's GPUs, so the variable holds their ranks instead.
+            ranks = {str(i) for i in range(len(spur))}
+            assert rocr in (spur, ranks), f"ROCR {rocr} vs SPUR_JOB_GPUS {spur}\n{content}"
 
         _, parsed, content = _submit_probe(
             cluster, probe, "gpu:1", job_name="native-smi"
