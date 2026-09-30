@@ -11,6 +11,7 @@ reaches a job's allow-list only through a real allocation and lives outside the
 only be the filter. Loading it needs root, hence ``@pytest.mark.rootful``.
 """
 
+import re
 from typing import NamedTuple
 
 import pytest
@@ -84,7 +85,10 @@ def _hold_job(cluster, name: str, sbatch_args: list[str]) -> int:
     job_id = parse_job_id(sb)
     assert job_id is not None, f"sbatch failed: {sb}"
 
-    wait_job_state(cluster, job_id, "R", timeout=120)
+    try:
+        wait_job_state(cluster, job_id, "R", timeout=120)
+    except TimeoutError as e:
+        raise TimeoutError(f"{e}\n{cluster.debug_job(job_id)}") from None
     return job_id
 
 
@@ -94,6 +98,18 @@ def _require_rootful(cluster) -> None:
         f"the device filter needs a rootful agent to load and attach the BPF "
         f"program, got user {user!r}"
     )
+
+
+def _require_node0_gpu(cluster, min_count: int = 1) -> None:
+    """gpu_preflight only checks that *some* node in the pool has a GPU; every
+    job here is pinned to node_names[0] specifically via -w, so check that one.
+    """
+    count = cluster.node_gpu_count(cluster.node_names[0])
+    if count < min_count:
+        pytest.skip(
+            f"{cluster.node_names[0]} (pinned via -w) reports {count} "
+            f"schedulable GPU(s), need >= {min_count}"
+        )
 
 
 def _require_unfiltered_access(cluster) -> None:
@@ -438,6 +454,242 @@ echo "STEP_PID=$$ STEP_CG=$CG"
         assert "STEP_CGROUP=JOINED" in out, (
             f"the step must run inside {job_cg} or one of its step leaves, so the "
             f"job's device filter applies to it (exit {code})\noutput:\n{out}"
+        )
+
+
+_RENDER_COUNT_PROBE = (
+    'n=0\nfor d in /dev/dri/renderD*; do [ -e "$d" ] || continue; n=$((n+1)); done\n'
+    'echo "RENDER_COUNT=$n"\n'
+)
+
+
+def _render_count(out: str) -> int:
+    m = re.search(r"RENDER_COUNT=(\d+)", out)
+    assert m is not None, f"probe did not report RENDER_COUNT\noutput:\n{out}"
+    return int(m.group(1))
+
+
+@pytest.mark.rootful
+class TestSrunStepDeviceVisibility:
+    """`run_command` and `interactive_session` build their own per-step mount
+    namespace and used to hardcode an empty device plan for it, so a step's
+    ``/dev/dri`` came up with zero render nodes even though the job held a
+    real GPU allocation — regardless of ``ROCR_VISIBLE_DEVICES``, which comes
+    from a separate mechanism and was never affected. A plain batch job (no
+    inner ``srun``) was never affected either; see
+    ``test_partial_gpu_allocation_hides_the_other_gpus`` above for that path,
+    and ``test_srun_container.py`` for containerized steps.
+    """
+
+    def test_srun_step_single_task_sees_its_gpu(self, gpu_cluster):
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
+        _require_rootful(cluster)
+
+        job_id = _hold_job(cluster, "srun-dev-single", ["--gres=gpu:1"])
+        probe = cluster.write_file(
+            "srun-dev-single-probe.sh", _probe_script(_RENDER_COUNT_PROBE)
+        )
+        try:
+            code, out = cluster.srun_in_allocation(job_id, ["-n1", probe])
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the step did not run to completion (exit {code})\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+        )
+        assert _render_count(out) > 0, (
+            f"a single-task step in a job allocated a GPU must see its render "
+            f"node(s), not an empty /dev/dri\noutput:\n{out}"
+        )
+
+    def test_srun_step_gpu_bind_overrides_allocation_wide_visibility(self, gpu_cluster):
+        # The host device plan's env carries the allocation-wide visibility list;
+        # it must not clobber a narrower --gpu-bind selection applied earlier. Binds
+        # to an index outside the allocation on purpose: a single-GPU node's own
+        # index would coincide with the (buggy) allocation-wide value too, masking
+        # the clobber this guards against.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
+        _require_rootful(cluster)
+
+        job_id = _hold_job(cluster, "srun-dev-bind", ["--gres=gpu:1"])
+        probe = cluster.write_file(
+            "srun-dev-bind-probe.sh", _probe_script('echo "ROCR=$ROCR_VISIBLE_DEVICES"\n')
+        )
+        try:
+            code, out = cluster.srun_in_allocation(
+                job_id, ["--gpu-bind=map_gpu:7", "-n1", probe]
+            )
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the step did not run to completion (exit {code})\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+        )
+        assert "ROCR=7" in out, (
+            f"--gpu-bind=map_gpu:7 must set ROCR_VISIBLE_DEVICES to '7', not "
+            f"the allocation's own device visibility\noutput:\n{out}"
+        )
+
+    def test_srun_step_multi_task_per_node_sees_its_gpu(self, gpu_cluster):
+        # Same per-step namespace-wrapper path as the single-task test above
+        # (task count alone does not skip it) — a second, independent
+        # assertion on that path, not a distinct control.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
+        _require_rootful(cluster)
+
+        job_id = _hold_job(cluster, "srun-dev-multi", ["--gres=gpu:1"])
+        probe = cluster.write_file(
+            "srun-dev-multi-probe.sh", _probe_script(_RENDER_COUNT_PROBE)
+        )
+        try:
+            code, out = cluster.srun_in_allocation(
+                job_id, ["-n2", "--ntasks-per-node=2", probe]
+            )
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the step did not run to completion (exit {code})\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+        )
+        assert _render_count(out) > 0, (
+            f"a multi-task-per-node step in a job allocated a GPU must see its "
+            f"render node(s)\noutput:\n{out}"
+        )
+
+    def test_srun_step_multi_task_pmix_control_was_never_broken(self, gpu_pmix_cluster):
+        # Genuine control: a multi-task `--mpi=pmix` step sets pmix_multi_task,
+        # which skips the per-step namespace wrapper entirely (so its server
+        # stays reachable) — this path never masked /dev/dri, unlike the two
+        # tests above. Matches the original bug report's working recipe.
+        cluster = gpu_pmix_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
+        _require_rootful(cluster)
+
+        job_id = _hold_job(cluster, "srun-dev-multi-pmix", ["--gres=gpu:1"])
+        probe = cluster.write_file(
+            "srun-dev-multi-pmix-probe.sh", _probe_script(_RENDER_COUNT_PROBE)
+        )
+        try:
+            code, out = cluster.srun_in_allocation(
+                job_id, ["--mpi=pmix", "-n2", "--ntasks-per-node=2", probe]
+            )
+        finally:
+            cluster.scancel(str(job_id))
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the step did not run to completion (exit {code})\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+        )
+        assert _render_count(out) > 0, (
+            f"a multi-task --mpi=pmix step in a job allocated a GPU must see "
+            f"its render node(s)\noutput:\n{out}"
+        )
+
+    def test_srun_inside_batch_script_single_task_sees_its_gpu(self, gpu_cluster):
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
+        _require_rootful(cluster)
+
+        probe = cluster.write_file(
+            "srun-batch-single-probe.sh", _probe_script(_RENDER_COUNT_PROBE)
+        )
+        script = cluster.write_file(
+            "srun-batch-single.sh",
+            f"#!/bin/bash\nsrun -n1 '{probe}'\n",
+        )
+        out_path = f"{cluster.remote_dir}/srun-batch-single.out"
+        sb = cluster.sbatch(
+            ["-J", "srun-batch-single", "-N", "1", "--gres=gpu:1", "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch failed: {sb}"
+        wait_job(cluster, job_id, timeout=120)
+        out = cluster.wait_output(out_path, "DEVICE_PROBE_OK", timeout=120)
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the nested srun step did not run to completion\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+        )
+        assert _render_count(out) > 0, (
+            f"a single-task srun step nested inside a batch script must see "
+            f"its render node(s)\noutput:\n{out}"
+        )
+
+    def test_srun_inside_batch_script_multi_task_sees_its_gpu(self, gpu_cluster):
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
+        _require_rootful(cluster)
+
+        probe = cluster.write_file(
+            "srun-batch-multi-probe.sh", _probe_script(_RENDER_COUNT_PROBE)
+        )
+        script = cluster.write_file(
+            "srun-batch-multi.sh",
+            f"#!/bin/bash\nsrun -n2 --ntasks-per-node=2 '{probe}'\n",
+        )
+        out_path = f"{cluster.remote_dir}/srun-batch-multi.out"
+        sb = cluster.sbatch(
+            ["-J", "srun-batch-multi", "-N", "1", "--gres=gpu:1", "-o", out_path, script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch failed: {sb}"
+        wait_job(cluster, job_id, timeout=120)
+        out = cluster.wait_output(out_path, "DEVICE_PROBE_OK", timeout=120)
+
+        assert "DEVICE_PROBE_OK" in out, (
+            f"the nested srun step did not run to completion\n"
+            f"{cluster.debug_job(job_id)}\noutput:\n{out}"
+        )
+        assert _render_count(out) > 0, (
+            f"a multi-task-per-node srun step nested inside a batch script "
+            f"must see its render node(s)\noutput:\n{out}"
+        )
+
+    def test_standalone_pty_session_sees_its_gpu(self, gpu_cluster):
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
+        _require_rootful(cluster)
+
+        code, out = cluster.salloc_run(
+            f"srun --pty bash -c '{_RENDER_COUNT_PROBE}'\n",
+            salloc_args=["-N", "1", "--gres=gpu:1", "-t", "0:05"],
+        )
+        assert code == 0, f"salloc/pty session failed (exit {code}):\n{out}"
+        assert _render_count(out) > 0, (
+            f"a standalone interactive --pty session in a job allocated a GPU "
+            f"must see its render node(s)\noutput:\n{out}"
+        )
+
+    def test_standalone_srun_sees_its_gpu(self, gpu_cluster):
+        # Unlike the batch-nested tests above, a bare salloc allocation has no
+        # namespaced parent step to join, so this exercises run_command's own
+        # host_device_plan wiring directly instead of the launch_job path.
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        _require_node0_gpu(cluster)
+        _require_rootful(cluster)
+
+        code, out = cluster.salloc_run(
+            f"srun -n1 bash -c '{_RENDER_COUNT_PROBE}'\n",
+            salloc_args=["-N", "1", "--gres=gpu:1", "-t", "0:05"],
+        )
+        assert code == 0, f"salloc/srun session failed (exit {code}):\n{out}"
+        assert _render_count(out) > 0, (
+            f"a standalone non-pty srun step in a bare allocation with a GPU "
+            f"must see its render node(s)\noutput:\n{out}"
         )
 
 

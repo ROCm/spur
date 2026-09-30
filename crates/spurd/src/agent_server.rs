@@ -6235,26 +6235,13 @@ impl SlurmAgent for AgentService {
 
         // Resolved before the running lock and the reservation: this is the one
         // step that awaits another lock, and failing here needs no release.
-        let device_paths = if controller_gpu_ids.is_empty() {
-            Vec::new()
-        } else {
-            let injection = self.device_registry.lock().await.build_job_injection_plans(
-                "gpu",
-                &controller_gpu_ids,
-                req.uid,
-                req.gid,
-            );
-            match injection {
-                Ok((host, _)) => host.device_paths,
-                Err(e) => {
-                    error!(job_id = req.job_id, error = %e, "device registry resolution failed");
-                    return Err(Status::failed_precondition(format!(
-                        "device resolution failed: {}",
-                        e
-                    )));
-                }
-            }
-        };
+        let host_device_plan = self
+            .resolve_host_device_plan(req.job_id, &controller_gpu_ids, req.uid, req.gid)
+            .await?;
+        let device_paths = host_device_plan
+            .as_ref()
+            .map(|p| p.device_paths.clone())
+            .unwrap_or_default();
 
         // Hold the running lock across the duplicate check, reserve+commit, and
         // insert (running → allocation, as in commit) so the job is never
@@ -6383,7 +6370,7 @@ impl SlurmAgent for AgentService {
                 partition: req.partition.clone(),
                 nodelist: req.nodelist.clone(),
                 mpi: req.mpi.clone(),
-                host_device_plan: None,
+                host_device_plan,
                 memlock: self.limits.memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
@@ -6716,10 +6703,10 @@ impl SlurmAgent for AgentService {
             .count()
             .max(1) as u32;
 
-        let (mut gpu_env, container_device_plan) = if gpu_devices.is_empty() {
-            (HashMap::new(), None)
+        let (mut gpu_env, host_device_plan, container_device_plan) = if gpu_devices.is_empty() {
+            (HashMap::new(), None, None)
         } else {
-            let (host_plan, container_plan) = self
+            let (mut host_plan, container_plan) = self
                 .device_registry
                 .lock()
                 .await
@@ -6727,7 +6714,11 @@ impl SlurmAgent for AgentService {
                 .map_err(|e| {
                     Status::failed_precondition(format!("GPU injection plan failed: {}", e))
                 })?;
-            (host_plan.env, Some(container_plan))
+            let env = host_plan.env.clone();
+            // Already merged into senv below with correct --gpu-bind precedence;
+            // clear so executor::launch_job doesn't re-apply it and clobber that.
+            host_plan.env.clear();
+            (env, Some(host_plan), Some(container_plan))
         };
         maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
 
@@ -7064,7 +7055,7 @@ impl SlurmAgent for AgentService {
                 partition: partition.clone(),
                 nodelist: job_nodelist.clone(),
                 mpi: job_mpi.clone(),
-                host_device_plan: None,
+                host_device_plan,
                 memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
@@ -7895,6 +7886,7 @@ impl SlurmAgent for AgentService {
                 tracked.user.clone(),
             )
         };
+        let mut host_device_plan: Option<spur_devices::inject::HostInjectionPlan> = None;
         let custody_dir = crate::stepd::StepdStore::new(&self.stepd_state_dir).session_dir(
             init.job_id,
             run_attempt,
@@ -8029,6 +8021,14 @@ impl SlurmAgent for AgentService {
                                     ]));
                                 }
                             }
+                            host_device_plan = self
+                                .resolve_host_device_plan(
+                                    init.job_id,
+                                    &gpu_devices,
+                                    entry.uid,
+                                    entry.gid,
+                                )
+                                .await?;
                             None
                         }
                         StepContainerPlan::Fresh(c) => {
@@ -8050,7 +8050,9 @@ impl SlurmAgent for AgentService {
                                             "GPU injection plan failed: {e}"
                                         ))
                                     })?;
-                                (host_plan.env, Some(container_plan))
+                                let env = host_plan.env.clone();
+                                host_device_plan = Some(host_plan);
+                                (env, Some(container_plan))
                             };
                             let passwd_entry = (entry.uid > 0)
                                 .then(|| {
@@ -8139,7 +8141,7 @@ impl SlurmAgent for AgentService {
                         partition,
                         nodelist,
                         mpi: String::new(),
-                        host_device_plan: None,
+                        host_device_plan,
                         memlock: self.limits.memlock,
                         cgroup: self.cgroup.clone(),
                         io_mode: executor::LaunchIo::Pty,
@@ -8579,6 +8581,30 @@ impl AgentService {
         if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %e, "PMIx stop failed on job drop");
         }
+    }
+
+    /// Host-side device injection plan for a launch that has no container of
+    /// its own. `None` for a zero-GPU launch (an empty plan either way).
+    async fn resolve_host_device_plan(
+        &self,
+        job_id: u32,
+        gpu_devices: &[u64],
+        uid: u32,
+        gid: u32,
+    ) -> Result<Option<spur_devices::inject::HostInjectionPlan>, Status> {
+        if gpu_devices.is_empty() {
+            return Ok(None);
+        }
+        let (host_plan, _) = self
+            .device_registry
+            .lock()
+            .await
+            .build_job_injection_plans("gpu", gpu_devices, uid, gid)
+            .map_err(|e| {
+                error!(job_id, error = %e, "device registry resolution failed");
+                Status::failed_precondition(format!("device resolution failed: {}", e))
+            })?;
+        Ok(Some(host_plan))
     }
 
     /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
@@ -16863,6 +16889,49 @@ mod tests {
             "AMD registry should not set CUDA_VISIBLE_DEVICES, got: {}",
             resp.stdout
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_host_device_plan_is_none_for_a_zero_gpu_job() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let plan = svc.resolve_host_device_plan(700, &[], 0, 0).await.unwrap();
+        assert!(plan.is_none());
+    }
+
+    // Regression guard for run_command/interactive_session/register_job_allocation
+    // dropping their computed device plan (host_device_plan hardcoded to None),
+    // which left the per-step /dev/dri namespace mount unpopulated.
+    #[tokio::test]
+    async fn resolve_host_device_plan_wires_the_injection_plan_for_a_gpu_job() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let plan = svc
+            .resolve_host_device_plan(700, &[0, 1], 0, 0)
+            .await
+            .unwrap()
+            .expect("a non-empty gpu_devices list must produce a host device plan");
+        assert!(
+            plan.device_paths.iter().any(|p| p.contains("renderD128")),
+            "expected renderD128 among {:?}",
+            plan.device_paths
+        );
+        assert!(
+            plan.device_paths.iter().any(|p| p.contains("renderD129")),
+            "expected renderD129 among {:?}",
+            plan.device_paths
+        );
+        // visible_devices is filtered to nodes that exist on this filesystem
+        // (see HostInjector::plan), so it's not asserted here: CI runners have
+        // no real /dev/dri, unlike the GPU dev box this was authored on.
     }
 
     /// Records the completion reports and drain requests it receives. Every
