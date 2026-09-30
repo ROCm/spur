@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.0](https://github.com/ROCm/spur/compare/v0.13.0...v0.14.0) (2026-09-30)
+
+
+### Features
+
+* **spur-cli:** add squeue -O/--Format field-name output ([#914](https://github.com/ROCm/spur/issues/914)) ([da676d0](https://github.com/ROCm/spur/commit/da676d0093e0303502c007385384ff3c4c18304e))
+
+
+### Bug Fixes
+
+* **deploy:** upgrade openssl in the runtime image ([#961](https://github.com/ROCm/spur/issues/961)) ([0dcdba7](https://github.com/ROCm/spur/commit/0dcdba784723939ec0a08225c69eb2c63e0e4532))
+* **spurctld:** repair raft follower forwarding under native auth ([#957](https://github.com/ROCm/spur/issues/957)) ([0c70ac7](https://github.com/ROCm/spur/commit/0c70ac7fd50e817b853e0b1504df8fc1ec5b0a9c))
+
 ## [0.13.0](https://github.com/ROCm/spur/compare/v0.12.0...v0.13.0) (2026-09-24)
 
 
