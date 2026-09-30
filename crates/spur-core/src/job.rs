@@ -1046,6 +1046,20 @@ impl Job {
             && self.node_completions.len() == self.allocated_nodes.len()
     }
 
+    /// Whether this node is still charged for this job. One definition, so the
+    /// derived totals and the reconciled set cannot drift apart.
+    pub fn is_held_on(&self, node: &str) -> bool {
+        self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
+    }
+
+    /// Whether a placement is already charged. `reserve_placement` charges while still
+    /// `Pending`, before dispatch, so "yes" here means a second placement would double-charge.
+    pub fn holds_a_placement(&self) -> bool {
+        self.allocated_nodes
+            .iter()
+            .any(|node| self.is_held_on(node))
+    }
+
     /// Earliest time the job may start: `--begin` when it falls after submit.
     pub fn eligible_time(&self) -> DateTime<Utc> {
         match self.spec.begin_time {
