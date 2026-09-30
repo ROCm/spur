@@ -48,6 +48,7 @@ NSS
 openraft
 OCI
 PBS
+PCI
 PMI
 PMIX
 PostgreSQL
