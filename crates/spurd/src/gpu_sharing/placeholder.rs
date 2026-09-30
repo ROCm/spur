@@ -498,14 +498,11 @@ pub async fn ensure_present(
     let name = spec.name();
     let pp = PostParams::default();
 
-    let claim = match claims.get_opt(&name).await? {
-        Some(c) => c,
-        None => {
-            warn!(job_id = spec.job_id, "recreating the deleted GPU claim");
-            exists_ok(claims.create(&pp, &build_claim(spec)).await)?;
-            return Ok(Presence::Pending);
-        }
-    };
+    let claim = claims.get_opt(&name).await?;
+    if claim.is_none() {
+        warn!(job_id = spec.job_id, "recreating the deleted GPU claim");
+        exists_ok(claims.create(&pp, &build_claim(spec)).await)?;
+    }
     let pod = match pods.get_opt(&name).await? {
         Some(p) => Some(p),
         None => {
@@ -516,6 +513,9 @@ pub async fn ensure_present(
             exists_ok(pods.create(&pp, &build_pod(spec)).await)?;
             None
         }
+    };
+    let Some(claim) = claim else {
+        return Ok(Presence::Pending);
     };
     let allocated = match allocated_devices(&claim, &spec.node_name) {
         Ok(a) => a,
@@ -1116,11 +1116,13 @@ mod tests {
         assert_eq!(api.calls(Method::POST, PODS).len(), 2);
     }
 
+    /// A claim with no pod is never allocated, so a pod deleted with it must
+    /// come back in the same check, not one interval later.
     #[tokio::test]
-    async fn ensure_present_recreates_a_deleted_claim() {
+    async fn ensure_present_recreates_a_deleted_claim_and_pod_together() {
         let api = ScriptedApi::new(|s| match (s.method.as_str(), s.path.as_str()) {
-            ("GET", CLAIM) => api_error(404, "NotFound"),
-            ("POST", CLAIMS) => ok(s.body.clone()),
+            ("GET", CLAIM) | ("GET", POD) => api_error(404, "NotFound"),
+            ("POST", CLAIMS) | ("POST", PODS) => ok(s.body.clone()),
             _ => api_error(500, "unexpected"),
         });
 
@@ -1130,6 +1132,7 @@ mod tests {
 
         assert_eq!(presence, Presence::Pending);
         assert_eq!(api.calls(Method::POST, CLAIMS).len(), 1);
+        assert_eq!(api.calls(Method::POST, PODS).len(), 1);
     }
 
     fn inventory() -> Vec<RequestedGpu> {
