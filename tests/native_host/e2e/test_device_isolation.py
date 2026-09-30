@@ -85,7 +85,10 @@ def _hold_job(cluster, name: str, sbatch_args: list[str]) -> int:
     job_id = parse_job_id(sb)
     assert job_id is not None, f"sbatch failed: {sb}"
 
-    wait_job_state(cluster, job_id, "R", timeout=120)
+    try:
+        wait_job_state(cluster, job_id, "R", timeout=120)
+    except TimeoutError as e:
+        raise TimeoutError(f"{e}\n{cluster.debug_job(job_id)}") from None
     return job_id
 
 
