@@ -1,0 +1,54 @@
+name: AMD GPU device IDs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Add suggested catalog entries
+        run: scripts/sync-amd-gpu-ids.sh --write --summary "${RUNNER_TEMP}/amd-gpu-ids-summary.md"
+
+      # Pushed with GITHUB_TOKEN, so CI does not run on the PR automatically.
+      # A maintainer reviews the TODO entries, pushes the fix and that triggers CI.
+      - name: Open or update pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: chore/amd-gpu-ids-sync
+          CATALOG: crates/spur-devices/src/cdi/amd_gpu_ids.txt
+          SUMMARY: ${{ runner.temp }}/amd-gpu-ids-summary.md
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- "${CATALOG}"; then
+            echo "The catalog covers every GPU operator device ID."
+            exit 0
+          fi
+          git switch -c "${BRANCH}"
+          git add "${CATALOG}"
+          git commit -m "feat(spur-devices): name new AMD GPU device IDs"
+          git push --force origin "${BRANCH}"
+          existing="$(gh pr list --head "${BRANCH}" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "${existing}" ]; then
+            gh pr edit "${existing}" --body-file "${SUMMARY}" --add-label dependencies
+          else
+            gh pr create --base main --head "${BRANCH}" \
+              --title "feat(spur-devices): name new AMD GPU device IDs from the GPU operator rule" \
+              --body-file "${SUMMARY}" \
+              --label dependencies
+          fi
