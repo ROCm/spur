@@ -2854,7 +2854,7 @@ impl SlurmController for ControllerService {
         let step = spur_core::step::JobStep {
             job_id,
             step_id,
-            name: req.command.join(" "),
+            name: spur_core::step::truncate_step_name(req.command.join(" ")),
             state: spur_core::step::StepState::Running,
             num_tasks: req.num_tasks.max(1),
             cpus_per_task: req.cpus_per_task.max(1),
@@ -8541,6 +8541,52 @@ mod tests {
             .await
             .expect_err("a still-Pending job must not accept a new step");
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_caps_the_stored_name() {
+        use spur_core::step::MAX_STEP_NAME_LEN;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.create_job_step(Request::new(CreateJobStepRequest {
+            job_id,
+            command: vec!["python".into(), "-c".into(), "€".repeat(40_000)],
+            user: "ubuntu".into(),
+            num_tasks: 1,
+            cpus_per_task: 1,
+            overlap: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("step creation must succeed");
+
+        let stored = svc.cluster.get_steps(job_id);
+        let step = stored
+            .iter()
+            .find(|s| spur_core::step::is_user_step(s.step_id))
+            .expect("the srun step must be recorded");
+        assert!(
+            step.name.len() <= MAX_STEP_NAME_LEN,
+            "stored name is {} bytes",
+            step.name.len()
+        );
+        assert!(step.name.starts_with("python -c "), "{}", step.name);
+        assert!(step.name.ends_with("..."), "{}", step.name);
+
+        let resp = svc
+            .get_job_steps(Request::new(GetJobStepsRequest { job_id }))
+            .await
+            .expect("steps must be readable")
+            .into_inner();
+        let wire = resp
+            .steps
+            .iter()
+            .find(|s| spur_core::step::is_user_step(s.step_id))
+            .expect("the srun step must be served");
+        assert_eq!(wire.name, step.name);
     }
 
     /// Submit and start a single-node job owned by `owner`, returning its id.
