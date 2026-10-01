@@ -247,6 +247,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -314,6 +315,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],
@@ -378,6 +380,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],

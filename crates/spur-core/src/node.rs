@@ -382,6 +382,10 @@ pub struct Node {
     /// Why this node blocked convergence when the cluster went `degraded` (surfaced in status).
     #[serde(default)]
     pub k0s_last_error: Option<String>,
+    /// GPU-level sharing with Kubernetes on a k0s-enrolled node: Spur keeps placing on
+    /// the GPUs that Kubernetes does not hold, instead of yielding the whole node.
+    #[serde(default)]
+    pub gpu_sharing: bool,
 }
 
 fn default_weight() -> u32 {
@@ -426,6 +430,7 @@ impl Node {
             k0s_mesh_ip: None,
             k0s_pod_cidr: None,
             k0s_last_error: None,
+            gpu_sharing: false,
         }
     }
 
@@ -459,9 +464,16 @@ impl Node {
     }
 
     /// True once `spur k8s up` has claimed this node for the managed k0s cluster.
-    /// Such nodes are owned by the k8s scheduler and must not also take Spur jobs.
+    /// Such nodes are owned by the k8s scheduler and must not also take Spur jobs,
+    /// unless the node shares its GPUs with Kubernetes.
     pub fn is_k0s_reserved(&self) -> bool {
-        self.k0s_role.is_some()
+        self.k0s_role.is_some() && !self.gpu_sharing
+    }
+
+    /// Whether the node is enrolled in k0s and shares its GPUs with Kubernetes. The
+    /// flag alone is enrolment intent until the node gets its k0s role.
+    pub fn shares_gpus(&self) -> bool {
+        self.gpu_sharing && self.k0s_role.is_some()
     }
 
     /// Update state based on allocation level.
@@ -492,6 +504,32 @@ mod tests {
         assert!(n.is_k0s_reserved());
         n.k0s_role = None;
         assert!(!n.is_k0s_reserved());
+    }
+
+    #[test]
+    fn a_gpu_sharing_node_is_not_k0s_reserved() {
+        let mut n = Node::new("n1".into(), ResourceSet::default());
+        n.k0s_role = Some(crate::k0s::K0sRole::Worker);
+        n.gpu_sharing = true;
+        assert!(!n.is_k0s_reserved());
+        assert!(n.shares_gpus());
+    }
+
+    #[test]
+    fn the_gpu_sharing_flag_takes_effect_only_once_enrolled() {
+        let mut n = Node::new("n1".into(), ResourceSet::default());
+        n.gpu_sharing = true;
+        assert!(!n.shares_gpus());
+        assert!(!n.is_k0s_reserved());
+    }
+
+    #[test]
+    fn a_node_snapshot_without_gpu_sharing_deserializes_as_not_shared() {
+        let node = Node::new("n1".into(), ResourceSet::default());
+        let mut value = serde_json::to_value(&node).expect("serialize node");
+        value.as_object_mut().unwrap().remove("gpu_sharing");
+        let back: Node = serde_json::from_value(value).expect("deserialize node");
+        assert!(!back.gpu_sharing);
     }
 
     #[test]

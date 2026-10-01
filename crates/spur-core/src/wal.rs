@@ -351,6 +351,11 @@ pub enum WalOperation {
     K0sMemberNodesRemove {
         nodes: Vec<String>,
     },
+    /// Opt a k0s-enrolled node in or out of GPU-level sharing with Kubernetes.
+    NodeGpuSharingSet {
+        name: String,
+        enabled: bool,
+    },
 }
 
 impl WalOperation {
@@ -944,6 +949,20 @@ mod deregistration_wal_tests {
             WalOperation::NodeK0sSetError { name, error } => {
                 assert_eq!(name, "gpu-node-1");
                 assert_eq!(error.as_deref(), Some("not active after 10m"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let op = WalOperation::NodeGpuSharingSet {
+            name: "gpu-node-1".into(),
+            enabled: true,
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::NodeGpuSharingSet { name, enabled } => {
+                assert_eq!(name, "gpu-node-1");
+                assert!(enabled);
             }
             _ => panic!("wrong variant"),
         }

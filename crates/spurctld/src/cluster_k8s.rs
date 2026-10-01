@@ -437,6 +437,43 @@ pub(crate) fn resolve_member_nodes(
     Ok(out)
 }
 
+/// Resolve `spur k8s up --gpu-sharing-nodes` fail-closed: every node must be a registered member
+/// of the cluster scope (`members`, never empty) that is or will be a worker. The reconciler gives a
+/// lone member the combined `Single` role, which also runs pods, so it may share too.
+pub(crate) fn resolve_gpu_sharing_nodes(
+    all_nodes: &[spur_core::node::Node],
+    hostlist: &str,
+    members: &[String],
+    cp_set: &[String],
+) -> Result<Vec<String>, String> {
+    if hostlist.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expanded = spur_core::hostlist::expand(hostlist)
+        .map_err(|e| format!("invalid --gpu-sharing-nodes hostlist {hostlist}: {e}"))?;
+    for name in &expanded {
+        let node = all_nodes
+            .iter()
+            .find(|n| &n.name == name)
+            .ok_or_else(|| format!("GPU-sharing node {name} is not a registered node"))?;
+        if !members.contains(name) {
+            return Err(format!(
+                "GPU-sharing node {name} is not in the cluster scope"
+            ));
+        }
+        let worker = match node.k0s_role {
+            Some(role) => matches!(role, K0sRole::Worker | K0sRole::Single),
+            None => members.len() == 1 || !cp_set.contains(name),
+        };
+        if !worker {
+            return Err(format!(
+                "GPU-sharing node {name} is a control plane; only a worker can share its GPUs"
+            ));
+        }
+    }
+    Ok(expanded)
+}
+
 /// Resolve the control-plane set for `spur k8s up`, fail-closed, bootstrap node first: an explicit
 /// `nodes` list wins, else the lowest `replicas` candidates. Count must be 1/3/5 and fit the nodes.
 pub(crate) fn resolve_control_plane_set(
@@ -807,9 +844,27 @@ pub async fn fetch_user_kubeconfig(
             user: user.to_string(),
             namespace: namespace.to_string(),
             service_account: service_account.to_string(),
+            ..Default::default()
         })
         .await
         .map_err(|e| anyhow::anyhow!("get_kubeconfig (scoped) RPC failed: {e}"))?;
+    Ok(resp.into_inner().kubeconfig)
+}
+
+/// Mint the GPU sharing kubeconfig of k0s Node `node` on a control-plane agent, which applies the
+/// node's ServiceAccount and RBAC first.
+pub async fn fetch_gpu_sharing_kubeconfig(
+    cluster: &ClusterManager,
+    node: &str,
+) -> anyhow::Result<String> {
+    let mut client = connect_control_plane(cluster).await?;
+    let resp = client
+        .get_kubeconfig(GetKubeconfigRequest {
+            gpu_sharing_node: node.to_string(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("get_kubeconfig (GPU sharing) RPC failed: {e}"))?;
     Ok(resp.into_inner().kubeconfig)
 }
 

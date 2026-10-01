@@ -28,6 +28,12 @@ pub struct GpuResource {
     pub stable_id: u64,
 }
 
+/// Identity of the physical GPU a logical device belongs to: `stable_id` without the
+/// PCI function and partition bits, which the kernel fills in per partition.
+pub fn gpu_parent_key(stable_id: u64) -> u64 {
+    stable_id >> 11
+}
+
 /// A set of compute resources (node-level inventory).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResourceSet {

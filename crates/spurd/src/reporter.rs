@@ -60,6 +60,8 @@ pub struct NodeReporter {
     allocation: std::sync::OnceLock<Arc<Mutex<NodeAllocation>>>,
     /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
     k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
+    /// GPU sharing with Kubernetes; wired once on a node with `[cluster].enabled`.
+    gpu_sharing: std::sync::OnceLock<Arc<crate::gpu_sharing::GpuSharing>>,
 }
 
 impl NodeReporter {
@@ -90,6 +92,7 @@ impl NodeReporter {
             held_jobs,
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
+            gpu_sharing: std::sync::OnceLock::new(),
         }
     }
 
@@ -114,6 +117,15 @@ impl NodeReporter {
     /// after the K0sAgent is constructed. No-op on a node without k0s (field stays unset).
     pub fn set_k0s_status(&self, status: Arc<crate::cluster::K0sNodeState>) {
         let _ = self.k0s_status.set(status);
+    }
+
+    /// Wire GPU sharing so heartbeats carry holds and deliver the controller's flag.
+    pub fn set_gpu_sharing(&self, sharing: Arc<crate::gpu_sharing::GpuSharing>) {
+        let _ = self.gpu_sharing.set(sharing);
+    }
+
+    pub fn gpu_sharing(&self) -> Option<&Arc<crate::gpu_sharing::GpuSharing>> {
+        self.gpu_sharing.get()
     }
 
     /// This node's current WireGuard mesh public key (empty if the interface has no key / no mesh).
@@ -238,23 +250,55 @@ impl NodeReporter {
         Ok(response.into_inner())
     }
 
+    /// Kubeconfig for GPU sharing on a k0s worker, minted by a control-plane
+    /// node through the controller.
+    pub async fn gpu_sharing_kubeconfig(&self) -> anyhow::Result<String> {
+        let mut client = crate::controller_auth::connect(&self.controller_addr)
+            .await
+            .context("failed to connect to spurctld for the GPU sharing kubeconfig")?;
+        let node_token = self
+            .node_token
+            .read()
+            .map_err(|_| anyhow::anyhow!("node token lock poisoned"))?
+            .clone();
+        let response = client
+            .get_gpu_sharing_kubeconfig(spur_proto::proto::GetGpuSharingKubeconfigRequest {
+                hostname: self.hostname.clone(),
+                node_token,
+            })
+            .await
+            .context("GPU sharing kubeconfig request failed")?;
+        Ok(response.into_inner().kubeconfig)
+    }
+
+    /// Whether this node reports GPUs to the controller.
+    pub fn has_gpus(&self) -> bool {
+        !self.snapshot_resources().gpus.is_empty()
+    }
+
     /// Periodic heartbeat loop.
     pub async fn heartbeat_loop(&self) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
 
         loop {
-            interval.tick().await;
+            wait_next_beat(&mut interval, self.gpu_sharing.get().map(|g| g.changed())).await;
 
             let (load, free_mem) = read_system_metrics();
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = self.node_token.read().unwrap().clone();
-            let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
+            let job_gpus = self.held_job_gpu_ids();
+            let gpu_holds = self
+                .gpu_sharing
+                .get()
+                .and_then(|g| g.heartbeat_report(&self.snapshot_resources(), &job_gpus));
+            let running_jobs = build_running_jobs(self.held_job_ids(), &job_gpus);
 
             match crate::controller_auth::connect(&self.controller_addr).await {
                 Ok(mut client) => {
                     match client
                         .heartbeat(spur_proto::proto::HeartbeatRequest {
+                            gpu_holds,
                             hostname: self.hostname.clone(),
                             cpu_load: load,
                             free_memory_mb: free_mem,
@@ -273,7 +317,12 @@ impl NodeReporter {
                         })
                         .await
                     {
-                        Ok(_) => debug!(load, free_mem, "heartbeat sent"),
+                        Ok(resp) => {
+                            if let Some(sharing) = self.gpu_sharing.get() {
+                                sharing.set_desired(resp.into_inner().gpu_sharing);
+                            }
+                            debug!(load, free_mem, "heartbeat sent")
+                        }
                         Err(e) if should_reregister(&e) => {
                             warn!(
                                 error = %e,
@@ -288,6 +337,23 @@ impl NodeReporter {
                 }
                 Err(e) => warn!(error = %e, "heartbeat connection failed"),
             }
+        }
+    }
+}
+
+/// Wait for the next periodic heartbeat, or for a GPU hold change, which
+/// asks for one extra heartbeat right away.
+async fn wait_next_beat(
+    interval: &mut tokio::time::Interval,
+    change: Option<&tokio::sync::Notify>,
+) {
+    match change {
+        Some(change) => tokio::select! {
+            _ = interval.tick() => {}
+            _ = change.notified() => {}
+        },
+        None => {
+            interval.tick().await;
         }
     }
 }
@@ -724,6 +790,24 @@ mod tests {
     use spur_devices::cdi::cache::CdiCache;
     use spur_devices::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
     use spur_devices::{DeviceRegistry, GresCache, GresEntry};
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_change_triggers_an_extra_heartbeat_at_once() {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        let change = tokio::sync::Notify::new();
+        let start = tokio::time::Instant::now();
+
+        change.notify_one();
+        wait_next_beat(&mut interval, Some(&change)).await;
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+
+        wait_next_beat(&mut interval, Some(&change)).await;
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(30));
+
+        wait_next_beat(&mut interval, None).await;
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(60));
+    }
 
     #[test]
     fn test_gpus_from_registry_link_type() {

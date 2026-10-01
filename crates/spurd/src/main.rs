@@ -636,10 +636,32 @@ async fn main() -> anyhow::Result<()> {
         running_jobs,
         allow_root_jobs,
     )
-    .with_runtime_state_dir(stepd_state_dir.clone());
+    .with_runtime_state_dir(stepd_state_dir.clone())
+    .with_dispatch_timeout_secs(
+        config
+            .as_ref()
+            .map(|c| c.controller.dispatch_timeout_secs)
+            .unwrap_or_else(|| {
+                spur_core::config::ControllerConfig::default().dispatch_timeout_secs
+            }),
+    );
     if let Some(config) = config.as_ref() {
         agent_service.apply_auth_policy(&config.auth);
     }
+    // Before the stepd recovery below, whose teardown releases GPU placeholders.
+    let gpu_sharing = cluster_config.enabled.then(|| {
+        // Stays inactive, with no Kubernetes client, until the controller marks the node shared.
+        let gpu_sharing =
+            spurd::gpu_sharing::GpuSharing::new(&hostname, agent_service.k0s(), &reporter);
+        reporter.set_gpu_sharing(gpu_sharing.clone());
+        tokio::spawn(gpu_sharing.clone().converge_loop());
+        tokio::spawn(
+            gpu_sharing
+                .clone()
+                .placeholder_loop(agent_service.allocation_handle()),
+        );
+        gpu_sharing
+    });
     // Give the reporter the live allocation so heartbeats carry each held job's
     // translated GPU stable_ids. Wired before the replay below records adopted
     // jobs; the OnceLock only shares the handle, so the ordering is immaterial.
@@ -648,6 +670,9 @@ async fn main() -> anyhow::Result<()> {
     agent_service
         .replay_adopted_allocations(&recovered_stepds)
         .await;
+    if let Some(gpu_sharing) = &gpu_sharing {
+        gpu_sharing.adopt_recovered(&*agent_service.allocation_handle().lock().await);
+    }
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;

@@ -113,6 +113,13 @@ together and resolved once, at up-time:
 A scoped cluster's membership is frozen until you grow or shrink it with
 ``add-nodes`` / ``remove-nodes`` (see `Adding and removing worker nodes`_).
 
+Share GPUs with Kubernetes
+''
+
+An enrolled node is reserved for Kubernetes as a whole. To let Spur jobs and
+pods use the GPUs of a worker node at the same time, mark the node as shared
+with ``--gpu-sharing-nodes <hostlist>``. See :doc:`gpu-sharing`.
+
 High-availability control plane
 '''''''''''''''''''''''''''''''''
 
@@ -294,7 +301,8 @@ you add it explicitly. Grow the cluster online, no ``down``/``--reset`` needed:
 
 Added nodes are workers; they are unioned into the member set and enrolled by the
 reconcile loop exactly as an in-scope node is. Adding a node already in the
-cluster is a no-op.
+cluster is a no-op. Add ``--gpu-sharing`` to share the GPUs of the added nodes
+with Kubernetes pods (see :doc:`gpu-sharing`).
 
 Remove a worker gracefully — cordon, drain (evict pods, PDB-aware), then stop and
 ``k0s reset`` the node:
@@ -337,7 +345,8 @@ Tear down
 systemd unit and cached join token, but leaves the WireGuard mesh (``spur0``)
 intact. Purging the join token matters: a token minted against the torn-down
 cluster's CA would fail the next join with a ``kubernetes-ca`` verification
-error. To switch the CNI, tear down with ``--reset`` and bring the cluster back
+error. ``--reset`` also removes the kubelet links of shared nodes (see
+:doc:`gpu-sharing`). To switch the CNI, tear down with ``--reset`` and bring the cluster back
 up with the new ``cni`` setting.
 
 For Users
@@ -386,6 +395,10 @@ requires ``[cluster] allow_admin_kubeconfig = true`` in ``spur.conf`` — it is
 authenticated identity. With it off, get the cluster-admin kubeconfig directly
 on the control-plane node instead: ``k0s kubeconfig admin``.
 
+``spurd`` on a GPU worker gets its own kubeconfig for GPU sharing through the
+controller. That kubeconfig has only the rights that GPU sharing needs (see
+:ref:`gpu-sharing-credential`).
+
 Run a workload
 ~~~~~~~~~~~~~~~
 
@@ -401,7 +414,9 @@ Request GPUs
 ~~~~~~~~~~~~~
 
 GPU worker nodes advertise ``amd.com/gpu`` (containerd injects the devices from a
-CDI spec spurd writes on join). Request them in a pod spec:
+CDI spec spurd writes on join). Request them in a pod spec. On a node that shares
+its GPUs with Spur, a pod must use a ``ResourceClaim`` instead (see
+:doc:`gpu-sharing`).
 
 .. code-block:: yaml
 
@@ -428,12 +443,18 @@ Command reference
 
    * - Command
      - Purpose
-   * - ``spur k8s up [--nodes <hostlist>] [--partition <p>] [--selector k=v] [--control-plane-node <h> | --control-plane-nodes <h1,h2,h3>] [--replicas 1|3|5]``
+   * - ``spur k8s up [--nodes <hostlist>] [--partition <p>] [--selector k=v] [--control-plane-node <h> | --control-plane-nodes <h1,h2,h3>] [--replicas 1|3|5] [--gpu-sharing-nodes <hostlist>]``
      - Provision + start the cluster (idempotent). Admin only. Control-plane
        node(s) must lie within the ``--nodes``/``--partition``/``--selector``
        scope (or leave that scope empty for the whole inventory).
-   * - ``spur k8s add-nodes --nodes <hostlist> | --partition <p> | --selector k=v``
+       ``--gpu-sharing-nodes`` marks worker nodes that share their GPUs with
+       pods (:doc:`gpu-sharing`).
+   * - ``spur k8s add-nodes --nodes <hostlist> | --partition <p> | --selector k=v [--gpu-sharing]``
      - Add worker nodes to a running scoped cluster (no down/reset). Admin only.
+       ``--gpu-sharing`` marks the added nodes as shared.
+   * - ``spur node gpu-sharing <nodes> on|off``
+     - Share the GPUs of enrolled worker nodes with pods, or stop. Same as
+       ``scontrol update NodeName=<nodes> GpuSharing=yes|no``. Admin only.
    * - ``spur k8s remove-nodes --nodes <hostlist> [--drain-timeout <secs>] [--force]``
      - Drain + ``k0s reset`` + remove a worker (destructive; re-add re-seeds state). Admin only.
    * - ``spur k8s status``

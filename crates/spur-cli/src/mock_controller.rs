@@ -46,6 +46,7 @@ pub(crate) struct StepCapture {
     get_node_names: Arc<Mutex<Vec<String>>>,
     get_node_requests: Arc<Mutex<Vec<String>>>,
     update_node_names: Arc<Mutex<Vec<String>>>,
+    update_node_gpu_sharing: Arc<Mutex<Vec<Option<bool>>>>,
     drain_node_names: Arc<Mutex<Vec<String>>>,
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
     /// Node names that `update_node` should reject with `NotFound`.
@@ -114,6 +115,11 @@ impl StepCapture {
 
     pub(crate) fn update_node_names(&self) -> Vec<String> {
         self.update_node_names.lock().unwrap().clone()
+    }
+
+    /// `gpu_sharing` carried by each `UpdateNode`, in call order.
+    pub(crate) fn update_node_gpu_sharing(&self) -> Vec<Option<bool>> {
+        self.update_node_gpu_sharing.lock().unwrap().clone()
     }
 
     pub(crate) fn drain_node_names(&self) -> Vec<String> {
@@ -274,8 +280,14 @@ mock_controller_impl! {
             &self,
             request: tonic::Request<proto::UpdateNodeRequest>,
         ) -> Result<tonic::Response<()>, tonic::Status> {
-            let name = request.into_inner().name;
+            let req = request.into_inner();
+            let name = req.name;
             self.capture.update_node_names.lock().unwrap().push(name.clone());
+            self.capture
+                .update_node_gpu_sharing
+                .lock()
+                .unwrap()
+                .push(req.gpu_sharing);
             if self.capture.update_node_fail_names.lock().unwrap().contains(&name) {
                 return Err(tonic::Status::not_found(format!("node {name} not found")));
             }
@@ -366,6 +378,7 @@ mock_controller_impl! {
         revoke_token(proto::RevokeTokenRequest) -> proto::RevokeTokenResponse;
         report_job_status(proto::ReportJobStatusRequest) -> ();
         report_stepd_recovery(proto::StepdRecoveryRequest) -> proto::StepdRecoveryResponse;
+        get_gpu_sharing_kubeconfig(proto::GetGpuSharingKubeconfigRequest) -> proto::GetGpuSharingKubeconfigResponse;
         create_reservation(proto::CreateReservationRequest) -> ();
         update_reservation(proto::UpdateReservationRequest) -> ();
         delete_reservation(proto::DeleteReservationRequest) -> ();

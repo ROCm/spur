@@ -1760,6 +1760,7 @@ mod tests {
         revoke_token(pb::RevokeTokenRequest) -> pb::RevokeTokenResponse;
         report_job_status(pb::ReportJobStatusRequest) -> ();
         report_stepd_recovery(pb::StepdRecoveryRequest) -> pb::StepdRecoveryResponse;
+        get_gpu_sharing_kubeconfig(pb::GetGpuSharingKubeconfigRequest) -> pb::GetGpuSharingKubeconfigResponse;
         create_reservation(pb::CreateReservationRequest) -> ();
         update_reservation(pb::UpdateReservationRequest) -> ();
         delete_reservation(pb::DeleteReservationRequest) -> ();
