@@ -500,6 +500,13 @@ fn discover_amd_gpus_in(sysfs: &Path) -> Vec<DiscoveredGpu> {
             // A partition's render node links to an amdgpu_xcp platform device,
             // which has none of these attributes, so read the PCI device.
             let device_path = sysfs.join("bus/pci/devices").join(&pci_bdf);
+            if !device_path.exists() {
+                warn!(
+                    pci_bdf = %pci_bdf,
+                    render_minor = node.render_minor,
+                    "decoded PCI device does not exist in sysfs; attributes will be missing"
+                );
+            }
 
             let gpu_type = if node.device_id != 0 {
                 detect_amd_gpu_type_from_id(node.device_id)
