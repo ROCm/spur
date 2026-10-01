@@ -516,7 +516,7 @@ pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> S
     )
 }
 
-/// Bash prefix shared by PMIx direct-launch wrappers (multi-node per-rank fork).
+/// Bash prefix every PMIx rank needs, however many share the node.
 ///
 /// Open MPI 4.x expects `PMIX_SERVER_URI4`/`URI3`; the same aliases exist in
 /// `spurd::mpi_plugin` and `crates/spur-mpi-pmix/c/pmix_server.c`.
@@ -675,11 +675,17 @@ pub fn build_multi_task_wrapper(
     wrapper
 }
 
-/// Bash wrapper for a single labeled task (one task per node in fan-out steps).
-pub fn build_labeled_single_task_wrapper(
+/// Bash wrapper for the sole task on a node.
+///
+/// A PMIx rank needs this wrapper even unlabeled: it is the only place
+/// `$HOME/spur/mpi/env.sh` and the `PMIX_SERVER_URI` aliases are applied, and a
+/// rank that misses them cannot find the MPI it was linked against.
+pub fn build_single_task_wrapper(
     user_script_path: &str,
     procid: u32,
     environment: Option<&HashMap<String, String>>,
+    label: bool,
+    mpi: bool,
 ) -> String {
     let escaped = user_script_path.replace('"', "\\\"");
     let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
@@ -697,7 +703,18 @@ pub fn build_labeled_single_task_wrapper(
         _ => Vec::new(),
     };
     let taskset_prefix = cpu_bind_bash_prefix(&bind, &map_cpus);
-    format!("#!/bin/bash\n{taskset_prefix}bash \"{escaped}\" 2>&1 | sed \"s/^/[{procid}] /\"\n")
+    let mut wrapper = String::from("#!/bin/bash\n");
+    if mpi {
+        wrapper.push_str(&mpi_direct_task_preamble(""));
+    }
+    if label {
+        wrapper.push_str(&format!(
+            "{taskset_prefix}bash \"{escaped}\" 2>&1 | sed \"s/^/[{procid}] /\"\n"
+        ));
+    } else {
+        wrapper.push_str(&format!("exec {taskset_prefix}bash \"{escaped}\"\n"));
+    }
+    wrapper
 }
 
 #[cfg(test)]
@@ -1102,8 +1119,29 @@ mod tests {
 
     #[test]
     fn labeled_single_task_wrapper_applies_sed_prefix() {
-        let script = build_labeled_single_task_wrapper("/tmp/step.sh", 4, None);
+        let script = build_single_task_wrapper("/tmp/step.sh", 4, None, true, false);
         assert!(script.contains("sed \"s/^/[4] /\""));
+    }
+
+    #[test]
+    fn a_lone_rank_still_gets_the_mpi_environment() {
+        let script = build_single_task_wrapper("/tmp/step.sh", 0, None, false, true);
+        assert!(
+            script.contains("${HOME}/spur/mpi/env.sh"),
+            "one rank on a node must source env.sh too, or it cannot find its MPI:\n{script}"
+        );
+        assert!(
+            script.contains("PMIX_SERVER_URI4"),
+            "Open MPI 4.x needs the URI aliases whatever the rank count:\n{script}"
+        );
+    }
+
+    #[test]
+    fn a_lone_non_mpi_task_gets_no_mpi_environment() {
+        let script = build_single_task_wrapper("/tmp/step.sh", 0, None, false, false);
+        assert!(!script.contains("spur/mpi/env.sh"), "{script}");
+        assert!(!script.contains("PMIX_SERVER_URI4"), "{script}");
+        assert!(script.contains("exec bash \"/tmp/step.sh\""), "{script}");
     }
 
     #[test]
