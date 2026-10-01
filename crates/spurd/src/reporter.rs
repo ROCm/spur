@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
@@ -15,6 +16,13 @@ use spur_proto::proto::{
 use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Ceiling on a single register/heartbeat/deregister/recovery RPC — these are fast,
+/// bounded calls, unlike a controller-to-agent launch, so a hung one means wedged.
+const CONTROLLER_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a controller endpoint that just failed is deprioritized, so it can't
+/// "recapture" every reconnect attempt before the next one is due.
+const FAILOVER_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Source of the job ids this node currently holds. The controller decides from
 /// its own authoritative state whether any reported id is stale.
@@ -60,6 +68,9 @@ pub struct NodeReporter {
     allocation: std::sync::OnceLock<Arc<Mutex<NodeAllocation>>>,
     /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
     k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
+    /// Endpoint a dial/RPC most recently failed against, and until when the next
+    /// attempt should prefer a different one. `None` once the cooldown lapses.
+    last_failed_endpoint: std::sync::Mutex<Option<(String, Instant)>>,
 }
 
 impl NodeReporter {
@@ -90,6 +101,81 @@ impl NodeReporter {
             held_jobs,
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
+            last_failed_endpoint: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Controller endpoints for the next dial. Skips a host that failed within the last
+    /// [`FAILOVER_COOLDOWN`], provided there's another one to prefer instead.
+    fn dial_endpoints(&self) -> String {
+        let guard = self.last_failed_endpoint.lock().unwrap();
+        match &*guard {
+            Some((bad, until)) if Instant::now() < *until => {
+                spur_client::deprioritize_first(&self.controller_addr, bad)
+            }
+            _ => self.controller_addr.clone(),
+        }
+    }
+
+    /// Record that `endpoints`' first entry just failed to dial or answer, so the next
+    /// attempt (from any RPC on this reporter) prefers a different host for a while.
+    fn note_dial_failure(&self, endpoints: &str) {
+        let Some(first) = spur_client::parse_endpoints(endpoints).into_iter().next() else {
+            return;
+        };
+        *self.last_failed_endpoint.lock().unwrap() =
+            Some((first, Instant::now() + FAILOVER_COOLDOWN));
+    }
+
+    /// Connect, run `op`, bound to [`CONTROLLER_RPC_TIMEOUT`]. A transport failure or
+    /// timeout deprioritizes the endpoint; an app-level rejection doesn't.
+    async fn with_controller<T, F, Fut>(
+        &self,
+        op: F,
+    ) -> Result<T, crate::controller_auth::ConnectAuthError>
+    where
+        F: FnOnce(crate::controller_auth::ControllerClient) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        self.with_controller_timeout(CONTROLLER_RPC_TIMEOUT, op)
+            .await
+    }
+
+    /// Same as [`Self::with_controller`] with an explicit bound, so tests can exercise
+    /// the real timeout/failover mechanism without waiting out the production value.
+    async fn with_controller_timeout<T, F, Fut>(
+        &self,
+        timeout: Duration,
+        op: F,
+    ) -> Result<T, crate::controller_auth::ConnectAuthError>
+    where
+        F: FnOnce(crate::controller_auth::ControllerClient) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        let endpoints = self.dial_endpoints();
+        let attempt = async {
+            let client = crate::controller_auth::connect(&endpoints).await?;
+            op(client)
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(crate::controller_auth::ConnectAuthError::Status)
+        };
+        match tokio::time::timeout(timeout, attempt).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => {
+                if is_transport_failure(&e) {
+                    self.note_dial_failure(&endpoints);
+                }
+                Err(e)
+            }
+            Err(_elapsed) => {
+                self.note_dial_failure(&endpoints);
+                Err(crate::controller_auth::ConnectAuthError::Status(
+                    tonic::Status::deadline_exceeded(format!(
+                        "controller RPC timed out after {timeout:?}"
+                    )),
+                ))
+            }
         }
     }
 
@@ -153,29 +239,24 @@ impl NodeReporter {
     /// the reporter baseline, so a failed register leaves the baseline unchanged
     /// and the next tick re-detects the same delta and retries.
     pub async fn register_with(&self, resources: &ResourceSet) -> anyhow::Result<()> {
-        let mut client = crate::controller_auth::connect(&self.controller_addr)
-            .await
-            .context("failed to connect to spurctld for registration")?;
-
         let mut labels = self.labels.clone();
         labels.insert("spur.stepd".into(), "1".into());
 
-        let resources = resource_to_proto(resources);
-        let resp = client
-            .register_agent(RegisterAgentRequest {
-                hostname: self.hostname.clone(),
-                resources: Some(resources),
-                version: env!("CARGO_PKG_VERSION").into(),
-                address: self.node_address.ip.clone(),
-                port: self.node_address.port as u32,
-                wg_pubkey: self.wg_pubkey(),
-                labels,
-                join_token: self.join_token.clone(),
-            })
+        let req = RegisterAgentRequest {
+            hostname: self.hostname.clone(),
+            resources: Some(resource_to_proto(resources)),
+            version: env!("CARGO_PKG_VERSION").into(),
+            address: self.node_address.ip.clone(),
+            port: self.node_address.port as u32,
+            wg_pubkey: self.wg_pubkey(),
+            labels,
+            join_token: self.join_token.clone(),
+        };
+        let inner = self
+            .with_controller(move |mut client| async move { client.register_agent(req).await })
             .await
             .context("registration failed")?;
 
-        let inner = resp.into_inner();
         if inner.accepted {
             warn_without_node_identity(&inner.node_token);
             if !inner.node_token.is_empty() {
@@ -191,17 +272,12 @@ impl NodeReporter {
 
     /// Notify the controller that this agent is shutting down.
     pub async fn deregister(&self, reason: &str) -> anyhow::Result<()> {
-        let current_token = self.node_token.read().unwrap().clone();
-        let mut client = crate::controller_auth::connect(&self.controller_addr)
-            .await
-            .context("failed to connect to spurctld for deregistration")?;
-
-        client
-            .deregister_agent(spur_proto::proto::DeregisterAgentRequest {
-                hostname: self.hostname.clone(),
-                node_token: current_token,
-                reason: reason.to_string(),
-            })
+        let req = spur_proto::proto::DeregisterAgentRequest {
+            hostname: self.hostname.clone(),
+            node_token: self.node_token.read().unwrap().clone(),
+            reason: reason.to_string(),
+        };
+        self.with_controller(move |mut client| async move { client.deregister_agent(req).await })
             .await
             .context("deregistration RPC failed")?;
 
@@ -216,26 +292,24 @@ impl NodeReporter {
         step_id: spur_core::step::StepId,
         stale_descriptor: bool,
     ) -> anyhow::Result<StepdRecoveryResponse> {
-        let mut client = crate::controller_auth::connect(&self.controller_addr)
-            .await
-            .context("failed to connect to spurctld for runtime recovery")?;
         let node_token = self
             .node_token
             .read()
             .map_err(|_| anyhow::anyhow!("runtime recovery node token lock poisoned"))?
             .clone();
-        let response = client
-            .report_stepd_recovery(StepdRecoveryRequest {
-                hostname: self.hostname.clone(),
-                job_id,
-                run_attempt,
-                node_token,
-                stale_descriptor,
-                step_id,
-            })
-            .await
-            .context("runtime recovery report failed")?;
-        Ok(response.into_inner())
+        let req = StepdRecoveryRequest {
+            hostname: self.hostname.clone(),
+            job_id,
+            run_attempt,
+            node_token,
+            stale_descriptor,
+            step_id,
+        };
+        self.with_controller(
+            move |mut client| async move { client.report_stepd_recovery(req).await },
+        )
+        .await
+        .context("runtime recovery report failed")
     }
 
     /// Periodic heartbeat loop.
@@ -250,43 +324,42 @@ impl NodeReporter {
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = self.node_token.read().unwrap().clone();
             let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
+            let req = spur_proto::proto::HeartbeatRequest {
+                hostname: self.hostname.clone(),
+                cpu_load: load,
+                free_memory_mb: free_mem,
+                running_jobs,
+                node_token: current_token,
+                wg_pubkey: self.wg_pubkey(),
+                k0s_status: self.k0s_status.get().map(|s| {
+                    let (unit_active, restart_count, install_secs) = s.take_for_heartbeat();
+                    spur_proto::proto::K0sNodeStatus {
+                        unit_active,
+                        restart_count,
+                        install_duration_seconds: install_secs,
+                    }
+                }),
+            };
 
-            match crate::controller_auth::connect(&self.controller_addr).await {
-                Ok(mut client) => {
-                    match client
-                        .heartbeat(spur_proto::proto::HeartbeatRequest {
-                            hostname: self.hostname.clone(),
-                            cpu_load: load,
-                            free_memory_mb: free_mem,
-                            running_jobs,
-                            node_token: current_token,
-                            wg_pubkey: self.wg_pubkey(),
-                            k0s_status: self.k0s_status.get().map(|s| {
-                                let (unit_active, restart_count, install_secs) =
-                                    s.take_for_heartbeat();
-                                spur_proto::proto::K0sNodeStatus {
-                                    unit_active,
-                                    restart_count,
-                                    install_duration_seconds: install_secs,
-                                }
-                            }),
-                        })
-                        .await
-                    {
-                        Ok(_) => debug!(load, free_mem, "heartbeat sent"),
-                        Err(e) if should_reregister(&e) => {
-                            warn!(
-                                error = %e,
-                                "controller does not recognize this node; re-registering"
-                            );
-                            if let Err(e) = self.register().await {
-                                warn!(error = %e, "re-registration after heartbeat rejection failed");
-                            }
-                        }
-                        Err(e) => warn!(error = %e, "heartbeat failed"),
+            // This await is bounded by `with_controller`'s own timeout, so a wedged
+            // controller can never stall this loop past one tick.
+            match self
+                .with_controller(move |mut client| async move { client.heartbeat(req).await })
+                .await
+            {
+                Ok(_) => debug!(load, free_mem, "heartbeat sent"),
+                Err(crate::controller_auth::ConnectAuthError::Status(status))
+                    if should_reregister(&status) =>
+                {
+                    warn!(
+                        error = %status,
+                        "controller does not recognize this node; re-registering"
+                    );
+                    if let Err(e) = self.register().await {
+                        warn!(error = %e, "re-registration after heartbeat rejection failed");
                     }
                 }
-                Err(e) => warn!(error = %e, "heartbeat connection failed"),
+                Err(e) => warn!(error = %e, "heartbeat failed"),
             }
         }
     }
@@ -315,6 +388,17 @@ fn build_running_jobs(
 /// this the agent would heartbeat into the same rejection forever.
 fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
+}
+
+/// Whether a connect/RPC failure means the dialed endpoint is unreachable or wedged,
+/// as opposed to a healthy host answering with an application-level rejection.
+fn is_transport_failure(e: &crate::controller_auth::ConnectAuthError) -> bool {
+    match e {
+        crate::controller_auth::ConnectAuthError::Transport(_) => true,
+        crate::controller_auth::ConnectAuthError::Status(status) => {
+            spur_proto::controller_rpc_retryable(status)
+        }
+    }
 }
 
 /// Jobs are supervised either way; without a signing key the controller takes a
@@ -977,9 +1061,13 @@ mod tests {
     }
 
     fn test_reporter(resources: ResourceSet) -> NodeReporter {
+        test_reporter_with_addr(resources, "http://localhost:6817".into())
+    }
+
+    fn test_reporter_with_addr(resources: ResourceSet, controller_addr: String) -> NodeReporter {
         NodeReporter::new(
             "test-node".into(),
-            "http://localhost:6817".into(),
+            controller_addr,
             resources,
             spur_net::NodeAddress {
                 ip: "127.0.0.1".into(),
@@ -993,6 +1081,117 @@ mod tests {
             std::path::PathBuf::from("/etc/wireguard"),
             Arc::new(Mutex::new(HashMap::<u32, ()>::new())),
         )
+    }
+
+    #[test]
+    fn dial_endpoints_prefers_original_order_once_the_cooldown_lapses() {
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), "http://a:1,http://b:1".into());
+        *reporter.last_failed_endpoint.lock().unwrap() =
+            Some(("http://a:1".into(), Instant::now() - Duration::from_secs(1)));
+        assert_eq!(reporter.dial_endpoints(), "http://a:1,http://b:1");
+    }
+
+    #[test]
+    fn dial_endpoints_deprioritizes_a_still_cooling_down_endpoint() {
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), "http://a:1,http://b:1".into());
+        *reporter.last_failed_endpoint.lock().unwrap() = Some((
+            "http://a:1".into(),
+            Instant::now() + Duration::from_secs(30),
+        ));
+        assert_eq!(reporter.dial_endpoints(), "http://b:1,http://a:1");
+    }
+
+    /// Accept a TCP connection and never read or write on it again — the shape of
+    /// the production incident this fix targets.
+    async fn stuck_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _stream = stream;
+            std::future::pending::<()>().await
+        });
+        addr
+    }
+
+    /// A real tonic server that doesn't implement SlurmController, so any RPC on it
+    /// answers fast with an error instead of hanging — a stand-in for a healthy peer.
+    async fn responsive_non_controller_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let (_health_reporter, health) = tonic_health::server::health_reporter();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(health)
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        addr
+    }
+
+    async fn heartbeat_op(
+        mut client: crate::controller_auth::ControllerClient,
+    ) -> Result<tonic::Response<spur_proto::proto::HeartbeatResponse>, tonic::Status> {
+        client
+            .heartbeat(spur_proto::proto::HeartbeatRequest::default())
+            .await
+    }
+
+    #[tokio::test]
+    async fn rpc_against_a_stuck_peer_errors_out_instead_of_hanging_forever() {
+        let stuck = stuck_listener().await;
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{stuck}"));
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
+        )
+        .await
+        .expect("must resolve well within the configured RPC timeout, not hang");
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_rpc_makes_the_next_dial_prefer_the_other_host() {
+        let stuck = stuck_listener().await;
+        let healthy = responsive_non_controller_server().await;
+        let reporter = test_reporter_with_addr(
+            rset(8, 0, vec![]),
+            format!("http://{stuck},http://{healthy}"),
+        );
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(3),
+            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
+        )
+        .await
+        .expect("bounded by the configured RPC timeout");
+        assert!(first.is_err(), "the stuck peer must not answer");
+
+        assert_eq!(
+            reporter.dial_endpoints(),
+            format!("http://{healthy},http://{stuck}"),
+            "the endpoint that just timed out must be deprioritized"
+        );
+
+        let start = Instant::now();
+        let second = tokio::time::timeout(
+            Duration::from_secs(3),
+            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
+        )
+        .await
+        .expect("bounded by the configured RPC timeout");
+        assert!(second.is_err(), "unimplemented on the stand-in server");
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "a dial that reaches the responsive host must not wait out the stuck one's timeout"
+        );
     }
 
     #[test]

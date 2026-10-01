@@ -69,11 +69,48 @@ pub async fn connect_channel(endpoints: &str) -> Result<Channel, tonic::transpor
     try_connect(&list[last]).await
 }
 
+/// Dial budget only — the handshake resolves as soon as we send our own preface, so a
+/// peer that accepts TCP but never engages dials fine; keepalive below catches that.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Liveness for an established channel: a peer that accepts TCP then stops answering is
+/// torn down after roughly the interval plus the timeout, independent of any in-flight RPC.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn try_connect(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
-    Endpoint::from_shared(endpoint.to_string())?
-        .connect_timeout(Duration::from_secs(2))
-        .connect()
-        .await
+    configure_endpoint(
+        endpoint,
+        CONNECT_TIMEOUT,
+        KEEP_ALIVE_INTERVAL,
+        KEEP_ALIVE_TIMEOUT,
+    )?
+    .connect()
+    .await
+}
+
+/// Shared builder so tests can exercise the real keepalive wiring with short
+/// durations instead of waiting out the production ones.
+fn configure_endpoint(
+    endpoint: &str,
+    connect_timeout: Duration,
+    keep_alive_interval: Duration,
+    keep_alive_timeout: Duration,
+) -> Result<Endpoint, tonic::transport::Error> {
+    Ok(Endpoint::from_shared(endpoint.to_string())?
+        .connect_timeout(connect_timeout)
+        .http2_keep_alive_interval(keep_alive_interval)
+        .keep_alive_timeout(keep_alive_timeout)
+        .keep_alive_while_idle(true))
+}
+
+/// Rotate `avoid` to the back when it's the first entry, so a caller that just saw it
+/// fail doesn't dial it first again. A no-op when it isn't first or there's only one.
+pub fn deprioritize_first(endpoints: &str, avoid: &str) -> String {
+    let mut list = parse_endpoints(endpoints);
+    if list.len() > 1 && list.first().map(String::as_str) == Some(avoid) {
+        list.rotate_left(1);
+    }
+    list.join(",")
 }
 
 #[cfg(test)]
@@ -151,6 +188,62 @@ mod tests {
         let up = spawn_server().await;
         let endpoints = format!("http://{down1},http://{down2},http://{up}");
         assert!(connect_channel(&endpoints).await.is_ok());
+    }
+
+    #[test]
+    fn deprioritize_first_rotates_the_failed_endpoint_to_the_back() {
+        assert_eq!(
+            deprioritize_first("http://a:1,http://b:1,http://c:1", "http://a:1"),
+            "http://b:1,http://c:1,http://a:1"
+        );
+    }
+
+    #[test]
+    fn deprioritize_first_is_a_no_op_when_the_failed_endpoint_is_not_first() {
+        assert_eq!(
+            deprioritize_first("http://a:1,http://b:1", "http://b:1"),
+            "http://a:1,http://b:1"
+        );
+    }
+
+    #[test]
+    fn deprioritize_first_is_a_no_op_with_a_single_endpoint() {
+        assert_eq!(deprioritize_first("http://a:1", "http://a:1"), "http://a:1");
+    }
+
+    /// A peer that accepts TCP and never engages at the app layer must not hang an
+    /// RPC forever; the outer timeout is a bound a regression would blow through.
+    #[tokio::test]
+    async fn stuck_peer_rpc_errors_out_via_keepalive_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _stream = stream;
+            std::future::pending::<()>().await
+        });
+
+        let channel = configure_endpoint(
+            &format!("http://{addr}"),
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .expect("valid endpoint")
+        .connect()
+        .await
+        .expect("dial succeeds even though the peer is silent");
+
+        let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.check(tonic_health::pb::HealthCheckRequest::default()),
+        )
+        .await
+        .expect("keepalive must bound the hung RPC, not let it hang forever");
+        assert!(result.is_err(), "RPC against a silent peer must fail");
     }
 
     /// Bind to an ephemeral port and release it, yielding an address that will
