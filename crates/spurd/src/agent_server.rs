@@ -1924,6 +1924,10 @@ async fn fence_dead_stepd(
             "could not confirm the crashed stepd's cgroup is empty; releasing tracking anyway"
         );
     }
+    // Release the local allocation before reporting, so the controller never
+    // dispatches a new job into this slot before it's actually free.
+    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+
     // The supervisor cannot be recovered, but its death still has to reach the
     // controller: unreported, the job holds its allocation in Running forever.
     let reported = report_completion(
@@ -1953,8 +1957,6 @@ async fn fence_dead_stepd(
             "could not report a dead stepd's completion; the retry loop will replay it"
         );
     }
-
-    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
 
     // The supervisor is gone, so no completion push is coming; without this the
     // RPC that launched this step stays parked for the agent's lifetime.
@@ -2077,6 +2079,16 @@ async fn handle_completion_notification(
             crate::stepd::AgentNotificationResponse::Acknowledged
         }
         Some(descriptor) => {
+            // Release the local allocation before reporting, so the controller
+            // never dispatches a new job into this slot before it's actually free.
+            release_stepd_tracking(
+                &context.running,
+                &context.allocation,
+                &context.stepds,
+                &descriptor,
+                "runtime completion",
+            )
+            .await;
             let reported = report_completion(
                 &context.controller_addr,
                 CompletionReport {
@@ -2090,14 +2102,6 @@ async fn handle_completion_notification(
                     }),
                     step_id: Some(step_id),
                 },
-            )
-            .await;
-            release_stepd_tracking(
-                &context.running,
-                &context.allocation,
-                &context.stepds,
-                &descriptor,
-                "runtime completion",
             )
             .await;
             // A user step's exit ends the RPC that launched it, not the job, so
@@ -10954,6 +10958,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fence_dead_stepd_releases_tracking_before_reporting() {
+        let (controller_addr, _reports, _drains, gate) = spawn_gated_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let descriptor = fenced_session(&store);
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(allocation.lock().await.commit_job(42, 1));
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut context = fence_context(
+            &running,
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            &store,
+        );
+        context.controller_addr = controller_addr;
+
+        let handler = tokio::spawn(async move { fence_dead_stepd(&context, descriptor).await });
+
+        // While the ReportJobStatus RPC is still withheld, local tracking must
+        // already be gone — proving release happens before the report, not after.
+        gate.started.notified().await;
+        assert!(!running.lock().await.contains_key(&42));
+        assert!(!sessions
+            .lock()
+            .await
+            .contains_key(&(42, spur_core::step::STEP_BATCH)));
+
+        gate.release.notify_one();
+        handler.await.expect("fence_dead_stepd task");
+    }
+
+    #[tokio::test]
     async fn fencing_leaves_an_unacknowledged_completion_for_the_retry_loop() {
         let state = tempfile::tempdir().expect("runtime state directory");
         let store = crate::stepd::StepdStore::new(state.path());
@@ -11781,6 +11838,54 @@ mod tests {
             .lock()
             .await
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
+    }
+
+    #[tokio::test]
+    async fn handle_completion_notification_releases_tracking_before_reporting() {
+        let (controller_addr, _reports, _drains, gate) = spawn_gated_mock_controller();
+        let (context, running, sessions, _state_dir) =
+            completion_listener_fixture(&controller_addr).await;
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::stepd::AgentNotification::StepdCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            step_id: spur_core::step::STEP_BATCH,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+
+        // While the ReportJobStatus RPC is still withheld, local tracking must
+        // already be gone — proving release happens before the report, not after.
+        gate.started.notified().await;
+        assert!(!running.lock().await.contains_key(&42));
+        assert!(!sessions
+            .lock()
+            .await
+            .contains_key(&(42, spur_core::step::STEP_BATCH)));
+
+        gate.release.notify_one();
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::stepd::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
     }
 
     #[tokio::test]
@@ -16940,6 +17045,16 @@ mod tests {
     struct MockController {
         reports: Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>,
         drains: DrainRequests,
+        report_gate: Option<Arc<ReportGate>>,
+    }
+
+    /// Lets a test observe a `ReportJobStatus` RPC genuinely in flight: the
+    /// mock notifies `started` on receipt, then blocks on `release` before
+    /// responding, so the caller can assert state while the report is withheld.
+    #[derive(Default)]
+    struct ReportGate {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
     }
 
     /// Notify-backed so a positive-case test can await the drain instead of
@@ -16965,6 +17080,10 @@ mod tests {
                         .lock()
                         .expect("completion reports")
                         .push(request.into_inner());
+                    if let Some(gate) = &self.report_gate {
+                        gate.started.notify_one();
+                        gate.release.notified().await;
+                    }
                     Ok(tonic::Response::new(()))
                 }
                 async fn drain_node(
@@ -17047,6 +17166,28 @@ mod tests {
     type DrainRequests = Arc<DrainLog>;
 
     fn spawn_mock_controller() -> (String, CompletionReports, DrainRequests) {
+        let (addr, reports, drains, _gate) = spawn_mock_controller_with_gate(None);
+        (addr, reports, drains)
+    }
+
+    /// Like `spawn_mock_controller`, but `ReportJobStatus` withholds its
+    /// response until the test calls `gate.release.notify_one()`, so a test
+    /// can observe state while that RPC is genuinely still in flight.
+    fn spawn_gated_mock_controller() -> (String, CompletionReports, DrainRequests, Arc<ReportGate>)
+    {
+        let gate = Arc::new(ReportGate::default());
+        let (addr, reports, drains, _) = spawn_mock_controller_with_gate(Some(gate.clone()));
+        (addr, reports, drains, gate)
+    }
+
+    fn spawn_mock_controller_with_gate(
+        report_gate: Option<Arc<ReportGate>>,
+    ) -> (
+        String,
+        CompletionReports,
+        DrainRequests,
+        Option<Arc<ReportGate>>,
+    ) {
         let incoming = tonic::transport::server::TcpIncoming::bind(
             "127.0.0.1:0".parse().expect("loopback address"),
         )
@@ -17057,6 +17198,7 @@ mod tests {
         let service = MockController {
             reports: reports.clone(),
             drains: drains.clone(),
+            report_gate: report_gate.clone(),
         };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
@@ -17064,7 +17206,7 @@ mod tests {
                 .serve_with_incoming(incoming)
                 .await;
         });
-        (format!("http://{addr}"), reports, drains)
+        (format!("http://{addr}"), reports, drains, report_gate)
     }
 
     fn test_reporter_with_controller(controller_addr: &str) -> Arc<NodeReporter> {

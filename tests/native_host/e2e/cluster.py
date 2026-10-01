@@ -940,6 +940,10 @@ class SpurCluster:
         raw = self.nodes[node_index].read_file(f"{self.log_dir}/spurd.log")
         return re.sub(r"\x1b\[[0-9;]*m", "", raw)
 
+    def spurctld_log(self, node_index: int = 0) -> str:
+        raw = self.nodes[node_index].read_file(f"{self.log_dir}/spurctld.log")
+        return re.sub(r"\x1b\[[0-9;]*m", "", raw)
+
     def spurd_registry_gpu_count(self, node_index: int = 0) -> int | None:
         """Parse cdi_devices count from spurd startup log."""
         log = self.spurd_log(node_index)
