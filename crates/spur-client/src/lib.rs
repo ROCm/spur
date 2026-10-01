@@ -52,12 +52,23 @@ fn endpoint_list(raw: &str) -> Vec<String> {
 /// routes writes to the current Raft leader, so a single reachable node is
 /// sufficient regardless of which one is the leader.
 pub async fn connect_channel(endpoints: &str) -> Result<Channel, tonic::transport::Error> {
+    connect_channel_tracked(endpoints)
+        .await
+        .map(|(channel, _)| channel)
+}
+
+/// Same as [`connect_channel`], but also returns the endpoint that was actually dialed —
+/// a caller blaming a later failure on "the first configured endpoint" would otherwise
+/// blame the wrong host whenever an earlier one failed fast and this call fell through.
+pub async fn connect_channel_tracked(
+    endpoints: &str,
+) -> Result<(Channel, String), tonic::transport::Error> {
     let list = endpoint_list(endpoints);
     let last = list.len() - 1;
 
     for endpoint in &list[..last] {
         match try_connect(endpoint).await {
-            Ok(channel) => return Ok(channel),
+            Ok(channel) => return Ok((channel, endpoint.clone())),
             Err(e) => debug!(
                 %endpoint,
                 error = %e,
@@ -66,7 +77,9 @@ pub async fn connect_channel(endpoints: &str) -> Result<Channel, tonic::transpor
         }
     }
 
-    try_connect(&list[last]).await
+    try_connect(&list[last])
+        .await
+        .map(|channel| (channel, list[last].clone()))
 }
 
 /// Dial budget only — the handshake resolves as soon as we send our own preface, so a
@@ -103,12 +116,16 @@ fn configure_endpoint(
         .keep_alive_while_idle(true))
 }
 
-/// Rotate `avoid` to the back when it's the first entry, so a caller that just saw it
-/// fail doesn't dial it first again. A no-op when it isn't first or there's only one.
-pub fn deprioritize_first(endpoints: &str, avoid: &str) -> String {
+/// Move `avoid` to the back of the endpoint list, wherever it currently sits, so a
+/// caller that just saw it fail doesn't dial it again first. A no-op when it's absent
+/// or there's only one endpoint.
+pub fn deprioritize(endpoints: &str, avoid: &str) -> String {
     let mut list = parse_endpoints(endpoints);
-    if list.len() > 1 && list.first().map(String::as_str) == Some(avoid) {
-        list.rotate_left(1);
+    if list.len() > 1 {
+        if let Some(pos) = list.iter().position(|e| e == avoid) {
+            let bad = list.remove(pos);
+            list.push(bad);
+        }
     }
     list.join(",")
 }
@@ -191,24 +208,43 @@ mod tests {
     }
 
     #[test]
-    fn deprioritize_first_rotates_the_failed_endpoint_to_the_back() {
+    fn deprioritize_moves_the_failed_first_endpoint_to_the_back() {
         assert_eq!(
-            deprioritize_first("http://a:1,http://b:1,http://c:1", "http://a:1"),
+            deprioritize("http://a:1,http://b:1,http://c:1", "http://a:1"),
             "http://b:1,http://c:1,http://a:1"
         );
     }
 
     #[test]
-    fn deprioritize_first_is_a_no_op_when_the_failed_endpoint_is_not_first() {
+    fn deprioritize_moves_a_failed_middle_endpoint_to_the_back() {
         assert_eq!(
-            deprioritize_first("http://a:1,http://b:1", "http://b:1"),
+            deprioritize("http://a:1,http://b:1,http://c:1", "http://b:1"),
+            "http://a:1,http://c:1,http://b:1"
+        );
+    }
+
+    #[test]
+    fn deprioritize_is_a_no_op_when_the_endpoint_is_absent() {
+        assert_eq!(
+            deprioritize("http://a:1,http://b:1", "http://z:1"),
             "http://a:1,http://b:1"
         );
     }
 
     #[test]
-    fn deprioritize_first_is_a_no_op_with_a_single_endpoint() {
-        assert_eq!(deprioritize_first("http://a:1", "http://a:1"), "http://a:1");
+    fn deprioritize_is_a_no_op_with_a_single_endpoint() {
+        assert_eq!(deprioritize("http://a:1", "http://a:1"), "http://a:1");
+    }
+
+    #[tokio::test]
+    async fn connect_channel_tracked_reports_the_endpoint_it_actually_dialed() {
+        let down = free_addr().await;
+        let up = spawn_server().await;
+        let endpoints = format!("http://{down},http://{up}");
+        let (_channel, dialed) = connect_channel_tracked(&endpoints)
+            .await
+            .expect("second endpoint is reachable");
+        assert_eq!(dialed, format!("http://{up}"));
     }
 
     /// A peer that accepts TCP and never engages at the app layer must not hang an

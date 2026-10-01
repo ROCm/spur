@@ -75,14 +75,6 @@ pub fn install(plugin: &str, cluster_name: &str) {
     }
 }
 
-/// Dial the controller and attach a native bearer when the plugin is `spur`.
-pub async fn connect(endpoints: &str) -> Result<ControllerClient, ConnectAuthError> {
-    let channel = spur_client::connect_channel(endpoints)
-        .await
-        .map_err(ConnectAuthError::Transport)?;
-    wrap(channel).await.map_err(ConnectAuthError::Status)
-}
-
 pub async fn wrap(channel: Channel) -> Result<ControllerClient, Status> {
     let interceptor = match NATIVE_SOCKET.get().cloned().flatten() {
         None => AgentControllerInterceptor::default(),

@@ -68,8 +68,8 @@ pub struct NodeReporter {
     allocation: std::sync::OnceLock<Arc<Mutex<NodeAllocation>>>,
     /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
     k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
-    /// Endpoint a dial/RPC most recently failed against, and until when the next
-    /// attempt should prefer a different one. `None` once the cooldown lapses.
+    /// Endpoint a dial/RPC most recently failed against, and until when to prefer a
+    /// different one. Left stale once the cooldown lapses; never read past then.
     last_failed_endpoint: std::sync::Mutex<Option<(String, Instant)>>,
 }
 
@@ -111,24 +111,25 @@ impl NodeReporter {
         let guard = self.last_failed_endpoint.lock().unwrap();
         match &*guard {
             Some((bad, until)) if Instant::now() < *until => {
-                spur_client::deprioritize_first(&self.controller_addr, bad)
+                spur_client::deprioritize(&self.controller_addr, bad)
             }
             _ => self.controller_addr.clone(),
         }
     }
 
-    /// Record that `endpoints`' first entry just failed to dial or answer, so the next
-    /// attempt (from any RPC on this reporter) prefers a different host for a while.
-    fn note_dial_failure(&self, endpoints: &str) {
-        let Some(first) = spur_client::parse_endpoints(endpoints).into_iter().next() else {
+    /// Record that `endpoint` just failed to dial or answer, so the next attempt
+    /// (from any RPC on this reporter) prefers a different host for a while.
+    fn note_dial_failure(&self, endpoint: &str) {
+        if endpoint.is_empty() {
             return;
-        };
+        }
         *self.last_failed_endpoint.lock().unwrap() =
-            Some((first, Instant::now() + FAILOVER_COOLDOWN));
+            Some((endpoint.to_string(), Instant::now() + FAILOVER_COOLDOWN));
     }
 
     /// Connect, run `op`, bound to [`CONTROLLER_RPC_TIMEOUT`]. A transport failure or
-    /// timeout deprioritizes the endpoint; an app-level rejection doesn't.
+    /// timeout deprioritizes the endpoint that was actually dialed; an app-level
+    /// rejection doesn't.
     async fn with_controller<T, F, Fut>(
         &self,
         op: F,
@@ -153,23 +154,35 @@ impl NodeReporter {
         Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
         let endpoints = self.dial_endpoints();
-        let attempt = async {
-            let client = crate::controller_auth::connect(&endpoints).await?;
+        // `connect_channel_tracked` may skip past a dead-fast entry before dialing
+        // succeeds; this records which one actually answered the dial so a later
+        // failure blames that host, not just whichever entry is listed first.
+        let dialed = Arc::new(std::sync::Mutex::new(None::<String>));
+        let record_dialed = Arc::clone(&dialed);
+        let attempt = async move {
+            let (channel, endpoint) = spur_client::connect_channel_tracked(&endpoints)
+                .await
+                .map_err(crate::controller_auth::ConnectAuthError::Transport)?;
+            *record_dialed.lock().unwrap() = Some(endpoint);
+            let client = crate::controller_auth::wrap(channel)
+                .await
+                .map_err(crate::controller_auth::ConnectAuthError::Status)?;
             op(client)
                 .await
                 .map(tonic::Response::into_inner)
                 .map_err(crate::controller_auth::ConnectAuthError::Status)
         };
+        let blame = move || dialed.lock().unwrap().clone().unwrap_or_default();
         match tokio::time::timeout(timeout, attempt).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(e)) => {
                 if is_transport_failure(&e) {
-                    self.note_dial_failure(&endpoints);
+                    self.note_dial_failure(&blame());
                 }
                 Err(e)
             }
             Err(_elapsed) => {
-                self.note_dial_failure(&endpoints);
+                self.note_dial_failure(&blame());
                 Err(crate::controller_auth::ConnectAuthError::Status(
                     tonic::Status::deadline_exceeded(format!(
                         "controller RPC timed out after {timeout:?}"
@@ -341,8 +354,8 @@ impl NodeReporter {
                 }),
             };
 
-            // This await is bounded by `with_controller`'s own timeout, so a wedged
-            // controller can never stall this loop past one tick.
+            // Bounded by `with_controller`'s own timeout, so a controller that goes
+            // silent on the network can't stall this loop past one tick.
             match self
                 .with_controller(move |mut client| async move { client.heartbeat(req).await })
                 .await
@@ -1142,6 +1155,15 @@ mod tests {
             .await
     }
 
+    /// Bind then release a port, yielding an address that refuses connections fast —
+    /// distinct from `stuck_listener`, which accepts but never answers.
+    async fn refusing_addr() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        listener.local_addr().expect("local addr")
+    }
+
     #[tokio::test]
     async fn rpc_against_a_stuck_peer_errors_out_instead_of_hanging_forever() {
         let stuck = stuck_listener().await;
@@ -1191,6 +1213,48 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_millis(250),
             "a dial that reaches the responsive host must not wait out the stuck one's timeout"
+        );
+    }
+
+    /// The wedged host isn't always first: a dead-fast entry can precede it, with a
+    /// healthy third entry after. Blame must attach to the host actually dialed (the
+    /// wedged one, not the dead-fast one), and the reorder must be able to move an
+    /// endpoint out of a non-first position so the healthy third host gets reached.
+    #[tokio::test]
+    async fn failover_reaches_a_healthy_host_behind_a_wedged_middle_entry() {
+        let dead = refusing_addr().await;
+        let stuck = stuck_listener().await;
+        let healthy = responsive_non_controller_server().await;
+        let reporter = test_reporter_with_addr(
+            rset(8, 0, vec![]),
+            format!("http://{dead},http://{stuck},http://{healthy}"),
+        );
+
+        let first = tokio::time::timeout(
+            Duration::from_secs(3),
+            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
+        )
+        .await
+        .expect("bounded by the configured RPC timeout");
+        assert!(first.is_err(), "the wedged middle host must not answer");
+
+        assert_eq!(
+            reporter.dial_endpoints(),
+            format!("http://{dead},http://{healthy},http://{stuck}"),
+            "blame must land on the host actually dialed (stuck), not the dead-fast one"
+        );
+
+        let start = Instant::now();
+        let second = tokio::time::timeout(
+            Duration::from_secs(3),
+            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
+        )
+        .await
+        .expect("bounded by the configured RPC timeout");
+        assert!(second.is_err(), "unimplemented on the stand-in server");
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "the next dial must reach the healthy host instead of the still-wedged one"
         );
     }
 
