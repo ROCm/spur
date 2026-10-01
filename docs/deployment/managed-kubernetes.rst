@@ -340,6 +340,9 @@ cluster's CA would fail the next join with a ``kubernetes-ca`` verification
 error. To switch the CNI, tear down with ``--reset`` and bring the cluster back
 up with the new ``cni`` setting.
 
+``--reset`` does not remove the k0s binary, ``/etc/k0s``, the CNI files or the iptables
+rules. To remove the cluster and Spur from a host completely, see :ref:`uninstall-k0s`.
+
 For Users
 ---------
 
