@@ -8545,7 +8545,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_job_step_caps_the_stored_name() {
-        use spur_core::step::MAX_STEP_NAME_LEN;
+        use spur_core::step::MAX_STEP_NAME_BYTES;
 
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
@@ -8569,7 +8569,7 @@ mod tests {
             .find(|s| spur_core::step::is_user_step(s.step_id))
             .expect("the srun step must be recorded");
         assert!(
-            step.name.len() <= MAX_STEP_NAME_LEN,
+            step.name.len() <= MAX_STEP_NAME_BYTES,
             "stored name is {} bytes",
             step.name.len()
         );
@@ -8587,6 +8587,16 @@ mod tests {
             .find(|s| spur_core::step::is_user_step(s.step_id))
             .expect("the srun step must be served");
         assert_eq!(wire.name, step.name);
+
+        // Truncating on read instead of before the propose would leave the
+        // full argv here, and every snapshot would carry it.
+        let snapshot = crate::raft::StateMachineApply::snapshot_state(&*svc.cluster)
+            .expect("snapshot must serialize");
+        assert!(
+            snapshot.len() < 8192,
+            "snapshot is {} bytes — the raw argv reached it",
+            snapshot.len()
+        );
     }
 
     /// Submit and start a single-node job owned by `owner`, returning its id.

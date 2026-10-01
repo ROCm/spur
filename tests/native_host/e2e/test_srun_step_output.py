@@ -10,8 +10,8 @@ drive real steps through an allocation shell and assert their output reaches
 the client intact.
 """
 
-# Mirrors MAX_STEP_NAME_LEN in crates/spur-core/src/step.rs.
-_MAX_STEP_NAME_LEN = 256
+# Mirrors MAX_STEP_NAME_BYTES in crates/spur-core/src/step.rs.
+_MAX_STEP_NAME_BYTES = 256
 
 
 class TestSrunStepOutput:
@@ -44,17 +44,20 @@ class TestSrunStepOutput:
 
     def test_long_command_line_does_not_become_the_step_name(self, cluster):
         # The controller stores the argv as the step name, so an unbounded one
-        # is replicated into every Raft entry and snapshot.
+        # lands in the Raft entry and is re-serialized into every snapshot.
         code, out = cluster.salloc_run(
             'srun bash -c "echo LONG-ARGV-DONE; true $(head -c 20000 /dev/zero | tr \'\\0\' x)"\n'
-            'scontrol show step "$SPUR_JOB_ID" | grep -v "StepId=[0-9]*\\.batch"\n'
+            'scontrol show step "$SPUR_JOB_ID"\n'
         )
         assert code == 0, out
         assert "LONG-ARGV-DONE" in out, out
 
-        step_lines = [ln for ln in out.splitlines() if "StepName=" in ln]
-        assert step_lines, out
-        for line in step_lines:
-            name = line.split("StepName=", 1)[1].split(" State=", 1)[0]
-            assert len(name.encode()) <= _MAX_STEP_NAME_LEN, f"{len(name)} bytes: {line[:400]}"
-        assert any(ln.rstrip().split(" State=", 1)[0].endswith("...") for ln in step_lines), out
+        names = [
+            ln.split("StepName=", 1)[1].split(" State=", 1)[0]
+            for ln in out.splitlines()
+            if "StepName=" in ln
+        ]
+        assert names, out
+        for name in names:
+            assert len(name.encode()) <= _MAX_STEP_NAME_BYTES, f"{len(name.encode())}B: {name[:400]}"
+        assert any(n.endswith("...") for n in names), out

@@ -65,19 +65,21 @@ pub fn step_dir_name(step_id: StepId) -> String {
     format!("step_{}", step_display_name(step_id))
 }
 
-/// Upper bound, in bytes, on a stored step name — inclusive of the marker a
-/// truncated name ends with.
-pub const MAX_STEP_NAME_LEN: usize = 256;
+/// Upper bound on a stored step name — inclusive of the marker a truncated
+/// name ends with.
+pub const MAX_STEP_NAME_BYTES: usize = 256;
 
 const STEP_NAME_TRUNCATION_MARKER: &str = "...";
 
-/// Bound a step name to `MAX_STEP_NAME_LEN`. Callers must apply this before
-/// proposing the step, so every replica applies the identical stored name.
+const _: () = assert!(MAX_STEP_NAME_BYTES > STEP_NAME_TRUNCATION_MARKER.len());
+
+/// Bound a step name. Callers must apply this before proposing the step, never
+/// in apply or snapshot restore — a mixed-version quorum would then diverge.
 pub fn truncate_step_name(name: String) -> String {
-    if name.len() <= MAX_STEP_NAME_LEN {
+    if name.len() <= MAX_STEP_NAME_BYTES {
         return name;
     }
-    let mut end = MAX_STEP_NAME_LEN - STEP_NAME_TRUNCATION_MARKER.len();
+    let mut end = MAX_STEP_NAME_BYTES - STEP_NAME_TRUNCATION_MARKER.len();
     while !name.is_char_boundary(end) {
         end -= 1;
     }
@@ -433,18 +435,18 @@ mod tests {
     fn truncate_step_name_passes_short_names_through() {
         assert_eq!(truncate_step_name(String::new()), "");
         assert_eq!(truncate_step_name("hostname".into()), "hostname");
-        let under = "a".repeat(MAX_STEP_NAME_LEN - 1);
+        let under = "a".repeat(MAX_STEP_NAME_BYTES - 1);
         assert_eq!(truncate_step_name(under.clone()), under);
     }
 
     #[test]
     fn truncate_step_name_keeps_a_name_exactly_at_the_bound() {
-        let exact = "a".repeat(MAX_STEP_NAME_LEN);
+        let exact = "a".repeat(MAX_STEP_NAME_BYTES);
         assert_eq!(truncate_step_name(exact.clone()), exact);
 
-        let over_by_one = "a".repeat(MAX_STEP_NAME_LEN + 1);
+        let over_by_one = "a".repeat(MAX_STEP_NAME_BYTES + 1);
         let capped = truncate_step_name(over_by_one);
-        assert_eq!(capped.len(), MAX_STEP_NAME_LEN);
+        assert_eq!(capped.len(), MAX_STEP_NAME_BYTES);
         assert!(capped.ends_with("..."));
     }
 
@@ -452,36 +454,35 @@ mod tests {
     fn truncate_step_name_caps_an_oversized_name() {
         let huge = "x".repeat(80_000);
         let capped = truncate_step_name(huge);
-        assert_eq!(capped.len(), MAX_STEP_NAME_LEN);
-        assert_eq!(capped, format!("{}...", "x".repeat(MAX_STEP_NAME_LEN - 3)));
+        assert_eq!(capped.len(), MAX_STEP_NAME_BYTES);
+        assert_eq!(
+            capped,
+            format!("{}...", "x".repeat(MAX_STEP_NAME_BYTES - 3))
+        );
     }
 
     #[test]
     fn truncate_step_name_never_splits_a_multibyte_char() {
-        // A 3-byte char straddles the cut for every offset the prefix can put
-        // it at, so this sweeps all three in-char boundary positions.
-        for pad in 0..3 {
-            let name = format!("{}{}", "a".repeat(pad), "€".repeat(MAX_STEP_NAME_LEN));
+        // An ASCII prefix of 0/1/2 puts the cut at all three in-char offsets of
+        // a 3-byte char, so backing off to a boundary loses 1/0/2 bytes.
+        for (pad, expected) in [(0, 255), (1, 256), (2, 254)] {
+            let name = format!("{}{}", "a".repeat(pad), "€".repeat(MAX_STEP_NAME_BYTES));
             let capped = truncate_step_name(name);
-            assert!(
-                capped.len() <= MAX_STEP_NAME_LEN,
-                "pad {pad}: {}",
-                capped.len()
-            );
-            assert!(
-                capped.len() > MAX_STEP_NAME_LEN - 3 - 3,
-                "pad {pad}: cut too much"
-            );
+            assert_eq!(capped.len(), expected, "pad {pad}");
             assert!(capped.ends_with("..."), "pad {pad}");
-            assert!(std::str::from_utf8(capped.as_bytes()).is_ok(), "pad {pad}");
+            let body = capped.trim_end_matches("...");
+            assert!(
+                body.chars().all(|c| c == 'a' || c == '€'),
+                "pad {pad}: {body}"
+            );
         }
     }
 
     #[test]
     fn truncate_step_name_handles_a_4_byte_char_at_the_boundary() {
-        let name = "🚀".repeat(MAX_STEP_NAME_LEN);
+        let name = "🚀".repeat(MAX_STEP_NAME_BYTES);
         let capped = truncate_step_name(name);
-        assert!(capped.len() <= MAX_STEP_NAME_LEN);
+        assert!(capped.len() <= MAX_STEP_NAME_BYTES);
         assert!(capped.ends_with("..."));
         let body = capped.trim_end_matches("...");
         assert!(body.chars().all(|c| c == '🚀'), "{body}");
