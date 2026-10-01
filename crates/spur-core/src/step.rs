@@ -482,7 +482,7 @@ mod tests {
     fn truncate_step_name_handles_a_4_byte_char_at_the_boundary() {
         let name = "🚀".repeat(MAX_STEP_NAME_BYTES);
         let capped = truncate_step_name(name);
-        assert!(capped.len() <= MAX_STEP_NAME_BYTES);
+        assert_eq!(capped.len(), 255);
         assert!(capped.ends_with("..."));
         let body = capped.trim_end_matches("...");
         assert!(body.chars().all(|c| c == '🚀'), "{body}");
@@ -506,7 +506,7 @@ mod tests {
         };
         let encoded = serde_json::to_string(&step).expect("serialize");
         assert!(
-            encoded.len() < 1024,
+            encoded.len() < 600,
             "encoded step still oversized: {}",
             encoded.len()
         );

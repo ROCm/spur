@@ -60,4 +60,6 @@ class TestSrunStepOutput:
         assert names, out
         for name in names:
             assert len(name.encode()) <= _MAX_STEP_NAME_BYTES, f"{len(name.encode())}B: {name[:400]}"
-        assert any(n.endswith("...") for n in names), out
+        capped = [n for n in names if n.endswith("...")]
+        assert len(capped) == 1, names
+        assert capped[0].startswith("bash -c echo LONG-ARGV-DONE"), capped[0]

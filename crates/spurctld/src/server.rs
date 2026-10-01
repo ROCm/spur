@@ -8588,15 +8588,27 @@ mod tests {
             .expect("the srun step must be served");
         assert_eq!(wire.name, step.name);
 
-        // Truncating on read instead of before the propose would leave the
-        // full argv here, and every snapshot would carry it.
-        let snapshot = crate::raft::StateMachineApply::snapshot_state(&*svc.cluster)
-            .expect("snapshot must serialize");
-        assert!(
-            snapshot.len() < 8192,
-            "snapshot is {} bytes — the raw argv reached it",
-            snapshot.len()
-        );
+        // Entries are serialized when proposed, so capping in the apply path
+        // instead would leave the raw argv here and diverge a mixed quorum.
+        let proposed = read_job_step_create_name(dir.path());
+        assert_eq!(proposed, step.name);
+    }
+
+    fn read_job_step_create_name(state_dir: &std::path::Path) -> String {
+        let log_dir = state_dir.join("raft").join("log");
+        let mut names: Vec<String> = std::fs::read_dir(&log_dir)
+            .expect("raft log dir must exist")
+            .filter_map(|e| std::fs::read(e.expect("log entry").path()).ok())
+            .filter_map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .filter_map(|v| {
+                let step = v.pointer("/payload/Normal/JobStepCreate/step")?;
+                let name = step.get("name")?.as_str()?;
+                spur_core::step::is_user_step(step.get("step_id")?.as_u64()? as u32)
+                    .then(|| name.to_string())
+            })
+            .collect();
+        assert_eq!(names.len(), 1, "expected exactly one user-step propose");
+        names.remove(0)
     }
 
     /// Submit and start a single-node job owned by `owner`, returning its id.
