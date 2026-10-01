@@ -2854,7 +2854,7 @@ impl SlurmController for ControllerService {
         let step = spur_core::step::JobStep {
             job_id,
             step_id,
-            name: spur_core::step::truncate_step_name(req.command.join(" ")),
+            name: req.command.join(" "),
             state: spur_core::step::StepState::Running,
             num_tasks: req.num_tasks.max(1),
             cpus_per_task: req.cpus_per_task.max(1),
@@ -8595,16 +8595,24 @@ mod tests {
     }
 
     fn read_job_step_create_name(state_dir: &std::path::Path) -> String {
+        use crate::raft::SpurTypeConfig;
+        use openraft::{Entry, EntryPayload};
+        use spur_core::wal::WalOperation;
+
         let log_dir = state_dir.join("raft").join("log");
         let mut names: Vec<String> = std::fs::read_dir(&log_dir)
             .expect("raft log dir must exist")
-            .filter_map(|e| std::fs::read(e.expect("log entry").path()).ok())
-            .filter_map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
-            .filter_map(|v| {
-                let step = v.pointer("/payload/Normal/JobStepCreate/step")?;
-                let name = step.get("name")?.as_str()?;
-                spur_core::step::is_user_step(step.get("step_id")?.as_u64()? as u32)
-                    .then(|| name.to_string())
+            .map(|e| std::fs::read(e.expect("log entry").path()).expect("read log entry"))
+            .map(|raw| {
+                serde_json::from_slice::<Entry<SpurTypeConfig>>(&raw).expect("decode log entry")
+            })
+            .filter_map(|entry| match entry.payload {
+                EntryPayload::Normal(WalOperation::JobStepCreate { step })
+                    if spur_core::step::is_user_step(step.step_id) =>
+                {
+                    Some(step.name)
+                }
+                _ => None,
             })
             .collect();
         assert_eq!(names.len(), 1, "expected exactly one user-step propose");

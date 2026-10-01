@@ -75,18 +75,14 @@ const _: () = assert!(MAX_STEP_NAME_BYTES > STEP_NAME_TRUNCATION_MARKER.len());
 
 /// Bound a step name. Callers must apply this before proposing the step, never
 /// in apply or snapshot restore — a mixed-version quorum would then diverge.
-pub fn truncate_step_name(name: String) -> String {
+pub fn truncate_step_name(mut name: String) -> String {
     if name.len() <= MAX_STEP_NAME_BYTES {
         return name;
     }
-    let mut end = MAX_STEP_NAME_BYTES - STEP_NAME_TRUNCATION_MARKER.len();
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut truncated = name;
-    truncated.truncate(end);
-    truncated.push_str(STEP_NAME_TRUNCATION_MARKER);
-    truncated
+    let end = name.floor_char_boundary(MAX_STEP_NAME_BYTES - STEP_NAME_TRUNCATION_MARKER.len());
+    name.truncate(end);
+    name.push_str(STEP_NAME_TRUNCATION_MARKER);
+    name
 }
 
 /// A step within a job.
@@ -443,7 +439,10 @@ mod tests {
     fn truncate_step_name_keeps_a_name_exactly_at_the_bound() {
         let exact = "a".repeat(MAX_STEP_NAME_BYTES);
         assert_eq!(truncate_step_name(exact.clone()), exact);
+    }
 
+    #[test]
+    fn truncate_step_name_caps_a_name_one_byte_over_the_bound() {
         let over_by_one = "a".repeat(MAX_STEP_NAME_BYTES + 1);
         let capped = truncate_step_name(over_by_one);
         assert_eq!(capped.len(), MAX_STEP_NAME_BYTES);
