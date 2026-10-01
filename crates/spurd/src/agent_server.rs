@@ -2955,7 +2955,10 @@ fn supervised_step_script(
     let namespaced_command = [
         "/bin/sh".to_string(),
         "-c".to_string(),
-        format!("cd {wd} 2>/dev/null; exec {inner}"),
+        format!(
+            "cd {wd} 2>/dev/null; {}; exec {inner}",
+            executor::DRI_ROCR_BASH
+        ),
     ];
     let plan = build_launch_plan(job_entry, priv_drop.as_ref(), &namespaced_command);
     let entering = shlex::try_join(
