@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.14.1](https://github.com/ROCm/spur/compare/v0.14.0...v0.14.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **spurctld:** advance run_attempt on every aborted/held dispatch ([#970](https://github.com/ROCm/spur/issues/970)) ([96464f9](https://github.com/ROCm/spur/commit/96464f944ad030c76f378fef0cad794656b51ae4))
+* **spurctld:** cap the stored srun step name ([#969](https://github.com/ROCm/spur/issues/969)) ([33ac656](https://github.com/ROCm/spur/commit/33ac656b6499ac8a23c782f9c875031fcb9967a6))
+* **spurd:** run node prolog for standalone srun allocations ([#955](https://github.com/ROCm/spur/issues/955)) ([dcce7c7](https://github.com/ROCm/spur/commit/dcce7c787ab366204375a817e3c6506c0d8834a7))
+* **spurd:** wire the host device plan into srun steps and interactive sessions ([#954](https://github.com/ROCm/spur/issues/954)) ([1141866](https://github.com/ROCm/spur/commit/11418664fd13c2d0aabe117c814184d329e17496))
+
 ## [0.14.0](https://github.com/ROCm/spur/compare/v0.13.0...v0.14.0) (2026-09-30)
 
 
