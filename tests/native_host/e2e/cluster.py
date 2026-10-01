@@ -1354,7 +1354,14 @@ tar -C "$R" -czf '{local_tar}' .
     # --- Internal helpers ---
 
     def _create_dirs(self):
+        # Job ids restart at 1 on every cluster, and a spurd killed before job
+        # end leaves its job spool behind. A step can then pick up a previous
+        # cluster's spool file, so a live tail of its output ends empty.
+        spool_jobs = '/var/spool/spur/job* "${TMPDIR:-/tmp}"/spur/job*'
         for node in self.nodes:
+            node.exec_allow_fail(
+                f"{self._sudo_prefix()}rm -rf {spool_jobs} 2>/dev/null || rm -rf {spool_jobs}"
+            )
             node.exec_allow_fail(f"rm -rf '{self.remote_dir}'")
             node.exec(f"mkdir -p '{self.remote_dir}' '{self.etc_dir}' '{self.state_dir}' '{self.log_dir}'")
 
