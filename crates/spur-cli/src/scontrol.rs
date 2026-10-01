@@ -567,23 +567,20 @@ fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> St
 }
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
+    let entity = entity.to_lowercase();
+    // Parsed before connecting so a malformed id surfaces its own error, not a connect failure.
+    let job_ids = match entity.as_str() {
+        "job" | "jobs" => parse_show_job_ids(name)?,
+        _ => Vec::new(),
+    };
+
     let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    match entity.to_lowercase().as_str() {
+    match entity.as_str() {
         "job" | "jobs" => {
-            // A named job must be a numeric id. Reject a typo with its own error
-            // and a non-zero exit instead of querying id 0 and printing nothing,
-            // which is indistinguishable from a job that has aged out of the queue.
-            let job_ids = match normalize_show_name(name) {
-                Some(n) => vec![n
-                    .parse::<u32>()
-                    .map_err(|_| anyhow::anyhow!("Invalid job id specified: {n}"))?],
-                None => Vec::new(),
-            };
-
             let resp = client
                 .get_jobs(spur_proto::proto::GetJobsRequest {
                     job_ids,
@@ -1646,6 +1643,17 @@ fn normalize_show_name(name: Option<&str>) -> Option<&str> {
     name.map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// Job-id filter for `scontrol show job [id]`; an empty list requests every job.
+fn parse_show_job_ids(name: Option<&str>) -> Result<Vec<u32>> {
+    let Some(n) = normalize_show_name(name) else {
+        return Ok(Vec::new());
+    };
+    let id = n
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid job id specified: {n}"))?;
+    Ok(vec![id])
+}
+
 /// Split a comma-separated list into trimmed, non-empty entries.
 fn split_csv(s: &str) -> Vec<String> {
     s.split(',')
@@ -2628,27 +2636,33 @@ mod tests {
         assert!(capture.update_node_names().is_empty());
     }
 
+    #[test]
+    fn parse_show_job_ids_rejects_a_malformed_id() {
+        for bad in ["abc", "12abc", "4294967296"] {
+            let err = parse_show_job_ids(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("Invalid job id specified: {bad}")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_show_job_ids_accepts_an_id_or_none() {
+        assert_eq!(parse_show_job_ids(Some(" 42 ")).unwrap(), vec![42]);
+        assert!(parse_show_job_ids(None).unwrap().is_empty());
+    }
+
     #[tokio::test]
-    async fn scontrol_show_job_rejects_a_malformed_id() {
-        // A non-numeric job id is a typo, not a job that aged out: it must fail
-        // with its own error and a non-zero exit rather than querying id 0 and
-        // printing nothing. The mock's get_jobs is unimplemented, so an error
-        // that names the bad id (rather than an RPC failure) proves the parse
-        // short-circuits before any request is sent.
-        let (addr, _capture) = crate::mock_controller::spawn().await;
-        let err = main_with_args(vec![
-            "scontrol".into(),
-            "--controller".into(),
-            format!("http://{addr}"),
-            "show".into(),
-            "job".into(),
-            "abc".into(),
-        ])
-        .await
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Invalid job id"), "{msg}");
-        assert!(msg.contains("abc"), "error should echo the input: {msg}");
+    async fn show_job_rejects_a_malformed_id_before_contacting_the_controller() {
+        // Nothing listens on port 1, so any network I/O would fail with a connect error first.
+        let err = show("http://127.0.0.1:1", "job", Some("abc"))
+            .await
+            .expect_err("a malformed job id must fail");
+        assert!(
+            err.to_string().contains("Invalid job id specified: abc"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
