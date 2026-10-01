@@ -482,6 +482,30 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, ``step``, or
    spur show node node01
    scontrol show partition gpu
 
+Expanding node lists — ``scontrol show hostnames`` / ``hostlist``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``scontrol show hostnames`` expands a hostlist expression to one host per line;
+``scontrol show hostlist`` (and ``hostlistsorted``) does the reverse, compressing
+a list back into the bracketed form. Both are pure local transforms: they never
+contact the controller, so they work inside a batch script on any compute node.
+
+With no argument, ``hostnames`` reads ``SLURM_JOB_NODELIST`` (Spur also honors
+``SPUR_JOB_NODELIST``), which makes it the standard way to derive a rendezvous
+address or an MPI hostfile from an allocation:
+
+.. code-block:: bash
+
+   scontrol show hostnames 'gpu[01-03]'      # -> gpu01 / gpu02 / gpu03, one per line
+   scontrol show hostlist gpu03,gpu01,gpu02  # -> gpu[01-03]
+
+   # Inside a job: first allocated node as the rendezvous host, all nodes to a hostfile.
+   export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"
+   scontrol show hostnames > "$HOME/hostfile.$SLURM_JOB_ID"
+
+``hostlist`` and ``hostlistsorted`` produce identical output in Spur: both remove
+duplicates and sort before compressing.
+
 Diagnosing a job that will not start
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
