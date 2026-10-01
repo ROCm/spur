@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::env_defaults::{
-    apply_csv, apply_flag, apply_num, apply_num_opt, apply_str, was_cli_set,
+    apply_csv, apply_flag, apply_num, apply_num_opt, apply_str, apply_string, was_cli_set,
 };
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, Parser};
@@ -190,6 +190,10 @@ pub struct SrunArgs {
     /// Epilog script to run locally after step completion
     #[arg(long)]
     pub epilog: Option<String>,
+
+    /// Export environment variables
+    #[arg(long, default_value = "ALL", overrides_with = "export")]
+    pub export: String,
 
     /// Allocate a pseudo-terminal for the job
     #[arg(long)]
@@ -516,6 +520,14 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         &["SPUR_EPILOG", "SLURM_EPILOG"],
         &mut args.epilog,
     );
+    // Slurm's sbatch sets SLURM_EXPORT_ENV so nested steps inherit its mode.
+    // An explicit `srun --export=ALL` still wins, undoing an inherited NONE.
+    apply_string(
+        matches,
+        "export",
+        &["SPUR_EXPORT_ENV", "SLURM_EXPORT_ENV"],
+        &mut args.export,
+    );
 
     Ok(())
 }
@@ -550,8 +562,11 @@ struct StepDispatchResult {
     exit_code: i32,
 }
 
-fn srun_dispatch_environment(args: &SrunArgs) -> HashMap<String, String> {
-    let mut environment: HashMap<String, String> = std::env::vars().collect();
+fn srun_dispatch_environment(
+    args: &SrunArgs,
+    source: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut environment = crate::export_env::resolve_export_env(&args.export, source);
     if let Some(ref cpu_bind) = args.cpu_bind {
         environment.insert("SPUR_CPU_BIND".into(), cpu_bind.clone());
     }
@@ -592,7 +607,7 @@ fn build_srun_job_spec(
             nanos: 0,
         });
 
-    let environment = srun_dispatch_environment(args);
+    let environment = srun_dispatch_environment(args, std::env::vars().collect());
 
     let memory_mb = args
         .mem
@@ -845,7 +860,7 @@ async fn dispatch_step(
         eprintln!("{warning}");
     }
 
-    let environment = srun_dispatch_environment(args);
+    let environment = srun_dispatch_environment(args, std::env::vars().collect());
     validate_step_cpu_bind(&environment, ntasks)?;
     // Live-stream the step's output when it lands on a single node and the user
     // has not redirected to a file. The tail runs concurrently with the blocking
@@ -1788,11 +1803,12 @@ fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<S
     let env_scoped = args.cpu_bind.is_some()
         || args.gpu_bind.is_some()
         || args.label
-        || crate::env_defaults::was_cli_set(matches, "mpi");
+        || crate::env_defaults::was_cli_set(matches, "mpi")
+        || crate::env_defaults::was_cli_set(matches, "export");
     if env_scoped {
         warnings.push(
             "srun: warning: a --pty step runs in the job's environment; \
-             --cpu-bind/--gpu-bind/--label/--mpi are ignored"
+             --cpu-bind/--gpu-bind/--label/--mpi/--export are ignored"
                 .into(),
         );
     }
@@ -2367,6 +2383,25 @@ mod tests {
         );
     }
 
+    /// Standalone srun creates the job, so --export scopes that job's environment
+    /// even for --pty, whose shell inherits it.
+    #[test]
+    fn build_srun_job_spec_applies_export_to_a_pty_job() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "--pty", "--export=NONE", "bash"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --pty --export=NONE")
+            .expect("spec");
+        assert!(spec
+            .environment
+            .keys()
+            .all(|k| k.starts_with("SLURM_") || k.starts_with("SPUR_")));
+    }
+
     /// Launchers like PRTE's `plm:slurm` always pass `--ntasks-per-node`, so
     /// srun must accept both spellings rather than rejecting the command line.
     #[test]
@@ -2596,6 +2631,81 @@ mod tests {
         env.set("SLURM_PARTITION", "gpu");
         let args = resolve_from(&["srun", "--partition=cpu", "hostname"]);
         assert_eq!(args.partition.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_env_default_applied() {
+        let env = EnvGuard::new();
+        env.set("SLURM_EXPORT_ENV", "NONE");
+        assert_eq!(resolve_from(&["srun", "hostname"]).export, "NONE");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_cli_overrides_env() {
+        let env = EnvGuard::new();
+        env.set("SLURM_EXPORT_ENV", "NONE");
+        assert_eq!(
+            resolve_from(&["srun", "--export=ALL", "hostname"]).export,
+            "ALL"
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_spur_var_precedes_slurm_var() {
+        let env = EnvGuard::new();
+        env.set("SPUR_EXPORT_ENV", "ALL");
+        env.set("SLURM_EXPORT_ENV", "NONE");
+        assert_eq!(resolve_from(&["srun", "hostname"]).export, "ALL");
+    }
+
+    fn dispatch_source() -> HashMap<String, String> {
+        [("PATH", "/usr/bin"), ("SLURM_JOB_ID", "42")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn dispatch_environment_default_forwards_source_unchanged() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(
+            srun_dispatch_environment(&args, dispatch_source()),
+            dispatch_source()
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn dispatch_environment_none_drops_non_scheduler_vars() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&["srun", "--export=NONE", "hostname"]);
+        let dispatch = srun_dispatch_environment(&args, dispatch_source());
+        assert_eq!(dispatch.get("SLURM_JOB_ID").map(String::as_str), Some("42"));
+        assert!(!dispatch.contains_key("PATH"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn dispatch_environment_all_keeps_full_env_and_adds_bindings() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&[
+            "srun",
+            "--cpu-bind=cores",
+            "--export=ALL,FOO=bar",
+            "hostname",
+        ]);
+        let dispatch = srun_dispatch_environment(&args, dispatch_source());
+        assert_eq!(dispatch.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(dispatch.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(
+            dispatch.get("SPUR_CPU_BIND").map(String::as_str),
+            Some("cores")
+        );
     }
 
     #[test]

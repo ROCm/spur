@@ -236,11 +236,35 @@ variables the job inherits. Default is ``ALL``.
 - ``ALL,VAR=value`` — combine the two: forward the full environment and set (or
   override) the named variables on top.
 
+The ``NONE`` and list forms still forward the caller's ``SLURM_*`` and
+``SPUR_*`` variables, matching Slurm, so a job keeps its scheduler context.
+The exception is the ``SPUR_AUTH_TOKEN`` credential, which these forms drop
+unless you name it explicitly (``--export=NONE,SPUR_AUTH_TOKEN``).
+
 .. code-block:: bash
 
    sbatch --export=NONE train.sh
    sbatch --export=DATA_DIR,MODEL_DIR train.sh
    sbatch --export=ALL,MASTER_PORT=29999,WORLD_SIZE=16 train.sh
+
+``ALL`` and ``NONE`` are case-insensitive.
+
+A non-default ``--export`` is recorded in ``SLURM_EXPORT_ENV``, so ``srun``
+steps inside the script inherit the same mode. Under ``NONE`` those steps get
+no ``PATH``, so commands need an absolute path. To give steps the full batch
+environment back, use ``srun --export=ALL`` for one step, or add
+``export SLURM_EXPORT_ENV=ALL`` near the top of the script for all of them.
+``srun`` accepts the same ``--export`` grammar directly.
+
+.. note::
+
+   As in Slurm, running ``sbatch`` from inside an existing job forwards that
+   job's ``SLURM_*``/``SPUR_*`` variables to the new job. The node overwrites
+   job-level variables such as the job ID, node list, and task counts, but
+   leftovers it does not set survive: for example, ``SLURM_ARRAY_TASK_ID`` from
+   a parent array task, or ``SLURM_EXPORT_ENV`` from a parent submitted with
+   ``--export=NONE``. Unset them before submitting if the child job should not
+   see them.
 
 .. _submit-gpus:
 
