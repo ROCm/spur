@@ -3855,8 +3855,11 @@ impl ClusterManager {
         Ok(resp.jobs_finalized)
     }
 
-    /// Create a job step durably via Raft.
-    pub fn create_step(&self, step: JobStep) -> anyhow::Result<()> {
+    /// Create a job step durably via Raft. Caps the step name before proposing:
+    /// doing it later (apply or snapshot restore) would let a mixed-version
+    /// quorum compute divergent state from the same WAL entry.
+    pub fn create_step(&self, mut step: JobStep) -> anyhow::Result<()> {
+        step.name = spur_core::step::truncate_step_name(step.name);
         let job_id = step.job_id;
         let step_id = step.step_id;
         self.propose(WalOperation::JobStepCreate {

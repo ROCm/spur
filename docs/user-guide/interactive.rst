@@ -28,6 +28,11 @@ Inside an allocation, a bare ``srun`` inherits the allocation's size
 (``--ntasks``, ``--cpus-per-task``, nodes, partition, account, QOS), so it runs
 at the allocation's scale unless you override on the command line.
 
+A step is named after the command line that created it. That name is stored
+capped at 256 bytes, so a longer command line is truncated on a character
+boundary and ends in ``...`` where ``scontrol show step`` prints it. The step
+still runs the full command — only the displayed name is shortened.
+
 Common options:
 
 .. list-table::

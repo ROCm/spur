@@ -8543,6 +8543,82 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_caps_the_stored_name() {
+        use spur_core::step::MAX_STEP_NAME_BYTES;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.create_job_step(Request::new(CreateJobStepRequest {
+            job_id,
+            command: vec!["python".into(), "-c".into(), "€".repeat(40_000)],
+            user: "ubuntu".into(),
+            num_tasks: 1,
+            cpus_per_task: 1,
+            overlap: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("step creation must succeed");
+
+        let stored = svc.cluster.get_steps(job_id);
+        let step = stored
+            .iter()
+            .find(|s| spur_core::step::is_user_step(s.step_id))
+            .expect("the srun step must be recorded");
+        assert!(
+            step.name.len() <= MAX_STEP_NAME_BYTES,
+            "stored name is {} bytes",
+            step.name.len()
+        );
+        assert!(step.name.starts_with("python -c "), "{}", step.name);
+        assert!(step.name.ends_with("..."), "{}", step.name);
+
+        let resp = svc
+            .get_job_steps(Request::new(GetJobStepsRequest { job_id }))
+            .await
+            .expect("steps must be readable")
+            .into_inner();
+        let wire = resp
+            .steps
+            .iter()
+            .find(|s| spur_core::step::is_user_step(s.step_id))
+            .expect("the srun step must be served");
+        assert_eq!(wire.name, step.name);
+
+        // Entries are serialized when proposed, so capping in the apply path
+        // instead would leave the raw argv here and diverge a mixed quorum.
+        let proposed = read_job_step_create_name(dir.path());
+        assert_eq!(proposed, step.name);
+    }
+
+    fn read_job_step_create_name(state_dir: &std::path::Path) -> String {
+        use crate::raft::SpurTypeConfig;
+        use openraft::{Entry, EntryPayload};
+        use spur_core::wal::WalOperation;
+
+        let log_dir = state_dir.join("raft").join("log");
+        let mut names: Vec<String> = std::fs::read_dir(&log_dir)
+            .expect("raft log dir must exist")
+            .map(|e| std::fs::read(e.expect("log entry").path()).expect("read log entry"))
+            .map(|raw| {
+                serde_json::from_slice::<Entry<SpurTypeConfig>>(&raw).expect("decode log entry")
+            })
+            .filter_map(|entry| match entry.payload {
+                EntryPayload::Normal(WalOperation::JobStepCreate { step })
+                    if spur_core::step::is_user_step(step.step_id) =>
+                {
+                    Some(step.name)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names.len(), 1, "expected exactly one user-step propose");
+        names.remove(0)
+    }
+
     /// Submit and start a single-node job owned by `owner`, returning its id.
     async fn running_job_owned_by(svc: &ControllerService, owner: &str) -> u32 {
         running_job_owned_by_inner(svc, owner, false).await

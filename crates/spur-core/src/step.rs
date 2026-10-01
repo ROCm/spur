@@ -65,6 +65,26 @@ pub fn step_dir_name(step_id: StepId) -> String {
     format!("step_{}", step_display_name(step_id))
 }
 
+/// Upper bound on a stored step name — inclusive of the marker a truncated
+/// name ends with.
+pub const MAX_STEP_NAME_BYTES: usize = 256;
+
+const STEP_NAME_TRUNCATION_MARKER: &str = "...";
+
+const _: () = assert!(MAX_STEP_NAME_BYTES > STEP_NAME_TRUNCATION_MARKER.len());
+
+/// Bound a step name. Callers must apply this before proposing the step, never
+/// in apply or snapshot restore — a mixed-version quorum would then diverge.
+pub fn truncate_step_name(mut name: String) -> String {
+    if name.len() <= MAX_STEP_NAME_BYTES {
+        return name;
+    }
+    let end = name.floor_char_boundary(MAX_STEP_NAME_BYTES - STEP_NAME_TRUNCATION_MARKER.len());
+    name.truncate(end);
+    name.push_str(STEP_NAME_TRUNCATION_MARKER);
+    name
+}
+
 /// A step within a job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStep {
@@ -405,6 +425,92 @@ mod tests {
         assert_eq!(step_dir_name(STEP_INTERACTIVE), "step_interactive");
         assert_eq!(step_dir_name(0), "step_0");
         assert_eq!(step_dir_name(42), "step_42");
+    }
+
+    #[test]
+    fn truncate_step_name_passes_short_names_through() {
+        assert_eq!(truncate_step_name(String::new()), "");
+        assert_eq!(truncate_step_name("hostname".into()), "hostname");
+        let under = "a".repeat(MAX_STEP_NAME_BYTES - 1);
+        assert_eq!(truncate_step_name(under.clone()), under);
+    }
+
+    #[test]
+    fn truncate_step_name_keeps_a_name_exactly_at_the_bound() {
+        let exact = "a".repeat(MAX_STEP_NAME_BYTES);
+        assert_eq!(truncate_step_name(exact.clone()), exact);
+    }
+
+    #[test]
+    fn truncate_step_name_caps_a_name_one_byte_over_the_bound() {
+        let over_by_one = "a".repeat(MAX_STEP_NAME_BYTES + 1);
+        let capped = truncate_step_name(over_by_one);
+        assert_eq!(capped.len(), MAX_STEP_NAME_BYTES);
+        assert!(capped.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_step_name_caps_an_oversized_name() {
+        let huge = "x".repeat(80_000);
+        let capped = truncate_step_name(huge);
+        assert_eq!(capped.len(), MAX_STEP_NAME_BYTES);
+        assert_eq!(
+            capped,
+            format!("{}...", "x".repeat(MAX_STEP_NAME_BYTES - 3))
+        );
+    }
+
+    #[test]
+    fn truncate_step_name_never_splits_a_multibyte_char() {
+        // An ASCII prefix of 0/1/2 puts the cut at all three in-char offsets of
+        // a 3-byte char, so backing off to a boundary loses 1/0/2 bytes.
+        for (pad, expected) in [(0, 255), (1, 256), (2, 254)] {
+            let name = format!("{}{}", "a".repeat(pad), "€".repeat(MAX_STEP_NAME_BYTES));
+            let capped = truncate_step_name(name);
+            assert_eq!(capped.len(), expected, "pad {pad}");
+            assert!(capped.ends_with("..."), "pad {pad}");
+            let body = capped.trim_end_matches("...");
+            assert!(
+                body.chars().all(|c| c == 'a' || c == '€'),
+                "pad {pad}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_step_name_handles_a_4_byte_char_at_the_boundary() {
+        let name = "🚀".repeat(MAX_STEP_NAME_BYTES);
+        let capped = truncate_step_name(name);
+        assert_eq!(capped.len(), 255);
+        assert!(capped.ends_with("..."));
+        let body = capped.trim_end_matches("...");
+        assert!(body.chars().all(|c| c == '🚀'), "{body}");
+    }
+
+    #[test]
+    fn truncated_step_name_round_trips_through_serde() {
+        let step = JobStep {
+            job_id: 1,
+            step_id: 0,
+            name: truncate_step_name("€".repeat(50_000)),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: ResourceAllocations::default(),
+            nodes: vec!["node001".into()],
+            distribution: TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        };
+        let encoded = serde_json::to_string(&step).expect("serialize");
+        assert!(
+            encoded.len() < 600,
+            "encoded step still oversized: {}",
+            encoded.len()
+        );
+        let decoded: JobStep = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.name, step.name);
     }
 
     #[test]
