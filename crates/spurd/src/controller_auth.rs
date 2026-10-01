@@ -121,7 +121,14 @@ impl std::fmt::Display for ConnectAuthError {
     }
 }
 
-impl std::error::Error for ConnectAuthError {}
+impl std::error::Error for ConnectAuthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(e) => Some(e),
+            Self::Status(e) => Some(e),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

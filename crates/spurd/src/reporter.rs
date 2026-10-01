@@ -1216,10 +1216,8 @@ mod tests {
         );
     }
 
-    /// The wedged host isn't always first: a dead-fast entry can precede it, with a
-    /// healthy third entry after. Blame must attach to the host actually dialed (the
-    /// wedged one, not the dead-fast one), and the reorder must be able to move an
-    /// endpoint out of a non-first position so the healthy third host gets reached.
+    /// A dead-fast entry can precede the wedged host; blame must still land on the
+    /// one actually dialed, and the reorder must reach past it to the healthy third.
     #[tokio::test]
     async fn failover_reaches_a_healthy_host_behind_a_wedged_middle_entry() {
         let dead = refusing_addr().await;

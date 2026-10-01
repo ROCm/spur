@@ -1114,6 +1114,29 @@ mod tests {
         assert!(parse_label("=").is_err());
     }
 
+    /// Built the same way `report_stepd_recovery` builds it: a `ConnectAuthError`
+    /// wrapped in `.context(...)`, not a bare `tonic::Status`. Catches a regression
+    /// where `ConnectAuthError` stops exposing its inner status via `source()`.
+    #[test]
+    fn permanent_recovery_error_is_detected_through_connect_auth_error() {
+        use anyhow::Context;
+        let err: anyhow::Result<()> = Err(controller_auth::ConnectAuthError::Status(
+            tonic::Status::unauthenticated("node token rejected"),
+        ))
+        .context("runtime recovery report failed");
+        assert!(is_permanent_recovery_error(&err.unwrap_err()));
+    }
+
+    #[test]
+    fn a_transient_recovery_error_is_not_permanent() {
+        use anyhow::Context;
+        let err: anyhow::Result<()> = Err(controller_auth::ConnectAuthError::Status(
+            tonic::Status::unavailable("controller unreachable"),
+        ))
+        .context("runtime recovery report failed");
+        assert!(!is_permanent_recovery_error(&err.unwrap_err()));
+    }
+
     #[test]
     fn a_stale_session_without_a_recorded_cgroup_still_names_one_to_reap() {
         let mut descriptor = stepd::StepdDescriptor::new(
