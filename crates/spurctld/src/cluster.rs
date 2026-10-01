@@ -2515,7 +2515,7 @@ impl ClusterManager {
                     JobState::Preempted | JobState::Timeout | JobState::NodeFail
                 ) {
                     drop(jobs);
-                    return self.hold_job_at_max_requeue(job_id);
+                    return self.hold_job_at_max_requeue(job_id, None);
                 }
                 return Ok(());
             }
@@ -2578,7 +2578,7 @@ impl ClusterManager {
             }
             if !hold && job.requeue_count >= self.config().controller.max_batch_requeue {
                 drop(jobs);
-                return self.hold_job_at_max_requeue(job_id);
+                return self.hold_job_at_max_requeue(job_id, None);
             }
             // A job that never reached Running has nothing to requeue: Pending ->
             // Failed is not a legal transition and Pending -> Pending applies as a
@@ -2636,6 +2636,7 @@ impl ClusterManager {
     pub(crate) fn backoff_pending_job_after_dispatch_failure(
         &self,
         job_id: JobId,
+        run_attempt: u32,
     ) -> anyhow::Result<()> {
         let begin_time = {
             let jobs = self.jobs.read();
@@ -2649,12 +2650,16 @@ impl ClusterManager {
             }
             if job.requeue_count >= self.config().controller.max_batch_requeue {
                 drop(jobs);
-                return self.hold_job_at_max_requeue(job_id);
+                return self.hold_job_at_max_requeue(job_id, Some(run_attempt));
             }
             self.launch_backoff_until(job)
         };
 
-        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        self.propose(WalOperation::JobDispatchBackoff {
+            job_id,
+            begin_time,
+            run_attempt,
+        })?;
         info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
         Ok(())
     }
@@ -3126,6 +3131,7 @@ impl ClusterManager {
             pending_reason_desc: None,
             reset_requeue_count: false,
             clear_reservation: false,
+            run_attempt: None,
         })?;
         info!(job_id, "job held");
         Ok(())
@@ -3141,6 +3147,7 @@ impl ClusterManager {
         &self,
         job_id: JobId,
         reason_desc: Option<&str>,
+        run_attempt: u32,
     ) -> anyhow::Result<()> {
         let old_priority = {
             let jobs = self.jobs.read();
@@ -3165,13 +3172,20 @@ impl ClusterManager {
             pending_reason_desc: Some(reason_desc.unwrap_or(LAUNCH_FAILURE_HELD_DESC).to_string()),
             reset_requeue_count: false,
             clear_reservation: false,
+            run_attempt: Some(run_attempt),
         })?;
         info!(job_id, "job held after launch failure");
         Ok(())
     }
 
     /// Hold a job that exhausted automatic requeues (`JobHoldMaxRequeue`).
-    fn hold_job_at_max_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
+    /// `run_attempt` is the dispatch epoch abandoned by the backoff call site;
+    /// `None` where no new epoch was presented this cycle.
+    fn hold_job_at_max_requeue(
+        &self,
+        job_id: JobId,
+        run_attempt: Option<u32>,
+    ) -> anyhow::Result<()> {
         let mut state = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -3228,6 +3242,7 @@ impl ClusterManager {
                 pending_reason_desc: None,
                 reset_requeue_count: false,
                 clear_reservation: false,
+                run_attempt,
             })?;
         }
         info!(job_id, "job held at max requeue limit");
@@ -3259,6 +3274,7 @@ impl ClusterManager {
             pending_reason_desc: None,
             reset_requeue_count: reset_requeue,
             clear_reservation,
+            run_attempt: None,
         })?;
         info!(job_id, "job released");
         Ok(())
@@ -3371,6 +3387,7 @@ impl ClusterManager {
                 pending_reason_desc: None,
                 reset_requeue_count: false,
                 clear_reservation: false,
+                run_attempt: None,
             })?;
         }
 
@@ -6152,7 +6169,11 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                begin_time,
+                run_attempt,
+            } => {
                 // NoOp if the job left Pending since the leader proposed this
                 // (e.g. a concurrent cancel).
                 let Some(job) = jobs.get_mut(job_id) else {
@@ -6164,6 +6185,8 @@ impl ClusterManager {
                 Self::reset_job_for_requeue(job);
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
+                // Monotonic: never regress on an out-of-order/duplicate replay.
+                job.run_attempt = (*run_attempt).max(job.run_attempt);
             }
             WalOperation::JobPreemptRequeue {
                 job_id,
@@ -6490,7 +6513,7 @@ impl ClusterManager {
                     job.per_node_alloc = per_node_alloc.clone();
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
-                    job.run_attempt = *run_attempt;
+                    job.run_attempt = (*run_attempt).max(job.run_attempt);
                     job.idle_fill = *idle_fill;
                     job.launch_failure_detail = None;
                     // A new run supersedes any prior preemption provenance; clear so
@@ -6777,6 +6800,7 @@ impl ClusterManager {
                 pending_reason_desc,
                 reset_requeue_count,
                 clear_reservation,
+                run_attempt,
                 ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -6786,6 +6810,9 @@ impl ClusterManager {
                             Some(desc) => job.set_pending_reason_desc(reason.clone(), desc.clone()),
                             None => job.set_pending_reason(reason.clone()),
                         }
+                    }
+                    if let Some(ra) = run_attempt {
+                        job.run_attempt = (*ra).max(job.run_attempt);
                     }
                     if *reset_requeue_count {
                         job.requeue_count = 0;
@@ -11515,6 +11542,7 @@ mod tests {
             pending_reason_desc: None,
             reset_requeue_count: false,
             clear_reservation: false,
+            run_attempt: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -17643,7 +17671,7 @@ mod tests {
         }
         assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
 
-        cm.hold_job_at_max_requeue(job_id).unwrap();
+        cm.hold_job_at_max_requeue(job_id, None).unwrap();
         wait_for("job held at max requeue", || {
             cm.get_job(job_id).is_some_and(|j| {
                 j.state == JobState::Pending && j.pending_reason == PendingReason::JobHoldMaxRequeue
@@ -18048,7 +18076,7 @@ mod tests {
                 state: JobState::Preempted,
             });
         }
-        cm.hold_job_at_max_requeue(job_id).unwrap();
+        cm.hold_job_at_max_requeue(job_id, None).unwrap();
         wait_for("job held at max requeue", || {
             cm.get_job(job_id)
                 .is_some_and(|j| j.pending_reason == PendingReason::JobHoldMaxRequeue)
@@ -22457,7 +22485,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("prolog-hold"));
 
-        cm.hold_job_for_launch_failure(id, None).unwrap();
+        cm.hold_job_for_launch_failure(id, None, 1).unwrap();
         wait_for("hold applied", || {
             cm.get_job(id).is_some_and(|j| j.priority == 0)
         });
@@ -22499,7 +22527,7 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
-        assert!(cm.hold_job_for_launch_failure(id, None).is_err());
+        assert!(cm.hold_job_for_launch_failure(id, None, 1).is_err());
     }
 
     // backoff_pending_job_after_dispatch_failure is confirm_dispatch_on_nodes's
@@ -22513,7 +22541,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        assert!(cm.backoff_pending_job_after_dispatch_failure(999).is_ok());
+        assert!(cm
+            .backoff_pending_job_after_dispatch_failure(999, 1)
+            .is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22524,7 +22554,7 @@ mod tests {
         cm.cancel_job(id, "testuser").unwrap();
         settle(&cm, id, JobState::Cancelled);
 
-        assert!(cm.backoff_pending_job_after_dispatch_failure(id).is_ok());
+        assert!(cm.backoff_pending_job_after_dispatch_failure(id, 1).is_ok());
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Cancelled);
     }
 
@@ -22534,7 +22564,8 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("backoff-applies"));
 
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, 1)
+            .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
@@ -22546,6 +22577,127 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_attempt_strictly_increases_across_consecutive_aborted_dispatches() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-run-attempt"));
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 0);
+
+        cm.backoff_pending_job_after_dispatch_failure(id, 1)
+            .unwrap();
+        wait_for("first backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
+        });
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 1);
+
+        cm.backoff_pending_job_after_dispatch_failure(id, 2)
+            .unwrap();
+        wait_for("second backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
+        });
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_dispatch_backoff_apply_never_regresses_run_attempt_on_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("backoff-monotonic"));
+
+        cm.backoff_pending_job_after_dispatch_failure(id, 5)
+            .unwrap();
+        wait_for("backoff applied", || {
+            cm.get_job(id).is_some_and(|j| j.run_attempt == 5)
+        });
+
+        // An out-of-order/duplicate replay carrying a stale, lower run_attempt
+        // must never regress the job's current value.
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: id,
+            begin_time: Utc::now(),
+            run_attempt: 2,
+        });
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_at_max_requeue_run_attempt_reflects_last_attempted_epoch() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let max = cm.config().controller.max_batch_requeue;
+        let id = submit_and_wait(&cm, basic_spec("backoff-hold-max-requeue"));
+
+        for attempt in 1..=(max + 1) {
+            cm.backoff_pending_job_after_dispatch_failure(id, attempt)
+                .unwrap();
+        }
+        wait_for("job held at max requeue", || {
+            cm.get_job(id)
+                .is_some_and(|j| j.pending_reason == PendingReason::JobHoldMaxRequeue)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(
+            job.run_attempt,
+            max + 1,
+            "the terminal hold must reflect the last attempted epoch, not just the last confirmed one"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_job_at_max_requeue_running_job_call_sites_pass_no_run_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("preempt-no-run-attempt"));
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Preempted,
+        });
+        let run_attempt_before = cm.get_job(job_id).unwrap().run_attempt;
+
+        // Regression guard: a None call site (no new epoch presented this
+        // cycle) must not disturb the job's existing run_attempt.
+        cm.hold_job_at_max_requeue(job_id, None).unwrap();
+        wait_for("job held at max requeue", || {
+            cm.get_job(job_id)
+                .is_some_and(|j| j.pending_reason == PendingReason::JobHoldMaxRequeue)
+        });
+        assert_eq!(cm.get_job(job_id).unwrap().run_attempt, run_attempt_before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prolog_failure_hold_advances_run_attempt_under_default_hold_on_prolog_fail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert!(
+            cm.config().controller.hold_on_prolog_fail,
+            "this test exercises the default behavior"
+        );
+        let id = submit_and_wait(&cm, basic_spec("prolog-fail-run-attempt"));
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 0);
+
+        cm.hold_job_for_launch_failure(id, Some("prolog check failed"), 3)
+            .unwrap();
+        wait_for("hold applied", || {
+            cm.get_job(id).is_some_and(|j| j.priority == 0)
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::Held);
+        assert_eq!(
+            job.run_attempt, 3,
+            "a held (not backed-off) prolog failure must still advance run_attempt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn job_dispatch_backoff_preserves_launch_failure_detail() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -22553,7 +22705,8 @@ mod tests {
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
             .unwrap();
 
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, 1)
+            .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
@@ -22578,14 +22731,16 @@ mod tests {
 
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n1: timeout".into())
             .unwrap();
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, 1)
+            .unwrap();
         wait_for("first backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
 
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
             .unwrap();
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, 2)
+            .unwrap();
         wait_for("second backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
         });
@@ -22617,6 +22772,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: 999,
             begin_time: Utc::now(),
+            run_attempt: 1,
         });
         assert!(cm.get_job(999).is_none());
     }
@@ -22633,6 +22789,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: id,
             begin_time: Utc::now(),
+            run_attempt: 1,
         });
 
         let job = cm.get_job(id).unwrap();

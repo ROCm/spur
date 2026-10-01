@@ -465,7 +465,9 @@ async fn process_assignment(
                 cancel_job_on_nodes(&cluster, job_id, prospective_run_attempt, &all_nodes, 9).await;
                 // The job never left Pending, so plain requeue is a no-op here — the same
                 // Pending-aware backoff the launch path uses is what actually throttles a retry.
-                if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+                if let Err(e) = cluster
+                    .backoff_pending_job_after_dispatch_failure(job_id, prospective_run_attempt)
+                {
                     error!(job_id, error = %e, "failed to back off after registration failure");
                 }
                 return false;
@@ -2006,9 +2008,10 @@ fn abort_pending_pmix_dispatch(
     cluster: &ClusterManager,
     job_id: spur_core::job::JobId,
     detail: String,
+    run_attempt: u32,
 ) -> DispatchConfirmOutcome {
     let _ = cluster.set_job_launch_failure_detail(job_id, detail);
-    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt) {
         error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
     }
     DispatchConfirmOutcome::Aborted
@@ -2147,6 +2150,7 @@ async fn confirm_dispatch_on_nodes(
                 &cluster,
                 job_id,
                 format!("failed to sign job execution credential: {e}"),
+                run_attempt,
             );
         }
     };
@@ -2167,7 +2171,7 @@ async fn confirm_dispatch_on_nodes(
                 node_agents.len(),
                 dispatch_nodes.len()
             );
-            return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+            return abort_pending_pmix_dispatch(&cluster, job_id, detail, run_attempt);
         }
 
         if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
@@ -2177,7 +2181,8 @@ async fn confirm_dispatch_on_nodes(
         ) {
             error!(job_id, "{detail}");
             let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
-            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail)) {
+            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail), run_attempt)
+            {
                 error!(job_id, error = %e, "failed to hold job for unsupported multi-node PMIx");
             }
             return DispatchConfirmOutcome::Aborted;
@@ -2211,12 +2216,12 @@ async fn confirm_dispatch_on_nodes(
                 Ok(None) => {
                     let detail = format!("job is not configured for PMIx on node {node_name}");
                     error!(job_id, node = %node_name, "{detail}");
-                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                    return abort_pending_pmix_dispatch(&cluster, job_id, detail, run_attempt);
                 }
                 Err(detail) => {
                     let detail = format!("invalid PMIx launch plan for node {node_name}: {detail}");
                     error!(job_id, node = %node_name, "{detail}");
-                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                    return abort_pending_pmix_dispatch(&cluster, job_id, detail, run_attempt);
                 }
             };
             prepare_nodes.push(PmixPrepareNode {
@@ -2239,6 +2244,7 @@ async fn confirm_dispatch_on_nodes(
                 &cluster,
                 job_id,
                 format!("PMIx prepare failed: {detail}"),
+                run_attempt,
             );
         }
         let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
@@ -2393,11 +2399,11 @@ async fn confirm_dispatch_on_nodes(
                 error!(job_id, error = %e, "failed to cancel interactive job after prolog failure");
             }
         } else if let Err(e) =
-            cluster.hold_job_for_launch_failure(job_id, Some(&confirmation_detail))
+            cluster.hold_job_for_launch_failure(job_id, Some(&confirmation_detail), run_attempt)
         {
             error!(job_id, error = %e, "failed to hold job after prolog failure");
         }
-    } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+    } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt) {
         error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
     }
 

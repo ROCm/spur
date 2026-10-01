@@ -805,8 +805,9 @@ pub struct Job {
     #[serde(default)]
     pub user_requeue_count: u32,
 
-    /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
-    /// the controller drop a completion report from a superseded run.
+    /// Monotonic run epoch, bumped on every dispatch attempt (confirmed,
+    /// aborted, or held). Lets the controller drop a completion report
+    /// from a superseded run.
     #[serde(default)]
     pub run_attempt: u32,
 

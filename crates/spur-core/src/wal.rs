@@ -112,6 +112,11 @@ pub enum WalOperation {
         /// When true, clears `spec.reservation` (admin release after reservation delete hold).
         #[serde(default)]
         clear_reservation: bool,
+        /// Dispatch epoch being held/backed-off, so a held or backed-off job's
+        /// `run_attempt` still advances past the poisoned attempt. `None`
+        /// where no new epoch was presented this cycle.
+        #[serde(default)]
+        run_attempt: Option<u32>,
     },
     /// Back off a job that failed dispatch before ever leaving Pending, where
     /// `JobStateChange`'s transition-gated backoff can't apply. NoOp on replay
@@ -119,6 +124,10 @@ pub enum WalOperation {
     JobDispatchBackoff {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
+        /// Dispatch epoch that failed, so the next attempt never re-presents
+        /// the same (now-poisoned) run_attempt. 0 for pre-upgrade entries.
+        #[serde(default)]
+        run_attempt: u32,
     },
     /// Preempt a running job and requeue it in one atomic step: free its node
     /// allocation, end the prior run for accounting (as PREEMPTED), return it to
@@ -605,13 +614,19 @@ mod job_state_change_wal_tests {
         let op = WalOperation::JobDispatchBackoff {
             job_id: 8,
             begin_time: hold,
+            run_attempt: 3,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                begin_time,
+                run_attempt,
+            } => {
                 assert_eq!(job_id, 8);
                 assert_eq!(begin_time, hold);
+                assert_eq!(run_attempt, 3);
             }
             _ => panic!("wrong variant"),
         }
@@ -628,6 +643,25 @@ mod job_state_change_wal_tests {
             } => {
                 assert_eq!(job_id, 3);
                 assert_eq!(begin_time, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pre_upgrade_job_dispatch_backoff_without_run_attempt_deserializes() {
+        // A WAL written before run_attempt existed on this variant must still
+        // replay, defaulting to 0 rather than crashing the controller.
+        let json = r#"{"JobDispatchBackoff":{"job_id":8,"begin_time":"2026-01-01T00:00:00Z"}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                run_attempt,
+                ..
+            } => {
+                assert_eq!(job_id, 8);
+                assert_eq!(run_attempt, 0);
             }
             _ => panic!("wrong variant"),
         }
@@ -652,6 +686,7 @@ mod job_priority_change_wal_tests {
             pending_reason_desc: Some("launch failed requeued held".into()),
             reset_requeue_count: false,
             clear_reservation: false,
+            run_attempt: Some(2),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -661,6 +696,7 @@ mod job_priority_change_wal_tests {
                 new_priority,
                 pending_reason,
                 pending_reason_desc,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(job_id, 4);
@@ -670,16 +706,17 @@ mod job_priority_change_wal_tests {
                     pending_reason_desc.as_deref(),
                     Some("launch failed requeued held")
                 );
+                assert_eq!(run_attempt, Some(2));
             }
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn pre_upgrade_job_priority_change_without_description_deserializes() {
-        // A WAL written before pending_reason_desc existed on this variant
-        // must still replay (e.g. hold_job / release_job entries from before
-        // this fix).
+    fn pre_upgrade_job_priority_change_without_description_or_run_attempt_deserializes() {
+        // A WAL written before pending_reason_desc/run_attempt existed on
+        // this variant must still replay (e.g. hold_job entries from before
+        // either field).
         let json = r#"{"JobPriorityChange":{"job_id":4,"old_priority":500,"new_priority":0,"pending_reason":"Held"}}"#;
         let back: WalOperation = serde_json::from_str(json).unwrap();
         match back {
@@ -689,6 +726,7 @@ mod job_priority_change_wal_tests {
                 pending_reason_desc,
                 reset_requeue_count,
                 clear_reservation,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(job_id, 4);
@@ -696,6 +734,10 @@ mod job_priority_change_wal_tests {
                 assert_eq!(pending_reason_desc, None);
                 assert!(!reset_requeue_count);
                 assert!(!clear_reservation);
+                assert_eq!(
+                    run_attempt, None,
+                    "an entry without the field must stay inert, not advance run_attempt"
+                );
             }
             _ => panic!("wrong variant"),
         }
