@@ -6338,6 +6338,43 @@ impl SlurmAgent for AgentService {
             "registered srun allocation"
         );
 
+        // Node Prolog for standalone srun. The batch/salloc path runs it inline
+        // in `launch_job`; this srun path never reaches that RPC, so run it here
+        // — once per allocation on the node, before the extern stepd (and thus
+        // any step workload) starts. Pairs with the node Epilog the extern
+        // stepd runs on teardown (owns_job_lifetime(STEP_EXTERN)).
+        if let Some(ref prolog) = self.hooks.prolog {
+            let ctx = spur_core::hooks::HookContext {
+                job_id: req.job_id,
+                work_dir: req.work_dir.clone(),
+                uid: req.uid,
+                gid: req.gid,
+                partition: req.partition.clone(),
+                nodelist: req.nodelist.clone(),
+                script_context: "prolog_slurmd".into(),
+                gpu_devices: controller_gpu_ids.clone(),
+                cpus,
+                memory_mb,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
+                error!(job_id = req.job_id, error = %e, "prolog hook failed before srun allocation");
+                // Release what the allocation set up so a failed prolog does not
+                // strand the cgroup; the reservation guard releases on return.
+                if let Some(path) = cgroup_path.as_ref() {
+                    executor::cleanup_cgroup(path);
+                }
+                // Typed failure, not a generic Status: the controller must drain
+                // the node and hold the job (hold_on_prolog_fail), as the
+                // LaunchJob path does, rather than cool the node and retry srun
+                // onto it. The allocation is not tracked, so returning Ok here
+                // leaves nothing registered.
+                return Ok(Response::new(RegisterJobAllocationResponse {
+                    failure_kind: LaunchFailureKind::LaunchFailureProlog as i32,
+                    error: format!("prolog failed: {e:#}"),
+                }));
+            }
+        }
+
         #[cfg(test)]
         let supervise_allocation = !self.force_legacy_launch;
         #[cfg(not(test))]
@@ -6507,7 +6544,10 @@ impl SlurmAgent for AgentService {
         reservation_guard.disarm();
         drop(jobs);
 
-        Ok(Response::new(RegisterJobAllocationResponse {}))
+        Ok(Response::new(RegisterJobAllocationResponse {
+            failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+            error: String::new(),
+        }))
     }
 
     /// Run a one-shot command on this node, used by srun inside an allocation.
@@ -12844,6 +12884,16 @@ mod tests {
         path
     }
 
+    fn touch_hook_script(target: &std::path::Path) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "#!/bin/bash\ntouch {}", target.display()).unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// The refusal driven through the real RPC entry point, not just the helper: a launch asking to
     /// run as root on a root spurd must be denied before anything is spawned. `with_root_override`
     /// makes this deterministic on an unprivileged runner, where the guard would otherwise be inert.
@@ -12966,6 +13016,86 @@ mod tests {
             resp.error.contains("prolog_slurmd script exited with"),
             "the operator needs the script's own failure, got {:?}",
             resp.error
+        );
+    }
+
+    #[tokio::test]
+    async fn node_prolog_runs_for_a_standalone_srun_allocation() {
+        // Standalone srun registers an allocation instead of going through
+        // launch_job, so the node Prolog was never invoked for it. It must
+        // now run once per allocation on the node, before the extern stepd.
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("prolog-ran");
+        let prolog = touch_hook_script(&sentinel);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 307,
+            cpus: 1,
+            ..Default::default()
+        }))
+        .await
+        .expect("register allocation");
+
+        assert!(
+            sentinel.exists(),
+            "the node Prolog must run for a standalone srun allocation"
+        );
+        assert!(
+            svc.running.lock().await.contains_key(&307),
+            "a successful prolog must not block the allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_prolog_fails_the_srun_allocation() {
+        // A prolog gates node access: if it fails, the srun allocation must not
+        // be registered, and the failure must be reported as a typed prolog
+        // failure so the controller drains+holds instead of retrying srun onto
+        // the same node, mirroring how launch_job classifies a batch prolog fail.
+        let prolog = failing_hook_script(1);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let resp = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 308,
+                cpus: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect("a prolog failure is a typed body response, not an RPC error")
+            .into_inner();
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailureProlog as i32,
+            "the failure must be classified as a prolog failure so the \
+             controller drains+holds, got {:?}",
+            resp.failure_kind
+        );
+        assert!(
+            resp.error.contains("prolog failed"),
+            "the failure must be attributable to the prolog, got {:?}",
+            resp.error
+        );
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a failed prolog must not leave a tracked allocation"
         );
     }
 

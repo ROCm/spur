@@ -73,6 +73,19 @@ def _get_ssh_key() -> str | None:
     return key if key else None
 
 
+def _parse_node_entry(entry: str, default_user: str) -> tuple[str, str]:
+    """Split an optional ``user@host`` node entry; falls back to default_user.
+
+    Lets a bed mix SSH identities per node (e.g. a login/controller host
+    reachable as one user and a lab GPU worker reachable as another) without
+    requiring uniform credentials across SPUR_TEST_NODES.
+    """
+    if "@" in entry:
+        user, host = entry.split("@", 1)
+        return host, user
+    return entry, default_user
+
+
 def _get_binaries_dir() -> str:
     return os.environ.get(
         "SPUR_TEST_BINARIES_DIR",
@@ -87,13 +100,14 @@ def ssh_nodes():
     Stays open for the entire test run.
     """
     nodes_config = _get_nodes_config()
-    ssh_user = _get_ssh_user()
+    default_user = _get_ssh_user()
     ssh_password = _get_ssh_password()
     ssh_key = _get_ssh_key()
 
     nodes = []
-    for host in nodes_config:
-        node = SshNode(host, ssh_user, password=ssh_password, key_path=ssh_key)
+    for entry in nodes_config:
+        host, user = _parse_node_entry(entry, default_user)
+        node = SshNode(host, user, password=ssh_password, key_path=ssh_key)
         nodes.append(node)
 
     yield nodes

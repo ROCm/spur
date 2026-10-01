@@ -459,16 +459,28 @@ async fn process_assignment(
         )
         .await
         {
-            // Both arms tear down identically: with a deadline in play, even "all failed" can mean
-            // every node registered and answered too late, so none of them may be left holding one.
-            AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
+            // With a deadline in play, even "all failed" can mean every node registered and
+            // answered too late, so none of them may be left holding one — cancel wide regardless.
+            AllocationRegisterOutcome::Failed { prolog_failed } => {
                 cancel_job_on_nodes(&cluster, job_id, prospective_run_attempt, &all_nodes, 9).await;
-                // The job never left Pending, so plain requeue is a no-op here — the same
-                // Pending-aware backoff the launch path uses is what actually throttles a retry.
-                if let Err(e) = cluster
-                    .backoff_pending_job_after_dispatch_failure(job_id, prospective_run_attempt)
-                {
-                    error!(job_id, error = %e, "failed to back off after registration failure");
+                let detail = "srun allocation registration failed".to_string();
+                let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
+                // A prolog failure drains the node and holds the job, as the launch path does;
+                // otherwise the job never left Pending, so the same Pending-aware backoff the
+                // launch path uses is what actually throttles a retry.
+                if !settle_prolog_failures(
+                    &cluster,
+                    job_id,
+                    &spec,
+                    &prolog_failed,
+                    &detail,
+                    prospective_run_attempt,
+                ) {
+                    if let Err(e) = cluster
+                        .backoff_pending_job_after_dispatch_failure(job_id, prospective_run_attempt)
+                    {
+                        error!(job_id, error = %e, "failed to back off after registration failure");
+                    }
                 }
                 return false;
             }
@@ -1805,8 +1817,12 @@ fn build_pmix_plan_proto(
 /// Outcome of parallel RegisterJobAllocation RPCs for a standalone srun job.
 pub(crate) enum AllocationRegisterOutcome {
     AllSucceeded,
-    AllFailed,
-    PartialFailed,
+    // Any node failed to register. Full and partial failure tear down the job
+    // identically, so they share one arm; `prolog_failed` carries the nodes
+    // whose prolog rejected the allocation, for drain+hold.
+    Failed {
+        prolog_failed: Vec<(String, String)>,
+    },
 }
 
 /// Why one RegisterJobAllocation RPC did not succeed. Split so the caller can tell a node that
@@ -1814,6 +1830,10 @@ pub(crate) enum AllocationRegisterOutcome {
 enum RegisterError {
     Failed(anyhow::Error),
     TimedOut(Duration),
+    // The node ran the job's prolog and it failed. Kept distinct from Failed so
+    // the caller drains+holds instead of cooling the node and retrying srun onto
+    // it, matching the LaunchJob path's DispatchError::PrologFailed handling.
+    PrologFailed(String),
 }
 
 impl std::fmt::Display for RegisterError {
@@ -1823,6 +1843,7 @@ impl std::fmt::Display for RegisterError {
             Self::TimedOut(limit) => {
                 write!(f, "allocation register RPC exceeded {}s", limit.as_secs())
             }
+            Self::PrologFailed(reason) => write!(f, "prolog failed: {reason}"),
         }
     }
 }
@@ -1845,13 +1866,14 @@ struct AllocationRegisterParams {
 async fn register_allocation_to_agent(
     agent_addr: &str,
     params: &AllocationRegisterParams,
-) -> anyhow::Result<()> {
+) -> Result<(), RegisterError> {
     let mut client = crate::agent_client::connect(agent_addr.to_string())
-        .await?
+        .await
+        .map_err(|e| RegisterError::Failed(e.into()))?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
-    client
+    let response = client
         .register_job_allocation(RegisterJobAllocationRequest {
             job_id: params.job_id,
             partition: params.partition.clone(),
@@ -1872,7 +1894,16 @@ async fn register_allocation_to_agent(
             user: params.user.clone(),
             run_attempt: params.run_attempt,
         })
-        .await?;
+        .await
+        .map_err(|s| RegisterError::Failed(s.into()))?
+        .into_inner();
+
+    // A prolog failure comes back as a successful RPC carrying a typed
+    // failure_kind (mirroring LaunchJobResponse), not a gRPC error, so it is not
+    // conflated with an unreachable/rejecting node.
+    if response.failure_kind == spur_proto::proto::LaunchFailureKind::LaunchFailureProlog as i32 {
+        return Err(RegisterError::PrologFailed(response.error));
+    }
 
     info!(
         job_id = params.job_id,
@@ -1880,6 +1911,49 @@ async fn register_allocation_to_agent(
     );
 
     Ok(())
+}
+
+/// Drain every node whose prolog failed and settle the job under
+/// `hold_on_prolog_fail`, shared by the LaunchJob (`confirm_dispatch_on_nodes`)
+/// and the srun-allocation (`register_allocation_on_nodes`) paths so they cannot
+/// re-diverge. Slurm semantics: hold a detached batch job rather than walk it
+/// onto the same failing node; cancel one with a client blocking on it (salloc's
+/// `interactive`, or a standalone `srun` waiting on its step), which would
+/// otherwise hang forever on a held job with nothing to release it. The drain is
+/// issued here, not by the agent, because only the controller can pair it with
+/// the hold.
+///
+/// Returns true when it applied a hold/cancel and the caller should do nothing
+/// more; false when the caller should fall back to its generic dispatch-failure
+/// backoff (no prolog failures, or `hold_on_prolog_fail` disabled).
+fn settle_prolog_failures(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    spec: &spur_core::job::JobSpec,
+    prolog_failed: &[(String, String)],
+    detail: &str,
+    run_attempt: u32,
+) -> bool {
+    if prolog_failed.is_empty() {
+        return false;
+    }
+    for (node_name, reason) in prolog_failed {
+        warn!(job_id, node = %node_name, reason = %reason, "draining node after prolog failure");
+        if let Err(e) = cluster.drain_node(node_name, Some(reason.clone()), Some(0)) {
+            error!(job_id, node = %node_name, error = %e, "failed to drain node after prolog failure");
+        }
+    }
+    if !cluster.config().controller.hold_on_prolog_fail {
+        return false;
+    }
+    if spec.interactive || spec.srun_job {
+        if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
+            error!(job_id, error = %e, "failed to cancel client-attached job after prolog failure");
+        }
+    } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(detail), run_attempt) {
+        error!(job_id, error = %e, "failed to hold job after prolog failure");
+    }
+    true
 }
 
 /// Register a srun-only allocation on every assigned node.
@@ -1943,16 +2017,16 @@ async fn register_allocation_on_nodes(
             let register = register_allocation_to_agent(&agent_addr, &params);
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, register).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(RegisterError::Failed(e)),
+                    Ok(inner) => inner,
                     Err(_) => Err(RegisterError::TimedOut(limit)),
                 },
-                None => register.await.map_err(RegisterError::Failed),
+                None => register.await,
             };
             (result_node, result)
         });
     }
 
+    let mut prolog_failed: Vec<(String, String)> = Vec::new();
     while let Some(result) = set.join_next().await {
         match result {
             Ok((_node_name, Ok(()))) => {
@@ -1966,10 +2040,12 @@ async fn register_allocation_on_nodes(
                     "allocation registration on agent failed"
                 );
                 // Mirrors the launch fan-out: an unreachable node is cooled briefly, one that
-                // burned a deadline is held for it, so neither is re-picked on the next tick.
+                // burned a deadline is held for it, so neither is re-picked on the next tick. A
+                // prolog failure is deferred to the caller, which drains the node and holds the job.
                 match e {
                     RegisterError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
                     RegisterError::Failed(_) => cluster.cool_down_node(&node_name),
+                    RegisterError::PrologFailed(reason) => prolog_failed.push((node_name, reason)),
                 }
                 failures += 1;
             }
@@ -1982,13 +2058,13 @@ async fn register_allocation_on_nodes(
 
     if successes == 0 && total > 0 {
         error!(job_id, failures, "all allocation registrations failed");
-        AllocationRegisterOutcome::AllFailed
+        AllocationRegisterOutcome::Failed { prolog_failed }
     } else if failures > 0 {
         warn!(
             job_id,
             successes, failures, "partial allocation registration failure"
         );
-        AllocationRegisterOutcome::PartialFailed
+        AllocationRegisterOutcome::Failed { prolog_failed }
     } else {
         AllocationRegisterOutcome::AllSucceeded
     }
@@ -2387,31 +2463,19 @@ async fn confirm_dispatch_on_nodes(
     // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
     cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9).await;
 
-    // Drain before deciding the job's fate, so the failing node is already out
-    // of the candidate set on the next scheduling attempt. The drain is issued
-    // here rather than by the agent because only the controller can pair it
-    // with the hold that stops the job walking the cluster.
-    for (node_name, reason) in &prolog_failed {
-        warn!(job_id, node = %node_name, reason = %reason, "draining node after prolog failure");
-        if let Err(e) = cluster.drain_node(node_name, Some(reason.clone()), Some(0)) {
-            error!(job_id, node = %node_name, error = %e, "failed to drain node after prolog failure");
+    // Drain+hold the prolog-failing nodes before deciding the job's fate, so a
+    // failing node is already out of the candidate set on the next attempt.
+    if !settle_prolog_failures(
+        &cluster,
+        job_id,
+        &spec,
+        &prolog_failed,
+        &confirmation_detail,
+        run_attempt,
+    ) {
+        if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt) {
+            error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
         }
-    }
-
-    if !prolog_failed.is_empty() && cluster.config().controller.hold_on_prolog_fail {
-        if spec.interactive {
-            // Holding an interactive job would strand its waiting srun forever
-            // with nothing to wait for; Slurm cancels these too.
-            if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
-                error!(job_id, error = %e, "failed to cancel interactive job after prolog failure");
-            }
-        } else if let Err(e) =
-            cluster.hold_job_for_launch_failure(job_id, Some(&confirmation_detail), run_attempt)
-        {
-            error!(job_id, error = %e, "failed to hold job after prolog failure");
-        }
-    } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt) {
-        error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
     }
 
     DispatchConfirmOutcome::Aborted
@@ -4182,6 +4246,17 @@ mod tests {
                 if !self.register_delay.is_zero() {
                     tokio::time::sleep(self.register_delay).await;
                 }
+                // A prolog-rejecting node fails both dispatch paths the same way:
+                // register_job_allocation carries the typed failure_kind, just as
+                // launch_job does, so the controller drains+holds either way.
+                if let Some(kind) = self.reject_launch_as {
+                    return Ok(tonic::Response::new(
+                        spur_proto::proto::RegisterJobAllocationResponse {
+                            failure_kind: kind as i32,
+                            error: "mock prolog failure".into(),
+                        },
+                    ));
+                }
                 Ok(tonic::Response::new(Default::default()))
             }
 
@@ -5298,6 +5373,82 @@ mod tests {
             assert!(
                 !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
                 "a held job must not be scheduled anywhere"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_srun_allocation_prolog_failure_drains_the_node_and_cancels_the_job() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            // A node whose prolog rejects the standalone-srun RegisterJobAllocation
+            // (not LaunchJob). Before the fix this came back as a generic error, so
+            // the node was only cooled and srun could be re-dispatched onto it.
+            // Driven through process_assignment (not register_allocation_on_nodes
+            // directly) so the whole dispatch arm — the wide cancel and the failure
+            // detail alongside settle_prolog_failures — is exercised.
+            let (addr, cancel_calls) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-prolog-fail", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
+            assert!(!started, "a prolog failure must not start the job");
+
+            assert!(
+                cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "the node that ran the failing prolog must stop taking srun work too"
+            );
+            // A standalone srun has a blocking client: holding it would hang srun
+            // forever with nothing to release it, so it is cancelled, not held.
+            settle(&cm, job_id, JobState::Cancelled);
+            // The dispatch arm also cancels wide across every assigned node, so a
+            // node that registered before another failed is not left holding one.
+            wait_for("allocation rolled back with a wide cancel", || {
+                cancel_calls.load(Ordering::SeqCst) >= 1
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_srun_allocation_prolog_failure_backs_off_when_hold_is_disabled() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.hold_on_prolog_fail = false;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-prolog-nohold", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
+            assert!(!started);
+
+            // nohold_on_prolog_fail: the node still drains (the prolog gates access
+            // regardless), but the job is backed off for a retry rather than held —
+            // the srun-allocation twin of hold_on_prolog_fail_off_retries_the_job_instead.
+            assert!(cm.get_node("n1").unwrap().state.is_admin_hold());
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            assert_eq!(job.requeue_count, 1);
+            assert!(
+                job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
+                "nohold retries with a backoff, not an unconditional immediate retry"
             );
         }
 
