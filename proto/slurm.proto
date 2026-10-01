@@ -1363,7 +1363,14 @@ message RegisterJobAllocationRequest {
   uint32 run_attempt = 13;
 }
 
-message RegisterJobAllocationResponse {}
+message RegisterJobAllocationResponse {
+  // Set when the node ran the job's prolog and it failed, so the controller
+  // drains the node and holds the job exactly as the LaunchJob path does
+  // instead of re-dispatching srun onto a node whose prolog fails every time.
+  // UNSPECIFIED (the default, and what a pre-field agent sends) on success.
+  LaunchFailureKind failure_kind = 1;
+  string error = 2;
+}
 
 message RunCommandResponse {
   int32 exit_code = 1;

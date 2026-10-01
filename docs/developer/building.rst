@@ -105,10 +105,10 @@ Environment Variables
      - Description
      - Example
    * - ``SPUR_TEST_NODES`` *(required)*
-     - Comma-separated list of node IPs/hostnames. First node becomes the controller.
-     - ``10.0.1.10,10.0.1.11,10.0.1.12``
+     - Comma-separated list of node IPs/hostnames. First node becomes the controller. An entry may be prefixed ``user@`` to override the SSH user for that node (a bed where the controller and a GPU worker use different accounts); entries without a prefix fall back to ``SPUR_TEST_SSH_USER``.
+     - ``10.0.1.10,10.0.1.11,10.0.1.12`` or ``admin@10.0.1.10,amd@10.0.1.11``
    * - ``SPUR_TEST_SSH_USER`` *(required)*
-     - SSH username for all nodes.
+     - Default SSH username, applied to every node entry without its own ``user@`` prefix.
      - ``vm``
    * - ``SPUR_TEST_SSH_PASSWORD`` *(optional)*
      - SSH password. If neither password nor key is set, ssh-agent is used.

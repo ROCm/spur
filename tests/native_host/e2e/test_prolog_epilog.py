@@ -7,6 +7,7 @@ Tests cover all hook types (prolog, epilog, prolog_slurmctld, epilog_slurmctld),
 environment variable propagation, failure semantics, and execution ordering.
 """
 
+import re
 import time
 
 from cluster import parse_job_id, wait_job, job_state
@@ -31,6 +32,7 @@ mkdir -p "{RD}/hook-out"
     echo "SPUR_CPUS_ON_NODE=$SPUR_CPUS_ON_NODE"
     echo "SLURM_CPUS_ON_NODE=$SLURM_CPUS_ON_NODE"
     echo "SPUR_JOB_MEMORY_MB=$SPUR_JOB_MEMORY_MB"
+    echo "SPUR_JOB_GPUS=$SPUR_JOB_GPUS"
     echo "SPUR_SCRIPT_CONTEXT=$SPUR_SCRIPT_CONTEXT"
 } > "{RD}/hook-out/prolog-$SPUR_JOB_ID.log"
 """
@@ -84,6 +86,12 @@ mkdir -p "{RD}/hook-out"
 FAILING_HOOK = """\
 #!/bin/bash
 exit 1
+"""
+
+COUNTING_PROLOG = """\
+#!/bin/bash
+mkdir -p "{RD}/hook-out"
+echo "$SPUR_JOB_ID $(date +%s%N)" >> "{RD}/hook-out/prolog-count-$SPUR_JOB_ID.log"
 """
 
 
@@ -484,4 +492,165 @@ class TestHookFailure:
         states = cluster.sinfo_nodes()
         assert not any(s.startswith("drain") for s in states.values()), (
             f"EpilogSlurmctld failure should not drain nodes:\n{states}"
+        )
+
+
+class TestSrunStandaloneProlog:
+    """Standalone srun on native hosts takes the controller's
+    ``srun_step_dispatch`` path (RegisterJobAllocation, not LaunchJob), which
+    used to skip the node Prolog entirely. Regression-locks the fix (the
+    prolog call added to ``register_job_allocation`` in agent_server.rs)."""
+
+    def test_srun_standalone_triggers_node_prolog_and_epilog(self, unstarted_cluster):
+        cluster = unstarted_cluster
+        cluster.start(_setup_hooks(cluster, prolog=LOGGING_PROLOG, epilog=LOGGING_EPILOG))
+
+        code, out = cluster.srun_with_exit(
+            ["-J", "srun-prolog", "bash", "-c", "echo SPUR_JOB_ID=$SPUR_JOB_ID"]
+        )
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+
+        m = re.search(r"SPUR_JOB_ID=(\d+)", out)
+        assert m, f"job output missing SPUR_JOB_ID:\n{out}"
+        job_id = int(m.group(1))
+
+        prolog = _read_hook_log(cluster, job_id, "prolog")
+        assert prolog["SPUR_JOB_ID"] == str(job_id)
+        assert prolog["SPUR_SCRIPT_CONTEXT"] == "prolog_slurmd"
+
+        # The extern stepd runs the epilog on teardown; give it a moment after
+        # srun (which blocks until the step completes) has already returned.
+        deadline = time.time() + 15
+        epilog = None
+        while time.time() < deadline:
+            raw = cluster.read_output_on_any_node(
+                f"{cluster.remote_dir}/hook-out/epilog-{job_id}.log"
+            )
+            if raw.strip():
+                epilog = _parse_hook_log(raw)
+                break
+            time.sleep(1)
+        assert epilog is not None, "node Epilog did not run for standalone srun"
+        assert epilog["SPUR_JOB_ID"] == str(job_id)
+        assert int(prolog["TS"]) < int(epilog["TS"]), (
+            f"prolog must run before epilog: {prolog['TS']} vs {epilog['TS']}"
+        )
+
+    def test_srun_standalone_gpu_allocation_reaches_prolog(self, gpu_cluster):
+        """The reporter's exact repro (``srun --gpus=N ...``) on a real GPU
+        host: the node Prolog must run and see the allocated GPU device IDs."""
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        cluster.stop()
+        cluster.start(_setup_hooks(cluster, prolog=LOGGING_PROLOG))
+
+        code, out = cluster.srun_with_exit(
+            ["-J", "srun-gpu-prolog", "--gpus=1", "bash", "-c", "echo SPUR_JOB_ID=$SPUR_JOB_ID"]
+        )
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+
+        m = re.search(r"SPUR_JOB_ID=(\d+)", out)
+        assert m, f"job output missing SPUR_JOB_ID:\n{out}"
+        job_id = int(m.group(1))
+
+        prolog = _read_hook_log(cluster, job_id, "prolog")
+        assert prolog["SPUR_SCRIPT_CONTEXT"] == "prolog_slurmd"
+        assert prolog.get("SPUR_JOB_GPUS"), (
+            f"node Prolog must see the allocated GPU device IDs for a --gpus=1 "
+            f"srun job, got {prolog.get('SPUR_JOB_GPUS')!r}"
+        )
+
+    def test_sbatch_prolog_runs_exactly_once(self, unstarted_cluster):
+        """Locks the invariant that the batch path runs the node Prolog exactly
+        once. sbatch dispatches via launch_job and never reaches the srun
+        register_job_allocation prolog site, so the two sites are disjoint by
+        construction — this cannot itself catch a double-run from that split.
+        It guards against a future change that runs the batch prolog twice, or
+        that wires the srun-allocation site into the batch path."""
+        cluster = unstarted_cluster
+        cluster.start(_setup_hooks(cluster, prolog=COUNTING_PROLOG))
+
+        script = cluster.write_file("test.sh", "#!/bin/bash\necho DONE\n")
+        sb = cluster.sbatch(["-J", "count-prolog", "-N", "1", script])
+        job_id = parse_job_id(sb)
+        assert job_id is not None
+
+        state = wait_job(cluster, job_id, timeout=60)
+        assert state in ("CD", "GONE"), f"expected completed, got {state}"
+
+        raw = cluster.read_output_on_any_node(
+            f"{cluster.remote_dir}/hook-out/prolog-count-{job_id}.log"
+        )
+        lines = [ln for ln in raw.strip().splitlines() if ln.strip()]
+        assert len(lines) == 1, (
+            f"sbatch node Prolog must run exactly once, ran {len(lines)} times:\n{raw}"
+        )
+
+    def test_srun_standalone_prolog_failure_drains_node(self, unstarted_cluster):
+        """A failing prolog on the srun path must drain the node, matching the
+        LaunchJob path. Otherwise the node is only cooled and srun keeps landing
+        on a node whose prolog fails every time (the prolog gates node access)."""
+        cluster = unstarted_cluster
+        cluster.start(_setup_hooks(cluster, prolog=FAILING_HOOK))
+
+        target = cluster.node_names[0]
+        code, out = cluster.srun_with_exit(
+            ["-J", "srun-prolog-fail", "-w", target, "bash", "-c", "echo SHOULD_NOT_RUN"]
+        )
+        assert code != 0, f"srun must fail when its prolog fails, got exit 0:\n{out}"
+        assert "SHOULD_NOT_RUN" not in out, (
+            f"the step must not run after a prolog failure:\n{out}"
+        )
+
+        states = _wait_node_state(cluster, "drain")
+        assert any("drain" in s.lower() for s in states.values()), (
+            f"the node whose srun prolog failed must drain, not just cool:\n{states}"
+        )
+
+
+class TestSrunClientHooks:
+    """srun_prolog / srun_epilog (``srun --prolog`` / ``--epilog``) run
+    client-side on the node where srun is invoked, as the invoking user — a
+    separate axis from the node prolog/epilog that run on the compute node as
+    root. A failing SrunProlog blocks step dispatch; the node hooks are a
+    distinct mechanism and unaffected."""
+
+    def test_srun_prolog_runs_client_side_before_the_step(self, cluster):
+        marker = f"{cluster.remote_dir}/srun-prolog-ran"
+        prolog = cluster.write_file(
+            "srun-prolog.sh", f'#!/bin/bash\necho "ctx=$SPUR_SCRIPT_CONTEXT" > {marker}\n'
+        )
+        code, out = cluster.srun_with_exit(
+            ["--prolog", prolog, "bash", "-c", "echo STEP_RAN"]
+        )
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+        assert "STEP_RAN" in out, f"the step must run after a passing SrunProlog:\n{out}"
+        recorded = cluster.nodes[0].read_file(marker).strip()
+        assert "prolog_srun" in recorded, (
+            f"SrunProlog must run client-side with context prolog_srun, got {recorded!r}"
+        )
+
+    def test_srun_prolog_failure_blocks_the_step(self, cluster):
+        prolog = cluster.write_file("srun-prolog-fail.sh", "#!/bin/bash\nexit 1\n")
+        code, out = cluster.srun_with_exit(
+            ["--prolog", prolog, "bash", "-c", "echo SHOULD_NOT_RUN"]
+        )
+        assert code != 0, f"a failing SrunProlog must fail srun, got exit 0:\n{out}"
+        assert "SHOULD_NOT_RUN" not in out, (
+            f"the step must not dispatch when SrunProlog fails:\n{out}"
+        )
+
+    def test_srun_epilog_runs_client_side_after_the_step(self, cluster):
+        marker = f"{cluster.remote_dir}/srun-epilog-ran"
+        epilog = cluster.write_file(
+            "srun-epilog.sh", f'#!/bin/bash\necho "ctx=$SPUR_SCRIPT_CONTEXT" > {marker}\n'
+        )
+        code, out = cluster.srun_with_exit(
+            ["--epilog", epilog, "bash", "-c", "echo STEP_RAN"]
+        )
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+        assert "STEP_RAN" in out, out
+        recorded = cluster.nodes[0].read_file(marker).strip()
+        assert "epilog_srun" in recorded, (
+            f"SrunEpilog must run client-side with context epilog_srun, got {recorded!r}"
         )

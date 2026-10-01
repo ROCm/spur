@@ -2193,7 +2193,7 @@ submitting host on each invocation.
      - Reload
    * - ``prolog``
      - ``Prolog``
-     - compute node, before job launch
+     - compute node, before job launch — once per job on each allocated node, for every submission method (``sbatch``, ``salloc``, and standalone ``srun``)
      - Agent restart
    * - ``epilog``
      - ``Epilog``
