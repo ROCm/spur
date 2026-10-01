@@ -47,7 +47,7 @@ On each node, make sure that the reset is complete before you continue:
 .. code-block:: bash
 
    systemctl is-active k0scontroller k0sworker   # inactive
-   pgrep -af /var/lib/k0s/bin                     # no output
+   pgrep -af "^/var/lib/k0s/bin/"                 # no output
    ls /var/lib/k0s                                # No such file or directory
 
 Remove what the reset keeps
@@ -63,7 +63,7 @@ items. Remove them on each node:
      - Made by
    * - k0s binary ``/usr/local/bin/k0s`` (``[cluster].k0s_binary``)
      - ``spur k8s install-k0s`` or ``spurd``
-   * - ``/etc/k0s`` (``k0s.yaml``)
+   * - ``/etc/k0s`` (``k0s.yaml``, ``containerd.toml``, ``containerd.d``)
      - ``spurd``
    * - PersistentVolume data in ``/var/lib/local-path-provisioner``
        (``[cluster].local_path_dir``)
@@ -99,15 +99,22 @@ To remove the iptables rules and ipsets, reboot the host. ``k0s reset`` also rec
 reboot. A reboot is the safest method, because it does not touch the rules of other
 software.
 
-If you cannot reboot, first look at the rules that do not belong to Kubernetes:
+If you cannot reboot, first look at the rules that do not belong to Kubernetes.
+kube-router also adds rules without ``KUBE`` in the name: ``FORWARD`` rules with the
+comments ``allow inbound traffic to pods``, ``allow outbound traffic from pods`` and
+``allow outbound node port traffic ...``, and a ``MASQUERADE`` rule that matches the
+``kube-router-*`` ipsets. The filter below removes them too:
 
 .. code-block:: bash
 
-   sudo iptables-save | grep -vE 'KUBE|cali-'
-   sudo ip6tables-save | grep -vE 'KUBE|cali-'
+   k8s='KUBE|cali-|kube-router|kube-bridge|node port traffic'
+   sudo iptables-save | grep -vE "$k8s"
+   sudo ip6tables-save | grep -vE "$k8s"
 
 If no other software (for example Docker or a host firewall in iptables) has rules there,
-flush all tables and destroy the ipsets:
+flush all tables and destroy the ipsets. The ``ipset`` command is not always installed
+(for example on Ubuntu 24.04). If it is missing, install it first, for example with
+``sudo apt-get install ipset``:
 
 .. code-block:: bash
 
@@ -374,7 +381,7 @@ The k0s cluster has its own life cycle. Neither teardown mode above touches it.
      - preserved
      - preserved (remove manually)
    * - k0s config and binary
-     - ``/etc/k0s/k0s.yaml``, ``/usr/local/bin/k0s``
+     - ``/etc/k0s``, ``/usr/local/bin/k0s``
      - preserved
      - preserved (remove manually)
    * - CNI files, iptables rules, ipsets
@@ -396,11 +403,12 @@ On each host, after a reboot or an iptables flush:
 
 .. code-block:: bash
 
-   pgrep -af 'spur|k0s'                              # no output
+   pgrep -ax 'spurctld|spurd|spurstepd|spurauthd'  # no output
+   pgrep -af '^/var/lib/k0s/bin/'                    # no output
    systemctl list-unit-files | grep -Ei 'spur|k0s'   # no output
    command -v spur spurctld spurd spurstepd k0s      # no output
    ls -d /etc/spur /etc/k0s /var/lib/k0s /var/spool/spur   # all missing
-   sudo iptables-save | grep -cE 'KUBE|cali-'        # 0
+   sudo iptables-save | grep -cE 'KUBE|cali-|kube-'  # 0
 
 See Also
 --------
