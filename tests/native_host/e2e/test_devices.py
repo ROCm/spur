@@ -265,6 +265,31 @@ class TestNativeInjection:
         assert "GPU count: 2" in content, content
         assert "ALLOC_OK 2/2" in content, content
 
+    def test_each_task_on_a_node_can_open_its_own_gpu(self, gpu_cluster):
+        """Every task of a multi-task step must be able to open the GPU it was given.
+
+        The task granted a non-zero device is the interesting one: the sibling that
+        happens to receive device 0 succeeds even when the per-task visibility
+        variables disagree with each other, so a single-task job cannot catch this.
+        """
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        if _max_gpus_per_node(cluster) < 2:
+            pytest.skip("need >= 2 GPUs")
+
+        gpu_bin = cluster.compile_hip_fixture("gpu_alloc_test.hip")
+        code, out = cluster.srun_with_exit(
+            ["-N", "1", "-n", "2", "--gres=gpu:2", "-l", gpu_bin]
+        )
+        assert code == 0, f"srun exited {code}\n{out}"
+        assert out.count("ALLOC_OK 1/1") == 2, (
+            f"both tasks must run a kernel on their own device\n{out}"
+        )
+        rocr = sorted(re.findall(r"ROCR_VISIBLE_DEVICES=(\S+)", out))
+        assert len(rocr) == 2 and rocr[0] != rocr[1], (
+            f"tasks must be given distinct devices, got {rocr}\n{out}"
+        )
+
     @pytest.mark.rootful
     def test_native_device_namespace_isolation(self, gpu_cluster):
         cluster = gpu_cluster
