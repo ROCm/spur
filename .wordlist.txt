@@ -333,6 +333,9 @@ cgroup's
 CPX
 KFD
 SPX
+DPX
+QPX
+deserialize
 CNIs
 ENI
 IPIP
