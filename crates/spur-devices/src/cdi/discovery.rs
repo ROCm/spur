@@ -581,9 +581,9 @@ fn find_card_for_render_minor(render_minor: u32) -> Option<u32> {
 fn detect_amd_gpu_type_from_id(device_id: u32) -> String {
     let dev_id = format!("0x{:04x}", device_id);
     match dev_id.as_str() {
-        "0x74a1" | "0x74a9" | "0x74bd" => "mi300x".into(),
+        "0x74a1" | "0x74a9" | "0x74b5" | "0x74bd" => "mi300x".into(),
         "0x74a0" => "mi300a".into(),
-        "0x74a5" => "mi325x".into(),
+        "0x74a5" | "0x74b9" => "mi325x".into(),
         "0x74a2" | "0x74a8" => "mi308x".into(),
         "0x75a0" => "mi350x".into(),
         "0x75a3" => "mi355x".into(),
@@ -791,6 +791,9 @@ mod tests {
     fn test_detect_amd_gpu_type_from_id() {
         assert_eq!(detect_amd_gpu_type_from_id(0x74a2), "mi308x");
         assert_eq!(detect_amd_gpu_type_from_id(0x74a1), "mi300x");
+        assert_eq!(detect_amd_gpu_type_from_id(0x74b5), "mi300x");
+        assert_eq!(detect_amd_gpu_type_from_id(0x74a5), "mi325x");
+        assert_eq!(detect_amd_gpu_type_from_id(0x74b9), "mi325x");
         assert_eq!(detect_amd_gpu_type_from_id(0xffff), "amdgpu-0xffff");
     }
 
