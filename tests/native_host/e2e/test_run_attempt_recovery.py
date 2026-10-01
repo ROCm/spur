@@ -58,8 +58,10 @@ class TestRunAttemptRecovery:
             config_overrides={"auth": {"plugin": "spur", "mode": "required"}},
         )
 
+        # Stay alive past a couple of wait_job_state poll intervals so the
+        # Running assertion below can't be missed by completing too fast.
         script = cluster.write_file(
-            "run-attempt-recovery.sh", "#!/bin/bash\necho run-attempt-ok\n"
+            "run-attempt-recovery.sh", "#!/bin/bash\necho run-attempt-ok\nsleep 15\n"
         )
         victim_nodes = ",".join(cluster.node_names[:2])
 
