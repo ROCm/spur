@@ -16,7 +16,6 @@ natural race, then asserts the node that *did* launch is usable again within
 a short bound — not the multi-minute window this bug used to require.
 """
 
-import re
 import time
 
 from cluster import block_agent_port, parse_job_id, wait_job_state
@@ -69,10 +68,7 @@ class TestDispatchAbortRelease:
         needle = f"aborting admission instead of partially running job_id={job_id} "
         deadline = time.time() + timeout
         while time.time() < deadline:
-            log = re.sub(
-                r"\x1b\[[0-9;]*m", "",
-                cluster.nodes[0].read_file(f"{cluster.log_dir}/spurctld.log"),
-            )
+            log = cluster.spurctld_log()
             if needle in log:
                 return
             time.sleep(0.5)

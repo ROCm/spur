@@ -609,6 +609,13 @@ async fn process_assignment(
             error = %e,
             "failed to start job"
         );
+        // No-op if the job already left Pending; otherwise persists the bump
+        // so a retry doesn't re-present the epoch cancel just poisoned above.
+        if let Err(e) =
+            cluster.backoff_pending_job_after_dispatch_failure(job_id, prospective_run_attempt)
+        {
+            error!(job_id, error = %e, "failed to back off after start_job failure");
+        }
         return false;
     }
 
@@ -6152,6 +6159,11 @@ mod tests {
                 "n2 cancelled after start_job rejected the assignment",
                 || cancel2.load(Ordering::SeqCst) >= 1,
             );
+            // The cancelled epoch must be persisted too, or a retry re-presents
+            // the same now-poisoned run_attempt and reproduces the wedge.
+            wait_for("run_attempt backed off after start_job failure", || {
+                cm.get_job(job_id).is_some_and(|j| j.run_attempt == 1)
+            });
         }
 
         // The release runs after the job is committed Running, so a node that

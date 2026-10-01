@@ -17,8 +17,6 @@ partial-admission-abort technique from test_dispatch_abort_release.py.
 import re
 import time
 
-import pytest
-
 from cluster import block_agent_port, parse_job_id, wait_job_state
 
 ADMISSION_ABORT_TIMEOUT = 30
@@ -28,11 +26,7 @@ RECOVERY_RUNNING_BOUND = 60
 class TestRunAttemptRecovery:
     def test_aborted_dispatch_advances_run_attempt_and_recovers(self, unstarted_cluster):
         cluster = unstarted_cluster
-        if len(cluster.nodes) < 2:
-            pytest.skip(
-                f"multi-node test requires >= 2 nodes in SPUR_TEST_NODES "
-                f"(got {len(cluster.nodes)})"
-            )
+        cluster.require_nodes(2)
 
         paths = cluster.install_native_jwks()
         sock = f"{cluster.remote_dir}/auth.sock"
@@ -85,10 +79,6 @@ class TestRunAttemptRecovery:
             )
 
             attempts = self._dispatch_run_attempts(cluster, job_id)
-            assert len(attempts) >= 2, (
-                f"expected at least two logged dispatch attempts for job {job_id}, "
-                f"got {attempts}\n{cluster.spurd_log(0)}"
-            )
             assert len(set(attempts)) >= 2, (
                 "two consecutive dispatch attempts for the same job_id must log "
                 f"different run_attempt= values, got {attempts}"
@@ -102,10 +92,7 @@ class TestRunAttemptRecovery:
         needle = f"aborting admission instead of partially running job_id={job_id} "
         deadline = time.time() + timeout
         while time.time() < deadline:
-            log = re.sub(
-                r"\x1b\[[0-9;]*m", "",
-                cluster.nodes[0].read_file(f"{cluster.log_dir}/spurctld.log"),
-            )
+            log = cluster.spurctld_log()
             if needle in log:
                 return
             time.sleep(0.5)
@@ -117,10 +104,7 @@ class TestRunAttemptRecovery:
     @staticmethod
     def _dispatch_run_attempts(cluster, job_id: int) -> list[int]:
         """Every run_attempt= value logged for this job's dispatch attempts, in order."""
-        log = re.sub(
-            r"\x1b\[[0-9;]*m", "",
-            cluster.nodes[0].read_file(f"{cluster.log_dir}/spurctld.log"),
-        )
+        log = cluster.spurctld_log()
         needle = f"job_id={job_id} "
         attempts = []
         for line in log.splitlines():
