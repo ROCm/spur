@@ -377,6 +377,13 @@ not the short hostname alone when ``/etc/hosts`` maps it to loopback.
 
 The agent auto-detects CPUs, memory, and GPUs, then registers with the controller over the mesh.
 
+The agent names each AMD GPU by its PCI device ID, for example ``mi300x`` or
+``w7900``. A virtual function or a board variant, such as an HF model, gets
+the name of its physical card. The ID table is
+``crates/spur-devices/src/cdi/amd_gpu_ids.txt`` and it follows the device list
+of the AMD GPU operator. A GPU with an unknown ID shows as ``amdgpu-0x<id>``,
+for example ``gpu:amdgpu-0x75c0:8``.
+
 For an HA quorum, pass every controller as a comma-separated list so the agent and CLI
 fail over to a surviving node if one is unreachable. The same format works for the
 ``SPUR_CONTROLLER_ADDR`` environment variable:
