@@ -92,28 +92,23 @@ mod tests {
     fn t21_8_qos_defaults() {
         let qos = Qos::default();
         assert_eq!(qos.priority, 0);
-        assert_eq!(qos.preempt_mode, QosPreemptMode::Off);
+        assert_eq!(qos.preempt_mode, None);
         assert_eq!(qos.usage_factor, 1.0);
     }
 
     #[test]
     fn t21_9_qos_preempt_modes() {
-        assert_eq!(
-            "cancel".parse::<QosPreemptMode>().unwrap(),
-            QosPreemptMode::Cancel
-        );
-        assert_eq!(
-            "requeue".parse::<QosPreemptMode>().unwrap(),
-            QosPreemptMode::Requeue
-        );
-        assert_eq!(
-            "suspend".parse::<QosPreemptMode>().unwrap(),
-            QosPreemptMode::Suspend
-        );
-        assert_eq!(
-            "off".parse::<QosPreemptMode>().unwrap(),
-            QosPreemptMode::Off
-        );
+        use spur_core::accounting::parse_qos_preempt_mode;
+        for (text, want) in [
+            ("cancel", QosPreemptMode::Cancel),
+            ("requeue", QosPreemptMode::Requeue),
+            ("suspend", QosPreemptMode::Suspend),
+            ("off", QosPreemptMode::Off),
+        ] {
+            assert_eq!(parse_qos_preempt_mode(text), Ok(Some(want)), "{text}");
+        }
+        assert_eq!(parse_qos_preempt_mode(""), Ok(None));
+        assert!(parse_qos_preempt_mode("cancle").is_err());
     }
 
     // ── T21.10: QOS limit enforcement ────────────────────────────
