@@ -16602,7 +16602,6 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        svc.start_monitor("http://127.0.0.1:1".into());
         {
             let mut alloc = svc.allocation.lock().await;
             alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
@@ -16632,6 +16631,7 @@ mod tests {
         tracked.job = executor::RunningJob::Managed { child };
         tracked.run_attempt = 1;
         svc.insert_test_job(99, tracked).await;
+        svc.start_monitor("http://127.0.0.1:1".into());
 
         svc.graceful_cancel(99, 1).await;
         let res = svc

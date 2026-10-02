@@ -945,7 +945,7 @@ mode), ``--partition``/``-p``, ``--state``/``-t`` (only ``PD`` or ``R``),
 ``--user``, or ``--name``. In filter mode, jobs already in a terminal state are
 silently skipped.
 
-Without ``--signal``, a cancel sends SIGTERM to the running job and SIGKILL
+Without ``--signal``, a cancel sends ``SIGTERM`` to the running job and ``SIGKILL``
 5 seconds later if it has not exited. The job shows as cancelled at once, and
 its resources go back to the scheduler. A new job that the scheduler puts on
 the GPUs of the cancelled job starts when the cancelled job has exited.
