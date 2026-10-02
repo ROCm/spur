@@ -3046,9 +3046,8 @@ mod tests {
         );
     }
 
-    /// `run_interactive_pty` already closes out the step on a clean exit; this
-    /// covers the job-level counterpart a standalone `--pty` srun must also
-    /// reach, since nothing else releases the job's allocation.
+    /// Job-level counterpart to `run_interactive_pty`'s step completion — the
+    /// standalone `--pty` path has nothing else to release the job's allocation.
     #[tokio::test]
     async fn conclude_pty_session_completes_the_job_on_a_clean_exit() {
         let (addr, capture) = crate::mock_controller::spawn().await;
@@ -3108,6 +3107,28 @@ mod tests {
             "with no real outcome ever reported, cancelling is the only safe option"
         );
         assert!(capture.complete_job_calls().is_empty());
+    }
+
+    /// `release_srun_allocation`'s own fallback still applies when reached
+    /// through the pty path: a rejected `CompleteJob` still cancels the job.
+    #[tokio::test]
+    async fn conclude_pty_session_falls_back_to_cancel_when_complete_job_is_rejected() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_complete_job_error(tonic::Code::FailedPrecondition);
+        let mut client = crate::mock_controller::client(addr).await;
+
+        conclude_pty_session(&mut client, 55, "alice", &Ok(0)).await;
+
+        assert_eq!(
+            capture.complete_job_calls().len(),
+            1,
+            "the real exit code must still be offered to CompleteJob first"
+        );
+        assert_eq!(
+            capture.cancel_job_calls(),
+            1,
+            "a rejected CompleteJob must still fall back to cancelling the job"
+        );
     }
 
     /// The step's supervisor outlives an agent restart, so a stream dropped
