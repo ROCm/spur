@@ -117,7 +117,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     // eviction is not just churn: it defeats the priority order, because the cheapest
     // victim goes first and the dearer one follows a second later anyway. Remember
     // which reclaimer has capacity in flight and leave it alone until it lands.
-    let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
+    let mut reclaim_in_flight: HashMap<spur_core::job::JobId, ReclaimInFlight> = HashMap::new();
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -157,7 +157,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
-        let (mut pending, idle_fill_candidates) = cluster.pending_jobs_with_idle_fill_candidates();
+        let (mut pending, mut idle_fill_candidates) =
+            cluster.pending_jobs_with_idle_fill_candidates();
+        reclaim_in_flight.retain(|_, r| r.until > Utc::now());
+        hold_reclaimed_victims(&reclaim_in_flight, &mut pending);
+        hold_reclaimed_victims(&reclaim_in_flight, &mut idle_fill_candidates);
         if pending.is_empty() && idle_fill_candidates.is_empty() {
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
@@ -277,8 +281,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // `try_preempt` this cycle.
                 let sched_cfg = cluster.config().scheduler.clone();
                 if sched_cfg.idle_fill_enabled {
-                    let now = Utc::now();
-                    reclaim_in_flight.retain(|_, until| *until > now);
                     // Reclaim considers borrow candidates too, unlike `try_preempt`
                     // and federation: rule (B) lets a higher-priority idle-fill job
                     // displace strictly-lower-priority opportunistic work. The
@@ -288,15 +290,15 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
                         .filter(|j| !reclaim_in_flight.contains_key(&j.job_id))
                         .collect();
-                    let (freed, freed_for) = reclaim_for_unplaced(
+                    if let Some(reclaim) = reclaim_for_unplaced(
                         &cluster,
                         &reclaimers,
                         &borrow_ids,
                         &cluster_state,
                         sched_cfg.idle_fill_exempt_secs,
                     )
-                    .await;
-                    if !freed.is_empty() {
+                    .await
+                    {
                         // The cancel has been *delivered*, which is not the same as the
                         // workload being gone: the agent then sends SIGTERM, waits its
                         // grace, and only then SIGKILLs. Hold the freed nodes out for
@@ -305,17 +307,21 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         // cgroup (D3).
                         const AGENT_KILL_GRACE: std::time::Duration =
                             std::time::Duration::from_secs(5);
-                        for node in &freed {
+                        for node in &reclaim.freed_nodes {
                             cluster.cool_down_node_for(node, AGENT_KILL_GRACE);
                         }
                         // Give the reclaimer the whole grace period plus a cycle to be
                         // dispatched onto what it was just given.
-                        if let Some(job_id) = freed_for {
-                            let settle = chrono::Duration::seconds(
-                                AGENT_KILL_GRACE.as_secs() as i64 + interval_secs as i64 + 1,
-                            );
-                            reclaim_in_flight.insert(job_id, Utc::now() + settle);
-                        }
+                        let settle = chrono::Duration::seconds(
+                            AGENT_KILL_GRACE.as_secs() as i64 + interval_secs as i64 + 1,
+                        );
+                        reclaim_in_flight.insert(
+                            reclaim.reclaimer,
+                            ReclaimInFlight {
+                                until: Utc::now() + settle,
+                                victims: reclaim.victims,
+                            },
+                        );
                         continue;
                     }
                 }
@@ -1057,9 +1063,33 @@ fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
         .min(CAP_SECS)
 }
 
+/// A reclaim whose freed capacity the reclaimer has not been dispatched onto yet.
+struct ReclaimInFlight {
+    until: DateTime<Utc>,
+    victims: Vec<spur_core::job::JobId>,
+}
+
+/// Keep the jobs an in-flight reclaim evicted out of this pass. A requeued victim is
+/// pending again, and when it sorts ahead of its reclaimer (equal priority, lower
+/// job ID, or a burst QOS with a higher priority) it would retake the capacity freed
+/// for the reclaimer, which then reclaims it again after the exempt window, forever.
+fn hold_reclaimed_victims(
+    in_flight: &HashMap<spur_core::job::JobId, ReclaimInFlight>,
+    pending: &mut Vec<spur_core::job::Job>,
+) {
+    pending.retain(|job| !in_flight.values().any(|r| r.victims.contains(&job.job_id)));
+}
+
+/// The outcome of one reclaim: the nodes freed, which the caller holds out of the
+/// next cycle until the agents have confirmed the kill, and the jobs evicted.
+struct Reclaim {
+    reclaimer: spur_core::job::JobId,
+    freed_nodes: Vec<String>,
+    victims: Vec<spur_core::job::JobId>,
+}
+
 /// Reclaim capacity lent to borrowed jobs, on behalf of in-quota jobs the pass could
-/// not place. Returns the nodes freed, which the caller holds out of the next cycle
-/// until the agents have confirmed the kill.
+/// not place.
 ///
 /// This is deliberately **not** part of `try_preempt`. Victim selection there never
 /// checks that an eviction helps: `preempt_overlaps_pending_nodes` returns true for
@@ -1081,7 +1111,7 @@ async fn reclaim_for_unplaced(
     opportunistic: &HashSet<spur_core::job::JobId>,
     cluster_state: &ClusterState<'_>,
     exempt_secs: u32,
-) -> (Vec<String>, Option<spur_core::job::JobId>) {
+) -> Option<Reclaim> {
     let now = Utc::now();
     let running = cluster.get_jobs(&JobFilter {
         states: &[spur_core::job::JobState::Running],
@@ -1132,7 +1162,7 @@ async fn reclaim_for_unplaced(
         });
     }
     if reclaimable.is_empty() {
-        return (Vec::new(), None);
+        return None;
     }
 
     // Which running jobs sit on each node, so a node is only counted as freed when
@@ -1169,6 +1199,7 @@ async fn reclaim_for_unplaced(
         };
 
         let mut freed = Vec::new();
+        let mut evicted = Vec::new();
         for victim in reclaimable.iter().filter(|r| victims.contains(&r.job_id)) {
             // Always requeue, whatever PreemptMode the victim's QOS or partition
             // configures. Suspend never releases the allocation, which is the one
@@ -1203,6 +1234,7 @@ async fn reclaim_for_unplaced(
                     )
                     .await;
                     freed.extend(victim.nodes.iter().cloned());
+                    evicted.push(victim.job_id);
                 }
                 Err(e) => {
                     warn!(job_id = victim.job_id, error = %e, "failed to reclaim borrowed job");
@@ -1212,10 +1244,14 @@ async fn reclaim_for_unplaced(
         if !freed.is_empty() {
             // One reclaim per cycle: the next pass re-derives everything from the
             // committed state rather than reasoning about a half-applied plan.
-            return (freed, Some(reclaimer.job_id));
+            return Some(Reclaim {
+                reclaimer: reclaimer.job_id,
+                freed_nodes: freed,
+                victims: evicted,
+            });
         }
     }
-    (Vec::new(), None)
+    None
 }
 
 /// The set of borrowed jobs whose eviction would let `reclaimer` actually run, or
@@ -3737,6 +3773,38 @@ mod tests {
                 topology: None,
                 busy_until: busy,
             }
+        }
+
+        #[test]
+        fn a_reclaimed_job_is_held_out_while_its_reclaim_is_in_flight() {
+            let pending_job = |id| {
+                let mut job = reclaimer(1, 1);
+                job.job_id = id;
+                job
+            };
+            let mut in_flight = HashMap::new();
+            in_flight.insert(
+                2,
+                ReclaimInFlight {
+                    until: Utc::now(),
+                    victims: vec![1],
+                },
+            );
+            let mut pending = vec![pending_job(1), pending_job(2), pending_job(3)];
+
+            hold_reclaimed_victims(&in_flight, &mut pending);
+
+            let ids: Vec<_> = pending.iter().map(|j| j.job_id).collect();
+            assert_eq!(
+                ids,
+                vec![2, 3],
+                "the victim must not compete with its reclaimer"
+            );
+
+            in_flight.clear();
+            let mut pending = vec![pending_job(1)];
+            hold_reclaimed_victims(&in_flight, &mut pending);
+            assert_eq!(pending.len(), 1, "a settled reclaim holds nothing back");
         }
 
         #[test]
