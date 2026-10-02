@@ -1180,6 +1180,90 @@ mod tests {
         );
     }
 
+    /// One MI300X in CPX (bus 0x11, ranks 0..7) beside one SPX GPU (bus 0x12).
+    fn cpx_node(generation: u64) -> ResourceSet {
+        let mut gpus: Vec<GpuResource> = (0..8).map(|r| gpu(r, sid(0x11, r as u64))).collect();
+        gpus.push(gpu(8, sid(0x12, 0)));
+        rset(8, generation, gpus)
+    }
+
+    #[test]
+    fn a_held_cpx_partition_on_unchanged_inventory_never_reaches_the_guard() {
+        use std::collections::HashSet;
+        let baseline = cpx_node(1);
+        let fresh = cpx_node(2);
+        let held: HashSet<u64> = [sid(0x11, 0)].into_iter().collect();
+
+        let delta = classify(&baseline, &fresh, &held);
+        let fp = fresh.schedulable_fingerprint();
+        let (action, _) = next_refresh_action(&delta, &fp, &delta, &fp);
+
+        assert_eq!(delta, InventoryDelta::Unchanged);
+        assert_eq!(action, RefreshAction::Wait);
+    }
+
+    #[test]
+    fn a_free_change_on_another_gpu_applies_capacity_with_a_held_cpx_partition() {
+        use std::collections::HashSet;
+        let baseline = cpx_node(1);
+        let mut fresh = cpx_node(2);
+        fresh.gpus.retain(|g| g.stable_id != sid(0x12, 0));
+        let held: HashSet<u64> = [sid(0x11, 0)].into_iter().collect();
+
+        let delta = classify(&baseline, &fresh, &held);
+        let fp = fresh.schedulable_fingerprint();
+        let (first, armed) = next_refresh_action(
+            &delta,
+            &fp,
+            &InventoryDelta::Unchanged,
+            &baseline.schedulable_fingerprint(),
+        );
+        let (second, _) = next_refresh_action(&delta, &fp, &armed, &fp);
+
+        assert_eq!(delta, InventoryDelta::FreeCapacityChanged);
+        assert_eq!(first, RefreshAction::Wait);
+        assert_eq!(second, RefreshAction::ApplyCapacity);
+    }
+
+    #[test]
+    fn a_changed_held_partition_id_reports_lost_and_hides_the_new_siblings() {
+        use std::collections::HashSet;
+        // The upgrade case: the baseline carries the old encoding, where the
+        // rank sat in the function bits, so rank 1 has its own BDF anchor.
+        let old_rank1 = (0x11 << 16) | (1 << 8);
+        let baseline = rset(
+            8,
+            1,
+            vec![
+                gpu(0, sid(0x11, 0)),
+                gpu(1, old_rank1),
+                gpu(8, sid(0x12, 0)),
+            ],
+        );
+        let fresh = cpx_node(2);
+        let held: HashSet<u64> = [sid(0x11, 0), old_rank1].into_iter().collect();
+
+        let delta = classify(&baseline, &fresh, &held);
+        let fp = fresh.schedulable_fingerprint();
+        let (first, armed) = next_refresh_action(
+            &delta,
+            &fp,
+            &InventoryDelta::Unchanged,
+            &baseline.schedulable_fingerprint(),
+        );
+        let (second, _) = next_refresh_action(&delta, &fp, &armed, &fp);
+        let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
+
+        assert_eq!(delta, InventoryDelta::AllocatedDevicesLost);
+        assert_eq!(first, RefreshAction::Wait);
+        assert_eq!(second, RefreshAction::ReportLost);
+        let ids: HashSet<u64> = reconciled.gpus.iter().map(|g| g.stable_id).collect();
+        assert!(ids.contains(&sid(0x11, 0)) && ids.contains(&old_rank1));
+        assert!((1..8).all(|r| !ids.contains(&sid(0x11, r))));
+        assert!(ids.contains(&sid(0x12, 0)));
+        assert_eq!(ids.len(), 3);
+    }
+
     #[test]
     fn after_release_next_classify_applies_current_baseline() {
         use spur_sched::cons_tres::{CapacityChange, NodeAllocation};
