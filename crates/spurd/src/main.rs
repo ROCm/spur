@@ -338,12 +338,19 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Absent a loaded config, these fall back to `SpurdConfig::default()` — the same
+    // values a present-but-empty `[spurd]` section would resolve to via `#[serde(default)]`.
+    let spurd_config = config.as_ref().map(|c| c.spurd.clone()).unwrap_or_default();
     match config.as_ref() {
-        Some(c) => controller_auth::install(&c.auth.plugin, &c.cluster_name),
+        Some(c) => controller_auth::install(
+            &c.auth.plugin,
+            &c.cluster_name,
+            spurd_config.native_mint_timeout(),
+        ),
         None => {
             let plugin = std::env::var("SPUR_AUTH_PLUGIN").unwrap_or_default();
             let cluster = std::env::var("SPUR_CLUSTER_NAME").unwrap_or_default();
-            controller_auth::install(&plugin, &cluster);
+            controller_auth::install(&plugin, &cluster, spurd_config.native_mint_timeout());
         }
     }
 
@@ -535,6 +542,15 @@ async fn main() -> anyhow::Result<()> {
     agent_server::recover_stepds(&running_jobs, recovered_stepds.clone()).await;
 
     // Create the node reporter
+    let reporter_timeouts = reporter::ReporterTimeouts {
+        channel: spur_client::ChannelTimeouts {
+            connect: spurd_config.controller_connect_timeout(),
+            keep_alive_interval: spurd_config.controller_keepalive_interval(),
+            keep_alive_timeout: spurd_config.controller_keepalive_timeout(),
+        },
+        controller_rpc_timeout: spurd_config.controller_rpc_timeout(),
+        failover_cooldown: spurd_config.controller_failover_cooldown(),
+    };
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
         args.controller.clone(),
@@ -545,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
         wg_iface,
         wg_config_dir,
         running_jobs.clone(),
+        reporter_timeouts,
     ));
 
     // Register with controller
@@ -1112,6 +1129,29 @@ mod tests {
     #[test]
     fn parse_label_just_equals() {
         assert!(parse_label("=").is_err());
+    }
+
+    /// Built the same way `report_stepd_recovery` builds it: a `ConnectAuthError`
+    /// wrapped in `.context(...)`, not a bare `tonic::Status`. Catches a regression
+    /// where `ConnectAuthError` stops exposing its inner status via `source()`.
+    #[test]
+    fn permanent_recovery_error_is_detected_through_connect_auth_error() {
+        use anyhow::Context;
+        let err: anyhow::Result<()> = Err(controller_auth::ConnectAuthError::Status(
+            tonic::Status::unauthenticated("node token rejected"),
+        ))
+        .context("runtime recovery report failed");
+        assert!(is_permanent_recovery_error(&err.unwrap_err()));
+    }
+
+    #[test]
+    fn a_transient_recovery_error_is_not_permanent() {
+        use anyhow::Context;
+        let err: anyhow::Result<()> = Err(controller_auth::ConnectAuthError::Status(
+            tonic::Status::unavailable("controller unreachable"),
+        ))
+        .context("runtime recovery report failed");
+        assert!(!is_permanent_recovery_error(&err.unwrap_err()));
     }
 
     #[test]

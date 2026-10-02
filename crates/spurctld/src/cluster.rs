@@ -9216,6 +9216,7 @@ mod tests {
             cgroup: Default::default(),
             mpi: Default::default(),
             health: Default::default(),
+            spurd: Default::default(),
         }
     }
 

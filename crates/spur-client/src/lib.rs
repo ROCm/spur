@@ -44,7 +44,8 @@ fn endpoint_list(raw: &str) -> Vec<String> {
     }
 }
 
-/// Connect to the first reachable controller endpoint.
+/// Connect to the first reachable controller endpoint, using the default
+/// dial/keepalive timeouts (see [`ChannelTimeouts::default`]).
 ///
 /// Endpoints are tried in the order given. On connection failure the next
 /// endpoint is attempted; if every endpoint fails, the last error is returned.
@@ -52,12 +53,53 @@ fn endpoint_list(raw: &str) -> Vec<String> {
 /// routes writes to the current Raft leader, so a single reachable node is
 /// sufficient regardless of which one is the leader.
 pub async fn connect_channel(endpoints: &str) -> Result<Channel, tonic::transport::Error> {
+    connect_channel_tracked(endpoints)
+        .await
+        .map(|(channel, _)| channel)
+}
+
+/// Same as [`connect_channel`], but also returns the endpoint that was actually dialed —
+/// a caller blaming a later failure on "the first configured endpoint" would otherwise
+/// blame the wrong host whenever an earlier one failed fast and this call fell through.
+pub async fn connect_channel_tracked(
+    endpoints: &str,
+) -> Result<(Channel, String), tonic::transport::Error> {
+    connect_channel_tracked_with_timeouts(endpoints, ChannelTimeouts::default()).await
+}
+
+/// Dial/keepalive timeouts for a controller channel. A caller with its own config should
+/// derive this from it; [`Default`] is for callers with none (one-shot CLI, FFI).
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelTimeouts {
+    pub connect: Duration,
+    pub keep_alive_interval: Duration,
+    pub keep_alive_timeout: Duration,
+}
+
+impl Default for ChannelTimeouts {
+    fn default() -> Self {
+        Self {
+            // Dial budget only; a peer that accepts TCP but never engages still dials fine.
+            connect: Duration::from_secs(2),
+            // Liveness for an idle-but-silent peer; detection is roughly interval + timeout.
+            keep_alive_interval: Duration::from_secs(10),
+            keep_alive_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Same as [`connect_channel_tracked`], with explicit timeouts instead of the module
+/// defaults.
+pub async fn connect_channel_tracked_with_timeouts(
+    endpoints: &str,
+    timeouts: ChannelTimeouts,
+) -> Result<(Channel, String), tonic::transport::Error> {
     let list = endpoint_list(endpoints);
     let last = list.len() - 1;
 
     for endpoint in &list[..last] {
-        match try_connect(endpoint).await {
-            Ok(channel) => return Ok(channel),
+        match try_connect(endpoint, timeouts).await {
+            Ok(channel) => return Ok((channel, endpoint.clone())),
             Err(e) => debug!(
                 %endpoint,
                 error = %e,
@@ -66,14 +108,65 @@ pub async fn connect_channel(endpoints: &str) -> Result<Channel, tonic::transpor
         }
     }
 
-    try_connect(&list[last]).await
+    try_connect(&list[last], timeouts)
+        .await
+        .map(|channel| (channel, list[last].clone()))
 }
 
-async fn try_connect(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
-    Endpoint::from_shared(endpoint.to_string())?
-        .connect_timeout(Duration::from_secs(2))
-        .connect()
-        .await
+async fn try_connect(
+    endpoint: &str,
+    timeouts: ChannelTimeouts,
+) -> Result<Channel, tonic::transport::Error> {
+    configure_endpoint(
+        endpoint,
+        timeouts.connect,
+        timeouts.keep_alive_interval,
+        timeouts.keep_alive_timeout,
+    )?
+    .connect()
+    .await
+}
+
+/// Shared builder so tests can exercise the real keepalive wiring with short
+/// durations instead of waiting out the production ones.
+///
+/// A zero duration is "disable this", not "pass zero through": `Endpoint::connect_timeout`/
+/// `http2_keep_alive_interval` treat `Duration::ZERO` as an already-elapsed deadline, which
+/// would fail every dial or keepalive tick instantly rather than falling back to the OS
+/// default or turning keepalive off. Matches `spurctld`'s own `agent_client::connect`.
+fn configure_endpoint(
+    endpoint: &str,
+    connect_timeout: Duration,
+    keep_alive_interval: Duration,
+    keep_alive_timeout: Duration,
+) -> Result<Endpoint, tonic::transport::Error> {
+    let mut builder = Endpoint::from_shared(endpoint.to_string())?;
+    if !connect_timeout.is_zero() {
+        builder = builder.connect_timeout(connect_timeout);
+    }
+    if !keep_alive_interval.is_zero() {
+        builder = builder
+            .http2_keep_alive_interval(keep_alive_interval)
+            .keep_alive_while_idle(true);
+        if !keep_alive_timeout.is_zero() {
+            builder = builder.keep_alive_timeout(keep_alive_timeout);
+        }
+    }
+    Ok(builder)
+}
+
+/// Move `avoid` to the back of the endpoint list, wherever it currently sits, so a
+/// caller that just saw it fail doesn't dial it again first. A no-op when it's absent
+/// or there's only one endpoint.
+pub fn deprioritize(endpoints: &str, avoid: &str) -> String {
+    let mut list = parse_endpoints(endpoints);
+    if list.len() > 1 {
+        if let Some(pos) = list.iter().position(|e| e == avoid) {
+            let bad = list.remove(pos);
+            list.push(bad);
+        }
+    }
+    list.join(",")
 }
 
 #[cfg(test)]
@@ -151,6 +244,102 @@ mod tests {
         let up = spawn_server().await;
         let endpoints = format!("http://{down1},http://{down2},http://{up}");
         assert!(connect_channel(&endpoints).await.is_ok());
+    }
+
+    #[test]
+    fn deprioritize_moves_the_failed_first_endpoint_to_the_back() {
+        assert_eq!(
+            deprioritize("http://a:1,http://b:1,http://c:1", "http://a:1"),
+            "http://b:1,http://c:1,http://a:1"
+        );
+    }
+
+    #[test]
+    fn deprioritize_moves_a_failed_middle_endpoint_to_the_back() {
+        assert_eq!(
+            deprioritize("http://a:1,http://b:1,http://c:1", "http://b:1"),
+            "http://a:1,http://c:1,http://b:1"
+        );
+    }
+
+    #[test]
+    fn deprioritize_is_a_no_op_when_the_endpoint_is_absent() {
+        assert_eq!(
+            deprioritize("http://a:1,http://b:1", "http://z:1"),
+            "http://a:1,http://b:1"
+        );
+    }
+
+    #[test]
+    fn deprioritize_is_a_no_op_with_a_single_endpoint() {
+        assert_eq!(deprioritize("http://a:1", "http://a:1"), "http://a:1");
+    }
+
+    #[tokio::test]
+    async fn connect_channel_tracked_reports_the_endpoint_it_actually_dialed() {
+        let down = free_addr().await;
+        let up = spawn_server().await;
+        let endpoints = format!("http://{down},http://{up}");
+        let (_channel, dialed) = connect_channel_tracked(&endpoints)
+            .await
+            .expect("second endpoint is reachable");
+        assert_eq!(dialed, format!("http://{up}"));
+    }
+
+    /// A peer that accepts TCP and never engages at the app layer must not hang an
+    /// RPC forever. Paused time makes the keepalive's firing deterministic rather
+    /// than racing a wall-clock bound against runner load.
+    #[tokio::test(start_paused = true)]
+    async fn stuck_peer_rpc_errors_out_via_keepalive_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _stream = stream;
+            std::future::pending::<()>().await
+        });
+
+        let channel = configure_endpoint(
+            &format!("http://{addr}"),
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .expect("valid endpoint")
+        .connect()
+        .await
+        .expect("dial succeeds even though the peer is silent");
+
+        let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
+        let result = client
+            .check(tonic_health::pb::HealthCheckRequest::default())
+            .await;
+        assert!(result.is_err(), "RPC against a silent peer must fail");
+    }
+
+    /// A configured `0` means "disable this", not "pass a zero deadline through" — the
+    /// latter would fail every dial instantly against a perfectly healthy peer.
+    #[tokio::test]
+    async fn zero_connect_and_keepalive_timeouts_disable_rather_than_instantly_fail() {
+        let up = spawn_server().await;
+
+        let channel = configure_endpoint(
+            &format!("http://{up}"),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .expect("valid endpoint")
+        .connect()
+        .await;
+
+        assert!(
+            channel.is_ok(),
+            "a zero connect_timeout must not make the dial fail against a reachable peer: {:?}",
+            channel.err()
+        );
     }
 
     /// Bind to an ephemeral port and release it, yielding an address that will
