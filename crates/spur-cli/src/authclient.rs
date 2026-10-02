@@ -166,11 +166,11 @@ fn native_cluster_name() -> anyhow::Result<String> {
         })
 }
 
-/// The CLI's own `[agent]` channel/mint timeouts, read from the same config file
+/// The CLI's own `[spurd]` channel/mint timeouts, read from the same config file
 /// `auth_plugin()` uses — so a cluster that tunes these for spurd gets the same
 /// values here instead of a constant hardcoded independently of that config.
-fn agent_config() -> spur_core::config::AgentConfig {
-    crate::spur_config::load_spur_config().agent
+fn spurd_config() -> spur_core::config::SpurdConfig {
+    crate::spur_config::load_spur_config().spurd
 }
 
 fn native_interceptor(audience: &str, epoch: u64) -> anyhow::Result<AuthInterceptor> {
@@ -182,7 +182,7 @@ fn native_interceptor(audience: &str, epoch: u64) -> anyhow::Result<AuthIntercep
             socket,
             audience: audience.to_string(),
             epoch,
-            timeout: agent_config().native_mint_timeout(),
+            timeout: spurd_config().native_mint_timeout(),
         }),
     })
 }
@@ -200,7 +200,7 @@ pub fn wrap_with_audience(channel: Channel, audience: &str) -> AuthChannel {
 /// Native `plugin = "spur"` first calls unauthenticated Ping to learn the
 /// verifier's audience and boot epoch, then mints against those values.
 pub async fn connect(endpoints: &str) -> anyhow::Result<AuthChannel> {
-    let cfg = agent_config();
+    let cfg = spurd_config();
     let timeouts = spur_client::ChannelTimeouts {
         connect: cfg.controller_connect_timeout(),
         keep_alive_interval: cfg.controller_keepalive_interval(),

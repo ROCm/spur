@@ -37,7 +37,7 @@ pub fn load_spur_config() -> SlurmConfig {
             cgroup: Default::default(),
             mpi: Default::default(),
             health: Default::default(),
-            agent: Default::default(),
+            spurd: Default::default(),
         },
     }
 }

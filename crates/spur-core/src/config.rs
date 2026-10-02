@@ -129,7 +129,7 @@ pub struct SlurmConfig {
     /// spurd's own channel/RPC timeouts for talking to the controller. Inverse
     /// direction of `[controller] agent_*`.
     #[serde(default)]
-    pub agent: AgentConfig,
+    pub spurd: SpurdConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -1786,10 +1786,10 @@ impl HealthConfig {
     }
 }
 
-/// spurd's own agent-to-controller channel tuning (the inverse direction of
-/// `[controller] agent_*`, which bounds the controller's connections to agents).
+/// spurd's own channel/RPC tuning for its connection to the controller (the inverse
+/// direction of `[controller] agent_*`, which bounds the controller's connections to agents).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
+pub struct SpurdConfig {
     /// Budget for establishing a spurd-to-controller connection (default 2; shorter than the
     /// controller-side default of 5 since it only needs to bound the dial, not app-layer silence).
     #[serde(default = "default_controller_connect_timeout_secs")]
@@ -1856,7 +1856,7 @@ fn default_native_mint_timeout_secs() -> u64 {
     DEFAULT_NATIVE_MINT_TIMEOUT_SECS
 }
 
-impl Default for AgentConfig {
+impl Default for SpurdConfig {
     fn default() -> Self {
         Self {
             controller_connect_timeout_secs: default_controller_connect_timeout_secs(),
@@ -1869,7 +1869,7 @@ impl Default for AgentConfig {
     }
 }
 
-impl AgentConfig {
+impl SpurdConfig {
     pub fn controller_connect_timeout(&self) -> Duration {
         Duration::from_secs(self.controller_connect_timeout_secs)
     }
@@ -2079,16 +2079,16 @@ impl SlurmConfig {
         // outbound connection to the controller.
         for (field, value) in [
             (
-                "agent.controller_connect_timeout_secs",
-                self.agent.controller_connect_timeout_secs,
+                "spurd.controller_connect_timeout_secs",
+                self.spurd.controller_connect_timeout_secs,
             ),
             (
-                "agent.controller_keepalive_interval_secs",
-                self.agent.controller_keepalive_interval_secs,
+                "spurd.controller_keepalive_interval_secs",
+                self.spurd.controller_keepalive_interval_secs,
             ),
             (
-                "agent.controller_keepalive_timeout_secs",
-                self.agent.controller_keepalive_timeout_secs,
+                "spurd.controller_keepalive_timeout_secs",
+                self.spurd.controller_keepalive_timeout_secs,
             ),
         ] {
             if value > MAX_AGENT_CHANNEL_TIMEOUT_SECS {
@@ -2098,11 +2098,11 @@ impl SlurmConfig {
                 });
             }
         }
-        if self.agent.controller_keepalive_interval_secs > 0
-            && self.agent.controller_keepalive_timeout_secs == 0
+        if self.spurd.controller_keepalive_interval_secs > 0
+            && self.spurd.controller_keepalive_timeout_secs == 0
         {
             return Err(ConfigError::InvalidValue {
-                field: "agent.controller_keepalive_timeout_secs".into(),
+                field: "spurd.controller_keepalive_timeout_secs".into(),
                 value: "0 (must be greater than 0 unless controller_keepalive_interval_secs is 0)"
                     .into(),
             });
@@ -2112,9 +2112,9 @@ impl SlurmConfig {
         // zero is rejected for the RPC timeout: this ceiling is the only thing bounding the
         // stuck-controller hang this config exists to fix, so "0 disables it" would silently
         // reopen that hang rather than skip an optional cooldown.
-        if self.agent.controller_rpc_timeout_secs == 0 {
+        if self.spurd.controller_rpc_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
-                field: "agent.controller_rpc_timeout_secs".into(),
+                field: "spurd.controller_rpc_timeout_secs".into(),
                 value: "0 (must be at least 1; a zero timeout would make every controller RPC \
                         fail instantly instead of bounding a hang)"
                     .into(),
@@ -2122,12 +2122,12 @@ impl SlurmConfig {
         }
         for (field, value) in [
             (
-                "agent.controller_rpc_timeout_secs",
-                self.agent.controller_rpc_timeout_secs,
+                "spurd.controller_rpc_timeout_secs",
+                self.spurd.controller_rpc_timeout_secs,
             ),
             (
-                "agent.controller_failover_cooldown_secs",
-                self.agent.controller_failover_cooldown_secs,
+                "spurd.controller_failover_cooldown_secs",
+                self.spurd.controller_failover_cooldown_secs,
             ),
         ] {
             if value > MAX_LAUNCH_BACKOFF_SECS {
@@ -2139,14 +2139,14 @@ impl SlurmConfig {
         }
         // A fast local IPC call, not a network RPC — bounded far tighter than the
         // day-scale ceiling above, and zero would fail every mint before it dials.
-        if self.agent.native_mint_timeout_secs == 0
-            || self.agent.native_mint_timeout_secs > MAX_NATIVE_MINT_TIMEOUT_SECS
+        if self.spurd.native_mint_timeout_secs == 0
+            || self.spurd.native_mint_timeout_secs > MAX_NATIVE_MINT_TIMEOUT_SECS
         {
             return Err(ConfigError::InvalidValue {
-                field: "agent.native_mint_timeout_secs".into(),
+                field: "spurd.native_mint_timeout_secs".into(),
                 value: format!(
                     "{} (must be between 1 and {MAX_NATIVE_MINT_TIMEOUT_SECS})",
-                    self.agent.native_mint_timeout_secs
+                    self.spurd.native_mint_timeout_secs
                 ),
             });
         }
@@ -4467,14 +4467,14 @@ agent_keepalive_timeout_secs = 0
     }
 
     #[test]
-    fn agent_config_rejects_out_of_range_channel_timeouts() {
+    fn spurd_config_rejects_out_of_range_channel_timeouts() {
         for field in [
             "controller_connect_timeout_secs",
             "controller_keepalive_interval_secs",
             "controller_keepalive_timeout_secs",
         ] {
             let toml = format!(
-                "cluster_name = \"test\"\n\n[agent]\n{field} = {}\n",
+                "cluster_name = \"test\"\n\n[spurd]\n{field} = {}\n",
                 MAX_AGENT_CHANNEL_TIMEOUT_SECS + 1
             );
             let err = SlurmConfig::load_from_str(&toml).unwrap_err();
@@ -4485,18 +4485,18 @@ agent_keepalive_timeout_secs = 0
         }
         // The bound itself must be accepted, for all three fields.
         let ok = format!(
-            "cluster_name = \"test\"\n\n[agent]\ncontroller_connect_timeout_secs = {max}\ncontroller_keepalive_interval_secs = {max}\ncontroller_keepalive_timeout_secs = {max}\n",
+            "cluster_name = \"test\"\n\n[spurd]\ncontroller_connect_timeout_secs = {max}\ncontroller_keepalive_interval_secs = {max}\ncontroller_keepalive_timeout_secs = {max}\n",
             max = MAX_AGENT_CHANNEL_TIMEOUT_SECS
         );
         assert!(SlurmConfig::load_from_str(&ok).is_ok());
     }
 
     #[test]
-    fn agent_config_rejects_a_zero_keepalive_timeout_while_keepalive_is_on() {
+    fn spurd_config_rejects_a_zero_keepalive_timeout_while_keepalive_is_on() {
         let toml = r#"
 cluster_name = "test"
 
-[agent]
+[spurd]
 controller_keepalive_interval_secs = 10
 controller_keepalive_timeout_secs = 0
 "#;
@@ -4511,7 +4511,7 @@ controller_keepalive_timeout_secs = 0
         let ok = r#"
 cluster_name = "test"
 
-[agent]
+[spurd]
 controller_keepalive_interval_secs = 0
 controller_keepalive_timeout_secs = 0
 "#;
@@ -4519,13 +4519,13 @@ controller_keepalive_timeout_secs = 0
     }
 
     #[test]
-    fn agent_config_rejects_out_of_range_rpc_timeout_and_cooldown() {
+    fn spurd_config_rejects_out_of_range_rpc_timeout_and_cooldown() {
         for field in [
             "controller_rpc_timeout_secs",
             "controller_failover_cooldown_secs",
         ] {
             let toml = format!(
-                "cluster_name = \"test\"\n\n[agent]\n{field} = {}\n",
+                "cluster_name = \"test\"\n\n[spurd]\n{field} = {}\n",
                 MAX_LAUNCH_BACKOFF_SECS + 1
             );
             let err = SlurmConfig::load_from_str(&toml).unwrap_err();
@@ -4537,13 +4537,13 @@ controller_keepalive_timeout_secs = 0
     }
 
     #[test]
-    fn agent_config_rejects_a_zero_controller_rpc_timeout() {
+    fn spurd_config_rejects_a_zero_controller_rpc_timeout() {
         // Unlike dispatch_reject_cooldown_secs, 0 is not a valid "disable" value here: it would
         // make every controller RPC fail instantly rather than bounding a hang.
         let toml = r#"
 cluster_name = "test"
 
-[agent]
+[spurd]
 controller_rpc_timeout_secs = 0
 "#;
         let err = SlurmConfig::load_from_str(toml).unwrap_err();
@@ -4554,9 +4554,9 @@ controller_rpc_timeout_secs = 0
     }
 
     #[test]
-    fn agent_config_rejects_out_of_range_native_mint_timeout() {
+    fn spurd_config_rejects_out_of_range_native_mint_timeout() {
         let toml = format!(
-            "cluster_name = \"test\"\n\n[agent]\nnative_mint_timeout_secs = {}\n",
+            "cluster_name = \"test\"\n\n[spurd]\nnative_mint_timeout_secs = {}\n",
             MAX_NATIVE_MINT_TIMEOUT_SECS + 1
         );
         let err = SlurmConfig::load_from_str(&toml).unwrap_err();
@@ -4566,17 +4566,17 @@ controller_rpc_timeout_secs = 0
         );
 
         let ok = format!(
-            "cluster_name = \"test\"\n\n[agent]\nnative_mint_timeout_secs = {MAX_NATIVE_MINT_TIMEOUT_SECS}\n"
+            "cluster_name = \"test\"\n\n[spurd]\nnative_mint_timeout_secs = {MAX_NATIVE_MINT_TIMEOUT_SECS}\n"
         );
         assert!(SlurmConfig::load_from_str(&ok).is_ok());
     }
 
     #[test]
-    fn agent_config_rejects_a_zero_native_mint_timeout() {
+    fn spurd_config_rejects_a_zero_native_mint_timeout() {
         let toml = r#"
 cluster_name = "test"
 
-[agent]
+[spurd]
 native_mint_timeout_secs = 0
 "#;
         let err = SlurmConfig::load_from_str(toml).unwrap_err();
@@ -4587,16 +4587,18 @@ native_mint_timeout_secs = 0
     }
 
     #[test]
-    fn agent_config_defaults_match_todays_hardcoded_values() {
+    fn spurd_config_defaults_match_todays_hardcoded_values() {
+        // No [spurd] section at all: the cluster admin never opted in, so every field must
+        // fall back to its serde default rather than fail to load or zero out.
         let cfg = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
         // These must stay 2/10/10/10/60/5 so making the timers configurable does not
-        // itself change behavior for a deployed config with no [agent] section.
-        assert_eq!(cfg.agent.controller_connect_timeout_secs, 2);
-        assert_eq!(cfg.agent.controller_keepalive_interval_secs, 10);
-        assert_eq!(cfg.agent.controller_keepalive_timeout_secs, 10);
-        assert_eq!(cfg.agent.controller_rpc_timeout_secs, 10);
-        assert_eq!(cfg.agent.controller_failover_cooldown_secs, 60);
-        assert_eq!(cfg.agent.native_mint_timeout_secs, 5);
+        // itself change behavior for a deployed config with no [spurd] section.
+        assert_eq!(cfg.spurd.controller_connect_timeout_secs, 2);
+        assert_eq!(cfg.spurd.controller_keepalive_interval_secs, 10);
+        assert_eq!(cfg.spurd.controller_keepalive_timeout_secs, 10);
+        assert_eq!(cfg.spurd.controller_rpc_timeout_secs, 10);
+        assert_eq!(cfg.spurd.controller_failover_cooldown_secs, 60);
+        assert_eq!(cfg.spurd.native_mint_timeout_secs, 5);
     }
 
     #[test]

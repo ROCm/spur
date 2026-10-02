@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 /// Channel dial/keepalive and RPC/failover timeouts a [`NodeReporter`] applies to every
-/// controller connection. A caller with its own config (spurd's `[agent]` section) should
+/// controller connection. A caller with its own config (spurd's `[spurd]` section) should
 /// build this from it; [`Default`] reproduces today's fixed values for tests and any
 /// caller with no config of its own.
 #[derive(Debug, Clone, Copy)]

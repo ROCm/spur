@@ -14,7 +14,7 @@ and meaning.
 
    ``spurctld`` reads every section of ``spur.conf``. ``spurd`` reads the same file
    but only for local agent settings (``[hooks]``, ``[devices]``, ``rlimits.memlock``,
-   ``[cgroup]``, ``[cluster]``, ``[mpi]``, and ``[agent]``); its identity and
+   ``[cgroup]``, ``[cluster]``, ``[mpi]``, and ``[spurd]``); its identity and
    networking come from CLI flags.
    Node CPU, memory, and GRES are reported by each agent when it registers;
    ``[[nodes]]`` overlays scheduling policy onto nodes that have already registered.
@@ -312,7 +312,7 @@ and Raft high-availability topology.
        dispatch for the same span, and is not marked down, so it still
        appears available in ``sinfo`` while being skipped.
 
-``[agent]``
+``[spurd]``
 -----------
 
 ``spurd``'s own channel and RPC tuning for its connection to the controller — the
