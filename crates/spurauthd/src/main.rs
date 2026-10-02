@@ -37,12 +37,22 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "-V" || a == "--version")
+    {
+        println!("{}", spur_core::version::version_string());
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    info!(version = %spur_core::version::version_string(), "spurauthd starting");
 
     let args = Args::parse();
     let socket = match args.socket {

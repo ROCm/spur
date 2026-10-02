@@ -6,6 +6,14 @@
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a == "-V" || a == "--version")
+    {
+        println!("{}", spur_core::version::version_string());
+        return Ok(());
+    }
+
     // stderr is inherited across the double-fork, so these land in the agent log
     // instead of being discarded for the job's whole lifetime.
     tracing_subscriber::fmt()
@@ -15,6 +23,8 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    tracing::info!(version = %spur_core::version::version_string(), "spurstepd starting");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let exit_code = spurd::stepd::run_process(&args).await.map_err(|error| {

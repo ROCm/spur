@@ -3841,8 +3841,10 @@ name = "spur-stepd"
 version = "0.14.0"
 dependencies = [
  "anyhow",
+ "spur-core",
  "spurd",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
