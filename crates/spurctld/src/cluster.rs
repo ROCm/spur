@@ -5407,7 +5407,7 @@ impl ClusterManager {
         );
         let (classification, _) =
             crate::scheduler_loop::classify_without_phantom_claims(self, |c| {
-                crate::scheduler_loop::trial_placement(self, &mut trial, c)
+                crate::scheduler_loop::trial_placement(self, &mut trial, c, &HashSet::new())
             });
         self.apply_classification(classification)
     }
@@ -12551,7 +12551,12 @@ state = "UP"
                 claims_blocked: false,
             };
             let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
-            let actual = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
+            let actual = crate::scheduler_loop::trial_placement(
+                &cm,
+                &mut trial,
+                &classification,
+                &HashSet::new(),
+            );
             assert_eq!(actual.contains(&1), placed, "{node}");
         };
         assert_trial("n0", true);
@@ -23083,8 +23088,12 @@ state = "UP"
             &HashSet::new(),
         );
         let classification = cm.classify_pending_jobs_with(&HashSet::new());
-        let trial =
-            crate::scheduler_loop::trial_placement(cm, &mut scheduler.for_trial(), &classification);
+        let trial = crate::scheduler_loop::trial_placement(
+            cm,
+            &mut scheduler.for_trial(),
+            &classification,
+            &HashSet::new(),
+        );
         assert_eq!(trial, assignments.iter().map(|a| a.job_id).collect());
         assignments
     }
@@ -27193,7 +27202,7 @@ state = "UP"
     fn classify_with_trials(cm: &ClusterManager) -> (PendingJobClassification, HashSet<JobId>) {
         let mut trial = spur_sched::backfill::BackfillScheduler::new(10);
         crate::scheduler_loop::classify_without_phantom_claims(cm, |c| {
-            crate::scheduler_loop::trial_placement(cm, &mut trial, c)
+            crate::scheduler_loop::trial_placement(cm, &mut trial, c, &HashSet::new())
         })
     }
 
