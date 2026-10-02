@@ -67,6 +67,8 @@ pub struct JobFinalized {
     pub job_id: u32,
     pub state: spur_core::job::JobState,
     pub exit_code: i32,
+    #[serde(default)]
+    pub actual_secs: u64,
 }
 
 /// Response returned after a Raft write is committed.

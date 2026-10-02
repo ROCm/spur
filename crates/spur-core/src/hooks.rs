@@ -48,11 +48,11 @@ impl HookContext {
         env.set_with_slurm_twin("SPUR_JOB_PARTITION", &self.partition);
         env.set_with_slurm_twin("SPUR_JOB_NODELIST", &self.nodelist);
         env.set_with_slurm_twin("SPUR_CPUS_ON_NODE", self.cpus);
-        env.set("SPUR_JOB_USER", &username);
+        env.set_with_slurm_twin("SPUR_JOB_USER", &username);
         env.set("SPUR_JOB_UID", self.uid);
         env.set("SPUR_JOB_GID", self.gid);
         env.set("SPUR_JOB_WORK_DIR", &self.work_dir);
-        env.set("SPUR_JOB_GPUS", &gpu_list);
+        env.set_with_slurm_twin("SPUR_JOB_GPUS", &gpu_list);
         env.set("SPUR_JOB_MEMORY_MB", self.memory_mb);
         env.set("SPUR_SCRIPT_CONTEXT", &self.script_context);
         env.into_map()

@@ -239,6 +239,9 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
             start_time,
             reservation: spec.reservation.clone(),
             idle_fill: job.idle_fill,
+            total_gpus: spur_core::job::effective_gpus(spec, spec.num_nodes) as u32,
+            // Minutes granularity matches the DB schema and sacct output format.
+            time_limit_min: spec.time_limit.map(|d| d.num_minutes() as i32),
         },
     )
     .await
@@ -611,6 +614,8 @@ mod tests {
                     start_time: job.start_time.unwrap(),
                     reservation: None,
                     idle_fill: false,
+                    total_gpus: 0,
+                    time_limit_min: None,
                 },
             )
             .await?;

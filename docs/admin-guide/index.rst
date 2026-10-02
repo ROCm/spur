@@ -14,6 +14,8 @@ Configuring and operating a Spur cluster.
 - :doc:`dme-integration` — attaching per-job labels (``job_id``, ``job_user``,
   ``job_partition``) to AMD Device Metrics Exporter GPU metrics via prolog/epilog
   hooks.
+- :doc:`karma-scoring` — per-user job lifecycle counters for computing a cluster
+  citizenship karma score in Prometheus.
 
 Partitions are defined statically in ``spur.conf`` (see
 :doc:`/deployment/partitioning`), not created at runtime.

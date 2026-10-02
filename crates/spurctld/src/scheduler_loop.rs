@@ -118,23 +118,25 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     // victim goes first and the dearer one follows a second later anyway. Remember
     // which reclaimer has capacity in flight and leave it alone until it lands.
     let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
+    let mut was_leader = false;
 
     loop {
-        // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
-        // This eliminates the up-to-`interval_secs` polling delay for new submissions while
-        // preserving a periodic wake for resource-freed events and node state changes.
         tokio::select! {
             _ = scheduler_notify.notified() => {}
             _ = interval.tick() => {}
         }
 
         if !raft.is_leader() {
-            // A former leader must not keep serving planned-reservation info
-            // from before it lost leadership.
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
             scheduler.clear_outcomes();
+            was_leader = false;
             continue;
+        }
+
+        if !was_leader {
+            cluster.reset_karma_stats();
+            was_leader = true;
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
