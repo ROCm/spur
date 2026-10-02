@@ -24,6 +24,12 @@ const CONTROLLER_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// "recapture" every reconnect attempt before the next one is due.
 const FAILOVER_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Lock a `std::sync::Mutex`, recovering the inner state on poison rather than
+/// panicking — none of this module's critical sections can leave data inconsistent.
+fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Source of the job ids this node currently holds. The controller decides from
 /// its own authoritative state whether any reported id is stale.
 pub trait HeldJobs: Send + Sync {
@@ -108,7 +114,7 @@ impl NodeReporter {
     /// Controller endpoints for the next dial. Skips a host that failed within the last
     /// [`FAILOVER_COOLDOWN`], provided there's another one to prefer instead.
     fn dial_endpoints(&self) -> String {
-        let guard = self.last_failed_endpoint.lock().unwrap();
+        let guard = lock_recover(&self.last_failed_endpoint);
         match &*guard {
             Some((bad, until)) if Instant::now() < *until => {
                 spur_client::deprioritize(&self.controller_addr, bad)
@@ -123,7 +129,7 @@ impl NodeReporter {
         if endpoint.is_empty() {
             return;
         }
-        *self.last_failed_endpoint.lock().unwrap() =
+        *lock_recover(&self.last_failed_endpoint) =
             Some((endpoint.to_string(), Instant::now() + FAILOVER_COOLDOWN));
     }
 
@@ -163,7 +169,7 @@ impl NodeReporter {
             let (channel, endpoint) = spur_client::connect_channel_tracked(&endpoints)
                 .await
                 .map_err(crate::controller_auth::ConnectAuthError::Transport)?;
-            *record_dialed.lock().unwrap() = Some(endpoint);
+            *lock_recover(&record_dialed) = Some(endpoint);
             let client = crate::controller_auth::wrap(channel)
                 .await
                 .map_err(crate::controller_auth::ConnectAuthError::Status)?;
@@ -172,7 +178,7 @@ impl NodeReporter {
                 .map(tonic::Response::into_inner)
                 .map_err(crate::controller_auth::ConnectAuthError::Status)
         };
-        let blame = move || dialed.lock().unwrap().clone().unwrap_or_default();
+        let blame = move || lock_recover(&dialed).clone().unwrap_or_default();
         match tokio::time::timeout(timeout, attempt).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(e)) => {
@@ -1155,6 +1161,17 @@ mod tests {
             .await
     }
 
+    /// The RPC status code behind a dial/app-level failure, so a test can prove
+    /// which peer actually answered instead of only inferring it from timing.
+    fn err_code(err: &crate::controller_auth::ConnectAuthError) -> tonic::Code {
+        match err {
+            crate::controller_auth::ConnectAuthError::Status(s) => s.code(),
+            crate::controller_auth::ConnectAuthError::Transport(_) => {
+                panic!("expected an app-level status, got a transport error: {err}")
+            }
+        }
+    }
+
     /// Bind then release a port, yielding an address that refuses connections fast —
     /// distinct from `stuck_listener`, which accepts but never answers.
     async fn refusing_addr() -> std::net::SocketAddr {
@@ -1169,12 +1186,9 @@ mod tests {
         let stuck = stuck_listener().await;
         let reporter = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{stuck}"));
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
-        )
-        .await
-        .expect("must resolve well within the configured RPC timeout, not hang");
+        let result = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
 
         assert!(result.is_err());
     }
@@ -1188,12 +1202,9 @@ mod tests {
             format!("http://{stuck},http://{healthy}"),
         );
 
-        let first = tokio::time::timeout(
-            Duration::from_secs(3),
-            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
-        )
-        .await
-        .expect("bounded by the configured RPC timeout");
+        let first = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
         assert!(first.is_err(), "the stuck peer must not answer");
 
         assert_eq!(
@@ -1203,13 +1214,15 @@ mod tests {
         );
 
         let start = Instant::now();
-        let second = tokio::time::timeout(
-            Duration::from_secs(3),
-            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
-        )
-        .await
-        .expect("bounded by the configured RPC timeout");
-        assert!(second.is_err(), "unimplemented on the stand-in server");
+        let second = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
+        let err = second.expect_err("unimplemented on the stand-in server");
+        assert_eq!(
+            err_code(&err),
+            tonic::Code::Unimplemented,
+            "must have reached the healthy stand-in, not the stuck host"
+        );
         assert!(
             start.elapsed() < Duration::from_millis(250),
             "a dial that reaches the responsive host must not wait out the stuck one's timeout"
@@ -1228,12 +1241,9 @@ mod tests {
             format!("http://{dead},http://{stuck},http://{healthy}"),
         );
 
-        let first = tokio::time::timeout(
-            Duration::from_secs(3),
-            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
-        )
-        .await
-        .expect("bounded by the configured RPC timeout");
+        let first = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
         assert!(first.is_err(), "the wedged middle host must not answer");
 
         assert_eq!(
@@ -1243,13 +1253,15 @@ mod tests {
         );
 
         let start = Instant::now();
-        let second = tokio::time::timeout(
-            Duration::from_secs(3),
-            reporter.with_controller_timeout(Duration::from_millis(300), heartbeat_op),
-        )
-        .await
-        .expect("bounded by the configured RPC timeout");
-        assert!(second.is_err(), "unimplemented on the stand-in server");
+        let second = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
+        let err = second.expect_err("unimplemented on the stand-in server");
+        assert_eq!(
+            err_code(&err),
+            tonic::Code::Unimplemented,
+            "must have reached the healthy stand-in, not the still-wedged host"
+        );
         assert!(
             start.elapsed() < Duration::from_millis(250),
             "the next dial must reach the healthy host instead of the still-wedged one"

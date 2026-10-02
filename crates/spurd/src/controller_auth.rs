@@ -83,7 +83,7 @@ pub async fn wrap(channel: Channel) -> Result<ControllerClient, Status> {
             let ping = raw
                 .ping(())
                 .await
-                .map_err(|e| Status::unauthenticated(format!("native auth handshake (Ping): {e}")))?
+                .map_err(|e| Status::new(e.code(), format!("native auth handshake (Ping): {e}")))?
                 .into_inner();
             if ping.auth_audience.is_empty() {
                 return Err(Status::unauthenticated(
@@ -172,6 +172,35 @@ mod tests {
             }]
         });
         HmacKeySet::from_bytes(doc.to_string().as_bytes(), unix_now().unwrap()).unwrap()
+    }
+
+    /// A transient Ping failure (here: Unimplemented, since this stand-in server never
+    /// registers SlurmController) must not be collapsed into Unauthenticated — that
+    /// would make `is_permanent_recovery_error` treat a retryable outage as permanent.
+    /// `NATIVE_SOCKET` is a process-wide OnceLock set once here, like at real startup.
+    #[tokio::test]
+    async fn wrap_preserves_the_real_status_code_on_a_failed_ping() {
+        let _ = NATIVE_SOCKET.set(Some(PathBuf::from("/nonexistent/auth.sock")));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_health_reporter, health) = tonic_health::server::health_reporter();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(health)
+                .serve_with_incoming(incoming)
+                .await;
+        });
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+
+        let err = wrap(channel).await.unwrap_err();
+        assert_eq!(err.code(), Code::Unimplemented);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

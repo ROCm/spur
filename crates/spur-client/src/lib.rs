@@ -248,8 +248,9 @@ mod tests {
     }
 
     /// A peer that accepts TCP and never engages at the app layer must not hang an
-    /// RPC forever; the outer timeout is a bound a regression would blow through.
-    #[tokio::test]
+    /// RPC forever. Paused time makes the keepalive's firing deterministic rather
+    /// than racing a wall-clock bound against runner load.
+    #[tokio::test(start_paused = true)]
     async fn stuck_peer_rpc_errors_out_via_keepalive_instead_of_hanging() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -273,12 +274,9 @@ mod tests {
         .expect("dial succeeds even though the peer is silent");
 
         let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            client.check(tonic_health::pb::HealthCheckRequest::default()),
-        )
-        .await
-        .expect("keepalive must bound the hung RPC, not let it hang forever");
+        let result = client
+            .check(tonic_health::pb::HealthCheckRequest::default())
+            .await;
         assert!(result.is_err(), "RPC against a silent peer must fail");
     }
 
