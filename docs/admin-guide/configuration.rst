@@ -14,8 +14,8 @@ and meaning.
 
    ``spurctld`` reads every section of ``spur.conf``. ``spurd`` reads the same file
    but only for local agent settings (``[hooks]``, ``[devices]``, ``rlimits.memlock``,
-   ``[cgroup]``, ``[cluster]``, and ``[mpi]``); its identity and networking come from
-   CLI flags.
+   ``[cgroup]``, ``[cluster]``, ``[mpi]``, and ``[agent]``); its identity and
+   networking come from CLI flags.
    Node CPU, memory, and GRES are reported by each agent when it registers;
    ``[[nodes]]`` overlays scheduling policy onto nodes that have already registered.
    The exception is ``cpus`` / ``memory_mb`` / ``reserved_memory_mb``, which cap the
@@ -358,14 +358,15 @@ bound the controller's connections to agents instead.
      - ``10``
      - Ceiling on a single register/heartbeat/deregister/recovery RPC to the
        controller. These are fast, bounded calls — unlike a controller-to-agent
-       launch — so a hung one means wedged, not slow. Range 0-86400.
+       launch — so a hung one means wedged, not slow. Range 1-86400; ``0`` is
+       rejected (it would fail every RPC instantly rather than bound a hang).
    * - ``controller_failover_cooldown_secs``
      - integer
      - ``60``
      - How long a controller endpoint that just failed to dial or answer is
        deprioritized in favor of another configured endpoint, so it can't
        "recapture" every reconnect attempt before the next one is due. Range
-       0-86400.
+       0-86400; ``0`` disables the cooldown.
    * - ``native_mint_timeout_secs``
      - integer
      - ``5``
@@ -373,8 +374,8 @@ bound the controller's connections to agents instead.
        Only consulted under ``[auth] plugin = "spur"``. The mint read runs
        inside a synchronous tonic interceptor, so this is the only thing that
        bounds a mint that accepts the connection and never replies — an
-       ``async`` timeout around the RPC cannot preempt it. Must be at least
-       ``1``; range 1-86400.
+       ``async`` timeout around the RPC cannot preempt it. Range 1-60 (a fast
+       local call, bounded tighter than the RPC/cooldown fields above).
 
 ``[accounting]``
 ----------------

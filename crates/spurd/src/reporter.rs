@@ -1229,6 +1229,33 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Proves `ReporterTimeouts.controller_rpc_timeout` actually reaches the public
+    /// `with_controller` path, not just the test-only explicit-override seam above: a
+    /// reporter built with a short configured timeout must give up well before the
+    /// 10-second module default would.
+    #[tokio::test]
+    async fn a_configured_rpc_timeout_bounds_the_public_with_controller_call() {
+        let stuck = stuck_listener().await;
+        let mut reporter = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{stuck}"));
+        reporter.timeouts.controller_rpc_timeout = Duration::from_millis(200);
+
+        let start = Instant::now();
+        let result = reporter
+            .with_controller(move |mut client| async move {
+                client
+                    .heartbeat(spur_proto::proto::HeartbeatRequest::default())
+                    .await
+            })
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a stuck peer must not satisfy the RPC");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must fail close to the configured 200ms, not the 10s module default; took {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_timed_out_rpc_makes_the_next_dial_prefer_the_other_host() {
         let stuck = stuck_listener().await;

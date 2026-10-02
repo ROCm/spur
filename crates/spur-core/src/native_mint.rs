@@ -187,13 +187,10 @@ pub async fn mint(socket: &Path, audience: &str, audience_epoch: u64) -> Result<
     decode_mint_response(&body)
 }
 
-/// Blocking mint for sync callers (tonic interceptors cannot `.await`).
-///
-/// `timeout` bounds both the write and the read on the mint socket. Without it, a mint that
-/// accepts the connection and never replies blocks this thread forever: it runs inside a
-/// synchronous tonic interceptor, so an async `tokio::time::timeout` around the RPC future
-/// cannot preempt it — the blocking syscall never yields back to the executor, and enough
-/// stuck calls can starve the runtime's bounded worker-thread pool.
+/// Blocking mint for sync callers (tonic interceptors cannot `.await`). `timeout` bounds the
+/// write and read: without it, a mint that accepts the connection and never replies blocks
+/// this thread forever, since the sync interceptor's blocking call can't yield to let an
+/// async `tokio::time::timeout` around the RPC preempt it.
 pub fn mint_blocking(
     socket: &Path,
     audience: &str,
@@ -212,8 +209,8 @@ pub fn mint_blocking(
             MintError::Io(err.to_string())
         }
     })?;
-    // A zero duration means "wait forever" to the socket option, the opposite of what a
-    // zero timeout should mean here; validate() rejects zero before this is ever reached.
+    // `validate()` rejects a zero timeout before this ever runs; the std wrapper would
+    // otherwise reject it too (`InvalidInput`), not silently block forever.
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| MintError::Io(e.to_string()))?;
@@ -229,11 +226,8 @@ pub fn mint_blocking(
     decode_mint_response(&body)
 }
 
-/// A read/write past `set_read_timeout`/`set_write_timeout`'s deadline surfaces as
-/// `WouldBlock` on Linux (`TimedOut` on some other Unixes); either means the mint is
-/// hung, not merely I/O-broken, so callers can distinguish "mint is slow" from "mint
-/// socket I/O failed" instead of a bounded, classifiable failure looking like any
-/// other I/O error.
+/// Labels a `WouldBlock`/`TimedOut` (what `set_read_timeout`/`set_write_timeout`'s deadline
+/// produces) as [`MintError::Timeout`] instead of a generic, unclassifiable I/O error.
 fn io_err_to_mint_err(err: io::Error, timeout: Duration) -> MintError {
     if matches!(
         err.kind(),
@@ -496,9 +490,8 @@ async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, MintError> {
     Ok(buf)
 }
 
-/// Same framing as [`write_frame`], for a blocking stream with a read/write deadline
-/// already set via `set_write_timeout` — `timeout` is only used to label a resulting
-/// `WouldBlock`/`TimedOut` as [`MintError::Timeout`] rather than a generic I/O error.
+/// Same framing as [`write_frame`], for a blocking stream; `timeout` only labels the
+/// resulting error via [`io_err_to_mint_err`], the deadline itself is already set.
 fn write_frame_sync_timed(
     stream: &mut impl Write,
     body: &[u8],

@@ -67,11 +67,8 @@ pub async fn connect_channel_tracked(
     connect_channel_tracked_with_timeouts(endpoints, ChannelTimeouts::default()).await
 }
 
-/// Dial/keepalive timeouts for a controller channel. A caller with its own config (e.g.
-/// spurd's `[agent]` section) should derive this from it rather than accept the module
-/// defaults, so an operator can shorten the dial budget or keepalive cadence without a
-/// rebuild. [`Default`] reproduces today's fixed behavior for callers with no config of
-/// their own (one-shot CLI subcommands, FFI).
+/// Dial/keepalive timeouts for a controller channel. A caller with its own config should
+/// derive this from it; [`Default`] is for callers with none (one-shot CLI, FFI).
 #[derive(Debug, Clone, Copy)]
 pub struct ChannelTimeouts {
     pub connect: Duration,
@@ -82,13 +79,9 @@ pub struct ChannelTimeouts {
 impl Default for ChannelTimeouts {
     fn default() -> Self {
         Self {
-            // Dial budget only — the handshake resolves as soon as we send our own preface,
-            // so a peer that accepts TCP but never engages dials fine; keepalive below
-            // catches that.
+            // Dial budget only; a peer that accepts TCP but never engages still dials fine.
             connect: Duration::from_secs(2),
-            // Liveness for an established channel: a peer that accepts TCP then stops
-            // answering is torn down after roughly the interval plus the timeout,
-            // independent of any in-flight RPC.
+            // Liveness for an idle-but-silent peer; detection is roughly interval + timeout.
             keep_alive_interval: Duration::from_secs(10),
             keep_alive_timeout: Duration::from_secs(10),
         }
@@ -136,17 +129,30 @@ async fn try_connect(
 
 /// Shared builder so tests can exercise the real keepalive wiring with short
 /// durations instead of waiting out the production ones.
+///
+/// A zero duration is "disable this", not "pass zero through": `Endpoint::connect_timeout`/
+/// `http2_keep_alive_interval` treat `Duration::ZERO` as an already-elapsed deadline, which
+/// would fail every dial or keepalive tick instantly rather than falling back to the OS
+/// default or turning keepalive off. Matches `spurctld`'s own `agent_client::connect`.
 fn configure_endpoint(
     endpoint: &str,
     connect_timeout: Duration,
     keep_alive_interval: Duration,
     keep_alive_timeout: Duration,
 ) -> Result<Endpoint, tonic::transport::Error> {
-    Ok(Endpoint::from_shared(endpoint.to_string())?
-        .connect_timeout(connect_timeout)
-        .http2_keep_alive_interval(keep_alive_interval)
-        .keep_alive_timeout(keep_alive_timeout)
-        .keep_alive_while_idle(true))
+    let mut builder = Endpoint::from_shared(endpoint.to_string())?;
+    if !connect_timeout.is_zero() {
+        builder = builder.connect_timeout(connect_timeout);
+    }
+    if !keep_alive_interval.is_zero() {
+        builder = builder
+            .http2_keep_alive_interval(keep_alive_interval)
+            .keep_alive_while_idle(true);
+        if !keep_alive_timeout.is_zero() {
+            builder = builder.keep_alive_timeout(keep_alive_timeout);
+        }
+    }
+    Ok(builder)
 }
 
 /// Move `avoid` to the back of the endpoint list, wherever it currently sits, so a
@@ -311,6 +317,29 @@ mod tests {
             .check(tonic_health::pb::HealthCheckRequest::default())
             .await;
         assert!(result.is_err(), "RPC against a silent peer must fail");
+    }
+
+    /// A configured `0` means "disable this", not "pass a zero deadline through" — the
+    /// latter would fail every dial instantly against a perfectly healthy peer.
+    #[tokio::test]
+    async fn zero_connect_and_keepalive_timeouts_disable_rather_than_instantly_fail() {
+        let up = spawn_server().await;
+
+        let channel = configure_endpoint(
+            &format!("http://{up}"),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .expect("valid endpoint")
+        .connect()
+        .await;
+
+        assert!(
+            channel.is_ok(),
+            "a zero connect_timeout must not make the dial fail against a reachable peer: {:?}",
+            channel.err()
+        );
     }
 
     /// Bind to an ephemeral port and release it, yielding an address that will

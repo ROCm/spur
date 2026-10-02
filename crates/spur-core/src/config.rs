@@ -1790,10 +1790,8 @@ impl HealthConfig {
 /// `[controller] agent_*`, which bounds the controller's connections to agents).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
-    /// Budget for establishing a spurd-to-controller connection (default 2, 0 falls back to the
-    /// OS TCP timeout). Deliberately shorter than the controller-side default of 5: this bounds
-    /// only the dial, which a peer that accepts TCP and never engages at the app layer still
-    /// completes quickly, so a short budget just means failing over to another endpoint sooner.
+    /// Budget for establishing a spurd-to-controller connection (default 2; shorter than the
+    /// controller-side default of 5 since it only needs to bound the dial, not app-layer silence).
     #[serde(default = "default_controller_connect_timeout_secs")]
     pub controller_connect_timeout_secs: u64,
 
@@ -1816,17 +1814,11 @@ pub struct AgentConfig {
     #[serde(default = "default_controller_failover_cooldown_secs")]
     pub controller_failover_cooldown_secs: u64,
 
-    /// Ceiling on one native-auth credential mint over the local Unix socket (default 5).
-    /// Only consulted under `[auth] plugin = "spur"`. The mint read runs inside a synchronous
-    /// tonic interceptor, so an async timeout around the RPC cannot preempt it if the mint
-    /// accepts the connection and never replies.
+    /// Ceiling on one native-auth credential mint over the local Unix socket (default 5), only
+    /// consulted under `[auth] plugin = "spur"`. See [`MAX_NATIVE_MINT_TIMEOUT_SECS`].
     #[serde(default = "default_native_mint_timeout_secs")]
     pub native_mint_timeout_secs: u64,
 }
-
-/// Shared with the bounds check in [`SlurmConfig::validate`]. Mirrors
-/// `MAX_AGENT_CHANNEL_TIMEOUT_SECS`'s rationale for the opposite direction.
-pub const MAX_CONTROLLER_CHANNEL_TIMEOUT_SECS: u64 = 600;
 
 pub const DEFAULT_CONTROLLER_CONNECT_TIMEOUT_SECS: u64 = 2;
 pub const DEFAULT_CONTROLLER_KEEPALIVE_INTERVAL_SECS: u64 = 10;
@@ -1834,6 +1826,11 @@ pub const DEFAULT_CONTROLLER_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_CONTROLLER_RPC_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_CONTROLLER_FAILOVER_COOLDOWN_SECS: u64 = 60;
 pub const DEFAULT_NATIVE_MINT_TIMEOUT_SECS: u64 = 5;
+
+/// A fast local Unix-socket round trip, not a network RPC — tighter than
+/// `MAX_LAUNCH_BACKOFF_SECS` on purpose so a misconfigured value can't reopen the
+/// worker-thread-starvation hang this timeout exists to close.
+pub const MAX_NATIVE_MINT_TIMEOUT_SECS: u64 = 60;
 
 fn default_controller_connect_timeout_secs() -> u64 {
     DEFAULT_CONTROLLER_CONNECT_TIMEOUT_SECS
@@ -2094,12 +2091,10 @@ impl SlurmConfig {
                 self.agent.controller_keepalive_timeout_secs,
             ),
         ] {
-            if value > MAX_CONTROLLER_CHANNEL_TIMEOUT_SECS {
+            if value > MAX_AGENT_CHANNEL_TIMEOUT_SECS {
                 return Err(ConfigError::InvalidValue {
                     field: field.into(),
-                    value: format!(
-                        "{value} (must be at most {MAX_CONTROLLER_CHANNEL_TIMEOUT_SECS})"
-                    ),
+                    value: format!("{value} (must be at most {MAX_AGENT_CHANNEL_TIMEOUT_SECS})"),
                 });
             }
         }
@@ -2113,7 +2108,18 @@ impl SlurmConfig {
             });
         }
         // Same reasoning as controller.dispatch_reject_cooldown_secs: a day-long cooldown or
-        // RPC ceiling has no legitimate operational use.
+        // RPC ceiling has no legitimate operational use. Unlike dispatch_reject_cooldown_secs,
+        // zero is rejected for the RPC timeout: this ceiling is the only thing bounding the
+        // stuck-controller hang this config exists to fix, so "0 disables it" would silently
+        // reopen that hang rather than skip an optional cooldown.
+        if self.agent.controller_rpc_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "agent.controller_rpc_timeout_secs".into(),
+                value: "0 (must be at least 1; a zero timeout would make every controller RPC \
+                        fail instantly instead of bounding a hang)"
+                    .into(),
+            });
+        }
         for (field, value) in [
             (
                 "agent.controller_rpc_timeout_secs",
@@ -2123,10 +2129,6 @@ impl SlurmConfig {
                 "agent.controller_failover_cooldown_secs",
                 self.agent.controller_failover_cooldown_secs,
             ),
-            (
-                "agent.native_mint_timeout_secs",
-                self.agent.native_mint_timeout_secs,
-            ),
         ] {
             if value > MAX_LAUNCH_BACKOFF_SECS {
                 return Err(ConfigError::InvalidValue {
@@ -2135,12 +2137,17 @@ impl SlurmConfig {
                 });
             }
         }
-        // Zero would make every mint call fail before dialing the socket, which is
-        // indistinguishable from the mint being permanently down.
-        if self.agent.native_mint_timeout_secs == 0 {
+        // A fast local IPC call, not a network RPC — bounded far tighter than the
+        // day-scale ceiling above, and zero would fail every mint before it dials.
+        if self.agent.native_mint_timeout_secs == 0
+            || self.agent.native_mint_timeout_secs > MAX_NATIVE_MINT_TIMEOUT_SECS
+        {
             return Err(ConfigError::InvalidValue {
                 field: "agent.native_mint_timeout_secs".into(),
-                value: "0 (must be at least 1)".into(),
+                value: format!(
+                    "{} (must be between 1 and {MAX_NATIVE_MINT_TIMEOUT_SECS})",
+                    self.agent.native_mint_timeout_secs
+                ),
             });
         }
         // A timed-out node is cooled down for this span, so it feeds the same map and needs the
@@ -4468,7 +4475,7 @@ agent_keepalive_timeout_secs = 0
         ] {
             let toml = format!(
                 "cluster_name = \"test\"\n\n[agent]\n{field} = {}\n",
-                MAX_CONTROLLER_CHANNEL_TIMEOUT_SECS + 1
+                MAX_AGENT_CHANNEL_TIMEOUT_SECS + 1
             );
             let err = SlurmConfig::load_from_str(&toml).unwrap_err();
             assert!(
@@ -4476,6 +4483,12 @@ agent_keepalive_timeout_secs = 0
                 "{field} past the ceiling must be rejected, got: {err}"
             );
         }
+        // The bound itself must be accepted, for all three fields.
+        let ok = format!(
+            "cluster_name = \"test\"\n\n[agent]\ncontroller_connect_timeout_secs = {max}\ncontroller_keepalive_interval_secs = {max}\ncontroller_keepalive_timeout_secs = {max}\n",
+            max = MAX_AGENT_CHANNEL_TIMEOUT_SECS
+        );
+        assert!(SlurmConfig::load_from_str(&ok).is_ok());
     }
 
     #[test]
@@ -4510,7 +4523,6 @@ controller_keepalive_timeout_secs = 0
         for field in [
             "controller_rpc_timeout_secs",
             "controller_failover_cooldown_secs",
-            "native_mint_timeout_secs",
         ] {
             let toml = format!(
                 "cluster_name = \"test\"\n\n[agent]\n{field} = {}\n",
@@ -4522,6 +4534,41 @@ controller_keepalive_timeout_secs = 0
                 "{field} past the ceiling must be rejected, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn agent_config_rejects_a_zero_controller_rpc_timeout() {
+        // Unlike dispatch_reject_cooldown_secs, 0 is not a valid "disable" value here: it would
+        // make every controller RPC fail instantly rather than bounding a hang.
+        let toml = r#"
+cluster_name = "test"
+
+[agent]
+controller_rpc_timeout_secs = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("controller_rpc_timeout_secs"),
+            "a zero RPC timeout must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_config_rejects_out_of_range_native_mint_timeout() {
+        let toml = format!(
+            "cluster_name = \"test\"\n\n[agent]\nnative_mint_timeout_secs = {}\n",
+            MAX_NATIVE_MINT_TIMEOUT_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("native_mint_timeout_secs"),
+            "a mint timeout past its (tighter, fast-IPC) ceiling must be rejected: {err}"
+        );
+
+        let ok = format!(
+            "cluster_name = \"test\"\n\n[agent]\nnative_mint_timeout_secs = {MAX_NATIVE_MINT_TIMEOUT_SECS}\n"
+        );
+        assert!(SlurmConfig::load_from_str(&ok).is_ok());
     }
 
     #[test]
