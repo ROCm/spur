@@ -944,6 +944,28 @@ async fn release_srun_allocation(
     }
 }
 
+/// Job-level counterpart to `run_interactive_pty`'s step completion: `Ok`
+/// releases via `CompleteJob` like a non-pty step; `Err` still cancels.
+async fn conclude_pty_session(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    owner: &str,
+    result: &Result<i32>,
+) {
+    match result {
+        Ok(exit_code) => release_srun_allocation(client, job_id, owner, *exit_code).await,
+        Err(_) => {
+            let _ = client
+                .cancel_job(CancelJobRequest {
+                    job_id,
+                    signal: 0,
+                    user: owner.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
 async fn dispatch_step_cancellable(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
@@ -1019,13 +1041,7 @@ async fn run_standalone_srun(
             container_spec_from_srun_args(args),
         )
         .await;
-        let _ = client
-            .cancel_job(CancelJobRequest {
-                job_id,
-                signal: 0,
-                user: owner.clone(),
-            })
-            .await;
+        conclude_pty_session(&mut client, job_id, &owner, &result).await;
         // SrunProlog already ran for this invocation; pair it.
         run_srun_epilog(hooks, work_dir).await;
         std::process::exit(result?);
@@ -3028,6 +3044,70 @@ mod tests {
             capture.complete_step_calls().is_empty(),
             "no step exists, so nothing may be reported complete"
         );
+    }
+
+    /// `run_interactive_pty` already closes out the step on a clean exit; this
+    /// covers the job-level counterpart a standalone `--pty` srun must also
+    /// reach, since nothing else releases the job's allocation.
+    #[tokio::test]
+    async fn conclude_pty_session_completes_the_job_on_a_clean_exit() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        conclude_pty_session(&mut client, 55, "alice", &Ok(0)).await;
+
+        assert_eq!(
+            capture.complete_job_calls(),
+            vec![(55, 0, "alice".to_string())],
+            "a session that reported a real exit code must release through CompleteJob"
+        );
+        assert_eq!(
+            capture.cancel_job_calls(),
+            0,
+            "a clean exit must not also be recorded as a cancellation"
+        );
+    }
+
+    /// A nonzero exit is still a real answer from the remote session, not
+    /// evidence the job should read as cancelled.
+    #[tokio::test]
+    async fn conclude_pty_session_completes_the_job_with_a_nonzero_exit_code() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        conclude_pty_session(&mut client, 55, "alice", &Ok(137)).await;
+
+        assert_eq!(
+            capture.complete_job_calls(),
+            vec![(55, 137, "alice".to_string())],
+            "the remote's own reported exit code must be forwarded verbatim"
+        );
+        assert_eq!(capture.cancel_job_calls(), 0);
+    }
+
+    /// Only a session that never got to report an outcome leaves the job
+    /// genuinely unaccounted for.
+    #[tokio::test]
+    async fn conclude_pty_session_cancels_only_when_no_exit_code_ever_came_back() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        conclude_pty_session(
+            &mut client,
+            55,
+            "alice",
+            &Err(anyhow::anyhow!(
+                "InteractiveSession RPC failed: transport error"
+            )),
+        )
+        .await;
+
+        assert_eq!(
+            capture.cancel_job_calls(),
+            1,
+            "with no real outcome ever reported, cancelling is the only safe option"
+        );
+        assert!(capture.complete_job_calls().is_empty());
     }
 
     /// The step's supervisor outlives an agent restart, so a stream dropped
