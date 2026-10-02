@@ -16652,6 +16652,13 @@ mod tests {
     // dispatch rejected, as for any live owner.
     #[tokio::test(start_paused = true)]
     async fn dispatch_rejects_a_cancelled_gpu_owner_past_its_deadline() {
+        let log = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _trace_guard = tracing::subscriber::set_default(subscriber);
+
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
@@ -16675,6 +16682,9 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
         assert!(svc.running.lock().await.contains_key(&99));
+        let output = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        assert!(output.contains("dispatch waits for cancelled jobs to release their GPUs"));
+        assert!(output.contains("owners=[99]"));
     }
 
     fn gpu_alloc_request(device_ids: &[u64]) -> ResourceAllocations {
