@@ -338,12 +338,19 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Absent a loaded config, these fall back to `AgentConfig::default()` — the same
+    // values a present-but-empty `[agent]` section would resolve to via `#[serde(default)]`.
+    let agent_config = config.as_ref().map(|c| c.agent.clone()).unwrap_or_default();
     match config.as_ref() {
-        Some(c) => controller_auth::install(&c.auth.plugin, &c.cluster_name),
+        Some(c) => controller_auth::install(
+            &c.auth.plugin,
+            &c.cluster_name,
+            agent_config.native_mint_timeout(),
+        ),
         None => {
             let plugin = std::env::var("SPUR_AUTH_PLUGIN").unwrap_or_default();
             let cluster = std::env::var("SPUR_CLUSTER_NAME").unwrap_or_default();
-            controller_auth::install(&plugin, &cluster);
+            controller_auth::install(&plugin, &cluster, agent_config.native_mint_timeout());
         }
     }
 
@@ -535,6 +542,15 @@ async fn main() -> anyhow::Result<()> {
     agent_server::recover_stepds(&running_jobs, recovered_stepds.clone()).await;
 
     // Create the node reporter
+    let reporter_timeouts = reporter::ReporterTimeouts {
+        channel: spur_client::ChannelTimeouts {
+            connect: agent_config.controller_connect_timeout(),
+            keep_alive_interval: agent_config.controller_keepalive_interval(),
+            keep_alive_timeout: agent_config.controller_keepalive_timeout(),
+        },
+        controller_rpc_timeout: agent_config.controller_rpc_timeout(),
+        failover_cooldown: agent_config.controller_failover_cooldown(),
+    };
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
         args.controller.clone(),
@@ -545,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
         wg_iface,
         wg_config_dir,
         running_jobs.clone(),
+        reporter_timeouts,
     ));
 
     // Register with controller

@@ -17,17 +17,45 @@ use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-/// Ceiling on a single register/heartbeat/deregister/recovery RPC — these are fast,
-/// bounded calls, unlike a controller-to-agent launch, so a hung one means wedged.
-const CONTROLLER_RPC_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a controller endpoint that just failed is deprioritized, so it can't
-/// "recapture" every reconnect attempt before the next one is due.
-const FAILOVER_COOLDOWN: Duration = Duration::from_secs(60);
+/// Channel dial/keepalive and RPC/failover timeouts a [`NodeReporter`] applies to every
+/// controller connection. A caller with its own config (spurd's `[agent]` section) should
+/// build this from it; [`Default`] reproduces today's fixed values for tests and any
+/// caller with no config of its own.
+#[derive(Debug, Clone, Copy)]
+pub struct ReporterTimeouts {
+    pub channel: spur_client::ChannelTimeouts,
+    /// Ceiling on a single register/heartbeat/deregister/recovery RPC — these are fast,
+    /// bounded calls, unlike a controller-to-agent launch, so a hung one means wedged.
+    pub controller_rpc_timeout: Duration,
+    /// How long a controller endpoint that just failed is deprioritized, so it can't
+    /// "recapture" every reconnect attempt before the next one is due.
+    pub failover_cooldown: Duration,
+}
+
+impl Default for ReporterTimeouts {
+    fn default() -> Self {
+        Self {
+            channel: spur_client::ChannelTimeouts::default(),
+            controller_rpc_timeout: Duration::from_secs(10),
+            failover_cooldown: Duration::from_secs(60),
+        }
+    }
+}
 
 /// Lock a `std::sync::Mutex`, recovering the inner state on poison rather than
 /// panicking — none of this module's critical sections can leave data inconsistent.
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Same recovery as [`lock_recover`], for a `RwLock` read guard.
+fn read_recover<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Same recovery as [`lock_recover`], for a `RwLock` write guard.
+fn write_recover<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Source of the job ids this node currently holds. The controller decides from
@@ -77,6 +105,7 @@ pub struct NodeReporter {
     /// Endpoint a dial/RPC most recently failed against, and until when to prefer a
     /// different one. Left stale once the cooldown lapses; never read past then.
     last_failed_endpoint: std::sync::Mutex<Option<(String, Instant)>>,
+    timeouts: ReporterTimeouts,
 }
 
 impl NodeReporter {
@@ -91,6 +120,7 @@ impl NodeReporter {
         wg_iface: String,
         wg_config_dir: std::path::PathBuf,
         held_jobs: Arc<dyn HeldJobs>,
+        timeouts: ReporterTimeouts,
     ) -> Self {
         Self {
             hostname,
@@ -108,11 +138,12 @@ impl NodeReporter {
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
             last_failed_endpoint: std::sync::Mutex::new(None),
+            timeouts,
         }
     }
 
     /// Controller endpoints for the next dial. Skips a host that failed within the last
-    /// [`FAILOVER_COOLDOWN`], provided there's another one to prefer instead.
+    /// [`ReporterTimeouts::failover_cooldown`], provided there's another one to prefer instead.
     fn dial_endpoints(&self) -> String {
         let guard = lock_recover(&self.last_failed_endpoint);
         match &*guard {
@@ -129,12 +160,14 @@ impl NodeReporter {
         if endpoint.is_empty() {
             return;
         }
-        *lock_recover(&self.last_failed_endpoint) =
-            Some((endpoint.to_string(), Instant::now() + FAILOVER_COOLDOWN));
+        *lock_recover(&self.last_failed_endpoint) = Some((
+            endpoint.to_string(),
+            Instant::now() + self.timeouts.failover_cooldown,
+        ));
     }
 
-    /// Connect, run `op`, bound to [`CONTROLLER_RPC_TIMEOUT`]. A transport failure or
-    /// timeout deprioritizes the endpoint that was actually dialed; an app-level
+    /// Connect, run `op`, bound to [`ReporterTimeouts::controller_rpc_timeout`]. A transport
+    /// failure or timeout deprioritizes the endpoint that was actually dialed; an app-level
     /// rejection doesn't.
     async fn with_controller<T, F, Fut>(
         &self,
@@ -144,7 +177,7 @@ impl NodeReporter {
         F: FnOnce(crate::controller_auth::ControllerClient) -> Fut,
         Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
     {
-        self.with_controller_timeout(CONTROLLER_RPC_TIMEOUT, op)
+        self.with_controller_timeout(self.timeouts.controller_rpc_timeout, op)
             .await
     }
 
@@ -165,10 +198,12 @@ impl NodeReporter {
         // failure blames that host, not just whichever entry is listed first.
         let dialed = Arc::new(std::sync::Mutex::new(None::<String>));
         let record_dialed = Arc::clone(&dialed);
+        let channel_timeouts = self.timeouts.channel;
         let attempt = async move {
-            let (channel, endpoint) = spur_client::connect_channel_tracked(&endpoints)
-                .await
-                .map_err(crate::controller_auth::ConnectAuthError::Transport)?;
+            let (channel, endpoint) =
+                spur_client::connect_channel_tracked_with_timeouts(&endpoints, channel_timeouts)
+                    .await
+                    .map_err(crate::controller_auth::ConnectAuthError::Transport)?;
             *lock_recover(&record_dialed) = Some(endpoint);
             let client = crate::controller_auth::wrap(channel)
                 .await
@@ -233,13 +268,13 @@ impl NodeReporter {
     }
 
     pub fn snapshot_resources(&self) -> ResourceSet {
-        self.resources.read().unwrap().clone()
+        read_recover(&self.resources).clone()
     }
 
     /// Swap the reported inventory if its schedulable content changed. Ignores
     /// `generation` so a pure generation bump does not itself count as a change.
     pub fn update_resources(&self, fresh: ResourceSet) -> bool {
-        let mut cur = self.resources.write().unwrap();
+        let mut cur = write_recover(&self.resources);
         let changed = cur.cpus != fresh.cpus
             || cur.memory_mb != fresh.memory_mb
             || cur.gpus != fresh.gpus
@@ -279,7 +314,7 @@ impl NodeReporter {
         if inner.accepted {
             warn_without_node_identity(&inner.node_token);
             if !inner.node_token.is_empty() {
-                *self.node_token.write().unwrap() = inner.node_token;
+                *write_recover(&self.node_token) = inner.node_token;
             }
             info!("registered with controller");
         } else {
@@ -293,7 +328,7 @@ impl NodeReporter {
     pub async fn deregister(&self, reason: &str) -> anyhow::Result<()> {
         let req = spur_proto::proto::DeregisterAgentRequest {
             hostname: self.hostname.clone(),
-            node_token: self.node_token.read().unwrap().clone(),
+            node_token: read_recover(&self.node_token).clone(),
             reason: reason.to_string(),
         };
         self.with_controller(move |mut client| async move { client.deregister_agent(req).await })
@@ -341,7 +376,7 @@ impl NodeReporter {
             let (load, free_mem) = read_system_metrics();
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
-            let current_token = self.node_token.read().unwrap().clone();
+            let current_token = read_recover(&self.node_token).clone();
             let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
             let req = spur_proto::proto::HeartbeatRequest {
                 hostname: self.hostname.clone(),
@@ -1099,6 +1134,7 @@ mod tests {
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
             Arc::new(Mutex::new(HashMap::<u32, ()>::new())),
+            ReporterTimeouts::default(),
         )
     }
 

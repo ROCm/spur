@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use spur_core::native_mint::{mint_blocking, resolve_socket_path};
 use tonic::metadata::MetadataValue;
@@ -26,6 +27,7 @@ struct NativeMintParams {
     socket: PathBuf,
     audience: String,
     epoch: u64,
+    timeout: Duration,
 }
 
 #[derive(Clone, Default)]
@@ -38,8 +40,13 @@ impl tonic::service::Interceptor for AgentControllerInterceptor {
         let Some(params) = &self.mint else {
             return Ok(request);
         };
-        let token = mint_blocking(&params.socket, &params.audience, params.epoch)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        let token = mint_blocking(
+            &params.socket,
+            &params.audience,
+            params.epoch,
+            params.timeout,
+        )
+        .map_err(|e| Status::unauthenticated(e.to_string()))?;
         let value = MetadataValue::try_from(format!("Bearer {token}"))
             .map_err(|_| Status::unauthenticated("minted credential is not valid metadata"))?;
         request.metadata_mut().insert("authorization", value);
@@ -47,11 +54,18 @@ impl tonic::service::Interceptor for AgentControllerInterceptor {
     }
 }
 
-static NATIVE_SOCKET: OnceLock<Option<PathBuf>> = OnceLock::new();
+/// Mint socket plus the bound applied to every blocking mint call made against it.
+#[derive(Clone)]
+struct NativeAuth {
+    socket: PathBuf,
+    mint_timeout: Duration,
+}
 
-pub fn install(plugin: &str, cluster_name: &str) {
+static NATIVE_AUTH: OnceLock<Option<NativeAuth>> = OnceLock::new();
+
+pub fn install(plugin: &str, cluster_name: &str, mint_timeout: Duration) {
     if plugin != "spur" {
-        let _ = NATIVE_SOCKET.set(None);
+        let _ = NATIVE_AUTH.set(None);
         return;
     }
     match resolve_socket_path(cluster_name) {
@@ -62,7 +76,10 @@ pub fn install(plugin: &str, cluster_name: &str) {
                     "native auth mint socket is missing; start spurauthd on this host"
                 );
             }
-            let _ = NATIVE_SOCKET.set(Some(socket));
+            let _ = NATIVE_AUTH.set(Some(NativeAuth {
+                socket,
+                mint_timeout,
+            }));
         }
         Err(e) => {
             tracing::error!(
@@ -70,15 +87,15 @@ pub fn install(plugin: &str, cluster_name: &str) {
                 cluster = cluster_name,
                 "native plugin requires a valid cluster name and a spurauthd socket"
             );
-            let _ = NATIVE_SOCKET.set(None);
+            let _ = NATIVE_AUTH.set(None);
         }
     }
 }
 
 pub async fn wrap(channel: Channel) -> Result<ControllerClient, Status> {
-    let interceptor = match NATIVE_SOCKET.get().cloned().flatten() {
+    let interceptor = match NATIVE_AUTH.get().cloned().flatten() {
         None => AgentControllerInterceptor::default(),
-        Some(socket) => {
+        Some(auth) => {
             let mut raw = spur_proto::controller_client(channel.clone());
             let ping = raw
                 .ping(())
@@ -93,9 +110,10 @@ pub async fn wrap(channel: Channel) -> Result<ControllerClient, Status> {
             }
             AgentControllerInterceptor {
                 mint: Some(NativeMintParams {
-                    socket,
+                    socket: auth.socket,
                     audience: ping.auth_audience,
                     epoch: ping.auth_epoch,
+                    timeout: auth.mint_timeout,
                 }),
             }
         }
@@ -155,6 +173,7 @@ mod tests {
                 socket: PathBuf::from("/no/such/auth.sock"),
                 audience: "spur/c/controller/h".into(),
                 epoch: 1,
+                timeout: Duration::from_secs(5),
             }),
         };
         let err = i.call(Request::new(())).unwrap_err();
@@ -177,10 +196,13 @@ mod tests {
     /// A transient Ping failure (here: Unimplemented, since this stand-in server never
     /// registers SlurmController) must not be collapsed into Unauthenticated — that
     /// would make `is_permanent_recovery_error` treat a retryable outage as permanent.
-    /// `NATIVE_SOCKET` is a process-wide OnceLock set once here, like at real startup.
+    /// `NATIVE_AUTH` is a process-wide OnceLock set once here, like at real startup.
     #[tokio::test]
     async fn wrap_preserves_the_real_status_code_on_a_failed_ping() {
-        let _ = NATIVE_SOCKET.set(Some(PathBuf::from("/nonexistent/auth.sock")));
+        let _ = NATIVE_AUTH.set(Some(NativeAuth {
+            socket: PathBuf::from("/nonexistent/auth.sock"),
+            mint_timeout: Duration::from_secs(5),
+        }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -217,6 +239,7 @@ mod tests {
                 socket: sock,
                 audience: "spur/cluster-a/controller/ctld".into(),
                 epoch: 7,
+                timeout: Duration::from_secs(5),
             }),
         };
         let first = i

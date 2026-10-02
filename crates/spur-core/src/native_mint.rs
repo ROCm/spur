@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::unistd::{Uid, User};
@@ -60,6 +60,10 @@ pub enum MintError {
     Jwks(#[from] JwksError),
     #[error("mint I/O: {0}")]
     Io(String),
+    /// The mint accepted the connection but never replied within the bound — the same hang
+    /// shape a wedged controller presents at the TCP layer, one socket hop further in.
+    #[error("mint request timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 impl From<io::Error> for MintError {
@@ -184,10 +188,17 @@ pub async fn mint(socket: &Path, audience: &str, audience_epoch: u64) -> Result<
 }
 
 /// Blocking mint for sync callers (tonic interceptors cannot `.await`).
+///
+/// `timeout` bounds both the write and the read on the mint socket. Without it, a mint that
+/// accepts the connection and never replies blocks this thread forever: it runs inside a
+/// synchronous tonic interceptor, so an async `tokio::time::timeout` around the RPC future
+/// cannot preempt it — the blocking syscall never yields back to the executor, and enough
+/// stuck calls can starve the runtime's bounded worker-thread pool.
 pub fn mint_blocking(
     socket: &Path,
     audience: &str,
     audience_epoch: u64,
+    timeout: Duration,
 ) -> Result<String, MintError> {
     if audience.is_empty() {
         return Err(MintError::EmptyAudience);
@@ -201,9 +212,36 @@ pub fn mint_blocking(
             MintError::Io(err.to_string())
         }
     })?;
-    write_frame_sync(&mut stream, &encode_mint_request(audience, audience_epoch)?)?;
-    let body = read_frame_sync(&mut stream)?;
+    // A zero duration means "wait forever" to the socket option, the opposite of what a
+    // zero timeout should mean here; validate() rejects zero before this is ever reached.
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| MintError::Io(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| MintError::Io(e.to_string()))?;
+    write_frame_sync_timed(
+        &mut stream,
+        &encode_mint_request(audience, audience_epoch)?,
+        timeout,
+    )?;
+    let body = read_frame_sync_timed(&mut stream, timeout)?;
     decode_mint_response(&body)
+}
+
+/// A read/write past `set_read_timeout`/`set_write_timeout`'s deadline surfaces as
+/// `WouldBlock` on Linux (`TimedOut` on some other Unixes); either means the mint is
+/// hung, not merely I/O-broken, so callers can distinguish "mint is slow" from "mint
+/// socket I/O failed" instead of a bounded, classifiable failure looking like any
+/// other I/O error.
+fn io_err_to_mint_err(err: io::Error, timeout: Duration) -> MintError {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) {
+        return MintError::Timeout(timeout);
+    }
+    MintError::from(err)
 }
 
 async fn handle_connection(mut stream: UnixStream, mint: &CredentialMint) -> Result<(), MintError> {
@@ -458,26 +496,42 @@ async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, MintError> {
     Ok(buf)
 }
 
-fn write_frame_sync(stream: &mut impl Write, body: &[u8]) -> Result<(), MintError> {
+/// Same framing as [`write_frame`], for a blocking stream with a read/write deadline
+/// already set via `set_write_timeout` — `timeout` is only used to label a resulting
+/// `WouldBlock`/`TimedOut` as [`MintError::Timeout`] rather than a generic I/O error.
+fn write_frame_sync_timed(
+    stream: &mut impl Write,
+    body: &[u8],
+    timeout: Duration,
+) -> Result<(), MintError> {
     if body.len() > MAX_FRAME {
         return Err(MintError::Protocol("frame too long"));
     }
     let len = u32::try_from(body.len()).map_err(|_| MintError::Protocol("frame too long"))?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()?;
-    Ok(())
+    stream
+        .write_all(&len.to_be_bytes())
+        .map_err(|e| io_err_to_mint_err(e, timeout))?;
+    stream
+        .write_all(body)
+        .map_err(|e| io_err_to_mint_err(e, timeout))?;
+    stream.flush().map_err(|e| io_err_to_mint_err(e, timeout))
 }
 
-fn read_frame_sync(stream: &mut impl Read) -> Result<Vec<u8>, MintError> {
+/// Same framing as [`read_frame`], for a blocking stream with a read deadline already
+/// set via `set_read_timeout`; see [`write_frame_sync_timed`] for the `timeout` param.
+fn read_frame_sync_timed(stream: &mut impl Read, timeout: Duration) -> Result<Vec<u8>, MintError> {
     let mut lenb = [0u8; 4];
-    stream.read_exact(&mut lenb)?;
+    stream
+        .read_exact(&mut lenb)
+        .map_err(|e| io_err_to_mint_err(e, timeout))?;
     let len = u32::from_be_bytes(lenb) as usize;
     if len == 0 || len > MAX_FRAME {
         return Err(MintError::Protocol("frame too long"));
     }
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
+    stream
+        .read_exact(&mut buf)
+        .map_err(|e| io_err_to_mint_err(e, timeout))?;
     Ok(buf)
 }
 
@@ -607,12 +661,53 @@ mod tests {
         let listener = bind_socket(&sock).await.unwrap();
         tokio::spawn(serve(listener, Arc::clone(&server)));
 
-        let token = mint_blocking(&sock, "spurctld-1", 7).unwrap();
+        let token = mint_blocking(&sock, "spurctld-1", 7, Duration::from_secs(5)).unwrap();
         let cred = open_minted(&token, &keys, unix_now().unwrap()).unwrap();
         assert_eq!(cred.audience, "spurctld-1");
         assert_eq!(cred.audience_epoch, 7);
-        let token2 = mint_blocking(&sock, "spurctld-1", 7).unwrap();
+        let token2 = mint_blocking(&sock, "spurctld-1", 7, Duration::from_secs(5)).unwrap();
         assert_ne!(token, token2);
+    }
+
+    /// A mint that accepts the connection and never replies must not hang
+    /// `mint_blocking` forever — it must fail bounded and classifiable instead.
+    #[test]
+    fn blocking_mint_times_out_against_a_silent_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("auth.sock");
+        // `bind` alone queues connections in the kernel backlog, so the client below can
+        // dial immediately without racing the server thread's own `accept()` call.
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            // Signal only so the test can join deterministically; the client has
+            // already dialed and is waiting on its own read deadline by this point.
+            let _ = accepted_tx.send(());
+            // Hold the connection open without ever writing a reply, then let it drop
+            // once the client-side read has had time to time out on its own.
+            std::thread::sleep(Duration::from_millis(600));
+            drop(stream);
+        });
+
+        let timeout = Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let result = mint_blocking(&sock, "spurctld-1", 7, timeout);
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(MintError::Timeout(_))),
+            "expected a Timeout error, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "must fail close to the configured timeout, not hang; took {elapsed:?}"
+        );
+        accepted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server thread must have accepted the connection");
+        handle.join().expect("server thread must not panic");
     }
 
     #[tokio::test]

@@ -44,7 +44,8 @@ fn endpoint_list(raw: &str) -> Vec<String> {
     }
 }
 
-/// Connect to the first reachable controller endpoint.
+/// Connect to the first reachable controller endpoint, using the default
+/// dial/keepalive timeouts (see [`ChannelTimeouts::default`]).
 ///
 /// Endpoints are tried in the order given. On connection failure the next
 /// endpoint is attempted; if every endpoint fails, the last error is returned.
@@ -63,11 +64,48 @@ pub async fn connect_channel(endpoints: &str) -> Result<Channel, tonic::transpor
 pub async fn connect_channel_tracked(
     endpoints: &str,
 ) -> Result<(Channel, String), tonic::transport::Error> {
+    connect_channel_tracked_with_timeouts(endpoints, ChannelTimeouts::default()).await
+}
+
+/// Dial/keepalive timeouts for a controller channel. A caller with its own config (e.g.
+/// spurd's `[agent]` section) should derive this from it rather than accept the module
+/// defaults, so an operator can shorten the dial budget or keepalive cadence without a
+/// rebuild. [`Default`] reproduces today's fixed behavior for callers with no config of
+/// their own (one-shot CLI subcommands, FFI).
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelTimeouts {
+    pub connect: Duration,
+    pub keep_alive_interval: Duration,
+    pub keep_alive_timeout: Duration,
+}
+
+impl Default for ChannelTimeouts {
+    fn default() -> Self {
+        Self {
+            // Dial budget only — the handshake resolves as soon as we send our own preface,
+            // so a peer that accepts TCP but never engages dials fine; keepalive below
+            // catches that.
+            connect: Duration::from_secs(2),
+            // Liveness for an established channel: a peer that accepts TCP then stops
+            // answering is torn down after roughly the interval plus the timeout,
+            // independent of any in-flight RPC.
+            keep_alive_interval: Duration::from_secs(10),
+            keep_alive_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Same as [`connect_channel_tracked`], with explicit timeouts instead of the module
+/// defaults.
+pub async fn connect_channel_tracked_with_timeouts(
+    endpoints: &str,
+    timeouts: ChannelTimeouts,
+) -> Result<(Channel, String), tonic::transport::Error> {
     let list = endpoint_list(endpoints);
     let last = list.len() - 1;
 
     for endpoint in &list[..last] {
-        match try_connect(endpoint).await {
+        match try_connect(endpoint, timeouts).await {
             Ok(channel) => return Ok((channel, endpoint.clone())),
             Err(e) => debug!(
                 %endpoint,
@@ -77,25 +115,20 @@ pub async fn connect_channel_tracked(
         }
     }
 
-    try_connect(&list[last])
+    try_connect(&list[last], timeouts)
         .await
         .map(|channel| (channel, list[last].clone()))
 }
 
-/// Dial budget only — the handshake resolves as soon as we send our own preface, so a
-/// peer that accepts TCP but never engages dials fine; keepalive below catches that.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Liveness for an established channel: a peer that accepts TCP then stops answering is
-/// torn down after roughly the interval plus the timeout, independent of any in-flight RPC.
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
-
-async fn try_connect(endpoint: &str) -> Result<Channel, tonic::transport::Error> {
+async fn try_connect(
+    endpoint: &str,
+    timeouts: ChannelTimeouts,
+) -> Result<Channel, tonic::transport::Error> {
     configure_endpoint(
         endpoint,
-        CONNECT_TIMEOUT,
-        KEEP_ALIVE_INTERVAL,
-        KEEP_ALIVE_TIMEOUT,
+        timeouts.connect,
+        timeouts.keep_alive_interval,
+        timeouts.keep_alive_timeout,
     )?
     .connect()
     .await

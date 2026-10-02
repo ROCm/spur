@@ -448,5 +448,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         cgroup: Default::default(),
         mpi: Default::default(),
         health: Default::default(),
+        agent: Default::default(),
     }
 }

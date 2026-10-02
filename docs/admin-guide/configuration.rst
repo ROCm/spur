@@ -312,6 +312,70 @@ and Raft high-availability topology.
        dispatch for the same span, and is not marked down, so it still
        appears available in ``sinfo`` while being skipped.
 
+``[agent]``
+-----------
+
+``spurd``'s own channel and RPC tuning for its connection to the controller — the
+inverse direction of ``[controller] agent_connect_timeout_secs`` /
+``agent_keepalive_interval_secs`` / ``agent_keepalive_timeout_secs`` above, which
+bound the controller's connections to agents instead.
+
+**Reload: Agent restart.**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 10 12 50
+
+   * - Field
+     - Type
+     - Default
+     - Description
+   * - ``controller_connect_timeout_secs``
+     - integer
+     - ``2``
+     - Budget for establishing spurd's connection to the controller. Range 0-600;
+       ``0`` falls back to the OS TCP timeout. Deliberately shorter than
+       ``[controller] agent_connect_timeout_secs``'s default of ``5``: this only
+       bounds the dial, which a controller that accepts TCP and never engages at
+       the app layer still completes quickly, so a short budget just means
+       spurd fails over to another configured endpoint sooner.
+   * - ``controller_keepalive_interval_secs``
+     - integer
+     - ``10``
+     - HTTP/2 ping interval on spurd's open connection to the controller. Range
+       0-600. ``0`` disables keepalive entirely. This is what detects a
+       controller that accepted the connection and then went silent — total
+       detection time is roughly this plus ``controller_keepalive_timeout_secs``.
+   * - ``controller_keepalive_timeout_secs``
+     - integer
+     - ``10``
+     - How long spurd waits for a ping response before dropping the connection.
+       Range 1-600 whenever keepalive is on; ``0`` is rejected because it marks
+       every ping overdue the moment it is sent. Ignored entirely when
+       ``controller_keepalive_interval_secs`` is ``0``.
+   * - ``controller_rpc_timeout_secs``
+     - integer
+     - ``10``
+     - Ceiling on a single register/heartbeat/deregister/recovery RPC to the
+       controller. These are fast, bounded calls — unlike a controller-to-agent
+       launch — so a hung one means wedged, not slow. Range 0-86400.
+   * - ``controller_failover_cooldown_secs``
+     - integer
+     - ``60``
+     - How long a controller endpoint that just failed to dial or answer is
+       deprioritized in favor of another configured endpoint, so it can't
+       "recapture" every reconnect attempt before the next one is due. Range
+       0-86400.
+   * - ``native_mint_timeout_secs``
+     - integer
+     - ``5``
+     - Ceiling on one native-auth credential mint over the local Unix socket.
+       Only consulted under ``[auth] plugin = "spur"``. The mint read runs
+       inside a synchronous tonic interceptor, so this is the only thing that
+       bounds a mint that accepts the connection and never replies — an
+       ``async`` timeout around the RPC cannot preempt it. Must be at least
+       ``1``; range 1-86400.
+
 ``[accounting]``
 ----------------
 
