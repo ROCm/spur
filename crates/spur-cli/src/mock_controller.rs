@@ -52,6 +52,8 @@ pub(crate) struct StepCapture {
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
     submit_job_id: Arc<AtomicU32>,
     cancel_job_calls: Arc<AtomicU32>,
+    /// `(job_id, exit_code, user)` for every `CompleteJob` the mock received.
+    complete_job_calls: Arc<Mutex<Vec<(u32, i32, String)>>>,
     /// `node_addr` handed back from `CreateJobStep`, so a test can point an
     /// interactive step at a mock agent instead of an empty address.
     create_step_node_addr: Arc<Mutex<String>>,
@@ -136,9 +138,13 @@ impl StepCapture {
         *self.get_job_sequence.lock().unwrap() = seq;
     }
 
-    #[allow(dead_code)]
     pub(crate) fn cancel_job_calls(&self) -> u32 {
         self.cancel_job_calls.load(Ordering::SeqCst)
+    }
+
+    /// Every `CompleteJob` the mock received, in call order.
+    pub(crate) fn complete_job_calls(&self) -> Vec<(u32, i32, String)> {
+        self.complete_job_calls.lock().unwrap().clone()
     }
 
     pub(crate) fn set_create_step_node_addr(&self, addr: impl Into<String>) {
@@ -254,6 +260,19 @@ mock_controller_impl! {
             Ok(tonic::Response::new(()))
         }
 
+        async fn complete_job(
+            &self,
+            request: tonic::Request<proto::CompleteJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            let request = request.into_inner();
+            self.capture.complete_job_calls.lock().unwrap().push((
+                request.job_id,
+                request.exit_code,
+                request.user,
+            ));
+            Ok(tonic::Response::new(()))
+        }
+
         async fn run_step(
             &self,
             request: tonic::Request<proto::RunStepRequest>,
@@ -345,7 +364,6 @@ mock_controller_impl! {
         }
     }
     unimplemented {
-        complete_job(proto::CompleteJobRequest) -> ();
         job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
