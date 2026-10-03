@@ -751,7 +751,6 @@ impl openraft::RaftNetwork<SpurTypeConfig> for SpurNetworkConnection {
 pub struct RaftHandle {
     pub raft: SpurRaft,
     pub node_id: NodeId,
-    pub peers: BTreeMap<NodeId, String>,
     /// The validated openraft config, so that admin checks use the same
     /// figures the node runs with.
     pub config: Arc<Config>,
@@ -1218,7 +1217,6 @@ pub async fn start_raft_with_recovery_mode(
     Ok(RaftHandle {
         raft,
         node_id,
-        peers: peer_map,
         config,
     })
 }

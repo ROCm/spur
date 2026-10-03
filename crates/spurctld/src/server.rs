@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -212,8 +212,6 @@ pub struct ControllerService {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
     leader_proxy: LeaderProxy,
-    /// Node ID → client API address (host:6817) for the x-spur-leader header.
-    client_addrs: BTreeMap<u64, String>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
     /// Default HA control-plane count (`[cluster] control_plane_replicas`) when `spur k8s up`
@@ -248,17 +246,22 @@ type CachedLeader = Option<(u64, tonic::transport::Channel)>;
 #[derive(Clone)]
 struct LeaderProxy {
     raft: Arc<RaftHandle>,
-    client_addrs: BTreeMap<u64, String>,
     cached_channel: Arc<Mutex<CachedLeader>>,
 }
 
 impl LeaderProxy {
-    fn new(raft: Arc<RaftHandle>, client_addrs: BTreeMap<u64, String>) -> Self {
+    fn new(raft: Arc<RaftHandle>) -> Self {
         Self {
             raft,
-            client_addrs,
             cached_channel: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Read from the replicated membership, not `controller.peers`: a leader
+    /// added at runtime is in the membership only.
+    fn client_addr(&self, node_id: u64) -> Option<String> {
+        let metrics = self.raft.raft.metrics().borrow().clone();
+        member_client_addr(metrics.membership_config.membership(), node_id)
     }
 
     /// An open channel to the current leader. Forwarding drives the RPC over this
@@ -278,8 +281,7 @@ impl LeaderProxy {
         }
 
         let addr = self
-            .client_addrs
-            .get(&leader_id)
+            .client_addr(leader_id)
             .ok_or_else(|| Status::unavailable("leader address unknown"))?;
 
         let url = if addr.starts_with("http") {
@@ -817,7 +819,7 @@ impl ControllerService {
     fn not_leader_status(&self) -> Status {
         let mut status = Status::unavailable("not the Raft leader");
         if let Some(leader_id) = self.raft.current_leader() {
-            if let Some(addr) = self.client_addrs.get(&leader_id) {
+            if let Some(addr) = self.leader_proxy.client_addr(leader_id) {
                 if let Ok(val) = addr.parse::<MetadataValue<tonic::metadata::Ascii>>() {
                     status.metadata_mut().insert(LEADER_HEADER, val);
                 }
@@ -1445,6 +1447,18 @@ fn promote_membership_ruling(
         )));
     }
     Ok(())
+}
+
+/// The client API of a member, on the port every controller serves it on.
+fn member_client_addr(
+    membership: &openraft::Membership<u64, BasicNode>,
+    node_id: u64,
+) -> Option<String> {
+    let raft_addr = &membership.get_node(&node_id)?.addr;
+    let host = raft_addr
+        .rsplit_once(':')
+        .map_or(raft_addr.as_str(), |(h, _)| h);
+    Some(format!("{host}:6817"))
 }
 
 /// A remove takes a voter or a learner. openraft has a variant for each, and
@@ -4664,20 +4678,7 @@ pub fn build_service(
     jwt_key: String,
     bearer: &spur_core::auth::BearerAuth,
 ) -> ControllerService {
-    let client_addrs: BTreeMap<u64, String> = raft_handle
-        .peers
-        .iter()
-        .map(|(id, raft_addr)| {
-            let client_addr = if let Some(host) = raft_addr.rsplit_once(':').map(|(h, _)| h) {
-                format!("{}:6817", host)
-            } else {
-                format!("{}:6817", raft_addr)
-            };
-            (*id, client_addr)
-        })
-        .collect();
-
-    let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
+    let leader_proxy = LeaderProxy::new(raft_handle.clone());
 
     let node_identity_key_configured =
         cluster.config().auth.has_jwt_key() || crate::native_keys::node_signer().is_some();
@@ -4685,7 +4686,6 @@ pub fn build_service(
 
     ControllerService {
         cluster,
-        client_addrs,
         raft: raft_handle,
         leader_proxy,
         rpc_stats,
@@ -5998,6 +5998,7 @@ mod tests {
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};
     use spur_core::reservation::ReservationFlags;
+    use std::collections::BTreeMap;
     use tonic::Code;
 
     fn job_state(cluster: &crate::cluster::ClusterManager, job_id: u32) -> Option<JobState> {
@@ -6405,12 +6406,10 @@ mod tests {
         assert_eq!(handle.current_leader(), None);
 
         let raft = Arc::new(handle);
-        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
         ControllerService {
             cluster,
             raft: raft.clone(),
-            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
-            client_addrs,
+            leader_proxy: LeaderProxy::new(raft.clone()),
             rpc_stats: Arc::new(RpcStatsCollector::new()),
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
             control_plane_replicas: 1,
@@ -7108,8 +7107,7 @@ mod tests {
         ControllerService {
             cluster,
             raft: raft.clone(),
-            leader_proxy: LeaderProxy::new(raft, BTreeMap::new()),
-            client_addrs: BTreeMap::new(),
+            leader_proxy: LeaderProxy::new(raft),
             rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
             control_plane_replicas: 1,
@@ -12125,6 +12123,32 @@ mod tests {
             .await
             .expect_err("the only voter cannot leave");
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn member_client_addr_covers_a_member_added_at_runtime() {
+        let membership = openraft::Membership::<u64, BasicNode>::new(
+            vec![[1, 4].into()],
+            BTreeMap::from([
+                (1, BasicNode::new("ctrl1:6821")),
+                (4, BasicNode::new("10.0.0.4:6821")),
+                (5, BasicNode::new("ctrl5")),
+            ]),
+        );
+
+        assert_eq!(
+            member_client_addr(&membership, 1).as_deref(),
+            Some("ctrl1:6817")
+        );
+        assert_eq!(
+            member_client_addr(&membership, 4).as_deref(),
+            Some("10.0.0.4:6817")
+        );
+        assert_eq!(
+            member_client_addr(&membership, 5).as_deref(),
+            Some("ctrl5:6817")
+        );
+        assert_eq!(member_client_addr(&membership, 9), None);
     }
 
     #[test]
