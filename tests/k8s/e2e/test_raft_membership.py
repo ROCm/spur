@@ -184,16 +184,19 @@ class TestRaftMembership:
         leader = elected_leader(ns, {1, 2})
         deletions = 0
         while True:
-            delete_pod(ns, controller_pod(leader))
+            deleted = leader
+            delete_pod(ns, controller_pod(deleted))
             deletions += 1
             for pod in ("spurctld-0", "spurctld-1"):
                 wait_pod_ready(ns, pod, HA_TIMEOUT)
             leader = elected_leader(ns, {1, 2})
             # Node 2 joined at runtime, so it is not in any controller.peers.
-            if leader == 2:
+            # Stop only when the follower restarted too: a follower that saw
+            # node 2 lead before can keep a channel to its old Pod IP.
+            if leader == 2 and deleted == 1:
                 break
             assert deletions < MAX_LEADER_DELETIONS, (
-                f"node 2 did not win any of {deletions} elections"
+                f"node 2 did not take over from node 1 in {deletions} leader deletions"
             )
 
         # Each follower must find a leader that only the replicated membership
