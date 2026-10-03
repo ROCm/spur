@@ -1570,9 +1570,6 @@ impl SlurmController for ControllerService {
             .asserted_actor(&req.user),
         );
 
-        // Snapshot the job before cancelling so we have allocated_nodes
-        let job = self.cluster.get_job(job_id);
-
         self.cluster
             .cancel_job_for(
                 job_id,
@@ -1581,11 +1578,19 @@ impl SlurmController for ControllerService {
             )
             .map_err(cancel_err_to_status)?;
 
-        // Send cancel signal to agents so the process is actually killed
-        if let Some(job) = job {
+        // Read the allocation after the cancel, not before: a job that started
+        // in between would otherwise be signalled on the nodes it used to hold.
+        if let Some(job) = self.cluster.get_job(job_id) {
             let cluster = self.cluster.clone();
             tokio::spawn(async move {
-                crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
+                crate::scheduler_loop::send_cancel_to_nodes(
+                    &cluster,
+                    job.job_id,
+                    job.run_attempt,
+                    &job.allocated_nodes,
+                    0,
+                )
+                .await;
             });
         }
 

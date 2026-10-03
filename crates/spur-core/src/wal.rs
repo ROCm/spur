@@ -168,6 +168,10 @@ pub enum WalOperation {
         /// QOS of the preempting job (`None` for plain priority-based preemption).
         #[serde(default)]
         preempt_qos: Option<String>,
+        /// Leader-stamped instant, so every replica measures the completing
+        /// deadline from one value. Absent pre-upgrade; falls back to apply time.
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Admin requeue (`scontrol requeue` / `requeuehold`): return a job to
     /// Pending with the same spec in one atomic step. A running/suspended job is
@@ -1139,10 +1143,12 @@ mod suspend_wal_tests {
 
     #[test]
     fn preempt_cancel_op_round_trips() {
+        let stamped = chrono::Utc::now();
         let op = WalOperation::JobPreemptCancel {
             job_id: 7,
             preempted_by: Some(3),
             preempt_qos: Some("burst".into()),
+            at: Some(stamped),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1151,10 +1157,12 @@ mod suspend_wal_tests {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                at,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, Some(3));
                 assert_eq!(preempt_qos.as_deref(), Some("burst"));
+                assert_eq!(at, Some(stamped));
             }
             _ => panic!("wrong variant"),
         }
@@ -1167,10 +1175,12 @@ mod suspend_wal_tests {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                at,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
+                assert_eq!(at, None, "legacy entry falls back to apply time");
             }
             _ => panic!("wrong variant"),
         }

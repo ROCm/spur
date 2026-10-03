@@ -2127,6 +2127,7 @@ impl ClusterManager {
                     job_id,
                     preempted_by,
                     preempt_qos,
+                    at: Some(Utc::now()),
                 })?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (cancel)");
@@ -6396,7 +6397,9 @@ impl ClusterManager {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                at,
             } => {
+                let at = at.unwrap_or(timestamp);
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
@@ -6412,14 +6415,14 @@ impl ClusterManager {
                         return ClientResponse::default();
                     }
                     job.exit_code = Some(-1);
-                    job.end_time = Some(timestamp);
+                    job.end_time = Some(at);
                     if let Some(since) = job.suspended_at.take() {
-                        job.suspended_secs += (timestamp - since).num_seconds().max(0);
+                        job.suspended_secs += (at - since).num_seconds().max(0);
                     }
                     job.preempted_by = *preempted_by;
                     job.preempt_mode = Some("Cancel".to_string());
                     job.preempt_qos = preempt_qos.clone();
-                    job.cancel_signaled_at = Some(timestamp);
+                    job.cancel_signaled_at = Some(at);
 
                     // The killed run still occupies its nodes; wait in Completing
                     // until each reports, then finalize as CANCELLED / PREEMPTED.
@@ -14699,6 +14702,7 @@ mod tests {
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
+            at: None,
         });
 
         assert!(
@@ -14735,6 +14739,7 @@ mod tests {
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
+            at: None,
         });
         assert!(
             replay.jobs_finalized.is_empty(),
@@ -21512,6 +21517,24 @@ mod tests {
             result.is_err(),
             "cancelling an already-cancelled job must fail"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_completing_job_again_is_accepted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "double-cancel-live", "worker1");
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completing);
+
+        // Slurm parity: scancel on a draining job is a no-op, not an error.
+        cm.cancel_job(job_id, "testuser").unwrap();
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completing);
+
+        report_nodes_released(&cm, job_id);
+        settle(&cm, job_id, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

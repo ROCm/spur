@@ -1409,10 +1409,7 @@ impl Job {
     /// resurrect a finished run.
     pub fn requeue_to_pending(&mut self) -> Result<(), JobTransitionError> {
         let ok = self.state.is_terminal()
-            || matches!(
-                self.state,
-                JobState::Running | JobState::Suspended | JobState::Completing
-            );
+            || matches!(self.state, JobState::Running | JobState::Suspended);
         if !ok {
             return Err(JobTransitionError::Invalid {
                 from: self.state,
@@ -1984,15 +1981,6 @@ mod tests {
         job.transition(JobState::Completing).unwrap();
         assert_eq!(job.state, JobState::Completing);
         job.transition(JobState::Cancelled).unwrap();
-    }
-
-    #[test]
-    fn requeue_accepts_a_completing_job() {
-        let mut job = make_job();
-        job.state = JobState::Completing;
-        job.requeue_to_pending().unwrap();
-        assert_eq!(job.state, JobState::Pending);
-        assert!(job.end_time.is_none());
     }
 
     // Frozen pre-`cancel_signaled_at` payload: replay of an older Raft log or

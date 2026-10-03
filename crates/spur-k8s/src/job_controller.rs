@@ -358,11 +358,13 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
         let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
         if let Ok(pod_list) = pods.list(&lp).await {
             for pod in pod_list {
+                let pod_name = pod.metadata.name.clone().unwrap_or_default();
+                if let Err(e) = pods.delete(&pod_name, &DeleteParams::default()).await {
+                    warn!(spurjob = %name, pod = %pod_name, error = %e, "failed to delete Pod");
+                }
                 // A deleted Pod never reaches Succeeded/Failed, so the reconciler
                 // that normally reports it never runs; speak for it here instead.
                 report_pod_released(ctx, job_id, &pod).await;
-                let pod_name = pod.metadata.name.unwrap_or_default();
-                let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
             }
         }
 

@@ -9,10 +9,13 @@ import pytest
 
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
 
-# SIG_IGN for TERM is inherited by every child, so only the agent's SIGKILL
-# ends this run — the COMPLETING window is the agent's full grace period.
-_STUBBORN_SCRIPT = "#!/bin/bash\ntrap '' TERM\nsleep 8675309\n"
+# SIG_IGN for TERM is inherited by every child, so the COMPLETING window is the
+# agent's full grace; the sleep is bounded so an orphan still reaps itself.
+_STUBBORN_SCRIPT = "#!/bin/bash\ntrap '' TERM\nsleep 600\n"
 _QUICK_SCRIPT = "#!/bin/bash\nsleep 2\n"
+# Long enough to be cancelled while RUNNING, short enough that the requeued
+# rerun finishes on its own.
+_RERUN_SCRIPT = "#!/bin/bash\nsleep 30\n"
 
 _AUTH_ROOT = {"auth": {"allow_root_jobs": True}}
 
@@ -142,9 +145,9 @@ class TestCancelHoldsAllocationUntilRelease:
             # The regression signal: a hard rejection shows up as a retry, not a
             # failure, because the dispatch abort re-pends the job.
             restarts = _show_field(cluster, contender_id, "Restarts")
-            assert restarts in ("", "0"), (
-                f"contender was re-dispatched {restarts} time(s) — it was rejected "
-                "for an allocation mismatch before it finally ran"
+            assert restarts == "0", (
+                f"contender reported Restarts={restarts!r} — it was rejected for "
+                "an allocation mismatch before it finally ran"
             )
         finally:
             for jid in contender:
@@ -153,14 +156,15 @@ class TestCancelHoldsAllocationUntilRelease:
     def test_requeue_after_cancel_runs_a_clean_job_to_completion(self, cluster):
         """The cancel verdict must not survive into the job's next run."""
         node = cluster.node_names[0]
-        script = cluster.write_file("requeue-after-cancel.sh", _QUICK_SCRIPT)
+        script = cluster.write_file("rerun.sh", _RERUN_SCRIPT)
 
-        job_id = parse_job_id(
-            cluster.sbatch(["-N1", "--exclusive", f"--nodelist={node}", script])
-        )
-        wait_job_state(cluster, job_id, "R", timeout=60)
-        cluster.scancel(job_id)
-        assert wait_job(cluster, job_id, timeout=60) == "CA"
+        def stage():
+            return parse_job_id(
+                cluster.sbatch(["-N1", "--exclusive", f"--nodelist={node}", script])
+            )
+
+        job_id, seq = _kill_and_watch(cluster, stage, cluster.scancel)
+        assert seq[-1] == "CA", f"job {job_id} went {'->'.join(seq)}, expected CANCELLED"
 
         try:
             cluster.scontrol("requeue", str(job_id))
