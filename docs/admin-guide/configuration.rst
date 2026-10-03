@@ -1734,7 +1734,11 @@ converges to the new device count without restarting ``spurd``.
    (``auto_detect = true``). On nodes provisioned with static on-disk CDI specs
    (``cdi_spec_dirs``), re-discovery re-reads the same spec files each tick, so
    the reported inventory only changes if those specs are regenerated out of
-   band.
+   band. A spec that has the annotation ``spur.amd.com/auto-detected: "true"``
+   is a saved copy of an earlier auto-detect, for example the spec that
+   ``spurd`` writes to ``/etc/cdi/amd.json`` for the containerd of k0s. Spur
+   does not read such a spec as inventory, so it does not hide a partition
+   change.
 
 ``[isolation]``
 ---------------
