@@ -5791,6 +5791,49 @@ mod tests {
         }
 
         #[test]
+        fn overlapping_reclaims_hold_all_victims_without_reordering_other_jobs() {
+            let now = Utc::now();
+            let mut in_flight = HashMap::from([
+                (
+                    5,
+                    ReclaimInFlight {
+                        until: now + chrono::Duration::seconds(10),
+                        victims: vec![1, 2],
+                    },
+                ),
+                (
+                    6,
+                    ReclaimInFlight {
+                        until: now + chrono::Duration::seconds(20),
+                        victims: vec![2, 3],
+                    },
+                ),
+            ]);
+            let candidates: Vec<_> = [6, 1, 4, 2, 5, 3]
+                .into_iter()
+                .map(|id| {
+                    let mut job = reclaimer(1, 1);
+                    job.job_id = id;
+                    job
+                })
+                .collect();
+            let mut pending = candidates.clone();
+            hold_reclaimed_victims(&reclaim_victims(&in_flight), &mut pending);
+            assert_eq!(
+                pending.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+                vec![6, 4, 5]
+            );
+
+            in_flight.remove(&5);
+            let mut pending = candidates;
+            hold_reclaimed_victims(&reclaim_victims(&in_flight), &mut pending);
+            assert_eq!(
+                pending.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+                vec![6, 1, 4, 5]
+            );
+        }
+
+        #[test]
         fn an_unplaceable_job_evicts_nothing_however_long_it_waits() {
             // The denial-of-service `try_preempt` would have allowed (D2): a job that
             // can never be placed anywhere must have no satisfiable victim set, so it
@@ -7478,6 +7521,126 @@ mod tests {
             assert_eq!(after.state, JobState::Running);
             assert!(after.preempt_grace().is_some());
             assert_eq!(suspend_calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn reclaim_reports_evicted_jobs_and_leaves_unplaceable_requests_alone() {
+            use spur_core::accounting::Qos;
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancel_calls) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            cm.qos_cache().insert(Qos {
+                name: "burst".into(),
+                idle_fill_preemptable: true,
+                ..Default::default()
+            });
+            let victim = submit_and_wait(
+                &cm,
+                JobSpec {
+                    user: "testuser".into(),
+                    qos: Some("burst".into()),
+                    cpus_per_task: 4,
+                    ..Default::default()
+                },
+            );
+            let allocation = ResourceAllocations::with_scalar(4, 0);
+            cm.start_job(
+                victim,
+                vec!["n1".into()],
+                allocation.clone(),
+                HashMap::from([("n1".into(), allocation)]),
+            )
+            .unwrap();
+            settle(&cm, victim, JobState::Running);
+            let reclaimer_id = submit_and_wait(
+                &cm,
+                JobSpec {
+                    user: "testuser".into(),
+                    cpus_per_task: 4,
+                    ..Default::default()
+                },
+            );
+            let mut reclaimer = cm.get_job(reclaimer_id).unwrap();
+            let nodes = cm.get_nodes();
+            let state = ClusterState {
+                nodes: &nodes,
+                partitions: &[],
+                reservations: &[],
+                topology: None,
+                fabric: None,
+                busy_until: &HashMap::new(),
+                preemption_handoffs: &HashMap::new(),
+            };
+
+            reclaimer.spec.cpus_per_task = 5;
+            assert!(
+                reclaim_for_unplaced(&cm, &[&reclaimer], &HashSet::new(), &state, &[], 0)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(cm.get_job(victim).unwrap().state, JobState::Running);
+            assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
+
+            reclaimer.spec.cpus_per_task = 4;
+            let reclaim = reclaim_for_unplaced(&cm, &[&reclaimer], &HashSet::new(), &state, &[], 0)
+                .await
+                .expect("the claim can run after the burst job is requeued");
+            assert_eq!(reclaim.reclaimer, reclaimer_id);
+            assert_eq!(reclaim.freed_nodes, vec!["n1"]);
+            assert_eq!(reclaim.victims, vec![victim]);
+            assert!(cancel_calls.load(Ordering::SeqCst) >= 1);
+            settle(&cm, victim, JobState::Pending);
+            let requeued = cm.get_job(victim).unwrap();
+            assert_eq!(requeued.preempt_requeue_count, 1);
+            assert!(requeued.allocated_nodes.is_empty());
+
+            assert!(
+                reclaim_for_unplaced(&cm, &[&reclaimer], &HashSet::new(), &state, &[], 0)
+                    .await
+                    .is_none()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_held_victim_cannot_take_its_reclaimers_claim_in_the_trial_placement() {
+            use spur_core::accounting::{Qos, QosLimits};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            // The second job of this QOS is refused after earlier jobs took a claim,
+            // which is what makes the pass run its trial placement.
+            cm.qos_cache().insert(Qos {
+                name: "capped".into(),
+                limits: QosLimits {
+                    max_jobs_per_user: Some(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let whole_node = |qos: Option<&str>| JobSpec {
+                user: "testuser".into(),
+                qos: qos.map(str::to_string),
+                cpus_per_task: 4,
+                ..Default::default()
+            };
+            let victim = submit_and_wait(&cm, whole_node(None));
+            let reclaimer = submit_and_wait(&cm, whole_node(None));
+            submit_and_wait(&cm, whole_node(Some("capped")));
+            submit_and_wait(&cm, whole_node(Some("capped")));
+
+            let (pending, _, unclaimed) =
+                classify_for_pass(&cm, &BackfillScheduler::new(10), &HashSet::from([victim]));
+
+            assert!(pending.iter().all(|job| job.job_id != victim));
+            assert!(
+                !unclaimed.contains(&reclaimer),
+                "the reclaimer must keep its claim on the capacity freed for it: {unclaimed:?}"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
