@@ -907,7 +907,6 @@ impl openraft::RaftNetwork<SpurTypeConfig> for SpurNetworkConnection {
 pub struct RaftHandle {
     pub raft: SpurRaft,
     pub node_id: NodeId,
-    pub peers: BTreeMap<NodeId, String>,
     /// This controller's durable start counter, from [`bump_boot_epoch`].
     pub boot_epoch: u64,
     /// The validated openraft config, so that admin checks use the same
@@ -1526,7 +1525,6 @@ pub async fn start_raft_with_recovery_mode(
     Ok(RaftHandle {
         raft,
         node_id,
-        peers: peer_map,
         boot_epoch,
         config,
     })
