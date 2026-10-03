@@ -1470,16 +1470,23 @@ impl ClusterManager {
         };
 
         // A job holding nodes still has processes to tear down: record the
-        // verdict and wait in Completing until each node reports its release,
-        // so the allocation is not handed to another job while it is still in
-        // use. A job with no allocation has nothing to wait for.
+        // verdict and wait in Completing until each node reports its release.
         if holds_nodes {
             self.propose(WalOperation::JobCancelSignaled {
                 job_id,
                 at: Utc::now(),
             })?;
-            info!(job_id, "job cancelled — completing");
-            return Ok(());
+            // Re-read rather than trust the pre-propose snapshot: the job may
+            // have started, ended or re-pended, and then the signal was a no-op.
+            let completing = self
+                .jobs
+                .read()
+                .get(&job_id)
+                .is_some_and(|j| j.state == JobState::Completing);
+            if completing {
+                info!(job_id, "job cancelled — completing");
+                return Ok(());
+            }
         }
 
         let resp = self.propose(WalOperation::JobComplete {
@@ -2162,8 +2169,8 @@ impl ClusterManager {
     fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
         if let Some(stats) = self.sched_stats.get() {
             stats.record_finalized();
-            // JobPreemptCancel and JobPreemptRequeue are the only WAL
-            // operations that set state=Preempted; Suspend does not.
+            // Preempt-cancel and preempt-requeue are the only sources of a
+            // Preempted finalize (see `Job::end_of_run_state`); Suspend is not.
             if finalized.state == JobState::Preempted {
                 stats.record_preempted();
             }
@@ -6007,6 +6014,7 @@ impl ClusterManager {
         job.per_node_alloc.clear();
         job.node_completions.clear();
         job.time_limit_signaled_at = None;
+        job.cancel_signaled_at = None;
         job.pending_reason = PendingReason::None;
         job.pending_reason_desc = None;
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
@@ -6063,13 +6071,22 @@ impl ClusterManager {
         if let Some(since) = job.suspended_at.take() {
             job.suspended_secs += (timestamp - since).num_seconds().max(0);
         }
-        if let Err(e) = job.transition(JobState::NodeFail) {
-            warn!(job_id, error = %e, "evict: invalid transition to NodeFail");
+        // A run already signalled for cancellation keeps that verdict: reporting
+        // it as NodeFail would requeue a job the user or the scheduler killed.
+        let evicted_state = if job.cancel_signaled_at.is_some() {
+            JobState::Cancelled
+        } else {
+            JobState::NodeFail
+        };
+        if let Err(e) = job.transition(evicted_state) {
+            warn!(job_id, error = %e, state = ?evicted_state, "evict: invalid transition");
             return None;
         }
         job.exit_code = Some(-1);
         job.end_time = Some(timestamp);
-        job.set_pending_reason(reason);
+        if evicted_state == JobState::NodeFail {
+            job.set_pending_reason(reason);
+        }
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
 
@@ -6084,7 +6101,7 @@ impl ClusterManager {
 
         Some(JobFinalized {
             job_id,
-            state: JobState::NodeFail,
+            state: job.end_of_run_state(evicted_state),
             exit_code: -1,
         })
     }
@@ -6411,7 +6428,6 @@ impl ClusterManager {
                             warn!(job_id = *job_id, error = %e, "invalid preempt-cancel transition to Completing");
                             return ClientResponse::default();
                         }
-                        job.end_time = Some(timestamp);
                         return ClientResponse::default();
                     }
 
@@ -6711,16 +6727,20 @@ impl ClusterManager {
                 if job.cancel_signaled_at.is_none() {
                     job.cancel_signaled_at = Some(*at);
                 }
-                if matches!(job.state, JobState::Running | JobState::Suspended) {
+                // Nothing will ever report for a run holding no nodes, so it must
+                // not wait in Completing; the caller finalizes it instead.
+                let waits_for_nodes = matches!(job.state, JobState::Running | JobState::Suspended)
+                    && !job.allocated_nodes.is_empty();
+                if waits_for_nodes {
                     if let Err(e) = job.transition(JobState::Completing) {
                         warn!(job_id = *job_id, error = %e, "invalid cancel transition to Completing");
                         return ClientResponse::default();
                     }
-                    // Completing is not terminal, so nothing stamps this for us;
-                    // without it the completing-timeout watchdog never sees the job.
-                    job.end_time = Some(timestamp);
+                    // Completing is not terminal, so nothing stamps this for us.
+                    // It is what gives the job its full complete_wait_secs grace.
+                    job.end_time = Some(*at);
                     if let Some(since) = job.suspended_at.take() {
-                        job.suspended_secs += (timestamp - since).num_seconds().max(0);
+                        job.suspended_secs += (*at - since).num_seconds().max(0);
                     }
                 }
             }
@@ -12972,8 +12992,10 @@ mod tests {
         }
 
         let job = cm.get_job(1).unwrap();
-        // Clean exits, but the cancel verdict still wins.
+        // Clean exits, but the cancel verdict still wins. The exit code is now
+        // the run's own, not the fixed -1 the synchronous cancel used to write.
         assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.exit_code, Some(0));
         assert!(job.node_completions.is_empty());
         for name in ["n1", "n2", "n3"] {
             assert_eq!(
@@ -16907,6 +16929,56 @@ mod tests {
         crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
             .await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemptor_does_not_kill_a_second_victim_while_the_first_drains() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut victims = Vec::new();
+        for name in ["low-1", "low-2"] {
+            let mut low = basic_spec(name);
+            low.priority = Some(100);
+            let id = submit_and_wait(&cm, low);
+            let res = scalar_alloc(4, 8000);
+            cm.start_job(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+            victims.push(id);
+        }
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        let high_id = submit_and_wait(&cm, high);
+        let partitions = cm.get_partitions();
+
+        for _ in 0..3 {
+            let high_job = cm.get_job(high_id).unwrap();
+            crate::scheduler_loop::try_preempt(
+                &cm,
+                &partitions,
+                &[&high_job],
+                &cm.config().scheduler,
+            )
+            .await;
+        }
+
+        // The first victim still holds n1 until its agent reports, so repeated
+        // ticks must not keep killing jobs the preemptor no longer needs.
+        let killed = victims
+            .iter()
+            .filter(|id| cm.get_job(**id).unwrap().state != JobState::Running)
+            .count();
+        assert_eq!(killed, 1, "only one victim should be preempted");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21182,8 +21254,7 @@ mod tests {
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Completing);
         assert!(job.cancel_signaled_at.is_some());
-        // Without an end time the completing-timeout watchdog skips the job and
-        // it holds its allocation forever.
+        // The end time is what gives the job its complete_wait_secs grace.
         assert!(job.end_time.is_some());
     }
 
@@ -21198,10 +21269,9 @@ mod tests {
         // SIGTERM death: without the verdict marker this derives Failed.
         cm.node_complete(job_id, "worker1", -1, 15, 0).unwrap();
         settle(&cm, job_id, JobState::Cancelled);
-        assert_eq!(
-            cm.get_job(job_id).unwrap().pending_reason,
-            PendingReason::None
-        );
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::None);
+        assert_eq!(job.exit_signal, 15);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21289,6 +21359,102 @@ mod tests {
         let busy = crate::scheduler_loop::running_jobs_busy_until(&cm);
         let until = busy.get("worker1").expect("completing job still holds it");
         assert!(*until < Utc::now() + chrono::Duration::hours(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_after_cancel_does_not_poison_the_next_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "requeue-after-cancel", "worker1");
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        report_nodes_released(&cm, job_id);
+        settle(&cm, job_id, JobState::Cancelled);
+
+        cm.requeue_job_by_user(job_id, "testuser", true, false)
+            .unwrap();
+        settle(&cm, job_id, JobState::Pending);
+        assert!(cm.get_job(job_id).unwrap().cancel_signaled_at.is_none());
+
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            alloc.clone(),
+            per_node_for(&["worker1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        cm.node_complete(job_id, "worker1", 0, 0, 0).unwrap();
+
+        // A clean exit must report Completed, not the previous run's verdict.
+        settle(&cm, job_id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicting_a_cancelled_job_keeps_the_cancel_verdict() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "evict-cancelled", "worker1");
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completing);
+
+        // NodeFail would also auto-requeue a job the user already cancelled.
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "worker1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("evicted".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+
+        settle(&cm, job_id, JobState::Cancelled);
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicting_a_preempt_cancelled_job_still_reports_preempted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "evict-preempted", "worker1");
+
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Cancel, Some(99), None)
+            .unwrap();
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "worker1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("evicted".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_of_a_running_job_holding_no_nodes_still_finalizes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("running-no-nodes"));
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+
+        // Nothing would ever report for it, so it must not wait in Completing.
+        cm.cancel_job(job_id, "testuser").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

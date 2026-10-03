@@ -836,8 +836,8 @@ pub struct Job {
     #[serde(default)]
     pub time_limit_signaled_at: Option<DateTime<Utc>>,
 
-    /// Instant the controller signalled this run for cancellation. Replicated
-    /// so every replica finalizes it as `Cancelled`, not as a signal death.
+    /// Instant the controller signalled this run for cancellation. Replicated so
+    /// every replica reads the run as cancelled, not as a plain signal death.
     #[serde(default)]
     pub cancel_signaled_at: Option<DateTime<Utc>>,
 
@@ -1042,7 +1042,7 @@ impl Job {
         let reason = match state {
             JobState::OutOfMemory => PendingReason::OutOfMemory,
             JobState::Timeout => PendingReason::TimeLimit,
-            // A cancel is the user's own doing, not a fault to explain.
+            // A cancel, user or scheduler, is not a fault to explain.
             JobState::Cancelled => PendingReason::None,
             _ if signal != 0 => PendingReason::RaisedSignal,
             _ if exit_code != 0 => PendingReason::NonZeroExitCode,
