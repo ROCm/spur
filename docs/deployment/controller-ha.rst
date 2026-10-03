@@ -167,14 +167,21 @@ remember that a quorum is a majority of the voters: three voters tolerate one
 failure, five tolerate two. Remove the member from the cluster before you stop
 its process, so the quorum never counts a member that is gone.
 
-Stop the removed controller afterwards, and keep it stopped. A removed node
+You can remove the leader. It commits its own removal, then stops to lead: it
+reports no leader, its readiness probe fails, and it stops all leader-only
+work, such as scheduling and job dispatch. The remaining voters elect a new
+leader after an election timeout. Run the next ``spur admin`` commands through
+a controller that is still a member.
+
+Stop the removed controller afterwards, and keep it stopped. A removed follower
 cannot be told that it left: the cluster commits the removal without it. Until
-you stop it, it still answers the client API with the state it last replicated,
-which grows more stale every minute, and it never accepts a write, because it
-can no longer elect a leader. The same holds if you start it again later: it
-reads its last membership from disk, still finds itself in it, and serves that
-stale state. To use the machine as a controller again, wipe its state directory
-first and add it as a new learner.
+you stop it, it stays ready and answers the client API with the state it last
+replicated, which grows more stale every minute. The same holds if you start it
+again later: it reads its last membership from disk, still finds itself in it,
+and serves that stale state. A removed leader is not ready and does not serve
+the client API after a restart, because its membership on disk does not list
+it. To use the machine as a controller again, wipe its state directory first
+and add it as a new learner.
 
 Read the status
 ---------------
@@ -188,7 +195,8 @@ Read the status
    ``Candidate`` or ``Learner``.
 
 ``leader``
-   The node id of the leader, or ``none`` during an election.
+   The node id of the leader, or ``none`` during an election and on a leader
+   that removed itself.
 
 ``MATCHED``
    Highest log index replicated to that member, from the leader's view. A

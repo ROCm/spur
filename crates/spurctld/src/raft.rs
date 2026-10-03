@@ -951,12 +951,17 @@ impl RaftHandle {
 }
 
 /// The leader in `metrics`, or `None` once the core has stopped: openraft leaves
-/// `current_leader` pointing at the dead node after a fatal error.
+/// `current_leader` pointing at the dead node after a fatal error. It also
+/// derives `current_leader` from the last committed vote, so a leader that
+/// removed itself keeps naming itself; only the server state tells it no longer leads.
 fn live_leader(metrics: &openraft::RaftMetrics<NodeId, openraft::BasicNode>) -> Option<NodeId> {
     if metrics.running_state.is_err() || metrics.state == openraft::ServerState::Shutdown {
         return None;
     }
-    metrics.current_leader
+    match metrics.current_leader {
+        Some(id) if id == metrics.id && !metrics.state.is_leader() => None,
+        leader => leader,
+    }
 }
 
 /// [`live_leader`], also failing closed on a dropped sender: a core panic never
@@ -2224,6 +2229,9 @@ mod tests {
         let mut m = openraft::RaftMetrics::new_initial(1);
         m.current_leader = leader;
         m.current_term = term;
+        if leader == Some(1) {
+            m.state = openraft::ServerState::Leader;
+        }
         m
     }
 
@@ -3009,6 +3017,72 @@ mod join_tests {
             .voter_ids([1, 2], "node 2 is a voter")
             .await
             .unwrap();
+    }
+
+    /// openraft keeps the committed vote of a leader that removed itself, so its
+    /// `current_leader` metric names itself after it stepped down to a learner.
+    #[tokio::test]
+    async fn a_leader_that_removes_itself_stops_reporting_leadership() {
+        let mut listeners = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..3 {
+            let (listener, addr) = reserve().await;
+            listeners.push(listener);
+            addrs.push(addr.to_string());
+        }
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::TempDir::new().unwrap()).collect();
+
+        let mut nodes = Vec::new();
+        for ((id, listener), dir) in (1..=3).zip(listeners).zip(&dirs) {
+            // A seed list maps position to node id, so each node lists the ones before it.
+            let seeds = &addrs[..id as usize];
+            let node = start_raft(id, seeds, dir.path(), noop_applier())
+                .await
+                .unwrap();
+            serve(listener, node.raft.clone());
+            if id == 1 {
+                node.raft
+                    .wait(Some(Duration::from_secs(10)))
+                    .state(openraft::ServerState::Leader, "node 1 leads")
+                    .await
+                    .unwrap();
+            }
+            nodes.push(node);
+        }
+        let (n1, n2) = (&nodes[0], &nodes[1]);
+
+        for (id, addr) in [(2, &addrs[1]), (3, &addrs[2])] {
+            n1.raft
+                .add_learner(id, BasicNode::new(addr.clone()), true)
+                .await
+                .unwrap();
+        }
+        n1.raft
+            .change_membership(openraft::ChangeMembers::AddVoterIds([2, 3].into()), false)
+            .await
+            .unwrap();
+        assert!(n1.is_leader());
+
+        n1.raft
+            .change_membership(openraft::ChangeMembers::RemoveVoters([1].into()), false)
+            .await
+            .unwrap();
+        n2.raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |m| matches!(m.current_leader, Some(2 | 3)),
+                "node 2 or node 3 leads",
+            )
+            .await
+            .unwrap();
+
+        assert!(!n1.is_member());
+        assert!(!n1.is_leader(), "a removed node must not act as the leader");
+        assert_eq!(n1.current_leader(), None);
+        assert_eq!(
+            crate::metrics_server::readiness(n1).await.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
 
