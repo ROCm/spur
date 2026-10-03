@@ -9114,8 +9114,9 @@ impl AgentService {
         let Some(deadline) = cancelled.iter().map(|(_, _, deadline)| *deadline).max() else {
             return;
         };
+        let owners: Vec<u32> = cancelled.iter().map(|(id, _, _)| *id).collect();
         info!(
-            owners = ?cancelled.iter().map(|(id, _, _)| id).collect::<Vec<_>>(),
+            ?owners,
             "dispatch waits for cancelled jobs to release their GPUs"
         );
         loop {
