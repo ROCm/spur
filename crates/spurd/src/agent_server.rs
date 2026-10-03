@@ -834,6 +834,9 @@ pub struct TrackedJob {
     /// The job's cgroup, owned here so every launch path into the job can reach
     /// it. `None` when cgroup enforcement is off or no cgroup was created.
     cgroup_path: Option<std::path::PathBuf>,
+    /// Set when a cancel starts tearing this run down: the instant by which its
+    /// grace period and reap have passed, so a dispatch onto its GPUs waits.
+    cancel_deadline: Option<tokio::time::Instant>,
 }
 
 impl TrackedJob {
@@ -1083,6 +1086,11 @@ async fn wait_for_exit_and_teardown(
 /// Grace between an immediate signal and its SIGKILL escalation, for both the
 /// legacy and stepd-supervised graceful-cancel paths.
 const GRACEFUL_CANCEL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long after a graceful cancel its run may still hold the node's devices:
+/// the grace period, then the reap after the SIGKILL.
+const CANCEL_RELEASE_BOUND: std::time::Duration =
+    GRACEFUL_CANCEL_GRACE_PERIOD.saturating_add(CANCEL_REAP_TIMEOUT);
 
 /// Polls until the job's `running` entry clears — via the supervisor's own
 /// completion push, this poll fencing a stepd stuck before `Start`, or (on
@@ -1603,6 +1611,7 @@ pub async fn recover_stepds(
             nodelist: descriptor.resources.nodelist.clone(),
             mpi: descriptor.resources.mpi.clone(),
             run_attempt: descriptor.run_attempt,
+            cancel_deadline: None,
         });
         // Sessions arrive in directory order, so only take these from the job's
         // own: a step's spool file and rootfs are the step's, not the job's.
@@ -5807,6 +5816,7 @@ impl SlurmAgent for AgentService {
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
                         run_attempt,
+                        cancel_deadline: None,
                         cgroup_path: pty_cgroup_path.clone().or(result.cgroup_path),
                     },
                 );
@@ -6531,6 +6541,7 @@ impl SlurmAgent for AgentService {
                 // Matches the epoch the allocation table was keyed with; 0 from an
                 // older controller keeps the previous stale-report-disabled behavior.
                 run_attempt: req.run_attempt,
+                cancel_deadline: None,
                 cgroup_path,
             },
         );
@@ -8677,6 +8688,9 @@ impl AgentService {
             )));
         }
 
+        self.wait_for_cancelled_gpu_owners(&controller_gpu_ids)
+            .await;
+
         // Hold running across the reclaim (running-then-allocation, as in commit)
         // so a concurrent commit can't make a live owner look stale.
         let running = self.running.lock().await;
@@ -8873,6 +8887,9 @@ impl AgentService {
         let lethal = signal_expected_to_terminate(
             nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM),
         );
+        if lethal {
+            self.mark_cancelling(job_id, run_attempt).await;
+        }
         // Spawned before the signal loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
         let release_wait =
@@ -9062,6 +9079,62 @@ impl AgentService {
         });
     }
 
+    /// Record that this run is being cancelled. The controller frees a run's
+    /// devices when it cancels it, so a dispatch onto them can arrive while the
+    /// run still holds them here in its grace period.
+    async fn mark_cancelling(&self, job_id: u32, run_attempt: u32) {
+        if let Some(tracked) = self
+            .running
+            .lock()
+            .await
+            .get_mut(&job_id)
+            .filter(|tracked| tracked.run_attempt == run_attempt)
+        {
+            tracked
+                .cancel_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + CANCEL_RELEASE_BOUND);
+        }
+    }
+
+    /// Wait, at most until their cancel deadlines, for cancelled runs that
+    /// still hold any of `gpu_ids` to exit. A live owner that is not being
+    /// cancelled is left to the conflict check in the caller.
+    async fn wait_for_cancelled_gpu_owners(&self, gpu_ids: &[u64]) {
+        let owners = self.allocation.lock().await.conflicting_owners(gpu_ids);
+        let cancelled: Vec<(u32, u32, tokio::time::Instant)> = {
+            let running = self.running.lock().await;
+            owners
+                .into_iter()
+                .filter_map(|id| {
+                    let tracked = running.get(&id)?;
+                    Some((id, tracked.run_attempt, tracked.cancel_deadline?))
+                })
+                .collect()
+        };
+        let Some(deadline) = cancelled.iter().map(|(_, _, deadline)| *deadline).max() else {
+            return;
+        };
+        let owners: Vec<u32> = cancelled.iter().map(|(id, _, _)| *id).collect();
+        info!(
+            ?owners,
+            "dispatch waits for cancelled jobs to release their GPUs"
+        );
+        loop {
+            let still_running = {
+                let running = self.running.lock().await;
+                cancelled.iter().any(|(id, attempt, _)| {
+                    running
+                        .get(id)
+                        .is_some_and(|tracked| tracked.run_attempt == *attempt)
+                })
+            };
+            if !still_running || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     async fn graceful_cancel(&self, job_id: u32, run_attempt: u32) {
         // A cancel naming an epoch this node no longer runs belongs to a superseded
         // run, and the processes here are the redispatch that replaced it.
@@ -9080,6 +9153,7 @@ impl AgentService {
                 .await;
             return;
         };
+        self.mark_cancelling(job_id, run_attempt).await;
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
         // Any stepd — including a terminal placeholder or a container step,
         // neither of which own the job's lifetime — can still wedge or die,
@@ -9686,6 +9760,7 @@ impl TrackedJob {
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
+            cancel_deadline: None,
             cgroup_path,
         }
     }
@@ -16510,6 +16585,109 @@ mod tests {
         );
     }
 
+    fn gpu_dispatch_spec() -> JobSpec {
+        JobSpec {
+            cpus_per_task: 1,
+            gres: vec!["gpu:1".into()],
+            ..Default::default()
+        }
+    }
+
+    // The controller frees a cancelled job's GPU at once, but a job that ignores
+    // SIGTERM holds it here until the SIGKILL after the grace period.
+    #[tokio::test]
+    async fn dispatch_waits_for_a_cancelled_gpu_owner_to_exit() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(99, 1);
+        }
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "trap '' TERM; echo ready; while true; do sleep 1; done",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn SIGTERM-trapping process");
+        // A SIGTERM that lands before the trap is set would end the job at once.
+        let mut ready = String::new();
+        tokio::io::AsyncBufReadExt::read_line(
+            &mut tokio::io::BufReader::new(child.stdout.take().unwrap()),
+            &mut ready,
+        )
+        .await
+        .unwrap();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.job = executor::RunningJob::Managed { child };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(99, tracked).await;
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        svc.graceful_cancel(99, 1).await;
+        let res = svc
+            .allocate_local_for_test(100, &gpu_dispatch_spec(), Some(&gpu_alloc_request(&[0])))
+            .await;
+
+        assert!(
+            res.is_ok(),
+            "dispatch must wait for the cancelled owner instead of rejecting, got {res:?}"
+        );
+        assert!(
+            !svc.running.lock().await.contains_key(&99),
+            "the GPU must not be handed over while the cancelled job still runs"
+        );
+    }
+
+    // The wait is bounded: an owner that outlives its cancel deadline keeps the
+    // dispatch rejected, as for any live owner.
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_rejects_a_cancelled_gpu_owner_past_its_deadline() {
+        let log = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _trace_guard = tracing::subscriber::set_default(subscriber);
+
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(99, 1);
+        }
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        tracked.cancel_deadline = Some(tokio::time::Instant::now() + CANCEL_RELEASE_BOUND);
+        svc.insert_test_job(99, tracked).await;
+
+        let err = svc
+            .allocate_local_for_test(100, &gpu_dispatch_spec(), Some(&gpu_alloc_request(&[0])))
+            .await
+            .expect_err("must reject: the cancelled owner never exited");
+
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(svc.running.lock().await.contains_key(&99));
+        let output = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        assert!(output.contains("dispatch waits for cancelled jobs to release their GPUs"));
+        assert!(output.contains("owners=[99]"));
+    }
+
     fn gpu_alloc_request(device_ids: &[u64]) -> ResourceAllocations {
         let devices = device_ids
             .iter()
@@ -17592,6 +17770,7 @@ mod tests {
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
+            cancel_deadline: None,
             cgroup_path: None,
         };
         svc.insert_test_job(job_id, tracked).await;
@@ -18144,6 +18323,7 @@ mod tests {
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt,
+                cancel_deadline: None,
                 cgroup_path: None,
             };
             (t, pid)
@@ -18685,6 +18865,7 @@ mod tests {
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt,
+                cancel_deadline: None,
             }
         }
         let job_id = 903;
@@ -18771,6 +18952,7 @@ mod tests {
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt: 1,
+                cancel_deadline: None,
             },
         )
         .await;
