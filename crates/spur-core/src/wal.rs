@@ -83,6 +83,12 @@ pub enum WalOperation {
         job_id: JobId,
         at: chrono::DateTime<chrono::Utc>,
     },
+    /// A live run was signalled for cancellation. Records the verdict and moves
+    /// the run to Completing, holding its allocation until the nodes report.
+    JobCancelSignaled {
+        job_id: JobId,
+        at: chrono::DateTime<chrono::Utc>,
+    },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
     JobStepComplete {
@@ -1318,6 +1324,24 @@ mod suspend_wal_tests {
                 at: at_back,
             } => {
                 assert_eq!(job_id, 13);
+                assert_eq!(at_back, at);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_cancel_signaled_op_round_trips() {
+        let at = chrono::Utc::now();
+        let op = WalOperation::JobCancelSignaled { job_id: 21, at };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobCancelSignaled {
+                job_id,
+                at: at_back,
+            } => {
+                assert_eq!(job_id, 21);
                 assert_eq!(at_back, at);
             }
             _ => panic!("wrong variant"),
