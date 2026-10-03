@@ -4394,7 +4394,7 @@ impl SlurmController for ControllerService {
             .collect();
         Ok(Response::new(RaftMembershipResponse {
             members,
-            leader: metrics.current_leader.unwrap_or(0),
+            leader: self.raft.current_leader().unwrap_or(0),
             this_node: self.raft.node_id,
             state: format!("{:?}", metrics.state),
             last_log_index: metrics.last_log_index.unwrap_or(0),
