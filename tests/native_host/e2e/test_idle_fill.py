@@ -20,6 +20,7 @@ and no reclaim ever fires, so a test that forgets to fill the cluster passes
 while asserting nothing.
 """
 
+import re
 import time
 
 import pytest
@@ -760,6 +761,67 @@ class TestExemptWindowProtectsAFreshBorrow:
             _await_running(c, claim)
             assert job_state(c.squeue_all(), borrowed) == "PD", (
                 "after the window the borrowed run is reclaimed"
+            )
+        finally:
+            _cancel_all(c, ids)
+
+
+class TestReclaimedBurstJobYieldsToItsReclaimer:
+    """Capacity reclaimed for a claim must go to that claim.
+
+    A burst job is reclaimable only through its QOS flag, so it is not a borrow
+    candidate and is scheduled in normal priority order. At equal priority the
+    requeued burst job has the lower job ID. If the scheduler offers it the freed
+    capacity first, it starts again, the claim stays pending, and the next reclaim
+    repeats the cycle. One node and CPUs only, so neither GPUs nor a second node
+    can hide the outcome.
+    """
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return _config()
+
+    def test_the_claim_starts_and_the_burst_job_waits(self, accounting_cluster):
+        c = accounting_cluster
+        node = c.node_names[0]
+        cpus = int(re.search(r"CPUTot=(\d+)", c.scontrol_show_node(node)).group(1))
+        burst_cpus = max(2, cpus * 70 // 100)
+        claim_cpus = max(2, cpus * 55 // 100)
+        if burst_cpus + claim_cpus <= cpus or max(burst_cpus, claim_cpus) > cpus:
+            pytest.skip(f"{node} has {cpus} CPUs, too few to stage the overlap")
+        c.sacctmgr(["add", "qos", "name=yburst", "priority=10",
+                    "idlefillpreemptable=yes"])
+        c.sacctmgr(["add", "qos", "name=yclaim", "priority=10"])
+        time.sleep(15)
+
+        def submit(name: str, qos: str, n_cpus: int) -> int:
+            script = c.write_file(f"{name}.sh", _SLEEP)
+            job_id = parse_job_id(c.sbatch(
+                ["-N1", "-c", str(n_cpus), "-q", qos, "-t", "30",
+                 f"--job-name={name}", script]))
+            assert job_id is not None, f"{name} submit failed"
+            return job_id
+
+        ids = []
+        try:
+            burst = submit("y-burst", "yburst", burst_cpus)
+            ids.append(burst)
+            _await_running(c, burst, timeout=60)
+            time.sleep(_EXEMPT_SECS + 3)
+
+            claim = submit("y-claim", "yclaim", claim_cpus)
+            ids.append(claim)
+            _await_running(c, claim)
+
+            # The claim holds the node until it ends, so a burst job that is
+            # still pending a guard period later has really yielded.
+            time.sleep(_GUARD_SECS)
+            sq = c.squeue_all()
+            assert job_state(sq, claim) == "R", (
+                f"the claim must keep the reclaimed capacity\n\n{_diagnostics(c)}"
+            )
+            assert job_state(sq, burst) == "PD", (
+                f"the reclaimed burst job must wait\n\n{_diagnostics(c)}"
             )
         finally:
             _cancel_all(c, ids)

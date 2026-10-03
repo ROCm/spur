@@ -129,6 +129,10 @@ partial run, not the work. ``--no-requeue`` does not prevent this; suspension is
 not used, because a suspended job keeps its node allocation and would never
 release the capacity.
 
+A requeued job does not compete for the capacity freed for the job that reclaimed
+it. It stays out of scheduling until that job has had the chance to start on it,
+even when the requeued job has the same or a higher priority.
+
 The fate is always requeue, whatever ``PreemptMode`` the job's QOS or partition
 sets. A QOS with ``preemptmode=cancel`` still has its borrowed runs requeued, not
 cancelled. The two other modes cannot serve reclaim: suspend never releases the
