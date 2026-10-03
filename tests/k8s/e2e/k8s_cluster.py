@@ -914,6 +914,16 @@ def scale_controllers(namespace: str, replicas: int) -> None:
     )
 
 
+def set_controller_ordinals(namespace: str, start: int, replicas: int) -> None:
+    """Keep only the controller Pods with ordinals start..start+replicas-1."""
+    _load_kube_config()
+    client.AppsV1Api().patch_namespaced_stateful_set(
+        "spurctld",
+        namespace,
+        {"spec": {"ordinals": {"start": start}, "replicas": replicas}},
+    )
+
+
 def delete_pvc(namespace: str, name: str) -> None:
     _load_kube_config()
     try:
