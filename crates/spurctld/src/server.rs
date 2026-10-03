@@ -1340,9 +1340,9 @@ fn reservation_manager_ruling(
     }
 }
 
-/// How long a signalled cancel may go unreported before a node still claiming
-/// the job is treated as having missed the kill rather than still serving it.
-const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(30);
+/// Twice the agent's own kill budget (SIGTERM grace plus reap). Past it, a node
+/// still claiming the job missed the cancel rather than being mid-teardown.
+const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(16);
 
 /// Whether `node` may release what it holds for `job_id`: the run is over, the
 /// job is active elsewhere, or the id is untracked but was issued by us.
