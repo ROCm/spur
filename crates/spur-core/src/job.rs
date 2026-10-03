@@ -836,6 +836,11 @@ pub struct Job {
     #[serde(default)]
     pub time_limit_signaled_at: Option<DateTime<Utc>>,
 
+    /// Instant the controller signalled this run for cancellation. Replicated
+    /// so every replica finalizes it as `Cancelled`, not as a signal death.
+    #[serde(default)]
+    pub cancel_signaled_at: Option<DateTime<Utc>>,
+
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
     pub suspended_at: Option<DateTime<Utc>>,
@@ -938,6 +943,7 @@ impl Job {
             het_group: None,
             node_completions: HashMap::new(),
             time_limit_signaled_at: None,
+            cancel_signaled_at: None,
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
@@ -1027,6 +1033,8 @@ impl Job {
             JobState::OutOfMemory
         } else if self.time_limit_signaled_at.is_some() {
             JobState::Timeout
+        } else if self.cancel_signaled_at.is_some() {
+            JobState::Cancelled
         } else {
             derived_state
         };
@@ -1034,12 +1042,23 @@ impl Job {
         let reason = match state {
             JobState::OutOfMemory => PendingReason::OutOfMemory,
             JobState::Timeout => PendingReason::TimeLimit,
+            // A cancel is the user's own doing, not a fault to explain.
+            JobState::Cancelled => PendingReason::None,
             _ if signal != 0 => PendingReason::RaisedSignal,
             _ if exit_code != 0 => PendingReason::NonZeroExitCode,
             _ => PendingReason::None,
         };
 
         (state, reason)
+    }
+
+    /// State to report to accounting for a finished run. A preempt-cancelled
+    /// run ends PREEMPTED in `sacct` while its live state is CANCELLED.
+    pub fn end_of_run_state(&self, final_state: JobState) -> JobState {
+        if self.cancel_signaled_at.is_some() && self.preempt_mode.as_deref() == Some("Cancel") {
+            return JobState::Preempted;
+        }
+        final_state
     }
 
     pub fn all_nodes_completed(&self) -> bool {
@@ -1359,6 +1378,9 @@ impl Job {
             (JobState::Timeout, JobState::Pending) => true,
             (JobState::Preempted, JobState::Pending) => true,
             (JobState::Preempted, JobState::Cancelled) => true,
+            // Preempt-cancel holds the allocation until the nodes report, so the
+            // killed run waits in Completing like any other (Slurm's PREEMPTED|CG).
+            (JobState::Preempted, JobState::Completing) => true,
             (JobState::NodeFail, JobState::Pending) => true,
             (JobState::Failed, JobState::Pending) => true,
             _ => false,
@@ -1387,7 +1409,10 @@ impl Job {
     /// resurrect a finished run.
     pub fn requeue_to_pending(&mut self) -> Result<(), JobTransitionError> {
         let ok = self.state.is_terminal()
-            || matches!(self.state, JobState::Running | JobState::Suspended);
+            || matches!(
+                self.state,
+                JobState::Running | JobState::Suspended | JobState::Completing
+            );
         if !ok {
             return Err(JobTransitionError::Invalid {
                 from: self.state,
@@ -1896,6 +1921,134 @@ mod tests {
         let (state, reason) = timed_out_job().completion_verdict(JobState::Failed, 0, 9, true);
         assert_eq!(state, JobState::OutOfMemory);
         assert_eq!(reason, PendingReason::OutOfMemory);
+    }
+
+    fn cancelled_job() -> Job {
+        let mut job = make_job();
+        job.cancel_signaled_at = Some(Utc::now());
+        job
+    }
+
+    #[test]
+    fn completion_verdict_reports_cancelled_for_a_signalled_run() {
+        // Without the marker the SIGTERM death reads as Failed and the user who
+        // ran scancel is told their job crashed.
+        let (state, reason) = cancelled_job().completion_verdict(JobState::Failed, 0, 15, false);
+        assert_eq!(state, JobState::Cancelled);
+        assert_eq!(reason, PendingReason::None);
+    }
+
+    #[test]
+    fn completion_verdict_reports_cancelled_when_the_job_exits_cleanly_on_sigterm() {
+        let (state, _) = cancelled_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Cancelled);
+    }
+
+    #[test]
+    fn completion_verdict_lets_the_time_limit_and_oom_outrank_a_cancel() {
+        let mut job = cancelled_job();
+        job.time_limit_signaled_at = Some(Utc::now());
+        let (state, _) = job.completion_verdict(JobState::Failed, 0, 15, false);
+        assert_eq!(state, JobState::Timeout);
+
+        let (state, _) = cancelled_job().completion_verdict(JobState::Failed, 0, 9, true);
+        assert_eq!(state, JobState::OutOfMemory);
+    }
+
+    #[test]
+    fn end_of_run_state_reports_a_preempt_cancel_as_preempted() {
+        let mut job = cancelled_job();
+        job.preempt_mode = Some("Cancel".into());
+        assert_eq!(
+            job.end_of_run_state(JobState::Cancelled),
+            JobState::Preempted
+        );
+
+        // A plain scancel, and a preempt-requeue, keep their own verdict.
+        assert_eq!(
+            cancelled_job().end_of_run_state(JobState::Cancelled),
+            JobState::Cancelled
+        );
+        let mut requeued = cancelled_job();
+        requeued.preempt_mode = Some("Requeue".into());
+        assert_eq!(
+            requeued.end_of_run_state(JobState::Cancelled),
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_preempt_cancelled_run_may_wait_in_completing() {
+        let mut job = make_job();
+        job.state = JobState::Preempted;
+        job.transition(JobState::Completing).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        job.transition(JobState::Cancelled).unwrap();
+    }
+
+    #[test]
+    fn requeue_accepts_a_completing_job() {
+        let mut job = make_job();
+        job.state = JobState::Completing;
+        job.requeue_to_pending().unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.end_time.is_none());
+    }
+
+    // Frozen pre-`cancel_signaled_at` payload: replay of an older Raft log or
+    // snapshot must still deserialize, or spurctld crashes on restart.
+    #[test]
+    fn job_deserializes_without_cancel_signaled_at_field() {
+        let json = r#"{
+            "job_id": 7,
+            "spec": {
+                "name": "old", "user": "alice", "uid": 0, "gid": 0,
+                "cpus_per_task": 1, "num_nodes": 1, "num_tasks": 1,
+                "gres": [],
+                "argv": [],
+                "environment": {},
+                "dependency": [],
+                "requeue": false,
+                "exclusive": false,
+                "hold": false,
+                "interactive": false,
+                "mail_type": [],
+                "container_mounts": [],
+                "container_readonly": false,
+                "container_mount_home": false,
+                "container_env": {},
+                "container_remap_root": false,
+                "spread_job": false,
+                "host_network": false,
+                "privileged": false,
+                "host_ipc": false,
+                "extra_resources": {},
+                "work_dir": "/tmp"
+            },
+            "state": "RUNNING",
+            "pending_reason": "None",
+            "priority": 1000,
+            "submit_time": "2026-01-02T03:04:05Z",
+            "start_time": null,
+            "end_time": null,
+            "allocated_nodes": ["n1"],
+            "allocated_resources": null,
+            "exit_code": null,
+            "exit_signal": 0,
+            "derived_exit_code": 0,
+            "requeue_count": 0,
+            "preempt_requeue_count": 0,
+            "user_requeue_count": 0,
+            "run_attempt": 0,
+            "node_completions": {},
+            "time_limit_signaled_at": null,
+            "suspended_secs": 0
+        }"#;
+        let job: Job = serde_json::from_str(json).unwrap();
+        assert_eq!(job.job_id, 7);
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
+        assert!(job.cancel_signaled_at.is_none());
     }
 
     #[test]

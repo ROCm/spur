@@ -9372,9 +9372,10 @@ mod tests {
         svc.cancel_job(req)
             .await
             .expect("a verified operator/admin must be able to cancel another user's job");
+        // Cancel of a job holding nodes lands in Completing until they report.
         assert_eq!(
             svc.cluster.get_job(job_id).unwrap().state,
-            spur_core::job::JobState::Cancelled
+            spur_core::job::JobState::Completing
         );
     }
 
@@ -9393,7 +9394,7 @@ mod tests {
         .expect("k8s operator cancel uses empty user and no bearer");
         assert_eq!(
             svc.cluster.get_job(job_id).unwrap().state,
-            spur_core::job::JobState::Cancelled
+            spur_core::job::JobState::Completing
         );
     }
 

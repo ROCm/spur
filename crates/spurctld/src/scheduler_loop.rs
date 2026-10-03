@@ -781,9 +781,12 @@ pub(crate) fn compute_job_allocation(
 
 /// Real per-node "free again at" times derived from running jobs, so backfill
 /// doesn't fall back to a flat placeholder for every busy node.
-fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
+pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
     let running = cluster.get_jobs(&JobFilter {
-        states: &[spur_core::job::JobState::Running],
+        states: &[
+            spur_core::job::JobState::Running,
+            spur_core::job::JobState::Completing,
+        ],
         ..Default::default()
     });
     busy_until_from_running_jobs(&running)
@@ -2720,16 +2723,28 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
         });
 
         for job in completing {
-            let Some(completing_since) = job.end_time else {
-                continue;
-            };
-            if now - completing_since < wait {
+            if !completing_job_is_overdue(&job, now, wait) {
                 continue;
             }
-
+            if job.end_time.is_none() {
+                warn!(
+                    job_id = job.job_id,
+                    "job is COMPLETING with no end time — force-finishing"
+                );
+            }
             force_finish_completing_job(&cluster, &job).await;
         }
     }
+}
+
+/// Whether a COMPLETING job has waited long enough to be force-finished. A job
+/// with no end time is already overdue: nothing else would ever free it.
+fn completing_job_is_overdue(
+    job: &spur_core::job::Job,
+    now: DateTime<Utc>,
+    wait: chrono::Duration,
+) -> bool {
+    job.end_time.is_none_or(|since| now - since >= wait)
 }
 
 /// Force-finishes a job stuck in Completing past `complete_wait_secs`. Cancels
@@ -3181,6 +3196,35 @@ mod tests {
         job.start_time = Some(start);
         job.allocated_nodes = vec![node.to_string()];
         job
+    }
+
+    #[test]
+    fn a_completing_job_with_no_end_time_is_already_overdue() {
+        // The silent-skip bug: nothing else finalizes a Completing job, so a
+        // missing end time would strand its allocation forever.
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 10);
+        job.state = spur_core::job::JobState::Completing;
+        job.end_time = None;
+        assert!(completing_job_is_overdue(
+            &job,
+            now,
+            chrono::Duration::seconds(300)
+        ));
+    }
+
+    #[test]
+    fn a_completing_job_is_overdue_only_after_the_wait_elapses() {
+        let now = Utc::now();
+        let wait = chrono::Duration::seconds(300);
+        let mut job = running_job_on("node001", now, 10);
+        job.state = spur_core::job::JobState::Completing;
+
+        job.end_time = Some(now - chrono::Duration::seconds(299));
+        assert!(!completing_job_is_overdue(&job, now, wait));
+
+        job.end_time = Some(now - chrono::Duration::seconds(300));
+        assert!(completing_job_is_overdue(&job, now, wait));
     }
 
     #[test]
