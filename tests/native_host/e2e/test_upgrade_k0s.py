@@ -23,14 +23,50 @@ for the no-k0s proof (job survival across agent restart).
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 import time
+from pathlib import Path
 
 import pytest
 
-from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job
+from cluster import BINARIES, SpurCluster, make_remote_dir, parse_job_id, wait_job
+
+logger = logging.getLogger(__name__)
 
 BUSYBOX_IMAGE = "docker.io/library/busybox:1.36"
+
+
+# --- binary swap helpers ---------------------------------------------------
+
+
+def _get_baseline_binaries_dir() -> str | None:
+    raw = os.environ.get("SPUR_TEST_BASELINE_BINARIES_DIR", "").strip()
+    return raw if raw else None
+
+
+def _get_upgrade_binaries_dir() -> str:
+    repo_root = Path(__file__).resolve().parents[3]
+    return os.environ.get(
+        "SPUR_TEST_BINARIES_DIR",
+        str(repo_root / "target" / "release"),
+    )
+
+
+def _swap_binaries(c: SpurCluster, binaries_dir: str) -> None:
+    """Upload-to-temp + mv to avoid ETXTBSY when a daemon holds the old binary."""
+    for name in BINARIES:
+        local_path = Path(binaries_dir) / name
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Missing binary for swap: {local_path}")
+        remote_path = f"{c.bin_dir}/{name}"
+        tmp_path = f"{remote_path}.new"
+        for node in c.nodes:
+            node.upload(str(local_path), tmp_path)
+            node.exec(f"chmod +x '{tmp_path}' && mv -f '{tmp_path}' '{remote_path}'")
+    logger.info("Swapped binaries on all nodes from %s", binaries_dir)
+
 
 # --- helpers ----------------------------------------------------------------
 
@@ -306,16 +342,8 @@ def _assert_nodes_by_role_metric(c: SpurCluster,
 
 
 def _restart_agent_and_wait(c: SpurCluster, node_index: int) -> None:
-    node_name = c.node_names[node_index]
     c.restart_agent(node_index=node_index)
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        if node_name in c.sinfo_nodes():
-            return
-        time.sleep(2)
-    raise AssertionError(
-        f"{node_name} did not re-register within 60s after agent restart"
-    )
+    c.wait_agent_serving(node_index=node_index, timeout=60)
 
 
 def _drain_and_restart_agent(c: SpurCluster, node_index: int) -> None:
@@ -624,3 +652,90 @@ class TestRollingUpgradePreservesK0s:
         assert c.etcd_member_count() == etcd_before
         _assert_k8s_metrics_phase(c, "ready")
         _assert_k8s_metrics_cluster_up(c)
+
+
+@pytest.mark.k0s
+class TestVersionUpgradePreservesK0s:
+    """Real version-to-version upgrade (no WireGuard): start the cluster on
+    baseline binaries (e.g. v0.14.0), bring k0s up, swap to the PR binaries,
+    do a rolling restart, and prove k0s survived.
+
+    Requires ``SPUR_TEST_BASELINE_BINARIES_DIR``. Skipped when unset.
+    """
+
+    def test_version_upgrade_preserves_k0s(self, k0s_native_cluster):
+        baseline_dir = _get_baseline_binaries_dir()
+        if not baseline_dir:
+            pytest.skip(
+                "SPUR_TEST_BASELINE_BINARIES_DIR not set — "
+                "set it to a directory with v0.14.0 binaries to run "
+                "the version upgrade test"
+            )
+        upgrade_dir = _get_upgrade_binaries_dir()
+
+        c = k0s_native_cluster
+
+        try:
+            # --- phase 1: start on baseline (old) binaries ---
+            _swap_binaries(c, baseline_dir)
+            c.restart_controller()
+            for i in range(len(c.nodes)):
+                _restart_agent_and_wait(c, i)
+            c.wait_ready(timeout=120)
+
+            cp_node = c.node_names[0]
+            multi_node = len(c.node_names) > 1
+            up_args = ["--control-plane-node", cp_node] if multi_node else []
+            out = c.k8s_up(up_args)
+            assert "provisioning requested" in out or "already" in out, out
+            c.wait_k8s_phase("ready", timeout=600)
+
+            cp_set = set(c.k8s_control_planes())
+            worker_names = [n for n in c.node_names if n not in cp_set]
+            if not worker_names:
+                worker_names = list(cp_set)
+            _wait_k8s_nodes_ready(c, worker_names, timeout=300)
+
+            if not _prepull_busybox(c):
+                pytest.skip("cannot pre-pull busybox image (offline registry)")
+
+            members_before = c.k8s_members()
+            cp_list_before = c.k8s_control_planes()
+            etcd_count_before = c.etcd_member_count()
+            roles_before = _k8s_node_roles(c)
+
+            num_workers = len(c.node_names) - 1
+            _deploy_canary(c, "canary", max(num_workers, 1))
+            _wait_deployment_ready(c, "canary", timeout=300)
+
+            # --- phase 2: swap to upgrade (new) binaries + rolling restart ---
+            _swap_binaries(c, upgrade_dir)
+
+            c.restart_controller()
+            c.wait_k8s_phase("ready", timeout=120)
+
+            _assert_spur_tracks_k0s(c)
+            _assert_canary_survived(c, "canary")
+
+            for i in range(len(c.nodes)):
+                _drain_and_restart_agent(c, i)
+
+            c.wait_k8s_phase("ready", timeout=120)
+            _wait_k8s_nodes_ready(c, worker_names, timeout=120)
+
+            _assert_spur_tracks_k0s(c)
+            assert c.k8s_members() == members_before
+            assert c.k8s_control_planes() == cp_list_before
+            assert c.etcd_member_count() == etcd_count_before
+            assert _k8s_node_roles(c) == roles_before
+            _assert_canary_survived(c, "canary")
+            _assert_k8s_metrics_phase(c, "ready")
+            _assert_k8s_metrics_cluster_up(c)
+
+            # --- phase 3: verify scheduling works on new version ---
+            _schedule_new_pod(c, "post-version-upgrade-pod", timeout=180)
+
+            _delete_k8s_resource(c, "deployment", "canary")
+            _delete_k8s_resource(c, "pod", "post-version-upgrade-pod")
+        finally:
+            _swap_binaries(c, upgrade_dir)
