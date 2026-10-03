@@ -1626,7 +1626,7 @@ async fn update_node(
             remove_labels: Vec::new(),
         })
         .await
-        .context("node update failed")?;
+        .map_err(|s| anyhow::anyhow!("node update failed: {}", s.message()))?;
 
     println!("node {} updated", name);
     Ok(())
@@ -2604,6 +2604,22 @@ mod tests {
             "error should mention failed node: {msg}"
         );
         assert!(msg.contains("1 of 3"), "error should report counts: {msg}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_update_shows_the_controller_reason() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_update_node_fail_names(["n2".to_string()].into());
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let err = update_node(&mut client, "n2", None, None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("node n2 not found"),
+            "the error must carry the reason: {err}"
+        );
     }
 
     #[tokio::test]
