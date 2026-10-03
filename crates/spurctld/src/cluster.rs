@@ -21458,6 +21458,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_signal_apply_leaves_an_unallocated_run_for_the_caller() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("apply-no-nodes"));
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+
+        // Guards the race where the allocation vanished between the caller's
+        // read and this apply: Completing here would never be reported out of.
+        cm.apply_operation(&WalOperation::JobCancelSignaled {
+            job_id,
+            at: Utc::now(),
+        });
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.cancel_signaled_at.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_signal_is_ignored_once_the_run_has_ended() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
