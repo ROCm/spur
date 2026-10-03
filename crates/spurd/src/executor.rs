@@ -2530,22 +2530,19 @@ fn build_namespace_wrapper(
         .filter_map(|p| p.rsplit('/').next())
         .filter(|b| !b.is_empty())
         .collect();
-    let stash_dri = dri_nodes
-        .iter()
-        .map(|b| format!("  cp -a /dev/dri/{b} $SPUR_HOST_DRI/{b} 2>/dev/null || true\n"))
-        .collect::<String>();
-
     // Gated on the mount: without the tmpfs the restore lands on the host's real
     // /dev/dri, where `cp` unlinks the node before recreating it.
     const MOUNT_DRI: &str = "mount -t tmpfs tmpfs /dev/dri 2>/dev/null";
     let mount_and_restore_dri = if dri_nodes.is_empty() {
         format!("  {MOUNT_DRI} || true\n")
     } else {
+        // fd 3 keeps the host /dev/dri reachable under the tmpfs, so the nodes
+        // are never staged in a host directory that outlives the job.
         let restore = dri_nodes
             .iter()
-            .map(|b| format!("    cp -a $SPUR_HOST_DRI/{b} /dev/dri/{b} 2>/dev/null || true\n"))
+            .map(|b| format!("    cp -a /proc/self/fd/3/{b} /dev/dri/{b} 2>/dev/null || true\n"))
             .collect::<String>();
-        format!("  if {MOUNT_DRI}; then\n{restore}  fi\n")
+        format!("  exec 3</dev/dri\n  if {MOUNT_DRI}; then\n{restore}  fi\n  exec 3<&-\n")
     };
 
     let final_exec = if uid > 0 {
@@ -2565,18 +2562,14 @@ fn build_namespace_wrapper(
             "# Namespace isolation wrapper — all mounts best-effort\n",
             "mount -t proc proc /proc 2>/dev/null || true\n",
             "mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true\n",
-            "# GPU device restriction: stash the allocated /dev/dri nodes, replace\n",
-            "# the directory with a tmpfs, then copy only those back. Staging any\n",
-            "# other node would mknod a device the cgroup device filter denies.\n",
-            "SPUR_HOST_DRI=$(mktemp -d /tmp/.spur_dri_XXXXXX 2>/dev/null || echo /tmp/.spur_dri)\n",
+            "# GPU device restriction: replace /dev/dri with a tmpfs, then copy only\n",
+            "# the allocated nodes into it. Copying any other node would mknod a\n",
+            "# device the cgroup device filter denies.\n",
             "if [ -d /dev/dri ]; then\n",
-            "  mkdir -p $SPUR_HOST_DRI 2>/dev/null || true\n",
-            "{stash_dri}",
             "{mount_and_restore_dri}",
             "fi\n",
             "{final_exec}",
         ),
-        stash_dri = stash_dri,
         mount_and_restore_dri = mount_and_restore_dri,
         final_exec = final_exec,
     )
@@ -3916,18 +3909,14 @@ mod tests {
             "no bulk copy of the host directory:\n{wrapper}"
         );
         assert!(
-            wrapper.contains("cp -a /dev/dri/renderD128 $SPUR_HOST_DRI/renderD128"),
-            "the job's own node is staged:\n{wrapper}"
-        );
-        assert!(
-            wrapper.contains("cp -a $SPUR_HOST_DRI/renderD128 /dev/dri/renderD128"),
-            "and restored onto the tmpfs:\n{wrapper}"
+            wrapper.contains("cp -a /proc/self/fd/3/renderD128 /dev/dri/renderD128"),
+            "the job's own node is copied onto the tmpfs:\n{wrapper}"
         );
         let mount = wrapper
             .find("mount -t tmpfs tmpfs /dev/dri")
             .expect("missing /dev/dri tmpfs mount");
         let restore = wrapper
-            .find("cp -a $SPUR_HOST_DRI/")
+            .find("cp -a /proc/self/fd/3/")
             .expect("missing restore");
         assert!(
             mount < restore,
@@ -3937,6 +3926,30 @@ mod tests {
             wrapper.contains("if mount -t tmpfs tmpfs /dev/dri 2>/dev/null; then"),
             "and the restore must be gated on that mount: against the host's real \
              /dev/dri, `cp` unlinks the node before recreating it:\n{wrapper}"
+        );
+    }
+
+    /// The host's /tmp is shared by every job, so the nodes must not be staged
+    /// there, and the handle on the host /dev/dri must not reach the job.
+    #[test]
+    fn test_namespace_wrapper_stages_nothing_on_the_host() {
+        let script = PathBuf::from("/work/.spur_job_11.sh");
+        let paths = vec!["/dev/dri/card1".into(), "/dev/dri/renderD128".into()];
+        let wrapper = build_namespace_wrapper(1000, 1000, &paths, &script);
+
+        assert!(
+            !wrapper.contains("/tmp"),
+            "no staging directory in the host /tmp:\n{wrapper}"
+        );
+        let open = wrapper.find("exec 3</dev/dri").expect("missing fd open");
+        let mount = wrapper
+            .find("mount -t tmpfs tmpfs /dev/dri")
+            .expect("missing /dev/dri tmpfs mount");
+        let close = wrapper.find("exec 3<&-").expect("missing fd close");
+        let setpriv = wrapper.find("setpriv").expect("missing setpriv");
+        assert!(
+            open < mount && mount < close && close < setpriv,
+            "fd 3 must open before the mount and close before the job runs:\n{wrapper}"
         );
     }
 
