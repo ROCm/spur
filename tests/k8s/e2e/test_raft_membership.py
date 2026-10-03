@@ -6,19 +6,23 @@
 Starts from one controller whose seed list names only itself, scales the
 StatefulSet to three, adds and promotes the two new replicas through
 `spur admin raft`, removes one again, and proves the cluster still elects a
-leader and runs a job.
+leader and runs a job. With a runtime-added leader, each follower must forward
+a write to it.
 """
 
 import re
+import shlex
 import time
 
 from k8s_cluster import (
+    ADMIN_POD,
     DEFAULT_TIMEOUT,
     HA_TIMEOUT,
     WAIT_INTERVAL,
     assert_eventually,
     delete_pod,
     delete_pvc,
+    exec_in_pod,
     pod_state,
     scale_controllers,
     service_endpoint_pods,
@@ -34,6 +38,10 @@ from k8s_cluster import (
 # failed periods of 20 seconds. A waiting pod that survives this long is not
 # being killed by it.
 LIVENESS_KILL_WINDOW = 15 + 3 * 20
+
+# Each leader deletion gives the runtime-added voter a fair chance to win the
+# next election; this many losses in a row point to a real problem.
+MAX_LEADER_DELETIONS = 6
 
 _HEADER = re.compile(
     r"answered by node (\d+) \((\w+)\), leader (\S+), last_log_index (\d+)"
@@ -80,6 +88,30 @@ def voters(status: dict) -> set[int]:
 
 def raft_address(namespace: str, pod: str) -> str:
     return f"{pod}.spurctld.{namespace}.svc.cluster.local:6821"
+
+
+def controller_pod(node_id: int) -> str:
+    return f"spurctld-{node_id - 1}"
+
+
+def elected_leader(namespace: str, expected_voters: set[int]) -> int:
+    def elected() -> bool:
+        try:
+            status = leader_status(namespace)
+        except AssertionError:
+            return False
+        return status["leader"] in expected_voters and voters(status) == expected_voters
+
+    assert_eventually(HA_TIMEOUT, WAIT_INTERVAL, f"no leader among voters {expected_voters}", elected)
+    return leader_status(namespace)["leader"]
+
+
+def spur_cli(namespace: str, controller_pod: str, args: list[str]) -> str:
+    """Run `spur ...` from the admin pod straight against one controller pod,
+    not through the client Service, with stderr in the output."""
+    controller = f"http://{controller_pod}.spurctld.{namespace}.svc.cluster.local:6817"
+    command = shlex.join(["spur", args[0], "--controller", controller, *args[1:]])
+    return exec_in_pod(namespace, ADMIN_POD, ["sh", "-c", f"{command} 2>&1"])
 
 
 class TestRaftMembership:
@@ -149,19 +181,28 @@ class TestRaftMembership:
         )
         delete_pvc(ns, "spool-spurctld-2")
 
-        leader = f"spurctld-{leader_status(ns)['leader'] - 1}"
-        delete_pod(ns, leader)
-        for pod in ("spurctld-0", "spurctld-1"):
-            wait_pod_ready(ns, pod, HA_TIMEOUT)
+        leader = elected_leader(ns, {1, 2})
+        deletions = 0
+        while True:
+            delete_pod(ns, controller_pod(leader))
+            deletions += 1
+            for pod in ("spurctld-0", "spurctld-1"):
+                wait_pod_ready(ns, pod, HA_TIMEOUT)
+            leader = elected_leader(ns, {1, 2})
+            # Node 2 joined at runtime, so it is not in any controller.peers.
+            if leader == 2:
+                break
+            assert deletions < MAX_LEADER_DELETIONS, (
+                f"node 2 did not win any of {deletions} elections"
+            )
 
-        def two_voters_elected() -> bool:
-            try:
-                status = leader_status(ns)
-            except AssertionError:
-                return False
-            return status["leader"] in (1, 2) and voters(status) == {1, 2}
-
-        assert_eventually(HA_TIMEOUT, WAIT_INTERVAL, "no leader among the two voters", two_voters_elected)
+        # Each follower must find a leader that only the replicated membership
+        # names, and forward the write to it.
+        for follower in (controller_pod(n) for n in voters(leader_status(ns)) - {leader}):
+            out = spur_cli(ns, follower, ["submit", "--wrap", "true"])
+            match = re.search(r"Submitted batch job (\d+)", out)
+            assert match, f"submit through follower {follower} failed:\n{out}"
+            spur_cli(ns, controller_pod(leader), ["cancel", match.group(1)])
 
         job = simple_spurjob("it-membership", ["sh", "-c", "echo MEMBERSHIP_OK"])
         seed_cluster.create_spurjob(job)
