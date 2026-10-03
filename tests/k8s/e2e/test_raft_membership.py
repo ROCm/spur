@@ -5,9 +5,10 @@
 
 Starts from one controller whose seed list names only itself, scales the
 StatefulSet to three, adds and promotes the two new replicas through
-`spur admin raft`, removes one again, and proves the cluster still elects a
-leader and runs a job. With a runtime-added leader, each follower must forward
-a write to it.
+`spur admin raft`, then removes the seed. The two voters that remain both
+joined at runtime, so the next leader is one that no controller.peers names,
+and the follower must forward a write to it. Then the cluster must survive a
+leader loss and run a job.
 """
 
 import re
@@ -26,6 +27,7 @@ from k8s_cluster import (
     pod_state,
     scale_controllers,
     service_endpoint_pods,
+    set_controller_ordinals,
     simple_spurjob,
     spur_admin,
     start_admin_pod,
@@ -38,10 +40,6 @@ from k8s_cluster import (
 # failed periods of 20 seconds. A waiting pod that survives this long is not
 # being killed by it.
 LIVENESS_KILL_WINDOW = 15 + 3 * 20
-
-# Each leader deletion gives the runtime-added voter a fair chance to win the
-# next election; this many losses in a row point to a real problem.
-MAX_LEADER_DELETIONS = 6
 
 _HEADER = re.compile(
     r"answered by node (\d+) \((\w+)\), leader (\S+), last_log_index (\d+)"
@@ -71,9 +69,9 @@ def parse_raft_status(text: str) -> dict:
     }
 
 
-def leader_status(namespace: str) -> dict:
+def leader_status(namespace: str, via: str = "spurctld-0") -> dict:
     """Status as the leader sees it: only the leader knows MATCHED."""
-    status = parse_raft_status(spur_admin(namespace, "spurctld-0", ["raft", "status"]))
+    status = parse_raft_status(spur_admin(namespace, via, ["raft", "status"]))
     if status["leader"] is None:
         raise AssertionError("no leader")
     if status["leader"] != status["this_node"]:
@@ -94,16 +92,16 @@ def controller_pod(node_id: int) -> str:
     return f"spurctld-{node_id - 1}"
 
 
-def elected_leader(namespace: str, expected_voters: set[int]) -> int:
+def elected_leader(namespace: str, expected_voters: set[int], via: str) -> int:
     def elected() -> bool:
         try:
-            status = leader_status(namespace)
+            status = leader_status(namespace, via)
         except AssertionError:
             return False
         return status["leader"] in expected_voters and voters(status) == expected_voters
 
     assert_eventually(HA_TIMEOUT, WAIT_INTERVAL, f"no leader among voters {expected_voters}", elected)
-    return leader_status(namespace)["leader"]
+    return leader_status(namespace, via)["leader"]
 
 
 def spur_cli(namespace: str, controller_pod: str, args: list[str]) -> str:
@@ -170,42 +168,52 @@ class TestRaftMembership:
         for pod in new_pods:
             wait_pod_ready(ns, pod, HA_TIMEOUT)
 
-        out = spur_admin(ns, "spurctld-0", ["raft", "remove", "3"])
-        assert "removed node 3" in out, out
-        assert voters(leader_status(ns)) == {1, 2}
-        scale_controllers(ns, 2)
+        out = spur_admin(ns, "spurctld-0", ["raft", "remove", "1"])
+        assert "removed node 1" in out, out
+        # Node 1 led when it removed itself, so it saw the removal commit and
+        # must step down and leave the client Service before it is stopped.
         wait_until(
-            lambda: pod_state(ns, "spurctld-2")[0] == "Missing",
+            lambda: not pod_state(ns, "spurctld-0")[1],
             HA_TIMEOUT,
-            "spurctld-2 still present after scale-down",
+            "spurctld-0 is still ready after it removed itself",
         )
-        delete_pvc(ns, "spool-spurctld-2")
+        status = parse_raft_status(spur_admin(ns, "spurctld-0", ["raft", "status"]))
+        assert status["state"] == "Learner" and status["leader"] is None, status
+        # A removed controller must be stopped (see controller-ha.rst). A
+        # scale-down drops only the highest ordinal, so move the first ordinal.
+        set_controller_ordinals(ns, start=1, replicas=2)
+        wait_until(
+            lambda: pod_state(ns, "spurctld-0")[0] == "Missing",
+            HA_TIMEOUT,
+            "spurctld-0 still present after the removal of node 1",
+        )
+        delete_pvc(ns, "spool-spurctld-0")
+        wait_until(
+            lambda: service_endpoint_pods(ns, "spurctld-client") == set(new_pods),
+            HA_TIMEOUT,
+            "client Service does not route to the two remaining members",
+        )
 
-        leader = elected_leader(ns, {1, 2})
-        deletions = 0
-        while True:
-            deleted = leader
-            delete_pod(ns, controller_pod(deleted))
-            deletions += 1
-            for pod in ("spurctld-0", "spurctld-1"):
-                wait_pod_ready(ns, pod, HA_TIMEOUT)
-            leader = elected_leader(ns, {1, 2})
-            # Node 2 joined at runtime, so it is not in any controller.peers.
-            # Stop only when the follower restarted too: a follower that saw
-            # node 2 lead before can keep a channel to its old Pod IP.
-            if leader == 2 and deleted == 1:
-                break
-            assert deletions < MAX_LEADER_DELETIONS, (
-                f"node 2 did not take over from node 1 in {deletions} leader deletions"
-            )
+        # Both voters joined at runtime, so whichever wins, no controller.peers
+        # names the leader. The leader id changes, so the follower cannot reuse
+        # a forwarding channel to an old Pod.
+        leader = elected_leader(ns, {2, 3}, via="spurctld-1")
+        follower = controller_pod(({2, 3} - {leader}).pop())
+        assert_eventually(
+            HA_TIMEOUT,
+            WAIT_INTERVAL,
+            f"{follower} does not know leader {leader}",
+            lambda: parse_raft_status(spur_admin(ns, follower, ["raft", "status"]))["leader"] == leader,
+        )
+        out = spur_cli(ns, follower, ["submit", "--wrap", "true"])
+        match = re.search(r"Submitted batch job (\d+)", out)
+        assert match, f"submit through follower {follower} failed:\n{out}"
+        spur_cli(ns, controller_pod(leader), ["cancel", match.group(1)])
 
-        # Each follower must find a leader that only the replicated membership
-        # names, and forward the write to it.
-        for follower in (controller_pod(n) for n in voters(leader_status(ns)) - {leader}):
-            out = spur_cli(ns, follower, ["submit", "--wrap", "true"])
-            match = re.search(r"Submitted batch job (\d+)", out)
-            assert match, f"submit through follower {follower} failed:\n{out}"
-            spur_cli(ns, controller_pod(leader), ["cancel", match.group(1)])
+        delete_pod(ns, controller_pod(leader))
+        for pod in new_pods:
+            wait_pod_ready(ns, pod, HA_TIMEOUT)
+        elected_leader(ns, {2, 3}, via="spurctld-1")
 
         job = simple_spurjob("it-membership", ["sh", "-c", "echo MEMBERSHIP_OK"])
         seed_cluster.create_spurjob(job)
