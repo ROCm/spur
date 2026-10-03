@@ -1340,11 +1340,24 @@ fn reservation_manager_ruling(
     }
 }
 
+/// How long a signalled cancel may go unreported before a node still claiming
+/// the job is treated as having missed the kill rather than still serving it.
+const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(30);
+
 /// Whether `node` may release what it holds for `job_id`: the run is over, the
 /// job is active elsewhere, or the id is untracked but was issued by us.
 fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
     match cluster.get_job(job_id) {
         Some(job) if job.state.is_terminal() => true,
+        // A cancel this old that the node is still claiming never reached it
+        // (an agent that was down when it was sent); the run is over regardless.
+        Some(job)
+            if job
+                .cancel_signaled_at
+                .is_some_and(|at| Utc::now() - at > CANCEL_RECLAIM_GRACE) =>
+        {
+            true
+        }
         // An active job's nodelist is authoritative only once populated: state
         // and allocation commit as two separate WAL entries, so a job can be
         // observed as Running with `allocated_nodes` still empty. Spare it, same
@@ -6235,6 +6248,78 @@ mod tests {
             reported_held_gpu_ids(&reported),
             vec![(1u32, vec![0x63_0000u64, 0x83_0000u64])]
         );
+    }
+
+    /// A node still claiming a long-signalled cancel missed the kill; one inside
+    /// the grace is mid-teardown and must keep its slice until it reports.
+    #[tokio::test]
+    async fn stale_reported_jobs_reclaims_a_cancel_the_node_never_received() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+            generation: 0,
+        };
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        for id in [20, 21] {
+            apply(&WalOperation::JobSubmit {
+                job_id: id,
+                spec: Box::new(JobSpec {
+                    name: "cancelled".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            });
+            apply(&WalOperation::job_start(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node.clone(),
+            ));
+            apply(&WalOperation::job_state_change(
+                id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+        }
+        apply(&WalOperation::JobCancelSignaled {
+            job_id: 20,
+            at: Utc::now() - chrono::Duration::seconds(300),
+        });
+        apply(&WalOperation::JobCancelSignaled {
+            job_id: 21,
+            at: Utc::now(),
+        });
+        assert_eq!(job_state(&cluster, 20), Some(JobState::Completing));
+        assert_eq!(job_state(&cluster, 21), Some(JobState::Completing));
+
+        let reported: Vec<RunningJobStatus> = [20, 21]
+            .into_iter()
+            .map(|job_id| RunningJobStatus {
+                job_id,
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(stale_reported_jobs(&cluster, "n1", &reported), vec![20]);
     }
 
     /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,
