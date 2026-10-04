@@ -1205,7 +1205,7 @@ fn planned_reservation_line(node: &spur_proto::proto::NodeInfo) -> Option<String
 }
 
 async fn requeue(controller: &str, job_id: u32, hold: bool) -> Result<()> {
-    let channel = spur_client::connect_channel(controller)
+    let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
