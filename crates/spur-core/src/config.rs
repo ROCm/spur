@@ -370,6 +370,11 @@ pub struct ControllerConfig {
     /// How long to wait for a ping response before dropping the connection (default 10).
     #[serde(default = "default_agent_keepalive_timeout_secs")]
     pub agent_keepalive_timeout_secs: u64,
+
+    /// Seconds to let in-flight RPCs drain on SIGTERM before forcing shutdown (default 10, 0 waits
+    /// indefinitely). An `srun` step holds its RPC open for the step's whole runtime.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
 }
 
 fn default_max_batch_requeue() -> u32 {
@@ -386,6 +391,10 @@ fn default_dispatch_reject_cooldown_secs() -> u64 {
 
 fn default_dispatch_timeout_secs() -> u64 {
     300
+}
+
+fn default_shutdown_grace_secs() -> u64 {
+    10
 }
 
 /// Shared with `spurctld`'s agent channel builder, which needs these before any config is loaded.
@@ -472,6 +481,7 @@ impl Default for ControllerConfig {
             agent_connect_timeout_secs: default_agent_connect_timeout_secs(),
             agent_keepalive_interval_secs: default_agent_keepalive_interval_secs(),
             agent_keepalive_timeout_secs: default_agent_keepalive_timeout_secs(),
+            shutdown_grace_secs: default_shutdown_grace_secs(),
         }
     }
 }
@@ -1968,6 +1978,17 @@ impl SlurmConfig {
                 value: format!(
                     "{} (must be at most {})",
                     self.controller.dispatch_timeout_secs, MAX_LAUNCH_BACKOFF_SECS
+                ),
+            });
+        }
+        // Same ceiling as the other duration fields: a shutdown wait beyond a
+        // day is not a bounded drain.
+        if self.controller.shutdown_grace_secs > MAX_LAUNCH_BACKOFF_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.shutdown_grace_secs".into(),
+                value: format!(
+                    "{} (must be at most {})",
+                    self.controller.shutdown_grace_secs, MAX_LAUNCH_BACKOFF_SECS
                 ),
             });
         }
@@ -4333,6 +4354,60 @@ listen_addr = "[::]:6817"
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.heartbeat_timeout_secs, None);
+    }
+
+    #[test]
+    fn controller_config_defaults_shutdown_grace_secs() {
+        let config = ControllerConfig::default();
+        assert_eq!(config.shutdown_grace_secs, 10);
+    }
+
+    #[test]
+    fn controller_config_parses_shutdown_grace_secs() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+shutdown_grace_secs = 30
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.controller.shutdown_grace_secs, 30);
+    }
+
+    #[test]
+    fn controller_config_accepts_zero_shutdown_grace_secs() {
+        let toml = r#"
+cluster_name = "test"
+
+[controller]
+shutdown_grace_secs = 0
+"#;
+        assert_eq!(
+            SlurmConfig::load_from_str(toml)
+                .unwrap()
+                .controller
+                .shutdown_grace_secs,
+            0,
+            "zero (unbounded wait) must be accepted"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_out_of_range_shutdown_grace_secs() {
+        let toml = format!(
+            r#"
+cluster_name = "test"
+
+[controller]
+shutdown_grace_secs = {}
+"#,
+            MAX_LAUNCH_BACKOFF_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("shutdown_grace_secs"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
