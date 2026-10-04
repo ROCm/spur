@@ -74,6 +74,24 @@ pub enum ArrayError {
 
 const MAX_ARRAY_SIZE: usize = 100_000;
 
+/// Cap on how many ids a spec may name before dedup. The deduped total alone
+/// cannot bound parsing cost, since overlapping ranges are meant to collapse
+/// into [`MAX_ARRAY_SIZE`]; twice the cap leaves room for overlap at fixed cost.
+const MAX_ARRAY_SPEC_IDS: u64 = 2 * MAX_ARRAY_SIZE as u64;
+
+/// Add `count` to a spec's running pre-dedup id total, rejecting once it passes
+/// [`MAX_ARRAY_SPEC_IDS`].
+fn add_named_ids(named: &mut u64, count: u64) -> Result<(), ArrayError> {
+    *named += count;
+    if *named > MAX_ARRAY_SPEC_IDS {
+        return Err(ArrayError::TooLarge {
+            count: *named as usize,
+            max: MAX_ARRAY_SIZE,
+        });
+    }
+    Ok(())
+}
+
 /// Parse an array spec string like "0-99%10".
 pub fn parse_array_spec(spec: &str) -> Result<ArraySpec, ArrayError> {
     let spec = spec.trim();
@@ -92,6 +110,7 @@ pub fn parse_array_spec(spec: &str) -> Result<ArraySpec, ArrayError> {
     };
 
     let mut task_ids = Vec::new();
+    let mut named_ids: u64 = 0;
 
     for part in range_part.split(',') {
         let part = part.trim();
@@ -123,14 +142,10 @@ pub fn parse_array_spec(spec: &str) -> Result<ArraySpec, ArrayError> {
                 return Err(ArrayError::InvalidSpec(format!("{} > {}", start, end)));
             }
 
-            // Bound element count BEFORE materializing (u64 avoids overflow in the count itself).
+            // Charge the range before materializing it; u64 avoids overflow in
+            // the count itself for a full-width u32 range.
             let count = (end as u64 - start as u64) / step as u64 + 1;
-            if task_ids.len() as u64 + count > MAX_ARRAY_SIZE as u64 {
-                return Err(ArrayError::TooLarge {
-                    count: (task_ids.len() as u64 + count) as usize,
-                    max: MAX_ARRAY_SIZE,
-                });
-            }
+            add_named_ids(&mut named_ids, count)?;
 
             let mut i = start;
             while i <= end {
@@ -144,9 +159,13 @@ pub fn parse_array_spec(spec: &str) -> Result<ArraySpec, ArrayError> {
             let id: u32 = range_str
                 .parse()
                 .map_err(|_| ArrayError::InvalidSpec(format!("invalid id: {}", range_str)))?;
+            add_named_ids(&mut named_ids, 1)?;
             task_ids.push(id);
         }
     }
+
+    task_ids.sort_unstable();
+    task_ids.dedup();
 
     if task_ids.len() > MAX_ARRAY_SIZE {
         return Err(ArrayError::TooLarge {
@@ -154,9 +173,6 @@ pub fn parse_array_spec(spec: &str) -> Result<ArraySpec, ArrayError> {
             max: MAX_ARRAY_SIZE,
         });
     }
-
-    task_ids.sort();
-    task_ids.dedup();
 
     Ok(ArraySpec {
         task_ids,
@@ -320,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_range_overflow_at_u32_max() {
+    fn parses_range_at_u32_boundary() {
         let spec = parse_array_spec("4294967293-4294967295:2").unwrap();
         assert_eq!(spec.task_ids, vec![4294967293, 4294967295]);
     }
@@ -337,5 +353,41 @@ mod tests {
     fn max_size_boundary_unchanged() {
         assert!(parse_array_spec("0-99999").is_ok());
         assert!(parse_array_spec("0-100000").is_err());
+    }
+
+    #[test]
+    fn overlapping_ranges_dedup_within_cap() {
+        // Dedup runs before the size cap, so overlapping ranges collapse into
+        // it: 0-99999,0-99999 names 200,000 ids but is 100,000 distinct tasks.
+        let spec = parse_array_spec("0-99999,0-99999").unwrap();
+        assert_eq!(spec.task_ids, (0u32..=99_999).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn distinct_ranges_over_cap_still_rejected() {
+        assert!(matches!(
+            parse_array_spec("0-99999,100000-199999"),
+            Err(ArrayError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn ranges_past_the_pre_dedup_cap_are_rejected() {
+        // Each extra segment would otherwise cost a full pass over the ids it
+        // names, so the pre-dedup total is bounded even when dedup would fit.
+        let spec = ["0-99999"; 3].join(",");
+        assert!(matches!(
+            parse_array_spec(&spec),
+            Err(ArrayError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn single_ids_count_toward_the_pre_dedup_cap() {
+        let spec = vec!["1"; MAX_ARRAY_SPEC_IDS as usize + 1].join(",");
+        assert!(matches!(
+            parse_array_spec(&spec),
+            Err(ArrayError::TooLarge { .. })
+        ));
     }
 }
