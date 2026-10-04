@@ -253,7 +253,7 @@ async fn cmd_add_nodes(
     selector: Vec<(String, String)>,
 ) -> Result<()> {
     let selector = selector_map(selector)?;
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_add_nodes(ClusterAddNodesRequest {
             nodes: nodes.unwrap_or_default(),
@@ -280,7 +280,7 @@ async fn cmd_remove_nodes(
     drain_timeout: Option<u32>,
     force: bool,
 ) -> Result<()> {
-    let mut client = SlurmControllerClient::new(spur_client::connect_channel(controller).await?);
+    let mut client = SlurmControllerClient::new(crate::authclient::connect(controller).await?);
     let resp = client
         .cluster_remove_nodes(ClusterRemoveNodesRequest {
             nodes,
