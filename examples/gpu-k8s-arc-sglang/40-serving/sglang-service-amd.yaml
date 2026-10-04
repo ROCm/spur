@@ -1,0 +1,76 @@
+# sglang serving on AMD MI355X (gfx950), adapted for k0s from sglang's docker/k8s-sglang-service.yaml.
+# NVIDIA-isms removed (the 3 k3s/upstream failure modes the review caught):
+#   - deleted `runtimeClassName: nvidia` + the RuntimeClass object  (no such handler on AMD/k0s)
+#   - Service is ClusterIP + Ingress (no `type: LoadBalancer` stuck pending; use MetalLB only if desired)
+#   - PVC is ReadWriteOnce on `local-path` (k0s has no RWX default)
+# Deploy:  kubectl apply -f sglang-service-amd.yaml   (done by the gated CI deploy job)
+# The `sglang` namespace + deployer RBAC + HF secret are created once by bootstrap.sh (the deploy
+# SA is namespaced and cannot create namespaces), so this file is workload-only.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: hf-cache, namespace: sglang }
+spec:
+  accessModes: ["ReadWriteOnce"]           # local-path is RWO; a single serving replica per PVC
+  storageClassName: local-path
+  resources: { requests: { storage: 100Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: sglang, namespace: sglang }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: sglang } }
+  template:
+    metadata: { labels: { app: sglang } }
+    spec:
+      nodeSelector: { spur.amd.com/compute: "true" }
+      securityContext:
+        seccompProfile: { type: Unconfined }      # ROCm needs unconfined seccomp
+        supplementalGroups: [44, 992]             # video=44, render=992 (VERIFIED on the MI355X hosts; /dev/kfd is root:render)
+      containers:
+        - name: sglang
+          image: lmsysorg/sglang:v0.5.14-rocm700-mi35x   # gfx950 image (same one M5-full CI validated); PIN by digest in versions.lock.md
+          command: ["python3", "-m", "sglang.launch_server"]   # override ENTRYPOINT explicitly (matches upstream)
+          args:
+            - "--model-path=Qwen/Qwen2.5-7B-Instruct"   # ungated default (no HF gating); change as needed
+            - "--host=0.0.0.0"
+            - "--port=30000"
+            - "--tp=1"                                    # tensor-parallel = #GPUs requested below
+          ports: [{ containerPort: 30000 }]
+          resources:
+            limits: { amd.com/gpu: 1 }                    # device plugin injects /dev/kfd + /dev/dri
+          env:
+            # Only needed for gated models; harmless if the secret exists. Remove for ungated models.
+            - name: HF_TOKEN
+              valueFrom: { secretKeyRef: { name: hf-token, key: token, optional: true } }
+          volumeMounts:
+            - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            - { name: shm, mountPath: /dev/shm }
+          startupProbe:                                   # gate liveness during cold load (/health is 503 until Up)
+            httpGet: { path: /health, port: 30000 }
+            periodSeconds: 15
+            timeoutSeconds: 10                            # default 1s is too tight for a GPU server under load
+            failureThreshold: 80                          # ~20 min worst-case cold 7B load onto an empty PVC
+          readinessProbe:
+            httpGet: { path: /health_generate, port: 30000 }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 80
+          livenessProbe:
+            httpGet: { path: /health, port: 30000 }       # safe: startupProbe holds liveness off until server is Up
+            periodSeconds: 30
+            timeoutSeconds: 10                            # a busy /health must not read as "dead" (was killing healthy servers)
+            failureThreshold: 6
+      volumes:
+        - { name: hf-cache, persistentVolumeClaim: { claimName: hf-cache } }
+        - { name: shm, emptyDir: { medium: Memory, sizeLimit: 16Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: sglang, namespace: sglang }
+spec:
+  type: ClusterIP
+  selector: { app: sglang }
+  ports: [{ name: http, port: 30000, targetPort: 30000 }]

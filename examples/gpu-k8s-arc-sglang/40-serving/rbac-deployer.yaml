@@ -1,0 +1,27 @@
+# RBAC for the gated CI deploy job. The CPU deploy runner pod (ns arc-runners) runs as this SA and
+# `kubectl apply`s the serving manifest into ns sglang using its in-cluster token.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: sglang-deployer, namespace: arc-runners }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: sglang-deployer, namespace: sglang }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims", "pods", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: sglang-deployer, namespace: sglang }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: sglang-deployer }
+subjects:
+  - { kind: ServiceAccount, name: sglang-deployer, namespace: arc-runners }
