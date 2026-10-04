@@ -1618,8 +1618,13 @@ impl Drop for CgroupGuard {
     }
 }
 
-/// Bounded to 200ms: cleanup sits on the completion-reporting path, and the next
-/// `setup_cgroup` clears any directory this gives up on.
+/// A killed process can stay in the cgroup for seconds (memcg reclaim, GPU driver
+/// teardown) while it still holds the job's memory and GPUs. Completion is reported
+/// after cleanup, so wait it out; kept under the stepd force-reclaim window.
+const CGROUP_EMPTY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Once the cgroup is empty rmdir should succeed at once; bounded because cleanup
+/// sits on the completion-reporting path.
 const CGROUP_REMOVE_ATTEMPTS: u32 = 20;
 const CGROUP_REMOVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -1695,14 +1700,8 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
         }
     }
 
-    // Kill any remaining processes
-    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
-        for pid_str in pids.lines() {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-            }
-        }
-    }
+    kill_cgroup_procs(cgroup_path);
+    wait_until_empty(cgroup_path, CGROUP_EMPTY_TIMEOUT);
 
     // `kill` returning does not mean the process has left the cgroup, and rmdir
     // fails EBUSY until it has. An abandoned dir strands its device program.
@@ -1715,6 +1714,35 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
             }
             Err(_) => std::thread::sleep(CGROUP_REMOVE_INTERVAL),
         }
+    }
+}
+
+fn kill_cgroup_procs(cgroup_path: &Path) {
+    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
+        for pid_str in pids.lines() {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+        }
+    }
+}
+
+fn cgroup_populated(cgroup_path: &Path) -> bool {
+    std::fs::read_to_string(cgroup_path.join("cgroup.events"))
+        .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
+}
+
+/// Re-kills on every poll so a child forked after the first kill cannot keep
+/// the cgroup alive.
+fn wait_until_empty(cgroup_path: &Path, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while cgroup_populated(cgroup_path) {
+        if std::time::Instant::now() >= deadline {
+            warn!(path = %cgroup_path.display(), "processes still in cgroup after SIGKILL");
+            return;
+        }
+        std::thread::sleep(CGROUP_REMOVE_INTERVAL);
+        kill_cgroup_procs(cgroup_path);
     }
 }
 
@@ -2755,6 +2783,27 @@ mod cgroup_guard_tests {
 
         cleanup_cgroup(&cgroup);
         assert!(cgroup.exists());
+    }
+
+    #[test]
+    fn cleanup_waits_for_a_killed_process_to_leave_the_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_6");
+        std::fs::create_dir(&cgroup).unwrap();
+        let events = cgroup.join("cgroup.events");
+        std::fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
+        // Longer than the rmdir retry budget, as a process stuck in memcg reclaim is.
+        let leaving = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::fs::remove_file(events).unwrap();
+        });
+
+        cleanup_cgroup(&cgroup);
+        leaving.join().unwrap();
+        assert!(
+            !cgroup.exists(),
+            "cleanup must not give up while the cgroup still holds a process"
+        );
     }
 
     #[test]
