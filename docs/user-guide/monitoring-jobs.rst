@@ -772,9 +772,10 @@ Endpoints
      - Live
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
    * - ``/metrics/jobs-users-accts``
-     - Planned
-     - Per-user/per-account breakdown. Returns ``404`` until implemented, even
-       with ``high_cardinality = true``.
+     - Live
+     - Per-user/per-account job gauges and karma counters. Requires
+       ``metrics.high_cardinality = true``; returns ``404`` otherwise.
+       See :doc:`/admin-guide/karma-scoring`.
 
 Job metrics — ``/metrics/jobs``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

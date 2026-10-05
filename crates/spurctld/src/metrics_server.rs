@@ -13,8 +13,8 @@ use axum::routing::get;
 use axum::Router;
 use spur_metrics::{
     encode_audit_metrics, encode_auth_metrics, encode_job_metrics, encode_jobs_users_accts_metrics,
-    encode_k8s_metrics, encode_nodes_metrics, encode_partitions_metrics, encode_rpc_metrics,
-    encode_scheduler_metrics, CONTENT_TYPE,
+    encode_k8s_metrics, encode_karma_metrics, encode_nodes_metrics, encode_partitions_metrics,
+    encode_rpc_metrics, encode_scheduler_metrics, CONTENT_TYPE,
 };
 use tracing::info;
 
@@ -123,9 +123,9 @@ async fn metrics_jobs_users_accts(State(state): State<Arc<MetricsState>>) -> Res
     if !state.raft.is_leader() {
         return not_leader_response();
     }
-    metrics_response(encode_jobs_users_accts_metrics(
-        &state.cluster.user_acct_metrics(),
-    ))
+    let gauges = encode_jobs_users_accts_metrics(&state.cluster.user_acct_metrics());
+    let counters = encode_karma_metrics(&state.cluster.karma_metrics());
+    metrics_response(spur_metrics::export::concat_encoded([gauges, counters]))
 }
 
 async fn metrics_auth(_state: State<Arc<MetricsState>>) -> Response {

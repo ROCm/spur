@@ -39,10 +39,10 @@ JSON document describing the job currently using that GPU:
 
 A Spur ``prolog`` hook writes this file when a job starts on a GPU; the
 matching ``epilog`` hook deletes it when the job ends. Spur's hook
-environment already twins ``SPUR_JOB_ID``/``SPUR_JOB_PARTITION`` into
-``SLURM_JOB_ID``/``SLURM_JOB_PARTITION`` automatically, so the scripts below
-can use those directly. ``SLURM_JOB_USER`` and ``CUDA_VISIBLE_DEVICES`` have
-no such twin — they're built from ``SPUR_JOB_USER`` and ``SPUR_JOB_GPUS``
+environment twins ``SPUR_JOB_ID``/``SPUR_JOB_PARTITION``/``SPUR_JOB_USER``/``SPUR_JOB_GPUS``
+into ``SLURM_JOB_ID``/``SLURM_JOB_PARTITION``/``SLURM_JOB_USER``/``SLURM_JOB_GPUS``
+automatically, so the scripts below can use those directly.
+``CUDA_VISIBLE_DEVICES`` has no twin — it is derived from ``SPUR_JOB_GPUS``
 (see :ref:`hooks-config` below).
 
 .. important::
