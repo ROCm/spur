@@ -2250,6 +2250,18 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             pmix.stop();
         }
         if let Some(cgroup) = cgroup.as_ref() {
+            // The completion report after teardown frees the job's resources, so a
+            // killed process must be gone first. One wait, on the widest cgroup
+            // this step owns, so waits do not add up.
+            let owned = match cgroup.parent() {
+                Some(job_cgroup) if spur_core::step::owns_job_lifetime(step_id) => job_cgroup,
+                _ => cgroup.as_path(),
+            };
+            crate::executor::kill_and_wait_until_empty(
+                owned,
+                crate::executor::CGROUP_EMPTY_TIMEOUT,
+            )
+            .await;
             crate::executor::cleanup_cgroup(cgroup);
             // The agent reaps the job node once its last step releases; this
             // covers the case where teardown here runs and that never does.

@@ -1695,14 +1695,7 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
         }
     }
 
-    // Kill any remaining processes
-    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
-        for pid_str in pids.lines() {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-            }
-        }
-    }
+    kill_cgroup_procs(cgroup_path);
 
     // `kill` returning does not mean the process has left the cgroup, and rmdir
     // fails EBUSY until it has. An abandoned dir strands its device program.
@@ -1715,6 +1708,63 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
             }
             Err(_) => std::thread::sleep(CGROUP_REMOVE_INTERVAL),
         }
+    }
+}
+
+fn kill_cgroup_procs(cgroup_path: &Path) {
+    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
+        for pid_str in pids.lines() {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+        }
+    }
+}
+
+fn cgroup_populated(cgroup_path: &Path) -> bool {
+    std::fs::read_to_string(cgroup_path.join("cgroup.events"))
+        .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
+}
+
+fn kill_cgroup_tree(cgroup_path: &Path) {
+    if let Ok(entries) = std::fs::read_dir(cgroup_path) {
+        for child in entries.flatten() {
+            if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                kill_cgroup_tree(&child.path());
+            }
+        }
+    }
+    kill_cgroup_procs(cgroup_path);
+}
+
+/// A killed process can stay in the cgroup for seconds (memcg reclaim, GPU driver
+/// teardown) while it still holds the job's memory and GPUs. Applied once per
+/// teardown, after the 5 s cancel grace, so it ends inside the agent's 30 s
+/// stepd force-reclaim window.
+pub const CGROUP_EMPTY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// SIGKILLs everything under `cgroup_path` and waits for it to empty, killing
+/// again on each poll so a child forked after the first kill cannot keep it
+/// alive. Returns whether it emptied.
+pub async fn kill_and_wait_until_empty(cgroup_path: &Path, timeout: std::time::Duration) -> bool {
+    if !is_own_cgroup(cgroup_path) {
+        warn!(
+            path = %cgroup_path.display(),
+            "refusing to reap a cgroup that is not a job or step of ours"
+        );
+        return false;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        kill_cgroup_tree(cgroup_path);
+        if !cgroup_populated(cgroup_path) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(path = %cgroup_path.display(), "processes still in cgroup after SIGKILL");
+            return false;
+        }
+        tokio::time::sleep(CGROUP_REMOVE_INTERVAL).await;
     }
 }
 
@@ -2701,7 +2751,7 @@ mod cgroup_join_tests {
 
 #[cfg(test)]
 mod cgroup_guard_tests {
-    use super::{cleanup_cgroup, CgroupGuard};
+    use super::{cleanup_cgroup, kill_and_wait_until_empty, CgroupGuard, CGROUP_EMPTY_TIMEOUT};
 
     #[test]
     fn dropping_the_guard_removes_the_cgroup() {
@@ -2755,6 +2805,39 @@ mod cgroup_guard_tests {
 
         cleanup_cgroup(&cgroup);
         assert!(cgroup.exists());
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_killed_process_to_leave_the_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_6");
+        std::fs::create_dir(&cgroup).unwrap();
+        let events = cgroup.join("cgroup.events");
+        std::fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
+        // Longer than the rmdir retry budget, as a process stuck in memcg reclaim is.
+        let leaving = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            std::fs::write(events, "populated 0\nfrozen 0\n").unwrap();
+        });
+
+        let emptied = kill_and_wait_until_empty(&cgroup, CGROUP_EMPTY_TIMEOUT).await;
+        leaving.join().unwrap();
+        assert!(
+            emptied,
+            "the wait must outlast a killed process that is slow to leave"
+        );
+    }
+
+    #[tokio::test]
+    async fn gives_up_on_a_cgroup_that_stays_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_7");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+
+        let emptied =
+            kill_and_wait_until_empty(&cgroup, std::time::Duration::from_millis(50)).await;
+        assert!(!emptied);
     }
 
     #[test]

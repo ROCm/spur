@@ -515,6 +515,13 @@ Out of the box the job's cgroup gets:
 A job submitted without ``--mem`` has no memory budget, so the memory ceilings are
 left unset.
 
+When a job ends, its supervisor (``spurstepd``) sends ``SIGKILL`` to anything still
+in the job cgroup and waits up to 20 seconds for the cgroup to empty before it
+reports the job complete.
+A killed process can take a few seconds to exit, for example after an OOM kill
+during memory reclaim, and until it has, it still holds the job's memory and GPUs.
+The wait keeps them from going to the next job too early.
+
 Inspect what a running job actually got:
 
 .. code-block:: bash
