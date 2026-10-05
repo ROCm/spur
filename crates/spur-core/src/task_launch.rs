@@ -525,7 +525,6 @@ fn mpi_direct_task_preamble(indent: &str) -> String {
         concat!(
             "{indent}unset PMI_RANK PMI_SIZE PMI_FD PMI_PORT PMI_PROCESS_KVS_ID 2>/dev/null || true\n",
             "{indent}unset OMPI_MCA_ess OMPI_MCA_ess_base_env 2>/dev/null || true\n",
-            "{indent}unset SLURM_PROCID SLURM_LOCALID SLURM_NODEID SLURM_TASKS_PER_NODE 2>/dev/null || true\n",
             "{indent}export SLURM_STEP_ID=${{SLURM_STEP_ID:-0}}\n",
             "{indent}export SLURM_STEPID=${{SLURM_STEPID:-0}}\n",
             "{indent}export OMPI_MCA_ess='^singleton,^slurm,^srun'\n",
@@ -712,7 +711,7 @@ pub fn build_single_task_wrapper(
             "{taskset_prefix}bash \"{escaped}\" 2>&1 | sed \"s/^/[{procid}] /\"\n"
         ));
     } else {
-        wrapper.push_str(&format!("exec {taskset_prefix}bash \"{escaped}\"\n"));
+        wrapper.push_str(&format!("{taskset_prefix}bash \"{escaped}\"\n"));
     }
     wrapper
 }
@@ -1141,7 +1140,38 @@ mod tests {
         let script = build_single_task_wrapper("/tmp/step.sh", 0, None, false, false);
         assert!(!script.contains("spur/mpi/env.sh"), "{script}");
         assert!(!script.contains("PMIX_SERVER_URI4"), "{script}");
-        assert!(script.contains("exec bash \"/tmp/step.sh\""), "{script}");
+        assert!(script.ends_with("\nbash \"/tmp/step.sh\"\n"), "{script}");
+    }
+
+    #[test]
+    fn a_lone_rank_runs_its_script_after_the_map_cpu_bounds_check() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_CPU_BIND".into(), "map_cpu:0,4".into());
+        let script = build_single_task_wrapper("/tmp/step.sh", 0, Some(&env), false, true);
+        assert!(script.contains("_CPU_MAP=(0 4)"), "{script}");
+        assert!(!script.contains("exec _CPU_MAP"), "{script}");
+        assert!(
+            script.ends_with("taskset -c ${_CPU_MAP[$_CPU_IDX]} bash \"/tmp/step.sh\"\n"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn the_mpi_preamble_keeps_the_ranks_slurm_ids() {
+        let preamble = mpi_direct_task_preamble("");
+        for id in [
+            "SLURM_PROCID",
+            "SLURM_LOCALID",
+            "SLURM_NODEID",
+            "SLURM_TASKS_PER_NODE",
+        ] {
+            assert!(
+                !preamble
+                    .lines()
+                    .any(|line| line.starts_with("unset") && line.contains(id)),
+                "{id} must reach the rank:\n{preamble}"
+            );
+        }
     }
 
     #[test]

@@ -5403,18 +5403,19 @@ impl SlurmAgent for AgentService {
         // not be given a rank's environment.
         let script_is_a_rank = spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script);
         let launch_script = if fan_out || script_is_a_rank {
-            // Write the user script to disk first so the wrapper can reference it
-            let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
-            std::fs::write(&user_script_path, &launch_script)
-                .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &user_script_path,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
+            let user_script_path = crate::executor::stage_user_script(
+                job_id,
+                launch_step,
+                &launch_script,
+                spec.uid,
+                spec.gid,
+            )
+            .map_err(|e| {
+                self.drain_on_node_fault(&e, job_id);
+                Status::internal(e.to_string())
+            })?
+            .to_string_lossy()
+            .into_owned();
 
             if !fan_out {
                 // A lone rank on this node still needs `env.sh` and the

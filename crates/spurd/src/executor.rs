@@ -2266,6 +2266,29 @@ pub(crate) fn namespace_wrapper_name(step_id: spur_core::step::StepId) -> String
     }
 }
 
+pub(crate) fn user_script_name(step_id: spur_core::step::StepId) -> String {
+    match spur_core::step::owns_job_lifetime(step_id) {
+        true => "spur_user.sh".to_string(),
+        false => format!("spur_user_step{step_id}.sh"),
+    }
+}
+
+/// Stage the user's script in the job's spool dir, for a launch wrapper that runs it per task.
+pub(crate) fn stage_user_script(
+    job_id: JobId,
+    step_id: spur_core::step::StepId,
+    script: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<PathBuf, LaunchError> {
+    let spool_dir = create_job_spool_dir(job_id, uid, gid)?;
+    let path = spool_dir.join(user_script_name(step_id));
+    write_job_scratch(&path, script, uid, gid)
+        .context("failed to write user script")
+        .map_err(|e| classify_spool_error(&spool_dir, Path::new(SPOOL_ROOT), e))?;
+    Ok(path)
+}
+
 /// Resolve output path patterns (%j → job_id, etc.)
 /// Resolve a pattern against the *effective* work_dir (may be the `/tmp`
 /// fallback) via the shared resolver, so agent and controller paths match.
@@ -3595,6 +3618,41 @@ mod tests {
         let interactive = spur_core::step::STEP_INTERACTIVE;
         assert_ne!(launch_script_name(interactive), "spur_job.sh");
         assert_ne!(namespace_wrapper_name(interactive), "spur_ns.sh");
+    }
+
+    // The wrapper is the launch script and runs the user script beside it, so one
+    // overwriting the other makes the wrapper run itself.
+    #[test]
+    fn the_user_script_never_takes_the_launch_scripts_name() {
+        for step in [
+            spur_core::step::STEP_BATCH,
+            spur_core::step::STEP_INTERACTIVE,
+            0,
+            1,
+        ] {
+            assert_ne!(user_script_name(step), launch_script_name(step));
+            assert_ne!(user_script_name(step), namespace_wrapper_name(step));
+        }
+        assert_ne!(user_script_name(0), user_script_name(1));
+    }
+
+    #[test]
+    fn a_staged_user_script_is_private_and_in_the_job_spool() {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let job_id: JobId = 987_654_322;
+        let path = stage_user_script(job_id, spur_core::step::STEP_BATCH, "echo hi\n", uid, gid)
+            .unwrap_or_else(|e| panic!("stage user script: {e}"));
+        let spool = create_job_spool_dir(job_id, uid, gid)
+            .unwrap_or_else(|e| panic!("create spool dir: {e}"));
+
+        assert_eq!(path.parent(), Some(spool.as_path()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo hi\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        cleanup_job_spool(job_id);
+        assert!(!path.exists());
     }
 
     #[test]
