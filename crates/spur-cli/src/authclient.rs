@@ -9,6 +9,7 @@
 //! so that mint is blocking.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use spur_core::native_mint::{mint_blocking, resolve_socket_path};
 use tonic::metadata::MetadataValue;
@@ -46,6 +47,7 @@ struct NativeMintParams {
     socket: PathBuf,
     audience: String,
     epoch: u64,
+    timeout: Duration,
 }
 
 #[derive(Clone, Default)]
@@ -63,8 +65,13 @@ impl tonic::service::Interceptor for AuthInterceptor {
                     .insert("authorization", value.clone());
             }
             CredAttach::Native(params) => {
-                let token = mint_blocking(&params.socket, &params.audience, params.epoch)
-                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+                let token = mint_blocking(
+                    &params.socket,
+                    &params.audience,
+                    params.epoch,
+                    params.timeout,
+                )
+                .map_err(|e| Status::unauthenticated(e.to_string()))?;
                 let value = MetadataValue::try_from(format!("Bearer {token}")).map_err(|_| {
                     Status::unauthenticated("minted credential is not valid metadata")
                 })?;
@@ -159,6 +166,13 @@ fn native_cluster_name() -> anyhow::Result<String> {
         })
 }
 
+/// The CLI's own `[spurd]` channel/mint timeouts, read from the same config file
+/// `auth_plugin()` uses — so a cluster that tunes these for spurd gets the same
+/// values here instead of a constant hardcoded independently of that config.
+fn spurd_config() -> spur_core::config::SpurdConfig {
+    crate::spur_config::load_spur_config().spurd
+}
+
 fn native_interceptor(audience: &str, epoch: u64) -> anyhow::Result<AuthInterceptor> {
     let cluster = native_cluster_name()?;
     let socket = resolve_socket_path(&cluster)
@@ -168,6 +182,7 @@ fn native_interceptor(audience: &str, epoch: u64) -> anyhow::Result<AuthIntercep
             socket,
             audience: audience.to_string(),
             epoch,
+            timeout: spurd_config().native_mint_timeout(),
         }),
     })
 }
@@ -185,7 +200,14 @@ pub fn wrap_with_audience(channel: Channel, audience: &str) -> AuthChannel {
 /// Native `plugin = "spur"` first calls unauthenticated Ping to learn the
 /// verifier's audience and boot epoch, then mints against those values.
 pub async fn connect(endpoints: &str) -> anyhow::Result<AuthChannel> {
-    let channel = spur_client::connect_channel(endpoints).await?;
+    let cfg = spurd_config();
+    let timeouts = spur_client::ChannelTimeouts {
+        connect: cfg.controller_connect_timeout(),
+        keep_alive_interval: cfg.controller_keepalive_interval(),
+        keep_alive_timeout: cfg.controller_keepalive_timeout(),
+    };
+    let (channel, _) =
+        spur_client::connect_channel_tracked_with_timeouts(endpoints, timeouts).await?;
     if plugin_is_spur() {
         return wrap_after_controller_ping(channel).await;
     }
@@ -279,6 +301,7 @@ mod tests {
                 socket: PathBuf::from("/no/such/auth.sock"),
                 audience: "http://127.0.0.1:6817".into(),
                 epoch: 0,
+                timeout: Duration::from_secs(5),
             }),
         };
         let err = i.call(Request::new(())).unwrap_err();
@@ -322,6 +345,7 @@ mod tests {
                 socket: sock,
                 audience: "http://controller:6817".into(),
                 epoch: 0,
+                timeout: Duration::from_secs(5),
             }),
         };
         let first = i

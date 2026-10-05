@@ -12870,6 +12870,7 @@ mod tests {
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
         ))
     }
 
@@ -15719,6 +15720,7 @@ mod tests {
             "spur0".into(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
         ))
     }
 
@@ -15818,6 +15820,7 @@ mod tests {
             "spur0".into(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
         ))
     }
 
@@ -15888,6 +15891,7 @@ mod tests {
             "spur0".into(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
         ));
         let svc = AgentService::new(
             reporter,
@@ -16722,6 +16726,7 @@ mod tests {
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
+            crate::reporter::ReporterTimeouts::default(),
         ));
         let svc = AgentService::with_cluster_config(
             reporter.clone(),
@@ -17359,6 +17364,7 @@ mod tests {
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
         ))
     }
 
