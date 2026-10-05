@@ -17307,9 +17307,8 @@ mod tests {
             "a job no node can ever host must evict nobody, however many cycles pass"
         );
 
-        // Control on the same fixture: an otherwise identical preemptor that can
-        // actually place does evict, so the refusal above is the gres and not the
-        // fixture being unable to preempt at all.
+        // Control: an otherwise identical preemptor that can place does evict,
+        // so the refusal above is the gres, not an unpreemptable fixture.
         let mut placeable = basic_spec("placeable");
         placeable.priority = Some(10_000);
         let placeable_id = submit_and_wait(&cm, placeable);
@@ -17425,6 +17424,67 @@ mod tests {
             cm.get_job(shielded_id).unwrap().state,
             JobState::Running,
             "the exempt-time guard must still hold"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_never_mixes_a_suspend_victim_into_a_releasing_set() {
+        // Suspension keeps the allocation, so pairing it with a real eviction
+        // would kill the cancel victim for a placement that cannot happen.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "freeze-me".into(),
+            preempt_mode: spur_core::accounting::QosPreemptMode::Suspend,
+            ..Default::default()
+        });
+
+        let mut cancellable = basic_spec("cancellable");
+        cancellable.priority = Some(100);
+        let cancellable_id = submit_and_wait(&cm, cancellable);
+
+        let mut suspendable = basic_spec("suspendable");
+        suspendable.priority = Some(100);
+        suspendable.qos = Some("freeze-me".into());
+        let suspendable_id = submit_and_wait(&cm, suspendable);
+
+        for (id, node) in [(cancellable_id, "n1"), (suspendable_id, "n2")] {
+            let res = scalar_alloc(2, 4000);
+            cm.start_job(
+                id,
+                vec![node.into()],
+                res.clone(),
+                per_node_for(&[node], res),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+        }
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        high.num_nodes = 2;
+        high.num_tasks = 2;
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
+            .await;
+
+        assert_eq!(
+            cm.get_job(cancellable_id).unwrap().state,
+            JobState::Running,
+            "a suspend victim frees nothing, so the cancel victim beside it must survive"
+        );
+        assert_eq!(
+            cm.get_job(suspendable_id).unwrap().state,
+            JobState::Running,
+            "a suspend-only set cannot place a two-node job either"
         );
     }
 
@@ -18796,8 +18856,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_still_blocks_when_occupied_nodes_have_no_spare_capacity() {
         // Same grp node=4 shape as the packable case above, but every node is
-        // fully allocated, so the packing credit has nothing to credit and the
-        // job must still block on QOSGrpNodeLimit.
+        // fully allocated, so the packing credit has nothing to credit.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         for n in ["n1", "n2", "n3", "n4"] {

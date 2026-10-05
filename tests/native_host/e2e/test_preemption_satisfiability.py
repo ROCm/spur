@@ -110,6 +110,9 @@ class TestUnplaceableAggressorEvictsNothing:
         return _SINGLE_PARTITION_CONFIG
 
     def test_unsatisfiable_gres_aggressor_preempts_nobody(self, cluster):
+        """End-to-end outcome for the production shape. The structural gate is
+        what keeps this job out of try_preempt; the victim-set proof is the
+        backstop, covered on its own by the multi-node cases below."""
         c = cluster
         node = c.node_names[0]
         victim_id = aggressor_id = None
@@ -117,7 +120,9 @@ class TestUnplaceableAggressorEvictsNothing:
             victim_id = _run_victim(c, node, "unsat-victim")
             preempted_before = c.sdiag_jobs_preempted()
             aggressor_id = _queue_aggressor(
-                c, "unsat-aggressor", ["-N1", "--exclusive", _BOGUS_GRES]
+                c,
+                "unsat-aggressor",
+                ["-N1", "--exclusive", f"--nodelist={node}", _BOGUS_GRES],
             )
 
             time.sleep(_GUARD_SECS)
@@ -160,7 +165,7 @@ class TestUnplaceableAggressorEvictsNothing:
             _scancel_all(c, [job_id])
 
     def test_placeable_aggressor_still_preempts(self, cluster):
-        """Control: the same fixture, minus the unsatisfiable gres, does evict."""
+        """Control: the same submission minus the unsatisfiable gres does evict."""
         c = cluster
         node = c.node_names[0]
         victim_id = aggressor_id = None
@@ -189,9 +194,8 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
     def test_partial_victim_set_evicts_nobody(self, multi_node_cluster):
         c = multi_node_cluster
         first, second = c.node_names[0], c.node_names[1]
-        # Overlays the second node: PreemptMode defaults to OFF on create, which
-        # makes a job submitted here ineligible for eviction while leaving the
-        # node itself inside the aggressor's default partition.
+        # Overlays the second node. PreemptMode defaults to OFF on create, so a
+        # job submitted here is ineligible for eviction but the node is not.
         c.scontrol(
             "create-partition",
             "--name=shielded",
@@ -206,8 +210,12 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
                 c, second, "partial-shielded", extra=["-p", "shielded"]
             )
             preempted_before = c.sdiag_jobs_preempted()
+            # Pinned to exactly these two nodes so a bed with spare capacity
+            # elsewhere cannot place the aggressor without preempting.
             aggressor_id = _queue_aggressor(
-                c, "partial-aggressor", ["-N2", "--exclusive", "-p", "default"]
+                c,
+                "partial-aggressor",
+                ["-N2", "--exclusive", "-p", "default", f"--nodelist={first},{second}"],
             )
 
             time.sleep(_GUARD_SECS)
@@ -240,7 +248,9 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
             for i, node in enumerate((first, second)):
                 victim_ids.append(_run_victim(c, node, f"full-victim-{i}"))
             aggressor_id = _queue_aggressor(
-                c, "full-aggressor", ["-N2", "--exclusive", "-p", "default"]
+                c,
+                "full-aggressor",
+                ["-N2", "--exclusive", "-p", "default", f"--nodelist={first},{second}"],
             )
 
             for victim_id in victim_ids:

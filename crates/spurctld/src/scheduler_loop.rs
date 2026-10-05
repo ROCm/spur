@@ -915,12 +915,10 @@ pub(crate) async fn try_preempt(
         .collect();
     running.sort_by_key(|j| running_priority[&j.job_id]);
 
-    // Which jobs hold each node, so a node is only counted as freed when *every*
-    // job on it is one this pass would evict. Suspended jobs are included because
-    // suspension never releases an allocation: a node one of them holds cannot be
-    // handed to the preemptor by evicting the running jobs beside it.
+    // Suspended and completing jobs still hold their allocation, so a node one of
+    // them sits on cannot be handed over by evicting the running jobs beside it.
     let holders = cluster.get_jobs(&JobFilter {
-        states: &[JobState::Running, JobState::Suspended],
+        states: &[JobState::Running, JobState::Suspended, JobState::Completing],
         ..Default::default()
     });
     let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
@@ -929,11 +927,10 @@ pub(crate) async fn try_preempt(
             occupants.entry(node.as_str()).or_default().push(job.job_id);
         }
     }
-    // Cheapest-first victim ordering inside the satisfiability search, matching
-    // the ascending sort above.
+    // Lets the satisfiability search spend the cheapest victims first.
     let victim_cost: HashMap<spur_core::job::JobId, i32> = running_priority
         .iter()
-        .map(|(id, p)| (*id, (*p).min(i32::MAX as u32) as i32))
+        .map(|(id, p)| (*id, i32::try_from(*p).unwrap_or(i32::MAX)))
         .collect();
 
     // Pending job's QOS is resolved once per pending job; used for the
@@ -956,9 +953,8 @@ pub(crate) async fn try_preempt(
         let pending_tier = pending_part.priority_tier;
         let pending_qos = &pending_qos_map[&pending.job_id];
 
-        // Every running job this pending job is permitted to evict, with the
-        // mode the eviction would use. Which of them actually get evicted is
-        // decided afterwards, by whether their removal would place the job.
+        // Merely permitted, not chosen: which of these actually go is decided
+        // below, by whether their removal would place the job.
         let mut eligible: Vec<(&spur_core::job::Job, PreemptMode)> = Vec::new();
         for candidate in &running {
             let candidate_priority = running_priority[&candidate.job_id];
@@ -1008,23 +1004,39 @@ pub(crate) async fn try_preempt(
             eligible.push((candidate, mode));
         }
 
-        // Nothing is evicted unless the eviction provably places the job. Without
-        // this a job no node can ever host — an unsatisfiable `--gres`, more CPUs
-        // than any node has — evicts a victim every cycle and still never runs.
-        let eligible_ids: HashSet<spur_core::job::JobId> =
-            eligible.iter().map(|(j, _)| j.job_id).collect();
-        let Some(victims) = satisfiable_victim_set(
-            pending,
-            &VictimPool {
-                evictable: &eligible_ids,
-                occupants: &occupants,
-                priority: &victim_cost,
-                max_priority: None,
-            },
-            &cluster_nodes,
-            &reservations,
-            now,
-        ) else {
+        // Per mode class, never across: suspension leaves the allocation in place,
+        // so a mixed set would prove a placement it cannot deliver.
+        let by_mode = |suspend: bool| -> HashSet<spur_core::job::JobId> {
+            eligible
+                .iter()
+                .filter(|(_, m)| (*m == PreemptMode::Suspend) == suspend)
+                .map(|(j, _)| j.job_id)
+                .collect()
+        };
+        // Nothing is evicted unless the eviction provably places the job: a job no
+        // node can host would otherwise spend a victim every cycle and never run.
+        let mut found = None;
+        for pool_ids in [by_mode(false), by_mode(true)] {
+            if pool_ids.is_empty() {
+                continue;
+            }
+            found = satisfiable_victim_set(
+                pending,
+                &VictimPool {
+                    evictable: &pool_ids,
+                    occupants: &occupants,
+                    priority: &victim_cost,
+                    max_priority: None,
+                },
+                &cluster_nodes,
+                &reservations,
+                now,
+            );
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some(victims) = found else {
             continue;
         };
 
@@ -1059,18 +1071,20 @@ pub(crate) async fn try_preempt(
                     preempted = true;
                 }
                 Err(e) => {
+                    // Stop at the first failure: the rest of the set can no longer
+                    // place the job, so evicting it would only destroy more work.
                     warn!(
                         job_id = candidate.job_id,
                         error = %e,
-                        "failed to preempt job"
+                        "failed to preempt job, abandoning the rest of the victim set"
                     );
+                    break;
                 }
             }
         }
         if preempted {
-            // One preemption per cycle: `occupants` is now stale, so a second
-            // pending job would otherwise prove placement on nodes already
-            // promised away and evict a set that cannot help it.
+            // `occupants` is now stale, so a second pending job could otherwise
+            // prove placement on nodes already promised away.
             break;
         }
     }
@@ -1117,17 +1131,11 @@ fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
 /// not place. Returns the nodes freed, which the caller holds out of the next cycle
 /// until the agents have confirmed the kill.
 ///
-/// This is deliberately **not** part of `try_preempt`. Victim selection there never
-/// checks that an eviction helps: `preempt_overlaps_pending_nodes` returns true for
-/// any node the victim occupies that lies in any of the reclaimer's partitions, with
-/// no GPU-type, memory, feature or topology check, and nothing afterwards verifies
-/// the shortfall was closed. That is inert today only because the outer loop
-/// short-circuits on `preempt_mode = Off` and the victim must clear a hardcoded 2x
-/// priority gap. Reclaim consults neither, so reusing that selection would let a job
-/// that can never be placed — `--gres=gpu:8` where the largest node has 4 — requeue
-/// one borrowed job per cycle forever (D2, §8.1).
-///
-/// Instead the victim set must provably close the shortfall, or nothing is evicted.
+/// Separate from `try_preempt`: the victim pool is borrowed runs rather than
+/// lower-priority ones, an opportunistic reclaimer is held under a QOS priority
+/// ceiling, and the eviction is always `Requeue`. Both reach the same
+/// `satisfiable_victim_set`, so neither can evict without closing the shortfall
+/// (D2, §8.1).
 async fn reclaim_for_unplaced(
     cluster: &Arc<ClusterManager>,
     unplaced: &[&spur_core::job::Job],
@@ -1286,10 +1294,8 @@ struct VictimPool<'a> {
     occupants: &'a HashMap<&'a str, Vec<spur_core::job::JobId>>,
     /// What each victim costs, so the cheapest sufficient set is chosen.
     priority: &'a HashMap<spur_core::job::JobId, i32>,
-    /// Set for an opportunistic reclaimer: it may only displace opportunistic work
-    /// of strictly lower priority, so a low-priority burst job cannot evict a
-    /// higher-priority borrowed run. `None` when `evictable` is already the final
-    /// answer.
+    /// Set for an opportunistic reclaimer, which may only displace opportunistic
+    /// work of strictly lower priority. `None` when `evictable` is already final.
     max_priority: Option<i32>,
 }
 

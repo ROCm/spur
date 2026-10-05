@@ -337,8 +337,7 @@ pub enum PendingReason {
     AccountingUnavailable,
 
     /// No eligible node could host the request even when completely empty, so
-    /// neither waiting nor preemption can ever place it. Re-derived every pass,
-    /// so it clears on its own once matching hardware joins.
+    /// neither waiting nor preemption can place it. Re-derived every pass.
     NodeConfigUnavailable,
 }
 
@@ -2378,6 +2377,19 @@ mod tests {
         assert_eq!(json, "\"AccountingUnavailable\"");
         let back: PendingReason = serde_json::from_str(&json).unwrap();
         assert_eq!(back, PendingReason::AccountingUnavailable);
+    }
+
+    // Same compatibility surface as the variant above.
+    #[test]
+    fn node_config_unavailable_reason_displays_and_roundtrips() {
+        assert_eq!(
+            PendingReason::NodeConfigUnavailable.display(),
+            "ReqNodeNotAvail, Requested node configuration is not available"
+        );
+        let json = serde_json::to_string(&PendingReason::NodeConfigUnavailable).unwrap();
+        assert_eq!(json, "\"NodeConfigUnavailable\"");
+        let back: PendingReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PendingReason::NodeConfigUnavailable);
     }
 
     #[test]
