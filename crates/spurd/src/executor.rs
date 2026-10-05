@@ -1618,13 +1618,8 @@ impl Drop for CgroupGuard {
     }
 }
 
-/// A killed process can stay in the cgroup for seconds (memcg reclaim, GPU driver
-/// teardown) while it still holds the job's memory and GPUs. Completion is reported
-/// after cleanup, so wait it out; kept under the stepd force-reclaim window.
-const CGROUP_EMPTY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Once the cgroup is empty rmdir should succeed at once; bounded because cleanup
-/// sits on the completion-reporting path.
+/// Bounded to 200ms: cleanup sits on the completion-reporting path, and the next
+/// `setup_cgroup` clears any directory this gives up on.
 const CGROUP_REMOVE_ATTEMPTS: u32 = 20;
 const CGROUP_REMOVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -1701,7 +1696,6 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
     }
 
     kill_cgroup_procs(cgroup_path);
-    wait_until_empty(cgroup_path, CGROUP_EMPTY_TIMEOUT);
 
     // `kill` returning does not mean the process has left the cgroup, and rmdir
     // fails EBUSY until it has. An abandoned dir strands its device program.
@@ -1732,17 +1726,45 @@ fn cgroup_populated(cgroup_path: &Path) -> bool {
         .is_ok_and(|events| events.lines().any(|line| line == "populated 1"))
 }
 
-/// Re-kills on every poll so a child forked after the first kill cannot keep
-/// the cgroup alive.
-fn wait_until_empty(cgroup_path: &Path, timeout: std::time::Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    while cgroup_populated(cgroup_path) {
-        if std::time::Instant::now() >= deadline {
-            warn!(path = %cgroup_path.display(), "processes still in cgroup after SIGKILL");
-            return;
+fn kill_cgroup_tree(cgroup_path: &Path) {
+    if let Ok(entries) = std::fs::read_dir(cgroup_path) {
+        for child in entries.flatten() {
+            if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                kill_cgroup_tree(&child.path());
+            }
         }
-        std::thread::sleep(CGROUP_REMOVE_INTERVAL);
-        kill_cgroup_procs(cgroup_path);
+    }
+    kill_cgroup_procs(cgroup_path);
+}
+
+/// A killed process can stay in the cgroup for seconds (memcg reclaim, GPU driver
+/// teardown) while it still holds the job's memory and GPUs. Applied once per
+/// teardown, after the 5 s cancel grace, so it ends inside the agent's 30 s
+/// stepd force-reclaim window.
+pub const CGROUP_EMPTY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// SIGKILLs everything under `cgroup_path` and waits for it to empty, killing
+/// again on each poll so a child forked after the first kill cannot keep it
+/// alive. Returns whether it emptied.
+pub async fn kill_and_wait_until_empty(cgroup_path: &Path, timeout: std::time::Duration) -> bool {
+    if !is_own_cgroup(cgroup_path) {
+        warn!(
+            path = %cgroup_path.display(),
+            "refusing to reap a cgroup that is not a job or step of ours"
+        );
+        return false;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        kill_cgroup_tree(cgroup_path);
+        if !cgroup_populated(cgroup_path) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(path = %cgroup_path.display(), "processes still in cgroup after SIGKILL");
+            return false;
+        }
+        tokio::time::sleep(CGROUP_REMOVE_INTERVAL).await;
     }
 }
 
@@ -2729,7 +2751,7 @@ mod cgroup_join_tests {
 
 #[cfg(test)]
 mod cgroup_guard_tests {
-    use super::{cleanup_cgroup, CgroupGuard};
+    use super::{cleanup_cgroup, kill_and_wait_until_empty, CgroupGuard, CGROUP_EMPTY_TIMEOUT};
 
     #[test]
     fn dropping_the_guard_removes_the_cgroup() {
@@ -2785,8 +2807,8 @@ mod cgroup_guard_tests {
         assert!(cgroup.exists());
     }
 
-    #[test]
-    fn cleanup_waits_for_a_killed_process_to_leave_the_cgroup() {
+    #[tokio::test]
+    async fn waits_for_a_killed_process_to_leave_the_cgroup() {
         let dir = tempfile::tempdir().unwrap();
         let cgroup = dir.path().join("job_6");
         std::fs::create_dir(&cgroup).unwrap();
@@ -2795,15 +2817,27 @@ mod cgroup_guard_tests {
         // Longer than the rmdir retry budget, as a process stuck in memcg reclaim is.
         let leaving = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(400));
-            std::fs::remove_file(events).unwrap();
+            std::fs::write(events, "populated 0\nfrozen 0\n").unwrap();
         });
 
-        cleanup_cgroup(&cgroup);
+        let emptied = kill_and_wait_until_empty(&cgroup, CGROUP_EMPTY_TIMEOUT).await;
         leaving.join().unwrap();
         assert!(
-            !cgroup.exists(),
-            "cleanup must not give up while the cgroup still holds a process"
+            emptied,
+            "the wait must outlast a killed process that is slow to leave"
         );
+    }
+
+    #[tokio::test]
+    async fn gives_up_on_a_cgroup_that_stays_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("job_7");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+
+        let emptied =
+            kill_and_wait_until_empty(&cgroup, std::time::Duration::from_millis(50)).await;
+        assert!(!emptied);
     }
 
     #[test]
