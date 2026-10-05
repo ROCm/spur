@@ -1007,8 +1007,8 @@ pub(crate) async fn try_preempt(
             eligible.push((candidate, mode));
         }
 
-        // Never mixed with suspend, which keeps the allocation: a mixed set would
-        // kill the releasing half for a placement suspension cannot deliver.
+        // Suspend keeps the allocation, so it is a configured outcome rather than a
+        // way to free a node: searched alone, never mixed into a releasing set.
         let by_mode = |suspend: bool| -> HashSet<spur_core::job::JobId> {
             eligible
                 .iter()

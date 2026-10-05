@@ -4217,6 +4217,13 @@ impl ClusterManager {
                 reserved.reserve(job, qos_charge, admitted.charge);
                 GateOutcome::Keep
             });
+
+            retain_eligible(&mut candidates, &mut reason_updates, |job| {
+                match resource_impossible_reason(job, &nodes, &reservations) {
+                    Some(reason) => GateOutcome::Block(reason),
+                    None => GateOutcome::Keep,
+                }
+            });
         }
 
         {
@@ -7703,6 +7710,32 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
+/// `NodeConfigUnavailable` when no eligible node could host the request even when
+/// idle. Runs after the quota gates, which carry the more actionable reason.
+fn resource_impossible_reason(
+    job: &Job,
+    nodes: &HashMap<String, Node>,
+    reservations: &[Reservation],
+) -> Option<PendingReason> {
+    let placement = spur_sched::node_match::NodePlacement::new(job);
+    let now = chrono::Utc::now();
+    let required = spur_sched::backfill::job_resource_request(job);
+
+    let eligible: Vec<&Node> = nodes
+        .values()
+        .filter(|n| placement.eligible(n, reservations, now))
+        .collect();
+
+    // An up node that has not reported inventory could be the one that fits.
+    let unknown_inventory = |n: &&Node| n.total_resources.cpus == 0 && n.state.is_up();
+    let impossible = !eligible.is_empty()
+        && !eligible.iter().any(unknown_inventory)
+        && !eligible
+            .iter()
+            .any(|n| n.total_resources.can_satisfy(&required));
+    impossible.then_some(PendingReason::NodeConfigUnavailable)
+}
+
 /// `Some(reason)` when no eligible node is one real placement would ever use.
 /// Too-few-eligible is left alone: those nodes may still join.
 fn structural_unplaceable_reason(
@@ -7721,18 +7754,6 @@ fn structural_unplaceable_reason(
         .values()
         .filter(|n| placement.eligible(n, reservations, now))
         .collect();
-
-    // Resource impossibility against total (not free) capacity. A node with no CPU
-    // count has not reported inventory yet, so it abstains rather than convicts.
-    let mut inventoried = eligible
-        .iter()
-        .filter(|n| n.total_resources.cpus > 0)
-        .peekable();
-    if inventoried.peek().is_some()
-        && !inventoried.any(|n| n.total_resources.can_satisfy(&required))
-    {
-        return Some(PendingReason::NodeConfigUnavailable);
-    }
 
     // A k0s-claimed node would otherwise match: unlike a down node, it can
     // free up on its own, so it must not be folded into a "will never place"
@@ -17565,6 +17586,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_qos_cap_outranks_hardware_the_cluster_does_not_have() {
+        // Asking for more GPUs than the QOS allows on a cluster with none at all
+        // breaches both, and the quota is the half the user can act on.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut limits = TresRecord::new();
+        limits.set(TresType::Gpu, 2);
+        cm.qos_cache().insert(Qos {
+            name: "gpucap".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_tres_per_user: Some(limits),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut greedy = basic_spec("over-the-gpu-cap");
+        greedy.qos = Some("gpucap".into());
+        greedy.gres = vec!["gpu:4".into()];
+        let greedy_id = submit_and_wait(&cm, greedy);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(greedy_id).unwrap().pending_reason,
+            PendingReason::QosMaxGpuPerUserLimit,
+            "the QOS cap must not be buried under a hardware verdict"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_wide_requests_are_not_mistaken_for_impossible_ones() {
         // The two requests `base_node_request` deliberately leaves out of the
         // per-node set must not be read as resource impossibility.
@@ -17584,7 +17637,7 @@ mod tests {
         {
             let nodes = cm.nodes.read();
             assert_eq!(
-                structural_unplaceable_reason(
+                resource_impossible_reason(
                     &cm.get_job(licensed_id).unwrap(),
                     &nodes,
                     &reservations
@@ -17594,19 +17647,39 @@ mod tests {
             );
         }
 
-        // A node that has not reported inventory must abstain rather than convict.
+        // n2 is too small for the request, but n1 has not reported inventory and
+        // could be the node that fits, so no verdict may be reached without it.
+        register_node(&cm, "n2", 2, 16000);
         if let Some(node) = cm.nodes.write().get_mut("n1") {
             node.total_resources.cpus = 0;
         }
+        {
+            let nodes = cm.nodes.read();
+            assert_eq!(
+                resource_impossible_reason(
+                    &cm.get_job(uninventoried_id).unwrap(),
+                    &nodes,
+                    &reservations
+                ),
+                None,
+                "an uninventoried node alongside a too-small one must withhold the verdict"
+            );
+        }
+
+        // Once it is down it can no longer be the node that fits, and the
+        // inventoried remainder settles the question.
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.state = NodeState::Down;
+        }
         let nodes = cm.nodes.read();
         assert_eq!(
-            structural_unplaceable_reason(
+            resource_impossible_reason(
                 &cm.get_job(uninventoried_id).unwrap(),
                 &nodes,
                 &reservations
             ),
-            None,
-            "an uninventoried node must not make every job structurally unplaceable"
+            Some(PendingReason::NodeConfigUnavailable),
+            "abstention must not outlive the node that justified it"
         );
     }
 
@@ -17625,7 +17698,7 @@ mod tests {
             let nodes = cm.nodes.read();
             let reservations = cm.get_reservations();
             assert_eq!(
-                structural_unplaceable_reason(&job, &nodes, &reservations),
+                resource_impossible_reason(&job, &nodes, &reservations),
                 Some(PendingReason::NodeConfigUnavailable)
             );
         }
