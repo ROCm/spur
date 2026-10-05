@@ -8,7 +8,8 @@
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every
+//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`,
+//! `RequeueJob`, `ClusterAddNodes`, `ClusterRemoveNodes`); every
 //! other RPC reports `unimplemented` so an unexpected call fails loudly instead
 //! of silently returning a default.
 
@@ -55,6 +56,8 @@ pub(crate) struct StepCapture {
     /// `node_addr` handed back from `CreateJobStep`, so a test can point an
     /// interactive step at a mock agent instead of an empty address.
     create_step_node_addr: Arc<Mutex<String>>,
+    /// `authorization` header of each call to an RPC that demands a credential.
+    authorizations: Arc<Mutex<Vec<String>>>,
 }
 
 impl StepCapture {
@@ -144,10 +147,31 @@ impl StepCapture {
     pub(crate) fn set_create_step_node_addr(&self, addr: impl Into<String>) {
         *self.create_step_node_addr.lock().unwrap() = addr.into();
     }
+
+    pub(crate) fn authorizations(&self) -> Vec<String> {
+        self.authorizations.lock().unwrap().clone()
+    }
 }
 
 struct MockController {
     capture: StepCapture,
+}
+
+impl MockController {
+    /// Reject a call without credentials, as a `mode = "required"` controller does.
+    fn require_credential<T>(&self, request: &tonic::Request<T>) -> Result<(), tonic::Status> {
+        let value = request
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| tonic::Status::unauthenticated("authentication required"))?;
+        self.capture
+            .authorizations
+            .lock()
+            .unwrap()
+            .push(value.to_string());
+        Ok(())
+    }
 }
 
 /// Emit the whole `impl` block, including the `#[tonic::async_trait]`
@@ -336,6 +360,33 @@ mock_controller_impl! {
                 .push((request.name, request.force));
             Ok(tonic::Response::new(proto::DeregisterNodeResponse::default()))
         }
+
+        async fn requeue_job(
+            &self,
+            request: tonic::Request<proto::RequeueJobRequest>,
+        ) -> Result<tonic::Response<proto::RequeueJobResponse>, tonic::Status> {
+            self.require_credential(&request)?;
+            Ok(tonic::Response::new(proto::RequeueJobResponse {
+                requeued: 1,
+                skipped: Vec::new(),
+            }))
+        }
+
+        async fn cluster_add_nodes(
+            &self,
+            request: tonic::Request<proto::ClusterAddNodesRequest>,
+        ) -> Result<tonic::Response<proto::ClusterAddNodesResponse>, tonic::Status> {
+            self.require_credential(&request)?;
+            Ok(tonic::Response::new(proto::ClusterAddNodesResponse::default()))
+        }
+
+        async fn cluster_remove_nodes(
+            &self,
+            request: tonic::Request<proto::ClusterRemoveNodesRequest>,
+        ) -> Result<tonic::Response<proto::ClusterRemoveNodesResponse>, tonic::Status> {
+            self.require_credential(&request)?;
+            Ok(tonic::Response::new(proto::ClusterRemoveNodesResponse::default()))
+        }
     }
     unimplemented {
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
@@ -344,7 +395,6 @@ mock_controller_impl! {
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
-        requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
         create_partition(proto::CreatePartitionRequest) -> ();
@@ -375,8 +425,6 @@ mock_controller_impl! {
         cluster_down(proto::ClusterDownRequest) -> proto::ClusterDownResponse;
         cluster_status(proto::ClusterStatusRequest) -> proto::ClusterStatusResponse;
         cluster_kubeconfig(proto::ClusterKubeconfigRequest) -> proto::ClusterKubeconfigResponse;
-        cluster_add_nodes(proto::ClusterAddNodesRequest) -> proto::ClusterAddNodesResponse;
-        cluster_remove_nodes(proto::ClusterRemoveNodesRequest) -> proto::ClusterRemoveNodesResponse;
     }
 }
 
