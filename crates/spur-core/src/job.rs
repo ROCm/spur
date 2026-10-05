@@ -335,6 +335,11 @@ pub enum PendingReason {
     /// association state on disk and refuses to start without it, so it never
     /// schedules in this state to begin with.
     AccountingUnavailable,
+
+    /// No eligible node could host the request even when completely empty, so
+    /// neither waiting nor preemption can ever place it. Re-derived every pass,
+    /// so it clears on its own once matching hardware joins.
+    NodeConfigUnavailable,
 }
 
 impl PendingReason {
@@ -424,6 +429,9 @@ impl PendingReason {
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
             Self::Preempted => "Preempted",
             Self::AccountingUnavailable => "AccountingUnavailable",
+            Self::NodeConfigUnavailable => {
+                "ReqNodeNotAvail, Requested node configuration is not available"
+            }
         }
     }
 

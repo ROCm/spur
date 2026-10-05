@@ -915,6 +915,27 @@ pub(crate) async fn try_preempt(
         .collect();
     running.sort_by_key(|j| running_priority[&j.job_id]);
 
+    // Which jobs hold each node, so a node is only counted as freed when *every*
+    // job on it is one this pass would evict. Suspended jobs are included because
+    // suspension never releases an allocation: a node one of them holds cannot be
+    // handed to the preemptor by evicting the running jobs beside it.
+    let holders = cluster.get_jobs(&JobFilter {
+        states: &[JobState::Running, JobState::Suspended],
+        ..Default::default()
+    });
+    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
+    for job in &holders {
+        for node in &job.allocated_nodes {
+            occupants.entry(node.as_str()).or_default().push(job.job_id);
+        }
+    }
+    // Cheapest-first victim ordering inside the satisfiability search, matching
+    // the ascending sort above.
+    let victim_cost: HashMap<spur_core::job::JobId, i32> = running_priority
+        .iter()
+        .map(|(id, p)| (*id, (*p).min(i32::MAX as u32) as i32))
+        .collect();
+
     // Pending job's QOS is resolved once per pending job; used for the
     // QosPriority hierarchy check.
     let pending_qos_map: std::collections::HashMap<
@@ -935,6 +956,10 @@ pub(crate) async fn try_preempt(
         let pending_tier = pending_part.priority_tier;
         let pending_qos = &pending_qos_map[&pending.job_id];
 
+        // Every running job this pending job is permitted to evict, with the
+        // mode the eviction would use. Which of them actually get evicted is
+        // decided afterwards, by whether their removal would place the job.
+        let mut eligible: Vec<(&spur_core::job::Job, PreemptMode)> = Vec::new();
         for candidate in &running {
             let candidate_priority = running_priority[&candidate.job_id];
             if candidate_priority >= pending.priority / 2 {
@@ -980,31 +1005,58 @@ pub(crate) async fn try_preempt(
             if mode == PreemptMode::Off {
                 continue;
             }
+            eligible.push((candidate, mode));
+        }
+
+        // Nothing is evicted unless the eviction provably places the job. Without
+        // this a job no node can ever host — an unsatisfiable `--gres`, more CPUs
+        // than any node has — evicts a victim every cycle and still never runs.
+        let eligible_ids: HashSet<spur_core::job::JobId> =
+            eligible.iter().map(|(j, _)| j.job_id).collect();
+        let Some(victims) = satisfiable_victim_set(
+            pending,
+            &VictimPool {
+                evictable: &eligible_ids,
+                occupants: &occupants,
+                priority: &victim_cost,
+                max_priority: None,
+            },
+            &cluster_nodes,
+            &reservations,
+            now,
+        ) else {
+            continue;
+        };
+
+        let preempt_qos = if sched.preempt_type == PreemptType::QosPriority {
+            Some(pending_qos.name.clone())
+        } else {
+            None
+        };
+        let mut preempted = false;
+        for (candidate, mode) in eligible.iter().filter(|(j, _)| victims.contains(&j.job_id)) {
             info!(
                 preempted_job = candidate.job_id,
-                preempted_priority = candidate_priority,
+                preempted_priority = running_priority[&candidate.job_id],
                 pending_job = pending.job_id,
                 pending_priority = pending.priority,
                 mode = ?mode,
                 "preempting lower-priority job"
             );
-            let preempt_qos = if sched.preempt_type == PreemptType::QosPriority {
-                Some(pending_qos.name.clone())
-            } else {
-                None
-            };
             match cluster.preempt_job_with_provenance(
                 candidate.job_id,
-                mode,
+                *mode,
                 Some(pending.job_id),
-                preempt_qos,
+                preempt_qos.clone(),
             ) {
                 Ok(PreemptOutcome::Killed) => {
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
+                    preempted = true;
                 }
                 Ok(PreemptOutcome::Suspended) => {
                     send_suspend_to_agents(cluster, candidate, false).await;
+                    preempted = true;
                 }
                 Err(e) => {
                     warn!(
@@ -1012,10 +1064,14 @@ pub(crate) async fn try_preempt(
                         error = %e,
                         "failed to preempt job"
                     );
-                    continue;
                 }
             }
-            break; // One preemption per cycle, re-evaluate next cycle
+        }
+        if preempted {
+            // One preemption per cycle: `occupants` is now stale, so a second
+            // pending job would otherwise prove placement on nodes already
+            // promised away and evict a set that cannot help it.
+            break;
         }
     }
 }
@@ -1158,11 +1214,14 @@ async fn reclaim_for_unplaced(
 
         let Some(victims) = satisfiable_victim_set(
             reclaimer,
-            &reclaimable_ids,
-            &occupants,
-            &victim_priority,
-            ceiling,
-            cluster_state,
+            &VictimPool {
+                evictable: &reclaimable_ids,
+                occupants: &occupants,
+                priority: &victim_priority,
+                max_priority: ceiling,
+            },
+            cluster_state.nodes,
+            cluster_state.reservations,
             now,
         ) else {
             continue;
@@ -1218,25 +1277,35 @@ async fn reclaim_for_unplaced(
     (Vec::new(), None)
 }
 
-/// The set of borrowed jobs whose eviction would let `reclaimer` actually run, or
-/// `None` when no such set exists.
+/// The candidate victims a satisfiability search is allowed to spend.
+struct VictimPool<'a> {
+    /// Jobs the caller's own eligibility rules already cleared for eviction.
+    evictable: &'a HashSet<spur_core::job::JobId>,
+    /// Every job holding each node, evictable or not, so a node only counts as
+    /// recovered when the whole set on it is being evicted.
+    occupants: &'a HashMap<&'a str, Vec<spur_core::job::JobId>>,
+    /// What each victim costs, so the cheapest sufficient set is chosen.
+    priority: &'a HashMap<spur_core::job::JobId, i32>,
+    /// Set for an opportunistic reclaimer: it may only displace opportunistic work
+    /// of strictly lower priority, so a low-priority burst job cannot evict a
+    /// higher-priority borrowed run. `None` when `evictable` is already the final
+    /// answer.
+    max_priority: Option<i32>,
+}
+
+/// The set of evictable jobs whose removal would let `reclaimer` actually run, or
+/// `None` when no such set exists. Shared by reclaim and preemption.
 ///
 /// Atomic by construction: a node counts as recovered only when every job on it is
-/// reclaimable, so the reclaimer either gets a full allocation or nothing is
+/// evictable, so the reclaimer either gets a full allocation or nothing is
 /// touched. A partial eviction destroys work without helping anyone, and an
-/// unplaceable job has no satisfiable set at all — which is what makes reclaim
-/// immune to the denial-of-service `try_preempt` would have allowed (§8.2).
+/// unplaceable job has no satisfiable set at all — which is what stops a job that
+/// can never be placed from evicting one victim per cycle forever (§8.2).
 fn satisfiable_victim_set(
     reclaimer: &spur_core::job::Job,
-    reclaimable_ids: &HashSet<spur_core::job::JobId>,
-    occupants: &HashMap<&str, Vec<spur_core::job::JobId>>,
-    victim_priority: &HashMap<spur_core::job::JobId, i32>,
-    // Set for an opportunistic reclaimer: it may only displace opportunistic work of
-    // strictly lower priority, so a low-priority burst job cannot evict a
-    // higher-priority borrowed run. `None` for a job holding a real quota claim,
-    // which may reclaim any borrowed capacity.
-    max_victim_priority: Option<i32>,
-    cluster_state: &ClusterState<'_>,
+    pool: &VictimPool<'_>,
+    nodes: &[spur_core::node::Node],
+    reservations: &[spur_core::reservation::Reservation],
     now: DateTime<Utc>,
 ) -> Option<HashSet<spur_core::job::JobId>> {
     let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
@@ -1246,29 +1315,29 @@ fn satisfiable_victim_set(
     // rules the scheduler applies, so reclaim cannot free a node placement would
     // then refuse — including reservations and the k0s gate.
     let suitable = |node: &spur_core::node::Node| {
-        placement.matches_for_reservation(node, cluster_state.reservations, now)
+        placement.matches_for_reservation(node, reservations, now)
             && node.total_resources.can_satisfy(&required)
     };
 
-    let needed = reclaimer.spec.num_nodes as usize;
+    let needed = (reclaimer.spec.num_nodes as usize).max(1);
     let mut have = 0usize;
     let mut victims = HashSet::new();
     let mut evacuable = Vec::new();
 
-    for node in cluster_state.nodes {
+    for node in nodes {
         if !suitable(node) {
             continue;
         }
-        match occupants.get(node.name.as_str()) {
+        match pool.occupants.get(node.name.as_str()) {
             // Already empty and suitable, yet the pass still could not place the
             // job — so these alone are never enough, but they count toward the total.
             None => have += 1,
             Some(on_node)
                 if on_node.iter().all(|id| {
-                    reclaimable_ids.contains(id)
-                        && max_victim_priority.is_none_or(|bound| {
-                            victim_priority.get(id).copied().unwrap_or(0) < bound
-                        })
+                    pool.evictable.contains(id)
+                        && pool
+                            .max_priority
+                            .is_none_or(|bound| pool.priority.get(id).copied().unwrap_or(0) < bound)
                 }) =>
             {
                 evacuable.push((node.name.as_str(), on_node));
@@ -1285,7 +1354,7 @@ fn satisfiable_victim_set(
     evacuable.sort_by_key(|(name, on_node)| {
         let cost = on_node
             .iter()
-            .map(|id| victim_priority.get(id).copied().unwrap_or(0))
+            .map(|id| pool.priority.get(id).copied().unwrap_or(0))
             .max()
             .unwrap_or(0);
         (cost, *name)
@@ -3726,26 +3795,12 @@ mod tests {
             })
         }
 
-        fn state<'a>(
-            nodes: &'a [Node],
-            busy: &'a HashMap<String, DateTime<Utc>>,
-        ) -> ClusterState<'a> {
-            ClusterState {
-                nodes,
-                partitions: &[],
-                reservations: &[],
-                topology: None,
-                busy_until: busy,
-            }
-        }
-
         #[test]
         fn an_unplaceable_job_evicts_nothing_however_long_it_waits() {
             // The denial-of-service `try_preempt` would have allowed (D2): a job that
             // can never be placed anywhere must have no satisfiable victim set, so it
             // evicts nothing — not one borrowed job per cycle, forever.
             let nodes = vec![node("n1", 4)];
-            let busy = HashMap::new();
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![7]);
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
@@ -3755,11 +3810,14 @@ mod tests {
             assert!(
                 satisfiable_victim_set(
                     &greedy,
-                    &reclaimable,
-                    &occupants,
-                    &no_priorities(),
-                    None,
-                    &state(&nodes, &busy),
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &no_priorities(),
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
                     Utc::now()
                 )
                 .is_none(),
@@ -3772,11 +3830,14 @@ mod tests {
             assert_eq!(
                 satisfiable_victim_set(
                     &fits,
-                    &reclaimable,
-                    &occupants,
-                    &no_priorities(),
-                    None,
-                    &state(&nodes, &busy),
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &no_priorities(),
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
                     Utc::now()
                 ),
                 Some([7].into_iter().collect())
@@ -3788,7 +3849,6 @@ mod tests {
             // Atomicity: the reclaimer needs two nodes but only one can be evacuated,
             // so nothing is touched. A partial eviction destroys work without helping.
             let nodes = vec![node("n1", 4), node("n2", 4)];
-            let busy = HashMap::new();
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![7]); // borrowed, evacuable
             occupants.insert("n2", vec![9]); // in-quota, not evacuable
@@ -3797,11 +3857,14 @@ mod tests {
             assert!(
                 satisfiable_victim_set(
                     &reclaimer(2, 1),
-                    &reclaimable,
-                    &occupants,
-                    &no_priorities(),
-                    None,
-                    &state(&nodes, &busy),
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &no_priorities(),
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
                     Utc::now()
                 )
                 .is_none(),
@@ -3815,11 +3878,14 @@ mod tests {
             let reclaimable: HashSet<spur_core::job::JobId> = [7, 8].into_iter().collect();
             let victims = satisfiable_victim_set(
                 &reclaimer(2, 1),
-                &reclaimable,
-                &occupants,
-                &no_priorities(),
-                None,
-                &state(&nodes, &busy),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &no_priorities(),
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
                 Utc::now(),
             )
             .expect("both nodes recoverable");
@@ -3834,7 +3900,6 @@ mod tests {
             // claim could evict a high-priority borrowed run while a low-priority burst
             // job on another node kept running.
             let nodes = vec![node("n1", 4), node("n2", 4)];
-            let busy = HashMap::new();
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![7]); // high-priority idle-fill
             occupants.insert("n2", vec![9]); // low-priority burst
@@ -3845,11 +3910,14 @@ mod tests {
             // One node needed, so exactly one victim: the cheaper one.
             let victims = satisfiable_victim_set(
                 &reclaimer(1, 1),
-                &reclaimable,
-                &occupants,
-                &priorities,
-                None,
-                &state(&nodes, &busy),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &priorities,
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
                 Utc::now(),
             )
             .expect("one evacuable node is enough");
@@ -3872,7 +3940,6 @@ mod tests {
             // priority -- the ordering decides *which first*, never whether enough is
             // taken to satisfy the claim.
             let nodes = vec![node("n1", 4), node("n2", 4)];
-            let busy = HashMap::new();
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![7]);
             occupants.insert("n2", vec![9]);
@@ -3882,11 +3949,14 @@ mod tests {
 
             let victims = satisfiable_victim_set(
                 &reclaimer(2, 1),
-                &reclaimable,
-                &occupants,
-                &priorities,
-                None,
-                &state(&nodes, &busy),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &priorities,
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
                 Utc::now(),
             )
             .expect("both nodes recoverable");
@@ -3900,7 +3970,6 @@ mod tests {
             // reclaimer's own priority, so a cheap opportunistic job finds no victim
             // set at all when the only candidate outranks it.
             let nodes = vec![node("n1", 4)];
-            let busy = HashMap::new();
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![7]); // dear borrowed run
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
@@ -3910,11 +3979,15 @@ mod tests {
             assert!(
                 satisfiable_victim_set(
                     &cheap,
-                    &reclaimable,
-                    &occupants,
-                    &priorities,
-                    Some(1001), // an opportunistic reclaimer at burst priority
-                    &state(&nodes, &busy),
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &priorities,
+                        // An opportunistic reclaimer at burst priority.
+                        max_priority: Some(1001),
+                    },
+                    &nodes,
+                    &[],
                     Utc::now()
                 )
                 .is_none(),
@@ -3927,11 +4000,14 @@ mod tests {
             assert_eq!(
                 satisfiable_victim_set(
                     &cheap,
-                    &reclaimable,
-                    &occupants,
-                    &priorities,
-                    None,
-                    &state(&nodes, &busy),
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &priorities,
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
                     Utc::now()
                 ),
                 Some([7].into_iter().collect()),
@@ -3945,7 +4021,6 @@ mod tests {
             // a lower-priority burst job. Strictly lower, so an equal-priority victim
             // is still protected.
             let nodes = vec![node("n1", 4)];
-            let busy = HashMap::new();
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![9]); // cheap burst victim
             let reclaimable: HashSet<spur_core::job::JobId> = [9].into_iter().collect();
@@ -3955,11 +4030,14 @@ mod tests {
             assert_eq!(
                 satisfiable_victim_set(
                     &dear,
-                    &reclaimable,
-                    &occupants,
-                    &priorities,
-                    Some(6000),
-                    &state(&nodes, &busy),
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &priorities,
+                        max_priority: Some(6000),
+                    },
+                    &nodes,
+                    &[],
                     Utc::now()
                 ),
                 Some([9].into_iter().collect()),
@@ -3970,11 +4048,14 @@ mod tests {
             assert!(
                 satisfiable_victim_set(
                     &dear,
-                    &reclaimable,
-                    &occupants,
-                    &priorities,
-                    Some(1001),
-                    &state(&nodes, &busy),
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &priorities,
+                        max_priority: Some(1001),
+                    },
+                    &nodes,
+                    &[],
                     Utc::now()
                 )
                 .is_none(),
@@ -3986,7 +4067,6 @@ mod tests {
         fn victim_order_is_deterministic_when_priorities_tie() {
             // Equal priority must not leave the choice to node registration order.
             let nodes = vec![node("n2", 4), node("n1", 4)];
-            let busy = HashMap::new();
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![7]);
             occupants.insert("n2", vec![9]);
@@ -3996,11 +4076,14 @@ mod tests {
 
             let victims = satisfiable_victim_set(
                 &reclaimer(1, 1),
-                &reclaimable,
-                &occupants,
-                &priorities,
-                None,
-                &state(&nodes, &busy),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &priorities,
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
                 Utc::now(),
             )
             .expect("one evacuable node is enough");
@@ -4016,18 +4099,20 @@ mod tests {
             // Evicting the borrowed job would not empty the node, so it must not count
             // toward closing the shortfall.
             let nodes = vec![node("n1", 4)];
-            let busy = HashMap::new();
             let mut occupants = HashMap::new();
             occupants.insert("n1", vec![7, 9]); // 7 borrowed, 9 has a claim
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
 
             assert!(satisfiable_victim_set(
                 &reclaimer(1, 1),
-                &reclaimable,
-                &occupants,
-                &no_priorities(),
-                None,
-                &state(&nodes, &busy),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &no_priorities(),
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
                 Utc::now()
             )
             .is_none());

@@ -7722,6 +7722,16 @@ fn structural_unplaceable_reason(
         .filter(|n| placement.eligible(n, reservations, now))
         .collect();
 
+    // Resource impossibility, checked against total (not free) capacity: an
+    // eligible set that could not host the job even when idle never will.
+    if !eligible.is_empty()
+        && !eligible
+            .iter()
+            .any(|n| n.total_resources.can_satisfy(&required))
+    {
+        return Some(PendingReason::NodeConfigUnavailable);
+    }
+
     // A k0s-claimed node would otherwise match: unlike a down node, it can
     // free up on its own, so it must not be folded into a "will never place"
     // verdict the way a truly dead node is. Capacity still has to hold —
@@ -17253,6 +17263,232 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_evicts_nothing_for_a_job_no_node_can_host() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut low = basic_spec("low");
+        low.priority = Some(100);
+        let low_id = submit_and_wait(&cm, low);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            low_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, low_id, JobState::Running);
+
+        // `--gres 1` parses into a generic GRES named "1" that no node declares,
+        // so this job can never place no matter how much capacity is freed.
+        let mut unplaceable = basic_spec("unplaceable");
+        unplaceable.priority = Some(10_000);
+        unplaceable.gres = vec!["1".into()];
+        let unplaceable_id = submit_and_wait(&cm, unplaceable);
+        let unplaceable_job = cm.get_job(unplaceable_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        for _ in 0..3 {
+            crate::scheduler_loop::try_preempt(
+                &cm,
+                &partitions,
+                &[&unplaceable_job],
+                &cm.config().scheduler,
+            )
+            .await;
+        }
+        assert_eq!(
+            cm.get_job(low_id).unwrap().state,
+            JobState::Running,
+            "a job no node can ever host must evict nobody, however many cycles pass"
+        );
+
+        // Control on the same fixture: an otherwise identical preemptor that can
+        // actually place does evict, so the refusal above is the gres and not the
+        // fixture being unable to preempt at all.
+        let mut placeable = basic_spec("placeable");
+        placeable.priority = Some(10_000);
+        let placeable_id = submit_and_wait(&cm, placeable);
+        let placeable_job = cm.get_job(placeable_id).unwrap();
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &[&placeable_job],
+            &cm.config().scheduler,
+        )
+        .await;
+        settle(&cm, low_id, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_evicts_the_whole_victim_set_a_multi_node_job_needs() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+
+        let mut victims = Vec::new();
+        for (name, node) in [("low-a", "n1"), ("low-b", "n2")] {
+            let mut low = basic_spec(name);
+            low.priority = Some(100);
+            let id = submit_and_wait(&cm, low);
+            let res = scalar_alloc(2, 4000);
+            cm.start_job(
+                id,
+                vec![node.into()],
+                res.clone(),
+                per_node_for(&[node], res),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+            victims.push(id);
+        }
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        high.num_nodes = 2;
+        high.num_tasks = 2;
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
+            .await;
+
+        for id in victims {
+            settle(&cm, id, JobState::Cancelled);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_evicts_nobody_when_the_victim_set_is_only_partly_eligible() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.partitions[0].preempt_mode = "cancel".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+
+        cm.qos_cache().insert(Qos {
+            name: "shielded".into(),
+            limits: spur_core::accounting::QosLimits {
+                preempt_exempt_time: Some(3600),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut evictable = basic_spec("evictable");
+        evictable.priority = Some(100);
+        let evictable_id = submit_and_wait(&cm, evictable);
+
+        let mut shielded = basic_spec("shielded");
+        shielded.priority = Some(100);
+        shielded.qos = Some("shielded".into());
+        let shielded_id = submit_and_wait(&cm, shielded);
+
+        for (id, node) in [(evictable_id, "n1"), (shielded_id, "n2")] {
+            let res = scalar_alloc(2, 4000);
+            cm.start_job(
+                id,
+                vec![node.into()],
+                res.clone(),
+                per_node_for(&[node], res),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+        }
+
+        let mut high = basic_spec("high");
+        high.priority = Some(10_000);
+        high.num_nodes = 2;
+        high.num_tasks = 2;
+        let high_id = submit_and_wait(&cm, high);
+        let high_job = cm.get_job(high_id).unwrap();
+        let partitions = cm.get_partitions();
+
+        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
+            .await;
+
+        assert_eq!(
+            cm.get_job(evictable_id).unwrap().state,
+            JobState::Running,
+            "half a victim set destroys work without placing the preemptor, so nothing is evicted"
+        );
+        assert_eq!(
+            cm.get_job(shielded_id).unwrap().state,
+            JobState::Running,
+            "the exempt-time guard must still hold"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_no_node_can_host_reports_node_config_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let mut stuck = basic_spec("bogus-gres");
+        stuck.gres = vec!["1".into()];
+        let stuck_id = submit_and_wait(&cm, stuck);
+
+        {
+            let job = cm.get_job(stuck_id).unwrap();
+            let nodes = cm.nodes.read();
+            let reservations = cm.get_reservations();
+            assert_eq!(
+                structural_unplaceable_reason(&job, &nodes, &reservations),
+                Some(PendingReason::NodeConfigUnavailable)
+            );
+        }
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().pending_reason,
+            PendingReason::NodeConfigUnavailable,
+            "the user must see a real reason, not Resources"
+        );
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == stuck_id),
+            "an unplaceable job must leave the schedulable set, keeping it out of \
+             preemption and federation"
+        );
+
+        // Not terminal: the same job becomes schedulable again the moment a node
+        // that declares the resource joins.
+        cm.register_node(
+            "n2".into(),
+            "n2".into(),
+            ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                generic: [("1".to_string(), 1u64)].into_iter().collect(),
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
+        wait_for("n2 registered", || cm.get_node("n2").is_some());
+
+        assert!(
+            cm.pending_jobs().iter().any(|j| j.job_id == stuck_id),
+            "matching hardware joining must clear the reason on its own"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn purge_expired_holds_pending_reservation_jobs() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -18559,17 +18795,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_still_blocks_when_occupied_nodes_have_no_spare_capacity() {
-        // Same grp node=4 shape as the packable case above, but each occupied
-        // node is registered with zero capacity — this test harness inserts
-        // running jobs directly into the job map without updating node-side
-        // allocation, so a genuinely "no headroom" node must be modeled via
-        // zero total capacity rather than an exact-fit allocation. The new job
-        // must still block on QOSGrpNodeLimit, proving the packing credit only
-        // applies when real spare capacity exists.
+        // Same grp node=4 shape as the packable case above, but every node is
+        // fully allocated, so the packing credit has nothing to credit and the
+        // job must still block on QOSGrpNodeLimit.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         for n in ["n1", "n2", "n3", "n4"] {
-            register_node(&cm, n, 0, 0);
+            register_node(&cm, n, 1, 0);
+            // Saturated but not undersized: the structural gate must stay out of
+            // the way so the QOS cap is what reports.
+            if let Some(node) = cm.nodes.write().get_mut(n) {
+                node.alloc_resources.cpus = 1;
+            }
         }
 
         let mut grp = TresRecord::new();
@@ -19786,7 +20023,7 @@ mod tests {
         cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(stuck_id).unwrap().pending_reason,
-            PendingReason::NodeDown,
+            PendingReason::NodeConfigUnavailable,
             "a k0s-reserved node too small for the request would never place even if released"
         );
     }
