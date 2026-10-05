@@ -7722,12 +7722,14 @@ fn structural_unplaceable_reason(
         .filter(|n| placement.eligible(n, reservations, now))
         .collect();
 
-    // Resource impossibility, checked against total (not free) capacity: an
-    // eligible set that could not host the job even when idle never will.
-    if !eligible.is_empty()
-        && !eligible
-            .iter()
-            .any(|n| n.total_resources.can_satisfy(&required))
+    // Resource impossibility against total (not free) capacity. A node with no CPU
+    // count has not reported inventory yet, so it abstains rather than convicts.
+    let mut inventoried = eligible
+        .iter()
+        .filter(|n| n.total_resources.cpus > 0)
+        .peekable();
+    if inventoried.peek().is_some()
+        && !inventoried.any(|n| n.total_resources.can_satisfy(&required))
     {
         return Some(PendingReason::NodeConfigUnavailable);
     }
@@ -16820,8 +16822,14 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&high_job],
+            &cm.config().scheduler,
+        )
+        .await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
     }
 
@@ -16855,8 +16863,14 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&high_job],
+            &cm.config().scheduler,
+        )
+        .await;
         assert_eq!(cm.get_job(low_id).unwrap().state, JobState::Running);
     }
 
@@ -16897,8 +16911,14 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &pending_refs,
+            &cm.config().scheduler,
+        )
+        .await;
 
         settle(&cm, low_id, JobState::Cancelled);
     }
@@ -16956,8 +16976,14 @@ mod tests {
              for preemption to fire"
         );
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &pending_refs,
+            &cm.config().scheduler,
+        )
+        .await;
 
         settle(&cm, burst_id, JobState::Cancelled);
         assert_eq!(
@@ -17012,8 +17038,14 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &pending_refs,
+            &cm.config().scheduler,
+        )
+        .await;
 
         // burst job must still be running — equal explicit priorities, no preemption.
         let burst_job = cm.get_job(burst_id).unwrap();
@@ -17069,8 +17101,14 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &pending_refs,
+            &cm.config().scheduler,
+        )
+        .await;
 
         // low job must still be running — "high" QOS is not allowed to preempt "low"
         assert_eq!(
@@ -17123,8 +17161,14 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &pending_refs,
+            &cm.config().scheduler,
+        )
+        .await;
 
         settle(&cm, low_id, JobState::Cancelled);
     }
@@ -17168,8 +17212,14 @@ mod tests {
         let pending = cm.pending_jobs();
         let pending_refs: Vec<&Job> = pending.iter().collect();
         let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &pending_refs,
+            &cm.config().scheduler,
+        )
+        .await;
 
         // low job must still be running — it was started moments ago and is within the exempt window
         assert_eq!(
@@ -17254,8 +17304,14 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&high_job],
+            &cm.config().scheduler,
+        )
+        .await;
 
         // Suspended, not Cancelled: proves the QoS override reached the real
         // preemption action, not just the pure job_preempt_mode() decision.
@@ -17296,6 +17352,7 @@ mod tests {
             crate::scheduler_loop::try_preempt(
                 &cm,
                 &partitions,
+                &cm.get_nodes(),
                 &[&unplaceable_job],
                 &cm.config().scheduler,
             )
@@ -17316,6 +17373,7 @@ mod tests {
         crate::scheduler_loop::try_preempt(
             &cm,
             &partitions,
+            &cm.get_nodes(),
             &[&placeable_job],
             &cm.config().scheduler,
         )
@@ -17357,8 +17415,14 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&high_job],
+            &cm.config().scheduler,
+        )
+        .await;
 
         for id in victims {
             settle(&cm, id, JobState::Cancelled);
@@ -17412,8 +17476,14 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&high_job],
+            &cm.config().scheduler,
+        )
+        .await;
 
         assert_eq!(
             cm.get_job(evictable_id).unwrap().state,
@@ -17473,8 +17543,14 @@ mod tests {
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
 
-        crate::scheduler_loop::try_preempt(&cm, &partitions, &[&high_job], &cm.config().scheduler)
-            .await;
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&high_job],
+            &cm.config().scheduler,
+        )
+        .await;
 
         assert_eq!(
             cm.get_job(cancellable_id).unwrap().state,
@@ -17485,6 +17561,52 @@ mod tests {
             cm.get_job(suspendable_id).unwrap().state,
             JobState::Running,
             "a suspend-only set cannot place a two-node job either"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_wide_requests_are_not_mistaken_for_impossible_ones() {
+        // The two requests `base_node_request` deliberately leaves out of the
+        // per-node set must not be read as resource impossibility.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let reservations = cm.get_reservations();
+
+        let mut licensed = basic_spec("licensed");
+        licensed.gres = vec!["license:matlab:1".into()];
+        let licensed_id = submit_and_wait(&cm, licensed);
+
+        let mut uninventoried = basic_spec("uninventoried");
+        uninventoried.cpus_per_task = 4;
+        let uninventoried_id = submit_and_wait(&cm, uninventoried);
+
+        {
+            let nodes = cm.nodes.read();
+            assert_eq!(
+                structural_unplaceable_reason(
+                    &cm.get_job(licensed_id).unwrap(),
+                    &nodes,
+                    &reservations
+                ),
+                None,
+                "cluster-wide licenses are not per-node capacity"
+            );
+        }
+
+        // A node that has not reported inventory must abstain rather than convict.
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.total_resources.cpus = 0;
+        }
+        let nodes = cm.nodes.read();
+        assert_eq!(
+            structural_unplaceable_reason(
+                &cm.get_job(uninventoried_id).unwrap(),
+                &nodes,
+                &reservations
+            ),
+            None,
+            "an uninventoried node must not make every job structurally unplaceable"
         );
     }
 
@@ -17513,6 +17635,11 @@ mod tests {
             cm.get_job(stuck_id).unwrap().pending_reason,
             PendingReason::NodeConfigUnavailable,
             "the user must see a real reason, not Resources"
+        );
+        assert_eq!(
+            cm.get_job(stuck_id).unwrap().state,
+            JobState::Pending,
+            "the verdict is re-derived, never terminal"
         );
         assert!(
             !cm.pending_jobs().iter().any(|j| j.job_id == stuck_id),
@@ -18860,11 +18987,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         for n in ["n1", "n2", "n3", "n4"] {
-            register_node(&cm, n, 1, 0);
-            // Saturated but not undersized: the structural gate must stay out of
-            // the way so the QOS cap is what reports.
+            register_node(&cm, n, 8, 16000);
+            // Saturated but not undersized, so the structural gate stays out of the
+            // way and the QOS cap is what reports.
             if let Some(node) = cm.nodes.write().get_mut(n) {
-                node.alloc_resources.cpus = 1;
+                node.alloc_resources.cpus = 8;
+                node.alloc_resources.memory_mb = 16000;
             }
         }
 
@@ -20062,15 +20190,19 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qos_grp_node_does_not_report_k8s_reserved_when_the_reserved_node_is_too_small() {
-        // The only node is k0s-reserved, but it could never fit this job's
-        // request even if k8s released it — releasing it changes nothing, so
-        // this must not be reported as the recoverable K8sReserved case.
+        // n1 is k0s-reserved but too small to fit even if k8s released it, so this
+        // is not the recoverable K8sReserved case. n2 is big enough and merely down,
+        // which keeps the structural gate from answering first.
         use spur_core::k0s::K0sRole;
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 2, 128000);
+        register_node(&cm, "n2", 8, 128000);
         if let Some(node) = cm.nodes.write().get_mut("n1") {
             node.k0s_role = Some(K0sRole::Worker);
+        }
+        if let Some(node) = cm.nodes.write().get_mut("n2") {
+            node.state = NodeState::Down;
         }
 
         let mut stuck = basic_spec("too-big-for-the-k0s-node");
@@ -20082,7 +20214,7 @@ mod tests {
         cm.refresh_pending_reasons();
         assert_eq!(
             cm.get_job(stuck_id).unwrap().pending_reason,
-            PendingReason::NodeConfigUnavailable,
+            PendingReason::NodeDown,
             "a k0s-reserved node too small for the request would never place even if released"
         );
     }

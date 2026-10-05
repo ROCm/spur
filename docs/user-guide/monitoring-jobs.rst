@@ -489,6 +489,16 @@ A job pending on ``Reason=Resources`` looks the same whether the cluster is full
 or the job is pinned to a busy subset of it. ``scontrol show job`` reports the
 request as submitted, which distinguishes the two:
 
+A job that no node could host even when completely idle reports
+``Reason=ReqNodeNotAvail, Requested node configuration is not available``
+instead. Waiting will not help it: either the request exceeds every node's
+capacity, or it names a resource no node declares — a typo such as
+``--gres 1`` asks for one unit of a resource literally named ``1``, which is
+easy to miss because it never appears in ``ReqTRES``. Compare ``ReqTRES`` and
+``MinCPUsNode`` / ``MinMemoryNode`` below against ``spur show node``, and
+check ``--gres`` spelling. The reason is recomputed every scheduling cycle, so
+the job starts on its own once matching nodes join.
+
 .. list-table::
    :header-rows: 1
    :widths: 24 76

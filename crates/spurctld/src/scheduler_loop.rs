@@ -323,6 +323,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 try_preempt(
                     &cluster,
                     &partitions,
+                    &nodes,
                     &unscheduled,
                     &cluster.config().scheduler,
                 )
@@ -875,6 +876,9 @@ fn effective_exempt_secs(
 pub(crate) async fn try_preempt(
     cluster: &Arc<ClusterManager>,
     partitions: &[spur_core::partition::Partition],
+    // The pass's own node view, not a fresh read: a node held back by dispatch
+    // cooldown is empty, and counting it would prove a placement the pass refused.
+    cluster_nodes: &[spur_core::node::Node],
     unscheduled: &[&spur_core::job::Job],
     sched: &spur_core::config::SchedulerConfig,
 ) {
@@ -885,7 +889,6 @@ pub(crate) async fn try_preempt(
 
     let now = chrono::Utc::now();
     let reservations = cluster.get_reservations();
-    let cluster_nodes = cluster.get_nodes();
 
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
         spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
@@ -962,7 +965,7 @@ pub(crate) async fn try_preempt(
                 continue;
             }
 
-            if !preempt_overlaps_pending_nodes(pending, candidate, &cluster_nodes) {
+            if !preempt_overlaps_pending_nodes(pending, candidate, cluster_nodes) {
                 continue;
             }
 
@@ -1004,8 +1007,8 @@ pub(crate) async fn try_preempt(
             eligible.push((candidate, mode));
         }
 
-        // Per mode class, never across: suspension leaves the allocation in place,
-        // so a mixed set would prove a placement it cannot deliver.
+        // Never mixed with suspend, which keeps the allocation: a mixed set would
+        // kill the releasing half for a placement suspension cannot deliver.
         let by_mode = |suspend: bool| -> HashSet<spur_core::job::JobId> {
             eligible
                 .iter()
@@ -1013,8 +1016,8 @@ pub(crate) async fn try_preempt(
                 .map(|(j, _)| j.job_id)
                 .collect()
         };
-        // Nothing is evicted unless the eviction provably places the job: a job no
-        // node can host would otherwise spend a victim every cycle and never run.
+        // A job no node can host finds no set in either pool, so it stops spending a
+        // victim per cycle on a placement that will never happen.
         let mut found = None;
         for pool_ids in [by_mode(false), by_mode(true)] {
             if pool_ids.is_empty() {
@@ -1028,7 +1031,7 @@ pub(crate) async fn try_preempt(
                     priority: &victim_cost,
                     max_priority: None,
                 },
-                &cluster_nodes,
+                cluster_nodes,
                 &reservations,
                 now,
             );
@@ -1071,14 +1074,20 @@ pub(crate) async fn try_preempt(
                     preempted = true;
                 }
                 Err(e) => {
-                    // Stop at the first failure: the rest of the set can no longer
-                    // place the job, so evicting it would only destroy more work.
+                    // A victim gone since the snapshot already released its node, so
+                    // the set still holds. Any other failure leaves it held.
+                    let gone = cluster
+                        .get_job(candidate.job_id)
+                        .is_none_or(|j| j.state != JobState::Running);
                     warn!(
                         job_id = candidate.job_id,
                         error = %e,
-                        "failed to preempt job, abandoning the rest of the victim set"
+                        abandoned_set = !gone,
+                        "failed to preempt job"
                     );
-                    break;
+                    if !gone {
+                        break;
+                    }
                 }
             }
         }
@@ -1131,11 +1140,9 @@ fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
 /// not place. Returns the nodes freed, which the caller holds out of the next cycle
 /// until the agents have confirmed the kill.
 ///
-/// Separate from `try_preempt`: the victim pool is borrowed runs rather than
-/// lower-priority ones, an opportunistic reclaimer is held under a QOS priority
-/// ceiling, and the eviction is always `Requeue`. Both reach the same
-/// `satisfiable_victim_set`, so neither can evict without closing the shortfall
-/// (D2, §8.1).
+/// Separate from `try_preempt`: the pool is borrowed runs, an opportunistic
+/// reclaimer sits under a QOS priority ceiling, and the eviction is always
+/// `Requeue`. Both prove the shortfall closes first (D2, §8.1).
 async fn reclaim_for_unplaced(
     cluster: &Arc<ClusterManager>,
     unplaced: &[&spur_core::job::Job],
@@ -1199,10 +1206,18 @@ async fn reclaim_for_unplaced(
         return (Vec::new(), None);
     }
 
-    // Which running jobs sit on each node, so a node is only counted as freed when
-    // *every* job on it is one this reclaim would evict.
+    // Suspended and completing jobs hold their nodes too, so a node they sit on is
+    // not free for the reclaimer even once every running job on it is evicted.
+    let holders = cluster.get_jobs(&JobFilter {
+        states: &[
+            spur_core::job::JobState::Running,
+            spur_core::job::JobState::Suspended,
+            spur_core::job::JobState::Completing,
+        ],
+        ..Default::default()
+    });
     let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
-    for job in &running {
+    for job in &holders {
         for node in &job.allocated_nodes {
             occupants.entry(node.as_str()).or_default().push(job.job_id);
         }
