@@ -83,7 +83,7 @@ impl Default for ChannelTimeouts {
             connect: Duration::from_secs(2),
             // Liveness for an idle-but-silent peer; detection is roughly interval + timeout.
             keep_alive_interval: Duration::from_secs(10),
-            keep_alive_timeout: Duration::from_secs(10),
+            keep_alive_timeout: Duration::from_secs(5),
         }
     }
 }

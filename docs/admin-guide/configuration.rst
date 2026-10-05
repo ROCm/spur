@@ -348,7 +348,7 @@ bound the controller's connections to agents instead.
        detection time is roughly this plus ``controller_keepalive_timeout_secs``.
    * - ``controller_keepalive_timeout_secs``
      - integer
-     - ``10``
+     - ``5``
      - How long spurd waits for a ping response before dropping the connection.
        Range 1-600 whenever keepalive is on; ``0`` is rejected because it marks
        every ping overdue the moment it is sent. Ignored entirely when

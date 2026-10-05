@@ -1800,7 +1800,7 @@ pub struct SpurdConfig {
     #[serde(default = "default_controller_keepalive_interval_secs")]
     pub controller_keepalive_interval_secs: u64,
 
-    /// How long to wait for a ping response before dropping the connection (default 10).
+    /// How long to wait for a ping response before dropping the connection (default 5).
     #[serde(default = "default_controller_keepalive_timeout_secs")]
     pub controller_keepalive_timeout_secs: u64,
 
@@ -1822,7 +1822,7 @@ pub struct SpurdConfig {
 
 pub const DEFAULT_CONTROLLER_CONNECT_TIMEOUT_SECS: u64 = 2;
 pub const DEFAULT_CONTROLLER_KEEPALIVE_INTERVAL_SECS: u64 = 10;
-pub const DEFAULT_CONTROLLER_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_CONTROLLER_KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_CONTROLLER_RPC_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_CONTROLLER_FAILOVER_COOLDOWN_SECS: u64 = 60;
 pub const DEFAULT_NATIVE_MINT_TIMEOUT_SECS: u64 = 5;
@@ -4591,11 +4591,13 @@ native_mint_timeout_secs = 0
         // No [spurd] section at all: the cluster admin never opted in, so every field must
         // fall back to its serde default rather than fail to load or zero out.
         let cfg = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
-        // These must stay 2/10/10/10/60/5 so making the timers configurable does not
-        // itself change behavior for a deployed config with no [spurd] section.
+        // A deployed config with no [spurd] section must fall back to exactly these
+        // values (2/10/5/10/60/5): the keepalive ack timeout matches the operator and
+        // leader-forwarding channels' own 5s default, since both of those already rely
+        // on it as their live stuck-peer detector.
         assert_eq!(cfg.spurd.controller_connect_timeout_secs, 2);
         assert_eq!(cfg.spurd.controller_keepalive_interval_secs, 10);
-        assert_eq!(cfg.spurd.controller_keepalive_timeout_secs, 10);
+        assert_eq!(cfg.spurd.controller_keepalive_timeout_secs, 5);
         assert_eq!(cfg.spurd.controller_rpc_timeout_secs, 10);
         assert_eq!(cfg.spurd.controller_failover_cooldown_secs, 60);
         assert_eq!(cfg.spurd.native_mint_timeout_secs, 5);
