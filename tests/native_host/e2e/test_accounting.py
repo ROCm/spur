@@ -22,6 +22,58 @@ from cluster import (
 )
 
 
+def _wait_node_gone(cluster, node_name, timeout=60):
+    """Poll sinfo until a node disappears."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if node_name not in cluster.sinfo_nodes():
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    raise TimeoutError(f"Node {node_name} still visible after {timeout}s")
+
+
+class TestSacctNodeFailState:
+    """A job killed by a forced node eviction must be reported and filterable
+    as NODE_FAIL, not silently displayed/filtered as COMPLETED."""
+
+    def test_node_fail_state_and_filter(self, accounting_cluster):
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("node-fail accounting test requires at least 2 nodes")
+        node0 = c.node_names[0]
+
+        script = c.write_file("acct-nodefail.sh", "#!/bin/bash\nsleep 600\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "acct-nodefail", "-N", "1", f"--nodelist={node0}", script])
+        )
+        assert job_id is not None
+        wait_job_state(c, job_id, "R")
+
+        c.cli(["spur", "node", "remove", node0, "--force", "--reason", "node-fail accounting test"])
+
+        final_state = wait_job(c, job_id, timeout=60)
+        assert final_state == "NF", f"expected NODE_FAIL, got {final_state}"
+        _wait_node_gone(c, node0)
+
+        row = wait_sacct_row(c, job_id, "JobID,State")
+        assert row.split()[1] == "NODE_FAIL", f"sacct displayed {row!r}, not NODE_FAIL"
+
+        nf_out = c.sacct(["-j", str(job_id), "-n", "-o", "JobID,State", "--state=NODE_FAIL"])
+        assert str(job_id) in nf_out, (
+            f"sacct --state=NODE_FAIL dropped job {job_id}: {nf_out!r}"
+        )
+
+        completed_out = c.sacct(
+            ["-j", str(job_id), "-n", "-o", "JobID,State", "--state=COMPLETED"]
+        )
+        assert str(job_id) not in completed_out, (
+            f"sacct --state=COMPLETED must not match a NODE_FAIL job: {completed_out!r}"
+        )
+
+
 class TestSacctExitReporting:
     def test_signal_half_and_derived_exit_code(self, accounting_cluster):
         c = accounting_cluster
