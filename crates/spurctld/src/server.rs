@@ -1379,15 +1379,14 @@ fn membership_write_status(
         return Status::internal(format!("{op} failed: {e}"));
     };
     match api {
-        ClientWriteError::ForwardToLeader(forward) => {
-            let leader = forward.leader_id.map_or_else(
-                || "an election is in progress".to_string(),
-                |id| format!("node {id}"),
-            );
-            Status::unavailable(format!(
-                "{op}: leadership moved to {leader} while the request was in flight; run it again"
-            ))
-        }
+        ClientWriteError::ForwardToLeader(forward) => match forward.leader_id {
+            Some(id) => Status::unavailable(format!(
+                "{op}: leadership moved to node {id} while the request was in flight; run it again"
+            )),
+            None => Status::unavailable(format!(
+                "{op}: leadership moved while the request was in flight and no leader is elected yet; run it again"
+            )),
+        },
         ClientWriteError::ChangeMembershipError(ChangeMembershipError::InProgress(_)) => {
             Status::unavailable(format!(
                 "{op}: a membership change is in flight; run it again"
@@ -11919,10 +11918,22 @@ mod tests {
             })),
         );
         assert_eq!(moved.code(), Code::Unavailable);
-        assert!(
-            moved.message().ends_with("run it again"),
-            "{}",
-            moved.message()
+        assert_eq!(
+            moved.message(),
+            "promote to voter: leadership moved to node 2 while the request was in flight; run it again"
+        );
+
+        let no_leader = membership_write_status(
+            "remove member",
+            write_error(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                leader_id: None,
+                leader_node: None,
+            })),
+        );
+        assert_eq!(no_leader.code(), Code::Unavailable);
+        assert_eq!(
+            no_leader.message(),
+            "remove member: leadership moved while the request was in flight and no leader is elected yet; run it again"
         );
 
         let in_flight = membership_write_status(
