@@ -4011,6 +4011,10 @@ impl AgentService {
             )));
         }
 
+        // The session is tracked, so a duplicate can be refused outright rather
+        // than parked here for the whole of the step's runtime.
+        drop(admission);
+
         // Record the workload's pid, not the supervisor's, so the existing
         // cancel path signals the step's own tree and leaves its reporter alive.
         if let Some(pid) = supervised_step_workload_pid(&descriptor).await {

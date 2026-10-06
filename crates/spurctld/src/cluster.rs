@@ -22968,8 +22968,9 @@ mod tests {
 
         cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![1] });
 
-        assert!(
-            cm.next_step_id.read().is_empty(),
+        assert_eq!(
+            cm.allocate_step_id(1),
+            0,
             "an evicted job must not keep a step-id high-water mark"
         );
     }

@@ -2012,21 +2012,30 @@ fn apply_multi_rank_pmix(
     })
 }
 
-/// Binds the control socket, refusing to displace a live peer: unlinking a
-/// path that already answers would steal another supervisor's identity.
+/// Whether a failed probe proves nobody is listening. Any other failure may be
+/// a live supervisor this process merely cannot reach.
+fn probe_proves_unserved(error: io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
+}
+
+/// Binds the control socket, unlinking a stale path only once the probe proves
+/// nobody is serving it: taking a live peer's path would steal its identity.
 pub(crate) fn bind_runtime_socket(socket_path: &Path) -> io::Result<UnixListener> {
     match UnixListener::bind(socket_path) {
         Ok(listener) => return Ok(listener),
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
         Err(error) => return Err(error),
     }
-    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+    let unserved = std::os::unix::net::UnixStream::connect(socket_path)
+        .err()
+        .is_some_and(probe_proves_unserved);
+    if !unserved {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
-            format!(
-                "another supervisor is already serving {}",
-                socket_path.display()
-            ),
+            format!("{} may still be served", socket_path.display()),
         ));
     }
     fs::remove_file(socket_path)?;
@@ -2516,6 +2525,7 @@ impl StepdStore {
 
     /// Takes exclusive ownership of a session directory for one launch. Unlike
     /// `prepare_session_dir`, sharing an owned one is refused rather than reused.
+    /// Refusals carry no errno — the spool classifier reads one as a node fault.
     pub fn claim_session_dir(
         &self,
         job_id: u32,
@@ -2530,7 +2540,7 @@ impl StepdStore {
             Err(error) => return Err(error),
         }
         self.reclaim_session_dir(&session_dir, job_id, run_attempt, step_id)?;
-        create_session_dir(&session_dir)?;
+        create_session_dir(&session_dir).map_err(|error| session_conflict_error(error, step_id))?;
         Ok(session_dir)
     }
 
@@ -2546,25 +2556,24 @@ impl StepdStore {
         // build cannot read may belong to a supervisor that is still running.
         match self.load_descriptor(session_dir) {
             Ok(existing) if !matches!(stepd_liveness(&existing), Ok(StepdLiveness::Stale)) => {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, owned));
+                return Err(session_conflict(owned));
             }
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, owned));
+                return Err(session_conflict(owned));
             }
             Ok(_) | Err(_) => {}
         }
         // Reusing the directory would graft the new run onto the old run's
         // obligation log, so its exit would be replayed as this run's.
         if !matches!(self.observed_exit(job_id, run_attempt, step_id), Ok(None)) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("an exit is already recorded for {job_id}.{run_attempt}.{step_id}"),
-            ));
+            return Err(session_conflict(format!(
+                "an exit is already recorded for {job_id}.{run_attempt}.{step_id}"
+            )));
         }
-        // A benign race with a sweeper must not read as a spool fault, which
-        // would condemn the node.
         match fs::remove_dir_all(session_dir) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                Err(session_conflict_error(error, step_id))
+            }
             _ => Ok(()),
         }
     }
@@ -2947,6 +2956,21 @@ impl StepdStore {
             ));
         }
         Ok(descriptor)
+    }
+}
+
+fn session_conflict(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::AlreadyExists, message)
+}
+
+/// Strips the errno off a directory race so it cannot be mistaken for the
+/// spool fault that condemns the node; a real fs fault keeps its errno.
+fn session_conflict_error(error: io::Error, step_id: spur_core::step::StepId) -> io::Error {
+    match error.raw_os_error() {
+        Some(libc::EEXIST) | Some(libc::ENOTEMPTY) | Some(libc::EBUSY) => {
+            session_conflict(format!("step {step_id}'s session directory is contended"))
+        }
+        _ => error,
     }
 }
 
@@ -3363,6 +3387,63 @@ mod tests {
             .claim_session_dir(9, 1, step_id)
             .expect_err("an unreadable descriptor still names an owner");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_refused_claim_never_reads_as_a_node_fault() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let session = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        let mut live = descriptor(9, 1, std::process::id());
+        live.socket_path = session.join("runtime.sock");
+        store.publish(&live).expect("publish descriptor");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("the duplicate is refused");
+
+        // An errno here is classified as a spool fault and drains the node.
+        assert_eq!(
+            error.raw_os_error(),
+            None,
+            "a contended session must not look like a failing disk"
+        );
+    }
+
+    #[test]
+    fn a_contended_session_directory_never_reads_as_a_node_fault() {
+        let busy = io::Error::from_raw_os_error(libc::EEXIST);
+        assert_eq!(session_conflict_error(busy, 3).raw_os_error(), None);
+
+        let not_empty = io::Error::from_raw_os_error(libc::ENOTEMPTY);
+        assert_eq!(session_conflict_error(not_empty, 3).raw_os_error(), None);
+
+        // A real spool fault must keep its errno so the node is condemned.
+        let no_space = io::Error::from_raw_os_error(libc::ENOSPC);
+        assert_eq!(
+            session_conflict_error(no_space, 3).raw_os_error(),
+            Some(libc::ENOSPC)
+        );
+    }
+
+    #[test]
+    fn only_a_refused_or_absent_peer_licenses_unlinking_a_socket() {
+        assert!(probe_proves_unserved(io::Error::from_raw_os_error(
+            libc::ECONNREFUSED
+        )));
+        assert!(probe_proves_unserved(io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+
+        // Unreachable for some other reason: a live supervisor may still own it.
+        for errno in [libc::EACCES, libc::EPERM, libc::EMFILE, libc::ETIMEDOUT] {
+            assert!(
+                !probe_proves_unserved(io::Error::from_raw_os_error(errno)),
+                "errno {errno} does not prove the socket is unserved"
+            );
+        }
     }
 
     #[test]
