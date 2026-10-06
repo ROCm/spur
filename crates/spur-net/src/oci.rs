@@ -457,6 +457,9 @@ pub struct RegistryCredentials {
     pub password: String,
 }
 
+/// Environment variable holding a registry password.
+pub const REGISTRY_PASSWORD_ENV: &str = "SPUR_REGISTRY_PASSWORD";
+
 /// Load credentials for a registry from:
 /// 1. Environment: SPUR_REGISTRY_USER + SPUR_REGISTRY_PASSWORD
 /// 2. Credentials file: ~/.config/spur/credentials (netrc format)
@@ -465,7 +468,7 @@ pub fn load_credentials(registry: &str) -> Option<RegistryCredentials> {
     // 1. Environment variables
     if let (Ok(user), Ok(pass)) = (
         std::env::var("SPUR_REGISTRY_USER"),
-        std::env::var("SPUR_REGISTRY_PASSWORD"),
+        std::env::var(REGISTRY_PASSWORD_ENV),
     ) {
         if !user.is_empty() {
             return Some(RegistryCredentials {

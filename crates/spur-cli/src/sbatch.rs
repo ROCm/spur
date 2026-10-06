@@ -791,7 +791,7 @@ fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool)
     script.unwrap_or("sbatch").to_string()
 }
 
-fn build_sbatch_job_spec(
+pub(crate) fn build_sbatch_job_spec(
     mut args: SbatchArgs,
     nodelist: Option<String>,
     submit_line: &str,

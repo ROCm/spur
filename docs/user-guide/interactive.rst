@@ -62,13 +62,14 @@ Common options:
      -
      - Which submission environment variables reach the step, using Slurm's
        grammar (``ALL``, ``NONE``, ``VAR1,VAR2``, ``VAR=value``,
-       ``ALL,VAR=value``; ``ALL``/``NONE`` are case-insensitive).
-       ``SLURM_*``/``SPUR_*`` are always kept, except ``SPUR_AUTH_TOKEN``
-       unless named. Default ``ALL``; env default
-       ``SPUR_EXPORT_ENV``, then ``SLURM_EXPORT_ENV`` (set by
-       ``sbatch --export``). Under ``NONE`` a step has no ``PATH``, so give
-       the command's absolute path. Ignored for a ``--pty`` step inside an
-       existing allocation, which runs in the job's environment.
+       ``ALL,VAR=value``; ``ALL``/``NONE`` are case-insensitive). Under
+       ``NONE``/list forms, ``SLURM_*``/``SPUR_*`` are kept, except credentials
+       (``SPUR_AUTH_TOKEN``, ``SPUR_REGISTRY_PASSWORD``) unless named. Default
+       ``ALL``; env default ``SPUR_EXPORT_ENV``, then ``SRUN_EXPORT_ENV``, then
+       ``SLURM_EXPORT_ENV`` (set by ``sbatch --export``). Under ``NONE`` a step
+       has no ``PATH``, so give the command's absolute path. Ignored for a
+       ``--pty`` step inside an existing allocation, which runs in the job's
+       environment.
    * - ``--partition``
      - ``-p``
      - Partition to run in.

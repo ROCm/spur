@@ -238,8 +238,10 @@ variables the job inherits. Default is ``ALL``.
 
 The ``NONE`` and list forms still forward the caller's ``SLURM_*`` and
 ``SPUR_*`` variables, matching Slurm, so a job keeps its scheduler context.
-The exception is the ``SPUR_AUTH_TOKEN`` credential, which these forms drop
-unless you name it explicitly (``--export=NONE,SPUR_AUTH_TOKEN``).
+The exception is credentials (``SPUR_AUTH_TOKEN``, ``SPUR_REGISTRY_PASSWORD``),
+which these forms drop unless you name them explicitly
+(``--export=NONE,SPUR_AUTH_TOKEN``). ``ALL`` forwards the whole environment
+unfiltered, credentials included.
 
 .. code-block:: bash
 
@@ -255,6 +257,11 @@ no ``PATH``, so commands need an absolute path. To give steps the full batch
 environment back, use ``srun --export=ALL`` for one step, or add
 ``export SLURM_EXPORT_ENV=ALL`` near the top of the script for all of them.
 ``srun`` accepts the same ``--export`` grammar directly.
+
+As in Slurm, ``srun --export`` does not rewrite ``SLURM_EXPORT_ENV`` in the
+step, so an ``srun`` launched from inside such a step still inherits the
+original mode, not the override. Set ``SRUN_EXPORT_ENV`` (the ``srun``-only
+override) or ``unset SLURM_EXPORT_ENV`` to change it.
 
 .. note::
 

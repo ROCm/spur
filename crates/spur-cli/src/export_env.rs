@@ -1,11 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared `--export` resolution for `sbatch` and `srun`.
-//!
-//! Both commands identify which of the submitter's environment variables reach
-//! the launched application, using Slurm's `--export` grammar. The logic lives
-//! here so the two entry points stay identical.
+//! Shared `--export` resolution for `sbatch` and `srun`, using Slurm's
+//! `--export` grammar so the two entry points stay identical.
 
 use std::collections::HashMap;
 
@@ -17,11 +14,9 @@ pub(crate) fn is_export_all(spec: &str) -> bool {
 /// Resolve `--export` per Slurm semantics against a submission environment.
 ///
 /// `ALL` seeds the full environment. `NONE` and a leading bare list token seed
-/// only the caller's `SLURM_*`/`SPUR_*` variables, which Slurm always
-/// propagates so a step keeps its allocation context. Remaining tokens are
-/// applied on top: `VAR` copies the current value from `source`, `VAR=value`
-/// sets an explicit value (overriding an inherited one). The value may itself
-/// contain `=`. `ALL` and `NONE` match case-insensitively.
+/// only `SLURM_*`/`SPUR_*` (minus [`CREDENTIAL_VARS`]). Remaining tokens apply
+/// on top: `VAR` copies from `source`, `VAR=value` sets it. `ALL`/`NONE` are
+/// case-insensitive.
 pub(crate) fn resolve_export_env(
     spec: &str,
     source: HashMap<String, String>,
@@ -54,14 +49,19 @@ pub(crate) fn resolve_export_env(
     env
 }
 
-/// Copy the `SLURM_*`/`SPUR_*` variables Slurm always propagates.
-///
-/// The auth token is scheduler-prefixed but is a credential, not allocation
-/// context; a restricted export must not carry it into the job unless named.
+/// Scheduler-prefixed variables that are credentials, not allocation context.
+/// A restricted export must not carry these into the job unless named.
+const CREDENTIAL_VARS: &[&str] = &[
+    crate::authclient::TOKEN_ENV,
+    spur_net::oci::REGISTRY_PASSWORD_ENV,
+];
+
+/// Copy the `SLURM_*`/`SPUR_*` variables Slurm always propagates, minus
+/// credentials (see [`CREDENTIAL_VARS`]).
 fn scheduler_vars(source: &HashMap<String, String>) -> HashMap<String, String> {
     source
         .iter()
-        .filter(|(k, _)| k.as_str() != crate::authclient::TOKEN_ENV)
+        .filter(|(k, _)| !CREDENTIAL_VARS.contains(&k.as_str()))
         .filter(|(k, _)| k.starts_with("SLURM_") || k.starts_with("SPUR_"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
@@ -100,17 +100,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_export_restricted_modes_drop_auth_token_unless_named() {
-        let mut source = source_env();
-        source.insert("SPUR_AUTH_TOKEN".into(), "secret".into());
+    fn resolve_export_restricted_modes_drop_credentials_unless_named() {
+        for cred in CREDENTIAL_VARS {
+            let mut source = source_env();
+            source.insert((*cred).into(), "secret".into());
 
-        for spec in ["NONE", "HOME", "MASTER_PORT=1"] {
-            let env = resolve_export_env(spec, source.clone());
-            assert!(!env.contains_key("SPUR_AUTH_TOKEN"), "{spec}");
-            assert_eq!(env["SPUR_NTASKS"], "4", "{spec}");
+            for spec in ["NONE", "HOME", "MASTER_PORT=1"] {
+                let env = resolve_export_env(spec, source.clone());
+                assert!(!env.contains_key(*cred), "{cred} leaked under {spec}");
+                assert_eq!(env["SPUR_NTASKS"], "4", "{cred} / {spec}");
+            }
+            let named = resolve_export_env(&format!("NONE,{cred}"), source);
+            assert_eq!(named[*cred], "secret", "{cred} not forwarded when named");
         }
-        let named = resolve_export_env("NONE,SPUR_AUTH_TOKEN", source);
-        assert_eq!(named["SPUR_AUTH_TOKEN"], "secret");
     }
 
     #[test]

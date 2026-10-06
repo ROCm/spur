@@ -522,10 +522,12 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
     );
     // Slurm's sbatch sets SLURM_EXPORT_ENV so nested steps inherit its mode.
     // An explicit `srun --export=ALL` still wins, undoing an inherited NONE.
+    // SRUN_EXPORT_ENV is Slurm's srun-only override, taking precedence over the
+    // inherited SLURM_EXPORT_ENV.
     apply_string(
         matches,
         "export",
-        &["SPUR_EXPORT_ENV", "SLURM_EXPORT_ENV"],
+        &["SPUR_EXPORT_ENV", "SRUN_EXPORT_ENV", "SLURM_EXPORT_ENV"],
         &mut args.export,
     );
 
@@ -2661,6 +2663,24 @@ mod tests {
         assert_eq!(resolve_from(&["srun", "hostname"]).export, "ALL");
     }
 
+    #[test]
+    #[serial(env_injection)]
+    fn export_srun_var_precedes_slurm_var() {
+        let env = EnvGuard::new();
+        env.set("SRUN_EXPORT_ENV", "NONE");
+        env.set("SLURM_EXPORT_ENV", "ALL");
+        assert_eq!(resolve_from(&["srun", "hostname"]).export, "NONE");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_spur_var_precedes_srun_var() {
+        let env = EnvGuard::new();
+        env.set("SPUR_EXPORT_ENV", "ALL");
+        env.set("SRUN_EXPORT_ENV", "NONE");
+        assert_eq!(resolve_from(&["srun", "hostname"]).export, "ALL");
+    }
+
     fn dispatch_source() -> HashMap<String, String> {
         [("PATH", "/usr/bin"), ("SLURM_JOB_ID", "42")]
             .into_iter()
@@ -2705,6 +2725,38 @@ mod tests {
         assert_eq!(
             dispatch.get("SPUR_CPU_BIND").map(String::as_str),
             Some("cores")
+        );
+    }
+
+    // The two sides of the inheritance chain meet here: sbatch --export=NONE
+    // records the mode, and a plain srun run in that job's environment picks it
+    // up and strips non-scheduler vars from the step.
+    #[test]
+    #[serial(env_injection)]
+    fn sbatch_none_mode_restricts_a_nested_step() {
+        let env = EnvGuard::new();
+        let argv = ["sbatch", "--export=NONE", "--wrap", "hostname"].map(String::from);
+        let sbatch_args = crate::sbatch::resolve_sbatch_args(&[], &argv).expect("args");
+        let line = crate::submitline::render(&argv);
+        let spec = crate::sbatch::build_sbatch_job_spec(sbatch_args, None, &line).expect("spec");
+        assert_eq!(
+            spec.environment.get("SLURM_EXPORT_ENV").map(String::as_str),
+            Some("NONE")
+        );
+
+        for (k, v) in &spec.environment {
+            env.set(k, v);
+        }
+        let step_args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(step_args.export, "NONE");
+
+        let mut shell_env = spec.environment.clone();
+        shell_env.insert("MYVAR".into(), "v".into());
+        let dispatch = srun_dispatch_environment(&step_args, shell_env);
+        assert!(!dispatch.contains_key("MYVAR"));
+        assert_eq!(
+            dispatch.get("SLURM_EXPORT_ENV").map(String::as_str),
+            Some("NONE")
         );
     }
 
