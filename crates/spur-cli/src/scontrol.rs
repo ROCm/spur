@@ -572,11 +572,9 @@ fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> St
     )
 }
 
-/// The job's nodelist from the environment, preferring `SLURM_JOB_NODELIST`
-/// and falling back to `SPUR_JOB_NODELIST` (both set by `spurd`). A set-but-empty
-/// variable is treated as absent, so an empty `SLURM_JOB_NODELIST` still falls
-/// back to `SPUR_JOB_NODELIST` rather than masking it. `lookup` is injected so
-/// the precedence is testable without touching the process environment.
+/// The job's nodelist from the environment: `SLURM_JOB_NODELIST`, else
+/// `SPUR_JOB_NODELIST`. A blank value counts as absent. `lookup` is injected
+/// so precedence is testable without touching the process environment.
 fn job_nodelist_env(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
     ["SLURM_JOB_NODELIST", "SPUR_JOB_NODELIST"]
         .into_iter()
@@ -584,23 +582,15 @@ fn job_nodelist_env(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
         .find(|v| !v.trim().is_empty())
 }
 
-/// `scontrol show hostnames|hostlist|hostlistsorted`: pure hostlist transforms
-/// that never contact the controller, so they work on a compute node with no
-/// controller reachable. `None` means `entity` is not one of these, so the
-/// caller should fall through to the controller-backed `show`.
-///
-/// Only `hostnames` falls back to the job's nodelist environment, matching
-/// Slurm. `hostlist`/`hostlistsorted` require an explicit argument. Both compress
-/// via [`spur_core::hostlist::compress`], which always dedups and natural-sorts,
-/// so they produce identical output here.
+/// `scontrol show hostnames|hostlist|hostlistsorted`: local hostlist transforms
+/// that never contact the controller. `None` if `entity` is not one of them.
 fn show_hostlist(
     entity: &str,
     arg: Option<&str>,
     env_nodelist: Option<&str>,
 ) -> Option<Result<String>> {
-    let entity = entity.to_lowercase();
     let arg = normalize_show_name(arg);
-    match entity.as_str() {
+    match entity.to_lowercase().as_str() {
         "hostnames" => {
             let Some(list) = arg.or(normalize_show_name(env_nodelist)) else {
                 return Some(Err(anyhow::anyhow!(
@@ -2633,6 +2623,33 @@ mod tests {
     #[test]
     fn detect_entity_rejects_both_markers() {
         assert!(detect_entity(&p(&["PartitionName=gpu", "ReservationName=maint"])).is_err());
+    }
+
+    #[tokio::test]
+    async fn show_hostnames_does_not_contact_controller() {
+        // Point at an address nothing listens on. The command must still succeed,
+        // which proves it returns before ever attempting to connect.
+        main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            "http://127.0.0.1:1".into(),
+            "show".into(),
+            "hostnames".into(),
+            "n[1-3]".into(),
+        ])
+        .await
+        .expect("hostnames must not contact the controller");
+    }
+
+    #[test]
+    fn show_hostlist_missing_arg_echoes_original_casing() {
+        let err = show_hostlist("HostList", None, None)
+            .expect("hostlist is a hostlist entity")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("scontrol show HostList:"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
