@@ -335,6 +335,10 @@ pub enum PendingReason {
     /// association state on disk and refuses to start without it, so it never
     /// schedules in this state to begin with.
     AccountingUnavailable,
+
+    /// No eligible node could host the request even when completely empty, so
+    /// neither waiting nor preemption can place it. Re-derived every pass.
+    NodeConfigUnavailable,
 }
 
 impl PendingReason {
@@ -424,6 +428,9 @@ impl PendingReason {
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
             Self::Preempted => "Preempted",
             Self::AccountingUnavailable => "AccountingUnavailable",
+            Self::NodeConfigUnavailable => {
+                "ReqNodeNotAvail, Requested node configuration is not available"
+            }
         }
     }
 
@@ -2370,6 +2377,19 @@ mod tests {
         assert_eq!(json, "\"AccountingUnavailable\"");
         let back: PendingReason = serde_json::from_str(&json).unwrap();
         assert_eq!(back, PendingReason::AccountingUnavailable);
+    }
+
+    // Same compatibility surface as the variant above.
+    #[test]
+    fn node_config_unavailable_reason_displays_and_roundtrips() {
+        assert_eq!(
+            PendingReason::NodeConfigUnavailable.display(),
+            "ReqNodeNotAvail, Requested node configuration is not available"
+        );
+        let json = serde_json::to_string(&PendingReason::NodeConfigUnavailable).unwrap();
+        assert_eq!(json, "\"NodeConfigUnavailable\"");
+        let back: PendingReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PendingReason::NodeConfigUnavailable);
     }
 
     #[test]
