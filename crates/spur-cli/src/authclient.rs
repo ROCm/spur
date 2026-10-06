@@ -18,7 +18,7 @@ use tonic::transport::Channel;
 use tonic::{Request, Status};
 
 /// Environment variable holding a JWT credential, checked before the on-disk token.
-const TOKEN_ENV: &str = "SPUR_AUTH_TOKEN";
+pub(crate) const TOKEN_ENV: &str = "SPUR_AUTH_TOKEN";
 
 /// Override `[auth] plugin` without rewriting the config file (tests and login-host debugging).
 const PLUGIN_ENV: &str = "SPUR_AUTH_PLUGIN";

@@ -6,7 +6,6 @@ use anyhow::{bail, Context, Result};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use spur_proto::proto::{GetJobRequest, JobSpec, JobState, SubmitJobRequest};
-use std::collections::HashMap;
 
 /// Submit a batch job script.
 #[derive(Parser, Debug)]
@@ -792,40 +791,7 @@ fn default_job_name(job_name: Option<&str>, script: Option<&str>, is_wrap: bool)
     script.unwrap_or("sbatch").to_string()
 }
 
-/// Resolve `--export` per Slurm semantics against a submission environment.
-///
-/// A leading `ALL` seeds the full environment, `NONE` seeds an empty one, and
-/// any other leading token starts an empty environment. Remaining tokens are
-/// applied on top: `VAR` copies the current value from `source`, `VAR=value`
-/// sets an explicit value (overriding an inherited one). The value may itself
-/// contain `=`.
-fn resolve_export_env(spec: &str, source: HashMap<String, String>) -> HashMap<String, String> {
-    let tokens: Vec<&str> = spec.split(',').filter(|t| !t.is_empty()).collect();
-    // Fast path for the default: forward the environment as-is, no copy.
-    if tokens.as_slice() == ["ALL"] {
-        return source;
-    }
-    let (mut env, rest) = match tokens.first() {
-        Some(&"ALL") => (source.clone(), &tokens[1..]),
-        Some(&"NONE") => (HashMap::new(), &tokens[1..]),
-        _ => (HashMap::new(), &tokens[..]),
-    };
-    for tok in rest {
-        match tok.split_once('=') {
-            Some((k, v)) => {
-                env.insert(k.to_string(), v.to_string());
-            }
-            None => {
-                if let Some(v) = source.get(*tok) {
-                    env.insert(tok.to_string(), v.clone());
-                }
-            }
-        }
-    }
-    env
-}
-
-fn build_sbatch_job_spec(
+pub(crate) fn build_sbatch_job_spec(
     mut args: SbatchArgs,
     nodelist: Option<String>,
     submit_line: &str,
@@ -896,7 +862,15 @@ fn build_sbatch_job_spec(
         .transpose()?;
 
     // Build environment
-    let environment = resolve_export_env(&args.export, std::env::vars().collect());
+    let mut environment =
+        crate::export_env::resolve_export_env(&args.export, std::env::vars().collect());
+
+    // Only a non-default mode is recorded, as in Slurm, so a plain job leaves any
+    // user-set value alone. No SPUR_ twin: srun reads SPUR_EXPORT_ENV first, so a
+    // stale twin would override a script's `export SLURM_EXPORT_ENV=ALL`.
+    if !crate::export_env::is_export_all(&args.export) {
+        environment.insert("SLURM_EXPORT_ENV".to_string(), args.export.clone());
+    }
 
     // Parse dependencies
     let dependencies: Vec<String> = args
@@ -1153,66 +1127,6 @@ async fn wait_for_job(
 mod tests {
     use super::*;
 
-    fn source_env() -> HashMap<String, String> {
-        [
-            ("HOME", "/home/me"),
-            ("EDITOR", "vim"),
-            ("PATH", "/usr/bin"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-    }
-
-    #[test]
-    fn resolve_export_all_propagates_full_env() {
-        let env = resolve_export_env("ALL", source_env());
-        assert_eq!(env, source_env());
-    }
-
-    #[test]
-    fn resolve_export_none_propagates_nothing() {
-        assert!(resolve_export_env("NONE", source_env()).is_empty());
-    }
-
-    #[test]
-    fn resolve_export_plain_list_copies_named_vars_only() {
-        let env = resolve_export_env("HOME,EDITOR", source_env());
-        assert_eq!(env.len(), 2);
-        assert_eq!(env["HOME"], "/home/me");
-        assert_eq!(env["EDITOR"], "vim");
-    }
-
-    #[test]
-    fn resolve_export_bare_name_missing_from_source_is_skipped() {
-        let env = resolve_export_env("HOME,NOPE", source_env());
-        assert_eq!(env.len(), 1);
-        assert!(!env.contains_key("NOPE"));
-    }
-
-    #[test]
-    fn resolve_export_combined_all_adds_and_overrides() {
-        let env = resolve_export_env("ALL,EDITOR=emacs,WORLD_SIZE=16", source_env());
-        assert_eq!(env["HOME"], "/home/me");
-        assert_eq!(env["PATH"], "/usr/bin");
-        assert_eq!(env["EDITOR"], "emacs");
-        assert_eq!(env["WORLD_SIZE"], "16");
-    }
-
-    #[test]
-    fn resolve_export_inline_assignment_without_all() {
-        let env = resolve_export_env("MASTER_PORT=29999,HOME", source_env());
-        assert_eq!(env.len(), 2);
-        assert_eq!(env["MASTER_PORT"], "29999");
-        assert_eq!(env["HOME"], "/home/me");
-    }
-
-    #[test]
-    fn resolve_export_value_may_contain_equals() {
-        let env = resolve_export_env("KEY=a=b=c", source_env());
-        assert_eq!(env["KEY"], "a=b=c");
-    }
-
     #[test]
     fn build_sbatch_job_spec_records_the_submit_line() {
         // --wrap keeps the script in memory, so the test needs no fixture file.
@@ -1225,6 +1139,44 @@ mod tests {
             spec.submit_line,
             "sbatch -w node1 --exclusive --wrap hostname"
         );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn build_sbatch_job_spec_records_non_default_export_for_steps() {
+        let _env = EnvGuard::new();
+        let argv = ["sbatch", "--export", "NONE", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let line = crate::submitline::render(&argv);
+        let spec = build_sbatch_job_spec(args, None, &line).expect("spec");
+        assert_eq!(
+            spec.environment.get("SLURM_EXPORT_ENV").map(String::as_str),
+            Some("NONE")
+        );
+        assert!(!spec.environment.contains_key("SPUR_EXPORT_ENV"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn build_sbatch_job_spec_treats_lowercase_all_as_default() {
+        let _env = EnvGuard::new();
+        let argv = ["sbatch", "--export=all", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let line = crate::submitline::render(&argv);
+        let spec = build_sbatch_job_spec(args, None, &line).expect("spec");
+        assert!(!spec.environment.contains_key("SLURM_EXPORT_ENV"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn build_sbatch_job_spec_omits_export_env_for_default_all() {
+        let _env = EnvGuard::new();
+        let argv = ["sbatch", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let line = crate::submitline::render(&argv);
+        let spec = build_sbatch_job_spec(args, None, &line).expect("spec");
+        assert!(!spec.environment.contains_key("SLURM_EXPORT_ENV"));
+        assert!(!spec.environment.contains_key("SPUR_EXPORT_ENV"));
     }
 
     /// --container-readonly is a no-op in the runtime today, so it is refused at

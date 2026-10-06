@@ -160,7 +160,7 @@ class TestSrunPtyStep:
         assert code == 0, out
         assert "--output/--error are not applied" in out, out
         assert "--chdir does not move a --pty step" in out, out
-        assert "--cpu-bind/--gpu-bind/--label/--mpi are ignored" in out, out
+        assert "--cpu-bind/--gpu-bind/--label/--mpi/--export are ignored" in out, out
 
     def test_step_warnings_are_emitted_exactly_once(self, cluster):
         # The pty path chains both helpers and returns before dispatch_step, so
