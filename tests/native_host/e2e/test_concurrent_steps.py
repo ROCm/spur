@@ -1,12 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Concurrent `srun` steps inside one allocation.
-
-Steps launched at the same instant must each get their own id and their own
-supervisor session. Two steps sharing one session overwrite each other's
-launch spec, descriptor and socket, which kills the whole job.
-"""
+"""Concurrent `srun` steps inside one allocation each get their own session."""
 
 import time
 
@@ -14,20 +9,25 @@ RESERVED_STEP_MIN = 0xFFFF_FFF0
 CONCURRENT_STEPS = 6
 
 
-def _session_names(cluster, node_index: int = 0) -> list[str]:
-    node = cluster.nodes[node_index]
-    listing = node.exec_allow_fail(
-        f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
-    )
-    return [name for name in listing.split() if name[:1].isdigit()]
+def _session_names(cluster) -> list[str]:
+    names = []
+    for node in cluster.nodes:
+        listing = node.exec_allow_fail(
+            f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
+        )
+        names.extend(name for name in listing.split() if name[:1].isdigit())
+    return names
 
 
 def _numbered_step_ids(cluster, job_id: int) -> set[int]:
     ids = set()
     for name in _session_names(cluster):
         parts = name.split(".")
-        if len(parts) == 3 and parts[0] == str(job_id) and int(parts[2]) < RESERVED_STEP_MIN:
-            ids.add(int(parts[2]))
+        if len(parts) != 3 or parts[0] != str(job_id):
+            continue
+        step_id = int(parts[2])
+        if step_id < RESERVED_STEP_MIN:
+            ids.add(step_id)
     return ids
 
 
@@ -35,13 +35,13 @@ class TestConcurrentStepLaunch:
     def test_concurrent_steps_each_run_exactly_once(self, cluster):
         marker = f"{cluster.remote_dir}/concurrent-steps-{time.time_ns()}.txt"
         job_file = f"{cluster.remote_dir}/concurrent-steps-job-{time.time_ns()}.txt"
-        # `wait` with no operands always returns 0, so each child is waited on
-        # by pid or a step that died would not fail the allocation shell.
+        # Each child is waited on by pid: bare `wait` always returns 0, so a
+        # step that died would not fail the allocation shell.
         body = (
             f'echo "$SPUR_JOB_ID" > {job_file}\n'
             "pids=()\n"
             f"for i in $(seq 1 {CONCURRENT_STEPS}); do\n"
-            f"  srun -n1 bash -c \"echo step-\\$i >> {marker}\" &\n"
+            f'  srun -n1 bash -c "echo step-$i >> {marker}" &\n'
             "  pids+=($!)\n"
             "done\n"
             'for pid in "${pids[@]}"; do wait "$pid"; done\n'
