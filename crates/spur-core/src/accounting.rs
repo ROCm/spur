@@ -166,9 +166,8 @@ pub struct PerUserCaps {
     pub max_jobs: Option<u32>,
     pub max_submit_jobs: Option<u32>,
     pub max_tres: Option<TresRecord>,
-    /// Per-job TRES cap for this user, where the scope keys it per user — an
-    /// association does. A QOS applies one per-job cap scope-wide, so it stays
-    /// `None` here and rides on the scope record instead.
+    /// Set only by an association, which keys its per-job cap per user; a QOS's
+    /// is scope-wide and lives on [`ScopeLimitUsage`].
     pub max_tres_per_job: Option<TresRecord>,
 }
 
@@ -194,16 +193,12 @@ pub struct ScopeLimitUsage {
     pub grp_tres: Option<TresRecord>,
     pub grp_submit_jobs: Option<u32>,
     pub max_wall_minutes: Option<u32>,
-    /// Per-job TRES cap the scope applies to a single job, distinct from the
-    /// per-user `user_caps.max_tres` and the aggregate `grp_tres`. Both a QOS and
-    /// an association enforce it.
+    /// This and the three below are QOS-only, `None` in an association record; an
+    /// association's per-job cap is on each [`PerUserCaps`].
     pub max_tres_per_job: Option<TresRecord>,
-    /// Caps a QOS carries that an association does not, so they stay `None` in an
-    /// association record. `grp_wall_consumed_minutes` is the wall-clock spend
-    /// behind `grp_wall_minutes`; `None` means the controller's GrpWall cache has
-    /// not loaded, not zero spend.
     pub max_submit_jobs_per_account: Option<u32>,
     pub grp_wall_minutes: Option<u32>,
+    /// `None` until the GrpWall cache loads, which is not zero spend.
     pub grp_wall_consumed_minutes: Option<u64>,
     /// The caps every user of this scope is held to, where the scope defines them
     /// once — a QOS does, an association does not, so it stays `None` there and
@@ -262,10 +257,8 @@ impl ScopeLimitUsage {
         exceeded
     }
 
-    /// Whether spend has reached the group wall budget. Uses `>=`, not `>`: the
-    /// gate blocks once consumption *reaches* the cap (see `check_qos_limits`),
-    /// so parity with enforcement means the same boundary counts as exceeded.
-    /// Unknown consumption (cache not loaded) is never a breach.
+    /// `>=`, not `>` like the other caps: `check_qos_limits` blocks once spend
+    /// reaches the budget. Unread spend is never a breach.
     fn grp_wall_exceeded(&self) -> bool {
         match (self.grp_wall_minutes, self.grp_wall_consumed_minutes) {
             (Some(cap), Some(consumed)) => consumed >= cap as u64,
@@ -558,9 +551,6 @@ mod tests {
 
     #[test]
     fn scope_exceeded_caps_reports_grp_wall_at_the_gate_boundary() {
-        // The gate blocks once spend *reaches* the budget (`>=`, see
-        // `check_qos_limits`), so 600 against a 600 cap is already exceeded, and a
-        // minute short is not.
         let at_cap = ScopeLimitUsage {
             grp_wall_minutes: Some(600),
             grp_wall_consumed_minutes: Some(600),
@@ -578,8 +568,6 @@ mod tests {
 
     #[test]
     fn scope_exceeded_caps_never_flags_grp_wall_without_a_reading() {
-        // Unknown spend (the GrpWall cache has not loaded) must not read as a
-        // breach; enforcement leaves the budget unapplied in exactly that state.
         let usage = ScopeLimitUsage {
             grp_wall_minutes: Some(1),
             grp_wall_consumed_minutes: None,

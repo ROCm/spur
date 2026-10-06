@@ -5077,10 +5077,8 @@ fn opt_tres(t: &Option<spur_core::accounting::TresRecord>) -> String {
     t.as_ref().map(|t| t.format()).unwrap_or_default()
 }
 
-/// A consumption figure onto the wire. `None` (the GrpWall cache holds no
-/// snapshot) becomes `INFINITE` so a client can tell "unknown" from a real zero;
-/// a genuine value is clamped just below the sentinel so it can never be mistaken
-/// for it, which realistic wall-minute spend never reaches anyway.
+/// Unread spend goes out as `INFINITE` so a client can tell it from a real zero; a
+/// real value is clamped below the sentinel so the two never collide.
 fn opt_consumed(v: Option<u64>) -> u32 {
     match v {
         None => spur_core::accounting::INFINITE,

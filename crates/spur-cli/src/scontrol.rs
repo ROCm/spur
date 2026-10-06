@@ -882,8 +882,6 @@ struct AssocMgrSection {
     title: &'static str,
     scope: &'static str,
     per_user: &'static str,
-    /// A QOS carries the per-account submit cap and the group wall budget; an
-    /// association cannot hold either, so those figures are printed only here.
     is_qos: bool,
 }
 
@@ -975,10 +973,7 @@ fn wall_or_n(minutes: u32) -> String {
     }
 }
 
-/// The group wall budget beside its spend, `cap(consumed)` like the other group
-/// figures but formatted as wall-clock time. `N` in the cap slot is no budget; `N`
-/// in the consumed slot is spend the controller could not read (its GrpWall cache
-/// holds no snapshot), not zero.
+/// The group wall budget beside its spend, `cap(consumed)` in wall-clock time.
 fn grp_wall_limit_consumed(cap: u32, consumed: u32) -> String {
     format!("{}({})", wall_or_n(cap), wall_or_n(consumed))
 }
@@ -1027,9 +1022,8 @@ fn render_assoc_mgr(
             r.scope,
             wall_or_n(r.max_wall_minutes),
         ));
-        // A QOS applies one per-job TRES cap to every job it governs, so it belongs
-        // on the scope line. An association's is per (user, account) and rides on
-        // each User= line instead.
+        // A QOS's per-job cap is scope-wide; an association's is per (user, account)
+        // and goes on each User= line.
         if section.is_qos {
             out.push_str(&format!(
                 " MaxTRESPJ={}",
@@ -1047,8 +1041,6 @@ fn render_assoc_mgr(
                 tres_cap_or_n(&caps.max_tres),
             ));
         }
-        // Per-account submit is a QOS-only cap; an association has no per-account
-        // scope within itself.
         if section.is_qos {
             out.push_str(&format!(
                 " MaxSubmitJobsPA={}",
@@ -2323,7 +2315,6 @@ mod tests {
         // scripts parse this, so the layout is a contract.
         let out = render_assoc_mgr(QOS_SECTION, &[assoc_mgr_record()]);
         assert!(out.starts_with("QOS Records\n"));
-        // MaxTRESPJ is the per-job cap, reading distinctly from the per-user MaxTRESPU.
         assert!(out.contains(
             "QOS=highprio MaxWall=01:00:00 MaxTRESPJ=cpu=8 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4 MaxSubmitJobsPA=N\n"
         ));
@@ -2348,9 +2339,6 @@ mod tests {
         // The controller names a breach for the hierarchy it came from.
         record.users[0].over_limit = vec!["MaxJobs".into()];
         let out = render_assoc_mgr(ASSOC_SECTION, &[record]);
-        // The per-job cap is per (user, account), so it rides on the User= line, not
-        // the scope line where one row would hide every other user's cap. It stays
-        // `MaxTRESPJ` so it reads distinctly from the association's own `MaxTRES`.
         assert!(out.contains("Account=highprio MaxWall=01:00:00\n"));
         assert!(!out.contains("MaxJobsPU"));
         assert!(!out.contains("MaxSubmitJobsPA"));
@@ -2439,14 +2427,11 @@ mod tests {
 
     #[test]
     fn assoc_mgr_renders_the_qos_only_caps_with_values() {
-        // The per-job TRES cap, the per-account submit cap, and the group wall
-        // budget beside its spend all read on the QOS record, with the per-job cap
-        // distinct from the per-user MaxTRESPU.
         let mut record = assoc_mgr_record();
         record.max_tres_per_job = "cpu=8,node=2".into();
         record.max_submit_jobs_per_account = 40;
-        record.grp_wall_minutes = 600; // 10h budget
-        record.grp_wall_consumed_minutes = 360; // 6h spent
+        record.grp_wall_minutes = 600;
+        record.grp_wall_consumed_minutes = 360;
         let out = render_assoc_mgr(QOS_SECTION, &[record]);
         assert!(out.contains(
             "QOS=highprio MaxWall=01:00:00 MaxTRESPJ=cpu=8,node=2 MaxJobsPU=2 MaxSubmitJobsPU=N MaxTRESPU=node=4 MaxSubmitJobsPA=40\n"
@@ -2456,9 +2441,6 @@ mod tests {
 
     #[test]
     fn assoc_mgr_renders_n_for_unset_per_job_tres_and_unread_grp_wall() {
-        // An unset per-job cap reads `N` like the per-user one; an unread spend
-        // reads `N` in the consumed slot, distinct from a real zero, even with the
-        // cap itself set.
         let mut record = assoc_mgr_record();
         record.max_tres_per_job = String::new();
         record.grp_wall_minutes = 600;
@@ -2470,8 +2452,6 @@ mod tests {
 
     #[test]
     fn assoc_mgr_reports_a_spent_grp_wall_budget_on_the_scope_line() {
-        // A QOS blocked by its wall budget names GrpWall in OverLimit, so the
-        // command explains the QOSGrpWallLimit an operator sees in squeue.
         let record = spur_proto::proto::AssocMgrRecord {
             grp_wall_minutes: 600,
             grp_wall_consumed_minutes: 600,

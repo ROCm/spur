@@ -5188,9 +5188,6 @@ impl ClusterManager {
                             max_jobs: limits.and_then(|l| l.max_running_jobs),
                             max_submit_jobs: limits.and_then(|l| l.max_submit_jobs),
                             max_tres: None,
-                            // Per (user, account), so it rides on each user record
-                            // rather than the scope line, where one row would hide
-                            // every other user's cap.
                             max_tres_per_job: limits.and_then(|l| l.max_tres_per_job.clone()),
                         }
                     },
@@ -12094,7 +12091,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn assoc_mgr_info_surfaces_the_new_qos_caps_and_grp_wall_spend() {
+    async fn assoc_mgr_info_surfaces_qos_per_job_submit_and_grp_wall_caps() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(capped_qos(
@@ -12132,9 +12129,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn assoc_mgr_info_leaves_the_new_caps_unset_when_the_qos_has_none() {
-        // A QOS without the new caps reports them unset (None → INFINITE on the
-        // wire), and a cold GrpWall cache reports unknown spend, not zero.
+    async fn assoc_mgr_info_reports_unset_qos_caps_and_cold_grp_wall_spend_as_none() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache()

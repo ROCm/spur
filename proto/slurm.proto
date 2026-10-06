@@ -799,8 +799,8 @@ message AssocMgrUserRecord {
   // "MaxJobsPU"). Decided controller-side so every consumer reads the same
   // verdict. Empty when everything is within its cap.
   repeated string over_limit = 8;
-  // Per-job TRES cap for this user, set only where the scope keys it per user (an
-  // association). Empty when unset. A QOS carries its per-job cap on the record.
+  // Association records only; a QOS carries its per-job cap on the record. Empty
+  // when unset.
   string max_tres_per_job = 9;
 }
 
