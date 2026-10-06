@@ -17565,13 +17565,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_evicts_nothing_for_a_job_no_node_can_host() {
         let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.partitions[0].preempt_mode = "cancel".into();
+        let config = preempting_config();
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
 
         let mut low = basic_spec("low");
         low.priority = Some(100);
+        low.qos = Some("low".into());
         let low_id = submit_and_wait(&cm, low);
         let res = scalar_alloc(2, 4000);
         cm.start_job(
@@ -17587,6 +17588,7 @@ mod tests {
         // so this job can never place no matter how much capacity is freed.
         let mut unplaceable = basic_spec("unplaceable");
         unplaceable.priority = Some(10_000);
+        unplaceable.qos = Some("high".into());
         unplaceable.gres = vec!["1".into()];
         let unplaceable_id = submit_and_wait(&cm, unplaceable);
         let unplaceable_job = cm.get_job(unplaceable_id).unwrap();
@@ -17612,6 +17614,7 @@ mod tests {
         // so the refusal above is the gres, not an unpreemptable fixture.
         let mut placeable = basic_spec("placeable");
         placeable.priority = Some(10_000);
+        placeable.qos = Some("high".into());
         let placeable_id = submit_and_wait(&cm, placeable);
         let placeable_job = cm.get_job(placeable_id).unwrap();
         crate::scheduler_loop::try_preempt(
@@ -17629,16 +17632,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_evicts_the_whole_victim_set_a_multi_node_job_needs() {
         let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.partitions[0].preempt_mode = "cancel".into();
+        let config = preempting_config();
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
         register_node(&cm, "n2", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
 
         let mut victims = Vec::new();
         for (name, node) in [("low-a", "n1"), ("low-b", "n2")] {
             let mut low = basic_spec(name);
             low.priority = Some(100);
+            low.qos = Some("low".into());
             let id = submit_and_wait(&cm, low);
             let res = scalar_alloc(2, 4000);
             cm.start_job(
@@ -17654,6 +17658,7 @@ mod tests {
 
         let mut high = basic_spec("high");
         high.priority = Some(10_000);
+        high.qos = Some("high".into());
         high.num_nodes = 2;
         high.num_tasks = 2;
         let high_id = submit_and_wait(&cm, high);
@@ -17678,23 +17683,35 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_evicts_nobody_when_the_victim_set_is_only_partly_eligible() {
         let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.partitions[0].preempt_mode = "cancel".into();
+        let config = preempting_config();
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
         register_node(&cm, "n2", 8, 16000);
 
         cm.qos_cache().insert(Qos {
+            name: "evictable".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
             name: "shielded".into(),
+            priority: 100,
             limits: spur_core::accounting::QosLimits {
                 preempt_exempt_time: Some(3600),
                 ..Default::default()
             },
             ..Default::default()
         });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 10_000,
+            preempt: vec!["evictable".into(), "shielded".into()],
+            ..Default::default()
+        });
 
         let mut evictable = basic_spec("evictable");
         evictable.priority = Some(100);
+        evictable.qos = Some("evictable".into());
         let evictable_id = submit_and_wait(&cm, evictable);
 
         let mut shielded = basic_spec("shielded");
@@ -17716,6 +17733,7 @@ mod tests {
 
         let mut high = basic_spec("high");
         high.priority = Some(10_000);
+        high.qos = Some("high".into());
         high.num_nodes = 2;
         high.num_tasks = 2;
         let high_id = submit_and_wait(&cm, high);
@@ -17748,20 +17766,32 @@ mod tests {
         // Suspension keeps the allocation, so pairing it with a real eviction
         // would kill the cancel victim for a placement that cannot happen.
         let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.partitions[0].preempt_mode = "cancel".into();
+        let config = preempting_config();
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
         register_node(&cm, "n2", 8, 16000);
 
         cm.qos_cache().insert(Qos {
+            name: "cancellable".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
             name: "freeze-me".into(),
+            priority: 100,
             preempt_mode: Some(spur_core::accounting::QosPreemptMode::Suspend),
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 10_000,
+            preempt: vec!["cancellable".into(), "freeze-me".into()],
             ..Default::default()
         });
 
         let mut cancellable = basic_spec("cancellable");
         cancellable.priority = Some(100);
+        cancellable.qos = Some("cancellable".into());
         let cancellable_id = submit_and_wait(&cm, cancellable);
 
         let mut suspendable = basic_spec("suspendable");
@@ -17783,6 +17813,7 @@ mod tests {
 
         let mut high = basic_spec("high");
         high.priority = Some(10_000);
+        high.qos = Some("high".into());
         high.num_nodes = 2;
         high.num_tasks = 2;
         let high_id = submit_and_wait(&cm, high);
