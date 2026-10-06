@@ -2321,17 +2321,28 @@ struct ActiveStep {
 struct ActiveStepGuard {
     steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     key: (u32, u32),
+    /// The epoch this guard inserted. Zero tracks nothing (a resumed terminal
+    /// keyed by someone else's launch) and so never matches a live entry.
+    epoch: u64,
+}
+
+/// Drops the tracking entry only while it is still this guard's: a launch
+/// refused after another took the key must not untrack the running step.
+fn release_active_step(steps: &mut HashMap<(u32, u32), ActiveStep>, key: (u32, u32), epoch: u64) {
+    if steps.get(&key).is_some_and(|step| step.epoch == epoch) {
+        steps.remove(&key);
+    }
 }
 
 impl Drop for ActiveStepGuard {
     fn drop(&mut self) {
-        let key = self.key;
+        let (key, epoch) = (self.key, self.epoch);
         if let Ok(mut steps) = self.steps.try_lock() {
-            steps.remove(&key);
+            release_active_step(&mut steps, key, epoch);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let steps = self.steps.clone();
             handle.spawn(async move {
-                steps.lock().await.remove(&key);
+                release_active_step(&mut *steps.lock().await, key, epoch);
             });
         }
     }
@@ -6762,11 +6773,12 @@ impl SlurmAgent for AgentService {
             .get(&job_id)
             .map(|tracked| tracked.run_attempt)
             .unwrap_or_default();
+        let step_epoch = next_step_epoch();
         {
             self.active_steps.lock().await.insert(
                 step_key,
                 ActiveStep {
-                    epoch: next_step_epoch(),
+                    epoch: step_epoch,
                     run_attempt: step_run_attempt,
                     ..Default::default()
                 },
@@ -6775,6 +6787,7 @@ impl SlurmAgent for AgentService {
         let _active_step_guard = ActiveStepGuard {
             steps: self.active_steps.clone(),
             key: step_key,
+            epoch: step_epoch,
         };
 
         // No retry on a miss: a step only reaches a Running job, i.e. one every
@@ -8120,6 +8133,9 @@ impl SlurmAgent for AgentService {
         }
 
         type ExitFuture = std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>>;
+        // Set only by the fresh-launch arm; a resumed terminal tracks nothing of
+        // its own, so its guard must leave whatever is already there alone.
+        let mut step_epoch = 0u64;
         let (master_fd, wait_exit, child_pid): (std::os::fd::OwnedFd, ExitFuture, i32) =
             match reclaimed {
                 Some((session_id, master)) => {
@@ -8334,10 +8350,11 @@ impl SlurmAgent for AgentService {
                             None => "terminal workload did not report a pid in time".to_string(),
                         }));
                     };
+                    step_epoch = next_step_epoch();
                     self.active_steps.lock().await.insert(
                         (init.job_id, init.step_id),
                         ActiveStep {
-                            epoch: next_step_epoch(),
+                            epoch: step_epoch,
                             pid: Some(pid),
                             ..Default::default()
                         },
@@ -8402,6 +8419,7 @@ impl SlurmAgent for AgentService {
         let active_step_guard = ActiveStepGuard {
             steps: self.active_steps.clone(),
             key: (init.job_id, init.step_id),
+            epoch: step_epoch,
         };
         let bridge =
             Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx);
@@ -10137,6 +10155,49 @@ mod tests {
         assert!(
             session.exists(),
             "an unreadable descriptor still names an owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_guard_leaves_the_running_step_tracked() {
+        let steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let key = (42, 0);
+        let loser = ActiveStepGuard {
+            steps: Arc::clone(&steps),
+            key,
+            epoch: next_step_epoch(),
+        };
+
+        // The winner re-keys the entry while the refused launch's guard is
+        // still alive; dropping it must not untrack the step that is running.
+        let winner_epoch = next_step_epoch();
+        steps.lock().await.insert(
+            key,
+            ActiveStep {
+                epoch: winner_epoch,
+                pid: Some(1234),
+                ..Default::default()
+            },
+        );
+        drop(loser);
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            steps.lock().await.get(&key).map(|step| step.epoch),
+            Some(winner_epoch),
+            "the running step must stay tracked after a loser's guard drops"
+        );
+
+        drop(ActiveStepGuard {
+            steps: Arc::clone(&steps),
+            key,
+            epoch: winner_epoch,
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !steps.lock().await.contains_key(&key),
+            "the owning guard must still release its own entry"
         );
     }
 
@@ -17237,12 +17298,20 @@ mod tests {
         let steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let key = (77, 1);
-        steps.lock().await.insert(key, ActiveStep::default());
+        let epoch = next_step_epoch();
+        steps.lock().await.insert(
+            key,
+            ActiveStep {
+                epoch,
+                ..Default::default()
+            },
+        );
 
         let held = steps.lock().await;
         drop(ActiveStepGuard {
             steps: steps.clone(),
             key,
+            epoch,
         });
         drop(held);
 
