@@ -325,7 +325,10 @@ def ha_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     try:
-        c.start_ha(3, config_overrides={"controller": {"heartbeat_timeout_secs": 10}})
+        # Above spurd's fixed 30s heartbeat-send interval (reporter.rs), so a
+        # false mark-down can only be attributed to the grace-window bug, not
+        # to ordinary heartbeat-cadence jitter racing a too-strict timeout.
+        c.start_ha(3, config_overrides={"controller": {"heartbeat_timeout_secs": 60}})
     except Exception:
         c.teardown()
         raise

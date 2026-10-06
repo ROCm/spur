@@ -16,11 +16,13 @@ against a stale map and marks healthy nodes down, evicting their running jobs.
 Reproducing this needs a real multi-controller Raft election (an actual
 quit-then-regain on the *same* controller), which is inherently a race against
 the other two controllers' own randomized election timeouts — there is no
-production API to force a specific winner. The test below biases that race
-(freezing the interim leader immediately, so the original leader does not have
-to out-run an already-stable incumbent) and retries a bounded number of times;
-if a genuine same-controller reclaim is never observed, it skips rather than
-assert on an untested scenario.
+production API to force a specific winner. The test below biases that race:
+once the interim leader is detected, it and the third controller are both
+frozen, the original leader is resumed and given a brief head start, and only
+then is the third controller released — so the original leader contests the
+next term against a cold peer instead of an already-stable incumbent. It
+retries a bounded number of times; if a genuine same-controller reclaim is
+never observed, it skips rather than assert on an untested scenario.
 """
 
 import time
@@ -35,11 +37,18 @@ ELECTION_TIMEOUT_MAX_SECS = 3.0
 # Budget for the interim election to complete; the leader is resumed as soon
 # as one is detected, so this is a timeout, not an enforced freeze duration.
 INTERIM_ELECTION_TIMEOUT_SECS = 5
-RACE_SETTLE_TIMEOUT_SECS = 12
+# Head start given to the resumed original leader before the third controller
+# is let back in, so it contests the next term against a cold peer.
+HEAD_START_SECS = 3
+RACE_SETTLE_TIMEOUT_SECS = 20
 MAX_RECLAIM_ATTEMPTS = 5
-# spurctld's health tick is a fixed 30s; wait past at least one full cycle
-# after the reclaim before judging node/job state.
-HEALTH_SETTLE_SECS = 40
+# spurctld's health tick is a fixed 30s and heartbeat_timeout_secs is 60s in
+# the ha_cluster fixture (grace = max(60, 30) = 60s); wait past grace plus one
+# full tick before judging node/job state.
+HEALTH_SETTLE_SECS = 100
+# Long enough to outlast MAX_RECLAIM_ATTEMPTS worth of retries plus
+# HEALTH_SETTLE_SECS, so the job can't complete out from under the assertion.
+SURVIVOR_JOB_SECS = 900
 
 
 def _log_tail_is_leader(log: str) -> bool:
@@ -86,11 +95,20 @@ def _attempt_reclaim(cluster, n: int, leader_idx: int) -> int | None:
         )
         if interim is None:
             return None
-        # Depose the interim leader immediately so the resumed original
-        # leader races a cold peer instead of an already-stable incumbent.
+        # Depose the interim leader AND silence the third controller, so when
+        # the original leader resumes it has a clear field — otherwise the
+        # third controller (never interrupted) tends to win the next election
+        # outright, since its own timer has been running the whole time.
+        third = next(i for i in others if i != interim)
         cluster.signal_controller(interim, "STOP")
+        cluster.signal_controller(third, "STOP")
     finally:
         cluster.signal_controller(leader_idx, "CONT")
+
+    # Head start: let the resumed leader notice it's stale and start
+    # campaigning before the third controller is a competing candidate too.
+    time.sleep(HEAD_START_SECS)
+    cluster.signal_controller(third, "CONT")
 
     race_candidates = [i for i in range(n) if i != interim]
     winner = _wait_became_leader_since(
@@ -108,7 +126,7 @@ class TestLeadershipBlipHealth:
 
         out_path = f"{cluster.remote_dir}/blip-survivor.out"
         script = cluster.write_file(
-            "blip-survivor.sh", "#!/bin/bash\nsleep 180\necho SURVIVED\n"
+            "blip-survivor.sh", f"#!/bin/bash\nsleep {SURVIVOR_JOB_SECS}\necho SURVIVED\n"
         )
         sb = cluster.sbatch(
             ["-J", "blip-survivor", "-N", "1", "-w", target, "-o", out_path, script]

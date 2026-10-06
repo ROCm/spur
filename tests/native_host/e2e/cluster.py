@@ -1514,9 +1514,27 @@ tar -C "$R" -czf '{local_tar}' .
         self.controller_addr = ",".join(
             f"http://{self.nodes[i].host}:{CONTROLLER_PORT}" for i in range(n_controllers)
         )
-        time.sleep(2)
+        # spurd's own registration has no retry (a failure here is fatal to the
+        # process), so agents must not start until a real multi-host election
+        # has actually produced a leader — a fixed sleep is too racy for that.
+        self._wait_raft_responsive()
         self.start_agents(kill_stale=False)
         self.wait_ready()
+
+    def _wait_raft_responsive(self, timeout: int = 30):
+        """Poll until the HA controller set answers a read RPC (i.e. some
+        controller has won the initial election), rather than assuming a
+        fixed settle time is enough on a real multi-host network."""
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            last = self.cli_allow_fail(["sinfo"])
+            if "error" not in last.lower():
+                return
+            time.sleep(1)
+        raise TimeoutError(
+            f"HA controller set never became responsive within {timeout}s:\n{last}"
+        )
 
     def _start_postgres(self):
         """Bring up Postgres (Docker) on node 0. Accounting runs inside spurctld."""
