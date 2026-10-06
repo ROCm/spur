@@ -769,6 +769,7 @@ the MPI binary are in place:
    sinfo                                    # all agents idle/ready
    srun --mpi=list                          # expect: none, pmix
    srun --mpi=pmix -n4 /path/to/hello_mpi   # single-node smoke test
+   srun --mpi=pmix -N2 -n2 /path/to/hello_mpi   # one rank per node: the layout most sensitive to a broken env.sh
    srun --mpi=pmix -N2 -n4 /path/to/hello_mpi   # 4 ranks total (2 per node)
    # Stronger multi-node check (same layout as a typical sbatch):
    # srun --mpi=pmix -N2 -n8 /path/to/hello_mpi
@@ -810,13 +811,16 @@ Architecture
    topology metadata (``PMIX_NODE_MAP``, ``PMIX_PROC_MAP``, job/local size
    keys, ``PMIX_LOCAL_PEERS``, ``PMIX_LOCALLDR``, ``PMIX_TMPDIR``), then serves
    PMIx to application processes.
-3. For ``-n > 1``, ``spurd`` wraps the user command in a bash script that
-   **forks one process per rank**. Each child receives a full
+3. ``spurd`` runs every rank through a bash wrapper, including a node's only
+   rank, because the wrapper is the one place ``env.sh`` and the aliases below
+   are applied. A batch script that calls ``srun`` itself is a driver, not a
+   rank, and runs unwrapped. With several ranks on a node the wrapper **forks
+   one process per rank**, and each child receives a full
    ``PMIx_server_setup_fork`` environment (Slurm ``mpi_p_slurmstepd_task``
    parity) via ``spur_mpi_pmix_setup_fork_env`` in the plugin.
-4. The wrapper exports ``PMIX_SERVER_URI4`` / ``PMIX_SERVER_URI3`` aliases.
-   Slurm-compatible ``SLURM_*`` twins remain set (same as Slurm under
-   ``--mpi=pmix``).
+4. The wrapper sources ``env.sh`` and exports ``PMIX_SERVER_URI4`` /
+   ``PMIX_SERVER_URI3`` aliases. Slurm-compatible ``SLURM_*`` twins remain set
+   (same as Slurm under ``--mpi=pmix``).
 
 The embedded PMIx server registers ``fence_nb`` once at ``PMIx_server_init``.
 Single-node jobs never call it (OpenPMIx GDS handles modex locally). Multi-node
