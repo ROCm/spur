@@ -69,6 +69,35 @@ pub fn resolve_role(
     }
 }
 
+/// Which records a read may return under a `PrivateData` category.
+///
+/// `All` is the unrestricted view: the caller may see every tenant's records.
+/// `Caller` pins the view to one user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadScope {
+    All,
+    Caller(String),
+}
+
+/// The read scope for one `PrivateData` category.
+///
+/// A caller with no verified identity is unrestricted: that is the
+/// `permissive`/`disabled` path, which trusts the client, and preserves the
+/// no-auth behaviour. Operators and Administrators (`role.operates_jobs()`) are
+/// always exempt, matching Slurm's `validate_operator`. When the category is not
+/// private, every authenticated caller sees everything, as a stock `slurm.conf`
+/// does. Only a plain, identified User under a private category is pinned to
+/// their own records.
+pub fn read_scope(identity: Option<&Identity>, role: Option<Role>, private: bool) -> ReadScope {
+    let Some(id) = identity else {
+        return ReadScope::All;
+    };
+    if !private || role.is_some_and(Role::operates_jobs) {
+        return ReadScope::All;
+    }
+    ReadScope::Caller(id.user.clone())
+}
+
 fn name_listed(names: &[String], user: &str) -> bool {
     names
         .iter()
@@ -228,6 +257,46 @@ mod tests {
         assert_eq!(
             resolve_role(&id("dave", 1000, false), &auth(), None, true, &[], true),
             Role::Coordinator
+        );
+    }
+
+    #[test]
+    fn read_scope_is_unrestricted_without_an_identity() {
+        assert_eq!(read_scope(None, None, true), ReadScope::All);
+    }
+
+    #[test]
+    fn read_scope_is_unrestricted_when_the_category_is_not_private() {
+        let alice = id("alice", 1000, false);
+        assert_eq!(
+            read_scope(Some(&alice), Some(Role::User), false),
+            ReadScope::All
+        );
+    }
+
+    #[test]
+    fn read_scope_exempts_operators_and_administrators() {
+        let bob = id("bob", 1000, false);
+        assert_eq!(
+            read_scope(Some(&bob), Some(Role::Operator), true),
+            ReadScope::All
+        );
+        assert_eq!(
+            read_scope(Some(&bob), Some(Role::Administrator), true),
+            ReadScope::All
+        );
+    }
+
+    #[test]
+    fn read_scope_pins_a_plain_user_under_a_private_category() {
+        let carol = id("carol", 1000, false);
+        assert_eq!(
+            read_scope(Some(&carol), Some(Role::User), true),
+            ReadScope::Caller("carol".into())
+        );
+        assert_eq!(
+            read_scope(Some(&carol), Some(Role::Coordinator), true),
+            ReadScope::Caller("carol".into())
         );
     }
 }

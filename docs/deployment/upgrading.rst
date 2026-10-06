@@ -428,6 +428,65 @@ On a drained cluster the change is invisible: user-facing output already renders
 steps as ``batch``/``extern``/``interactive`` rather than the integer, so no scripts or
 CLI output change.
 
+Job and usage visibility (``private_data``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Earlier releases pinned identified callers with no way to turn it off:
+
+- v0.9 to v0.14 pinned the gRPC job list (``squeue``, ``sprio``) to the caller's
+  own jobs, Operators included through v0.12.
+- v0.11 to v0.14 pinned ``scontrol show assoc_mgr`` to the caller's own scopes.
+- v0.13 and v0.14 also pinned REST ``/jobs`` and returned not found for another
+  user's job from ``scontrol show job``, ``scontrol show step``, ``sstat``, and
+  REST ``/job/{id}``.
+
+The release introducing :ref:`[auth] private_data <private-data>` makes this
+opt-in and defaults to Slurm's behavior: every user sees every job and every
+assoc_mgr scope.
+
+**Effect:** with an unchanged ``spur.conf``, a User now sees other tenants' jobs
+and steps, including their command (the first non-comment line of the batch
+script), working directory, and output paths. A step command such as
+``srun --jobid`` against another user's job now fails with a permission error
+instead of "job not found". To keep the previous visibility, set this on every
+controller **before** upgrading:
+
+.. code-block:: toml
+
+   [auth]
+   private_data = ["jobs", "usage"]
+
+.. warning::
+
+   ``rolling_upgrade.yml`` and ``deploy.yml`` regenerate ``spur.conf`` from the
+   toolkit template, which has no ``[auth]`` section, and restart the controllers.
+   On a toolkit-managed cluster, every job is visible from that restart until you
+   re-add ``private_data`` and restart every controller again. Every later run of
+   either playbook drops it again.
+
+A request from a User that names another user no longer falls back to the caller's
+own jobs. In v0.14, ``squeue -u bob``, ``sprio -u bob``, and REST
+``/jobs?user=bob`` from alice returned alice's own jobs, and ``scancel -u bob``
+cancelled them. Under ``"jobs"`` these now return nothing and cancel nothing, as
+in Slurm. Without ``private_data`` they list bob's jobs.
+
+Without ``private_data``, ``scancel -p``, ``-A``, or ``-n`` also selects other
+users' jobs. Each one the caller does not own is refused and reported on stderr.
+
+``scontrol reconfigure`` applies ``private_data`` on the leader only; restart every
+controller after changing it. During a rolling upgrade, visibility depends on which
+controller serves the request, but it is never wider than the new configuration
+allows.
+
+``spurctld`` refuses to start on a category it does not support. Agents and the CLI
+ignore the field, so a ``spur.conf`` naming a category from a newer release still
+loads on them.
+
+Rolling back to v0.13 or v0.14 is safe with the field left in place: those releases
+ignore it and pin Users to their own jobs and assoc_mgr scopes regardless. v0.12 and
+earlier also pin Operators to their own job list, but leave REST ``/jobs`` and
+``scontrol show job`` unpinned.
+
 See Also
 --------
 

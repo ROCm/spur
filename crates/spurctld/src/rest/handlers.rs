@@ -10,7 +10,8 @@ use axum::Extension;
 use super::convert::{job_to_json, node_to_json, parse_states_query, partition_to_json};
 use super::types::*;
 use super::RestState;
-use crate::server::{identified_user_may_view_job, identity_operates_jobs};
+use crate::server::{job_read_scope, scoped_user_filter};
+use spur_core::rbac::ReadScope;
 
 pub async fn ping(
     State(state): State<Arc<RestState>>,
@@ -45,7 +46,11 @@ pub async fn get_jobs(
         None => Vec::new(),
     };
 
-    let scoped_user = rest_list_user(query.user.as_deref(), identity.as_ref(), &state.cluster);
+    let scope = job_read_scope(&state.cluster, identity.as_ref());
+    let requested_user = query.user.as_deref().filter(|u| !u.is_empty());
+    let Some(scoped_user) = scoped_user_filter(&scope, requested_user) else {
+        return Ok(ApiResponse::ok(JobsData { jobs: Vec::new() }));
+    };
     let partition = query.partition.as_deref();
     let account = query.account.as_deref();
     let name = query.name.as_deref();
@@ -237,39 +242,17 @@ fn proto_gpu(value: Option<&str>) -> Result<Option<spur_proto::proto::GpuRequest
     )
 }
 
-fn rest_list_user(
-    query_user: Option<&str>,
-    identity: Option<&spur_core::auth::Identity>,
-    cluster: &crate::cluster::ClusterManager,
-) -> Option<String> {
-    rest_list_user_from_flags(
-        query_user,
-        identity.map(|id| id.user.as_str()),
-        identity_operates_jobs(cluster, identity),
-    )
-}
-
-fn rest_list_user_from_flags(
-    query_user: Option<&str>,
-    identity_user: Option<&str>,
-    is_operator: bool,
-) -> Option<String> {
-    if is_operator {
-        return query_user.filter(|u| !u.is_empty()).map(str::to_string);
-    }
-    if let Some(user) = identity_user {
-        return Some(user.to_string());
-    }
-    query_user.filter(|u| !u.is_empty()).map(str::to_string)
-}
-
 fn rest_job_json(
     job: &spur_core::job::Job,
     identity: Option<&spur_core::auth::Identity>,
     cluster: &crate::cluster::ClusterManager,
 ) -> Option<serde_json::Value> {
-    let operates = identity_operates_jobs(cluster, identity);
-    identified_user_may_view_job(identity, &job.spec.user, operates).then(|| job_to_json(job))
+    match job_read_scope(cluster, identity) {
+        ReadScope::All => Some(job_to_json(job)),
+        ReadScope::Caller(user) => {
+            (!user.is_empty() && user == job.spec.user).then(|| job_to_json(job))
+        }
+    }
 }
 
 pub async fn cancel_job(
@@ -445,35 +428,5 @@ mod tests {
             let (status, _) = status_to_rest(Status::new(code, "x"));
             assert_eq!(status, want, "{code:?}");
         }
-    }
-
-    #[test]
-    fn rest_list_user_pins_identified_non_operator() {
-        assert_eq!(
-            rest_list_user_from_flags(Some("mallory"), Some("alice"), false).as_deref(),
-            Some("alice")
-        );
-        assert_eq!(
-            rest_list_user_from_flags(None, Some("alice"), false).as_deref(),
-            Some("alice")
-        );
-    }
-
-    #[test]
-    fn rest_list_user_lets_operator_honor_query() {
-        assert_eq!(
-            rest_list_user_from_flags(Some("bob"), Some("erin"), true).as_deref(),
-            Some("bob")
-        );
-        assert_eq!(rest_list_user_from_flags(None, Some("erin"), true), None);
-    }
-
-    #[test]
-    fn rest_list_user_anonymous_keeps_query() {
-        assert_eq!(
-            rest_list_user_from_flags(Some("alice"), None, false).as_deref(),
-            Some("alice")
-        );
-        assert_eq!(rest_list_user_from_flags(None, None, false), None);
     }
 }

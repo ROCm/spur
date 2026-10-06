@@ -74,7 +74,7 @@ noted as "accepted for compatibility" parse without error but have no effect yet
    * - ``scontrol show hostnames`` / ``hostlist``
      - Supported as local transforms (no controller call). ``hostnames`` falls back to ``SLURM_JOB_NODELIST`` (or ``SPUR_JOB_NODELIST``) when given no argument. ``hostlist`` and ``hostlistsorted`` both remove duplicates and sort, so they emit the same output; Slurm keeps input order for ``hostlist``. Reading a hostlist from a file path argument is not supported.
    * - ``scontrol show assoc_mgr``
-     - Caps print as ``Limit(Consumed)`` with ``N`` for no limit, as in Slurm, and an ``OverLimit`` field names caps already exceeded. Filters to one user (``users=<name>`` or a bare name); Slurm's ``accounts=``, ``qos=`` and ``flags=`` selectors are not accepted (an unknown ``<key>=`` errors rather than being read as a username). As in Slurm, an unprivileged caller is scoped to their own associations and administrators see every scope. Users are listed on their own lines under a scope rather than nested in a ``User Limits=`` field, and an account's group figures are stated once for the account instead of repeated per association row. Fairshare and priority internals Slurm prints (``SharesRaw``, ``UsageRaw``, ``Lft-Rgt``, ``GrpTRESMins``) are not included.
+     - Caps print as ``Limit(Consumed)`` with ``N`` for no limit, as in Slurm, and an ``OverLimit`` field names caps already exceeded. Filters to one user (``users=<name>`` or a bare name); Slurm's ``accounts=``, ``qos=`` and ``flags=`` selectors are not accepted (an unknown ``<key>=`` errors rather than being read as a username). By default every caller sees every scope; ``[auth] private_data = ["usage"]`` scopes an unprivileged caller to their own (see :ref:`private-data`). Users are listed on their own lines under a scope rather than nested in a ``User Limits=`` field, and an account's group figures are stated once for the account instead of repeated per association row. Fairshare and priority internals Slurm prints (``SharesRaw``, ``UsageRaw``, ``Lft-Rgt``, ``GrpTRESMins``) are not included.
    * - ``sshare``/``sreport`` usage units
      - ``sshare`` ``RawUsage`` and ``CPURawUsage`` report cpu-seconds, matching Slurm. Prior Spur releases displayed cpu-hours under the same column names. ``sreport`` columns are likewise cpu-seconds. Scripts parsing ``sshare --parsable`` output will see values 3600× larger than before. Upgrade ``spurctld`` and ``spur-cli`` together to avoid a mixed-unit window.
    * - QOS ``GrpWall``
@@ -93,6 +93,16 @@ Accounting entities map directly from Slurm:
 - The ``[accounting] require_association`` setting is the equivalent of Slurm's
   ``AccountingStorageEnforce=associations``.
 - The ``default_qos`` setting is the equivalent of Slurm's fallback QOS.
+- The ``[auth] private_data`` setting is the equivalent of the ``slurm.conf``
+  side of Slurm's ``PrivateData`` (see :ref:`private-data`). Like Slurm, it is
+  unset by default, so every user sees every job. ``"jobs"`` and ``"usage"`` are
+  supported, written as a TOML list (``private_data = ["jobs", "usage"]``), not a
+  comma-separated string. ``sacct``, ``sshare``, and ``sreport``, which Slurm
+  restricts through ``slurmdbd.conf``, are not restricted yet. Unlike Slurm, root
+  has no implicit exemption: grant it a role (``cluster_admins``,
+  ``admin_groups``, an accounting admin level, or
+  ``allow_uid_zero_administrator``). Account coordinators are not exempt from
+  ``"jobs"``.
 
 See :doc:`/admin-guide/accounting` for the accounting concept guide.
 

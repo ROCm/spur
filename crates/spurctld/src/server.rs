@@ -858,19 +858,6 @@ impl ControllerService {
         *asserted = id.user.clone();
     }
 
-    /// Job-list user filter: pin a non-operator to their credential, leave an
-    /// operator's (possibly empty) asserted user so they can see the whole queue.
-    fn pin_job_list_user(
-        asserted: &mut String,
-        identity: Option<&spur_core::auth::Identity>,
-        is_operator: bool,
-    ) {
-        if is_operator {
-            return;
-        }
-        Self::authoritative_user(asserted, identity);
-    }
-
     /// Bind a submitted spec to the authenticated caller.
     ///
     /// Overwrites `user`/`uid`/`gid` from the verified identity rather than trusting what the client
@@ -1079,14 +1066,18 @@ impl ControllerService {
         }
     }
 
-    /// Identified Users cannot fetch another tenant's job (same pin as `get_jobs`).
-    /// Operators, Administrators, and unauthenticated callers see every job in full.
+    /// Identified Users cannot fetch another tenant's job once `jobs` is private
+    /// (same scope as `get_jobs`). Operators, Administrators, unauthenticated
+    /// callers, and everyone when `jobs` is not private see every job in full.
     fn caller_may_see_job(
         &self,
         owner: &str,
         identity: Option<&spur_core::auth::Identity>,
     ) -> bool {
-        identified_user_may_view_job(identity, owner, self.caller_is_operator(identity))
+        match job_read_scope(&self.cluster, identity) {
+            spur_core::rbac::ReadScope::All => true,
+            spur_core::rbac::ReadScope::Caller(user) => !user.is_empty() && user == owner,
+        }
     }
 
     fn scoped_job_info(
@@ -1446,12 +1437,7 @@ impl SlurmController for ControllerService {
         let meta = request.metadata().clone();
         let path = rpc_path(&request);
         let __identity = Self::verified_identity(&request).cloned();
-        let mut req = request.into_inner();
-        Self::pin_job_list_user(
-            &mut req.user,
-            __identity.as_ref(),
-            identity_operates_jobs(&self.cluster, __identity.as_ref()),
-        );
+        let req = request.into_inner();
         if let Some(resp) = self
             .forward_read(meta, forward.then(|| req.clone()), __identity.clone(), path)
             .await
@@ -1459,17 +1445,22 @@ impl SlurmController for ControllerService {
             return Ok(resp);
         }
 
+        // Scope the list to the caller when `jobs` is private. A query naming a
+        // user the caller may not see returns an empty list, matching Slurm's
+        // `squeue -u other`.
+        let scope = job_read_scope(&self.cluster, __identity.as_ref());
+        let requested_user = (!req.user.is_empty()).then_some(req.user.as_str());
+        let Some(scoped_user) = scoped_user_filter(&scope, requested_user) else {
+            return Ok(Response::new(GetJobsResponse { jobs: Vec::new() }));
+        };
+
         let states: Vec<spur_core::job::JobState> = req
             .states
             .iter()
             .filter_map(|s| spur_core::job::JobState::from_proto_i32(*s))
             .collect();
 
-        let user = if req.user.is_empty() {
-            None
-        } else {
-            Some(req.user.as_str())
-        };
+        let user = scoped_user.as_deref();
         let partition = if req.partition.is_empty() {
             None
         } else {
@@ -1510,16 +1501,6 @@ impl SlurmController for ControllerService {
 
         let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
         annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
-
-        // Operators may list other tenants; identified Users stay pinned to own jobs.
-        let proto_jobs: Vec<JobInfo> = jobs
-            .iter()
-            .zip(proto_jobs)
-            .filter_map(|(job, info)| {
-                self.caller_may_see_job(&job.spec.user, __identity.as_ref())
-                    .then_some(info)
-            })
-            .collect();
 
         Ok(Response::new(GetJobsResponse { jobs: proto_jobs }))
     }
@@ -2242,9 +2223,9 @@ impl SlurmController for ControllerService {
         }
 
         let identity = Self::verified_identity(&request).cloned();
-        let caller_is_admin = self.caller_is_operator(identity.as_ref());
         let req = request.into_inner();
-        let filter = assoc_mgr_scope_user(identity.as_ref(), &req.user, caller_is_admin);
+        let scope = usage_read_scope(&self.cluster, identity.as_ref());
+        let filter = assoc_mgr_user_filter(&scope, &req.user);
         let info = self.cluster.assoc_mgr_info(filter.as_deref());
 
         Ok(Response::new(GetAssocMgrInfoResponse {
@@ -4900,35 +4881,61 @@ pub(crate) fn identity_operates_jobs(
     })
 }
 
-/// Identified Users cannot see another tenant's job, matching `get_jobs` pinning.
-/// Unauthenticated callers and Operators/Administrators are not pinned.
-pub(crate) fn identified_user_may_view_job(
+/// The read scope for job records: `All` for an unauthenticated caller, an
+/// Operator, an Administrator, or any caller when `[auth] private_data` does not
+/// list `jobs`; `Caller` for a plain User once `jobs` is private.
+pub(crate) fn job_read_scope(
+    cluster: &crate::cluster::ClusterManager,
     identity: Option<&spur_core::auth::Identity>,
-    owner: &str,
-    operates_jobs: bool,
-) -> bool {
-    match identity {
-        None => true,
-        Some(_) if operates_jobs => true,
-        Some(id) => id.user == owner,
+) -> spur_core::rbac::ReadScope {
+    spur_core::rbac::read_scope(
+        identity,
+        identity_role(cluster, identity),
+        cluster.config().auth.jobs_private(),
+    )
+}
+
+/// The read scope for `scontrol show assoc_mgr`, gated by
+/// `[auth] private_data = ["usage"]`.
+fn usage_read_scope(
+    cluster: &crate::cluster::ClusterManager,
+    identity: Option<&spur_core::auth::Identity>,
+) -> spur_core::rbac::ReadScope {
+    spur_core::rbac::read_scope(
+        identity,
+        identity_role(cluster, identity),
+        cluster.config().auth.usage_private(),
+    )
+}
+
+/// The assoc-mgr `users=` filter: an unrestricted caller keeps the selector
+/// (empty means every user), a scoped caller is pinned to their own user.
+fn assoc_mgr_user_filter(scope: &spur_core::rbac::ReadScope, requested: &str) -> Option<String> {
+    match scope {
+        spur_core::rbac::ReadScope::All => (!requested.is_empty()).then(|| requested.to_string()),
+        spur_core::rbac::ReadScope::Caller(user) => Some(user.clone()),
     }
 }
 
-/// The user an assoc-mgr read is scoped to. A privileged caller — an admin, or
-/// an unauthenticated one under `permissive`/`disabled` — reads whichever user
-/// the request names, or every user when it names none. A non-admin authenticated
-/// caller is pinned to their own identity, so they can neither read another
-/// tenant's usage nor enumerate the cluster-wide scope inventory. Pure so the
-/// policy is testable without a live service.
-fn assoc_mgr_scope_user(
-    identity: Option<&spur_core::auth::Identity>,
-    requested: &str,
-    caller_is_admin: bool,
-) -> Option<String> {
-    if identity.is_none() || caller_is_admin {
-        return (!requested.is_empty()).then(|| requested.to_string());
+/// The `user` filter for a job list, given the caller's read scope and the user
+/// the request named. The inner `Option` is the filter itself (`None` means every
+/// user). The outer `None` means the request named a user the caller may not see,
+/// so the list comes back empty, as Slurm's `squeue -u other` does.
+pub(crate) fn scoped_user_filter(
+    scope: &spur_core::rbac::ReadScope,
+    requested: Option<&str>,
+) -> Option<Option<String>> {
+    match scope {
+        spur_core::rbac::ReadScope::All => Some(requested.map(str::to_string)),
+        // An empty user filter means "every user" downstream, so a scoped caller
+        // with no name must see nothing rather than everything.
+        spur_core::rbac::ReadScope::Caller(user) if user.is_empty() => None,
+        spur_core::rbac::ReadScope::Caller(user) => match requested {
+            None => Some(Some(user.clone())),
+            Some(r) if r == user => Some(Some(user.clone())),
+            Some(_) => None,
+        },
     }
-    identity.map(|id| id.user.clone())
 }
 
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
@@ -5833,26 +5840,42 @@ mod tests {
     }
 
     #[test]
-    fn identified_user_job_view_owner_operator_and_anonymous() {
-        use spur_core::auth::Identity;
-        let bob = Identity {
-            user: "bob".into(),
-            uid: 1000,
-            gid: 1000,
-            is_admin: false,
-            trusted_unix: false,
-        };
-        let alice = Identity {
-            user: "alice".into(),
-            uid: 1001,
-            gid: 1001,
-            is_admin: false,
-            trusted_unix: false,
-        };
-        assert!(identified_user_may_view_job(None, "bob", false));
-        assert!(identified_user_may_view_job(Some(&bob), "bob", false));
-        assert!(!identified_user_may_view_job(Some(&alice), "bob", false));
-        assert!(identified_user_may_view_job(Some(&alice), "bob", true));
+    fn scoped_user_filter_is_unrestricted_under_all_scope() {
+        use spur_core::rbac::ReadScope;
+        assert_eq!(scoped_user_filter(&ReadScope::All, None), Some(None));
+        assert_eq!(
+            scoped_user_filter(&ReadScope::All, Some("bob")),
+            Some(Some("bob".into()))
+        );
+    }
+
+    #[test]
+    fn scoped_user_filter_pins_a_scoped_caller_to_itself() {
+        use spur_core::rbac::ReadScope;
+        let scope = ReadScope::Caller("alice".into());
+        assert_eq!(
+            scoped_user_filter(&scope, None),
+            Some(Some("alice".into())),
+            "no filter scopes to the caller"
+        );
+        assert_eq!(
+            scoped_user_filter(&scope, Some("alice")),
+            Some(Some("alice".into())),
+            "asking for own records is honored"
+        );
+        assert_eq!(
+            scoped_user_filter(&scope, Some("bob")),
+            None,
+            "asking for another user's records yields an empty list"
+        );
+    }
+
+    #[test]
+    fn scoped_user_filter_yields_nothing_for_a_nameless_caller() {
+        use spur_core::rbac::ReadScope;
+        let scope = ReadScope::Caller(String::new());
+        assert_eq!(scoped_user_filter(&scope, None), None);
+        assert_eq!(scoped_user_filter(&scope, Some("")), None);
     }
 
     /// Identity for a viewer in the get_job/get_job_steps handler tests. No NSS resolution happens
@@ -5952,10 +5975,19 @@ mod tests {
         assert!(resolve_step_container(Some(ContainerSpec::default()), &job).is_none());
     }
 
+    fn jobs_private_config() -> spur_core::config::SlurmConfig {
+        let mut config = step_test_config();
+        config
+            .auth
+            .private_data
+            .insert(spur_core::config::PrivateData::Jobs);
+        config
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_job_hides_other_tenants_from_identified_users() {
+    async fn get_job_hides_other_tenants_under_private_jobs() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with(&dir, jobs_private_config()).await;
         let job_id = svc
             .cluster
             .submit_job(owned_job("bob", "/home/bob"))
@@ -5982,6 +6014,25 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_job_shows_other_tenants_by_default() {
+        // With `private_data` unset, any authenticated user sees any job.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = svc
+            .cluster
+            .submit_job(owned_job("bob", "/home/bob"))
+            .unwrap()
+            .job_id;
+
+        let info = svc
+            .get_job(get_job_req(job_id, Some(viewer("alice", false))))
+            .await
+            .expect("alice may read bob's job when jobs are not private")
+            .into_inner();
+        assert_eq!(info.work_dir, "/home/bob");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6032,6 +6083,19 @@ mod tests {
 
     fn test_slurm_config() -> spur_core::config::SlurmConfig {
         serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap()
+    }
+
+    /// A config with `[auth] private_data` set to the given categories.
+    fn test_slurm_config_private(categories: &[&str]) -> spur_core::config::SlurmConfig {
+        let list = categories
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        serde_json::from_str(&format!(
+            r#"{{"cluster_name":"test","auth":{{"plugin":"jwt","private_data":[{list}]}}}}"#
+        ))
+        .unwrap()
     }
 
     /// A `ControllerService` on a node that can never elect a leader: three
@@ -6119,17 +6183,20 @@ mod tests {
         assert_eq!(jobs[0].job_id, 1);
     }
 
-    /// `scontrol show job` and `squeue` both read through `get_jobs`. Spoofing the
-    /// wire `user` field, and naming the job id outright, must both come back empty.
+    /// `scontrol show job` and `squeue` both read through `get_jobs`. Under
+    /// `private_data = ["jobs"]`, spoofing the wire `user` field, and naming the
+    /// job id outright, must both come back empty.
     #[tokio::test]
-    async fn get_jobs_never_returns_another_users_job_to_an_identified_caller() {
+    async fn get_jobs_never_returns_another_users_job_under_private_jobs() {
         use crate::raft::StateMachineApply;
         use spur_core::job::JobSpec;
         use spur_core::wal::WalOperation;
 
         let dir = tempfile::TempDir::new().unwrap();
-        let cluster =
-            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(test_slurm_config_private(&["jobs"]), dir.path())
+                .unwrap(),
+        );
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
@@ -6172,6 +6239,113 @@ mod tests {
                 "{label} let bob read alice's job: {jobs:?}"
             );
         }
+
+        for (label, user) in [("a bare query", ""), ("-u alice", "alice")] {
+            let mut req = Request::new(GetJobsRequest {
+                user: user.into(),
+                ..Default::default()
+            });
+            req.extensions_mut().insert(viewer("carol", true));
+            let jobs = service.get_jobs(req).await.unwrap().into_inner().jobs;
+            assert_eq!(
+                jobs.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+                vec![1],
+                "an administrator is exempt from private jobs ({label})"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_pins_users_but_not_admins_under_private_usage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config
+            .auth
+            .private_data
+            .insert(spur_core::config::PrivateData::Usage);
+        let service = test_service_with(&dir, config).await;
+        let mut spec = owned_job("alice", "/tmp");
+        spec.qos = Some("alice-qos".into());
+        <crate::cluster::ClusterManager as crate::raft::StateMachineApply>::apply_operation(
+            service.cluster.as_ref(),
+            &spur_core::wal::WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(spec),
+            },
+        );
+
+        let qos_seen = |viewer_id: spur_core::auth::Identity, users: &str| {
+            let mut req = Request::new(GetAssocMgrInfoRequest { user: users.into() });
+            req.extensions_mut().insert(viewer_id);
+            let service = &service;
+            async move {
+                service
+                    .get_assoc_mgr_info(req)
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .qos_records
+                    .into_iter()
+                    .map(|r| r.scope)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert!(qos_seen(viewer("bob", false), "").await.is_empty());
+        assert!(
+            qos_seen(viewer("bob", false), "alice").await.is_empty(),
+            "users=alice from bob stays pinned to bob"
+        );
+        assert_eq!(qos_seen(viewer("carol", true), "").await, ["alice-qos"]);
+        assert_eq!(
+            qos_seen(viewer("carol", true), "alice").await,
+            ["alice-qos"]
+        );
+    }
+
+    /// With `private_data` unset (the default, matching a stock slurm.conf),
+    /// every authenticated user sees every job. A bare query returns all jobs,
+    /// and `-u alice` from bob returns alice's job.
+    #[tokio::test]
+    async fn get_jobs_shows_all_users_by_default() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "alice-job".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            },
+        );
+        let service = no_leader_service(cluster, dir.path()).await;
+
+        let mut bare = Request::new(GetJobsRequest::default());
+        bare.extensions_mut().insert(viewer("bob", false));
+        let jobs = service.get_jobs(bare).await.unwrap().into_inner().jobs;
+        assert_eq!(jobs.len(), 1, "a bare query lists every user's jobs");
+        assert_eq!(jobs[0].user, "alice");
+
+        let mut by_user = Request::new(GetJobsRequest {
+            user: "alice".into(),
+            ..Default::default()
+        });
+        by_user.extensions_mut().insert(viewer("bob", false));
+        let jobs = service.get_jobs(by_user).await.unwrap().into_inner().jobs;
+        assert_eq!(jobs.len(), 1, "bob may filter to alice's jobs");
+        assert_eq!(jobs[0].user, "alice");
     }
 
     /// The write side of the contract: with no leader, writes must fail rather
@@ -11885,38 +12059,7 @@ mod tests {
         assert_eq!(user, "carol");
     }
 
-    #[test]
-    fn pin_job_list_user_leaves_operator_query_alone() {
-        let mut user = String::new();
-        let id = spur_core::auth::Identity {
-            user: "erin".into(),
-            uid: 1003,
-            gid: 1003,
-            is_admin: false,
-            trusted_unix: true,
-        };
-        ControllerService::pin_job_list_user(&mut user, Some(&id), true);
-        assert!(user.is_empty(), "operator with no filter sees everyone");
-        user = "bob".into();
-        ControllerService::pin_job_list_user(&mut user, Some(&id), true);
-        assert_eq!(user, "bob", "operator may still filter by user");
-    }
-
-    #[test]
-    fn pin_job_list_user_pins_non_operator_to_identity() {
-        let mut user = "mallory".into();
-        let id = spur_core::auth::Identity {
-            user: "alice".into(),
-            uid: 1000,
-            gid: 1000,
-            is_admin: false,
-            trusted_unix: true,
-        };
-        ControllerService::pin_job_list_user(&mut user, Some(&id), false);
-        assert_eq!(user, "alice");
-    }
-
-    // --- assoc_mgr_scope_user (assoc-mgr read authorization) ---
+    // --- assoc_mgr_user_filter (assoc-mgr read scoping) ---
 
     fn ident(user: &str) -> spur_core::auth::Identity {
         spur_core::auth::Identity {
@@ -11929,40 +12072,23 @@ mod tests {
     }
 
     #[test]
-    fn assoc_mgr_scope_user_unauthenticated_honors_the_request() {
-        // permissive/disabled: no identity is privileged, so the request stands —
-        // empty means every user, a name means that user.
-        assert_eq!(assoc_mgr_scope_user(None, "", false), None);
+    fn assoc_mgr_user_filter_under_all_scope_honors_the_selector() {
+        use spur_core::rbac::ReadScope;
+        assert_eq!(assoc_mgr_user_filter(&ReadScope::All, ""), None);
         assert_eq!(
-            assoc_mgr_scope_user(None, "alice", false).as_deref(),
+            assoc_mgr_user_filter(&ReadScope::All, "alice").as_deref(),
             Some("alice")
         );
     }
 
     #[test]
-    fn assoc_mgr_scope_user_pins_a_non_admin_to_itself() {
-        // A non-admin cannot widen (empty request) or retarget (another user) the
-        // view: both collapse to their own identity.
-        let id = ident("bob");
+    fn assoc_mgr_user_filter_pins_a_scoped_caller_to_itself() {
+        use spur_core::rbac::ReadScope;
+        let scope = ReadScope::Caller("bob".into());
+        assert_eq!(assoc_mgr_user_filter(&scope, "").as_deref(), Some("bob"));
         assert_eq!(
-            assoc_mgr_scope_user(Some(&id), "", false).as_deref(),
+            assoc_mgr_user_filter(&scope, "alice").as_deref(),
             Some("bob")
-        );
-        assert_eq!(
-            assoc_mgr_scope_user(Some(&id), "alice", false).as_deref(),
-            Some("bob")
-        );
-    }
-
-    #[test]
-    fn assoc_mgr_scope_user_lets_an_admin_target_anyone() {
-        // An admin keeps the request: every user when empty, an arbitrary user
-        // when named.
-        let id = ident("root");
-        assert_eq!(assoc_mgr_scope_user(Some(&id), "", true), None);
-        assert_eq!(
-            assoc_mgr_scope_user(Some(&id), "alice", true).as_deref(),
-            Some("alice")
         );
     }
 

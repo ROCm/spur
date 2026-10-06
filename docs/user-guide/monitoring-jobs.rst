@@ -18,7 +18,8 @@ View the Queue — ``squeue``
 ---------------------------
 
 ``spur queue`` (Slurm ``squeue``) lists jobs currently in the system. With no
-arguments it shows every active job.
+arguments it shows every active job, or only your own if your site sets
+``private_data = ["jobs"]`` (see :ref:`private-data`).
 
 .. code-block:: bash
 
@@ -753,10 +754,12 @@ cache has not loaded yet, so some caps below may be missing; the usage figures
 are still current. A cluster with accounting disabled has no caps to read and so
 never prints this line.
 
-An unprivileged caller sees only their own usage: ``scontrol show assoc_mgr``
-scopes the view to the caller and lists only the QOS and accounts they take part
-in. Administrators see every scope, and may pass ``users=<name>`` to inspect one
-user.
+By default every caller sees every scope and may pass ``users=<name>`` to
+inspect one user. When an administrator sets ``private_data = ["usage"]`` under
+``[auth]`` (see :ref:`private-data`), an unprivileged caller sees only the QOS
+and accounts they take part in, and only their own ``User=`` lines; a ``users=``
+selector is replaced with their own name. ``Grp*`` totals on the scope line
+still include every user's jobs. Operators and Administrators are exempt.
 
 Cluster Metrics — ``/metrics``
 ------------------------------
@@ -973,12 +976,14 @@ Controlling Jobs
    spur cancel -u alice -p gpu --state PENDING
    scancel --signal SIGTERM 2048
 
-Filter flags include ``--user``/``-u`` (defaults to the current user in filter
-mode), ``--partition``/``-p``, ``--state``/``-t`` (only ``PD`` or ``R``),
-``--name``/``-n``, ``--account``/``-A``, and ``--signal``/``-s`` (``KILL``/9,
-``TERM``/15, ``INT``/2, and others). You must supply at least job IDs,
-``--user``, or ``--name``. In filter mode, jobs already in a terminal state are
-silently skipped.
+Filter flags include ``--user``/``-u``, ``--partition``/``-p``, ``--state``/``-t``
+(only ``PD`` or ``R``), ``--name``/``-n``, ``--account``/``-A``, and
+``--signal``/``-s`` (``KILL``/9, ``TERM``/15, ``INT``/2, and others). You must
+supply job IDs or at least one of ``--user``, ``--name``, ``--partition``, or
+``--account``; ``--state`` alone only narrows a selection. Without ``--user``, a
+filter matches every user's jobs you can see, as in Slurm, and each one you do not
+own is refused. In filter mode, jobs already in a terminal state are silently
+skipped.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 

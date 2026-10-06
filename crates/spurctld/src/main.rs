@@ -104,6 +104,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    config.auth.check_private_data()?;
+
     // Fail fast on a broken submit hook (missing, non-executable, or a Lua that
     // won't compile) instead of deferring the error to the first user submission.
     hooks::validate_submit_hooks(&config.hooks)?;
@@ -378,6 +380,9 @@ async fn main() -> anyhow::Result<()> {
             "RPC callers are NOT authenticated: the identity used for authorization is supplied by \
              the client. Treat this port as an administrative boundary."
         ),
+    }
+    if let Some(warning) = config.auth.private_data_warning() {
+        tracing::warn!("{warning}");
     }
     if !addr.ip().is_loopback() && config.auth.mode != spur_core::config::AuthMode::Required {
         tracing::warn!(
