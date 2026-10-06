@@ -12,8 +12,8 @@ pub enum HostlistError {
     InvalidPattern(String),
     #[error("invalid range: {0}")]
     InvalidRange(String),
-    #[error("hostlist too large: {count} hosts exceeds maximum {max}")]
-    TooLarge { count: u64, max: usize },
+    #[error("hostlist too large: exceeds maximum {max} hosts")]
+    TooLarge { max: usize },
 }
 
 /// Expand a Slurm hostlist pattern into individual hostnames.
@@ -26,9 +26,8 @@ pub enum HostlistError {
 pub fn expand(pattern: &str) -> Result<Vec<String>, HostlistError> {
     let mut results = Vec::new();
     for part in split_top_level(pattern) {
-        expand_single(part.trim(), &mut results)?;
+        walk(part.trim(), &mut Collect(&mut results))?;
     }
-    results.retain(|s| !s.is_empty());
     Ok(results)
 }
 
@@ -303,8 +302,8 @@ fn split_top_level(s: &str) -> Vec<&str> {
 ///
 /// Returns `Some((start, end, width))` for a range, where `width` is the
 /// zero-pad width taken from the start token; returns `None` for a non-range
-/// term, which the caller emits verbatim. Shared by `expand_single` and
-/// `first_single` so the range grammar and its error handling live in one place.
+/// term, which the caller emits verbatim. Shared by `walk` and `first_single`
+/// so the range grammar and its error handling live in one place.
 fn parse_range_bounds(part: &str) -> Result<Option<(u64, u64, usize)>, HostlistError> {
     let Some(dash) = part.find('-') else {
         return Ok(None);
@@ -324,70 +323,119 @@ fn parse_range_bounds(part: &str) -> Result<Option<(u64, u64, usize)>, HostlistE
     Ok(Some((start, end, width)))
 }
 
-/// Expand a single hostlist term (no top-level commas).
-fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), HostlistError> {
-    if let Some(bracket_start) = pattern.find('[') {
-        let bracket_end = pattern
-            .find(']')
-            .ok_or_else(|| HostlistError::InvalidPattern("unmatched [".into()))?;
+/// Sink for [`walk`]: either collects hostnames or only tallies them, so the
+/// grammar and the cap stay in one traversal and `expand` and `count` cannot
+/// drift in what they accept.
+trait HostSink {
+    /// Hosts emitted so far, which is what the cap is measured against.
+    fn emitted(&self) -> u64;
+    fn emit(&mut self, name: std::fmt::Arguments<'_>);
+}
 
-        // ']' before '[' would make the slice below reversed (start > end) and panic.
-        if bracket_end < bracket_start {
-            return Err(HostlistError::InvalidPattern(format!(
-                "']' before '[': {pattern}"
-            )));
+struct Collect<'a>(&'a mut Vec<String>);
+
+impl HostSink for Collect<'_> {
+    fn emitted(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn emit(&mut self, name: std::fmt::Arguments<'_>) {
+        self.0.push(std::fmt::format(name));
+    }
+}
+
+struct Tally(u64);
+
+impl HostSink for Tally {
+    fn emitted(&self) -> u64 {
+        self.0
+    }
+
+    /// Discarding the name is what makes counting cheap: `format_args!` at the
+    /// call site formats nothing, so no per-host `String` is ever built.
+    fn emit(&mut self, _name: std::fmt::Arguments<'_>) {
+        self.0 += 1;
+    }
+}
+
+/// Every path that produces a host funnels through here, so a bare name is
+/// bounded by the cap the same way a range is.
+fn emit_one<S: HostSink>(sink: &mut S, name: std::fmt::Arguments<'_>) -> Result<(), HostlistError> {
+    if sink.emitted() >= MAX_HOSTLIST_SIZE as u64 {
+        return Err(HostlistError::TooLarge {
+            max: MAX_HOSTLIST_SIZE,
+        });
+    }
+    sink.emit(name);
+    Ok(())
+}
+
+/// Walk a single hostlist term (no top-level commas) into `sink`.
+fn walk<S: HostSink>(pattern: &str, sink: &mut S) -> Result<(), HostlistError> {
+    if pattern.is_empty() {
+        return Ok(());
+    }
+
+    let Some(bracket_start) = pattern.find('[') else {
+        emit_one(sink, format_args!("{pattern}"))?;
+        return Ok(());
+    };
+
+    let bracket_end = pattern
+        .find(']')
+        .ok_or_else(|| HostlistError::InvalidPattern("unmatched [".into()))?;
+
+    // ']' before '[' would make the slice below reversed (start > end) and panic.
+    if bracket_end < bracket_start {
+        return Err(HostlistError::InvalidPattern(format!(
+            "']' before '[': {pattern}"
+        )));
+    }
+
+    let prefix = &pattern[..bracket_start];
+    let range_str = &pattern[bracket_start + 1..bracket_end];
+    let suffix = &pattern[bracket_end + 1..];
+    let nested = suffix.contains('[');
+
+    for range_part in range_str.split(',') {
+        let Some((start, end, width)) = parse_range_bounds(range_part)? else {
+            // With nothing on either side of it an empty bracket names no host,
+            // so `[]` yields nothing rather than the empty string.
+            if prefix.is_empty() && suffix.is_empty() && range_part.is_empty() {
+                continue;
+            }
+            if nested {
+                walk(&format!("{prefix}{range_part}{suffix}"), sink)?;
+            } else {
+                emit_one(sink, format_args!("{prefix}{range_part}{suffix}"))?;
+            }
+            continue;
+        };
+
+        // Bound the element count before walking the range, so a u64-wide range
+        // fails at once instead of iterating. Saturating so the count arithmetic
+        // cannot itself overflow.
+        let range_count = (end - start).saturating_add(1);
+        if sink.emitted().saturating_add(range_count) > MAX_HOSTLIST_SIZE as u64 {
+            return Err(HostlistError::TooLarge {
+                max: MAX_HOSTLIST_SIZE,
+            });
         }
 
-        let prefix = &pattern[..bracket_start];
-        let range_str = &pattern[bracket_start + 1..bracket_end];
-        let suffix = &pattern[bracket_end + 1..];
-
-        for range_part in range_str.split(',') {
-            if let Some((start, end, width)) = parse_range_bounds(range_part)? {
-                // Bound element count BEFORE materializing. Saturating so the count
-                // arithmetic itself can't overflow on a u64::MAX range.
-                let range_count = (end - start).saturating_add(1);
-                if (results.len() as u64).saturating_add(range_count) > MAX_HOSTLIST_SIZE as u64 {
-                    return Err(HostlistError::TooLarge {
-                        count: (results.len() as u64).saturating_add(range_count),
-                        max: MAX_HOSTLIST_SIZE,
-                    });
-                }
-
-                for i in start..=end {
-                    let name = format!("{}{:0>width$}{}", prefix, i, suffix, width = width);
-                    if suffix.contains('[') {
-                        expand_single(&name, results)?;
-                    } else {
-                        results.push(name);
-                    }
-                    // Incremental backstop: nested products like rack[0-9999]-node[0-9999]
-                    // can exceed the cap even when each single range is under it.
-                    if results.len() > MAX_HOSTLIST_SIZE {
-                        return Err(HostlistError::TooLarge {
-                            count: results.len() as u64,
-                            max: MAX_HOSTLIST_SIZE,
-                        });
-                    }
-                }
+        for i in start..=end {
+            if nested {
+                walk(&format!("{prefix}{i:0>width$}{suffix}"), sink)?;
             } else {
-                let name = format!("{}{}{}", prefix, range_part, suffix);
-                if suffix.contains('[') {
-                    expand_single(&name, results)?;
-                } else {
-                    results.push(name);
-                }
+                emit_one(sink, format_args!("{prefix}{i:0>width$}{suffix}"))?;
             }
         }
-    } else {
-        results.push(pattern.to_string());
     }
     Ok(())
 }
 
 /// First hostname of a single term (no top-level commas), or `None` when the
-/// term expands to nothing (e.g. an empty string). Mirrors [`expand_single`]'s
-/// parsing but only resolves the first element of the leading range.
+/// term expands to nothing (e.g. an empty string). Mirrors [`walk`]'s parsing
+/// but only resolves the first element of the leading range.
 fn first_single(pattern: &str) -> Result<Option<String>, HostlistError> {
     if pattern.is_empty() {
         return Ok(None);
@@ -418,10 +466,18 @@ fn first_single(pattern: &str) -> Result<Option<String>, HostlistError> {
     }
 }
 
-/// Count the number of hosts in a hostlist pattern without expanding.
+/// Count the hosts a pattern expands to, without materializing them.
+///
+/// Shares [`expand`]'s traversal, so it accepts and rejects exactly the same
+/// patterns under the same `MAX_HOSTLIST_SIZE` cap while allocating no name
+/// list. Callers that only need to know a pattern is usable — the submit path
+/// checking `--nodelist` and `--exclude` — should use this rather than `expand`.
 pub fn count(pattern: &str) -> Result<usize, HostlistError> {
-    // For now, just expand and count. Can optimize later.
-    Ok(expand(pattern)?.len())
+    let mut tally = Tally(0);
+    for part in split_top_level(pattern) {
+        walk(part.trim(), &mut tally)?;
+    }
+    Ok(tally.0 as usize)
 }
 
 #[cfg(test)]
@@ -827,5 +883,74 @@ mod tests {
     #[test]
     fn count_rejects_oversized_range() {
         assert!(count("node[0-18446744073709551615]").is_err());
+    }
+
+    /// Every branch of `walk`: plain names, single and multi-part ranges, zero
+    /// padding, nested products, degenerate brackets, empty parts, and each way
+    /// to be malformed or over the cap.
+    const AGREEMENT_PATTERNS: &[&str] = &[
+        "login01",
+        "node1,node2,node3",
+        "node[001-003,005,010-012]",
+        "node[0001-0003]",
+        "gpu[01-04],cpu[01-02]",
+        "rack[1-2]-node[1-2]",
+        "node9,node010,node011",
+        "node[a,b]",
+        "",
+        ",node1,,node2",
+        "node1,node2,",
+        "[]",
+        "[,]",
+        "x[]",
+        "node[0-999998],extra",
+        "node[1-2",
+        "a]b[1-2]",
+        "node[5-3]",
+        "node[0-18446744073709551615]",
+        "node[0-1000000]",
+        "node[0-999999],extra",
+    ];
+
+    /// `count` must be indistinguishable from `expand(..).len()` on every input,
+    /// because the submit path trusts it to reject whatever `expand` would.
+    #[test]
+    fn count_agrees_with_expand_on_every_pattern() {
+        for pattern in AGREEMENT_PATTERNS {
+            match expand(pattern) {
+                Ok(hosts) => {
+                    let counted = count(pattern)
+                        .unwrap_or_else(|e| panic!("count rejected {pattern:?}: {e}"));
+                    assert_eq!(counted, hosts.len(), "count disagreed for {pattern:?}");
+                }
+                Err(expected) => {
+                    let actual = count(pattern)
+                        .expect_err(&format!("count accepted {pattern:?}, expand did not"));
+                    assert_eq!(
+                        std::mem::discriminant(&expected),
+                        std::mem::discriminant(&actual),
+                        "different error for {pattern:?}: {expected} vs {actual}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cap_bounds_bare_names_too() {
+        // Only the range loop used to test the limit, so a bare name appended to
+        // a cap-filling range took the total past it.
+        assert_eq!(
+            expand("node[0-999998],extra").unwrap().len(),
+            MAX_HOSTLIST_SIZE
+        );
+        assert!(matches!(
+            expand("node[0-999999],extra"),
+            Err(HostlistError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            count("node[0-999999],extra"),
+            Err(HostlistError::TooLarge { .. })
+        ));
     }
 }
