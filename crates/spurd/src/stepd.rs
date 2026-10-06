@@ -2514,8 +2514,8 @@ impl StepdStore {
         Ok(session_dir)
     }
 
-    /// Takes exclusive ownership of a session directory. Unlike
-    /// `prepare_session_dir`, an existing one is a conflict, not a success.
+    /// Takes exclusive ownership of a session directory for one launch. Unlike
+    /// `prepare_session_dir`, sharing an owned one is refused rather than reused.
     pub fn claim_session_dir(
         &self,
         job_id: u32,
@@ -2524,20 +2524,13 @@ impl StepdStore {
     ) -> io::Result<PathBuf> {
         self.prepare_session_root()?;
         let session_dir = self.session_dir(job_id, run_attempt, step_id);
-        match fs::create_dir(&session_dir) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700))?;
-                }
-                return Ok(session_dir);
-            }
+        match create_session_dir(&session_dir) {
+            Ok(()) => return Ok(session_dir),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
         self.reclaim_session_dir(&session_dir, job_id, run_attempt, step_id)?;
-        create_private_dir(&session_dir)?;
+        create_session_dir(&session_dir)?;
         Ok(session_dir)
     }
 
@@ -2548,26 +2541,32 @@ impl StepdStore {
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> io::Result<()> {
-        if let Ok(existing) = self.load_descriptor(session_dir) {
-            if !matches!(stepd_liveness(&existing), Ok(StepdLiveness::Stale)) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("a supervisor is already running for {job_id}.{run_attempt}.{step_id}"),
-                ));
+        let owned = format!("{job_id}.{run_attempt}.{step_id} is already owned");
+        // Only a descriptor's absence proves nobody owns the session: one this
+        // build cannot read may belong to a supervisor that is still running.
+        match self.load_descriptor(session_dir) {
+            Ok(existing) if !matches!(stepd_liveness(&existing), Ok(StepdLiveness::Stale)) => {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, owned));
             }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, owned));
+            }
+            Ok(_) | Err(_) => {}
         }
         // Reusing the directory would graft the new run onto the old run's
         // obligation log, so its exit would be replayed as this run's.
-        if matches!(
-            self.observed_exit(job_id, run_attempt, step_id),
-            Ok(Some(_))
-        ) {
+        if !matches!(self.observed_exit(job_id, run_attempt, step_id), Ok(None)) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("an exit is already recorded for {job_id}.{run_attempt}.{step_id}"),
             ));
         }
-        fs::remove_dir_all(session_dir)
+        // A benign race with a sweeper must not read as a spool fault, which
+        // would condemn the node.
+        match fs::remove_dir_all(session_dir) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
     }
 
     fn prepare_session_root(&self) -> io::Result<()> {
@@ -2949,6 +2948,16 @@ impl StepdStore {
         }
         Ok(descriptor)
     }
+}
+
+/// Creates `path` and nothing else — an existing directory is reported as
+/// `AlreadyExists` rather than adopted.
+#[cfg(unix)]
+fn create_session_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(unix)]
@@ -3339,6 +3348,21 @@ mod tests {
             store.observed_exit(9, 1, step_id).expect("observed exit"),
             Some((3, 0))
         );
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_session_whose_descriptor_it_cannot_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let first = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        fs::write(first.join(DESCRIPTOR_FILE), b"not json").expect("unreadable descriptor");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("an unreadable descriptor still names an owner");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]
