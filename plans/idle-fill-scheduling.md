@@ -6,6 +6,16 @@ them. Behind one cluster switch, `scheduler.idle_fill_enabled`, defaulting to of
 
 ## Revision note
 
+Draft 5 reconciles the design with what was built. The feature is implemented, and
+`docs/admin-guide/idle-fill-scheduling.rst` is the operator reference; every step in §11
+has shipped except the metrics export. Building it closed Q7 and exposed a rule this
+document never stated: within the opportunistic tier, QOS priority decides who is
+evicted first and whom an opportunistic job may itself displace (§8.7). §3.1 and §7.1
+now describe the borrow ceilings as they shipped, and D18-D20 record three defects that
+only surfaced in the implementation. Section and defect numbers are unchanged because
+the code cites them. `path:line` citations refer to `943d16d`, the tree the design was
+verified against.
+
 Draft 4 folds in the review decisions on Q1, Q2, Q3 and Q5. Four questions are now
 settled and recorded as decisions in §15: build it; reclaim a borrowed job regardless of
 `preempt_mode`; keep `idle_fill_preemptable` so reclaim can call back burst jobs during
@@ -111,10 +121,10 @@ Every setting the feature introduces, in one place.
 | Setting | Scope | Default | Purpose |
 |---|---|---|---|
 | `idle_fill_enabled` | cluster | `false` | The master switch. Off means no behavior change anywhere (§10) |
-| `idle_fill_exempt_secs` | cluster, per-QOS planned | short, order of a minute | Minimum run before a borrowed job may be reclaimed. The *only* guard on reclaim (§8.5) |
-| `idle_fill_preemptable` | per-QOS | `false` | Marks a QOS whose running jobs are reclaimable even though they are inside quota. Exists for burst (§4.1) |
-| `idle_fill_borrow_cap_*` | per-QOS | unset | Caps how much a scope may borrow. Two independent dimensions (§7.1) |
-| `idle_fill_atomic` | cluster, partition, QOS | `true` | Reserved. See below |
+| `idle_fill_exempt_secs` | cluster, per-QOS planned | `60` | Minimum run before a borrowed job may be reclaimed, doubling with each eviction of the same job up to an hour. The *only* guard on a reclaim driven by a quota claim (§8.5) |
+| `idle_fill_preemptable` | per-QOS | `false` | Marks a QOS whose running jobs are reclaimable even though they are inside quota. Exists for burst (§4.1). Set with `sacctmgr modify qos <name> set idlefillpreemptable=yes` |
+| `idle_fill_max_borrow_factor` | cluster | `0.0`, unbounded | Most nodes one QOS may hold on loan, as a multiple of its group node cap (§7.1) |
+| `idle_fill_max_cluster_fraction` | cluster | `0.0`, unbounded | Most nodes one QOS may hold on loan, as a share of registered nodes (§7.1) |
 
 Two notes on this table, both of which matter to reviewers.
 
@@ -123,19 +133,16 @@ Two notes on this table, both of which matter to reviewers.
 raisable by any user through a multi-partition submit, and is sized for arbitrating
 between two jobs that both hold a claim. Reclaim needs neither of those properties.
 
-`idle_fill_atomic` is carried in this table because the original proposal specified it,
-but it has no behavior to configure. Placement is already whole-job-or-nothing
+`idle_fill_atomic`, which the original proposal specified, is left out. It has no
+behavior to configure: placement is already whole-job-or-nothing
 (`backfill.rs:577-580`), so `true` describes what the scheduler already does, and `false`
-would mean building partial dispatch — an explicit non-goal above, and a much larger
-change than this feature. The honest options are to ship it as an accepted-and-ignored
-compatibility field, or to leave it out until partial dispatch is actually on the table.
-This is Q7.
+would mean building partial dispatch — an explicit non-goal above. Q7.
 
 ## 4. Two tiers
 
 - **Legitimate** — within quota. Never evicted by this mechanism.
 - **Borrowed** — running only because capacity was spare. Displaceable by a legitimate
-  job that needs the capacity.
+  job that needs the capacity, or by strictly dearer opportunistic work (§8.7).
 
 The contract is: *you may use spare capacity, and you will lose it on demand.* A loan
 that cannot be recalled is not a weaker version of this feature; it is a worse one
@@ -178,9 +185,8 @@ The two sources are not interchangeable, and three places must treat them differ
   behavior for operators who have not adopted idle-fill, which this feature has no
   business doing.
 
-Ordering within the victim set needs no special rule: a burst QOS sits at a large
-negative priority by construction, so it already sorts to the tail alongside the stamped
-candidates, and §8.2 evicts in one ordering across both sources.
+Both sources form one opportunistic tier, and QOS priority orders it: which run a reclaim
+takes first, and whom an opportunistic job may itself displace. §8.7 states the two rules.
 
 One consequence to state plainly, because it is a behavior change for existing burst
 users. Reclaim does not consult the preemption gates at all (§8.6), so once idle-fill is
@@ -246,8 +252,9 @@ The `hit_depth_limit` metric at `:161` is similarly sensitive.
 An unplaced candidate is still in the list, so four things must be handled:
 
 1. **It must not trigger preemption.** `try_preempt` receives everything that failed to
-   schedule (`scheduler_loop.rs:220-238`). A borrowed job has no claim and must never
-   evict anyone.
+   schedule (`scheduler_loop.rs:220-238`). A candidate has no claim and must never evict
+   a job that does. It may still reclaim from strictly cheaper opportunistic work, which
+   is reclaim's job, not preemption's (§8.7).
 2. **It must keep reporting `QosGrpNodeLimit`.** It is over quota; that is the true
    reason. `update_pending_reasons` would otherwise relabel it `NoSuitableNodes`.
 3. **It must not be forwarded to a federated peer** (`scheduler_loop.rs:243-250`).
@@ -397,9 +404,11 @@ lot of eviction when claims return, even though every eviction is legitimate.
 The cap runs on its own counter, and keeping it separate from the quota aggregates is the
 part that must not be got wrong.
 
-**A per-QOS `borrowed_tres` counter**, tracking what the scope currently holds on loan. It
-is a distinct quantity from the quota aggregate that §7 excludes borrowed jobs from — the
-same jobs are counted in one and excluded from the other, deliberately.
+**A per-QOS borrowed-node counter**, tracking what the scope currently holds on loan. It is
+seeded from running stamped jobs each pass and charged as the pass admits candidates, so
+one cycle cannot admit a batch that collectively breaks the ceiling. It is a distinct
+quantity from the quota aggregate that §7 excludes borrowed jobs from — the same jobs are
+counted in one and excluded from the other, deliberately.
 
 **The counter is strictly one-directional: it may only deny a new borrow.** It must never
 feed the legitimate-job admission gate and must never influence `retain_eligible`. If it
@@ -408,18 +417,22 @@ value that blocks a legitimate job strips that job from the pending list before 
 scheduler sees it, and reclaim can never be triggered by a job that is not there. The
 counter is read at one place, the borrow-admission decision, and nowhere else.
 
-**Two independent cap dimensions**, either or both configurable:
+**Two independent cap dimensions**, set cluster-wide and applied to each QOS:
 
-| Dimension | Bounds | Example |
+| Setting | Bounds | Example |
 |---|---|---|
-| Multiple of quota | One team's blast radius | borrow at most `N ×` the QOS's `grp_tres[Node]` |
-| Fraction of cluster | Cross-team fairness ceiling | no scope borrows more than `X%` of total nodes |
+| `idle_fill_max_borrow_factor` | One team's blast radius | `2.0` against `grptres=node=4` allows 8 borrowed nodes |
+| `idle_fill_max_cluster_fraction` | Cross-team fairness ceiling | `0.25` lets no QOS hold more than a quarter of registered nodes on loan |
+
+Both default to `0.0`, meaning unbounded. When both are set the tighter wins, and
+fractions floor so a ceiling never overshoots.
 
 A fraction of the scope's *own* quota is deliberately not offered: it rounds to zero for
 small teams, which are the ones the feature helps most.
 
-Sequencing: this lands after the §7 exclusion, behind its own configuration, and does not
-gate the core feature. Q3 is resolved.
+Sequencing: planned to follow the mechanism, the cap shipped with it. It remains a churn
+control rather than a correctness fix only because reclaim asks the over-quota question of
+the whole QOS (D13). Q3 is resolved.
 
 ## 8. Reclaim
 
@@ -450,24 +463,26 @@ holds chews through unrelated borrowed jobs.
 Reclaim is a separate, self-contained step after placement, not a modification of
 `try_preempt`:
 
-1. For each in-quota job that the pass did not place, compute the nodes that would
-   actually let it run, using the same `find_suitable_nodes` the scheduler uses.
+1. For each job that the pass did not place, compute the nodes that would actually let
+   it run, using the same `find_suitable_nodes` the scheduler uses. That includes borrow
+   candidates, which are bounded by their own QOS priority (§8.7).
 2. Intersect with nodes held by borrowed jobs — both sources from §4.1, the
-   `idle_fill`-stamped jobs and the jobs whose QOS is marked `idle_fill_preemptable`,
-   ordered as one list.
-3. If the borrowed jobs on those nodes would free **enough** capacity to place the job,
-   evict exactly that set. If not, evict nothing — a partial eviction destroys work
-   without helping anyone.
-4. Otherwise leave the job pending. It keeps its future-slot reservation, so it stays
-   ahead of every borrowed job next cycle.
+   `idle_fill`-stamped jobs and the jobs whose QOS is marked `idle_fill_preemptable`.
+   A node is evacuable only when every job on it is borrowed. Order the evacuable nodes
+   by the highest QOS priority each carries, cheapest first.
+3. If evacuating nodes in that order would free **enough** capacity to place the job,
+   evict the shortest prefix that does. If not, evict nothing — a partial eviction
+   destroys work without helping anyone.
+4. Otherwise leave the job pending. An in-quota job keeps its future-slot reservation,
+   so it stays ahead of every borrowed job next cycle.
 
 This fixes the denial-of-service directly: an unplaceable job never has a satisfiable
 victim set, so it evicts nothing, forever. It also fixes the multi-node accumulation
 problem draft 2 could only argue about analytically, because step 3 is atomic — the
 reclaimer either gets its whole allocation or nothing changes.
 
-It is also better isolated: one function, inputs (unplaced legitimate jobs, borrowed
-jobs, nodes), output (a victim set), independently testable without a scheduler loop.
+It is also better isolated: one function, inputs (unplaced jobs, borrowed jobs, nodes),
+output (a victim set), independently testable without a scheduler loop.
 
 ### 8.3 Eviction must actually free the node before it is reused
 
@@ -494,7 +509,9 @@ nodes out of the next cycle until the agent confirms.
 `Pending` with its spec intact (`cluster.rs:5731-5745`). It ignores `spec.requeue` by
 existing design (`cluster.rs:1871-1874`), so `--no-requeue` cannot pin borrowed
 capacity. `preempt_requeue_count` is deliberately excluded from the `max_batch_requeue`
-hold (`cluster.rs:5531-5536`), so a repeatedly evicted job is never cancelled.
+hold (`cluster.rs:5531-5536`), so a repeatedly evicted job is never cancelled. The fate
+is requeue whatever `PreemptMode` the victim's QOS or partition sets: a QOS with
+`preemptmode=cancel` still has its borrowed runs requeued.
 
 **Suspend cannot work.** `JobSuspend` signals SIGSTOP but leaves `allocated_nodes` and
 `allocated_resources` untouched (`cluster.rs:5946-5968`), so capacity is never released;
@@ -516,17 +533,17 @@ claim waits an hour for capacity that was lent away. A user can also raise their
 window with `--partition=fast,protected`, since the maximum across matched partitions
 wins, and that needs no privilege. Reclaim therefore uses a separate bounded minimum-run
 window, **`idle_fill_exempt_secs`**, rather than inheriting a knob sized for arbitrating
-between two claim-holders. It is the only guard standing between a borrowed job and
-reclaim (§8.6), so it is deliberately short — order of a minute — and capped, which is
-the property `preempt_exempt_time` lacks.
+between two claim-holders. It is the only guard standing between a borrowed job and a
+reclaim driven by a quota claim (§8.6), so it is deliberately short — order of a minute —
+and capped, which is the property `preempt_exempt_time` lacks.
 
 The anti-thrash hold is `max(interval_secs * 2 + 3, 5)` (`cluster.rs:1875-1876`), which
 at defaults is **5 seconds** — exactly the agent's SIGTERM-to-SIGKILL grace. A borrowed
 job can be lent, evicted, and re-lent every five seconds indefinitely, each round
 costing a Raft entry, an epilog, an accounting upsert, an agent RPC, and a log line,
 while completing nothing. `preempt_requeue_count` is incremented but backs nothing off.
-Reclaim backs off on it, following the existing `launch_backoff_secs` shape
-(`cluster.rs:64-69`), turning unbounded churn into a converging series.
+Reclaim backs off on it: the exempt window doubles with each eviction of the same job,
+capped at an hour, turning unbounded churn into a converging series.
 
 ### 8.6 Reclaim ignores `preempt_mode`
 
@@ -552,7 +569,9 @@ What this means concretely:
 - `preempt_mode` does not shield a borrowed job. Neither does the priority gap, the QOS
   allow list, or `preempt_exempt_time`. Reclaim consults none of them — it is not
   preemption, and it does not run through `try_preempt` (§8.1).
-- `idle_fill_exempt_secs` is the only guard (§8.5).
+- `idle_fill_exempt_secs` is the only guard against a reclaim driven by a quota claim
+  (§8.5). A reclaim driven by another opportunistic job is also bounded by QOS priority
+  (§8.7).
 - The documented guarantee narrows from "running jobs in this partition are never kicked
   out" to "jobs with a quota claim are never kicked out." That edit to
   `configuration.rst:779-785` ships with the change, not after it.
@@ -566,6 +585,32 @@ its quota, `preempt_mode = "off"` still means exactly what it says.
 
 Q2 is resolved. The one group affected beyond idle-fill's own borrowers is existing burst
 users, covered at the end of §4.1.
+
+### 8.7 Priority inside the opportunistic tier
+
+Both sources of borrowed work (§4.1) form one tier, and QOS priority decides what happens
+inside it. Two rules:
+
+- **(A) A reclaim takes the cheapest opportunistic run first.** A job with a quota claim
+  evicts the lowest-priority opportunistic work available — typically burst — and climbs
+  to a dearer borrowed run only when that is not enough. A node costs the highest priority
+  among the jobs on it, since evacuating it forfeits all of them. Only as many nodes as
+  the claim needs are taken.
+- **(B) An opportunistic job may displace only strictly cheaper opportunistic work.** An
+  unplaced borrow candidate, or an unplaced job in an `idle_fill_preemptable` QOS, may
+  reclaim only from runs whose QOS priority is strictly below its own, so a high-priority
+  idle-fill job outranks a low-priority burst job. The reverse is refused, and equal
+  priority displaces nothing.
+
+The comparison is `Qos::priority`, never `Job::priority`. A job's priority folds in an age
+factor and climbs while it waits, so a long-queued burst job would outrank a freshly
+borrowed run and invert both rules (D18). Standing within the tier is a property of the
+QOS, which is stable.
+
+This is what lets burst and idle-fill coexist while burst is phased out. A burst QOS sits
+at a large negative priority by construction, so it sorts below stamped idle-fill work with
+no special case: a legitimate claim calls burst back first, and burst can never take
+capacity back from idle-fill.
 
 ## 9. Defect register
 
@@ -585,11 +630,14 @@ Everything found by verification, with a fix. This is the implementation checkli
 | D10 | Serious | `preempt_exempt_time` is unbounded and user-raisable via multi-partition submit; an ordinary cluster-wide hour makes borrowed capacity unreclaimable for an hour (`scheduler_loop.rs:631-635`) | A separate bounded minimum-run window for borrowed jobs. §8.5 |
 | D11 | Serious | Anti-thrash hold is 5 seconds at defaults and nothing backs off (`cluster.rs:1875`) | Back off on `preempt_requeue_count`. §8.5 |
 | D12 | Serious | Accounting cannot report which runs were borrowed, and the start-upsert leaves stale preemption provenance, so an evicted-then-completed job reads `COMPLETED, PreemptMode=Requeue` forever (`db.rs:280-297`) | Add `idle_fill` to the jobs table; add the three preempt columns to the upsert's `DO UPDATE SET` |
-| D13 | Serious | The `idle_fill` flag is stamped once and never re-evaluated, so a job that becomes legitimate when a quota is raised stays evictable — contradicting §4 | Re-evaluate at reclaim time rather than trusting the stamp. Does not apply to the `idle_fill_preemptable` source, which is read live (§4.1) |
+| D13 | Serious | The `idle_fill` flag is stamped once and never re-evaluated, so a job that becomes legitimate when a quota is raised stays evictable — contradicting §4 | Re-evaluate at reclaim time rather than trusting the stamp, and ask it of the QOS as a whole: asked per run, two borrowers each measure themselves against the same headroom, both read as legitimate, and nothing is reclaimable while the team sits over its cap. Does not apply to the `idle_fill_preemptable` source, which is read live (§4.1) |
 | D14 | Serious | Unbounded borrowed jobs make a node look busy for a year via `busy_until`, and a legitimate job then reserves future slots a year out on unrelated idle nodes (`scheduler_loop.rs:573`, `backfill.rs:233`) | Refuse to lend to a job with no effective time limit. Mandatory, not optional |
 | D15 | Minor | Unplaced candidates take future-slot reservations and publish a `StartTime` for a job with no claim | Skip the `earliest > now` branch for candidates. §5.4 item 4 |
 | D16 | Minor | Append point matters: appending before the node-set build lets a candidate's nodelist unpin a cooling node for an in-quota job (`cluster.rs:2745`) | Append between `scheduler_loop.rs:163` and `:191`. §5.3 |
 | D17 | Minor | Double-subtract on a partially completed multi-node victim: the requeue apply passes `already_deallocated = &[]` after clearing `node_completions` (`cluster.rs:5761` vs `:5571`) | Collect completions first, as `evict_job_locked` does |
+| D18 | Serious | Ordering victims by `Job::priority` inverts both §8.7 rules: it folds in an age factor, so a long-queued burst job outranks a fresh borrowed run | Compare `Qos::priority`, in the victim order and in the opportunistic reclaimer's ceiling. §8.7 |
+| D19 | Serious | A freed node sits in kill-grace cooldown, invisible to the next pass, so the still-unplaced reclaimer evicts a second victim a cycle later and defeats the cheapest-first order | Hold each reclaiming job out of reclaim for the kill grace plus one interval |
+| D20 | Serious | Gating reclaim on a non-empty list of unplaced in-quota jobs makes rule (B) unreachable: when the only unplaced job is a borrow candidate, that list is empty and reclaim never runs | Run reclaim whenever idle-fill is enabled; keep `try_preempt` and federation behind the original guard |
 
 D14 resolves what draft 2 left as an open question. It is a correctness requirement, not
 a judgment call.
@@ -613,11 +661,11 @@ a judgment call.
 - **Accounting**: two additive columns (D12). There is no migrations directory — schema
   changes are `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` lines in `db::migrate()`
   (`db.rs:149-167`).
-- **Config**: every setting in §3.1 needs both a `#[serde(default)]` field and an entry in
-  the hand-written `Default` impl (`config.rs:700`) or it will not compile. A near-empty
-  config parse test already exists (`config.rs:2554`). The per-QOS settings —
-  `idle_fill_preemptable` and the borrow caps — are additive columns on the QOS record and
-  follow the same rules as the accounting columns below.
+- **Config**: every cluster setting in §3.1 needs both a `#[serde(default)]` field and an
+  entry in the hand-written `Default` impl (`config.rs:700`) or it will not compile. A
+  near-empty config parse test already exists (`config.rs:2554`). `idle_fill_preemptable`
+  is an additive column on the QOS record and follows the same rules as the accounting
+  columns above.
 - **Breaking**: the documented meaning of `preempt_mode = "off"` narrows (§8.6), so the
   implementation PR carries `!`. Existing burst users are affected as well, since burst
   jobs gain a second reclaim path once idle-fill is enabled (§4.1).
@@ -633,12 +681,12 @@ a judgment call.
 | 5 | `spurctld/src/cluster.rs` | Collect candidates: exclusions D5/D6/D7, credit re-check D4, `preferred_nodes` clear, `reserved.reserve` D8 |
 | 6 | `spurctld/src/scheduler_loop.rs` | Append at the right point (D16); tag assignments; the four exclusions in §5.4; refuse unbounded jobs (D14) |
 | 7 | `spur-sched/src/backfill.rs` | Suppress future-slot reservations for candidates (D15) |
-| 8 | `spurctld/src/scheduler_loop.rs` | Reclaim routine (§8.2) over both victim sources (§4.1), awaiting cancel (D3), `idle_fill_exempt_secs` (D10), backoff (D11), flag re-evaluation (D13) |
+| 8 | `spurctld/src/scheduler_loop.rs` | Reclaim routine (§8.2) over both victim sources (§4.1), awaiting cancel (D3), `idle_fill_exempt_secs` (D10), backoff (D11), flag re-evaluation (D13), the priority rules (§8.7, D18-D20) |
 | 9 | Fairshare | Exclude reclaimed runs of stamped jobs from usage (D9) |
 | 10 | `db.rs`, `proto`, `server.rs`, `rest/convert.rs`, `spur-cli` | Surfacing and accounting (D12, §11.1) |
 | 11 | `docs/admin-guide/` | New page, including the burst interaction in §4.1; the narrowing edit to `configuration.rst` (§8.6); `accounting.rst` on how this relates to the burst pattern (§2); `monitoring-jobs.rst` |
 | 12 | `spur-metrics` | Nodes-on-loan gauge, reclaim counter |
-| 13 | `spurctld`, QOS record | Borrow cap: `borrowed_tres` counter and the two cap dimensions (§7.1) |
+| 13 | `spurctld`, `config.rs` | Borrow cap: the borrowed-node counter and the two cap dimensions (§7.1) |
 
 Steps 1-3 are inert. The mechanism becomes live at step 6, and **step 4 must land before
 step 6** or the loan is unrecallable. This is the one hard ordering constraint in the
@@ -676,10 +724,10 @@ Three things draft 2 wanted to defer also belong in the unit:
 - **Docs** (step 11). Required by repo policy for user-facing change, and §8.6 narrows a
   documented guarantee, which cannot ship silently.
 
-Two steps genuinely follow after: the metrics export (step 12), and the borrow cap
-(step 13), which is additive, sits behind its own configuration, and controls churn rather
-than correctness (§7.1). Default-off is what makes landing the rest at once safe: a
-zero-behavior-change deployment for every existing cluster.
+One step genuinely follows after: the metrics export (step 12). The borrow cap (step 13)
+was planned to follow too, and shipped with the rest instead (§7.1). Default-off is what
+makes landing the rest at once safe: a zero-behavior-change deployment for every existing
+cluster.
 
 ## 13. Corrections
 
@@ -688,7 +736,7 @@ zero-behavior-change deployment for every existing cluster.
 | The proposal assumes | Reality |
 |---|---|
 | `idle_fill_exempt_secs` is a new knob | Correct after all, though not for the stated reason: `preempt_exempt_time` already exists and would have served, but it is unbounded and user-raisable, so §8.5 introduces a separate bounded window under this name |
-| `idle_fill_atomic`, default true, with a three-level override chain | Whole-job-or-nothing is already invariant (`backfill.rs:577`). `true` is a no-op; `false` would mean building partial dispatch. Retained in §3.1 as a compatibility field pending Q7 |
+| `idle_fill_atomic`, default true, with a three-level override chain | Whole-job-or-nothing is already invariant (`backfill.rs:577`). `true` is a no-op; `false` would mean building partial dispatch. Left out (§3.1, Q7) |
 | Fates are `REQUEUE`, `CANCEL`, `CHECKPOINT` | No checkpoint mode exists; the fourth is `Suspend` (`partition.rs:86`), which cannot free nodes. An unrecognized mode string parses **silently to `Off`** with no warning (`config.rs:2118`) |
 | "No new configuration needed" for preemption | False. Under defaults preemption does not run at all, and the reclaim semantics described are blocked three ways |
 | This is new capability | The burst QOS pattern already does opportunistic borrowing with reclaim (`accounting.rst:942`). §2 |
@@ -711,6 +759,8 @@ zero-behavior-change deployment for every existing cluster.
 | Draft 3: D1's exclusion is "the QOS dimension" of the aggregates | Too narrow. It must cover the job-count limits too, and `max_jobs_per_user` is checked before the TRES breach, so a node-only exclusion fixes nothing (§7) |
 | Draft 3: no borrow cap for a first cut | A cap is in scope as a churn control, on a counter kept strictly separate from the quota aggregates (§7.1) |
 | Draft 4: D1's aggregate list, though introduced as "every quota aggregate", enumerated only the QOS gate | Incomplete in a way that reproduces D1 in full. `account_block_with` computes the same four aggregates and runs *first*, so a job it blocks never reaches the QOS gate where the exclusion was applied. §7 carries the scenario |
+| Draft 4: ordering within the victim set needs no special rule, because burst already sorts to the tail | Too weak to implement: §8.2 never sorted, so following it literally gives node-order eviction, and it omitted rule (B) altogether. Both rules are now explicit (§8.7) |
+| Draft 4: a borrow candidate must never evict anyone | It may reclaim from strictly cheaper opportunistic work (§5.4, §8.7) |
 
 ### Outside this feature
 
@@ -779,6 +829,11 @@ Placement is all-or-nothing (`backfill.rs:577`).
   victim without any per-job change; a reclaimed burst run *is* charged to fairshare
   while a reclaimed stamped run is not; reclaim proceeds with `preempt_mode = "off"` and
   with no `preempt_type` configured.
+- **Opportunistic-tier priority (§8.7)**: a legitimate claim with a burst victim and a
+  dearer idle-fill victim available evicts the burst one, with the burst job on a node
+  placement would not otherwise choose; a dearer borrow candidate displaces cheaper burst
+  work; a cheaper burst job cannot displace a dearer borrowed run, and equal priority
+  displaces nothing. Each direction is the other's control.
 - **Borrow cap (§7.1)**: a borrow is denied at the cap under each dimension; the counter
   never blocks a legitimate job — assert directly that a scope at its borrow cap still
   admits an in-quota job and that the job survives `retain_eligible`, since that is the
@@ -803,6 +858,8 @@ Placement is all-or-nothing (`backfill.rs:577`).
    with no partial eviction.
 7. Repeat (4) immediately: no eviction until the bounded window elapses.
 8. Restart the controller with a borrowed job running; the flag survives.
+9. Both §8.7 rules, each with the cluster full: a claim evicts burst before idle-fill, a
+   dearer idle-fill job displaces burst, and burst never displaces it.
 
 Real commands and output go in the PR body.
 
@@ -822,10 +879,9 @@ reintroducing the adoption cliff. The docs edit ships with the change and the
 implementation PR carries `!`. §8.6.
 
 **Q3 — Should borrowing be capped? → Yes, on a separate counter.** A per-QOS
-`borrowed_tres` counter, strictly one-directional so it can only deny a new borrow, with
+borrowed-node counter, strictly one-directional so it can only deny a new borrow, with
 two configurable dimensions: a multiple of the scope's quota, and a fraction of the
-cluster. Additive, sequenced after the D1 exclusion, and a churn control rather than a
-correctness fix. §7.1.
+cluster. A churn control rather than a correctness fix. §7.1.
 
 **Q5 — Does `idle_fill_preemptable` still have a purpose? → Keep it.** The draft-3
 inclination to drop it was backwards. The documented burst QOS carries no group TRES cap at
@@ -833,13 +889,17 @@ all, so a burst job has none to exceed, never fails the sole-blocker test, and i
 stamped — meaning without this flag reclaim can never call back a burst job, which is the
 case that matters most while burst is being migrated away from. §4.1.
 
+**Q7 — What happens to `idle_fill_atomic`? → Leave it out.** It has no behavior to
+configure: placement is already whole-job-or-nothing, so a knob whose `false` the
+scheduler cannot produce would be dead config. §3.1.
+
 ### Still open
 
 **Q4 — Which cap do the teams asking for this actually hit?** The QOS group node cap, or
 the association/account cap? The account gate runs first and returns early
 (`cluster.rs:3715`), so account-blocked jobs never reach eligibility. Extending to account
-quotas needs a second predicate and a second collection point. Worth knowing before
-implementation starts, because it decides whether §6 covers the real cases.
+quotas needs a second predicate and a second collection point. The implementation covers
+the QOS group node cap only, so the answer decides whether §6 covers the real cases.
 
 **Q6 — Fairshare treatment.** D9 proposes not charging usage for a reclaimed run of a
 stamped job, and §4.1 keeps today's treatment for burst victims. The objection to exempting
@@ -853,9 +913,5 @@ reference to how the job ended (`db.rs:440-458`), and the factor is
 `target_share / actual_share` (`fairshare.rs:11`) keyed on **(user, account)** rather than
 QOS. So charging a reclaimed run lowers the priority of every job that user runs under that
 account, including their in-quota work, because capacity was taken back from them. The
-proposal is therefore to exempt, but the call is not mine.
-
-**Q7 — What happens to `idle_fill_atomic`?** It has no behavior to configure: placement is
-already whole-job-or-nothing, so `true` is the status quo and `false` would mean building
-partial dispatch, an explicit non-goal. Ship it as an accepted-and-ignored compatibility
-field, or leave it out until partial dispatch is real? §3.1.
+proposal is therefore to exempt, but the call is not mine. The implementation exempts, as
+proposed.
