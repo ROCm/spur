@@ -618,22 +618,15 @@ Reading it:
   cap ``MaxTRESPJ``, the per-user caps it enforces (``MaxJobsPU``,
   ``MaxSubmitJobsPU``, ``MaxTRESPU``), and the per-account submit cap
   ``MaxSubmitJobsPA``. An association caps each ``(user, account)`` pair on its
-  own, so its per-user caps — and its per-job ``MaxTRESPJ`` — ride on each
-  ``User=`` line instead, where a single scope-line value would show one user's
-  cap and hide the rest. The ``PJ``/``PU`` suffixes are Slurm's and matter here:
-  ``MaxTRESPJ`` bounds one job, ``MaxTRESPU`` one user's total, and an
-  association's own per-user cap is named plainly ``MaxTRES`` on each ``User=``
-  line — so within one association record ``MaxTRESPJ`` and ``MaxTRES`` are
-  different caps, not a contradiction. A QOS carries ``MaxSubmitJobsPA`` and
-  ``GrpWall``; an association cannot, so those never appear in its records, but
-  the per-job ``MaxTRESPJ`` a QOS and an association both enforce shows in both —
-  on the QOS scope line, and on each association ``User=`` line.
+  own, so its per-user caps and its ``MaxTRESPJ`` ride on each ``User=`` line
+  instead. ``MaxTRESPJ`` bounds one job; ``MaxTRESPU``, or ``MaxTRES`` on an
+  association ``User=`` line, bounds that user's total. ``MaxSubmitJobsPA`` and
+  ``GrpWall`` are QOS-only and never appear in association records.
 * ``Grp*`` figures are the whole scope's, summed across every user, and stay on
   the scope line. ``GrpWall`` is the QOS's wall-clock budget beside the spend
-  measured over ``grp_wall_window_days`` (see :doc:`/admin-guide/accounting`);
-  it applies to a QOS only. Filtering to one user narrows the ``User=`` lines but
-  never the group figures, since a group cap cannot be judged from one user's
-  share.
+  measured over ``grp_wall_window_days`` (see :doc:`/admin-guide/accounting`).
+  Filtering to one user narrows the ``User=`` lines but never the group figures,
+  since a group cap cannot be judged from one user's share.
 * ``OverLimit`` lists caps that are **already exceeded**, on the scope line for
   group caps — including ``GrpWall`` once spend reaches the budget, the state
   behind a ``QOSGrpWallLimit`` hold — and on a user's line for that user's caps.
