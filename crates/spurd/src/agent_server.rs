@@ -25,8 +25,8 @@ use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
-    batch_companion_hold_script, batch_script_uses_step_launch, build_multi_task_pmix_wrapper,
-    build_multi_task_wrapper, use_multi_task_launch,
+    batch_companion_hold_script, batch_launch, batch_script_uses_step_launch,
+    build_multi_task_pmix_wrapper, build_multi_task_wrapper, use_multi_task_launch, BatchLaunch,
 };
 use spur_devices::DeviceRegistry;
 
@@ -5397,12 +5397,8 @@ impl SlurmAgent for AgentService {
         // out when `task_fanout` is set (standalone `srun` routed through the batch
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
-        let fan_out =
-            use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
-        // A script that launches its own steps is a driver, not a rank, so it must
-        // not be given a rank's environment.
-        let script_is_a_rank = spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script);
-        let launch_script = if fan_out || script_is_a_rank {
+        let shape = batch_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
+        let launch_script = if shape != BatchLaunch::Script {
             let user_script_path = crate::executor::stage_user_script(
                 job_id,
                 launch_step,
@@ -5417,7 +5413,7 @@ impl SlurmAgent for AgentService {
             .to_string_lossy()
             .into_owned();
 
-            if !fan_out {
+            if shape == BatchLaunch::LoneRank {
                 // A lone rank on this node still needs `env.sh` and the
                 // `PMIX_SERVER_URI` aliases the per-rank wrapper carries.
                 spur_core::task_launch::build_single_task_wrapper(

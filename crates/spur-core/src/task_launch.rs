@@ -121,6 +121,32 @@ pub fn use_multi_task_launch(
     mpi == MPI_PMIX && !batch_script_uses_step_launch(script)
 }
 
+/// How batch `launch_job` runs the user script on this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchLaunch {
+    /// Unwrapped: not an MPI rank, or a driver that launches its own steps.
+    Script,
+    /// The node's only rank, which still needs the rank wrapper's environment.
+    LoneRank,
+    /// One wrapper per local task.
+    FanOut,
+}
+
+pub fn batch_launch(
+    tasks_per_node: u32,
+    task_fanout: bool,
+    mpi: &str,
+    script: &str,
+) -> BatchLaunch {
+    if use_multi_task_launch(tasks_per_node, task_fanout, mpi, script) {
+        return BatchLaunch::FanOut;
+    }
+    if mpi == MPI_PMIX && !batch_script_uses_step_launch(script) {
+        return BatchLaunch::LoneRank;
+    }
+    BatchLaunch::Script
+}
+
 /// True when batch dispatch already ran multi-node PMIx prepare for this job.
 ///
 /// Direct `#SBATCH --mpi=pmix` on multiple nodes prepares PMIx before launch.
@@ -814,6 +840,64 @@ mod tests {
         assert!(!use_multi_task_launch(4, false, "none", "echo hi"));
         assert!(use_multi_task_launch(4, true, "none", "hostname"));
         assert!(!use_multi_task_launch(1, true, "none", "hostname"));
+    }
+
+    #[test]
+    fn a_lone_pmix_batch_rank_is_wrapped() {
+        let direct = "#!/bin/bash\n#SBATCH --mpi=pmix\n/tmp/hello_mpi\n";
+        assert_eq!(
+            batch_launch(1, false, MPI_PMIX, direct),
+            BatchLaunch::LoneRank
+        );
+    }
+
+    #[test]
+    fn a_pmix_batch_driver_runs_unwrapped() {
+        let driver = "#!/bin/bash\n#SBATCH --mpi=pmix\nsrun --mpi=pmix /tmp/hello_mpi\n";
+        assert_eq!(
+            batch_launch(1, false, MPI_PMIX, driver),
+            BatchLaunch::Script
+        );
+        assert_eq!(
+            batch_launch(4, false, MPI_PMIX, driver),
+            BatchLaunch::Script
+        );
+    }
+
+    #[test]
+    fn a_non_mpi_batch_script_runs_unwrapped() {
+        assert_eq!(
+            batch_launch(1, false, "none", "hostname"),
+            BatchLaunch::Script
+        );
+        assert_eq!(
+            batch_launch(4, false, "none", "hostname"),
+            BatchLaunch::Script
+        );
+    }
+
+    #[test]
+    fn several_local_tasks_fan_out() {
+        assert_eq!(
+            batch_launch(4, false, MPI_PMIX, "/tmp/hello_mpi"),
+            BatchLaunch::FanOut
+        );
+        assert_eq!(
+            batch_launch(4, true, "none", "hostname"),
+            BatchLaunch::FanOut
+        );
+    }
+
+    #[test]
+    fn a_lone_standalone_srun_task_is_wrapped_only_for_pmix() {
+        assert_eq!(
+            batch_launch(1, true, "none", "hostname"),
+            BatchLaunch::Script
+        );
+        assert_eq!(
+            batch_launch(1, true, MPI_PMIX, "/tmp/hello_mpi"),
+            BatchLaunch::LoneRank
+        );
     }
 
     #[test]
