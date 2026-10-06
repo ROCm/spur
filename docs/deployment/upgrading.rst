@@ -466,12 +466,13 @@ controller **before** upgrading:
 
 A request from a User that names another user no longer falls back to the caller's
 own jobs. In v0.14, ``squeue -u bob``, ``sprio -u bob``, and REST
-``/jobs?user=bob`` from alice returned alice's own jobs, and ``scancel -u bob``
+``/jobs?user=bob`` returned the caller's own jobs, and ``scancel -u bob``
 cancelled them. Under ``"jobs"`` these now return nothing and cancel nothing, as
 in Slurm. Without ``private_data`` they list bob's jobs.
 
 Without ``private_data``, ``scancel -p``, ``-A``, or ``-n`` also selects other
-users' jobs. Each one the caller does not own is refused and reported on stderr.
+users' jobs. Each one the caller does not own is refused and reported on
+``stderr``.
 
 ``scontrol reconfigure`` applies ``private_data`` on the leader only; restart every
 controller after changing it. During a rolling upgrade, visibility depends on which
