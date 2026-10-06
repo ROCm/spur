@@ -2012,6 +2012,27 @@ fn apply_multi_rank_pmix(
     })
 }
 
+/// Binds the control socket, refusing to displace a live peer: unlinking a
+/// path that already answers would steal another supervisor's identity.
+pub(crate) fn bind_runtime_socket(socket_path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(socket_path) {
+        Ok(listener) => return Ok(listener),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+        Err(error) => return Err(error),
+    }
+    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "another supervisor is already serving {}",
+                socket_path.display()
+            ),
+        ));
+    }
+    fs::remove_file(socket_path)?;
+    UnixListener::bind(socket_path)
+}
+
 const STEPD_USAGE: &str = "usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>\n\n\
      Per-step supervisor. spurd spawns this; it is not meant to be run by hand.";
 
@@ -2037,12 +2058,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let step_id = launch_spec.step_id;
     let store = StepdStore::new(state_dir);
     let agent_socket = store.agent_socket();
-    let session_dir = store.session_dir(job_id, run_attempt, step_id);
+    let session_dir = store.prepare_session_dir(job_id, run_attempt, step_id)?;
     let obligations = store.obligations(job_id, run_attempt, step_id);
+    // Bound before the descriptor is published: a losing duplicate must fail
+    // here, while the running supervisor's identity is still on disk.
     let socket_path = session_dir.join("runtime.sock");
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
+    let listener = bind_runtime_socket(&socket_path)?;
     let pid = std::process::id();
     let mut descriptor = StepdDescriptor::new(
         job_id,
@@ -2069,7 +2090,6 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
     store.publish(&descriptor)?;
-    let listener = UnixListener::bind(&socket_path)?;
     // Custody of an interactive session's pty master outlives the agent that
     // created it, so the terminal survives a restart and can be picked back up.
     let custody_path = session_dir.join(PTY_CUSTODY_SOCKET_NAME);
@@ -2488,6 +2508,69 @@ impl StepdStore {
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> io::Result<PathBuf> {
+        self.prepare_session_root()?;
+        let session_dir = self.session_dir(job_id, run_attempt, step_id);
+        create_private_dir(&session_dir)?;
+        Ok(session_dir)
+    }
+
+    /// Takes exclusive ownership of a session directory. Unlike
+    /// `prepare_session_dir`, an existing one is a conflict, not a success.
+    pub fn claim_session_dir(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<PathBuf> {
+        self.prepare_session_root()?;
+        let session_dir = self.session_dir(job_id, run_attempt, step_id);
+        match fs::create_dir(&session_dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(session_dir);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        self.reclaim_session_dir(&session_dir, job_id, run_attempt, step_id)?;
+        create_private_dir(&session_dir)?;
+        Ok(session_dir)
+    }
+
+    fn reclaim_session_dir(
+        &self,
+        session_dir: &Path,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<()> {
+        if let Ok(existing) = self.load_descriptor(session_dir) {
+            if !matches!(stepd_liveness(&existing), Ok(StepdLiveness::Stale)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("a supervisor is already running for {job_id}.{run_attempt}.{step_id}"),
+                ));
+            }
+        }
+        // Reusing the directory would graft the new run onto the old run's
+        // obligation log, so its exit would be replayed as this run's.
+        if matches!(
+            self.observed_exit(job_id, run_attempt, step_id),
+            Ok(Some(_))
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("an exit is already recorded for {job_id}.{run_attempt}.{step_id}"),
+            ));
+        }
+        fs::remove_dir_all(session_dir)
+    }
+
+    fn prepare_session_root(&self) -> io::Result<()> {
         let state_dir = self.root.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2502,10 +2585,7 @@ impl StepdStore {
                 fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
             }
         }
-        create_private_dir(&self.root)?;
-        let session_dir = self.session_dir(job_id, run_attempt, step_id);
-        create_private_dir(&session_dir)?;
-        Ok(session_dir)
+        create_private_dir(&self.root)
     }
 
     pub fn publish(&self, descriptor: &StepdDescriptor) -> io::Result<()> {
@@ -3183,6 +3263,120 @@ mod tests {
             PathBuf::from("/run/spur/runtime.sock"),
             PathBuf::from("/sys/fs/cgroup/spur/test"),
         )
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_directory_a_live_supervisor_owns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let first = store
+            .claim_session_dir(9, 1, step_id)
+            .expect("the first launch claims the session");
+        let mut live = descriptor(9, 1, std::process::id());
+        live.socket_path = first.join("runtime.sock");
+        store.publish(&live).expect("publish descriptor");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("a second launch must not share the live session");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            store
+                .load_descriptor(&first)
+                .expect("descriptor survives")
+                .pid,
+            live.pid,
+            "the refused launch must leave the live session's identity intact"
+        );
+    }
+
+    #[test]
+    fn claim_session_dir_reclaims_a_directory_whose_supervisor_is_gone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let first = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        let mut dead = descriptor(9, 1, 0);
+        dead.pid = u32::MAX;
+        dead.socket_path = first.join("runtime.sock");
+        store.publish(&dead).expect("publish descriptor");
+        fs::write(first.join("launch.json"), b"stale").expect("stale launch spec");
+
+        let reclaimed = store
+            .claim_session_dir(9, 1, step_id)
+            .expect("a session with no live owner is reclaimable");
+
+        assert_eq!(reclaimed, first);
+        assert!(
+            !reclaimed.join("launch.json").exists(),
+            "reclaiming must not leave the previous launch's records behind"
+        );
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_session_that_already_recorded_an_exit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        store.claim_session_dir(9, 1, step_id).expect("first claim");
+        store
+            .obligations(9, 1, step_id)
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 3,
+                signal: 0,
+            })
+            .expect("append exit observed");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("a recorded exit must not be grafted onto a new run");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            store.observed_exit(9, 1, step_id).expect("observed exit"),
+            Some((3, 0))
+        );
+    }
+
+    #[test]
+    fn claim_session_dir_separates_attempts_and_steps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+
+        let batch = store
+            .claim_session_dir(9, 1, spur_core::step::STEP_BATCH)
+            .expect("batch step");
+        let next_attempt = store
+            .claim_session_dir(9, 2, spur_core::step::STEP_BATCH)
+            .expect("next attempt");
+        let numbered = store.claim_session_dir(9, 1, 0).expect("numbered step");
+
+        assert_ne!(batch, next_attempt);
+        assert_ne!(batch, numbered);
+    }
+
+    #[tokio::test]
+    async fn bind_runtime_socket_refuses_a_path_a_live_peer_is_serving() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        let _held = bind_runtime_socket(&socket_path).expect("the first bind wins");
+
+        let error = bind_runtime_socket(&socket_path)
+            .expect_err("a second supervisor must not take over a served socket");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn bind_runtime_socket_replaces_a_socket_nobody_is_serving() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        drop(bind_runtime_socket(&socket_path).expect("the first bind wins"));
+
+        bind_runtime_socket(&socket_path).expect("a stale socket file must not wedge a relaunch");
     }
 
     fn descriptor_for_step(

@@ -1,33 +1,56 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Per-job-id serialization of the phases that create and destroy a job's state.
+//! Per-key serialization of the phases that create and destroy the state a job
+//! or a supervisor session owns.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 type Entry = Arc<AsyncMutex<()>>;
-type Registry = Arc<Mutex<HashMap<u32, Entry>>>;
+type Registry<K> = Arc<Mutex<HashMap<K, Entry>>>;
 
 /// Serializes setup and teardown for a given job id. A job's cgroup, spool dir and rootfs
 /// all derive from its id and the controller reuses that id on re-dispatch, so without
 /// this a launch and the previous run's teardown each act on the other's files.
-#[derive(Clone, Default)]
-pub(crate) struct JobLifecycle {
-    entries: Registry,
+pub(crate) type JobLifecycle = KeyedLifecycle<u32>;
+
+/// Serializes launches of one supervisor session: its directory, launch spec
+/// and control socket all derive from this triple.
+pub(crate) type StepLaunchLifecycle = KeyedLifecycle<crate::agent_server::SessionIdentity>;
+
+pub(crate) struct KeyedLifecycle<K: Eq + Hash + Clone> {
+    entries: Registry<K>,
 }
 
-impl JobLifecycle {
-    pub(crate) async fn acquire(&self, job_id: u32) -> JobLifecycleGuard {
+impl<K: Eq + Hash + Clone> Clone for KeyedLifecycle<K> {
+    fn clone(&self) -> Self {
+        Self {
+            entries: Arc::clone(&self.entries),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> Default for KeyedLifecycle<K> {
+    fn default() -> Self {
+        Self {
+            entries: Registry::default(),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> KeyedLifecycle<K> {
+    pub(crate) async fn acquire(&self, key: K) -> KeyedLifecycleGuard<K> {
         let entry = lock_registry(&self.entries)
-            .entry(job_id)
+            .entry(key.clone())
             .or_default()
             .clone();
         let held = entry.lock_owned().await;
-        JobLifecycleGuard {
-            job_id,
+        KeyedLifecycleGuard {
+            key,
             entries: Arc::clone(&self.entries),
             held: Some(held),
         }
@@ -36,31 +59,37 @@ impl JobLifecycle {
 
 /// Poisoning means some holder panicked, not that the map is torn: it is only ever
 /// inserted into and removed from. Refusing it here would wedge every later launch.
-fn lock_registry(entries: &Registry) -> MutexGuard<'_, HashMap<u32, Entry>> {
+fn lock_registry<K: Eq + Hash>(entries: &Registry<K>) -> MutexGuard<'_, HashMap<K, Entry>> {
     entries.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Held for as long as the caller owns the job id's state. Nothing else may set up or
-/// tear down that id until it drops.
+/// Held for as long as the caller owns the key's state. Nothing else may set up or
+/// tear down that key until it drops.
 #[must_use = "the lifecycle is serialized only while this guard is held"]
-pub(crate) struct JobLifecycleGuard {
-    job_id: u32,
-    entries: Registry,
+pub(crate) struct KeyedLifecycleGuard<K: Eq + Hash + Clone> {
+    key: K,
+    entries: Registry<K>,
     held: Option<OwnedMutexGuard<()>>,
 }
 
-impl Drop for JobLifecycleGuard {
+impl<K: Eq + Hash + Clone> KeyedLifecycleGuard<K> {
+    pub(crate) fn key(&self) -> &K {
+        &self.key
+    }
+}
+
+impl<K: Eq + Hash + Clone> Drop for KeyedLifecycleGuard<K> {
     fn drop(&mut self) {
         // Release first so this guard's own reference is not counted below.
         self.held.take();
         let mut entries = lock_registry(&self.entries);
-        // The sole remaining reference is the map's, so no one is waiting on this id
+        // The sole remaining reference is the map's, so no one is waiting on this key
         // and the entry can go rather than accumulating one per job the node ever ran.
         if entries
-            .get(&self.job_id)
+            .get(&self.key)
             .is_some_and(|e| Arc::strong_count(e) == 1)
         {
-            entries.remove(&self.job_id);
+            entries.remove(&self.key);
         }
     }
 }
