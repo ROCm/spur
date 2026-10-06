@@ -11414,6 +11414,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn assoc_mgr_wire_record_puts_an_association_per_job_cap_on_its_user() {
+        use spur_core::accounting::{PerUserCaps, ScopeLimitUsage, TresRecord, UserLimitUsage};
+        let usage = ScopeLimitUsage {
+            scope: "tenant-a".into(),
+            users: vec![UserLimitUsage {
+                user: "alice".into(),
+                caps: PerUserCaps {
+                    max_tres_per_job: Some(TresRecord::parse("node=2").unwrap()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let record = assoc_mgr_to_proto(&usage, AssocMgrScope::Association);
+        assert_eq!(record.users[0].max_tres_per_job, "node=2");
+        assert_eq!(record.max_tres_per_job, "");
+    }
+
+    #[test]
+    fn assoc_mgr_wire_record_keeps_unread_grp_wall_spend_apart_from_any_real_value() {
+        use spur_core::accounting::INFINITE;
+        assert_eq!(opt_consumed(None), INFINITE);
+        assert_eq!(opt_consumed(Some(0)), 0);
+        assert_eq!(opt_consumed(Some(u64::MAX)), INFINITE - 1);
+    }
+
     // --- build_reservation_txn (audit attribution) ---
 
     #[test]
