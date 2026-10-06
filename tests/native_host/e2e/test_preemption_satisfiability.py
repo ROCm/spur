@@ -192,6 +192,8 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
         return _SINGLE_PARTITION_CONFIG
 
     def test_partial_victim_set_evicts_nobody(self, multi_node_cluster):
+        """Covers the PreemptMode=Off eligibility gate, excluded before the
+        satisfiability proof runs; see _via_satisfiability_proof for that proof."""
         c = multi_node_cluster
         first, second = c.node_names[0], c.node_names[1]
         # Overlays the second node. PreemptMode defaults to OFF on create, so a
@@ -265,3 +267,46 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
             )
         finally:
             _scancel_all(c, victim_ids + [aggressor_id])
+
+    def test_partial_victim_set_evicts_nobody_via_satisfiability_proof(self, accounting_cluster):
+        """Both victims clear PreemptMode=cancel eligibility; only
+        satisfiable_victim_set's all-or-nothing proof decides the outcome."""
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("requires 2 nodes")
+        first, second = c.node_names[0], c.node_names[1]
+
+        c.sacctmgr(["add", "qos", "name=exempt-shield", "preemptexempttime=3600"])
+        time.sleep(15)  # past the QoS cache refresh floor
+
+        evictable_id = shielded_id = aggressor_id = None
+        try:
+            evictable_id = _run_victim(c, first, "proof-evictable")
+            shielded_id = _run_victim(
+                c, second, "proof-shielded", extra=["-q", "exempt-shield"]
+            )
+            preempted_before = c.sdiag_jobs_preempted()
+            aggressor_id = _queue_aggressor(
+                c,
+                "proof-aggressor",
+                ["-N2", "--exclusive", "-p", "default", f"--nodelist={first},{second}"],
+            )
+
+            time.sleep(_GUARD_SECS)
+
+            sq = c.squeue_all()
+            assert job_state(sq, evictable_id) == "R", (
+                "both victims clear PreemptMode=cancel; only the satisfiability "
+                "proof's all-or-nothing refusal leaves the evictable one alone"
+            )
+            assert job_state(sq, shielded_id) == "R", (
+                "the exempt-time guard must still hold"
+            )
+            assert job_state(sq, aggressor_id) == "PD", (
+                "the aggressor cannot be placed, so it must stay pending"
+            )
+            assert c.sdiag_jobs_preempted() == preempted_before, (
+                "no partial eviction should have been recorded"
+            )
+        finally:
+            _scancel_all(c, [evictable_id, shielded_id, aggressor_id])

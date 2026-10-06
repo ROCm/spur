@@ -17291,10 +17291,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preempt_uses_candidate_qos_preempt_mode_over_partition() {
+    async fn preempt_skips_a_satisfiable_suspend_only_set() {
+        // Partition says Cancel; the candidate's QoS overrides it to Suspend,
+        // so this is the only node and the only candidate. A satisfiable
+        // suspend-only set still cannot place the pending job — suspend never
+        // releases the allocation — so the real preemption action must not
+        // act on it, even though job_preempt_mode() correctly resolves Suspend.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
-        // Partition says Cancel; the candidate's QoS overrides it to Suspend.
         config.partitions[0].preempt_mode = "cancel".into();
         let cm = test_cluster_with_config(&dir, config).await;
         register_node(&cm, "n1", 8, 16000);
@@ -17334,9 +17338,16 @@ mod tests {
         )
         .await;
 
-        // Suspended, not Cancelled: proves the QoS override reached the real
-        // preemption action, not just the pure job_preempt_mode() decision.
-        settle(&cm, low_id, JobState::Suspended);
+        assert_eq!(
+            cm.get_job(low_id).unwrap().state,
+            JobState::Running,
+            "a satisfiable suspend-only set must not be acted on"
+        );
+        assert_eq!(
+            cm.get_job(high_id).unwrap().state,
+            JobState::Pending,
+            "nothing was evicted, so the pending job stays pending"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

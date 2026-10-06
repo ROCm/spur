@@ -872,7 +872,8 @@ fn effective_exempt_secs(
 }
 
 /// Preempt lower-priority running jobs per their partition PreemptMode
-/// (Off jobs are never preempted).
+/// (Off jobs are never preempted). A non-`gone` failure mid-set leaves the
+/// already-evicted victims evicted with the pending job still unplaced.
 pub(crate) async fn try_preempt(
     cluster: &Arc<ClusterManager>,
     partitions: &[spur_core::partition::Partition],
@@ -896,13 +897,26 @@ pub(crate) async fn try_preempt(
             .max_by_key(|p| p.preempt_mode.aggressiveness())
     };
 
-    let mut running: Vec<spur_core::job::Job> = cluster
-        .get_jobs(&JobFilter {
-            states: &[JobState::Running],
-            ..Default::default()
-        })
-        .into_iter()
+    // Suspended and completing jobs still hold their allocation, so a node one of
+    // them sits on cannot be handed over by evicting the running jobs beside it.
+    // One read covers both: a job finishing between two separate reads would
+    // otherwise appear as a running candidate but vanish from the occupant map,
+    // making its node look falsely empty to `satisfiable_victim_set`.
+    let holders = cluster.get_jobs(&JobFilter {
+        states: &[JobState::Running, JobState::Suspended, JobState::Completing],
+        ..Default::default()
+    });
+    let mut running: Vec<spur_core::job::Job> = holders
+        .iter()
+        .filter(|j| j.state == JobState::Running)
+        .cloned()
         .collect();
+    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
+    for job in &holders {
+        for node in &job.allocated_nodes {
+            occupants.entry(node.as_str()).or_default().push(job.job_id);
+        }
+    }
     // Resolve once, reuse for both the priority recompute and the
     // preempt-mode decision below.
     let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
@@ -917,19 +931,6 @@ pub(crate) async fn try_preempt(
         .map(|j| (j.job_id, cluster.current_effective_priority(j, partitions)))
         .collect();
     running.sort_by_key(|j| running_priority[&j.job_id]);
-
-    // Suspended and completing jobs still hold their allocation, so a node one of
-    // them sits on cannot be handed over by evicting the running jobs beside it.
-    let holders = cluster.get_jobs(&JobFilter {
-        states: &[JobState::Running, JobState::Suspended, JobState::Completing],
-        ..Default::default()
-    });
-    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
-    for job in &holders {
-        for node in &job.allocated_nodes {
-            occupants.entry(node.as_str()).or_default().push(job.job_id);
-        }
-    }
     // Lets the satisfiability search spend the cheapest victims first.
     let victim_cost: HashMap<spur_core::job::JobId, i32> = running_priority
         .iter()
@@ -1017,13 +1018,15 @@ pub(crate) async fn try_preempt(
                 .collect()
         };
         // A job no node can host finds no set in either pool, so it stops spending a
-        // victim per cycle on a placement that will never happen.
+        // victim per cycle on a placement that will never happen. A set found in
+        // the suspend pool is discarded rather than acted on: suspend never frees
+        // the node, so it could not place the pending job either.
         let mut found = None;
-        for pool_ids in [by_mode(false), by_mode(true)] {
+        for (is_suspend_pool, pool_ids) in [(false, by_mode(false)), (true, by_mode(true))] {
             if pool_ids.is_empty() {
                 continue;
             }
-            found = satisfiable_victim_set(
+            let set = satisfiable_victim_set(
                 pending,
                 &VictimPool {
                     evictable: &pool_ids,
@@ -1035,7 +1038,8 @@ pub(crate) async fn try_preempt(
                 &reservations,
                 now,
             );
-            if found.is_some() {
+            if set.is_some() {
+                found = if is_suspend_pool { None } else { set };
                 break;
             }
         }
@@ -1049,6 +1053,7 @@ pub(crate) async fn try_preempt(
             None
         };
         let mut preempted = false;
+        let mut evicted_so_far = Vec::new();
         for (candidate, mode) in eligible.iter().filter(|(j, _)| victims.contains(&j.job_id)) {
             info!(
                 preempted_job = candidate.job_id,
@@ -1068,24 +1073,33 @@ pub(crate) async fn try_preempt(
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
                     preempted = true;
+                    evicted_so_far.push(candidate.job_id);
                 }
                 Ok(PreemptOutcome::Suspended) => {
                     send_suspend_to_agents(cluster, candidate, false).await;
                     preempted = true;
+                    evicted_so_far.push(candidate.job_id);
                 }
                 Err(e) => {
                     // A victim gone since the snapshot already released its node, so
-                    // the set still holds. Any other failure leaves it held.
+                    // the set still holds. Any other failure leaves it held, with
+                    // `evicted_so_far` already gone and the rest of the set abandoned.
                     let gone = cluster
                         .get_job(candidate.job_id)
                         .is_none_or(|j| j.state != JobState::Running);
-                    warn!(
-                        job_id = candidate.job_id,
-                        error = %e,
-                        abandoned_set = !gone,
-                        "failed to preempt job"
-                    );
-                    if !gone {
+                    if gone {
+                        warn!(
+                            job_id = candidate.job_id,
+                            error = %e,
+                            "failed to preempt job already gone"
+                        );
+                    } else {
+                        error!(
+                            job_id = candidate.job_id,
+                            error = %e,
+                            already_evicted = ?evicted_so_far,
+                            "failed to preempt job, abandoning the rest of its victim set"
+                        );
                         break;
                     }
                 }
