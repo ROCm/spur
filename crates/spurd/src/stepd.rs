@@ -2071,7 +2071,16 @@ pub(crate) fn bind_runtime_socket(socket_path: &Path) -> io::Result<UnixListener
             format!("{} may still be served", socket_path.display()),
         ));
     }
-    fs::remove_file(socket_path)?;
+    rebind_unserved_socket(socket_path)
+}
+
+/// Replaces a socket the probe proved unserved. One already unlinked by someone
+/// else is no failure — the bind is what that leaves us free to retry.
+fn rebind_unserved_socket(socket_path: &Path) -> io::Result<UnixListener> {
+    match fs::remove_file(socket_path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
     UnixListener::bind(socket_path)
 }
 
@@ -3587,6 +3596,16 @@ mod tests {
         drop(bind_runtime_socket(&socket_path).expect("the first bind wins"));
 
         bind_runtime_socket(&socket_path).expect("a stale socket file must not wedge a relaunch");
+    }
+
+    #[tokio::test]
+    async fn rebinding_tolerates_a_socket_already_unlinked_under_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+
+        // Stands in for a third party unlinking between the failed bind and the
+        // probe; a plain retry would have succeeded, so this must not fail.
+        rebind_unserved_socket(&socket_path).expect("an absent path must not fail the rebind");
     }
 
     fn descriptor_for_step(
