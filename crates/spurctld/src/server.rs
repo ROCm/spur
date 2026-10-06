@@ -1311,6 +1311,18 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
     caller == "root" || cache.is_admin(caller)
 }
 
+/// The kubelet reads its worker profile only at start, and on a single node the k0s controller
+/// writes the new profile after its own kubelet has started, so a changed value lands one cycle late.
+/// Spur cannot see what the kubelet runs with, so warn whenever the fields are set.
+fn image_pull_warning(pulls: spur_core::k0s::KubeletPullConfig) -> Option<String> {
+    pulls.is_set().then(|| {
+        "image pull settings are set in [cluster]. If you changed them on a cluster that ran \
+         before, a single node gets the new values only after a second `spur k8s down` and \
+         `spur k8s up`. See the [cluster] section of the configuration guide for the check."
+            .to_string()
+    })
+}
+
 fn k0s_admin_allowed(
     resolved_admin: bool,
     has_identity: bool,
@@ -3948,9 +3960,14 @@ impl SlurmController for ControllerService {
                 false,
             )
             .map_err(|e| Status::internal(format!("set k0s phase: {e}")))?;
+        let mut message = "k0s cluster provisioning requested".to_string();
+        if let Some(warning) = image_pull_warning(self.cluster.config().cluster.kubelet_pulls()) {
+            warn!("{warning}");
+            message = format!("{message}\nwarning: {warning}");
+        }
         Ok(Response::new(ClusterUpResponse {
             accepted: true,
-            message: "k0s cluster provisioning requested".to_string(),
+            message,
             nodes: crate::cluster_k8s::node_statuses(&self.cluster),
         }))
     }
@@ -5587,6 +5604,25 @@ mod tests {
         assert!(!is_agent_connection_loss(&Status::permission_denied(
             "nope"
         )));
+    }
+
+    #[test]
+    fn image_pull_warning_shows_only_when_a_field_is_set() {
+        use spur_core::k0s::KubeletPullConfig;
+        assert_eq!(image_pull_warning(KubeletPullConfig::default()), None);
+        for pulls in [
+            KubeletPullConfig {
+                serialize_image_pulls: Some(false),
+                max_parallel_image_pulls: None,
+            },
+            KubeletPullConfig {
+                serialize_image_pulls: Some(false),
+                max_parallel_image_pulls: Some(2),
+            },
+        ] {
+            let w = image_pull_warning(pulls).expect("warning when a field is set");
+            assert!(w.contains("spur k8s down"), "{w}");
+        }
     }
 
     #[test]

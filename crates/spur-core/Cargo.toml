@@ -33,6 +33,7 @@ serial_test = { workspace = true }
 # Real IANA zones with DST transitions, so the spring-forward gap path is
 # exercised against fixed tz data rather than the runner's environment.
 chrono-tz = "0.10"
+serde_yaml = { workspace = true }
 
 [lints]
 workspace = true
