@@ -52,6 +52,17 @@ class TestSacctNodeFailState:
         assert job_id is not None
         wait_job_state(c, job_id, "R")
 
+        # While still running, --state=RUNNING must match it and --state=PENDING
+        # must not (a dropped filter code silently matches every job instead).
+        running_out = c.sacct(["-j", str(job_id), "-n", "-o", "JobID,State", "--state=RUNNING"])
+        assert str(job_id) in running_out, (
+            f"sacct --state=RUNNING dropped job {job_id}: {running_out!r}"
+        )
+        pending_out = c.sacct(["-j", str(job_id), "-n", "-o", "JobID,State", "--state=PENDING"])
+        assert str(job_id) not in pending_out, (
+            f"sacct --state=PENDING must not match a running job: {pending_out!r}"
+        )
+
         c.cli(["spur", "node", "remove", node0, "--force", "--reason", "node-fail accounting test"])
 
         final_state = wait_job(c, job_id, timeout=60)

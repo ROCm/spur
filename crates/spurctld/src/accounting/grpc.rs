@@ -1058,6 +1058,8 @@ impl SlurmAccounting for AccountingService {
 
 fn proto_job_state_to_db_str(code: i32) -> Option<&'static str> {
     match code {
+        0 => Some("PENDING"),
+        1 => Some("RUNNING"),
         3 => Some("COMPLETED"),
         4 => Some("FAILED"),
         5 => Some("CANCELLED"),
@@ -1124,6 +1126,20 @@ mod tests {
         assert_eq!(
             db_job_state_str_to_proto("NODE_FAIL"),
             JobState::JobNodeFail as i32
+        );
+    }
+
+    #[test]
+    fn running_and_pending_states_are_preserved_in_the_history_filter() {
+        // A dropped code empties the states filter, which the query then
+        // treats as "match everything" instead of narrowing it.
+        assert_eq!(
+            proto_job_state_to_db_str(JobState::JobRunning as i32),
+            Some("RUNNING")
+        );
+        assert_eq!(
+            proto_job_state_to_db_str(JobState::JobPending as i32),
+            Some("PENDING")
         );
     }
 
