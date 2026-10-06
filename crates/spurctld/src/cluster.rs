@@ -12149,22 +12149,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn assoc_mgr_info_surfaces_the_association_per_job_tres_cap_per_user() {
-        // An association's per-job TRES cap is per (user, account), so it rides on
-        // the user record rather than the scope, and the account carries no
-        // per-account submit cap or group wall budget.
+    async fn assoc_mgr_info_reports_each_association_users_own_per_job_tres_cap() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
-        cm.association_cache()
-            .insert_association("alice", "tenant-a");
-        cm.association_cache().insert_limits(
-            "alice",
-            "tenant-a",
-            AccountLimits {
-                max_tres_per_job: Some(spur_core::accounting::TresRecord::parse("node=2").unwrap()),
-                ..Default::default()
-            },
-        );
+        for (user, cap) in [("alice", "node=2"), ("bob", "node=4")] {
+            cm.association_cache().insert_association(user, "tenant-a");
+            cm.association_cache().insert_limits(
+                user,
+                "tenant-a",
+                AccountLimits {
+                    max_tres_per_job: Some(spur_core::accounting::TresRecord::parse(cap).unwrap()),
+                    ..Default::default()
+                },
+            );
+        }
 
         let record = cm
             .assoc_mgr_info(None)
@@ -12172,20 +12170,17 @@ mod tests {
             .into_iter()
             .find(|r| r.scope == "tenant-a")
             .expect("the defined association is reported");
+        let per_job_nodes = |user: &str| {
+            record
+                .users
+                .iter()
+                .find(|u| u.user == user)
+                .and_then(|u| u.caps.max_tres_per_job.as_ref())
+                .map(|t| t.get(TresType::Node))
+        };
+        assert_eq!(per_job_nodes("alice"), Some(2));
+        assert_eq!(per_job_nodes("bob"), Some(4));
         assert!(record.max_tres_per_job.is_none());
-        let alice = record
-            .users
-            .iter()
-            .find(|u| u.user == "alice")
-            .expect("the association's user is reported");
-        assert_eq!(
-            alice
-                .caps
-                .max_tres_per_job
-                .as_ref()
-                .map(|t| t.get(TresType::Node)),
-            Some(2)
-        );
         assert!(record.max_submit_jobs_per_account.is_none());
         assert!(record.grp_wall_minutes.is_none());
         assert!(record.grp_wall_consumed_minutes.is_none());
