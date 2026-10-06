@@ -242,8 +242,8 @@ async fn main() -> anyhow::Result<()> {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(HEALTH_TICK_SECS));
         // Floored at one tick: health still runs once per tick, so a shorter
-        // grace could elapse before the first post-election check, before any
-        // heartbeat lands.
+        // grace could elapse before the first post-election check runs, and
+        // before any heartbeat has had a chance to land.
         let grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(
             hb_timeout.max(HEALTH_TICK_SECS),
         ));

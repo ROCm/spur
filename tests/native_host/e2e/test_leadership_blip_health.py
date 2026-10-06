@@ -32,7 +32,9 @@ from cluster import parse_job_id, wait_job_state, job_state
 # openraft election_timeout_max in raft.rs; a blip longer than this guarantees
 # the other two controllers complete an election before it ends.
 ELECTION_TIMEOUT_MAX_SECS = 3.0
-BLIP_SECS = 5
+# Budget for the interim election to complete; the leader is resumed as soon
+# as one is detected, so this is a timeout, not an enforced freeze duration.
+INTERIM_ELECTION_TIMEOUT_SECS = 5
 RACE_SETTLE_TIMEOUT_SECS = 12
 MAX_RECLAIM_ATTEMPTS = 5
 # spurctld's health tick is a fixed 30s; wait past at least one full cycle
@@ -80,7 +82,7 @@ def _attempt_reclaim(cluster, n: int, leader_idx: int) -> int | None:
     cluster.signal_controller(leader_idx, "STOP")
     try:
         interim = _wait_became_leader_since(
-            cluster, others, since_lens, timeout=BLIP_SECS + ELECTION_TIMEOUT_MAX_SECS
+            cluster, others, since_lens, timeout=INTERIM_ELECTION_TIMEOUT_SECS + ELECTION_TIMEOUT_MAX_SECS
         )
         if interim is None:
             return None

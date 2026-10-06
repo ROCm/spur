@@ -1579,9 +1579,18 @@ tar -C "$R" -czf '{local_tar}' .
             return f"echo '{escaped}' | sudo -S "
         return "sudo -n "
 
-    def _pkill(self, node: SshNode, pattern: str, *, use_sudo: bool = False):
+    def _pkill(self, node: SshNode, pattern: str, *, use_sudo: bool = False, sig: str | None = None):
         prefix = self._sudo_prefix() if use_sudo else ""
-        node.exec_allow_fail(f"{prefix}pkill -f '{pattern}' 2>/dev/null || true")
+        # Bracket the first character so this pattern can't match the shell
+        # invocation that embeds it literally (classic pkill -f self-match: a
+        # STOP would then freeze that shell forever, since it never sees CONT).
+        safe_pattern = f"[{pattern[0]}]{pattern[1:]}" if pattern else pattern
+        if sig is None:
+            # A prior STOP (e.g. a chaos test's signal_controller) leaves TERM
+            # queued but undelivered; CONT first so a frozen process actually dies.
+            node.exec_allow_fail(f"{prefix}pkill -CONT -f '{safe_pattern}' 2>/dev/null || true")
+        flag = f"-{sig} " if sig else ""
+        node.exec_allow_fail(f"{prefix}pkill {flag}-f '{safe_pattern}' 2>/dev/null || true")
 
     def _kill_controller(self):
         for i in self._controller_node_indices:
@@ -1589,9 +1598,7 @@ tar -C "$R" -czf '{local_tar}' .
 
     def signal_controller(self, index: int, sig: str):
         """Send *sig* (e.g. ``STOP``/``CONT``) to the spurctld on nodes[index]."""
-        self.nodes[index].exec_allow_fail(
-            f"pkill -{sig} -f '{self.bin_dir}/spurctld' 2>/dev/null || true"
-        )
+        self._pkill(self.nodes[index], f"{self.bin_dir}/spurctld", sig=sig)
 
     def _kill_mint(self):
         for node in self.nodes:
