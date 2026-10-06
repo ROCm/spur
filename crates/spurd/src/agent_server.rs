@@ -266,6 +266,13 @@ async fn launch_stepd(
             anyhow::Error::from(error).context("write runtime launch specification"),
         )
     })?;
+    // Published before the spawn so the window between claiming the directory
+    // and the supervisor publishing itself never reads as an unowned session.
+    descriptor.mark_provisional();
+    if let Err(error) = store.publish(&descriptor) {
+        warn!(job_id = config.job_id, run_attempt, %error,
+            "failed to publish the provisional runtime descriptor");
+    }
     let executable = resolve_stepd_executable();
     info!(job_id = config.job_id, run_attempt, state_dir = %state_dir.display(), executable = %executable.display(), "starting stepd process");
     let spawn_args = vec![
@@ -337,6 +344,11 @@ async fn launch_stepd(
 /// process) is confirmed via `stepd_liveness` before signaling, same check
 /// the crash watchdog uses.
 async fn stop_stepd_process(descriptor: &crate::stepd::StepdDescriptor) -> std::io::Result<()> {
+    // A provisional descriptor names this agent, and pid 0 would signal the
+    // whole process group; there is no supervisor here to stop.
+    if descriptor.is_provisional() {
+        return Ok(());
+    }
     match crate::stepd::stepd_liveness(descriptor)? {
         crate::stepd::StepdLiveness::Stale => Ok(()),
         crate::stepd::StepdLiveness::Live => {
@@ -768,24 +780,30 @@ fn unreported_durable_exit(
         .unwrap_or(false)
 }
 
-/// Whether the published descriptor names a running supervisor other than the
+/// Whether the session directory belongs to a running supervisor other than the
 /// one this launch spawned — someone else's session, not ours to delete.
 fn session_dir_has_live_owner(
     store: &crate::stepd::StepdStore,
     session_dir: &std::path::Path,
     launched_pid: u32,
 ) -> bool {
-    let published = match store.load_descriptor(session_dir) {
-        Ok(published) => published,
-        // A descriptor this build cannot read still names an owner; only its
-        // absence means there is none.
-        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
-    };
-    published.pid != launched_pid
-        && !matches!(
-            crate::stepd::stepd_liveness(&published),
-            Ok(crate::stepd::StepdLiveness::Stale)
-        )
+    match store.load_descriptor(session_dir) {
+        Ok(published) if !published.is_provisional() => {
+            published.pid != launched_pid
+                && !matches!(
+                    crate::stepd::stepd_liveness(&published),
+                    Ok(crate::stepd::StepdLiveness::Stale)
+                )
+        }
+        // A provisional descriptor names this launch, not an owner, and an
+        // absent one names nobody: the bound socket is the only proof left.
+        Ok(_) => crate::stepd::session_socket_is_served(session_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::stepd::session_socket_is_served(session_dir)
+        }
+        // One this build cannot read still names an owner.
+        Err(_) => true,
+    }
 }
 
 fn cleanup_unstarted_stepd(
@@ -1237,6 +1255,11 @@ fn force_kill_stepd(descriptor: &crate::stepd::StepdDescriptor) {
     if let Err(error) = crate::executor::cgroup_kill(&cgroup_path) {
         warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
             "force-reclaim: cgroup kill failed");
+    }
+    // Same reason as `stop_stepd_process`: pid 0 is the process group, not a
+    // supervisor.
+    if descriptor.is_provisional() {
+        return;
     }
     if let Err(error) = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(descriptor.pid as i32),
@@ -10137,6 +10160,56 @@ mod tests {
         cleanup_unstarted_stepd(&store, 42, 7, step_id, ours.pid);
 
         assert!(!session.exists(), "our own failed session must be removed");
+    }
+
+    #[test]
+    fn unstarted_runtime_cleanup_spares_a_session_whose_socket_is_still_served() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let step_id = spur_core::step::STEP_BATCH;
+        let session = store
+            .claim_session_dir(42, 7, step_id)
+            .expect("session directory");
+        // Bound but not yet published: the socket is the only owner on record.
+        let _served = std::os::unix::net::UnixListener::bind(session.join("runtime.sock"))
+            .expect("bind the session socket");
+
+        cleanup_unstarted_stepd(&store, 42, 7, step_id, 0);
+
+        assert!(
+            session.exists(),
+            "a session whose socket is still served must survive"
+        );
+    }
+
+    #[test]
+    fn unstarted_runtime_cleanup_removes_its_own_provisional_session() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let step_id = spur_core::step::STEP_BATCH;
+        let session = store
+            .claim_session_dir(42, 7, step_id)
+            .expect("session directory");
+        let mut provisional = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            step_id,
+            0,
+            0,
+            session.join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        provisional.mark_provisional();
+        store.publish(&provisional).expect("publish provisional");
+
+        // The readiness-failure path knows the pid it spawned; the supervisor
+        // never published, so only this agent's provisional record is left.
+        cleanup_unstarted_stepd(&store, 42, 7, step_id, std::process::id());
+
+        assert!(
+            !session.exists(),
+            "our own half-built session is ours to remove"
+        );
     }
 
     #[test]

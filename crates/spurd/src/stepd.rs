@@ -278,6 +278,7 @@ impl StepdLaunchSpec {
 }
 
 const DESCRIPTOR_FILE: &str = "descriptor.json";
+const RUNTIME_SOCKET_NAME: &str = "runtime.sock";
 /// Custody socket for an interactive session's pty master. Separate from the
 /// control socket because ancillary data cannot cross a buffered reader.
 pub const PTY_CUSTODY_SOCKET_NAME: &str = "ptyfd.sock";
@@ -858,6 +859,12 @@ pub struct StepdDescriptor {
     pub step_id: spur_core::step::StepId,
     pub pid: u32,
     pub process_start_ticks: u64,
+    /// The agent that claimed the session, published before the supervisor
+    /// exists so the gap before it publishes itself does not read as unowned.
+    #[serde(default)]
+    pub launcher_pid: u32,
+    #[serde(default)]
+    pub launcher_start_ticks: u64,
     pub socket_path: PathBuf,
     pub cgroup_path: PathBuf,
     #[serde(default)]
@@ -922,6 +929,8 @@ impl StepdDescriptor {
             step_id,
             pid,
             process_start_ticks,
+            launcher_pid: 0,
+            launcher_start_ticks: 0,
             socket_path,
             cgroup_path,
             capability: uuid::Uuid::new_v4().to_string(),
@@ -942,6 +951,21 @@ impl StepdDescriptor {
             cred_kid: String::new(),
             cred_digest: String::new(),
         }
+    }
+
+    /// Published before the supervisor exists, so it names the launcher rather
+    /// than a supervisor: nothing may signal it or adopt it as one.
+    pub(crate) fn is_provisional(&self) -> bool {
+        self.pid == 0
+    }
+
+    /// Stamps this agent's identity on a descriptor published before the spawn,
+    /// so its liveness answers for the session until the supervisor takes over.
+    pub(crate) fn mark_provisional(&mut self) {
+        self.pid = 0;
+        self.process_start_ticks = 0;
+        self.launcher_pid = std::process::id();
+        self.launcher_start_ticks = process_start_ticks(self.launcher_pid).unwrap_or(0);
     }
 }
 
@@ -2021,6 +2045,15 @@ fn probe_proves_unserved(error: io::Error) -> bool {
     )
 }
 
+/// Whether anything answers on the session's control socket. Fail-closed: only
+/// a refused or absent socket proves no supervisor is bound to it.
+pub(crate) fn session_socket_is_served(session_dir: &Path) -> bool {
+    match std::os::unix::net::UnixStream::connect(session_dir.join(RUNTIME_SOCKET_NAME)) {
+        Ok(_) => true,
+        Err(error) => !probe_proves_unserved(error),
+    }
+}
+
 /// Binds the control socket, unlinking a stale path only once the probe proves
 /// nobody is serving it: taking a live peer's path would steal its identity.
 pub(crate) fn bind_runtime_socket(socket_path: &Path) -> io::Result<UnixListener> {
@@ -2071,7 +2104,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let obligations = store.obligations(job_id, run_attempt, step_id);
     // Bound before the descriptor is published: a losing duplicate must fail
     // here, while the running supervisor's identity is still on disk.
-    let socket_path = session_dir.join("runtime.sock");
+    let socket_path = session_dir.join(RUNTIME_SOCKET_NAME);
     let listener = bind_runtime_socket(&socket_path)?;
     let pid = std::process::id();
     let mut descriptor = StepdDescriptor::new(
@@ -2523,9 +2556,8 @@ impl StepdStore {
         Ok(session_dir)
     }
 
-    /// Takes exclusive ownership of a session directory for one launch. Unlike
-    /// `prepare_session_dir`, sharing an owned one is refused rather than reused.
-    /// Refusals carry no errno — the spool classifier reads one as a node fault.
+    /// Takes exclusive ownership of a session directory for one launch; sharing
+    /// an owned one is refused. Refusals carry no errno (that reads as a node fault).
     pub fn claim_session_dir(
         &self,
         job_id: u32,
@@ -2562,6 +2594,11 @@ impl StepdStore {
                 return Err(session_conflict(owned));
             }
             Ok(_) | Err(_) => {}
+        }
+        // A supervisor binds its socket before it publishes itself, so an absent
+        // descriptor alone would license unlinking a live peer's socket.
+        if session_socket_is_served(session_dir) {
+            return Err(session_conflict(owned));
         }
         // Reusing the directory would graft the new run onto the old run's
         // obligation log, so its exit would be replayed as this run's.
@@ -3058,6 +3095,17 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
 }
 
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
+    // No supervisor has published itself yet, so the agent that claimed the
+    // session is the one still answering for it.
+    if descriptor.is_provisional() {
+        let held = descriptor.launcher_pid != 0
+            && process_is_live(descriptor.launcher_pid, descriptor.launcher_start_ticks);
+        return Ok(if held {
+            StepdLiveness::Live
+        } else {
+            StepdLiveness::Stale
+        });
+    }
     match process_start_ticks(descriptor.pid) {
         // A zombie's start ticks still match (the kernel keeps them until
         // reaped), but it has already exited and released everything —
@@ -3347,6 +3395,63 @@ mod tests {
             !reclaimed.join("launch.json").exists(),
             "reclaiming must not leave the previous launch's records behind"
         );
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_session_whose_socket_is_still_served() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        // The window a supervisor spends bound but not yet published: nothing
+        // names an owner except the socket itself.
+        let first = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        let _served = std::os::unix::net::UnixListener::bind(first.join(RUNTIME_SOCKET_NAME))
+            .expect("bind the session socket");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("a served socket must not be unlinked out from under its peer");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(first.join(RUNTIME_SOCKET_NAME).exists());
+    }
+
+    #[test]
+    fn a_provisional_descriptor_reads_live_while_its_launcher_runs() {
+        let mut provisional = descriptor(9, 1, 0);
+        provisional.mark_provisional();
+
+        assert!(matches!(
+            stepd_liveness(&provisional),
+            Ok(StepdLiveness::Live)
+        ));
+
+        // A launcher that is gone leaves nothing holding the session.
+        provisional.launcher_pid = u32::MAX;
+        assert!(matches!(
+            stepd_liveness(&provisional),
+            Ok(StepdLiveness::Stale)
+        ));
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_session_a_live_launcher_still_holds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let first = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        let mut provisional = descriptor(9, 1, 0);
+        provisional.socket_path = first.join(RUNTIME_SOCKET_NAME);
+        provisional.mark_provisional();
+        store.publish(&provisional).expect("publish provisional");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("a launch still in flight owns the session");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]
