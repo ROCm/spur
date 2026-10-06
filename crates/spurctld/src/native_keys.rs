@@ -73,8 +73,8 @@ pub fn leader_and_term() -> (u64, u64) {
         .cloned()
         .flatten()
         .map(|r| {
-            let m = r.raft.metrics().borrow().clone();
-            (m.current_leader.unwrap_or(r.node_id), m.current_term)
+            let term = r.raft.metrics().borrow().current_term;
+            (r.current_leader().unwrap_or(r.node_id), term)
         })
         .unwrap_or((0, 0))
 }

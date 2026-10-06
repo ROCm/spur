@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -24,6 +24,8 @@ use crate::accounting::txn;
 use crate::audit::{annotate, Annotation};
 use crate::cluster::{CancelError, ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
+use openraft::BasicNode;
+
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
@@ -210,8 +212,6 @@ pub struct ControllerService {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
     leader_proxy: LeaderProxy,
-    /// Node ID → client API address (host:6817) for the x-spur-leader header.
-    client_addrs: BTreeMap<u64, String>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
     /// Default HA control-plane count (`[cluster] control_plane_replicas`) when `spur k8s up`
@@ -246,17 +246,22 @@ type CachedLeader = Option<(u64, tonic::transport::Channel)>;
 #[derive(Clone)]
 struct LeaderProxy {
     raft: Arc<RaftHandle>,
-    client_addrs: BTreeMap<u64, String>,
     cached_channel: Arc<Mutex<CachedLeader>>,
 }
 
 impl LeaderProxy {
-    fn new(raft: Arc<RaftHandle>, client_addrs: BTreeMap<u64, String>) -> Self {
+    fn new(raft: Arc<RaftHandle>) -> Self {
         Self {
             raft,
-            client_addrs,
             cached_channel: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Read from the replicated membership, not `controller.peers`: a leader
+    /// added at runtime is in the membership only.
+    fn client_addr(&self, node_id: u64) -> Option<String> {
+        let metrics = self.raft.raft.metrics().borrow().clone();
+        member_client_addr(metrics.membership_config.membership(), node_id)
     }
 
     /// An open channel to the current leader. Forwarding drives the RPC over this
@@ -276,8 +281,7 @@ impl LeaderProxy {
         }
 
         let addr = self
-            .client_addrs
-            .get(&leader_id)
+            .client_addr(leader_id)
             .ok_or_else(|| Status::unavailable("leader address unknown"))?;
 
         let url = if addr.starts_with("http") {
@@ -815,7 +819,7 @@ impl ControllerService {
     fn not_leader_status(&self) -> Status {
         let mut status = Status::unavailable("not the Raft leader");
         if let Some(leader_id) = self.raft.current_leader() {
-            if let Some(addr) = self.client_addrs.get(&leader_id) {
+            if let Some(addr) = self.leader_proxy.client_addr(leader_id) {
                 if let Ok(val) = addr.parse::<MetadataValue<tonic::metadata::Ascii>>() {
                     status.metadata_mut().insert(LEADER_HEADER, val);
                 }
@@ -1029,14 +1033,56 @@ impl ControllerService {
         identity.is_none() || self.caller_is_admin(identity)
     }
 
-    /// Stricter form of [`Self::require_admin`] for reservations: the admin bar, or the
-    /// root-or-`sudo`/`wheel` rule the CLI states, resolved from the caller's name on this host.
-    /// `require_admin` alone would be inert under the default `permissive` mode, since it waves an
-    /// unidentified caller through, and would deny a `sudo`/`wheel` operator under `required`.
+    /// Refuse a promote unless every other voter answers `ClusterProbe`. A voter
+    /// on a build without it cannot reach a node that only the replicated
+    /// membership names, so it would fall out of the cluster as soon as it became
+    /// leader. A voter that does not answer at all may be dead, and a promote
+    /// would then widen a quorum that already counts a member which is gone.
+    fn current_membership(&self) -> openraft::Membership<u64, BasicNode> {
+        self.raft
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .clone()
+    }
+
+    async fn refuse_promote_unless_every_voter_answers(
+        &self,
+        membership: &openraft::Membership<u64, BasicNode>,
+    ) -> Result<(), Status> {
+        let voters: Vec<(u64, String)> = membership
+            .voter_ids()
+            .filter(|id| *id != self.raft.node_id)
+            .filter_map(|id| membership.get_node(&id).map(|n| (id, n.addr.clone())))
+            .collect();
+        for (id, addr) in voters {
+            let support = crate::raft::probe_support(&addr).await;
+            voter_probe_ruling(id, &addr, support)?;
+        }
+        Ok(())
+    }
+
+    /// Reservations are managed by the strict operator bar.
     async fn require_reservation_manager(
         &self,
         user: &str,
         identity: Option<&spur_core::auth::Identity>,
+    ) -> Result<(), Status> {
+        self.require_operator(user, identity, "manage reservations")
+            .await
+    }
+
+    /// Stricter form of [`Self::require_admin`]: the admin bar, or the
+    /// root-or-`sudo`/`wheel` rule the CLI states, resolved from the caller's name on this host.
+    /// `require_admin` alone would be inert under the default `permissive` mode, since it waves an
+    /// unidentified caller through, and would deny a `sudo`/`wheel` operator under `required`.
+    async fn require_operator(
+        &self,
+        user: &str,
+        identity: Option<&spur_core::auth::Identity>,
+        action: &str,
     ) -> Result<(), Status> {
         // Skipping the lookup for a verified admin keeps a credential working on a controller that
         // shares no user directory with the login nodes and cannot resolve the name at all.
@@ -1050,7 +1096,7 @@ impl ControllerService {
         })
         .await
         .map_err(|e| Status::internal(format!("privilege lookup failed: {e}")))?;
-        reservation_manager_ruling(user, privileged)
+        operator_ruling(user, action, privileged)
     }
 
     /// Clamp a non-privileged caller's base priority to `[scheduler] max_user_priority`, mirroring
@@ -1320,21 +1366,179 @@ fn k0s_admin_allowed(
     resolved_admin || (!has_identity && is_k0s_admin(cache, caller))
 }
 
+/// A membership write can lose its race with an election: the route check passed,
+/// then openraft rejected the write because leadership had already moved. That is
+/// retryable, not an internal fault, so it must not reach the operator as one.
+fn membership_write_status(
+    op: &str,
+    e: openraft::error::RaftError<u64, openraft::error::ClientWriteError<u64, openraft::BasicNode>>,
+) -> Status {
+    use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
+
+    let RaftError::APIError(api) = &e else {
+        return Status::internal(format!("{op} failed: {e}"));
+    };
+    match api {
+        ClientWriteError::ForwardToLeader(forward) => match forward.leader_id {
+            Some(id) => Status::unavailable(format!(
+                "{op}: leadership moved to node {id} while the request was in flight; run it again"
+            )),
+            None => Status::unavailable(format!(
+                "{op}: leadership moved while the request was in flight and no leader is elected yet; run it again"
+            )),
+        },
+        ClientWriteError::ChangeMembershipError(ChangeMembershipError::InProgress(_)) => {
+            Status::unavailable(format!(
+                "{op}: a membership change is in flight; run it again"
+            ))
+        }
+        ClientWriteError::ChangeMembershipError(ChangeMembershipError::LearnerNotFound(e)) => {
+            Status::failed_precondition(format!(
+                "{op}: node {} is not a learner; add it as a learner first",
+                e.node_id
+            ))
+        }
+        ClientWriteError::ChangeMembershipError(ChangeMembershipError::EmptyMembership(e)) => {
+            Status::failed_precondition(format!("{op}: {e}"))
+        }
+    }
+}
+
+/// Reject a Raft node id that cannot name a member.
+fn validate_raft_node_id(node_id: u64) -> Result<u64, Status> {
+    if node_id == 0 {
+        return Err(Status::invalid_argument("node_id 0 is not a valid Raft id"));
+    }
+    Ok(node_id)
+}
+
+type ReplicationMap = std::collections::BTreeMap<u64, Option<openraft::LogId<u64>>>;
+
+/// Highest log index the leader has replicated to `node_id`. `None` when the
+/// leader has no figure yet, or when the answering node is not the leader.
+fn matched_log_index(replication: &Option<ReplicationMap>, node_id: u64) -> Option<u64> {
+    replication
+        .as_ref()
+        .and_then(|r| r.get(&node_id).copied().flatten())
+        .map(|log_id| log_id.index)
+}
+
+/// [`matched_log_index`] for the wire, where -1 stands for unknown.
+fn matched_index(replication: &Option<ReplicationMap>, node_id: u64) -> i64 {
+    matched_log_index(replication, node_id).map_or(-1, |index| index as i64)
+}
+
+/// A promote is only for a learner: an id the membership does not hold gets the
+/// same answer openraft would give, and an id that is already a voter must not
+/// be reported as newly promoted.
+fn promote_membership_ruling(
+    membership: &openraft::Membership<u64, BasicNode>,
+    node_id: u64,
+) -> Result<(), Status> {
+    if membership.get_node(&node_id).is_none() {
+        return Err(Status::failed_precondition(format!(
+            "promote to voter: node {node_id} is not a learner; add it as a learner first"
+        )));
+    }
+    if membership.voter_ids().any(|id| id == node_id) {
+        return Err(Status::already_exists(format!(
+            "node {node_id} is already a voter"
+        )));
+    }
+    Ok(())
+}
+
+/// The client API of a member, on the port every controller serves it on.
+fn member_client_addr(
+    membership: &openraft::Membership<u64, BasicNode>,
+    node_id: u64,
+) -> Option<String> {
+    let raft_addr = &membership.get_node(&node_id)?.addr;
+    let host = raft_addr
+        .rsplit_once(':')
+        .map_or(raft_addr.as_str(), |(h, _)| h);
+    Some(format!("{host}:6817"))
+}
+
+/// A remove takes a voter or a learner. openraft has a variant for each, and
+/// the voter one leaves a learner in place with an `Ok`, so the role decides.
+fn remove_membership_change(
+    membership: &openraft::Membership<u64, BasicNode>,
+    node_id: u64,
+) -> Result<openraft::ChangeMembers<u64, BasicNode>, Status> {
+    if membership.get_node(&node_id).is_none() {
+        return Err(Status::not_found(format!(
+            "node {node_id} is not a member of the raft cluster"
+        )));
+    }
+    if membership.voter_ids().any(|id| id == node_id) {
+        return Ok(openraft::ChangeMembers::RemoveVoters([node_id].into()));
+    }
+    Ok(openraft::ChangeMembers::RemoveNodes([node_id].into()))
+}
+
+/// A learner joins the quorum only once it holds nearly the whole log. openraft
+/// calls a member lagging past `threshold` a snapshot case; a voter in that
+/// state can stall every write until it has caught up.
+fn promote_lag_ruling(
+    last_log_index: u64,
+    matched: Option<u64>,
+    threshold: u64,
+) -> Result<(), Status> {
+    let Some(matched) = matched else {
+        return Err(Status::failed_precondition(format!(
+            "the leader has not replicated anything to this learner yet (last_log_index \
+             {last_log_index}); wait until `spur admin raft status` shows a MATCHED figure \
+             and run it again"
+        )));
+    };
+    let lag = last_log_index.saturating_sub(matched);
+    if lag > threshold {
+        return Err(Status::failed_precondition(format!(
+            "learner is at log index {matched} while the leader is at {last_log_index}, \
+             {lag} entries behind and more than the threshold of {threshold}; wait for it \
+             to catch up and run it again"
+        )));
+    }
+    Ok(())
+}
+
+/// What one voter's answer to `ClusterProbe` means for a promote.
+fn voter_probe_ruling(
+    id: u64,
+    addr: &str,
+    support: crate::raft::ProbeSupport,
+) -> Result<(), Status> {
+    use crate::raft::ProbeSupport;
+    match support {
+        ProbeSupport::Supported => Ok(()),
+        ProbeSupport::Unimplemented => Err(Status::failed_precondition(format!(
+            "voter {id} at {addr} runs a controller build that predates dynamic raft \
+             membership and cannot reach a node added at runtime. Update every controller \
+             before you promote a learner."
+        ))),
+        ProbeSupport::Unreachable => Err(Status::failed_precondition(format!(
+            "voter {id} at {addr} did not answer; remove a dead voter before you promote"
+        ))),
+    }
+}
+
 /// Ruling for a non-admin caller, split from the lookup so the policy is testable without the
 /// host's user database. An error denies: a name the controller cannot resolve is a name it cannot
 /// vouch for.
-fn reservation_manager_ruling(
+fn operator_ruling(
     user: &str,
+    action: &str,
     privileged: Result<bool, spur_core::auth::AuthError>,
 ) -> Result<(), Status> {
     match privileged {
         Ok(true) => Ok(()),
         Ok(false) => Err(Status::permission_denied(format!(
-            "user '{user}' may not manage reservations: {}",
+            "user '{user}' may not {action}: {}",
             spur_core::privilege::PRIVILEGE_REQUIREMENT
         ))),
         Err(e) => Err(Status::permission_denied(format!(
-            "cannot verify that '{user}' may manage reservations ({e}); reservation management {}",
+            "cannot verify that '{user}' may {action} ({e}); this {}",
             spur_core::privilege::PRIVILEGE_REQUIREMENT
         ))),
     }
@@ -4041,6 +4245,161 @@ impl SlurmController for ControllerService {
         }))
     }
 
+    async fn raft_add_learner(
+        &self,
+        request: Request<RaftAddLearnerRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+        let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &format!("raft node {}", req.node_id),
+                txn::requested(&[("address", Some(req.address.clone().into()))]),
+            )
+            .asserted_actor(&req.user),
+        );
+        self.require_operator(&req.user, identity.as_ref(), "change raft membership")
+            .await?;
+
+        let node_id = validate_raft_node_id(req.node_id)?;
+        let address = req.address.trim();
+        if address.is_empty() {
+            return Err(Status::invalid_argument(
+                "address is required: the leader can only reach a new node through it",
+            ));
+        }
+        let membership = self.current_membership();
+        if let Some(node) = membership.get_node(&node_id) {
+            return Err(Status::already_exists(format!(
+                "node {node_id} is already a member at {}; remove it first to change its address",
+                node.addr
+            )));
+        }
+
+        // Non-blocking: the caller watches the learner catch up with
+        // `spur admin raft status` rather than holding the RPC open.
+        self.raft
+            .raft
+            .add_learner(node_id, BasicNode::new(address.to_string()), false)
+            .await
+            .map_err(|e| membership_write_status("add learner", e))?;
+        info!(node_id, address, "added raft learner");
+        Ok(Response::new(()))
+    }
+
+    async fn raft_promote_voter(
+        &self,
+        request: Request<RaftPromoteVoterRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+        let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(&format!("raft node {}", req.node_id), serde_json::json!({}))
+                .asserted_actor(&req.user),
+        );
+        self.require_operator(&req.user, identity.as_ref(), "change raft membership")
+            .await?;
+
+        let node_id = validate_raft_node_id(req.node_id)?;
+        let metrics = self.raft.raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership().clone();
+        promote_membership_ruling(&membership, node_id)?;
+        self.refuse_promote_unless_every_voter_answers(&membership)
+            .await?;
+        // The handler runs on the leader, so the replication map is populated.
+        promote_lag_ruling(
+            metrics.last_log_index.unwrap_or(0),
+            matched_log_index(&metrics.replication, node_id),
+            self.raft.config.replication_lag_threshold,
+        )?;
+
+        self.raft
+            .raft
+            .change_membership(
+                openraft::ChangeMembers::AddVoterIds([node_id].into()),
+                false,
+            )
+            .await
+            .map_err(|e| membership_write_status("promote to voter", e))?;
+        info!(node_id, "promoted raft learner to voter");
+        Ok(Response::new(()))
+    }
+
+    async fn raft_remove_voter(
+        &self,
+        request: Request<RaftRemoveVoterRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+        let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.user, identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(&format!("raft node {}", req.node_id), serde_json::json!({}))
+                .asserted_actor(&req.user),
+        );
+        self.require_operator(&req.user, identity.as_ref(), "change raft membership")
+            .await?;
+
+        let node_id = validate_raft_node_id(req.node_id)?;
+        let change = remove_membership_change(&self.current_membership(), node_id)?;
+        let role = match change {
+            openraft::ChangeMembers::RemoveVoters(_) => "voter",
+            _ => "learner",
+        };
+        // retain = false drops a voter entirely instead of leaving it a learner
+        // that the leader keeps replicating to.
+        self.raft
+            .raft
+            .change_membership(change, false)
+            .await
+            .map_err(|e| membership_write_status("remove member", e))?;
+        info!(node_id, role, "removed raft member");
+        Ok(Response::new(()))
+    }
+
+    async fn raft_membership(
+        &self,
+        _request: Request<RaftMembershipRequest>,
+    ) -> Result<Response<RaftMembershipResponse>, Status> {
+        let metrics = self.raft.raft.metrics().borrow().clone();
+        let voters: std::collections::BTreeSet<u64> =
+            metrics.membership_config.membership().voter_ids().collect();
+        let members = metrics
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, node)| RaftMember {
+                node_id: *id,
+                address: node.addr.clone(),
+                voter: voters.contains(id),
+                matched_index: matched_index(&metrics.replication, *id),
+            })
+            .collect();
+        Ok(Response::new(RaftMembershipResponse {
+            members,
+            leader: self.raft.current_leader().unwrap_or(0),
+            this_node: self.raft.node_id,
+            state: format!("{:?}", metrics.state),
+            last_log_index: metrics.last_log_index.unwrap_or(0),
+        }))
+    }
+
     async fn cluster_remove_nodes(
         &self,
         request: Request<ClusterRemoveNodesRequest>,
@@ -4318,20 +4677,7 @@ pub fn build_service(
     jwt_key: String,
     bearer: &spur_core::auth::BearerAuth,
 ) -> ControllerService {
-    let client_addrs: BTreeMap<u64, String> = raft_handle
-        .peers
-        .iter()
-        .map(|(id, raft_addr)| {
-            let client_addr = if let Some(host) = raft_addr.rsplit_once(':').map(|(h, _)| h) {
-                format!("{}:6817", host)
-            } else {
-                format!("{}:6817", raft_addr)
-            };
-            (*id, client_addr)
-        })
-        .collect();
-
-    let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
+    let leader_proxy = LeaderProxy::new(raft_handle.clone());
 
     let node_identity_key_configured =
         cluster.config().auth.has_jwt_key() || crate::native_keys::node_signer().is_some();
@@ -4339,7 +4685,6 @@ pub fn build_service(
 
     ControllerService {
         cluster,
-        client_addrs,
         raft: raft_handle,
         leader_proxy,
         rpc_stats,
@@ -5652,6 +5997,7 @@ mod tests {
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};
     use spur_core::reservation::ReservationFlags;
+    use std::collections::BTreeMap;
     use tonic::Code;
 
     fn job_state(cluster: &crate::cluster::ClusterManager, job_id: u32) -> Option<JobState> {
@@ -6059,12 +6405,10 @@ mod tests {
         assert_eq!(handle.current_leader(), None);
 
         let raft = Arc::new(handle);
-        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
         ControllerService {
             cluster,
             raft: raft.clone(),
-            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
-            client_addrs,
+            leader_proxy: LeaderProxy::new(raft.clone()),
             rpc_stats: Arc::new(RpcStatsCollector::new()),
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
             control_plane_replicas: 1,
@@ -6762,8 +7106,7 @@ mod tests {
         ControllerService {
             cluster,
             raft: raft.clone(),
-            leader_proxy: LeaderProxy::new(raft, BTreeMap::new()),
-            client_addrs: BTreeMap::new(),
+            leader_proxy: LeaderProxy::new(raft),
             rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
             control_plane_replicas: 1,
@@ -11460,12 +11803,12 @@ mod tests {
 
     #[test]
     fn privileged_user_manages_reservations() {
-        assert!(reservation_manager_ruling("alice", Ok(true)).is_ok());
+        assert!(operator_ruling("alice", "manage reservations", Ok(true)).is_ok());
     }
 
     #[test]
     fn unprivileged_user_may_not_manage_reservations() {
-        let err = reservation_manager_ruling("alice", Ok(false))
+        let err = operator_ruling("alice", "manage reservations", Ok(false))
             .expect_err("an unprivileged user must be denied");
         assert_eq!(err.code(), Code::PermissionDenied);
         assert!(
@@ -11475,11 +11818,434 @@ mod tests {
         );
     }
 
+    /// Every raft membership mutation stands behind the strict operator bar, so a
+    /// caller the controller cannot vouch for is denied even under `permissive`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raft_mutations_refuse_an_unidentified_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let user = "no_such_user_in_nss_7f3a".to_string();
+
+        let err = svc
+            .raft_add_learner(Request::new(RaftAddLearnerRequest {
+                user: user.clone(),
+                node_id: 2,
+                address: "127.0.0.1:6821".into(),
+            }))
+            .await
+            .expect_err("add-learner must refuse an unidentified caller");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let err = svc
+            .raft_promote_voter(Request::new(RaftPromoteVoterRequest {
+                user: user.clone(),
+                node_id: 2,
+            }))
+            .await
+            .expect_err("promote must refuse an unidentified caller");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        let err = svc
+            .raft_remove_voter(Request::new(RaftRemoveVoterRequest { user, node_id: 2 }))
+            .await
+            .expect_err("remove must refuse an unidentified caller");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        // A denied mutation must not have touched the membership.
+        let members = svc
+            .raft_membership(Request::new(RaftMembershipRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(members.members.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raft_membership_reports_the_leader_and_this_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let status = svc
+            .raft_membership(Request::new(RaftMembershipRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.leader, 1);
+        assert_eq!(status.this_node, 1);
+        assert_eq!(status.state, "Leader");
+        let member = status.members.first().expect("the node is its own member");
+        assert_eq!(member.node_id, 1);
+        assert!(member.voter);
+    }
+
+    /// The matched index an operator reads to know whether a learner has caught
+    /// up: the leader's replication map on a follower, -1 where it says nothing.
+    #[test]
+    fn matched_index_reads_the_leaders_replication_map() {
+        let log_id = openraft::LogId::new(openraft::CommittedLeaderId::new(3, 0), 42);
+        let replication = Some(std::collections::BTreeMap::from([
+            (2u64, Some(log_id)),
+            (3u64, None),
+        ]));
+        assert_eq!(matched_index(&replication, 2), 42);
+        assert_eq!(matched_index(&replication, 3), -1);
+        assert_eq!(matched_index(&replication, 4), -1);
+        assert_eq!(matched_index(&None, 2), -1);
+    }
+
+    fn write_error(
+        e: openraft::error::ClientWriteError<u64, openraft::BasicNode>,
+    ) -> openraft::error::RaftError<u64, openraft::error::ClientWriteError<u64, openraft::BasicNode>>
+    {
+        openraft::error::RaftError::APIError(e)
+    }
+
+    /// Each openraft refusal of a membership write has a gRPC code that tells the
+    /// operator whether to run the command again, fix the order of steps, or
+    /// look at the controller.
+    #[test]
+    fn membership_write_status_maps_each_openraft_error_to_a_code() {
+        use openraft::error::{
+            ChangeMembershipError, ClientWriteError, EmptyMembership, Fatal, ForwardToLeader,
+            InProgress, LearnerNotFound,
+        };
+
+        let moved = membership_write_status(
+            "promote to voter",
+            write_error(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                leader_id: Some(2),
+                leader_node: None,
+            })),
+        );
+        assert_eq!(moved.code(), Code::Unavailable);
+        assert_eq!(
+            moved.message(),
+            "promote to voter: leadership moved to node 2 while the request was in flight; run it again"
+        );
+
+        let no_leader = membership_write_status(
+            "remove member",
+            write_error(ClientWriteError::ForwardToLeader(ForwardToLeader {
+                leader_id: None,
+                leader_node: None,
+            })),
+        );
+        assert_eq!(no_leader.code(), Code::Unavailable);
+        assert_eq!(
+            no_leader.message(),
+            "remove member: leadership moved while the request was in flight and no leader is elected yet; run it again"
+        );
+
+        let in_flight = membership_write_status(
+            "promote to voter",
+            write_error(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::InProgress(InProgress {
+                    committed: None,
+                    membership_log_id: None,
+                }),
+            )),
+        );
+        assert_eq!(in_flight.code(), Code::Unavailable);
+        assert!(
+            in_flight
+                .message()
+                .ends_with("a membership change is in flight; run it again"),
+            "{}",
+            in_flight.message()
+        );
+
+        let no_learner = membership_write_status(
+            "promote to voter",
+            write_error(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::LearnerNotFound(LearnerNotFound { node_id: 4 }),
+            )),
+        );
+        assert_eq!(no_learner.code(), Code::FailedPrecondition);
+        assert!(
+            no_learner.message().ends_with("add it as a learner first"),
+            "{}",
+            no_learner.message()
+        );
+
+        let empty = membership_write_status(
+            "remove voter",
+            write_error(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::EmptyMembership(EmptyMembership {}),
+            )),
+        );
+        assert_eq!(empty.code(), Code::FailedPrecondition);
+        assert!(
+            empty.message().ends_with(&EmptyMembership {}.to_string()),
+            "{}",
+            empty.message()
+        );
+
+        let fatal = membership_write_status(
+            "add learner",
+            openraft::error::RaftError::Fatal(Fatal::Stopped),
+        );
+        assert_eq!(fatal.code(), Code::Internal);
+    }
+
+    /// An id the membership already holds cannot be added again: openraft would
+    /// silently rewrite the address of a live member.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn add_learner_refuses_an_id_that_is_already_a_member() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let err = svc
+            .raft_add_learner(admin_request(RaftAddLearnerRequest {
+                user: "root".into(),
+                node_id: 1,
+                address: "127.0.0.1:6821".into(),
+            }))
+            .await
+            .expect_err("node 1 is this node and already a voter");
+        assert_eq!(err.code(), Code::AlreadyExists);
+        assert!(
+            err.message().contains("already a member at"),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// A promote goes through the real handler: an unknown id and a voter are
+    /// refused before openraft, and a learner the leader has never reached is
+    /// refused by the lag test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn promote_refuses_an_unknown_id_a_voter_and_an_unreached_learner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let err = svc
+            .raft_promote_voter(admin_request(RaftPromoteVoterRequest {
+                user: "root".into(),
+                node_id: 9,
+            }))
+            .await
+            .expect_err("node 9 is in no membership");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().ends_with("add it as a learner first"),
+            "{}",
+            err.message()
+        );
+
+        let err = svc
+            .raft_promote_voter(admin_request(RaftPromoteVoterRequest {
+                user: "root".into(),
+                node_id: 1,
+            }))
+            .await
+            .expect_err("node 1 is already a voter");
+        assert_eq!(err.code(), Code::AlreadyExists);
+
+        // Port 1 is never served, so the leader never matches anything on node 2.
+        svc.raft_add_learner(admin_request(RaftAddLearnerRequest {
+            user: "root".into(),
+            node_id: 2,
+            address: "127.0.0.1:1".into(),
+        }))
+        .await
+        .expect("a learner at an unreachable address is accepted");
+        let err = svc
+            .raft_promote_voter(admin_request(RaftPromoteVoterRequest {
+                user: "root".into(),
+                node_id: 2,
+            }))
+            .await
+            .expect_err("a learner the leader has not reached must not be promoted");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("has not replicated anything"),
+            "{}",
+            err.message()
+        );
+
+        let members = svc
+            .raft_membership(Request::new(RaftMembershipRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let learner = members.members.iter().find(|m| m.node_id == 2).unwrap();
+        assert!(
+            !learner.voter,
+            "the refused promote must not have gone through"
+        );
+    }
+
+    /// A remove goes through the real handler: a learner leaves the membership,
+    /// an id that is no member is refused, and the last voter cannot leave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_drops_a_learner_and_refuses_an_unknown_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.raft_add_learner(admin_request(RaftAddLearnerRequest {
+            user: "root".into(),
+            node_id: 2,
+            address: "127.0.0.1:1".into(),
+        }))
+        .await
+        .expect("a learner at an unreachable address is accepted");
+
+        svc.raft_remove_voter(admin_request(RaftRemoveVoterRequest {
+            user: "root".into(),
+            node_id: 2,
+        }))
+        .await
+        .expect("a learner can be removed");
+        svc.raft
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(
+                |m| m.membership_config.membership().get_node(&2).is_none(),
+                "learner 2 left the membership",
+            )
+            .await
+            .unwrap();
+        let members = svc
+            .raft_membership(Request::new(RaftMembershipRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            members.members.iter().all(|m| m.node_id != 2),
+            "the learner is still listed: {:?}",
+            members.members
+        );
+
+        let err = svc
+            .raft_remove_voter(admin_request(RaftRemoveVoterRequest {
+                user: "root".into(),
+                node_id: 9,
+            }))
+            .await
+            .expect_err("node 9 is in no membership");
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(err.message().contains("not a member"), "{}", err.message());
+
+        let err = svc
+            .raft_remove_voter(admin_request(RaftRemoveVoterRequest {
+                user: "root".into(),
+                node_id: 1,
+            }))
+            .await
+            .expect_err("the only voter cannot leave");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn member_client_addr_covers_a_member_added_at_runtime() {
+        let membership = openraft::Membership::<u64, BasicNode>::new(
+            vec![[1, 4].into()],
+            BTreeMap::from([
+                (1, BasicNode::new("ctrl1:6821")),
+                (4, BasicNode::new("10.0.0.4:6821")),
+                (5, BasicNode::new("ctrl5")),
+            ]),
+        );
+
+        assert_eq!(
+            member_client_addr(&membership, 1).as_deref(),
+            Some("ctrl1:6817")
+        );
+        assert_eq!(
+            member_client_addr(&membership, 4).as_deref(),
+            Some("10.0.0.4:6817")
+        );
+        assert_eq!(
+            member_client_addr(&membership, 5).as_deref(),
+            Some("ctrl5:6817")
+        );
+        assert_eq!(member_client_addr(&membership, 9), None);
+    }
+
+    #[test]
+    fn remove_membership_change_follows_the_role_of_the_id() {
+        use openraft::ChangeMembers;
+        let membership = openraft::Membership::<u64, BasicNode>::new(
+            vec![[1].into()],
+            BTreeMap::from([
+                (1, BasicNode::new("127.0.0.1:6821")),
+                (2, BasicNode::new("127.0.0.1:7821")),
+            ]),
+        );
+
+        let unknown = remove_membership_change(&membership, 9).unwrap_err();
+        assert_eq!(unknown.code(), Code::NotFound);
+        assert!(
+            unknown.message().contains("node 9 is not a member"),
+            "{}",
+            unknown.message()
+        );
+
+        assert!(matches!(
+            remove_membership_change(&membership, 1).unwrap(),
+            ChangeMembers::RemoveVoters(ids) if ids == [1].into()
+        ));
+        assert!(matches!(
+            remove_membership_change(&membership, 2).unwrap(),
+            ChangeMembers::RemoveNodes(ids) if ids == [2].into()
+        ));
+    }
+
+    #[test]
+    fn promote_lag_ruling_admits_only_a_caught_up_learner() {
+        let unknown = promote_lag_ruling(100, None, 10).unwrap_err();
+        assert_eq!(unknown.code(), Code::FailedPrecondition);
+        assert!(
+            unknown.message().contains("has not replicated anything"),
+            "{}",
+            unknown.message()
+        );
+
+        let far_behind = promote_lag_ruling(100, Some(50), 10).unwrap_err();
+        assert_eq!(far_behind.code(), Code::FailedPrecondition);
+        assert!(
+            far_behind.message().contains("50 entries behind"),
+            "{}",
+            far_behind.message()
+        );
+        assert!(
+            far_behind.message().contains("threshold of 10"),
+            "{}",
+            far_behind.message()
+        );
+
+        assert!(promote_lag_ruling(100, Some(90), 10).is_ok());
+        assert!(promote_lag_ruling(100, Some(100), 10).is_ok());
+    }
+
+    /// Only a voter that answers the probe lets a promote through.
+    #[test]
+    fn voter_probe_ruling_refuses_an_old_and_a_silent_voter() {
+        use crate::raft::ProbeSupport;
+
+        assert!(voter_probe_ruling(2, "ctrl2:6821", ProbeSupport::Supported).is_ok());
+
+        let old = voter_probe_ruling(2, "ctrl2:6821", ProbeSupport::Unimplemented).unwrap_err();
+        assert_eq!(old.code(), Code::FailedPrecondition);
+        assert!(old.message().contains("predates"), "{}", old.message());
+
+        let silent = voter_probe_ruling(3, "ctrl3:6821", ProbeSupport::Unreachable).unwrap_err();
+        assert_eq!(silent.code(), Code::FailedPrecondition);
+        assert!(
+            silent.message().ends_with(
+                "voter 3 at ctrl3:6821 did not answer; remove a dead voter before you promote"
+            ),
+            "{}",
+            silent.message()
+        );
+    }
+
     /// An unresolvable name must deny rather than fall through to an allow.
     #[test]
     fn unresolvable_user_is_denied() {
-        let err = reservation_manager_ruling(
+        let err = operator_ruling(
             "ghost",
+            "manage reservations",
             Err(spur_core::auth::AuthError::UnknownUser("ghost".into())),
         )
         .expect_err("an unresolvable user must be denied");

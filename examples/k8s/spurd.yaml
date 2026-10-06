@@ -13,7 +13,7 @@ spec:
         app: spurd
     spec:
       nodeSelector:
-        spur.amd.com/compute: "true"
+        spur.amd.com/managed: "true"
       tolerations:
         - key: spur.amd.com/gpu-node
           operator: Exists
@@ -24,7 +24,7 @@ spec:
           image: spur:latest
           command: [spurd]
           args:
-            - --controller=spurctld.spur.svc.cluster.local:6817
+            - --controller=spurctld-client.spur.svc.cluster.local:6817
             - --listen=[::]:6816
           ports:
             - containerPort: 6816
