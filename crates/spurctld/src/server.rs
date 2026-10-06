@@ -261,17 +261,15 @@ impl LeaderProxy {
 
     /// An open channel to the current leader. Forwarding drives the RPC over this
     /// with a codec (see [`PassthroughCodec`]); a typed client is not needed.
-    async fn get_leader_channel(&self) -> Result<tonic::transport::Channel, Status> {
+    async fn get_leader_channel(&self) -> Result<(u64, tonic::transport::Channel), Status> {
         let leader_id = self
             .raft
             .current_leader()
             .ok_or_else(|| Status::unavailable("no leader elected yet"))?;
 
-        let mut cached = self.cached_channel.lock().await;
-
-        if let Some((id, ref channel)) = *cached {
+        if let Some((id, ref channel)) = *self.cached_channel.lock().await {
             if id == leader_id {
-                return Ok(channel.clone());
+                return Ok((leader_id, channel.clone()));
             }
         }
 
@@ -286,15 +284,52 @@ impl LeaderProxy {
             format!("http://{}", addr)
         };
 
-        let channel = tonic::transport::Endpoint::from_shared(url)
-            .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?
-            .connect()
-            .await
-            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?;
+        // Not under the lock: a connect that runs to its timeout must not hold up
+        // the forwards that are waiting to drop a broken channel.
+        // The alternate form prints the source chain; tonic's own message is only
+        // "transport error".
+        let channel = leader_endpoint(url)?.connect().await.map_err(|e| {
+            Status::unavailable(format!(
+                "cannot reach leader {leader_id} at {addr}: {:#}",
+                anyhow::Error::new(e)
+            ))
+        })?;
 
-        *cached = Some((leader_id, channel.clone()));
-        Ok(channel)
+        *self.cached_channel.lock().await = Some((leader_id, channel.clone()));
+        Ok((leader_id, channel))
     }
+
+    /// A transport error may mean the leader is gone, so the next forward must
+    /// reconnect and resolve its address again. An answer from the leader keeps the
+    /// channel.
+    async fn release_after(&self, leader_id: u64, status: &Status) {
+        if !spur_proto::controller_rpc_retryable(status) {
+            return;
+        }
+        let addr = self.client_addrs.get(&leader_id).map_or("", String::as_str);
+        warn!("forward to leader {leader_id} at {addr} failed: {status}");
+        let mut cached = self.cached_channel.lock().await;
+        if matches!(*cached, Some((id, _)) if id == leader_id) {
+            *cached = None;
+        }
+    }
+}
+
+// A restarted leader Pod keeps its id but not its IP, so a stale DNS answer or a dead
+// connection would hold a forward for minutes. The connect bound is short because a
+// forward queued behind a failed connect retries it. No request bound: RunStep is long.
+const LEADER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LEADER_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const LEADER_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[allow(clippy::result_large_err)]
+fn leader_endpoint(url: String) -> Result<tonic::transport::Endpoint, Status> {
+    Ok(tonic::transport::Endpoint::from_shared(url)
+        .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?
+        .connect_timeout(LEADER_CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(LEADER_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(LEADER_KEEP_ALIVE_TIMEOUT)
+        .keep_alive_while_idle(true))
 }
 
 const STEP_REAWAIT_ATTEMPTS: u32 = 30;
@@ -413,8 +448,8 @@ impl ControllerService {
         if Self::is_already_forwarded(&request) {
             return Err(self.not_leader_status());
         }
-        let channel = match self.leader_proxy.get_leader_channel().await {
-            Ok(channel) => channel,
+        let leader = match self.leader_proxy.get_leader_channel().await {
+            Ok(leader) => leader,
             Err(e) => {
                 warn!("failed to forward to leader: {e}");
                 return Err(self.not_leader_status());
@@ -428,7 +463,7 @@ impl ControllerService {
             .get::<spur_core::auth::Identity>()
             .cloned();
         self.send_to_leader(
-            channel,
+            leader,
             request.metadata(),
             request.get_ref(),
             identity,
@@ -441,7 +476,7 @@ impl ControllerService {
     /// through [`PassthroughCodec`].
     async fn send_to_leader<Resp>(
         &self,
-        channel: tonic::transport::Channel,
+        (leader_id, channel): (u64, tonic::transport::Channel),
         orig_meta: &tonic::metadata::MetadataMap,
         message: &impl prost::Message,
         identity: Option<spur_core::auth::Identity>,
@@ -458,15 +493,21 @@ impl ControllerService {
         let digest = spur_core::native_peer::request_digest(&body);
         let meta = Self::forwarded_metadata_for(orig_meta, identity.as_ref(), digest, path)?;
         let fwd = Request::from_parts(meta, http::Extensions::default(), body);
+        let path = http::uri::PathAndQuery::try_from(path)
+            .map_err(|e| Status::internal(format!("invalid RPC path: {e}")))?;
         let mut grpc = tonic::client::Grpc::new(channel)
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
             .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
-        grpc.ready()
-            .await
-            .map_err(|e| Status::unavailable(format!("leader connection not ready: {e}")))?;
-        let path = http::uri::PathAndQuery::try_from(path)
-            .map_err(|e| Status::internal(format!("invalid RPC path: {e}")))?;
-        grpc.unary(fwd, path, PassthroughCodec::<Resp>::new()).await
+        let result = match grpc.ready().await {
+            Ok(()) => grpc.unary(fwd, path, PassthroughCodec::<Resp>::new()).await,
+            Err(e) => Err(Status::unavailable(format!(
+                "leader connection not ready: {e}"
+            ))),
+        };
+        if let Err(status) = &result {
+            self.leader_proxy.release_after(leader_id, status).await;
+        }
+        result
     }
 
     // Claims the right to fence an incomplete cohort past its grace period.
@@ -799,9 +840,9 @@ impl ControllerService {
     {
         let payload = payload?;
         let path = path?;
-        let channel = self.leader_proxy.get_leader_channel().await.ok()?;
+        let leader = self.leader_proxy.get_leader_channel().await.ok()?;
         match self
-            .send_to_leader::<Resp>(channel, &meta, &payload, identity, &path)
+            .send_to_leader::<Resp>(leader, &meta, &payload, identity, &path)
             .await
         {
             Ok(resp) => Some(resp),
@@ -6172,6 +6213,79 @@ mod tests {
                 "{label} let bob read alice's job: {jobs:?}"
             );
         }
+    }
+
+    /// A leader that accepts the connection but never answers, like a peer whose
+    /// Pod is gone, must fail the forward instead of holding it.
+    #[tokio::test]
+    async fn a_forward_to_a_silent_leader_fails_in_bounded_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (_conn, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let channel = leader_endpoint(url).unwrap().connect().await.unwrap();
+        // Paused only now: the clock jumps whenever the runtime idles, which would
+        // also expire the connect timeout before loopback I/O completes.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let err = spur_proto::proto::slurm_controller_client::SlurmControllerClient::new(channel)
+            .ping(())
+            .await
+            .unwrap_err();
+
+        assert!(spur_proto::controller_rpc_retryable(&err), "{err:?}");
+        assert!(
+            started.elapsed() <= LEADER_KEEP_ALIVE_INTERVAL * 2 + LEADER_KEEP_ALIVE_TIMEOUT,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_forward_drops_the_leader_channel_and_an_answer_keeps_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut svc = test_service(&dir).await;
+        let gone = "127.0.0.1:1";
+        svc.leader_proxy =
+            LeaderProxy::new(svc.raft.clone(), BTreeMap::from([(1, gone.to_string())]));
+        let cache = svc.leader_proxy.cached_channel.clone();
+        let lazy = leader_endpoint(format!("http://{gone}"))
+            .unwrap()
+            .connect_lazy();
+
+        *cache.lock().await = Some((1, lazy.clone()));
+        svc.leader_proxy
+            .release_after(1, &Status::not_found("no such job"))
+            .await;
+        assert!(cache.lock().await.is_some(), "an answer keeps the channel");
+
+        let err = svc
+            .send_to_leader::<()>(
+                (1, lazy),
+                &tonic::metadata::MetadataMap::new(),
+                &(),
+                None,
+                "/slurm.SlurmController/Ping",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable, "{err:?}");
+        assert!(cache.lock().await.is_none(), "a transport error drops it");
+
+        let again = svc.leader_proxy.get_leader_channel().await.unwrap_err();
+        assert!(
+            again
+                .message()
+                .contains("cannot reach leader 1 at 127.0.0.1:1"),
+            "the next forward dials the leader again: {again:?}"
+        );
+        assert!(
+            again.message().contains("tcp connect error"),
+            "the log line names the cause, not only \"transport error\": {again:?}"
+        );
     }
 
     /// The write side of the contract: with no leader, writes must fail rather
