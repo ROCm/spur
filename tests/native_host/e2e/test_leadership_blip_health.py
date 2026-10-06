@@ -42,9 +42,10 @@ INTERIM_ELECTION_TIMEOUT_SECS = 5
 HEAD_START_SECS = 3
 RACE_SETTLE_TIMEOUT_SECS = 20
 MAX_RECLAIM_ATTEMPTS = 5
-# spurctld's health tick is a fixed 30s and heartbeat_timeout_secs is 60s in
-# the ha_cluster fixture (grace = max(60, 30) = 60s); wait past grace plus one
-# full tick before judging node/job state.
+# heartbeat_timeout_secs in the ha_cluster fixture (grace = max(60, 30) = 60s).
+GRACE_SECS = 60
+# spurctld's health tick is a fixed 30s; wait past grace plus one full tick
+# after the reclaim before judging node/job state.
 HEALTH_SETTLE_SECS = 100
 # Long enough to outlast MAX_RECLAIM_ATTEMPTS worth of retries plus
 # HEALTH_SETTLE_SECS, so the job can't complete out from under the assertion.
@@ -95,10 +96,8 @@ def _attempt_reclaim(cluster, n: int, leader_idx: int) -> int | None:
         )
         if interim is None:
             return None
-        # Depose the interim leader AND silence the third controller, so when
-        # the original leader resumes it has a clear field — otherwise the
-        # third controller (never interrupted) tends to win the next election
-        # outright, since its own timer has been running the whole time.
+        # Silence the third controller too — uninterrupted, its own timer
+        # would otherwise let it win the next election outright.
         third = next(i for i in others if i != interim)
         cluster.signal_controller(interim, "STOP")
         cluster.signal_controller(third, "STOP")
@@ -134,6 +133,13 @@ class TestLeadershipBlipHealth:
         job_id = parse_job_id(sb)
         assert job_id is not None, f"sbatch failed:\n{sb}"
         wait_job_state(cluster, job_id, "R", timeout=60)
+
+        # A buggy never-reset grace is still legitimately armed until the
+        # ORIGINAL window expires; wait it out so a pass proves re-arming.
+        elapsed = time.time() - cluster.ha_leader_elected_at
+        remaining = GRACE_SECS + 5 - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
         reclaimed = False
         for _ in range(MAX_RECLAIM_ATTEMPTS):

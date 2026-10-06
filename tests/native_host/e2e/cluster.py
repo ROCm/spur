@@ -282,6 +282,9 @@ class SpurCluster:
         self.controller_env: dict[str, str] = {}
         # Node indices running spurctld. Only index 0 outside start_ha().
         self._controller_node_indices: list[int] = [0]
+        # Wall-clock (this process's clock) when start_ha()'s first leader was
+        # observed — lets a test wait out the grace window from a known origin.
+        self.ha_leader_elected_at: float | None = None
 
     @property
     def ha_controller_count(self) -> int:
@@ -1506,6 +1509,9 @@ tar -C "$R" -czf '{local_tar}' .
             self._kill_controller()
             self._kill_agents(use_sudo=False, broad=True)
         self.config_overrides = config_overrides or {}
+        # Agent-only hosts (beyond n_controllers) never get the HA rewrite
+        # below, so write the shared config everywhere first.
+        self._write_config()
         peers = [f"{self.nodes[i].host}:{raft_port}" for i in range(n_controllers)]
         for i in range(n_controllers):
             self._write_ha_controller_config(i, peers, i + 1, raft_port)
@@ -1514,27 +1520,24 @@ tar -C "$R" -czf '{local_tar}' .
         self.controller_addr = ",".join(
             f"http://{self.nodes[i].host}:{CONTROLLER_PORT}" for i in range(n_controllers)
         )
-        # spurd's own registration has no retry (a failure here is fatal to the
-        # process), so agents must not start until a real multi-host election
-        # has actually produced a leader — a fixed sleep is too racy for that.
-        self._wait_raft_responsive()
+        # spurd's registration has no retry, so agents must not start until a
+        # real election has produced a leader (a fixed sleep is too racy).
+        self._wait_leader_elected()
+        self.ha_leader_elected_at = time.time()
         self.start_agents(kill_stale=False)
         self.wait_ready()
 
-    def _wait_raft_responsive(self, timeout: int = 30):
-        """Poll until the HA controller set answers a read RPC (i.e. some
-        controller has won the initial election), rather than assuming a
-        fixed settle time is enough on a real multi-host network."""
+    def _wait_leader_elected(self, timeout: int = 30):
+        """A read like ``sinfo`` isn't proof of a leader (reads fall back to
+        local state); poll each controller's own log for "become leader"."""
         deadline = time.time() + timeout
-        last = ""
         while time.time() < deadline:
-            last = self.cli_allow_fail(["sinfo"])
-            if "error" not in last.lower():
-                return
+            for i in self._controller_node_indices:
+                log = self.spurctld_log(i)
+                if log.rfind("become leader") > log.rfind("quit leader"):
+                    return
             time.sleep(1)
-        raise TimeoutError(
-            f"HA controller set never became responsive within {timeout}s:\n{last}"
-        )
+        raise TimeoutError(f"no controller became leader within {timeout}s")
 
     def _start_postgres(self):
         """Bring up Postgres (Docker) on node 0. Accounting runs inside spurctld."""
