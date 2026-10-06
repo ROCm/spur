@@ -280,6 +280,12 @@ class SpurCluster:
         self.cli_env: dict[str, str] = {}
         self.daemon_env: dict[str, str] = {}
         self.controller_env: dict[str, str] = {}
+        # Node indices running spurctld. Only index 0 outside start_ha().
+        self._controller_node_indices: list[int] = [0]
+
+    @property
+    def ha_controller_count(self) -> int:
+        return len(self._controller_node_indices)
 
     @property
     def _db_url(self) -> str:
@@ -1446,6 +1452,9 @@ tar -C "$R" -czf '{local_tar}' .
         ) + " "
 
     def _start_controller(self):
+        self._start_controller_on(0)
+
+    def _start_controller_on(self, index: int):
         listen = f"[::]:{CONTROLLER_PORT}"
         extra = self._daemon_env_assignments(self.controller_env)
         cmd = (
@@ -1454,8 +1463,60 @@ tar -C "$R" -czf '{local_tar}' .
             f"--listen '{listen}' --state-dir '{self.state_dir}' --log-level info -D "
             f"> '{self.log_dir}/spurctld.log' 2>&1 & echo $!"
         )
-        pid = self.nodes[0].exec(cmd).strip()
-        logger.info("spurctld started on %s (pid %s)", self.node_names[0], pid)
+        pid = self.nodes[index].exec(cmd).strip()
+        logger.info("spurctld started on %s (pid %s)", self.node_names[index], pid)
+
+    def _write_ha_controller_config(
+        self, index: int, peers: list[str], node_id: int, raft_port: int
+    ):
+        """Per-node spur.conf for an HA controller: same cluster config as
+        ``_write_config``, but with this node's own Raft identity spliced in."""
+        cfg = self._default_config()
+        deep_merge(cfg, self.config_overrides)
+        cfg["controller"] = {
+            **cfg.get("controller", {}),
+            "peers": peers,
+            "node_id": node_id,
+            "raft_listen_addr": f"[::]:{raft_port}",
+        }
+        config = tomli_w.dumps(cfg)
+        self.nodes[index].write_file(f"{self.etc_dir}/spur.conf", config)
+
+    def start_ha(
+        self,
+        n_controllers: int,
+        config_overrides: dict | None = None,
+        raft_port: int = 6821,
+        kill_stale: bool = True,
+    ):
+        """Start an n-controller Raft HA cluster: spurctld on nodes[0:n_controllers]
+        (explicit ``controller.node_id``/``peers``, bypassing hostname matching),
+        spurd on every node. ``controller_addr`` becomes the full comma-separated
+        endpoint list, so CLI/agent traffic uses the real failover and
+        follower-forwarding paths rather than a test-only shortcut.
+        """
+        if not self.node_names:
+            raise RuntimeError("provision() must be called before start_ha()")
+        if n_controllers > len(self.nodes):
+            raise RuntimeError(
+                f"start_ha({n_controllers}) needs that many nodes, have {len(self.nodes)}"
+            )
+        self._controller_node_indices = list(range(n_controllers))
+        if kill_stale:
+            self._kill_controller()
+            self._kill_agents(use_sudo=False, broad=True)
+        self.config_overrides = config_overrides or {}
+        peers = [f"{self.nodes[i].host}:{raft_port}" for i in range(n_controllers)]
+        for i in range(n_controllers):
+            self._write_ha_controller_config(i, peers, i + 1, raft_port)
+        for i in range(n_controllers):
+            self._start_controller_on(i)
+        self.controller_addr = ",".join(
+            f"http://{self.nodes[i].host}:{CONTROLLER_PORT}" for i in range(n_controllers)
+        )
+        time.sleep(2)
+        self.start_agents(kill_stale=False)
+        self.wait_ready()
 
     def _start_postgres(self):
         """Bring up Postgres (Docker) on node 0. Accounting runs inside spurctld."""
@@ -1523,7 +1584,14 @@ tar -C "$R" -czf '{local_tar}' .
         node.exec_allow_fail(f"{prefix}pkill -f '{pattern}' 2>/dev/null || true")
 
     def _kill_controller(self):
-        self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld")
+        for i in self._controller_node_indices:
+            self._pkill(self.nodes[i], f"{self.bin_dir}/spurctld")
+
+    def signal_controller(self, index: int, sig: str):
+        """Send *sig* (e.g. ``STOP``/``CONT``) to the spurctld on nodes[index]."""
+        self.nodes[index].exec_allow_fail(
+            f"pkill -{sig} -f '{self.bin_dir}/spurctld' 2>/dev/null || true"
+        )
 
     def _kill_mint(self):
         for node in self.nodes:

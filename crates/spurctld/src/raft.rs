@@ -771,6 +771,74 @@ impl RaftHandle {
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
     }
+
+    /// Watches the Raft metrics channel for leadership transitions and
+    /// publishes the instant leadership has been held continuously since
+    /// (`None` when not leader). Driven by `.changed().await` on openraft's
+    /// own metrics watch channel, so a transition is observed the moment it
+    /// happens rather than at the next poll of a fixed-interval timer — the
+    /// latter can miss a leadership blip that completes between two polls.
+    pub fn spawn_leadership_watcher(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<std::time::Instant>> {
+        let mut metrics_rx = self.raft.metrics();
+        let node_id = self.node_id;
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(async move {
+            let mut last_leader_term = None;
+            let mut leader_since = None;
+            loop {
+                let (current_leader, current_term) = {
+                    let m = metrics_rx.borrow_and_update();
+                    (m.current_leader, m.current_term)
+                };
+                let (next_since, next_term) = observe_leadership(
+                    current_leader,
+                    current_term,
+                    node_id,
+                    last_leader_term,
+                    leader_since,
+                    std::time::Instant::now(),
+                );
+                last_leader_term = next_term;
+                if next_since != leader_since {
+                    leader_since = next_since;
+                    if tx.send(leader_since).is_err() {
+                        break;
+                    }
+                }
+                if metrics_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+}
+
+/// Pure transition logic behind `spawn_leadership_watcher`. Resets
+/// `leader_since` to `now` whenever this node becomes the observed leader
+/// under a term it wasn't already credited with — covering both a fresh
+/// election win and a term bump while already leader (the latter catches a
+/// `watch` channel coalescing a fast lose-then-regain into one observed
+/// value: the term proves an election happened even if `current_leader`
+/// reads unchanged across the two reads).
+fn observe_leadership(
+    current_leader: Option<NodeId>,
+    current_term: u64,
+    node_id: NodeId,
+    last_leader_term: Option<u64>,
+    prior_since: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> (Option<std::time::Instant>, Option<u64>) {
+    if current_leader != Some(node_id) {
+        return (None, None);
+    }
+    if last_leader_term == Some(current_term) {
+        (prior_since, last_leader_term)
+    } else {
+        (Some(now), Some(current_term))
+    }
 }
 
 /// The system hostname as a UTF-8 string.
@@ -1405,6 +1473,46 @@ mod tests {
         let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
         let inner = store.inner.read();
         assert!(inner.last_purged.is_none());
+    }
+
+    #[test]
+    fn observe_leadership_sets_since_on_election_win() {
+        let now = std::time::Instant::now();
+        let (since, term) = super::observe_leadership(Some(1), 3, 1, None, None, now);
+        assert_eq!(since, Some(now));
+        assert_eq!(term, Some(3));
+    }
+
+    #[test]
+    fn observe_leadership_keeps_since_steady_while_leader_and_term_unchanged() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(5);
+        let (since, term) = super::observe_leadership(Some(1), 3, 1, Some(3), Some(t0), t1);
+        assert_eq!(
+            since,
+            Some(t0),
+            "unchanged term must not restart the window"
+        );
+        assert_eq!(term, Some(3));
+    }
+
+    #[test]
+    fn observe_leadership_resets_on_term_bump_while_still_leader() {
+        // Simulates a watch channel coalescing a fast lose-then-regain: the
+        // leader value reads unchanged, but the term proves a new election.
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(20);
+        let (since, term) = super::observe_leadership(Some(1), 4, 1, Some(3), Some(t0), t1);
+        assert_eq!(since, Some(t1));
+        assert_eq!(term, Some(4));
+    }
+
+    #[test]
+    fn observe_leadership_clears_since_when_not_leader() {
+        let t0 = std::time::Instant::now();
+        let (since, term) = super::observe_leadership(Some(2), 3, 1, Some(3), Some(t0), t0);
+        assert_eq!(since, None);
+        assert_eq!(term, None);
     }
 
     #[test]

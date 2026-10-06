@@ -317,6 +317,23 @@ def k8s_calico_direct_cluster(ssh_nodes, remote_bin_dir):
 
 
 @pytest.fixture
+def ha_cluster(ssh_nodes, remote_bin_dir):
+    """3-controller Raft HA cluster: spurctld on every node (real election,
+    real peers), spurd on every node. Skips unless >= 3 nodes are configured."""
+    if len(ssh_nodes) < 3:
+        pytest.skip(f"HA controller tests require >= 3 nodes (got {len(ssh_nodes)})")
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    c.provision()
+    try:
+        c.start_ha(3, config_overrides={"controller": {"heartbeat_timeout_secs": 10}})
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    c.teardown()
+
+
+@pytest.fixture
 def accounting_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """
     Per-test fixture: a running cluster with Postgres on node 0.

@@ -237,25 +237,22 @@ async fn main() -> anyhow::Result<()> {
     const HEALTH_TICK_SECS: u64 = 30;
     let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
     let health_cluster = cluster.clone();
-    let health_raft = raft_handle.clone();
+    let mut leader_since_rx = raft_handle.spawn_leadership_watcher();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(HEALTH_TICK_SECS));
-        // Floored at one tick because `LeadershipGrace::observe` is itself only
-        // called once per tick: a grace shorter than that can lapse before the
-        // first post-election check even runs, leaving the fleet exposed to a
-        // mass DOWN before any agent heartbeat lands.
-        let mut grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(
+        // Floored at one tick: health still runs once per tick, so a shorter
+        // grace could elapse before the first post-election check, before any
+        // heartbeat lands.
+        let grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(
             hb_timeout.max(HEALTH_TICK_SECS),
         ));
         loop {
             interval.tick().await;
-            let is_leader = health_raft.is_leader();
-            // Observed before the non-leader bail so a lost term restarts the window.
-            let mark_down = grace.observe(is_leader, std::time::Instant::now());
-            if !is_leader {
+            let leader_since = *leader_since_rx.borrow_and_update();
+            let Some(mark_down) = grace.policy(leader_since, std::time::Instant::now()) else {
                 continue;
-            }
+            };
             let evicted = health_cluster.check_node_health(hb_timeout, mark_down);
             for fin in &evicted {
                 if let Some(job) = health_cluster.get_job(fin.job_id) {

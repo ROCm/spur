@@ -8767,30 +8767,33 @@ pub enum MarkDownPolicy {
 
 /// Withholds DOWN marking for `grace` after leadership is first observed: a
 /// non-leader records no heartbeats, so every `last_heartbeat` is outage-stale.
+///
+/// `leader_since` is owned by `raft::RaftHandle::spawn_leadership_watcher`,
+/// which resets it the instant a real Raft leadership transition happens —
+/// not on this struct's own sampling cadence — so a blip shorter than one
+/// health tick still restarts the grace window.
 pub struct LeadershipGrace {
     grace: std::time::Duration,
-    leader_since: Option<std::time::Instant>,
 }
 
 impl LeadershipGrace {
     pub fn new(grace: std::time::Duration) -> Self {
-        Self {
-            grace,
-            leader_since: None,
-        }
+        Self { grace }
     }
 
-    pub fn observe(&mut self, is_leader: bool, now: std::time::Instant) -> MarkDownPolicy {
-        if !is_leader {
-            self.leader_since = None;
-            return MarkDownPolicy::Suppressed;
-        }
-        let since = *self.leader_since.get_or_insert(now);
-        if now.saturating_duration_since(since) >= self.grace {
+    /// `None` means not currently leader (skip the health pass entirely);
+    /// `Some` carries whether `grace` has elapsed since `leader_since`.
+    pub fn policy(
+        &self,
+        leader_since: Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> Option<MarkDownPolicy> {
+        let since = leader_since?;
+        Some(if now.saturating_duration_since(since) >= self.grace {
             MarkDownPolicy::Allowed
         } else {
             MarkDownPolicy::Suppressed
-        }
+        })
     }
 }
 
@@ -24912,45 +24915,54 @@ mod tests {
     #[test]
     fn leadership_grace_suppresses_until_the_window_elapses() {
         let grace = std::time::Duration::from_secs(90);
-        let mut gate = super::LeadershipGrace::new(grace);
+        let gate = super::LeadershipGrace::new(grace);
         let t0 = std::time::Instant::now();
 
         assert_eq!(
-            gate.observe(true, t0),
-            super::MarkDownPolicy::Suppressed,
+            gate.policy(Some(t0), t0),
+            Some(super::MarkDownPolicy::Suppressed),
             "leadership just acquired"
         );
         assert_eq!(
-            gate.observe(true, t0 + std::time::Duration::from_secs(89)),
-            super::MarkDownPolicy::Suppressed
+            gate.policy(Some(t0), t0 + std::time::Duration::from_secs(89)),
+            Some(super::MarkDownPolicy::Suppressed)
         );
         assert_eq!(
-            gate.observe(true, t0 + grace),
-            super::MarkDownPolicy::Allowed
+            gate.policy(Some(t0), t0 + grace),
+            Some(super::MarkDownPolicy::Allowed)
         );
     }
 
     #[test]
     fn leadership_grace_restarts_after_losing_leadership() {
         let grace = std::time::Duration::from_secs(90);
-        let mut gate = super::LeadershipGrace::new(grace);
+        let gate = super::LeadershipGrace::new(grace);
         let t0 = std::time::Instant::now();
-        assert_eq!(gate.observe(true, t0), super::MarkDownPolicy::Suppressed);
         assert_eq!(
-            gate.observe(true, t0 + grace),
-            super::MarkDownPolicy::Allowed
+            gate.policy(Some(t0), t0),
+            Some(super::MarkDownPolicy::Suppressed)
+        );
+        assert_eq!(
+            gate.policy(Some(t0), t0 + grace),
+            Some(super::MarkDownPolicy::Allowed)
         );
 
         let lost = t0 + std::time::Duration::from_secs(200);
-        assert_eq!(gate.observe(false, lost), super::MarkDownPolicy::Suppressed);
         assert_eq!(
-            gate.observe(true, lost + std::time::Duration::from_secs(1)),
-            super::MarkDownPolicy::Suppressed,
+            gate.policy(None, lost),
+            None,
+            "not leader: health pass skipped"
+        );
+
+        let reacquired = lost + std::time::Duration::from_secs(1);
+        assert_eq!(
+            gate.policy(Some(reacquired), reacquired),
+            Some(super::MarkDownPolicy::Suppressed),
             "re-acquiring leadership restarts the grace window"
         );
         assert_eq!(
-            gate.observe(true, lost + std::time::Duration::from_secs(1) + grace),
-            super::MarkDownPolicy::Allowed
+            gate.policy(Some(reacquired), reacquired + grace),
+            Some(super::MarkDownPolicy::Allowed)
         );
     }
 
