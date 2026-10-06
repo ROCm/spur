@@ -7391,6 +7391,13 @@ struct ClusterSnapshot {
     /// from survivors alone would reissue used ids; restore takes max(rebuilt, this).
     #[serde(default)]
     next_job_id: JobId,
+    /// Per-job user step-id high-water marks, same rationale as `next_job_id`.
+    /// The mark advances when an id is handed out, before `JobStepCreate`
+    /// commits, so a create that never lands leaves no trace in `steps` and
+    /// rebuilding from the restored steps alone would reissue its id. Absent
+    /// (pre-field snapshot) → empty, and the restored steps still floor it.
+    #[serde(default)]
+    next_step_id: HashMap<JobId, u32>,
 }
 
 impl ClusterManager {
@@ -7473,6 +7480,7 @@ impl StateMachineApply for ClusterManager {
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
             k0s: self.k0s.read().clone(),
             next_job_id: self.next_job_id.load(Ordering::Relaxed),
+            next_step_id: self.next_step_id.read().clone(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -7531,10 +7539,28 @@ impl StateMachineApply for ClusterManager {
         for step in snap.steps {
             steps.insert((step.job_id, step.step_id), step);
         }
+        // Floored here, while `steps` is held, so the `next_step_id` lock is
+        // taken after it is released: `allocate_step_id` acquires the two in the
+        // opposite order and holding both here could deadlock against it.
+        let mut marks: HashMap<JobId, u32> = HashMap::new();
+        for (job_id, step_id) in steps.keys() {
+            if spur_core::step::is_user_step(*step_id) {
+                let slot = marks.entry(*job_id).or_insert(0);
+                *slot = (*slot).max(step_id.saturating_add(1));
+            }
+        }
         drop(steps);
-        // Dropped rather than rebuilt: `allocate_step_id` re-seeds from the
-        // restored steps, and a stale mark could hand back a restored id.
-        self.next_step_id.write().clear();
+        // Folded over those floors, never under them, so neither a stale mark
+        // from this replica's pre-restore life nor a lower persisted one can
+        // hand back a restored id. A mark whose job the snapshot no longer
+        // carries is dropped so the map cannot grow without bound.
+        for (job_id, mark) in snap.next_step_id {
+            if jobs.contains_key(&job_id) {
+                let slot = marks.entry(job_id).or_insert(0);
+                *slot = (*slot).max(mark);
+            }
+        }
+        *self.next_step_id.write() = marks;
 
         // license_pool is the configured total (immutable); it is intentionally
         // NOT restored from the snapshot so config stays authoritative and any
@@ -22994,6 +23020,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_carries_a_step_id_mark_whose_create_never_committed() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(basic_spec("j")),
+        });
+        // Handed out, then the create is lost: nothing in `steps` records id 0.
+        assert_eq!(cm.allocate_step_id(7), 0);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(
+            cm2.allocate_step_id(7),
+            1,
+            "an id handed out before its create committed must not be reissued"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_lifts_the_step_floor_to_a_higher_persisted_mark() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(basic_spec("j")),
+        });
+        cm.steps.write().insert((7, 4), user_step(7, 4));
+        // 5..8 were handed out and their creates never landed.
+        cm.next_step_id.write().insert(7, 9);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(cm2.allocate_step_id(7), 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_never_lowers_the_step_floor_to_a_stale_mark() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(basic_spec("j")),
+        });
+        cm.steps.write().insert((7, 4), user_step(7, 4));
+        cm.next_step_id.write().insert(7, 2);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(
+            cm2.allocate_step_id(7),
+            5,
+            "a mark below the restored steps must not hand back a used id"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_drops_a_step_id_mark_whose_job_is_gone() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        // No job 99 and no steps behind it — the mark must not outlive its job,
+        // or the map grows for the cluster's whole life.
+        cm.next_step_id.write().insert(99, 5);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(cm2.allocate_step_id(99), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_snapshot_drops_stale_live_partition() {
         // A partition present in the target's live memory but absent from the
         // snapshot (and not tombstoned) must not survive a snapshot install —
@@ -26866,6 +26974,7 @@ mod tests {
             burst_buffer_total_gb: 0,
             k0s: spur_core::k0s::K0sClusterState::default(),
             next_job_id: 0,
+            next_step_id: HashMap::new(),
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         cm.restore_from_snapshot(&bytes).unwrap();
