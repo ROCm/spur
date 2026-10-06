@@ -1504,6 +1504,12 @@ tar -C "$R" -czf '{local_tar}' .
             raise RuntimeError(
                 f"start_ha({n_controllers}) needs that many nodes, have {len(self.nodes)}"
             )
+        if CONTROLLER_PORT != 6817:
+            # spurctld hardcodes :6817 for follower-forwarding destinations
+            # (server.rs build_service); a non-default port breaks forwarding.
+            raise RuntimeError(
+                "start_ha() does not support SPUR_TEST_CONTROLLER_PORT overrides"
+            )
         self._controller_node_indices = list(range(n_controllers))
         if kill_stale:
             self._kill_controller()
