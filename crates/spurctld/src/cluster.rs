@@ -15341,6 +15341,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gpus_total_above_free_gpus_on_one_node_reports_resources() {
+        // A one-node `--gpus 3` with only 2 of 4 GPUs free waits for resources,
+        // not for priority.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_gpu_node(
+            &cm,
+            "n1",
+            (0..4)
+                .map(|i| gpu_resource(i, 100 + u64::from(i)))
+                .collect(),
+        );
+
+        let mut spec = basic_spec("gpus-3");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest {
+            count: 3,
+            gpu_type: None,
+        });
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        let mut node = cm.get_node("n1").unwrap();
+        node.state = NodeState::Mixed;
+        node.alloc_resources = ResourceAllocations::from_device_ids("gpu", &[100, 101]);
+        let nodes = vec![node];
+        let state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Resources
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nodelist_that_cannot_match_reports_req_node_not_avail() {
         // A job pinned to a node that isn't idle/usable must report
         // ReqNodeNotAvail, not Priority (as if merely queued behind others).

@@ -846,8 +846,11 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
     let mut rs = base_node_request(job);
     let demand = resolve_gpu_demand(&job.spec).unwrap_or(GpuDemand::None);
     // Heterogeneous demand needs at least one GPU per node for feasibility;
-    // homogeneous demand carries its exact per-node count.
-    let per_node = homogeneous_per_node(&demand).unwrap_or(1);
+    // homogeneous demand, and a job total on one node, carry the exact count.
+    let per_node = match demand {
+        GpuDemand::Total { count, .. } if job.spec.num_nodes <= 1 => count,
+        _ => homogeneous_per_node(&demand).unwrap_or(1),
+    };
     rs.gpus = placeholder_gpus(per_node, demand.gpu_type());
     rs
 }
@@ -3304,6 +3307,36 @@ mod tests {
 
         let request = job_resource_request(&job);
         assert_eq!(request.generic.get("bandwidth:lustre"), Some(&100));
+    }
+
+    fn gpus_total_request(num_nodes: u32, count: u32) -> usize {
+        let job = Job::new(
+            1,
+            JobSpec {
+                name: "gpu-total".into(),
+                partition: Some("default".into()),
+                user: "test".into(),
+                num_nodes,
+                num_tasks: num_nodes,
+                cpus_per_task: 1,
+                gpus: Some(spur_core::gpu_request::GpuRequest {
+                    count,
+                    gpu_type: None,
+                }),
+                ..Default::default()
+            },
+        );
+        job_resource_request(&job).gpus.len()
+    }
+
+    #[test]
+    fn gpus_total_on_one_node_requests_the_whole_count_there() {
+        assert_eq!(gpus_total_request(1, 3), 3);
+    }
+
+    #[test]
+    fn gpus_total_over_nodes_requests_one_gpu_per_node() {
+        assert_eq!(gpus_total_request(2, 3), 1);
     }
 
     fn cpu_request(num_nodes: u32, num_tasks: u32, cpus_per_task: u32) -> u32 {
