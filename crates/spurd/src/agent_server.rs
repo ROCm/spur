@@ -188,8 +188,8 @@ fn session_dir_prepare_error(
     )
 }
 
-/// Proof that the caller holds the session's launch slot. Required by
-/// `launch_stepd` so no path can reach a session directory unserialized.
+/// Proof that the caller holds this session's launch slot, so `launch_stepd`
+/// cannot be reached without one.
 type StepLaunchAdmission = crate::job_lifecycle::KeyedLifecycleGuard<SessionIdentity>;
 
 async fn launch_stepd(
@@ -201,10 +201,15 @@ async fn launch_stepd(
     options: StepdLaunchOptions,
     admission: &StepLaunchAdmission,
 ) -> Result<(executor::LaunchResult, crate::stepd::StepdDescriptor), executor::LaunchError> {
-    debug_assert_eq!(
-        admission.key(),
-        &(config.job_id, run_attempt, options.step_id)
-    );
+    // Enforced, not asserted: a guard for another session would serialize
+    // against the wrong launches and leave this one unprotected.
+    if admission.key() != &(config.job_id, run_attempt, options.step_id) {
+        return Err(executor::LaunchError::Other(anyhow::anyhow!(
+            "step launch admission does not cover job {} attempt {run_attempt} step {}",
+            config.job_id,
+            options.step_id
+        )));
+    }
     let mut launch_spec = crate::stepd::StepdLaunchSpec::try_from(config)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
     launch_spec.controller_addr = controller_addr.into();
@@ -770,8 +775,11 @@ fn session_dir_has_live_owner(
     session_dir: &std::path::Path,
     launched_pid: u32,
 ) -> bool {
-    let Ok(published) = store.load_descriptor(session_dir) else {
-        return false;
+    let published = match store.load_descriptor(session_dir) {
+        Ok(published) => published,
+        // A descriptor this build cannot read still names an owner; only its
+        // absence means there is none.
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
     };
     published.pid != launched_pid
         && !matches!(
@@ -10107,6 +10115,69 @@ mod tests {
         cleanup_unstarted_stepd(&store, 42, 7, step_id, ours.pid);
 
         assert!(!session.exists(), "our own failed session must be removed");
+    }
+
+    #[test]
+    fn unstarted_runtime_cleanup_spares_a_session_whose_descriptor_it_cannot_read() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let step_id = spur_core::step::STEP_BATCH;
+        let session = store
+            .claim_session_dir(42, 7, step_id)
+            .expect("session directory");
+        std::fs::write(session.join("descriptor.json"), b"not json")
+            .expect("unreadable descriptor");
+
+        cleanup_unstarted_stepd(&store, 42, 7, step_id, 0);
+
+        assert!(
+            session.exists(),
+            "an unreadable descriptor still names an owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_stepd_refuses_an_admission_for_another_session() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let launches = crate::job_lifecycle::StepLaunchLifecycle::default();
+        let mut config = namespace_test_config();
+        config.job_id = 42;
+        let wrong = launches.acquire((43, 7, 0)).await;
+
+        let launched = launch_stepd(
+            &config,
+            7,
+            "http://127.0.0.1:1",
+            "n1",
+            state.path(),
+            StepdLaunchOptions {
+                step_id: 0,
+                allocation_only: false,
+                container_rootfs_mode: None,
+                hooks: HooksConfig::default(),
+                plugstack_path: String::new(),
+                pmix: None,
+                cred_id: String::new(),
+                cred_kid: String::new(),
+                cred_digest: String::new(),
+            },
+            &wrong,
+        )
+        .await;
+
+        let Err(error) = launched else {
+            panic!("a guard for another session must not admit this launch");
+        };
+        assert!(
+            error.to_string().contains("admission does not cover"),
+            "{error}"
+        );
+        assert!(
+            !crate::stepd::StepdStore::new(state.path())
+                .session_dir(42, 7, 0)
+                .exists(),
+            "the refused launch must not create a session directory"
+        );
     }
 
     #[tokio::test]

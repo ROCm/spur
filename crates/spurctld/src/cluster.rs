@@ -434,7 +434,8 @@ pub struct ClusterManager {
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
     /// Per-job high-water mark for user step ids, seeded lazily from `steps`.
-    /// An id whose `JobStepCreate` was dropped is still held by its client.
+    /// Leader-local and not persisted: re-seeding after a failover or a
+    /// snapshot install can reissue an id whose create never applied.
     next_step_id: RwLock<HashMap<JobId, u32>>,
     /// Configured cluster-wide license totals (immutable; from config). Current
     /// availability is derived as total minus the licenses held by active jobs

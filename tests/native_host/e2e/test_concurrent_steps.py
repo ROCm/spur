@@ -35,12 +35,16 @@ class TestConcurrentStepLaunch:
     def test_concurrent_steps_each_run_exactly_once(self, cluster):
         marker = f"{cluster.remote_dir}/concurrent-steps-{time.time_ns()}.txt"
         job_file = f"{cluster.remote_dir}/concurrent-steps-job-{time.time_ns()}.txt"
+        # `wait` with no operands always returns 0, so each child is waited on
+        # by pid or a step that died would not fail the allocation shell.
         body = (
             f'echo "$SPUR_JOB_ID" > {job_file}\n'
+            "pids=()\n"
             f"for i in $(seq 1 {CONCURRENT_STEPS}); do\n"
             f"  srun -n1 bash -c \"echo step-\\$i >> {marker}\" &\n"
+            "  pids+=($!)\n"
             "done\n"
-            "wait\n"
+            'for pid in "${pids[@]}"; do wait "$pid"; done\n'
         )
 
         code, out = cluster.salloc_run(body, salloc_args=["-N", "1", "-t", "0:05"])

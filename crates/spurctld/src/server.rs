@@ -8568,11 +8568,11 @@ mod tests {
         for call in calls.collect::<Vec<_>>() {
             ids.push(call.await.expect("task").expect("step creation"));
         }
-        let unique: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        ids.sort_unstable();
         assert_eq!(
-            unique.len(),
-            ids.len(),
-            "duplicate step ids handed out: {ids:?}"
+            ids,
+            (0..8).collect::<Vec<u32>>(),
+            "ids must be distinct and contiguous, not reused or skipped"
         );
     }
 
