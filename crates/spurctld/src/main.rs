@@ -191,6 +191,26 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("native signing keys: {e}"))?;
 
+    // A panic inside RaftCore ends that task alone. Every other task, the gRPC
+    // listener included, keeps running, so the controller goes on accepting
+    // connections and serving reads from a state machine that can no longer be
+    // replicated to, and writes fail. Kubernetes cannot see it either: the
+    // readiness probe reaches the listener, not Raft. Leave instead, so the
+    // supervisor restarts a controller that is whole.
+    {
+        let supervised = raft_handle.clone();
+        tokio::spawn(async move {
+            supervised.core_stopped().await;
+            tracing::error!(
+                "RaftCore has stopped; this controller can no longer replicate. Exiting so the \
+                 supervisor restarts it."
+            );
+            // The state machine is behind an Arc that other tasks still hold, so
+            // a graceful unwind cannot be relied on here.
+            std::process::exit(70);
+        });
+    }
+
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
 
@@ -289,6 +309,16 @@ async fn main() -> anyhow::Result<()> {
             .await
             {
                 tracing::error!(error = %e, "OpenMetrics metrics server failed");
+            }
+        });
+    }
+
+    if config.probes.enabled {
+        let probes_addr = config.probes.effective_listen_addr()?;
+        let health_raft = raft_handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server::serve_probes(probes_addr, health_raft).await {
+                tracing::error!(error = %e, "probe server failed");
             }
         });
     }
@@ -407,6 +437,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         accounting: Default::default(),
         scheduler: Default::default(),
         auth: Default::default(),
+        probes: Default::default(),
         partitions: vec![spur_core::config::PartitionConfig {
             name: "default".into(),
             default: true,
