@@ -290,8 +290,8 @@ Flags:
    * - ``--states``
      - ``-t``
      - Filter by node state (comma-separated). Accepts the base states and the
-       display-only labels ``resv``, ``maint``, and ``plnd``. ``all`` disables
-       the filter.
+       display-only labels ``resv`` (or ``reserved``), ``maint``, and ``plnd``
+       (or ``planned``). ``all`` disables the filter.
    * - ``--nodes``
      - ``-n``
      - Filter by node.
@@ -352,10 +352,11 @@ job and start time shown for ``plnd`` reflect the most recent scheduling
 cycle (``scheduler.interval_secs``), not the current instant.
 
 Every abbreviation above, including the overlay labels ``resv``, ``maint``, and
-``plnd``, can be passed to ``-t`` / ``--states``. ``-t resv`` also matches
-``maint`` nodes (a maintenance reservation is still a reservation), while
-``-t maint`` matches only maintenance nodes. ``-t idle`` returns all idle nodes,
-including those shown as ``resv``, ``maint``, or ``plnd``.
+``plnd``, can be passed to ``-t`` / ``--states``. The long forms ``reserved``
+and ``planned`` are accepted as aliases for ``resv`` and ``plnd``. ``-t resv``
+also matches ``maint`` nodes (a maintenance reservation is still a reservation),
+while ``-t maint`` matches only maintenance nodes. ``-t idle`` returns all idle
+nodes, including those shown as ``resv``, ``maint``, or ``plnd``.
 
 Accounting History — ``sacct``
 -------------------------------

@@ -234,7 +234,8 @@ impl StateFilter {
     }
 
     /// States sent to the controller. Overlays only apply to idle nodes, so
-    /// their presence pulls idle into the query. Deduplicated, order preserved.
+    /// their presence pulls idle into the query; that overlay-implied idle is
+    /// deduplicated against existing base states.
     fn request_states(&self) -> Vec<i32> {
         let mut states: Vec<i32> = self.base.iter().map(|s| *s as i32).collect();
         if !self.overlays.is_empty() {
@@ -726,6 +727,9 @@ mod tests {
         let alloc_plnd = StateFilter::parse(Some("alloc,plnd")).unwrap();
         assert!(alloc_plnd.keeps(&make_node("a", NodeState::NodeAllocated, "batch")));
         assert!(!alloc_plnd.keeps(&overlay_node("i", false, false, false)));
+        // The case the union exists for: an idle node earmarked by backfill is
+        // kept via the overlay match even though its base state isn't `alloc`.
+        assert!(alloc_plnd.keeps(&overlay_node("p", true, false, false)));
     }
 
     #[test]
