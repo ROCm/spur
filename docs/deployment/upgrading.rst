@@ -488,6 +488,15 @@ ignore it and pin Users to their own jobs and assoc_mgr scopes regardless. v0.12
 earlier also pin Operators to their own job list, but leave REST ``/jobs`` and
 ``scontrol show job`` unpinned.
 
+scancel exit status on a refused cancel
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release makes ``scancel`` exit ``1`` when the controller refuses a cancel or signal
+(for example, cancelling a job you do not own). It previously always exited ``0`` and only
+printed to stderr. Scripts that call ``scancel`` and branch on its exit code now see the
+failure. A job that is already finished or unknown still does not fail a plain cancel (or
+``-s KILL``), and ``--quiet``/``-Q`` hides the report but not the exit status.
+
 See Also
 --------
 

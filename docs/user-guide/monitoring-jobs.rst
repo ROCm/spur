@@ -994,7 +994,10 @@ supply job IDs or at least one of ``--user``, ``--name``, ``--partition``, or
 ``--account``; ``--state`` alone only narrows a selection. Without ``--user``, a
 filter matches every user's jobs you can see, as in Slurm, and each one you do not
 own is refused. In filter mode, jobs already in a terminal state are silently
-skipped.
+skipped. ``scancel`` exits ``1`` and reports on stderr if any cancel or signal is
+refused. A job that is already finished or unknown does not fail a plain cancel
+(or ``-s KILL``) and is not reported. With another signal it fails, and
+``--quiet``/``-Q`` hides the report but not the exit status.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
