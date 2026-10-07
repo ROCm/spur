@@ -235,6 +235,7 @@ class TestMpiSingleNode:
         rank = cluster.write_file(
             "batch-driver-rank.sh",
             f'#!/bin/bash\necho "rank seen=${ENV_SH_SENTINEL}"\nexec "{hello_mpi}"\n',
+            all_nodes=True,
         )
         script = cluster.write_file(
             "batch-driver.sh",
