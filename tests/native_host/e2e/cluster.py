@@ -119,13 +119,16 @@ class SshNode:
             self._sftp = self.client.open_sftp()
         return self._sftp
 
-    def exec(self, cmd: str, check: bool = True) -> str:
-        """Run a command via SSH. Returns stdout. Raises on non-zero exit if check=True."""
+    def _run(self, cmd: str) -> tuple[int, str, str]:
+        """Run a command via SSH. Returns (exit_code, stdout, stderr). The one
+        place that drives the channel; higher-level helpers shape the result."""
         _, stdout, stderr = self.client.exec_command(cmd)
         exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode()
-        err = stderr.read().decode()
+        return exit_code, stdout.read().decode(), stderr.read().decode()
 
+    def exec(self, cmd: str, check: bool = True) -> str:
+        """Run a command via SSH. Returns stdout. Raises on non-zero exit if check=True."""
+        exit_code, out, err = self._run(cmd)
         if check and exit_code != 0:
             raise RuntimeError(
                 f"Command failed on {self.host} (exit {exit_code}): {cmd}\n"
@@ -135,11 +138,13 @@ class SshNode:
 
     def exec_allow_fail(self, cmd: str) -> str:
         """Run a command, returning stdout+stderr regardless of exit code."""
-        _, stdout, stderr = self.client.exec_command(cmd)
-        stdout.channel.recv_exit_status()
-        out = stdout.read().decode()
-        err = stderr.read().decode()
+        _, out, err = self._run(cmd)
         return out + err
+
+    def exec_with_exit(self, cmd: str) -> tuple[int, str]:
+        """Run a command, returning (exit_code, combined stdout+stderr)."""
+        exit_code, out, err = self._run(cmd)
+        return exit_code, out + err
 
     def upload(self, local_path: str, remote_path: str):
         """Upload a local file to the remote node."""
@@ -423,16 +428,33 @@ class SpurCluster:
             parts.append(f"{key}={shlex.quote(str(value))}")
         return parts
 
+    def _cli_command(
+        self,
+        args: list[str],
+        controller_addr: str | None = None,
+        run_as: str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> str:
+        """Build the remote command line for a CLI invocation. With *run_as*
+        set, wrap it in ``sudo -u <user> env ...`` so the controller derives the
+        invoking account from that user."""
+        parts = self._cli_env_assignments(controller_addr)
+        for key, value in (extra_env or {}).items():
+            parts.append(f"{key}={shlex.quote(str(value))}")
+        parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
+        parts.extend(shlex.quote(a) for a in args[1:])
+        cmd = " ".join(parts)
+        if run_as is not None:
+            cmd = f"{self._sudo_prefix()}-u {shlex.quote(run_as)} env {cmd}"
+        return cmd
+
     def cli(self, args: list[str], controller_addr: str | None = None) -> str:
         """Run a spur CLI command on the controller node.
 
         *controller_addr* overrides the endpoint(s) passed via
         ``SPUR_CONTROLLER_ADDR`` (e.g. a comma-separated failover list).
         """
-        cmd_parts = self._cli_env_assignments(controller_addr)
-        cmd_parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
-        cmd_parts.extend(shlex.quote(a) for a in args[1:])
-        return self.nodes[0].exec(" ".join(cmd_parts))
+        return self.nodes[0].exec(self._cli_command(args, controller_addr))
 
     def cli_allow_fail(self, args: list[str], controller_addr: str | None = None) -> str:
         """Run a spur CLI command, returning stdout+stderr regardless of exit
@@ -440,10 +462,7 @@ class SpurCluster:
 
         *controller_addr* overrides ``SPUR_CONTROLLER_ADDR`` as in :meth:`cli`.
         """
-        cmd_parts = self._cli_env_assignments(controller_addr)
-        cmd_parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
-        cmd_parts.extend(shlex.quote(a) for a in args[1:])
-        return self.nodes[0].exec_allow_fail(" ".join(cmd_parts))
+        return self.nodes[0].exec_allow_fail(self._cli_command(args, controller_addr))
 
     def cli_as_user(
         self,
@@ -451,9 +470,9 @@ class SpurCluster:
         args: list[str],
         controller_addr: str | None = None,
         extra_env: dict[str, str] | None = None,
+        check: bool = False,
     ) -> str:
-        """Run a spur CLI command as a specific UNIX user via sudo, returning
-        stdout+stderr regardless of exit code.
+        """Run a spur CLI command as a specific UNIX user via sudo.
 
         Commands that carry an identity (reservation create/update/delete,
         job cancel, ...) derive it from the invoking account (``whoami``), so
@@ -461,25 +480,27 @@ class SpurCluster:
 
         *extra_env* adds variables to the environment. Pass ``SPUR_AUTH_TOKEN`` to
         separate the identity the controller verifies from the invoking account.
+
+        With *check* set, a non-zero exit raises ``RuntimeError``; otherwise the
+        combined stdout+stderr is returned regardless of exit code.
         """
-        inner = self._cli_env_assignments(controller_addr)
-        for key, value in (extra_env or {}).items():
-            inner.append(f"{key}={shlex.quote(str(value))}")
-        inner.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
-        inner.extend(shlex.quote(a) for a in args[1:])
-        cmd = f"{self._sudo_prefix()}-u {shlex.quote(run_as)} env {' '.join(inner)}"
-        return self.nodes[0].exec_allow_fail(cmd)
+        cmd = self._cli_command(
+            args, controller_addr, run_as=run_as, extra_env=extra_env
+        )
+        if not check:
+            return self.nodes[0].exec_allow_fail(cmd)
+        code, out = self.nodes[0].exec_with_exit(cmd)
+        if code != 0:
+            raise RuntimeError(
+                f"Command failed as {run_as} (exit {code}): {cmd}\n{out}"
+            )
+        return out
 
     def cli_with_exit(
         self, args: list[str], controller_addr: str | None = None
     ) -> tuple[int, str]:
         """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
-        cmd_parts = self._cli_env_assignments(controller_addr)
-        cmd_parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
-        cmd_parts.extend(shlex.quote(a) for a in args[1:])
-        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
-        code = stdout.channel.recv_exit_status()
-        return code, stdout.read().decode() + stderr.read().decode()
+        return self.nodes[0].exec_with_exit(self._cli_command(args, controller_addr))
 
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)

@@ -121,7 +121,10 @@ unset SPUR_AUTH_TOKEN
             assert out.strip(), f"expected hostname output, got:\n{out}"
         finally:
             cluster.cli_as_user(
-                ssh_user, ["scancel", str(job_id)], extra_env={"SPUR_AUTH_TOKEN": token}
+                ssh_user,
+                ["scancel", str(job_id)],
+                extra_env={"SPUR_AUTH_TOKEN": token},
+                check=True,
             )
 
     def test_srun_step_wrong_job_user_denied(self, cluster):
@@ -148,7 +151,10 @@ unset SPUR_AUTH_TOKEN
             assert _denied(out), f"expected ownership denial, got:\n{out}"
         finally:
             cluster.cli_as_user(
-                ssh_user, ["scancel", str(job_id)], extra_env={"SPUR_AUTH_TOKEN": token}
+                ssh_user,
+                ["scancel", str(job_id)],
+                extra_env={"SPUR_AUTH_TOKEN": token},
+                check=True,
             )
 
     def test_srun_step_jwt_non_owner_denied(self, cluster):
@@ -183,7 +189,10 @@ unset SPUR_AUTH_TOKEN
             assert _denied(out), f"expected ownership denial, got:\n{out}"
         finally:
             cluster.cli_as_user(
-                ssh_user, ["scancel", str(job_id)], extra_env={"SPUR_AUTH_TOKEN": owner_token}
+                ssh_user,
+                ["scancel", str(job_id)],
+                extra_env={"SPUR_AUTH_TOKEN": owner_token},
+                check=True,
             )
 
 
