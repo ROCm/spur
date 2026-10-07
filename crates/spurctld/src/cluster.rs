@@ -4751,6 +4751,10 @@ impl ClusterManager {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
         let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        new_config.auth.check_private_data()?;
+        if let Some(warning) = new_config.auth.private_data_warning() {
+            warn!("{warning}");
+        }
         // Reject a broken submit hook before it goes live, so reconfigure can't
         // silently swap in a hook that fails every subsequent submission.
         crate::hooks::validate_submit_hooks(&new_config.hooks)?;
@@ -9552,6 +9556,33 @@ mod tests {
         let cfg = cm.config();
         assert_eq!(cfg.scheduler.resv_overrun_minutes, 45);
         assert_eq!(cfg.scheduler.complete_wait_secs, 90);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_applies_private_data_and_rejects_an_unsupported_category() {
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, "cluster_name = \"test\"\n").await;
+        assert!(!cm.config().auth.jobs_private());
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\"]\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.config().auth.jobs_private());
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"accounts\"]\n",
+        )
+        .unwrap();
+        cm.reconfigure()
+            .expect_err("an unsupported category must not go live");
+        assert!(
+            cm.config().auth.jobs_private(),
+            "a rejected reconfigure keeps the running config"
+        );
     }
 
     #[tokio::test]

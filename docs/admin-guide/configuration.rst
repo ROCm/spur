@@ -724,9 +724,9 @@ Authentication modes
    trusted. A request that does carry one must pass verification — an invalid,
    expired, or malformed credential is refused in this mode too, so presenting
    a forgery is never better than presenting nothing. An unauthenticated
-   caller is not pinned to their own jobs, so they can list and fetch every
-   job. This is the migration setting: start here, watch the logs name each
-   caller that is still unauthenticated, then tighten.
+   caller is never subject to :ref:`private_data <private-data>`, so they can
+   list and fetch every job. This is the migration setting: start here, watch
+   the logs name each caller that is still unauthenticated, then tighten.
 
 ``"required"``
    Every request must carry a valid credential. Unauthenticated callers are
@@ -1066,7 +1066,9 @@ Roles and access control
 
 Every authenticated caller resolves to exactly one of four fixed roles. Sites
 assign them; new roles cannot be defined. A caller with no verified identity is
-not a User: job listing is not pinned, so they see every job. That is the path
+not a User. For visibility that only matters once :ref:`private_data
+<private-data>` is set: by default every caller, identified or not, sees every
+job and every assoc_mgr scope. An unauthenticated caller is the path
 ``"disabled"`` and credential-less ``"permissive"`` take, including the default
 ``jwt`` configuration until you set ``mode = "required"``.
 
@@ -1077,8 +1079,9 @@ not a User: job listing is not pinned, so they see every job. That is the path
    * - Role
      - May do
    * - User
-     - Submit and manage their own jobs. Job listing is pinned to their own
-       jobs, and asking for another tenant's job id returns ``NOT_FOUND``.
+     - Submit and manage their own jobs. Sees every tenant's jobs and assoc_mgr
+       scopes by default; see :ref:`private-data` to pin their view to their
+       own.
    * - Coordinator
      - Reserved for a future grant hierarchy. Not assigned today.
    * - Operator
@@ -1150,7 +1153,85 @@ admin signal apply.
    refused briefly after a restart. Retry once the controller has finished
    loading. After that first load, a later PostgreSQL outage keeps the last
    snapshot: cached Operator and Administrator bindings still apply until a
-   refresh succeeds.
+   refresh succeeds. Under ``private_data``, an Operator whose role comes only
+   from accounting sees just their own jobs during that window.
+
+.. _private-data:
+
+Job and usage visibility (``private_data``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default every caller sees every job and every ``scontrol show assoc_mgr``
+scope, as a stock ``slurm.conf`` does. That includes each job's ``command``, the
+first non-comment line of its batch script, so a credential written there is
+readable by every user. ``private_data`` under ``[auth]`` is the equivalent of
+Slurm's ``PrivateData`` and narrows what a User sees.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 10 10 52
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``private_data``
+     - list of strings
+     - ``[]``
+     - Live
+     - Categories to hide from Users. Must be a TOML list:
+       ``private_data = "jobs,usage"`` is a parse error.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 82
+
+   * - Category
+     - Hides from a User
+   * - ``"jobs"``
+     - Other users' jobs and steps: ``squeue``/``spur queue``, ``sprio``,
+       ``sstat``, ``scontrol show job``/``step``, the jobs that ``scancel -p``,
+       ``-A``, or ``-n`` selects, and REST ``/jobs`` and ``/job/{id}``.
+       ``squeue -u other``, ``squeue -j``, and ``scontrol show job`` print
+       nothing for another user's job; ``sstat``, ``scontrol show step``, and
+       REST ``/job/{id}`` report it as not found.
+   * - ``"usage"``
+     - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
+       part in, and only their own ``User=`` lines. A ``users=`` selector is
+       replaced with their own name. ``Grp*`` totals still include every user's
+       jobs.
+
+``sacct``, ``sshare``, and ``sreport`` are not restricted by either category yet.
+Set both categories for the visibility closest to what Spur v0.13 and v0.14
+enforced:
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "spur"
+   mode = "required"
+   private_data = ["jobs", "usage"]
+
+Operators and Administrators are exempt. Root is exempt only through a role
+(``cluster_admins``, ``admin_groups``, an accounting admin level, or
+``allow_uid_zero_administrator``), and account coordinators are not exempt.
+
+.. warning::
+
+   ``private_data`` restricts identified callers only. Under ``"permissive"`` or
+   ``"disabled"``, a caller that sends no credential is not restricted at all,
+   and ``spurctld`` logs a warning at startup and on ``reconfigure``. Use the
+   native plugin with ``mode = "required"``, as above. Under ``plugin = "jwt"``,
+   ``spurd`` presents no credential to the controller, so ``"required"`` stops
+   agents from registering; on a JWT cluster ``private_data`` only hides data
+   from users who keep their token set.
+
+``scontrol reconfigure`` applies a change on the leader, which serves every gRPC
+read. Followers keep their startup value for REST and for any read they serve
+while the leader is unreachable, so restart every controller after changing it.
+``spurctld`` refuses to start, or to reconfigure, on a category it does not
+support; agents and the CLI ignore unknown category names.
 
 .. _privileged-operations:
 

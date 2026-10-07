@@ -17,17 +17,6 @@ def _pending_reason(cluster, job_id: int) -> str:
     return match.group(1) if match else ""
 
 
-def _sbatch_when_qos_ready(cluster, args: list[str], timeout: int = 15) -> str:
-    deadline = time.time() + timeout
-    while True:
-        try:
-            return cluster.sbatch(args)
-        except RuntimeError as error:
-            if "does not exist" not in str(error) or time.time() >= deadline:
-                raise
-            time.sleep(1)
-
-
 def _wait_time_limit(cluster, job_id: int, timeout: int = 30) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -81,8 +70,7 @@ class TestPartitionAndQosWallTimePolicy:
         script = cluster.write_file("qos-walltime-policy.sh", "#!/bin/bash\nsleep 5\n")
 
         long_job = parse_job_id(
-            _sbatch_when_qos_ready(
-                cluster,
+            cluster.sbatch_when_qos_ready(
                 ["-J", "long-window", "-N", "1", "-q", "long-window", script],
             )
         )
@@ -91,8 +79,7 @@ class TestPartitionAndQosWallTimePolicy:
         assert wait_job(cluster, long_job, timeout=30) == "CD"
 
         standard_job = parse_job_id(
-            _sbatch_when_qos_ready(
-                cluster,
+            cluster.sbatch_when_qos_ready(
                 ["-J", "standard-window", "-N", "1", "-q", "standard-window", script],
             )
         )
@@ -117,8 +104,7 @@ class TestPartitionAndQosWallTimePolicy:
         assert "Requested time limit is invalid" in over_partition, over_partition
 
         short_job = parse_job_id(
-            _sbatch_when_qos_ready(
-                cluster,
+            cluster.sbatch_when_qos_ready(
                 [
                     "-J",
                     "standard-over-wall",

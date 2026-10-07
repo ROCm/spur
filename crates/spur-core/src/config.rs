@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -753,6 +753,45 @@ impl AuthMode {
     }
 }
 
+/// A category of information a site chooses to hide from ordinary users, mirroring
+/// Slurm's `PrivateData`. The default is empty: every authenticated user sees
+/// everything, as a stock `slurm.conf` does. Operators and Administrators are
+/// never subject to these restrictions.
+///
+/// Any string parses, so agents and the CLI keep reading a `spur.conf` that names a
+/// category from a newer release. Only `spurctld` enforces it, so it alone rejects
+/// [`PrivateData::Unsupported`] via [`AuthConfig::check_private_data`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum PrivateData {
+    /// Hide other users' jobs and job steps from `squeue`, `scontrol show job`,
+    /// `scontrol show step`, and the REST job surface.
+    Jobs,
+    /// Pin `scontrol show assoc_mgr` to the scopes the caller takes part in.
+    Usage,
+    Unsupported(String),
+}
+
+impl From<String> for PrivateData {
+    fn from(name: String) -> Self {
+        match name.as_str() {
+            "jobs" => PrivateData::Jobs,
+            "usage" => PrivateData::Usage,
+            _ => PrivateData::Unsupported(name),
+        }
+    }
+}
+
+impl From<PrivateData> for String {
+    fn from(category: PrivateData) -> Self {
+        match category {
+            PrivateData::Jobs => "jobs".into(),
+            PrivateData::Usage => "usage".into(),
+            PrivateData::Unsupported(name) => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     /// Auth plugin: `"jwt"` (bearer tokens), `"spur"` (native per-RPC mint), or `"none"`.
@@ -788,6 +827,11 @@ pub struct AuthConfig {
     /// When true, a verified UID 0 native identity is Administrator.
     #[serde(default)]
     pub allow_uid_zero_administrator: bool,
+    /// Categories of information hidden from ordinary users, mirroring Slurm's
+    /// `PrivateData`. Empty (the default) means every authenticated user sees
+    /// everything. Operators and Administrators are always exempt.
+    #[serde(default)]
+    pub private_data: BTreeSet<PrivateData>,
 }
 
 impl Default for AuthConfig {
@@ -802,11 +846,49 @@ impl Default for AuthConfig {
             admin_groups: Vec::new(),
             operator_groups: Vec::new(),
             allow_uid_zero_administrator: false,
+            private_data: BTreeSet::new(),
         }
     }
 }
 
 impl AuthConfig {
+    /// Whether other users' jobs are hidden from an ordinary caller.
+    pub fn jobs_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Jobs)
+    }
+
+    /// Whether other users' usage is hidden from an ordinary caller.
+    pub fn usage_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Usage)
+    }
+
+    /// A warning when `private_data` is set but a caller can bypass it by sending no credential.
+    pub fn private_data_warning(&self) -> Option<&'static str> {
+        if self.private_data.is_empty() || self.mode == AuthMode::Required {
+            return None;
+        }
+        Some(
+            "[auth] private_data restricts only callers that present a credential; without \
+             mode = \"required\", a caller that sends none still sees every job and scope",
+        )
+    }
+
+    /// Reject a `private_data` category this release does not enforce, so a typo or
+    /// an unimplemented Slurm category fails loudly instead of leaving data visible.
+    pub fn check_private_data(&self) -> Result<(), ConfigError> {
+        let unsupported = self.private_data.iter().find_map(|c| match c {
+            PrivateData::Unsupported(name) => Some(name.as_str()),
+            _ => None,
+        });
+        match unsupported {
+            Some(name) => Err(ConfigError::InvalidValue {
+                field: "auth.private_data".into(),
+                value: format!("{name:?} (supported: \"jobs\", \"usage\")"),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Resolve the signing key once at process startup.
     ///
     /// `jwt_key` is always treated as a literal secret. `jwt_key_file` is the explicit
@@ -4271,6 +4353,74 @@ mode = "permissive"
 "#;
         let config = SlurmConfig::load_from_str(toml).expect("permissive must not require a key");
         assert_eq!(config.auth.mode, AuthMode::Permissive);
+    }
+
+    #[test]
+    fn private_data_defaults_to_everything_visible() {
+        let config =
+            SlurmConfig::load_from_str("cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\n")
+                .unwrap();
+        assert!(config.auth.private_data.is_empty());
+        assert!(!config.auth.jobs_private());
+        assert!(!config.auth.usage_private());
+    }
+
+    #[test]
+    fn private_data_parses_jobs_and_usage() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\", \"usage\"]\n",
+        )
+        .unwrap();
+        assert!(config.auth.jobs_private());
+        assert!(config.auth.usage_private());
+    }
+
+    #[test]
+    fn private_data_parses_an_unknown_category_but_the_controller_check_rejects_it() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\", \"nodes\"]\n",
+        )
+        .expect("agents and the CLI must still load a conf naming a newer category");
+        assert!(config.auth.jobs_private());
+
+        let err = config.auth.check_private_data().unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, value }
+                if field == "auth.private_data" && value.contains("\"nodes\"")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn private_data_check_accepts_supported_categories() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\", \"usage\"]\n",
+        )
+        .unwrap();
+        config.auth.check_private_data().unwrap();
+    }
+
+    #[test]
+    fn private_data_warns_unless_credentials_are_required() {
+        let auth = |body: &str| {
+            SlurmConfig::load_from_str(&format!("cluster_name = \"test\"\n[auth]\n{body}"))
+                .unwrap()
+                .auth
+        };
+        assert!(auth("plugin = \"jwt\"\nprivate_data = [\"jobs\"]\n")
+            .private_data_warning()
+            .is_some());
+        assert!(
+            auth("plugin = \"jwt\"\nmode = \"disabled\"\nprivate_data = [\"usage\"]\n")
+                .private_data_warning()
+                .is_some()
+        );
+        assert!(auth(
+            "plugin = \"jwt\"\njwt_key = \"k\"\nmode = \"required\"\nprivate_data = [\"jobs\"]\n"
+        )
+        .private_data_warning()
+        .is_none());
+        assert!(auth("plugin = \"jwt\"\n").private_data_warning().is_none());
     }
 
     #[test]

@@ -14,20 +14,6 @@ def _unique(prefix: str) -> str:
     return f"{prefix}-{int(time.time())}"
 
 
-def _sbatch_when_qos_ready(cluster, args: list[str], timeout: int = 15) -> str:
-    """Retry sbatch until the accounting QoS cache picks up a QoS created
-    moments earlier via sacctmgr — the cache refreshes on a fixed interval
-    (see accounting_cluster's fairshare_refresh_secs), not on write."""
-    deadline = time.time() + timeout
-    while True:
-        try:
-            return cluster.sbatch(args)
-        except RuntimeError as e:
-            if "does not exist" not in str(e) or time.time() >= deadline:
-                raise
-            time.sleep(1)
-
-
 class TestPartitionCreate:
     def test_create_and_show_partition(self, cluster):
         name = _unique("part")
@@ -538,8 +524,8 @@ class TestPartitionAllowDenyQos:
         script = c.write_file("allow-qos2.sh", "#!/bin/bash\necho ALLOW_QOS_OK\n")
         out_path = f"{c.remote_dir}/allow-qos2.out"
 
-        sb = _sbatch_when_qos_ready(
-            c, ["-N", "1", "-p", name, "-q", "premium", "-t", "1", "-o", out_path, script]
+        sb = c.sbatch_when_qos_ready(
+            ["-N", "1", "-p", name, "-q", "premium", "-t", "1", "-o", out_path, script]
         )
         job_id = parse_job_id(sb)
         assert job_id is not None
@@ -591,8 +577,8 @@ class TestPartitionAllowDenyQos:
         script = c.write_file("deny-qos2.sh", "#!/bin/bash\necho DENY_QOS_OK\n")
         out_path = f"{c.remote_dir}/deny-qos2.out"
 
-        sb = _sbatch_when_qos_ready(
-            c, ["-N", "1", "-p", name, "-q", "normal", "-t", "1", "-o", out_path, script]
+        sb = c.sbatch_when_qos_ready(
+            ["-N", "1", "-p", name, "-q", "normal", "-t", "1", "-o", out_path, script]
         )
         job_id = parse_job_id(sb)
         assert job_id is not None
@@ -622,7 +608,7 @@ class TestPartitionAllowDenyQos:
         script = c.write_file("upd-qos.sh", "#!/bin/bash\necho DONE\n")
 
         # Before update: lowpri QoS is accepted.
-        sb = _sbatch_when_qos_ready(c, ["-N", "1", "-p", name, "-q", "lowpri", "-t", "1", script])
+        sb = c.sbatch_when_qos_ready(["-N", "1", "-p", name, "-q", "lowpri", "-t", "1", script])
         assert parse_job_id(sb) is not None, "lowpri should be accepted before deny update"
 
         # Add lowpri to deny list at runtime.

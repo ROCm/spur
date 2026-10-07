@@ -69,6 +69,63 @@ pub fn resolve_role(
     }
 }
 
+/// Which records a read may return under a `PrivateData` category.
+///
+/// `All` is the unrestricted view: the caller may see every tenant's records.
+/// `Caller` pins the view to one user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadScope {
+    All,
+    Caller(String),
+}
+
+impl ReadScope {
+    /// Whether a record owned by `owner` is visible under this scope.
+    pub fn permits(&self, owner: &str) -> bool {
+        match self {
+            ReadScope::All => true,
+            ReadScope::Caller(user) => !user.is_empty() && user == owner,
+        }
+    }
+
+    /// The `user` filter for a job list, given the user the request named. The
+    /// inner `Option` is the filter itself (`None` means every user). The outer
+    /// `None` means the request named a user the caller may not see, so the list
+    /// comes back empty, as Slurm's `squeue -u other` does.
+    pub fn job_user_filter(&self, requested: Option<&str>) -> Option<Option<String>> {
+        match self {
+            ReadScope::All => Some(requested.map(str::to_string)),
+            // An empty user filter means "every user" downstream, so a scoped
+            // caller with no name must see nothing rather than everything.
+            ReadScope::Caller(user) if user.is_empty() => None,
+            ReadScope::Caller(user) => match requested {
+                None => Some(Some(user.clone())),
+                Some(r) if r == user => Some(Some(user.clone())),
+                Some(_) => None,
+            },
+        }
+    }
+}
+
+/// The read scope for one `PrivateData` category.
+///
+/// A caller with no verified identity is unrestricted: that is the
+/// `permissive`/`disabled` path, which trusts the client, and preserves the
+/// no-auth behaviour. Operators and Administrators (`role.operates_jobs()`) are
+/// always exempt, matching Slurm's `validate_operator`. When the category is not
+/// private, every authenticated caller sees everything, as a stock `slurm.conf`
+/// does. Only a plain, identified User under a private category is pinned to
+/// their own records.
+pub fn read_scope(identity: Option<&Identity>, role: Option<Role>, private: bool) -> ReadScope {
+    let Some(id) = identity else {
+        return ReadScope::All;
+    };
+    if !private || role.is_some_and(Role::operates_jobs) {
+        return ReadScope::All;
+    }
+    ReadScope::Caller(id.user.clone())
+}
+
 fn name_listed(names: &[String], user: &str) -> bool {
     names
         .iter()
@@ -229,5 +286,98 @@ mod tests {
             resolve_role(&id("dave", 1000, false), &auth(), None, true, &[], true),
             Role::Coordinator
         );
+    }
+
+    #[test]
+    fn read_scope_is_unrestricted_without_an_identity() {
+        assert_eq!(read_scope(None, None, true), ReadScope::All);
+    }
+
+    #[test]
+    fn read_scope_is_unrestricted_when_the_category_is_not_private() {
+        let alice = id("alice", 1000, false);
+        assert_eq!(
+            read_scope(Some(&alice), Some(Role::User), false),
+            ReadScope::All
+        );
+    }
+
+    #[test]
+    fn read_scope_exempts_operators_and_administrators() {
+        let bob = id("bob", 1000, false);
+        assert_eq!(
+            read_scope(Some(&bob), Some(Role::Operator), true),
+            ReadScope::All
+        );
+        assert_eq!(
+            read_scope(Some(&bob), Some(Role::Administrator), true),
+            ReadScope::All
+        );
+    }
+
+    #[test]
+    fn read_scope_pins_a_plain_user_under_a_private_category() {
+        let carol = id("carol", 1000, false);
+        assert_eq!(
+            read_scope(Some(&carol), Some(Role::User), true),
+            ReadScope::Caller("carol".into())
+        );
+        assert_eq!(
+            read_scope(Some(&carol), Some(Role::Coordinator), true),
+            ReadScope::Caller("carol".into())
+        );
+    }
+
+    #[test]
+    fn permits_is_unrestricted_under_all_scope() {
+        assert!(ReadScope::All.permits("anyone"));
+    }
+
+    #[test]
+    fn permits_only_the_caller_under_a_scoped_view() {
+        let scope = ReadScope::Caller("alice".into());
+        assert!(scope.permits("alice"));
+        assert!(!scope.permits("bob"));
+    }
+
+    #[test]
+    fn permits_nothing_for_a_nameless_caller() {
+        assert!(!ReadScope::Caller(String::new()).permits(""));
+    }
+
+    #[test]
+    fn job_user_filter_is_unrestricted_under_all_scope() {
+        assert_eq!(ReadScope::All.job_user_filter(None), Some(None));
+        assert_eq!(
+            ReadScope::All.job_user_filter(Some("bob")),
+            Some(Some("bob".into()))
+        );
+    }
+
+    #[test]
+    fn job_user_filter_pins_a_scoped_caller_to_itself() {
+        let scope = ReadScope::Caller("alice".into());
+        assert_eq!(
+            scope.job_user_filter(None),
+            Some(Some("alice".into())),
+            "no filter scopes to the caller"
+        );
+        assert_eq!(
+            scope.job_user_filter(Some("alice")),
+            Some(Some("alice".into())),
+            "asking for own records is honored"
+        );
+        assert_eq!(
+            scope.job_user_filter(Some("bob")),
+            None,
+            "asking for another user's records yields an empty list"
+        );
+    }
+
+    #[test]
+    fn job_user_filter_yields_nothing_for_a_nameless_caller() {
+        let scope = ReadScope::Caller(String::new());
+        assert_eq!(scope.job_user_filter(None), None);
+        assert_eq!(scope.job_user_filter(Some("")), None);
     }
 }

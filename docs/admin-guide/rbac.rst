@@ -66,13 +66,14 @@ the accounting admin level never applies on a node. They use
 JWT ``admin`` claim or verified UID 0, when deciding who may attach to, exec
 in, or stream a job.
 
-Job list pins a non-operator to their own jobs. ``get_job`` and
-``get_job_steps`` use the same pin: an identified User asking for another
-tenant's job id gets ``NOT_FOUND``. Operators and Administrators see every
-job in full. A caller with no verified identity is not pinned either, so they
-also see every job in full; that path exists only under ``mode = "permissive"``
-or ``"disabled"``. Under ``mode = "required"`` the auth layer rejects the call
-before the handler.
+By default every caller sees every job and every ``scontrol show assoc_mgr``
+scope, as a stock ``slurm.conf`` does. ``[auth] private_data`` narrows this,
+matching Slurm's ``PrivateData``: ``"jobs"`` pins a User's job reads to their
+own jobs, and ``"usage"`` pins ``scontrol show assoc_mgr`` to the scopes they
+take part in. Operators and Administrators are exempt. A caller with no verified
+identity is not restricted either, so ``private_data`` is enforceable only under
+``plugin = "spur"`` with ``mode = "required"``. See :ref:`private-data` for the
+full list of affected commands.
 
 ``CancelJob`` with no verified identity and an empty ``user`` is treated as the
 in-cluster daemon (the Kubernetes operator) and can cancel any job. A named
