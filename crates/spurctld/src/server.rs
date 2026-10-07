@@ -1074,10 +1074,7 @@ impl ControllerService {
         owner: &str,
         identity: Option<&spur_core::auth::Identity>,
     ) -> bool {
-        match job_read_scope(&self.cluster, identity) {
-            spur_core::rbac::ReadScope::All => true,
-            spur_core::rbac::ReadScope::Caller(user) => !user.is_empty() && user == owner,
-        }
+        job_read_scope(&self.cluster, identity).permits(owner)
     }
 
     fn scoped_job_info(
@@ -1450,7 +1447,7 @@ impl SlurmController for ControllerService {
         // `squeue -u other`.
         let scope = job_read_scope(&self.cluster, __identity.as_ref());
         let requested_user = (!req.user.is_empty()).then_some(req.user.as_str());
-        let Some(scoped_user) = scoped_user_filter(&scope, requested_user) else {
+        let Some(scoped_user) = scope.job_user_filter(requested_user) else {
             return Ok(Response::new(GetJobsResponse { jobs: Vec::new() }));
         };
 
@@ -4917,27 +4914,6 @@ fn assoc_mgr_user_filter(scope: &spur_core::rbac::ReadScope, requested: &str) ->
     }
 }
 
-/// The `user` filter for a job list, given the caller's read scope and the user
-/// the request named. The inner `Option` is the filter itself (`None` means every
-/// user). The outer `None` means the request named a user the caller may not see,
-/// so the list comes back empty, as Slurm's `squeue -u other` does.
-pub(crate) fn scoped_user_filter(
-    scope: &spur_core::rbac::ReadScope,
-    requested: Option<&str>,
-) -> Option<Option<String>> {
-    match scope {
-        spur_core::rbac::ReadScope::All => Some(requested.map(str::to_string)),
-        // An empty user filter means "every user" downstream, so a scoped caller
-        // with no name must see nothing rather than everything.
-        spur_core::rbac::ReadScope::Caller(user) if user.is_empty() => None,
-        spur_core::rbac::ReadScope::Caller(user) => match requested {
-            None => Some(Some(user.clone())),
-            Some(r) if r == user => Some(Some(user.clone())),
-            Some(_) => None,
-        },
-    }
-}
-
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
@@ -5576,6 +5552,96 @@ fn validate_completion_report_state_for_rpc(
         .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
+/// Shared fixtures for the gRPC tests here and the REST handler tests in
+/// `rest::handlers`. Lives in `server` so it can build a `ControllerService`
+/// from its private fields.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Identity for a viewer in the read-path handler tests. No NSS resolution
+    /// happens on the read path (only ownership/admin comparison), so any
+    /// username works.
+    pub(crate) fn viewer(user: &str, is_admin: bool) -> spur_core::auth::Identity {
+        spur_core::auth::Identity {
+            user: user.to_string(),
+            uid: 1000,
+            gid: 1000,
+            is_admin,
+            trusted_unix: false,
+        }
+    }
+
+    pub(crate) fn test_slurm_config() -> spur_core::config::SlurmConfig {
+        serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap()
+    }
+
+    /// A config with `[auth] private_data` set to the given categories.
+    pub(crate) fn test_slurm_config_private(categories: &[&str]) -> spur_core::config::SlurmConfig {
+        let list = categories
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        serde_json::from_str(&format!(
+            r#"{{"cluster_name":"test","auth":{{"plugin":"jwt","private_data":[{list}]}}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// A `ControllerService` on a node that can never elect a leader: three
+    /// unreachable peers mean no quorum, so `current_leader` stays `None`.
+    pub(crate) async fn no_leader_service(
+        cluster: Arc<crate::cluster::ClusterManager>,
+        dir: &std::path::Path,
+    ) -> ControllerService {
+        let handle = crate::raft::start_raft(
+            1,
+            &[
+                "[::1]:0".to_string(),
+                "[::1]:0".to_string(),
+                "[::1]:0".to_string(),
+            ],
+            dir,
+            cluster.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!handle.is_leader());
+        assert_eq!(handle.current_leader(), None);
+
+        let raft = Arc::new(handle);
+        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
+        ControllerService {
+            cluster,
+            raft: raft.clone(),
+            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
+            client_addrs,
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
+            control_plane_replicas: 1,
+            jwt_key: String::new(),
+            node_identity_key_configured: false,
+            incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
+            auth_audience: String::new(),
+            auth_epoch: 0,
+        }
+    }
+
+    /// A `RestState` backed by the same leaderless service, for REST handler tests.
+    pub(crate) async fn no_leader_rest_state(
+        cluster: Arc<crate::cluster::ClusterManager>,
+        dir: &std::path::Path,
+    ) -> Arc<crate::rest::RestState> {
+        let controller = no_leader_service(cluster, dir).await;
+        Arc::new(crate::rest::RestState {
+            cluster: controller.cluster.clone(),
+            raft: controller.raft.clone(),
+            controller,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -5655,6 +5721,7 @@ mod tests {
         assert!(!reports_whole_job(Some(0)));
         assert!(!reports_whole_job(Some(7)));
     }
+    use super::test_support::*;
     use super::*;
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};
@@ -5837,57 +5904,6 @@ mod tests {
             "a privileged caller may set any priority"
         );
         assert!(warning.is_none());
-    }
-
-    #[test]
-    fn scoped_user_filter_is_unrestricted_under_all_scope() {
-        use spur_core::rbac::ReadScope;
-        assert_eq!(scoped_user_filter(&ReadScope::All, None), Some(None));
-        assert_eq!(
-            scoped_user_filter(&ReadScope::All, Some("bob")),
-            Some(Some("bob".into()))
-        );
-    }
-
-    #[test]
-    fn scoped_user_filter_pins_a_scoped_caller_to_itself() {
-        use spur_core::rbac::ReadScope;
-        let scope = ReadScope::Caller("alice".into());
-        assert_eq!(
-            scoped_user_filter(&scope, None),
-            Some(Some("alice".into())),
-            "no filter scopes to the caller"
-        );
-        assert_eq!(
-            scoped_user_filter(&scope, Some("alice")),
-            Some(Some("alice".into())),
-            "asking for own records is honored"
-        );
-        assert_eq!(
-            scoped_user_filter(&scope, Some("bob")),
-            None,
-            "asking for another user's records yields an empty list"
-        );
-    }
-
-    #[test]
-    fn scoped_user_filter_yields_nothing_for_a_nameless_caller() {
-        use spur_core::rbac::ReadScope;
-        let scope = ReadScope::Caller(String::new());
-        assert_eq!(scoped_user_filter(&scope, None), None);
-        assert_eq!(scoped_user_filter(&scope, Some("")), None);
-    }
-
-    /// Identity for a viewer in the get_job/get_job_steps handler tests. No NSS resolution happens
-    /// on the read path (only ownership/admin comparison), so any username works.
-    fn viewer(user: &str, is_admin: bool) -> spur_core::auth::Identity {
-        spur_core::auth::Identity {
-            user: user.to_string(),
-            uid: 1000,
-            gid: 1000,
-            is_admin,
-            trusted_unix: false,
-        }
     }
 
     fn get_job_req(job_id: u32, id: Option<spur_core::auth::Identity>) -> Request<GetJobRequest> {
@@ -6079,65 +6095,6 @@ mod tests {
         assert!(read_forwarding_policy(false, false));
         // An already-forwarded read is served locally to avoid forward loops.
         assert!(!read_forwarding_policy(false, true));
-    }
-
-    fn test_slurm_config() -> spur_core::config::SlurmConfig {
-        serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap()
-    }
-
-    /// A config with `[auth] private_data` set to the given categories.
-    fn test_slurm_config_private(categories: &[&str]) -> spur_core::config::SlurmConfig {
-        let list = categories
-            .iter()
-            .map(|c| format!("\"{c}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        serde_json::from_str(&format!(
-            r#"{{"cluster_name":"test","auth":{{"plugin":"jwt","private_data":[{list}]}}}}"#
-        ))
-        .unwrap()
-    }
-
-    /// A `ControllerService` on a node that can never elect a leader: three
-    /// unreachable peers mean no quorum, so `current_leader` stays `None`.
-    async fn no_leader_service(
-        cluster: Arc<crate::cluster::ClusterManager>,
-        dir: &std::path::Path,
-    ) -> ControllerService {
-        use crate::rpc_stats::RpcStatsCollector;
-        use crate::sched_stats::SchedStatsCollector;
-
-        let handle = crate::raft::start_raft(
-            1,
-            &[
-                "[::1]:0".to_string(),
-                "[::1]:0".to_string(),
-                "[::1]:0".to_string(),
-            ],
-            dir,
-            cluster.clone(),
-        )
-        .await
-        .unwrap();
-        assert!(!handle.is_leader());
-        assert_eq!(handle.current_leader(), None);
-
-        let raft = Arc::new(handle);
-        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
-        ControllerService {
-            cluster,
-            raft: raft.clone(),
-            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
-            client_addrs,
-            rpc_stats: Arc::new(RpcStatsCollector::new()),
-            sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
-            control_plane_replicas: 1,
-            jwt_key: String::new(),
-            node_identity_key_configured: false,
-            incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
-            auth_audience: String::new(),
-            auth_epoch: 0,
-        }
     }
 
     /// A non-leader that can't reach a leader must still answer reads

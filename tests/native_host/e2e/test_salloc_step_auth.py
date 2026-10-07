@@ -50,10 +50,6 @@ def _denied(combined: str) -> bool:
         or "cannot attach" in lower
         or "permission denied" in lower
         or "not job owner" in lower
-        # Under `private_data = ["jobs"]` GetJob is NOT_FOUND for a non-owner, so
-        # the step path fails before an ownership string is produced.
-        or "look up job owner" in lower
-        or ("job " in lower and "not found" in lower)
     )
 
 

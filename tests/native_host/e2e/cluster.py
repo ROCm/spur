@@ -484,6 +484,11 @@ class SpurCluster:
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
 
+    def sbatch_when_qos_ready(self, args: list[str], timeout: int = 15) -> str:
+        """``sbatch`` that retries while the controller's QoS cache has not yet
+        loaded a QoS created moments earlier via ``sacctmgr``."""
+        return retry_until_qos_ready(lambda: self.sbatch(args), timeout)
+
     def sbatch_with_exit(self, args: list[str]) -> tuple[int, str]:
         """Run sbatch and return (exit_code, combined stdout+stderr)."""
         cmd_parts = [
@@ -1634,6 +1639,28 @@ def job_state(squeue_output: str, job_id: int) -> str | None:
         state = _TRUNCATED_STATE_CODES.get(fields[state_index], fields[state_index])
         return state if state in _JOB_STATE_CODES else None
     return None
+
+
+def retry_until_qos_ready(submit, timeout: int = 15) -> str:
+    """Retry *submit* while the controller's QoS cache has not yet loaded a QoS
+    created moments earlier via ``sacctmgr``. The cache refreshes on a fixed
+    interval (``fairshare_refresh_secs``), not on write.
+
+    Handles both a checked submit that raises ``RuntimeError`` (``cluster.sbatch``)
+    and an unchecked one that returns the error text (``cli_as_user``)."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            out = submit()
+        except RuntimeError as error:
+            if "does not exist" not in str(error) or time.time() >= deadline:
+                raise
+            time.sleep(1)
+            continue
+        if "does not exist" in out and time.time() < deadline:
+            time.sleep(1)
+            continue
+        return out
 
 
 def wait_job_state(

@@ -14,7 +14,7 @@ submit owner can differ from the invoking login account.
 
 import pytest
 
-from cluster import parse_job_id, wait_job_state
+from cluster import parse_job_id, retry_until_qos_ready, wait_job_state
 
 # Must exist in NSS on the test nodes; the job owner, distinct from the login.
 JOB_OWNER = "root"
@@ -181,10 +181,13 @@ def _owner_job_in_qos(c, qos: str) -> int:
     """Run a job owned by ``JOB_OWNER`` under ``qos``, a scope the login user has no part in."""
     c.sacctmgr(["add", "qos", f"name={qos}"])
     script = c.write_file(f"{qos}.sh", "#!/bin/bash\nsleep 120\n")
-    out = c.cli_as_user(
-        _login(c),
-        ["sbatch", "-J", qos, "-t", "5", f"--qos={qos}", script],
-        extra_env={"SPUR_AUTH_TOKEN": _token_for(c, JOB_OWNER)},
+    owner_token = _token_for(c, JOB_OWNER)
+    out = retry_until_qos_ready(
+        lambda: c.cli_as_user(
+            _login(c),
+            ["sbatch", "-J", qos, "-t", "5", f"--qos={qos}", script],
+            extra_env={"SPUR_AUTH_TOKEN": owner_token},
+        )
     )
     job_id = parse_job_id(out)
     assert job_id is not None, f"sbatch failed: {out}"

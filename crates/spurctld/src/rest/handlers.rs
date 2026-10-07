@@ -10,8 +10,7 @@ use axum::Extension;
 use super::convert::{job_to_json, node_to_json, parse_states_query, partition_to_json};
 use super::types::*;
 use super::RestState;
-use crate::server::{job_read_scope, scoped_user_filter};
-use spur_core::rbac::ReadScope;
+use crate::server::job_read_scope;
 
 pub async fn ping(
     State(state): State<Arc<RestState>>,
@@ -48,7 +47,7 @@ pub async fn get_jobs(
 
     let scope = job_read_scope(&state.cluster, identity.as_ref());
     let requested_user = query.user.as_deref().filter(|u| !u.is_empty());
-    let Some(scoped_user) = scoped_user_filter(&scope, requested_user) else {
+    let Some(scoped_user) = scope.job_user_filter(requested_user) else {
         return Ok(ApiResponse::ok(JobsData { jobs: Vec::new() }));
     };
     let partition = query.partition.as_deref();
@@ -247,12 +246,9 @@ fn rest_job_json(
     identity: Option<&spur_core::auth::Identity>,
     cluster: &crate::cluster::ClusterManager,
 ) -> Option<serde_json::Value> {
-    match job_read_scope(cluster, identity) {
-        ReadScope::All => Some(job_to_json(job)),
-        ReadScope::Caller(user) => {
-            (!user.is_empty() && user == job.spec.user).then(|| job_to_json(job))
-        }
-    }
+    job_read_scope(cluster, identity)
+        .permits(&job.spec.user)
+        .then(|| job_to_json(job))
 }
 
 pub async fn cancel_job(
@@ -428,5 +424,155 @@ mod tests {
             let (status, _) = status_to_rest(Status::new(code, "x"));
             assert_eq!(status, want, "{code:?}");
         }
+    }
+
+    use crate::server::test_support::{
+        no_leader_rest_state, test_slurm_config, test_slurm_config_private, viewer,
+    };
+
+    /// A leaderless REST backend holding a single job owned by alice.
+    async fn rest_state_with_alice_job(
+        cfg: spur_core::config::SlurmConfig,
+        dir: &std::path::Path,
+    ) -> Arc<RestState> {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(cfg, dir).expect("cluster manager"));
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "alice-job".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            },
+        );
+        no_leader_rest_state(cluster, dir).await
+    }
+
+    fn jobs_query(user: Option<&str>) -> JobsQuery {
+        JobsQuery {
+            user: user.map(str::to_string),
+            partition: None,
+            state: None,
+            account: None,
+            name: None,
+            qos: None,
+            reservation: None,
+        }
+    }
+
+    async fn list_jobs(
+        state: &Arc<RestState>,
+        user: Option<&str>,
+        identity: Option<spur_core::auth::Identity>,
+    ) -> Vec<serde_json::Value> {
+        get_jobs(
+            State(state.clone()),
+            Query(jobs_query(user)),
+            identity.map(Extension),
+        )
+        .await
+        .ok()
+        .expect("get_jobs returned an error")
+        .0
+        .data
+        .jobs
+    }
+
+    async fn job_is_visible(
+        state: &Arc<RestState>,
+        identity: Option<spur_core::auth::Identity>,
+    ) -> bool {
+        get_job(State(state.clone()), Path(1), identity.map(Extension))
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn rest_default_lets_any_caller_see_every_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = rest_state_with_alice_job(test_slurm_config(), dir.path()).await;
+
+        assert_eq!(
+            list_jobs(&state, None, Some(viewer("bob", false)))
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_jobs(&state, Some("alice"), Some(viewer("bob", false)))
+                .await
+                .len(),
+            1
+        );
+        assert!(job_is_visible(&state, Some(viewer("bob", false))).await);
+    }
+
+    #[tokio::test]
+    async fn rest_private_jobs_hides_other_tenants() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state =
+            rest_state_with_alice_job(test_slurm_config_private(&["jobs"]), dir.path()).await;
+
+        assert!(
+            list_jobs(&state, None, Some(viewer("bob", false)))
+                .await
+                .is_empty(),
+            "bob must not list alice's job"
+        );
+        assert!(
+            list_jobs(&state, Some("alice"), Some(viewer("bob", false)))
+                .await
+                .is_empty(),
+            "an explicit ?user=alice must not leak alice's job to bob"
+        );
+        assert!(
+            !job_is_visible(&state, Some(viewer("bob", false))).await,
+            "GET /job/1 must be 404 for a non-owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_private_jobs_still_shows_owner_admin_and_anonymous() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state =
+            rest_state_with_alice_job(test_slurm_config_private(&["jobs"]), dir.path()).await;
+
+        assert_eq!(
+            list_jobs(&state, None, Some(viewer("alice", false)))
+                .await
+                .len(),
+            1,
+            "alice sees her own job"
+        );
+        assert!(job_is_visible(&state, Some(viewer("alice", false))).await);
+
+        for user in [None, Some("alice")] {
+            assert_eq!(
+                list_jobs(&state, user, Some(viewer("carol", true)))
+                    .await
+                    .len(),
+                1,
+                "an administrator is exempt (user filter = {user:?})"
+            );
+        }
+        assert!(job_is_visible(&state, Some(viewer("carol", true))).await);
+
+        assert_eq!(
+            list_jobs(&state, None, None).await.len(),
+            1,
+            "an unauthenticated caller is unrestricted on the permissive path"
+        );
+        assert!(job_is_visible(&state, None).await);
     }
 }
