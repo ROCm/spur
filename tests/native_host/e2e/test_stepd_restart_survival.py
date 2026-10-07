@@ -420,9 +420,9 @@ class TestSupervisedGpuReclaim:
             cluster.nodes[node_index].exec(cluster._spurd_start_cmd(node_index))
             cluster.wait_agent_serving(node_index, timeout=60)
 
-            # Only the controller's reclaim-heartbeat can explain this dying
-            # now: nothing here issues a second cancel.
-            deadline = time.time() + 30
+            # The first restart heartbeat can arrive inside the controller's
+            # reclaim grace; the next one plus teardown needs a full interval.
+            deadline = time.time() + 60
             while supervisor_pid in _supervisor_pids(cluster, node_index):
                 assert time.time() < deadline, (
                     f"reconnect-reported stale job {job_id}'s supervisor "
