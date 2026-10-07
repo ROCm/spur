@@ -17005,9 +17005,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preemptor_does_not_kill_a_second_victim_while_the_first_drains() {
         let dir = TempDir::new().unwrap();
-        let mut config = test_config();
-        config.partitions[0].preempt_mode = "cancel".into();
+        let config = preempting_config();
         let cm = test_cluster_with_config(&dir, config).await;
+        insert_preempting_qos_pair(&cm, "low", "high");
         // One victim per node: the atomic per-node eviction search vacates a
         // node only when every occupant on it is evictable, so two victims
         // sharing one node would both go in the same tick and never exercise
@@ -17018,7 +17018,7 @@ mod tests {
         let mut victims = Vec::new();
         for name in ["low-1", "low-2"] {
             let mut low = basic_spec(name);
-            low.priority = Some(100);
+            low.qos = Some("low".into());
             let id = submit_and_wait(&cm, low);
             let node = if name == "low-1" { "n1" } else { "n2" };
             let res = scalar_alloc(4, 8000);
@@ -17034,7 +17034,7 @@ mod tests {
         }
 
         let mut high = basic_spec("high");
-        high.priority = Some(10_000);
+        high.qos = Some("high".into());
         let high_id = submit_and_wait(&cm, high);
         let partitions = cm.get_partitions();
 
@@ -17232,6 +17232,7 @@ mod tests {
         )
         .await;
 
+        report_nodes_released(&cm, burst_id);
         settle(&cm, burst_id, JobState::Cancelled);
     }
 
