@@ -401,9 +401,18 @@ class TestSupervisedGpuReclaim:
                 f"{prefix}pkill -9 -f '{cluster.bin_dir}/spurd'"
             )
             cluster.scancel(str(job_id))
-            assert wait_job(cluster, job_id, timeout=15) in ("CA", "GONE"), (
+            # The controller records the cancel but holds the allocation until
+            # the node reports, which an unreachable agent cannot yet do.
+            cancel_deadline = time.time() + 15
+            seen = None
+            while time.time() < cancel_deadline:
+                seen = job_state(cluster.squeue_all(), job_id)
+                if seen in ("CG", "CA", None):
+                    break
+                time.sleep(1)
+            assert seen in ("CG", "CA", None), (
                 "the controller must record the cancel even though the node "
-                "agent is unreachable"
+                f"agent is unreachable; job is {seen!r}"
             )
 
             # The agent adopts its still-running supervisor, unaware it was

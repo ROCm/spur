@@ -695,9 +695,11 @@ script can tell a typo from a job that has left the controller.
    suspended, but are cleared when the job resumes so that a subsequent normal
    completion is not miscounted as a preemption. As a result, ``sacct`` has
    no record of the preemption for suspend-mode jobs: the accounting row for
-   that run will show the final completion state only. Requeue and cancel modes
-   are unaffected — both write an accounting end-record (``PREEMPTED``) at the
-   time of preemption.
+   that run will show the final completion state only. Requeue mode is
+   unaffected — it writes an accounting end-record (``PREEMPTED``) at the time
+   of preemption. Cancel mode writes the same record, but only once the run has
+   actually ended: the victim holds its allocation in ``COMPLETING`` until every
+   node reports the release, or until ``CompleteWait`` elapses.
 
 Limits Against Usage — ``scontrol show assoc_mgr``
 --------------------------------------------------

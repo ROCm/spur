@@ -789,23 +789,45 @@ pub(crate) fn compute_job_allocation(
 
 /// Real per-node "free again at" times derived from running jobs, so backfill
 /// doesn't fall back to a flat placeholder for every busy node.
-fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
+pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
     let running = cluster.get_jobs(&JobFilter {
-        states: &[spur_core::job::JobState::Running],
+        states: &[
+            spur_core::job::JobState::Running,
+            spur_core::job::JobState::Completing,
+        ],
         ..Default::default()
     });
-    busy_until_from_running_jobs(&running)
+    busy_until_from_running_jobs(&running, cluster.config().scheduler.complete_wait_secs)
 }
 
 /// Pure core of [`running_jobs_busy_until`], split out so it's testable
 /// without a full `ClusterManager` harness.
-fn busy_until_from_running_jobs(running: &[spur_core::job::Job]) -> HashMap<String, DateTime<Utc>> {
+fn busy_until_from_running_jobs(
+    running: &[spur_core::job::Job],
+    complete_wait_secs: u32,
+) -> HashMap<String, DateTime<Utc>> {
     use spur_sched::UNLIMITED_JOB_DURATION as UNLIMITED_FALLBACK;
 
     let now = Utc::now();
     let far_future = now + UNLIMITED_FALLBACK;
     let mut busy_until: HashMap<String, DateTime<Utc>> = HashMap::new();
     for job in running {
+        // A job tearing down is bounded by the completing timeout, not by its
+        // own time limit — an unlimited one would otherwise read as a year out.
+        if job.state == spur_core::job::JobState::Completing {
+            let since = job.end_time.unwrap_or(now);
+            let end = since
+                .checked_add_signed(chrono::Duration::seconds(complete_wait_secs as i64))
+                .unwrap_or(far_future)
+                .max(now);
+            for node in &job.allocated_nodes {
+                busy_until
+                    .entry(node.clone())
+                    .and_modify(|e| *e = (*e).max(end))
+                    .or_insert(end);
+            }
+            continue;
+        }
         let start = job.start_time.unwrap_or(now);
         let mut suspended = job.suspended_secs;
         if let Some(since) = job.suspended_at {
@@ -954,7 +976,27 @@ pub(crate) async fn try_preempt(
         .map(|j| (j.job_id, cluster.resolve_qos(j)))
         .collect();
 
+    // Victims of an earlier tick that are still tearing down. Their nodes stay
+    // allocated until each agent reports, so their preemptor must not kill again.
+    let draining_victims: Vec<spur_core::job::Job> = cluster
+        .get_jobs(&JobFilter {
+            states: &[JobState::Completing],
+            ..Default::default()
+        })
+        .into_iter()
+        .filter(|j| j.preempted_by.is_some())
+        .collect();
+
     for pending in unscheduled {
+        // Scoped to the nodes this job could actually use: a victim wedged
+        // elsewhere must not block preemption across the whole cluster.
+        let waiting_on_release = draining_victims.iter().any(|victim| {
+            victim.preempted_by == Some(pending.job_id)
+                && preempt_overlaps_pending_nodes(pending, victim, &cluster_nodes)
+        });
+        if waiting_on_release {
+            continue;
+        }
         let Some(pending_part) = partition_for(pending) else {
             continue;
         };
@@ -2831,16 +2873,28 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
         });
 
         for job in completing {
-            let Some(completing_since) = job.end_time else {
-                continue;
-            };
-            if now - completing_since < wait {
+            if !completing_job_is_overdue(&job, now, wait) {
                 continue;
             }
-
+            if job.end_time.is_none() {
+                warn!(
+                    job_id = job.job_id,
+                    "job is COMPLETING with no end time — force-finishing"
+                );
+            }
             force_finish_completing_job(&cluster, &job).await;
         }
     }
+}
+
+/// Whether a COMPLETING job has waited long enough to be force-finished. No
+/// production path leaves the end time unset, so a missing one is corrupt state.
+fn completing_job_is_overdue(
+    job: &spur_core::job::Job,
+    now: DateTime<Utc>,
+    wait: chrono::Duration,
+) -> bool {
+    job.end_time.is_none_or(|since| now - since >= wait)
 }
 
 /// Force-finishes a job stuck in Completing past `complete_wait_secs`. Cancels
@@ -3295,6 +3349,56 @@ mod tests {
     }
 
     #[test]
+    fn a_completing_job_with_no_end_time_is_already_overdue() {
+        // The silent-skip bug: an unstamped job was never force-finished, so a
+        // node that stopped reporting stranded its allocation forever.
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 10);
+        job.state = spur_core::job::JobState::Completing;
+        job.end_time = None;
+        assert!(completing_job_is_overdue(
+            &job,
+            now,
+            chrono::Duration::seconds(300)
+        ));
+    }
+
+    #[test]
+    fn a_completing_job_is_overdue_only_after_the_wait_elapses() {
+        let now = Utc::now();
+        let wait = chrono::Duration::seconds(300);
+        let mut job = running_job_on("node001", now, 10);
+        job.state = spur_core::job::JobState::Completing;
+
+        job.end_time = Some(now - chrono::Duration::seconds(299));
+        assert!(!completing_job_is_overdue(&job, now, wait));
+
+        job.end_time = Some(now - chrono::Duration::seconds(300));
+        assert!(completing_job_is_overdue(&job, now, wait));
+    }
+
+    #[test]
+    fn busy_until_bounds_a_completing_job_by_the_completing_timeout() {
+        // An unlimited job tearing down would otherwise read as a year out and
+        // block every backfill reservation on its nodes.
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now - chrono::Duration::days(2), 0);
+        job.spec.time_limit = None;
+        job.state = spur_core::job::JobState::Completing;
+        job.end_time = Some(now);
+
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
+        let got = busy_until["node001"];
+        assert!(
+            (got - (now + chrono::Duration::seconds(300)))
+                .num_seconds()
+                .abs()
+                < 2,
+            "expected the completing timeout to bound it, got {got}"
+        );
+    }
+
+    #[test]
     fn busy_until_takes_the_max_across_jobs_sharing_a_node() {
         let now = Utc::now();
         let sooner = running_job_on("node001", now, 10);
@@ -3302,7 +3406,7 @@ mod tests {
 
         // Larger-ending job processed first: a "last wins" bug (instead of a
         // true max) would incorrectly keep the smaller value here.
-        let busy_until = busy_until_from_running_jobs(&[later, sooner]);
+        let busy_until = busy_until_from_running_jobs(&[later, sooner], 300);
 
         let expected =
             now + chrono::Duration::minutes(60) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
@@ -3319,7 +3423,7 @@ mod tests {
         let mut job = running_job_on("node001", now, 60);
         job.suspended_secs = i64::MAX;
 
-        let busy_until = busy_until_from_running_jobs(&[job]);
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
         let got = busy_until["node001"];
         assert!(got > now, "expected a sane future timestamp, got {got}");
     }
@@ -3330,7 +3434,7 @@ mod tests {
         let mut job = running_job_on("node001", now - chrono::Duration::days(400), 0);
         job.spec.time_limit = None;
 
-        let busy_until = busy_until_from_running_jobs(&[job]);
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
         let got = busy_until["node001"];
         assert!(
             got >= now,
@@ -3344,7 +3448,7 @@ mod tests {
         let mut job = running_job_on("node001", now, 10);
         job.suspended_at = Some(now - chrono::Duration::minutes(5));
 
-        let busy_until = busy_until_from_running_jobs(&[job]);
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
         let expected = now
             + chrono::Duration::minutes(10)
             + chrono::Duration::minutes(5)
@@ -3362,7 +3466,7 @@ mod tests {
         let mut job = running_job_on("node001", now, 10);
         job.start_time = None;
 
-        let busy_until = busy_until_from_running_jobs(&[job]);
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
         let expected =
             now + chrono::Duration::minutes(10) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
         let got = busy_until["node001"];

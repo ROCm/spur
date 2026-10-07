@@ -358,8 +358,13 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
         let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
         if let Ok(pod_list) = pods.list(&lp).await {
             for pod in pod_list {
-                let pod_name = pod.metadata.name.unwrap_or_default();
-                let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
+                let pod_name = pod.metadata.name.clone().unwrap_or_default();
+                if let Err(e) = pods.delete(&pod_name, &DeleteParams::default()).await {
+                    warn!(spurjob = %name, pod = %pod_name, error = %e, "failed to delete Pod");
+                }
+                // A deleted Pod never reaches Succeeded/Failed, so the reconciler
+                // that normally reports it never runs; speak for it here instead.
+                report_pod_released(ctx, job_id, &pod).await;
             }
         }
 
@@ -370,6 +375,36 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
     }
 
     Ok(Action::await_change())
+}
+
+/// Tell spurctld the Pod has released its slice of the allocation, which the
+/// controller holds until every node reports. Best-effort: a duplicate is a no-op.
+async fn report_pod_released(ctx: &JobControllerCtx, job_id: u32, pod: &Pod) {
+    let Some(reporting_node) = resolve_reporting_node(pod) else {
+        warn!(job_id, "cannot resolve reporting_node for a deleted Pod");
+        return;
+    };
+    let req = ReportJobStatusRequest {
+        step_id: None,
+        job_id,
+        state: spur_core::job::JobState::Failed.to_proto_i32(),
+        exit_code: 1,
+        signal: 0,
+        message: "Pod deleted".into(),
+        drain_node: false,
+        drain_reason: String::new(),
+        reporting_node,
+        run_attempt: 0,
+    };
+    let result = ctx
+        .ctrl_client
+        .lock()
+        .await
+        .call(|mut c| async move { c.report_job_status(req).await })
+        .await;
+    if let Err(e) = result {
+        debug!(job_id, error = %e, "deleted-Pod release report not accepted");
+    }
 }
 
 /// A job with no Pod yet lives only in the controller queue, so a lost cancel
