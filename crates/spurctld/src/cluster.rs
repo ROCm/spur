@@ -17013,19 +17013,25 @@ mod tests {
         let mut config = test_config();
         config.partitions[0].preempt_mode = "cancel".into();
         let cm = test_cluster_with_config(&dir, config).await;
-        register_node(&cm, "n1", 8, 16000);
+        // One victim per node: the atomic per-node eviction search vacates a
+        // node only when every occupant on it is evictable, so two victims
+        // sharing one node would both go in the same tick and never exercise
+        // the drain guard this test targets.
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
 
         let mut victims = Vec::new();
         for name in ["low-1", "low-2"] {
             let mut low = basic_spec(name);
             low.priority = Some(100);
             let id = submit_and_wait(&cm, low);
+            let node = if name == "low-1" { "n1" } else { "n2" };
             let res = scalar_alloc(4, 8000);
             cm.start_job(
                 id,
-                vec!["n1".into()],
+                vec![node.into()],
                 res.clone(),
-                per_node_for(&["n1"], res),
+                per_node_for(&[node], res),
             )
             .unwrap();
             settle(&cm, id, JobState::Running);
@@ -17042,14 +17048,15 @@ mod tests {
             crate::scheduler_loop::try_preempt(
                 &cm,
                 &partitions,
+                &cm.get_nodes(),
                 &[&high_job],
                 &cm.config().scheduler,
             )
             .await;
         }
 
-        // The first victim still holds n1 until its agent reports, so repeated
-        // ticks must not keep killing jobs the preemptor no longer needs.
+        // The first victim still holds its node until its agent reports, so
+        // repeated ticks must not keep killing jobs the preemptor no longer needs.
         let killed = victims
             .iter()
             .filter(|id| cm.get_job(**id).unwrap().state != JobState::Running)
@@ -17617,6 +17624,7 @@ mod tests {
             &cm.config().scheduler,
         )
         .await;
+        report_nodes_released(&cm, low_id);
         settle(&cm, low_id, JobState::Cancelled);
     }
 
@@ -17664,6 +17672,7 @@ mod tests {
         .await;
 
         for id in victims {
+            report_nodes_released(&cm, id);
             settle(&cm, id, JobState::Cancelled);
         }
     }
