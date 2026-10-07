@@ -800,4 +800,4 @@ class TestNsenterSupplementaryGroups:
                 f"groups={sorted(step_groups)}\nraw: {step_id}"
             )
         finally:
-            cluster.scancel(str(job_id))
+            cluster.cli_as_user(user, ["scancel", str(job_id)], check=True)
