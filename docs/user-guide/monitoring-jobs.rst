@@ -680,8 +680,11 @@ memory, fall back to:
    sacct -j <id> --format=JobID,State,PreemptedBy,PreemptMode,PreemptQOS
 
 The accounting database keeps the record permanently. In practice
-``scontrol show job`` is the right first instinct; use ``sacct`` only if
-``scontrol`` returns ``Invalid job id``.
+``scontrol show job`` is the right first instinct; fall back to ``sacct`` when
+it reports ``Job <id> not found`` (a non-zero exit status), which means the
+controller no longer holds the job. A malformed id is different:
+``scontrol show job abc`` fails with ``Invalid job id specified: abc``, so a
+script can tell a typo from a job that has left the controller.
 
 .. note::
 

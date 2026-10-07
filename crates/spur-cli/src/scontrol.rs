@@ -628,17 +628,21 @@ fn show_hostlist(
 }
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
+    let entity = entity.to_lowercase();
+    // Parsed before connecting so a malformed id surfaces its own error, not a connect failure.
+    let job_ids = match entity.as_str() {
+        "job" | "jobs" => parse_show_job_ids(name)?,
+        _ => Vec::new(),
+    };
+
     let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    match entity.to_lowercase().as_str() {
+    match entity.as_str() {
         "job" | "jobs" => {
-            let job_ids = name
-                .map(|n| vec![n.parse::<u32>().unwrap_or(0)])
-                .unwrap_or_default();
-
+            let requested_job_id = job_ids.first().copied();
             let resp = client
                 .get_jobs(spur_proto::proto::GetJobsRequest {
                     job_ids,
@@ -647,7 +651,17 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .await
                 .context("failed to get jobs")?;
 
-            for job in resp.into_inner().jobs {
+            let jobs = resp.into_inner().jobs;
+            // A specific id that matches nothing exits non-zero, matching Slurm,
+            // so a script can tell a gone job from one still in the queue. With
+            // no id filter, an empty cluster just prints nothing.
+            if jobs.is_empty() {
+                if let Some(id) = requested_job_id {
+                    bail!("Job {id} not found");
+                }
+            }
+
+            for job in jobs {
                 print!("{}", format_job_detail(&job));
             }
         }
@@ -1701,6 +1715,17 @@ fn normalize_show_name(name: Option<&str>) -> Option<&str> {
     name.map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// Job-id filter for `scontrol show job [id]`; an empty list requests every job.
+fn parse_show_job_ids(name: Option<&str>) -> Result<Vec<u32>> {
+    let Some(n) = normalize_show_name(name) else {
+        return Ok(Vec::new());
+    };
+    let id = n
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid job id specified: {n}"))?;
+    Ok(vec![id])
+}
+
 /// Split a comma-separated list into trimmed, non-empty entries.
 fn split_csv(s: &str) -> Vec<String> {
     s.split(',')
@@ -2708,6 +2733,49 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(capture.update_node_names().is_empty());
+    }
+
+    #[test]
+    fn parse_show_job_ids_rejects_a_malformed_id() {
+        for bad in ["abc", "12abc", "4294967296"] {
+            let err = parse_show_job_ids(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("Invalid job id specified: {bad}")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_show_job_ids_accepts_an_id_or_none() {
+        assert_eq!(parse_show_job_ids(Some(" 42 ")).unwrap(), vec![42]);
+        assert!(parse_show_job_ids(None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn show_job_rejects_a_malformed_id_before_contacting_the_controller() {
+        // Nothing listens on port 1, so any network I/O would fail with a connect error first.
+        let err = show("http://127.0.0.1:1", "job", Some("abc"))
+            .await
+            .expect_err("a malformed job id must fail");
+        assert!(
+            err.to_string().contains("Invalid job id specified: abc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_job_reports_not_found_for_an_unknown_id() {
+        // The mock returns no jobs, so a well-formed id that matches nothing must
+        // fail (exit non-zero), not print nothing and succeed.
+        let (addr, _capture) = crate::mock_controller::spawn().await;
+        let err = show(&format!("http://{addr}"), "job", Some("999999"))
+            .await
+            .expect_err("an unknown job id must fail");
+        assert!(
+            err.to_string().contains("Job 999999 not found"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -294,6 +294,13 @@ mock_controller_impl! {
             Err(tonic::Status::not_found(format!("node {name} not found")))
         }
 
+        async fn get_jobs(
+            &self,
+            _request: tonic::Request<proto::GetJobsRequest>,
+        ) -> Result<tonic::Response<proto::GetJobsResponse>, tonic::Status> {
+            Ok(tonic::Response::new(proto::GetJobsResponse::default()))
+        }
+
         async fn get_nodes(
             &self,
             _request: tonic::Request<proto::GetNodesRequest>,
@@ -338,7 +345,6 @@ mock_controller_impl! {
         }
     }
     unimplemented {
-        get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
         complete_job(proto::CompleteJobRequest) -> ();
         job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
