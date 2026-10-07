@@ -51,6 +51,9 @@ class TestSacctNodeFailState:
         )
         assert job_id is not None
         wait_job_state(c, job_id, "R")
+        # The RUNNING accounting row is written asynchronously after the
+        # squeue state transition, so wait for it before filtering on it.
+        wait_sacct_row(c, job_id, "JobID,State")
 
         # While still running, --state=RUNNING must match it and --state=PENDING
         # must not (a dropped filter code silently matches every job instead).
