@@ -992,7 +992,7 @@ pub(crate) async fn try_preempt(
         // elsewhere must not block preemption across the whole cluster.
         let waiting_on_release = draining_victims.iter().any(|victim| {
             victim.preempted_by == Some(pending.job_id)
-                && preempt_overlaps_pending_nodes(pending, victim, &cluster_nodes)
+                && preempt_overlaps_pending_nodes(pending, victim, cluster_nodes)
         });
         if waiting_on_release {
             continue;
