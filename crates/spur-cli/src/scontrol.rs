@@ -581,6 +581,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
 
     match entity.as_str() {
         "job" | "jobs" => {
+            let requested_job_id = job_ids.first().copied();
             let resp = client
                 .get_jobs(spur_proto::proto::GetJobsRequest {
                     job_ids,
@@ -589,7 +590,17 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .await
                 .context("failed to get jobs")?;
 
-            for job in resp.into_inner().jobs {
+            let jobs = resp.into_inner().jobs;
+            // A specific id that matches nothing exits non-zero, matching Slurm,
+            // so a script can tell a gone job from one still in the queue. With
+            // no id filter, an empty cluster just prints nothing.
+            if jobs.is_empty() {
+                if let Some(id) = requested_job_id {
+                    bail!("Job {id} not found");
+                }
+            }
+
+            for job in jobs {
                 print!("{}", format_job_detail(&job));
             }
         }
@@ -2661,6 +2672,20 @@ mod tests {
             .expect_err("a malformed job id must fail");
         assert!(
             err.to_string().contains("Invalid job id specified: abc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_job_reports_not_found_for_an_unknown_id() {
+        // The mock returns no jobs, so a well-formed id that matches nothing must
+        // fail (exit non-zero), not print nothing and succeed.
+        let (addr, _capture) = crate::mock_controller::spawn().await;
+        let err = show(&format!("http://{addr}"), "job", Some("999999"))
+            .await
+            .expect_err("an unknown job id must fail");
+        assert!(
+            err.to_string().contains("Job 999999 not found"),
             "unexpected error: {err}"
         );
     }
