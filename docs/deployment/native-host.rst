@@ -650,6 +650,12 @@ below).
    spur --version
    ls "$HOME/spur/lib/spur/spur_mpi_pmix.so"
 
+``spurstepd`` and ``spurauthd`` also answer ``-V``/``--version`` directly
+(``spurstepd --version``, ``spurauthd --version``), without needing the
+positional/``--cluster`` arguments they otherwise require to run — useful for
+confirming a deployed binary's version without standing up a job or a
+credential-mint socket.
+
 ``install.sh`` layout (when ``INSTALL_DIR=$HOME/spur/bin``):
 
 .. list-table::
