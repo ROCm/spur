@@ -32,6 +32,10 @@ _PARTITION = {
 # hiccup re-pends it), which leaves nothing to observe. Re-stage instead.
 _STAGE_ATTEMPTS = 3
 
+# QOS cache refreshes on the accounting interval; a freshly added QOS needs a
+# cycle before the scheduler acts on it.
+_CACHE_WARMUP_SECS = 15
+
 
 def _show_field(cluster, job_id: int, field: str) -> str:
     out = cluster.scontrol("show", "job", str(job_id))
@@ -216,30 +220,52 @@ class TestCancelledJobOnALostNode:
 
 
 class TestPreemptCancelHoldsAllocationUntilRelease:
+    """Preempt-cancel must hold the victim's allocation until the node releases it.
+
+    Requires:
+      - preempt_type=qos_priority (scheduler config); preemption is off otherwise
+      - a QOS pair where the aggressor allow-lists the victim and outranks it
+      - Postgres on node 0 (accounting_cluster fixture, skips when Docker is absent)
+    """
+
     @pytest.fixture
     def cluster_config_overrides(self):
-        return {**_AUTH_ROOT, "partitions": [{**_PARTITION, "preempt_mode": "cancel"}]}
+        return {
+            **_AUTH_ROOT,
+            "partitions": [{**_PARTITION, "preempt_mode": "cancel"}],
+            "scheduler": {"preempt_type": "qos_priority"},
+        }
 
-    def test_preempted_victim_routes_through_completing(self, cluster):
+    def test_preempted_victim_routes_through_completing(self, accounting_cluster):
+        cluster = accounting_cluster
         node = cluster.node_names[0]
         victim = cluster.write_file("stubborn.sh", _STUBBORN_SCRIPT)
         aggressor_script = cluster.write_file("aggressor.sh", _QUICK_SCRIPT)
         aggressor = []
 
+        # Neither QOS sets preemptmode, so both defer to the partition's
+        # `cancel` — the mode whose COMPLETING routing is under test.
+        cluster.sacctmgr(["add", "qos", "name=cancel-low", "priority=100"])
+        cluster.sacctmgr(
+            ["add", "qos", "name=cancel-high", "priority=10000", "preempt=cancel-low"]
+        )
+        time.sleep(_CACHE_WARMUP_SECS)
+
         def stage():
             return parse_job_id(
-                cluster.sbatch(["-N1", "--exclusive", f"--nodelist={node}", victim])
+                cluster.sbatch(
+                    ["-N1", "--exclusive", f"--nodelist={node}", "-q", "cancel-low", victim]
+                )
             )
 
         def kill(_job_id):
             aid = parse_job_id(
                 cluster.sbatch(
-                    ["-N1", "--exclusive", f"--nodelist={node}", aggressor_script]
+                    ["-N1", "--exclusive", f"--nodelist={node}", "-q", "cancel-high", aggressor_script]
                 )
             )
             wait_job_state(cluster, aid, "PD", timeout=60)
             aggressor.append(aid)
-            cluster.scontrol("update", f"JobId={aid}", "Priority=1000000")
 
         try:
             victim_id, seq = _kill_and_watch(cluster, stage, kill)
