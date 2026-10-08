@@ -414,6 +414,39 @@ not finish (often hash GDS, memlock, or Open MPI TCP using the wrong NIC) —
 ask an admin to check the native-host MPI section rather than retrying the
 same script.
 
+Open MPI via mpirun (``--mpi=mpirun``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Spur launches a single ``mpirun`` process per node instead of forking
+per-rank wrappers.  Mpirun handles rank fan-out internally via PRRTE.
+
+**srun mode** — the simplest way to run an MPI binary:
+
+.. code-block:: bash
+
+   srun --mpi=mpirun -n 8 --gres=gpu:8 ./hello_mpi
+
+**sbatch mode** — the batch script calls ``mpirun`` directly:
+
+.. code-block:: bash
+
+   #!/bin/bash
+   #SBATCH -N 2
+   #SBATCH -n 8
+   #SBATCH --gres=gpu:8
+
+   mpirun -np 8 --bind-to none ./hello_mpi
+
+When ``--mpi=mpirun`` is set, Spur provides:
+
+- ``SLURM_TASKS_PER_NODE`` in the ``N(xM)`` format Open MPI expects.
+- ``SPUR_MPIRUN_HOSTS`` with per-node slot counts for multi-node runs.
+- Automatic ``$HOME/spur/mpi/env.sh`` sourcing for MPI library paths.
+- Driver election: only node-0 launches mpirun; other nodes hold the
+  allocation until the driver completes.
+
+The ``--mpi=mpirun`` value appears in ``srun --mpi=list``.
+
 Distributed-training rendezvous variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
