@@ -339,12 +339,14 @@ of disagreement are reported:
   for example a worker where the controller expects a control plane.
 
 While the cluster is ``ready`` or ``degraded``, every node with a role, and every
-node outside a scoped cluster, is checked at least once every ten minutes. Nodes
-that are down, drained, draining, or in an unknown state are skipped. A
-disagreement is reported only when two successive readings of the same node
-agree, and once per episode: as a warning in the ``spurctld`` log naming the node
-and both roles, and on ``spur_k8s_drift_detected_total`` (see
-:doc:`/user-guide/monitoring-jobs`).
+node outside a scoped cluster, is checked about once every ten minutes. Nodes
+that are down, drained, draining, in an unknown state, or being taken out by
+``k8s remove-nodes`` are skipped. A disagreement is reported only when two
+successive readings of the same node agree, and once per episode: as a warning
+in the ``spurctld`` log naming the node and the roles involved, and on
+``spur_k8s_drift_detected_total`` (see :doc:`/user-guide/monitoring-jobs`). A
+node that stops being checked, or a cluster that leaves ``ready`` or
+``degraded``, starts its readings over.
 
 Spur reports drift but does not correct it: nothing is stopped or restarted.
 

@@ -632,9 +632,13 @@ pub fn phase_str(p: K0sPhase) -> String {
     .to_string()
 }
 
-/// Reconcile ticks per drift sweep, so every candidate node is visited at least once per ten
+/// Reconcile ticks per drift sweep, so every candidate node is visited about once per ten
 /// minutes however large the fleet.
 const DRIFT_SWEEP_TICKS: usize = (600 / RECONCILE_INTERVAL.as_secs()) as usize;
+const _: () = assert!(
+    DRIFT_SWEEP_TICKS > 0,
+    "RECONCILE_INTERVAL exceeds a drift sweep"
+);
 
 /// A disagreement between what the controller recorded for a node and what its agent runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -658,10 +662,8 @@ impl Drift {
     }
 }
 
-/// Classify one node from its recorded role and the agent's `(role, component_state)`.
-///
-/// An in-scope node with no role is not drift: `provision_assignments` assigns it one every tick.
-/// A roled node that is not active is not drift either: `converge_provisioning` starts it.
+/// Classify one node from its record and the agent's `(role, component_state)`. An inactive node,
+/// or an in-scope one with no role yet, is not drift: the reconcile starts or assigns it.
 fn classify_drift(
     ledger_role: Option<K0sRole>,
     in_scope: bool,
@@ -670,19 +672,19 @@ fn classify_drift(
     let Some((live_role, live_state)) = live else {
         return Drift::Unknown;
     };
-    let active = live_state == "active";
-    let Some(recorded) = ledger_role else {
-        return if active && !in_scope {
-            Drift::OutOfScope
-        } else {
-            Drift::None
-        };
-    };
-    if !active {
+    if live_state != "active" {
         return Drift::None;
     }
+    if live_role.is_empty() {
+        return Drift::Unknown;
+    }
+    if !in_scope {
+        return Drift::OutOfScope;
+    }
+    let Some(recorded) = ledger_role else {
+        return Drift::None;
+    };
     match (recorded, live_role) {
-        (_, "") => Drift::Unknown,
         // Single and controller share k0scontroller.service, and an agent that is not tracking
         // its unit names it from the unit alone, so "controller" is all it can say.
         (K0sRole::Single, "controller") => Drift::Unknown,
@@ -701,20 +703,50 @@ enum Sighting {
 /// Leader-local: a new leader starts over and re-observes.
 #[derive(Debug, Default)]
 struct DriftTracker {
-    cursor: usize,
+    last_visited: Option<String>,
     seen: HashMap<String, Sighting>,
 }
 
 impl DriftTracker {
-    /// The next slice of `candidates`, sized so the whole list is covered within one sweep.
-    fn next_slice<'a, T>(&mut self, candidates: &'a [T]) -> Vec<&'a T> {
-        if candidates.is_empty() {
+    /// This tick's nodes to probe. A sighting only survives back-to-back visits, so a node that
+    /// stops being checked, or a cluster leaving `ready`/`degraded`, starts over.
+    fn next_probe<'a>(
+        &mut self,
+        state: &K0sClusterState,
+        nodes: &'a [spur_core::node::Node],
+        removing: &HashSet<String>,
+    ) -> Vec<&'a spur_core::node::Node> {
+        if !matches!(state.phase, K0sPhase::Ready | K0sPhase::Degraded) {
+            *self = Self::default();
             return Vec::new();
         }
+        let candidates = drift_candidates(nodes, state, removing);
+        let names: HashSet<&str> = candidates.iter().map(|n| n.name.as_str()).collect();
+        self.seen.retain(|name, _| names.contains(name.as_str()));
+        self.next_slice(&candidates)
+    }
+
+    /// The next slice of name-sorted `candidates`, sized to cover them all in one sweep. Resumes
+    /// after the last node visited, so nodes joining or leaving never shift the sweep past anyone.
+    fn next_slice<'a>(
+        &mut self,
+        candidates: &[&'a spur_core::node::Node],
+    ) -> Vec<&'a spur_core::node::Node> {
         let take = candidates.len().div_ceil(DRIFT_SWEEP_TICKS);
-        let start = self.cursor % candidates.len();
-        self.cursor = start + take;
-        candidates.iter().cycle().skip(start).take(take).collect()
+        let start = self.last_visited.as_deref().map_or(0, |last| {
+            candidates.partition_point(|n| n.name.as_str() <= last)
+        });
+        let slice: Vec<_> = candidates
+            .iter()
+            .copied()
+            .cycle()
+            .skip(start)
+            .take(take)
+            .collect();
+        if let Some(last) = slice.last() {
+            self.last_visited = Some(last.name.clone());
+        }
+        slice
     }
 
     /// Record one visit. Returns the drift on the visit that confirms it, once per episode.
@@ -739,18 +771,14 @@ impl DriftTracker {
             },
         }
     }
-
-    fn forget_absent(&mut self, present: &HashSet<&str>) {
-        self.seen.retain(|name, _| present.contains(name.as_str()));
-    }
 }
 
-/// Nodes worth probing for drift, sorted so the sweep order is stable across ticks. An in-scope
-/// node with no role cannot drift, and a node the controller already considers unhealthy or under
-/// operator maintenance is left alone.
+/// Nodes worth probing for drift, sorted by name. Skipped: in-scope nodes with no role, nodes
+/// mid-removal, and nodes the controller already holds unhealthy or in maintenance.
 fn drift_candidates<'a>(
     nodes: &'a [spur_core::node::Node],
     state: &K0sClusterState,
+    removing: &HashSet<String>,
 ) -> Vec<&'a spur_core::node::Node> {
     use spur_core::node::NodeState;
     let mut out: Vec<_> = nodes
@@ -762,25 +790,21 @@ fn drift_candidates<'a>(
             )
         })
         .filter(|n| n.k0s_role.is_some() || !state.is_member(&n.name))
+        .filter(|n| !removing.contains(&n.name))
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
-/// Probe one slice of the fleet and report drift that two successive readings agree on. Detection
-/// only: nothing is stopped or restarted here. Runs in Ready and Degraded; Provisioning is
-/// mid-join by definition, and Down is already tearing everything down.
+/// Probe one slice of the fleet and report drift two successive readings agree on. Detection only.
 async fn detect_drift(cluster: &ClusterManager, tracker: &mut DriftTracker) {
     let state = cluster.k0s_state();
-    if !matches!(state.phase, K0sPhase::Ready | K0sPhase::Degraded) {
-        return;
-    }
     let nodes = cluster.get_nodes();
-    tracker.forget_absent(&nodes.iter().map(|n| n.name.as_str()).collect());
-    let candidates = drift_candidates(&nodes, &state);
+    let slice = tracker.next_probe(&state, &nodes, &cluster.k0s_removals_in_flight());
+    let mut statuses = fetch_component_statuses(cluster, &slice).await;
     let cluster_name = cluster.config().cluster_name.clone();
-    for node in tracker.next_slice(&candidates) {
-        let live = fetch_component_status(cluster, &node.name).await;
+    for node in slice {
+        let live = statuses.remove(&node.name);
         let drift = classify_drift(
             node.k0s_role,
             state.is_member(&node.name),
@@ -996,7 +1020,33 @@ async fn fetch_component_status(
     cluster: &ClusterManager,
     node: &str,
 ) -> Option<(String, String, bool)> {
-    let endpoint = agent_endpoint(cluster, node)?;
+    query_component_status(agent_endpoint(cluster, node)?).await
+}
+
+/// `fetch_component_status` for every node at once, so a tick waits one `AGENT_TIMEOUT` however
+/// many agents are slow. Unreachable nodes are absent from the result.
+async fn fetch_component_statuses(
+    cluster: &ClusterManager,
+    nodes: &[&spur_core::node::Node],
+) -> HashMap<String, (String, String, bool)> {
+    let mut set = tokio::task::JoinSet::new();
+    for node in nodes {
+        let Some(endpoint) = agent_endpoint(cluster, &node.name) else {
+            continue;
+        };
+        let name = node.name.clone();
+        set.spawn(async move { (name, query_component_status(endpoint).await) });
+    }
+    let mut out = HashMap::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((name, Some(status))) = joined {
+            out.insert(name, status);
+        }
+    }
+    out
+}
+
+async fn query_component_status(endpoint: String) -> Option<(String, String, bool)> {
     let fut = async {
         let mut client = crate::agent_client::connect(endpoint).await.ok()?;
         let resp = client
@@ -2373,42 +2423,26 @@ mod tests {
     }
 
     #[test]
-    fn a_node_that_left_the_registry_is_forgotten() {
-        let mut t = DriftTracker::default();
-        t.observe("gone", Drift::OutOfScope);
-        t.forget_absent(&HashSet::from(["n1"]));
-        assert_eq!(t.observe("gone", Drift::OutOfScope), None);
-    }
-
-    #[test]
-    fn a_sweep_visits_every_candidate_once() {
-        for len in [1usize, 4, 20, 21, 400] {
-            let nodes: Vec<usize> = (0..len).collect();
-            let mut t = DriftTracker::default();
-            let mut visits = vec![0; len];
-            let ticks = len.min(DRIFT_SWEEP_TICKS);
-            for _ in 0..ticks {
-                for &n in t.next_slice(&nodes) {
-                    visits[n] += 1;
-                }
-            }
-            assert!(
-                visits.iter().all(|&v| v >= 1),
-                "len {len}: unvisited after {ticks} ticks"
-            );
-            assert!(
-                visits.iter().all(|&v| v <= 2),
-                "len {len}: a node was visited more than twice in one sweep"
+    fn an_out_of_scope_node_is_drift_even_with_a_stale_recorded_role() {
+        for live in ["worker", "controller"] {
+            assert_eq!(
+                classify_drift(Some(K0sRole::Worker), false, Some((live, "active"))),
+                Drift::OutOfScope,
+                "live {live}"
             );
         }
+        assert_eq!(
+            classify_drift(Some(K0sRole::Worker), false, Some(("worker", "inactive"))),
+            Drift::None
+        );
     }
 
     #[test]
-    fn the_slice_grows_with_the_fleet() {
-        let mut t = DriftTracker::default();
-        assert_eq!(t.next_slice(&[0; 4]).len(), 1);
-        assert_eq!(t.next_slice(&[0; 400]).len(), 20);
-        assert!(t.next_slice::<u8>(&[]).is_empty());
+    fn an_out_of_scope_node_that_cannot_name_its_role_is_unknown() {
+        assert_eq!(
+            classify_drift(None, false, Some(("", "active"))),
+            Drift::Unknown
+        );
     }
 
     fn drift_node(name: &str, role: Option<K0sRole>) -> spur_core::node::Node {
@@ -2418,11 +2452,153 @@ mod tests {
         n
     }
 
-    fn candidate_names(nodes: &[spur_core::node::Node], state: &K0sClusterState) -> Vec<String> {
-        drift_candidates(nodes, state)
+    fn workers(names: &[&str]) -> Vec<spur_core::node::Node> {
+        names
+            .iter()
+            .map(|n| drift_node(n, Some(K0sRole::Worker)))
+            .collect()
+    }
+
+    fn ready() -> K0sClusterState {
+        K0sClusterState {
+            phase: K0sPhase::Ready,
+            ..Default::default()
+        }
+    }
+
+    fn slice_names(t: &mut DriftTracker, nodes: &[spur_core::node::Node]) -> Vec<String> {
+        t.next_probe(&ready(), nodes, &HashSet::new())
             .into_iter()
             .map(|n| n.name.clone())
             .collect()
+    }
+
+    #[test]
+    fn a_sweep_visits_every_candidate_once() {
+        for len in [1usize, 4, 20, 21, 400] {
+            let names: Vec<String> = (0..len).map(|i| format!("n{i:03}")).collect();
+            let nodes = workers(&names.iter().map(String::as_str).collect::<Vec<_>>());
+            let mut t = DriftTracker::default();
+            let mut visits: HashMap<String, usize> = HashMap::new();
+            let ticks = len.min(DRIFT_SWEEP_TICKS);
+            for _ in 0..ticks {
+                for name in slice_names(&mut t, &nodes) {
+                    *visits.entry(name).or_default() += 1;
+                }
+            }
+            assert_eq!(
+                visits.len(),
+                len,
+                "len {len}: unvisited after {ticks} ticks"
+            );
+            assert!(
+                visits.values().all(|&v| v <= 2),
+                "len {len}: a node was visited more than twice in one sweep"
+            );
+        }
+    }
+
+    #[test]
+    fn the_slice_grows_with_the_fleet() {
+        let four: Vec<String> = (0..4).map(|i| format!("n{i}")).collect();
+        let many: Vec<String> = (0..400).map(|i| format!("n{i:03}")).collect();
+        let mut t = DriftTracker::default();
+        let as_strs = |v: &[String]| workers(&v.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(slice_names(&mut t, &as_strs(&four)).len(), 1);
+        assert_eq!(slice_names(&mut t, &as_strs(&many)).len(), 20);
+        assert!(slice_names(&mut t, &[]).is_empty());
+    }
+
+    #[test]
+    fn nodes_leaving_behind_the_cursor_do_not_skip_the_next_one() {
+        let mut t = DriftTracker::default();
+        let nodes = workers(&["a", "b", "c", "d", "e", "f"]);
+        for want in ["a", "b", "c"] {
+            assert_eq!(slice_names(&mut t, &nodes), [want]);
+        }
+        let shrunk = workers(&["b", "c", "d", "e", "f"]);
+        assert_eq!(slice_names(&mut t, &shrunk), ["d"]);
+        let grown = workers(&["0", "b", "c", "d", "e", "f"]);
+        for want in ["e", "f", "0"] {
+            assert_eq!(slice_names(&mut t, &grown), [want]);
+        }
+    }
+
+    #[test]
+    fn a_node_that_stops_being_checked_starts_over() {
+        let mut t = DriftTracker::default();
+        let mut nodes = workers(&["n1", "n2"]);
+        t.observe("n1", Drift::RoleMismatch);
+        t.observe("n1", Drift::RoleMismatch);
+        t.observe("n2", Drift::RoleMismatch);
+
+        for n in &mut nodes {
+            n.state = spur_core::node::NodeState::Down;
+        }
+        let _ = slice_names(&mut t, &nodes);
+        for n in &mut nodes {
+            n.state = spur_core::node::NodeState::Idle;
+        }
+        let _ = slice_names(&mut t, &nodes);
+
+        assert_eq!(t.observe("n2", Drift::RoleMismatch), None);
+        assert_eq!(t.observe("n1", Drift::RoleMismatch), None);
+        assert_eq!(
+            t.observe("n1", Drift::RoleMismatch),
+            Some(Drift::RoleMismatch)
+        );
+    }
+
+    #[test]
+    fn a_cluster_brought_back_up_reports_drift_again() {
+        for between in [K0sPhase::Down, K0sPhase::Provisioning] {
+            let nodes = workers(&["n1"]);
+            let mut t = DriftTracker::default();
+            t.observe("n1", Drift::RoleMismatch);
+            t.observe("n1", Drift::RoleMismatch);
+
+            let paused = K0sClusterState {
+                phase: between,
+                ..Default::default()
+            };
+            assert!(t.next_probe(&paused, &nodes, &HashSet::new()).is_empty());
+            let _ = slice_names(&mut t, &nodes);
+
+            assert_eq!(t.observe("n1", Drift::RoleMismatch), None, "{between:?}");
+            assert_eq!(
+                t.observe("n1", Drift::RoleMismatch),
+                Some(Drift::RoleMismatch),
+                "{between:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ready_cluster_keeps_its_episodes() {
+        let nodes = workers(&["n1"]);
+        let mut t = DriftTracker::default();
+        t.observe("n1", Drift::RoleMismatch);
+        t.observe("n1", Drift::RoleMismatch);
+        let _ = slice_names(&mut t, &nodes);
+        assert_eq!(t.observe("n1", Drift::RoleMismatch), None);
+    }
+
+    fn candidate_names(nodes: &[spur_core::node::Node], state: &K0sClusterState) -> Vec<String> {
+        drift_candidates(nodes, state, &HashSet::new())
+            .into_iter()
+            .map(|n| n.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn candidates_skip_nodes_mid_removal() {
+        let nodes = workers(&["leaving", "staying"]);
+        let removing = HashSet::from(["leaving".to_string()]);
+        let names: Vec<_> = drift_candidates(&nodes, &ready(), &removing)
+            .into_iter()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(names, ["staying"]);
     }
 
     #[test]

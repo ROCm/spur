@@ -455,6 +455,9 @@ pub struct ClusterManager {
     /// Per-node locks serializing (re-)registration, so unrelated nodes don't block each other
     /// while a same-name racer can't act on a stale label diff (see `register_node`).
     node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
+    /// Nodes `k8s remove-nodes` is taking out right now, counted so overlapping calls for one
+    /// node keep it marked until the last finishes. Leader-local, like the handler that sets it.
+    k0s_removals: parking_lot::Mutex<HashMap<String, usize>>,
     raft: RwLock<Option<SpurRaft>>,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
@@ -639,6 +642,25 @@ pub struct RequeueOutcome {
     pub skipped: Vec<String>,
 }
 
+/// Held for the length of one node's `k8s remove-nodes`; see `ClusterManager::begin_k0s_removal`.
+pub struct K0sRemoval<'a> {
+    cluster: &'a ClusterManager,
+    node: String,
+}
+
+impl Drop for K0sRemoval<'_> {
+    fn drop(&mut self) {
+        let mut removals = self.cluster.k0s_removals.lock();
+        let Some(count) = removals.get_mut(&self.node) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            removals.remove(&self.node);
+        }
+    }
+}
+
 impl ClusterManager {
     #[cfg(test)]
     pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
@@ -682,6 +704,7 @@ impl ClusterManager {
             k0s_role_counts: K0sRoleCounts::default(),
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
+            k0s_removals: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
@@ -3613,6 +3636,25 @@ impl ClusterManager {
     pub fn remove_k0s_member_nodes(&self, nodes: Vec<String>) -> anyhow::Result<()> {
         self.propose(WalOperation::K0sMemberNodesRemove { nodes })?;
         Ok(())
+    }
+
+    /// Mark `node` as mid-removal until the guard drops. While it drains it is out of scope with
+    /// its role still recorded, which drift detection must not mistake for a stray.
+    #[must_use]
+    pub fn begin_k0s_removal(&self, node: &str) -> K0sRemoval<'_> {
+        *self
+            .k0s_removals
+            .lock()
+            .entry(node.to_string())
+            .or_default() += 1;
+        K0sRemoval {
+            cluster: self,
+            node: node.to_string(),
+        }
+    }
+
+    pub fn k0s_removals_in_flight(&self) -> HashSet<String> {
+        self.k0s_removals.lock().keys().cloned().collect()
     }
 
     /// snapshot of the current cluster-wide k0s state.
@@ -22661,6 +22703,23 @@ mod tests {
             cm.get_node("node-c").and_then(|n| n.k0s_role).is_none(),
             "out-of-scope node must stay un-roled and schedulable"
         );
+    }
+
+    #[test]
+    fn a_node_stays_mid_removal_until_its_last_removal_ends() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let first = cm.begin_k0s_removal("w1");
+        let second = cm.begin_k0s_removal("w1");
+        let other = cm.begin_k0s_removal("w2");
+        drop(first);
+        assert_eq!(
+            cm.k0s_removals_in_flight(),
+            HashSet::from(["w1".to_string(), "w2".to_string()])
+        );
+        drop(second);
+        drop(other);
+        assert!(cm.k0s_removals_in_flight().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

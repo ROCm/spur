@@ -4142,6 +4142,7 @@ impl SlurmController for ControllerService {
         let mut removed: Vec<String> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
         for n in &requested {
+            let _removal = self.cluster.begin_k0s_removal(n);
             if let Err(e) = self.cluster.remove_k0s_member_nodes(vec![n.clone()]) {
                 failures.push(format!("{n}: could not update membership: {e}"));
                 continue;
