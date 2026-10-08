@@ -50,6 +50,16 @@ impl SpurEnv {
     /// Consume into the final `HashMap` for process spawning.
     pub fn into_map(self) -> HashMap<String, String> {
         self.vars
+            .into_iter()
+            .filter(|(k, _)| {
+                let u = k.to_ascii_uppercase();
+                !u.contains("EXECUTION_CREDENTIAL")
+                    && u != "SPUR_JOB_CREDENTIAL"
+                    && u != "SLURM_JOB_CREDENTIAL"
+                    && u != "SPUR_STEP_CREDENTIAL"
+                    && u != "SLURM_STEP_CREDENTIAL"
+            })
+            .collect()
     }
 
     /// Generate bash `export` lines for the `PROCID` twins and `SLURM_LOCALID`.
@@ -114,6 +124,18 @@ mod tests {
         assert_eq!(map.get("SPUR_JOB_ID").unwrap(), "42");
         assert_eq!(map.get("SLURM_JOB_ID").unwrap(), "42");
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn into_map_drops_execution_credential_env() {
+        let mut env = SpurEnv::new();
+        env.set("SPUR_JOB_ID", "1");
+        env.set("SPUR_EXECUTION_CREDENTIAL", "secret");
+        env.set("SPUR_STEP_CREDENTIAL", "secret");
+        let map = env.into_map();
+        assert_eq!(map.get("SPUR_JOB_ID").unwrap(), "1");
+        assert!(!map.contains_key("SPUR_EXECUTION_CREDENTIAL"));
+        assert!(!map.contains_key("SPUR_STEP_CREDENTIAL"));
     }
 
     #[test]

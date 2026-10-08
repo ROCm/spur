@@ -146,7 +146,7 @@ pub struct ContainerConfig {
     pub readonly: bool,
     pub mount_home: bool,
     pub remap_root: bool,
-    pub gpu_devices: Vec<u32>,
+    pub gpu_devices: Vec<u64>,
     pub environment: HashMap<String, String>,
     pub container_env: HashMap<String, String>,
     pub entrypoint: Option<String>,
@@ -156,6 +156,34 @@ pub struct ContainerConfig {
     pub home_dir: String,
     /// Registry-based device injection plan (replaces mount_hw_devices when present).
     pub device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
+}
+
+/// Bind-mount the host mint socket so nested `srun` can mint. Host UID 0 does
+/// not receive the socket unless root jobs are explicitly allowed.
+pub fn maybe_bind_auth_socket(
+    mounts: &mut Vec<BindMount>,
+    cluster_id: &str,
+    uid: u32,
+    allow_root_jobs: bool,
+) {
+    if cluster_id.is_empty() || (uid == 0 && !allow_root_jobs) {
+        return;
+    }
+    let Ok(path) = spur_core::native_mint::resolve_socket_path(cluster_id) else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let displayed = path.display().to_string();
+    if mounts.iter().any(|m| m.source == displayed) {
+        return;
+    }
+    mounts.push(BindMount {
+        source: displayed.clone(),
+        target: displayed,
+        readonly: false,
+    });
 }
 
 /// Resolve image reference to a rootfs path.

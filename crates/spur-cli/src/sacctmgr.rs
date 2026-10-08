@@ -97,7 +97,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SacctmgrArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SacctmgrArgs>(&args);
     let addr = args.controller.clone();
     let style = args.output_style();
 
@@ -141,6 +141,7 @@ const QOS_KEYS: &[&str] = &[
     "preempt",
     "preemptexempttime",
     "clearpreemptexempttime",
+    "idlefillpreemptable",
     "usagefactor",
     "maxjobsperuser",
     "maxjobspu",
@@ -270,6 +271,16 @@ fn parse_i32(key: &str, val: &str) -> Result<i32> {
 fn parse_u32(key: &str, val: &str) -> Result<u32> {
     val.parse()
         .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
+}
+
+/// Parse an explicit on/off parameter. Unrecognised values are rejected rather
+/// than treated as off, so a typo cannot silently clear the setting.
+fn parse_bool(key: &str, val: &str) -> Result<bool> {
+    match val.to_lowercase().as_str() {
+        "1" | "yes" | "true" => Ok(true),
+        "0" | "no" | "false" => Ok(false),
+        _ => Err(anyhow::anyhow!("invalid value for {key}=: '{val}'")),
+    }
 }
 
 /// Return true when a key=value pair explicitly opts in to a boolean action
@@ -569,6 +580,10 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .map(|v| parse_u32("preemptexempttime", v))
                         .transpose()?,
                     clear_preempt_exempt_time: false,
+                    idle_fill_preemptable: p
+                        .get("idlefillpreemptable")
+                        .map(|v| parse_bool("idlefillpreemptable", v))
+                        .transpose()?,
                     max_submit_jobs_per_account: Some(
                         find_alias(
                             &p,
@@ -756,6 +771,10 @@ fn build_modify_qos_request(
             .get("clearpreemptexempttime")
             .map(|v| is_truthy(v))
             .unwrap_or(false),
+        idle_fill_preemptable: p
+            .get("idlefillpreemptable")
+            .map(|v| parse_bool("idlefillpreemptable", v))
+            .transpose()?,
         max_submit_jobs_per_account: find_alias(
             p,
             &["maxsubmitjobsperaccount", "maxsubmitpa", "maxsubmitjobspa"],
@@ -1031,7 +1050,7 @@ fn filter_qos_by_name(qos_list: &mut Vec<QosInfo>, filter: &str) {
 // Slurm's default `sacctmgr show transaction` columns: Time, Action, Actor,
 // Where, Info. Where renders entity_type:entity_name; Info renders details JSON.
 const TXN_DEFAULT_FORMAT: &str = "%-20t %-8a %-14A %-24w %-40i";
-const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-24w %-10o %-8u %-40i";
+const TXN_ALL_FORMAT: &str = "%-8d %-20t %-8a %-14A %-6v %-8s %-22p %-24w %-10o %-8u %-40i";
 
 fn txn_header(spec: char) -> &'static str {
     match spec {
@@ -1045,6 +1064,7 @@ fn txn_header(spec: char) -> &'static str {
         's' => "Source",
         'd' => "ID",
         'u' => "ActorUID",
+        'p' => "Peer",
         _ => "?",
     }
 }
@@ -1061,6 +1081,7 @@ fn txn_field_spec(name: &str) -> Option<char> {
         "source" => Some('s'),
         "id" => Some('d'),
         "actoruid" | "uid" => Some('u'),
+        "peer" | "peeraddr" => Some('p'),
         _ => None,
     }
 }
@@ -1074,13 +1095,12 @@ fn txn_format_fields(
         TXN_ALL_FORMAT,
         &txn_field_spec,
         &txn_header,
-        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID",
+        "Time, Action, Actor, Where, Info, Outcome, Verified, Source, ID, ActorUID, Peer",
     )
 }
 
-/// Build a `GetTransactions` request from Slurm-style `key=value` filters
-/// (`Actor=`, `Action=`, `Entity=`, `Name=`, `Outcome=`, `Start=`, `End=`,
-/// `limit=`). `action`/`outcome` are lowercased to match the stored values.
+/// Build a `GetTransactions` request from Slurm-style `key=value` filters.
+/// `action`/`outcome` are lowercased to match the stored values.
 fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransactionsRequest {
     GetTransactionsRequest {
         actor: p.get("actor").cloned().unwrap_or_default(),
@@ -1101,6 +1121,11 @@ fn build_txn_request(p: &std::collections::HashMap<String, String>) -> GetTransa
         outcome: p
             .get("outcome")
             .map(|s| s.to_lowercase())
+            .unwrap_or_default(),
+        peer_addr: p
+            .get("peer")
+            .or_else(|| p.get("peeraddr"))
+            .cloned()
             .unwrap_or_default(),
         start_after: p
             .get("start")
@@ -1125,15 +1150,9 @@ fn resolve_txn_field(t: &TransactionRecord, spec: char) -> String {
         'v' => if t.verified { "yes" } else { "no" }.to_string(),
         's' => t.source.clone(),
         'd' => t.id.to_string(),
-        // uid is recorded only for a verified identity; render blank otherwise so
-        // the unknown case (stored NULL, flattened to 0 on the wire) can't read as root.
-        'u' => {
-            if t.verified {
-                t.actor_uid.to_string()
-            } else {
-                String::new()
-            }
-        }
+        'p' => t.peer_addr.clone(),
+        // Absent whenever nothing vouched for the uid, so it cannot read as root.
+        'u' => t.actor_uid.map(|u| u.to_string()).unwrap_or_default(),
         _ => "?".to_string(),
     }
 }
@@ -1267,8 +1286,7 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
 const QOS_DEFAULT_FORMAT: &str =
     "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
 
-const QOS_ALL_FORMAT: &str =
-    "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-20T %-20V %-20G";
+const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
 
 fn qos_header(spec: char) -> &'static str {
     match spec {
@@ -1278,6 +1296,7 @@ fn qos_header(spec: char) -> &'static str {
         'P' => "PreemptMode",
         'Q' => "Preempt",
         'E' => "PreemptExemptTime",
+        'I' => "IdleFillPreemptable",
         'U' => "UsageFactor",
         'G' => "GrpTRES",
         'T' => "MaxTRES",
@@ -1301,6 +1320,7 @@ fn qos_field_spec(name: &str) -> Option<char> {
         "preemptmode" => Some('P'),
         "preempt" => Some('Q'),
         "preemptexempttime" => Some('E'),
+        "idlefillpreemptable" => Some('I'),
         "usagefactor" => Some('U'),
         "grptres" => Some('G'),
         "maxtres" | "maxtrespj" | "maxtresperjob" => Some('T'),
@@ -1324,6 +1344,7 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'P' => q.preempt_mode.clone(),
         'Q' => q.preempt.clone(),
         'E' => q.preempt_exempt_time.map(blank_if_zero).unwrap_or_default(),
+        'I' => if q.idle_fill_preemptable { "yes" } else { "no" }.into(),
         'U' => format!("{}", q.usage_factor),
         'G' => q.grp_tres.clone(),
         'T' => q.max_tres_per_job.clone(),
@@ -1946,6 +1967,77 @@ mod tests {
     }
 
     #[test]
+    fn every_qos_format_letter_has_a_header_and_a_value() {
+        let q = stub_qos();
+        for fmt in [QOS_DEFAULT_FORMAT, QOS_ALL_FORMAT] {
+            for spec in fmt.chars().filter(|c| c.is_ascii_alphabetic()) {
+                assert_ne!(
+                    qos_header(spec),
+                    "?",
+                    "letter {spec} in {fmt} has no header"
+                );
+                assert_ne!(
+                    resolve_qos_field(&q, spec),
+                    "?",
+                    "letter {spec} in {fmt} has a header but no resolver"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idle_fill_preemptable_renders_as_yes_or_no() {
+        let fields = format_engine::parse_named_format(
+            "Name,IdleFillPreemptable",
+            &qos_field_spec,
+            &qos_header,
+        );
+        let on = QosInfo {
+            idle_fill_preemptable: true,
+            ..stub_qos()
+        };
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&on, spec));
+        assert!(row.contains("yes"), "expected yes: {row}");
+
+        let off = QosInfo {
+            idle_fill_preemptable: false,
+            ..stub_qos()
+        };
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&off, spec));
+        assert!(row.contains("no"), "expected no: {row}");
+    }
+
+    #[test]
+    fn add_qos_sets_idle_fill_preemptable() {
+        let p = parse_params(&["name=burst".into(), "idlefillpreemptable=yes".into()]);
+        assert_eq!(
+            p.get("idlefillpreemptable")
+                .map(|v| parse_bool("idlefillpreemptable", v))
+                .transpose()
+                .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parse_bool_accepts_both_directions() {
+        for v in &["1", "yes", "TRUE"] {
+            assert!(parse_bool("idlefillpreemptable", v).unwrap(), "{v}");
+        }
+        for v in &["0", "no", "False"] {
+            assert!(!parse_bool("idlefillpreemptable", v).unwrap(), "{v}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_rejects_unrecognised_values() {
+        // A typo must not silently read as "off" and disable the burst tier.
+        for v in &["maybe", "", "2", "off"] {
+            assert!(parse_bool("idlefillpreemptable", v).is_err(), "{v}");
+        }
+    }
+
+    #[test]
     fn qos_field_spec_aliases_are_case_insensitive() {
         assert_eq!(qos_field_spec("grptres"), qos_field_spec("GrpTRES"));
         assert_eq!(qos_field_spec("maxtres"), qos_field_spec("MaxTRESPJ"));
@@ -2149,7 +2241,7 @@ mod tests {
             id: 7,
             timestamp: None,
             actor: "bob".into(),
-            actor_uid: 1000,
+            actor_uid: Some(1000),
             verified: true,
             source: "api".into(),
             action: "create".into(),
@@ -2157,26 +2249,46 @@ mod tests {
             entity_name: "daily".into(),
             outcome: "success".into(),
             details: "{}".into(),
+            peer_addr: "10.11.99.42:51234".into(),
         };
         assert_eq!(resolve_txn_field(&t, 'w'), "reservation:daily");
         assert_eq!(resolve_txn_field(&t, 'v'), "yes");
         assert_eq!(resolve_txn_field(&t, 'A'), "bob");
         assert_eq!(resolve_txn_field(&t, 'd'), "7");
         assert_eq!(resolve_txn_field(&t, 'u'), "1000");
+        assert_eq!(resolve_txn_field(&t, 'p'), "10.11.99.42:51234");
     }
 
     #[test]
-    fn resolve_txn_field_blanks_uid_when_unverified() {
-        // Unverified rows carry an unknown uid (stored NULL, 0 on the wire); it
-        // must render blank so it can't be mistaken for root (uid 0).
-        let t = TransactionRecord {
+    fn resolve_txn_field_blanks_an_unrecorded_uid() {
+        // No uid is stored unless the kernel vouched for it, so an absent one
+        // must render blank rather than as uid 0, which would read as root.
+        let unverified = TransactionRecord {
             actor: "vm".into(),
-            actor_uid: 0,
+            actor_uid: None,
             verified: false,
             ..Default::default()
         };
-        assert_eq!(resolve_txn_field(&t, 'u'), "");
-        assert_eq!(resolve_txn_field(&t, 'v'), "no");
+        assert_eq!(resolve_txn_field(&unverified, 'u'), "");
+        assert_eq!(resolve_txn_field(&unverified, 'v'), "no");
+
+        // A JWT caller is verified but its uid was never proven.
+        let jwt = TransactionRecord {
+            actor: "mallory".into(),
+            actor_uid: None,
+            verified: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&jwt, 'u'), "");
+        assert_eq!(resolve_txn_field(&jwt, 'A'), "mallory");
+
+        // A real root action is still distinguishable from the blank case.
+        let root = TransactionRecord {
+            actor_uid: Some(0),
+            verified: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_txn_field(&root, 'u'), "0");
     }
 
     #[test]
@@ -2607,7 +2719,7 @@ mod tests {
             id: 7,
             timestamp: None,
             actor: "bob".into(),
-            actor_uid: 1000,
+            actor_uid: Some(1000),
             verified: true,
             source: "api".into(),
             action: "create".into(),
@@ -2615,6 +2727,7 @@ mod tests {
             entity_name: "gpu".into(),
             outcome: "success".into(),
             details: "{}".into(),
+            peer_addr: "10.11.99.42:51234".into(),
         }
     }
 
@@ -2633,6 +2746,30 @@ mod tests {
         .output_style();
         let row = style.row(&fields, &|spec| resolve_txn_field(&stub_txn(), spec));
         (style.header_lines(&fields), row)
+    }
+
+    /// An unauthenticated `UpdateNode` records an empty actor, and dropping the
+    /// column would silently shift every field after it for a parser.
+    #[test]
+    fn delimited_txn_output_keeps_an_empty_actor_column() {
+        let t = TransactionRecord {
+            actor: String::new(),
+            action: "update".into(),
+            entity_type: "node".into(),
+            entity_name: "node07".into(),
+            outcome: "success".into(),
+            peer_addr: "10.11.99.42:51234".into(),
+            ..Default::default()
+        };
+        let fields = txn_format_fields(Some("Action,Actor,Where,Outcome,Peer"))
+            .expect("txn format must parse");
+        let style = SacctmgrArgs::try_parse_from(["sacctmgr", "-n", "-P", "show", "txn"])
+            .expect("flags must parse")
+            .output_style();
+
+        let row = style.row(&fields, &|spec| resolve_txn_field(&t, spec));
+        assert_eq!(row, "update||node:node07|success|10.11.99.42:51234");
+        assert_eq!(row.split('|').count(), 5);
     }
 
     #[test]

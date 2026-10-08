@@ -330,6 +330,12 @@ pub struct Node {
     pub source: NodeSource,
 
     pub total_resources: ResourceSet,
+    /// Raw resources the agent last reported, before configured caps/headroom are
+    /// applied. `total_resources` is the post-clamp schedulable inventory; this
+    /// retains the detected truth for observability. Defaults to an empty set for
+    /// Raft entries persisted before this field existed.
+    #[serde(default)]
+    pub detected_resources: ResourceSet,
     pub alloc_resources: ResourceAllocations,
 
     /// Node feature tags (e.g., "gpu", "nvme", "rack1") for --constraint matching.
@@ -397,6 +403,7 @@ impl Node {
             admin_locked: false,
             partitions: Vec::new(),
             source: NodeSource::default(),
+            detected_resources: resources.clone(),
             total_resources: resources,
             alloc_resources: ResourceAllocations::default(),
             features: Vec::new(),

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -25,8 +25,8 @@ use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
-    batch_companion_hold_script, batch_script_uses_step_launch, build_multi_task_pmix_wrapper,
-    build_multi_task_wrapper, use_multi_task_launch,
+    batch_companion_hold_script, batch_launch, batch_script_uses_step_launch,
+    build_multi_task_pmix_wrapper, build_multi_task_wrapper, use_multi_task_launch, BatchLaunch,
 };
 use spur_devices::DeviceRegistry;
 
@@ -38,7 +38,7 @@ use crate::reporter::NodeReporter;
 ///
 /// Keeps the GPU-job path untouched; only zero-GPU jobs are forced to "no
 /// devices" so they cannot inherit the runtime's all-visible default.
-fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u32]) {
+fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &[u64]) {
     if allocated_device_ids.is_empty() {
         spur_core::task_launch::gpu_deny_visibility(env);
     }
@@ -51,6 +51,9 @@ struct StepdLaunchOptions {
     hooks: HooksConfig,
     plugstack_path: String,
     pmix: Option<crate::stepd::StepdPmix>,
+    cred_id: String,
+    cred_kid: String,
+    cred_digest: String,
 }
 
 /// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
@@ -171,6 +174,20 @@ fn execv_reported_failure(pipe_r: &std::os::fd::OwnedFd) -> bool {
     matches!(nix::unistd::read(pipe_r, &mut byte), Ok(1))
 }
 
+/// The session directory lives under this agent's configured state dir, which
+/// spurd owns exclusively, so a failure to create it condemns the node.
+fn session_dir_prepare_error(
+    dir: &std::path::Path,
+    state_dir: &std::path::Path,
+    error: std::io::Error,
+) -> executor::LaunchError {
+    executor::classify_spool_error(
+        dir,
+        state_dir,
+        anyhow::Error::from(error).context("prepare stepd directory"),
+    )
+}
+
 async fn launch_stepd(
     config: &executor::JobLaunchConfig,
     run_attempt: u32,
@@ -184,21 +201,20 @@ async fn launch_stepd(
     launch_spec.controller_addr = controller_addr.into();
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
-    launch_spec.allocation_only =
-        options.allocation_only || config.io_mode == executor::LaunchIo::Pty;
+    launch_spec.allocation_only = options.allocation_only;
     launch_spec.step_id = options.step_id;
     launch_spec.container_rootfs_mode = options.container_rootfs_mode;
     launch_spec.hooks = options.hooks;
     launch_spec.plugstack_path = options.plugstack_path;
     launch_spec.pmix = options.pmix;
+    launch_spec.cred_id = options.cred_id;
+    launch_spec.cred_kid = options.cred_kid;
+    launch_spec.cred_digest = options.cred_digest;
     let store = crate::stepd::StepdStore::new(state_dir);
+    let intended_session_dir = store.session_dir(config.job_id, run_attempt, launch_spec.step_id);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt, launch_spec.step_id)
-        .map_err(|error| {
-            executor::LaunchError::Other(
-                anyhow::Error::from(error).context("prepare stepd directory"),
-            )
-        })?;
+        .map_err(|error| session_dir_prepare_error(&intended_session_dir, state_dir, error))?;
     let mut descriptor = crate::stepd::StepdDescriptor::new(
         config.job_id,
         run_attempt,
@@ -213,6 +229,9 @@ async fn launch_stepd(
     descriptor.uid = config.uid;
     descriptor.gid = config.gid;
     descriptor.work_dir = config.work_dir.clone();
+    descriptor.cred_id = launch_spec.cred_id.clone();
+    descriptor.cred_kid = launch_spec.cred_kid.clone();
+    descriptor.cred_digest = launch_spec.cred_digest.clone();
     let namespaces = launch_namespaces(config, nix::unistd::geteuid().is_root());
     descriptor.has_pid_namespace = namespaces.pid;
     descriptor.has_user_namespace = namespaces.user;
@@ -227,7 +246,9 @@ async fn launch_stepd(
     let launch_json = serde_json::to_vec(&launch_spec)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
     crate::stepd::write_private(&launch_path, &launch_json).map_err(|error| {
-        executor::LaunchError::Other(
+        executor::classify_spool_error(
+            &launch_path,
+            state_dir,
             anyhow::Error::from(error).context("write runtime launch specification"),
         )
     })?;
@@ -285,6 +306,7 @@ async fn launch_stepd(
             pty_master: None,
             // Not created until the job is released; steps read it live.
             cgroup_path: None,
+            task_environment: HashMap::new(),
         },
         descriptor,
     ))
@@ -395,6 +417,39 @@ fn launch_step_id(pty: bool) -> spur_core::step::StepId {
     }
 }
 
+fn execution_status(err: spur_core::native_cred::CredentialError) -> Status {
+    use spur_core::native_cred::CredentialStatusCode;
+    match err.status_code() {
+        CredentialStatusCode::FailedPrecondition => Status::failed_precondition(err.to_string()),
+        CredentialStatusCode::PermissionDenied => Status::permission_denied(err.to_string()),
+        CredentialStatusCode::Unauthenticated => Status::unauthenticated(err.to_string()),
+    }
+}
+
+fn decode_fixed_b64<const N: usize>(s: &str) -> Option<[u8; N]> {
+    let bytes = spur_core::native_cred::payload_from_base64url(s).ok()?;
+    bytes.try_into().ok()
+}
+
+fn persist_execution_meta(
+    cred: &spur_core::native_cred::ExecutionCredential,
+) -> (String, String, String) {
+    (
+        spur_core::native_cred::payload_to_base64url(&cred.credential_id),
+        cred.key_id.clone(),
+        spur_core::native_cred::payload_to_base64url(&cred.command_digest),
+    )
+}
+
+fn map_exec_err(err: spur_core::native_cred::CredentialError) -> Status {
+    spur_core::native_metrics::inc_exec_fail();
+    execution_status(err)
+}
+
+fn proto_slice_devices(alloc: &Option<ResourceAllocations>) -> (u32, u64, Vec<(String, u64, u64)>) {
+    spur_core::native_exec::proto_slice_devices(alloc)
+}
+
 /// Read a cgroup's member pids.
 fn cgroup_member_pids(cgroup_path: &std::path::Path) -> Vec<i32> {
     std::fs::read_to_string(cgroup_path.join("cgroup.procs"))
@@ -457,6 +512,71 @@ fn replayable_allocations(
     chosen
 }
 
+/// Map a legacy descriptor's positional GPU ids onto the live inventory's
+/// stable_ids so an upgrade-restart re-adopts the job's real GPUs. Returns
+/// `None` when no translation is warranted or the recording is ambiguous, so
+/// the caller keeps the ids verbatim and the strict `restore_for_job` path
+/// under-adopts safely rather than guessing.
+///
+/// A pre-stable_id `spurd` recorded `gpu_devices` as positional indices; the
+/// scheme this build uses records stable_ids. `current_gpus` is the registry's
+/// BDF-sorted device list, and on AMD KFD nodes the kernel assigns render_minor
+/// (and hence the old build's positional ids) in PCI/BDF enumeration order, so
+/// those two orders coincide and positional `i` maps to `current_gpus[i]` — the
+/// sole real-world legacy case. The render_minor stable_id scheme only ever
+/// existed unreleased on this branch, so a render_minor-looking id (not a valid
+/// index, not a current stable_id) is left untranslated; not a supported upgrade.
+fn translate_legacy_gpu_ids(
+    recorded: &[u64],
+    current_gpus: &[spur_core::resource::GpuResource],
+) -> Option<Vec<u64>> {
+    if recorded.is_empty() {
+        return None;
+    }
+    let is_current = |id: u64| current_gpus.iter().any(|g| g.stable_id == id);
+    // Already stable_ids (all match live inventory): nothing to translate.
+    if recorded.iter().all(|&id| is_current(id)) {
+        return None;
+    }
+    // Legacy positional only when every id is a distinct in-range index AND
+    // none already matches a stable_id; any mix or out-of-range is ambiguous.
+    let mut seen = std::collections::HashSet::with_capacity(recorded.len());
+    for &id in recorded {
+        if is_current(id) || (id as usize) >= current_gpus.len() || !seen.insert(id) {
+            return None;
+        }
+    }
+    Some(
+        recorded
+            .iter()
+            .map(|&i| current_gpus[i as usize].stable_id)
+            .collect(),
+    )
+}
+
+/// Persist the translated stable_ids back into the on-disk descriptor so the
+/// translation runs once, not on every restart. Best-effort: a failure only
+/// means the next restart re-translates, which is correct, so it warns and
+/// moves on rather than failing the recovery.
+fn rewrite_descriptor_gpu_ids(
+    state_dir: &std::path::Path,
+    descriptor: &crate::stepd::StepdDescriptor,
+    stable_ids: Vec<u64>,
+) {
+    let mut rewritten = descriptor.clone();
+    rewritten.resources.gpu_devices = stable_ids;
+    let store = crate::stepd::StepdStore::new(state_dir);
+    if let Err(error) = store.publish(&rewritten) {
+        warn!(
+            job_id = descriptor.job_id,
+            run_attempt = descriptor.run_attempt,
+            ?error,
+            "could not rewrite adopted descriptor to stable gpu ids; \
+             translation re-runs next restart"
+        );
+    }
+}
+
 /// A descriptor with no recorded cores — a step, or one written before they
 /// were persisted; the lowest free cores keep occupancy right if not identity.
 fn fallback_cpu_ids(allocation: &NodeAllocation, cpus: u32) -> Vec<u32> {
@@ -507,12 +627,14 @@ fn owns_job_processes(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
         .any(|descriptor| descriptor.step_id == spur_core::step::STEP_BATCH)
 }
 
-/// Whether a supervisor is running the job's teardown, so the agent must not
-/// retire its tracking underneath one and strand its completion.
-fn supervisor_owns_teardown(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
-    descriptors
-        .iter()
-        .any(|descriptor| descriptor.step_id != spur_core::step::STEP_EXTERN)
+/// Same pid/start-ticks check the crash watchdog uses. A pid of 0 means no
+/// pid was ever recorded, which reads as "not yet known" rather than dead.
+fn stepd_confirmed_dead(descriptor: &crate::stepd::StepdDescriptor) -> bool {
+    descriptor.pid != 0
+        && matches!(
+            crate::stepd::stepd_liveness(descriptor),
+            Ok(crate::stepd::StepdLiveness::Stale)
+        )
 }
 
 async fn fence_displaced_stepd(
@@ -681,7 +803,7 @@ mod gpu_deny_tests {
     #[test]
     fn nonempty_allocation_leaves_gpu_env_untouched() {
         let mut env = HashMap::new();
-        super::maybe_deny_gpu_env(&mut env, &[0u32, 1]);
+        super::maybe_deny_gpu_env(&mut env, &[0u64, 1]);
         assert!(!env.contains_key("ROCR_VISIBLE_DEVICES"));
     }
 }
@@ -702,7 +824,7 @@ pub struct TrackedJob {
     /// at the agent without passing through the controller.
     user: String,
     partition: String,
-    gpu_devices: Vec<u32>,
+    gpu_devices: Vec<u64>,
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
@@ -733,7 +855,7 @@ struct CompletedJob {
     uid: u32,
     gid: u32,
     partition: String,
-    gpu_devices: Vec<u32>,
+    gpu_devices: Vec<u64>,
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
@@ -787,6 +909,379 @@ async fn teardown_completed_job(
     ));
     allocation.lock().await.release_job(job_id);
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
+}
+
+/// Shared by the periodic monitor tick and a cancel's active wait, so a job
+/// reaped early gets the same epilog/SPANK/completion-report treatment.
+async fn run_completion_hooks_and_report(
+    completed: &[CompletedJob],
+    hooks: &HooksConfig,
+    spank: &Option<SpankHost>,
+    controller_addr: &str,
+) {
+    let mut drain_jobs: HashMap<u32, String> = HashMap::new();
+
+    if let Some(ref epilog_script) = hooks.epilog {
+        for c in completed {
+            let ctx = spur_core::hooks::HookContext {
+                job_id: c.job_id,
+                work_dir: c.work_dir.clone(),
+                uid: c.uid,
+                gid: c.gid,
+                partition: c.partition.clone(),
+                nodelist: c.nodelist.clone(),
+                script_context: "epilog_slurmd".into(),
+                gpu_devices: c.gpu_devices.clone(),
+                cpus: c.cpus,
+                memory_mb: c.memory_mb,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
+                error!(
+                    job_id = c.job_id,
+                    error = %e,
+                    "epilog hook failed — requesting node drain"
+                );
+                drain_jobs.insert(c.job_id, "epilog script failed".into());
+            }
+        }
+    }
+
+    if let Some(ref spank_host) = spank {
+        for c in completed {
+            let context = SpankContext {
+                job_id: c.job_id,
+                uid: c.uid,
+                gid: c.gid,
+                ..Default::default()
+            };
+            let mut handle = SpankHandle::new(context, HashMap::new());
+            if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit, &mut handle) {
+                warn!(c.job_id, error = %e, "SPANK TaskExit hook failed");
+            }
+            if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog, &mut handle) {
+                warn!(c.job_id, error = %e, "SPANK JobEpilog hook failed");
+            }
+        }
+    }
+
+    let local_hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "localhost".into());
+
+    for c in completed {
+        let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
+            reason: reason.clone(),
+        });
+        report_completion(
+            controller_addr,
+            CompletionReport {
+                job_id: c.job_id,
+                exit_code: c.exit_code,
+                signal: c.signal,
+                run_attempt: c.run_attempt,
+                reporting_node: &local_hostname,
+                drain: drain.as_ref(),
+                step_id: None,
+            },
+        )
+        .await;
+    }
+}
+
+/// Bounded so a hung teardown can't stall the cancel RPC past the
+/// controller's own CancelJob timeout.
+const CANCEL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A cancel only warrants an active wait if the signal is expected to end
+/// the process — a non-terminal `scancel --signal` would poll for nothing.
+fn signal_expected_to_terminate(sig: nix::sys::signal::Signal) -> bool {
+    matches!(
+        sig,
+        nix::sys::signal::Signal::SIGKILL | nix::sys::signal::Signal::SIGTERM
+    )
+}
+
+/// Releases a just-signaled job's ledger entry as soon as it exits, closing
+/// the window where an immediate redispatch retry finds the GPU still held.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_exit_and_teardown(
+    job_id: u32,
+    run_attempt: u32,
+    running: &RunningJobs,
+    lifecycle: &crate::job_lifecycle::JobLifecycle,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    mpi_host: &MpiPluginHost,
+    hooks: Arc<HooksConfig>,
+    spank: Arc<Option<SpankHost>>,
+    controller_addr: String,
+) {
+    let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+    loop {
+        let completed = {
+            let mut jobs = running.lock().await;
+            let Some(tracked) = jobs.get_mut(&job_id) else {
+                return;
+            };
+            if tracked.run_attempt != run_attempt {
+                // Superseded by a redispatch while we were waiting; not ours to reap.
+                return;
+            }
+            match tracked.job.try_wait() {
+                Ok(Some((exit_code, mut signal))) => {
+                    let cgroup = tracked.take_cgroup();
+                    if let Some(ref cg) = cgroup {
+                        if crate::executor::cgroup_oom_killed(cg) {
+                            warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
+                            signal |= spur_core::job::OOM_SIGNAL_FLAG;
+                        }
+                    }
+                    info!(job_id, exit_code, signal, "job finished");
+                    let tracked = jobs.remove(&job_id).expect("checked present above");
+                    Some(CompletedJob {
+                        job_id,
+                        exit_code,
+                        signal,
+                        run_attempt: tracked.run_attempt,
+                        rootfs_mode: tracked.rootfs_mode,
+                        cgroup,
+                        work_dir: tracked.work_dir,
+                        uid: tracked.uid,
+                        gid: tracked.gid,
+                        partition: tracked.partition,
+                        gpu_devices: tracked.gpu_devices,
+                        cpus: tracked.cpus,
+                        memory_mb: tracked.memory_mb,
+                        nodelist: tracked.nodelist,
+                        mpi: tracked.mpi,
+                    })
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(job_id, error = %e, "failed to check job status during cancel wait");
+                    None
+                }
+            }
+        };
+        if let Some(c) = completed {
+            teardown_completed_job(&c, lifecycle, running, allocation, mpi_host).await;
+            tokio::spawn(async move {
+                run_completion_hooks_and_report(&[c], &hooks, &spank, &controller_addr).await;
+            });
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                job_id,
+                "job outlived cancel wait bound; monitor tick will reap it"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Grace between an immediate signal and its SIGKILL escalation, for both the
+/// legacy and stepd-supervised graceful-cancel paths.
+const GRACEFUL_CANCEL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Polls until the job's `running` entry clears — via the supervisor's own
+/// completion push, this poll fencing a stepd stuck before `Start`, or (on
+/// deadline) arming the force-reclaim escalation for a wedged supervisor.
+async fn wait_for_stepd_release(
+    job_id: u32,
+    run_attempt: u32,
+    deadline: tokio::time::Instant,
+    context: &CompletionListenerContext,
+) {
+    loop {
+        let still_tracked = context
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|tracked| tracked.run_attempt == run_attempt);
+        if !still_tracked {
+            return;
+        }
+        let candidates = {
+            let sessions = context.stepds.lock().await;
+            stepds_for_attempt(&sessions, job_id, run_attempt)
+        };
+        let mut any_live = false;
+        for descriptor in candidates {
+            if descriptor.pid == 0 {
+                continue;
+            }
+            match crate::stepd::stepd_liveness(&descriptor) {
+                Ok(crate::stepd::StepdLiveness::Stale) => {
+                    fence_dead_stepd(context, descriptor).await;
+                }
+                // An unreadable check must not default to "gone", or it
+                // strands the ledger: never fenced, never escalated either.
+                Ok(crate::stepd::StepdLiveness::Live) | Err(_) => any_live = true,
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Still alive past the active-fence window: not gone, just not
+            // observed to be gone yet by anything gated on stepd_liveness.
+            // Escalate on a wall clock instead of waiting on that oracle.
+            if any_live {
+                spawn_wedged_stepd_force_reclaim(job_id, run_attempt, deadline, context.clone());
+            }
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Backstop for a supervisor that's alive but wedged (frozen, deadlocked, or
+/// stuck in a hung hook) rather than exited — `stepd_liveness` reads a
+/// wedged process identically to a healthy one, so nothing gated on it ever
+/// fires here. Comfortably above the existing escalation stack (this
+/// function's own 3s bound, the 5s graceful-cancel grace period, the 10s
+/// stepd-request timeout), so it never fires during ordinary resolution.
+const STEPD_FORCE_RECLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One poll window between kill retries; the ledger only releases once one
+/// of these confirms the stepd is actually gone, never on a bare timeout.
+const FORCE_KILL_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const FORCE_KILL_CONFIRM_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_RECLAIM_TIMEOUT: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(STEPD_FORCE_RECLAIM_TIMEOUT) };
+}
+
+#[cfg(test)]
+fn force_reclaim_timeout() -> std::time::Duration {
+    FORCE_RECLAIM_TIMEOUT.with(|timeout| timeout.get())
+}
+
+#[cfg(not(test))]
+fn force_reclaim_timeout() -> std::time::Duration {
+    STEPD_FORCE_RECLAIM_TIMEOUT
+}
+
+/// Shortens the force-reclaim window on this thread until dropped.
+#[cfg(test)]
+pub(crate) struct ShortenedForceReclaim(std::time::Duration);
+
+#[cfg(test)]
+impl ShortenedForceReclaim {
+    pub(crate) fn new(duration: std::time::Duration) -> Self {
+        Self(FORCE_RECLAIM_TIMEOUT.with(|timeout| timeout.replace(duration)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShortenedForceReclaim {
+    fn drop(&mut self) {
+        FORCE_RECLAIM_TIMEOUT.with(|timeout| timeout.set(self.0));
+    }
+}
+
+/// Best-effort: SIGKILLs the job's cgroup (reaches forked descendants that
+/// escaped the tracked pid) and the supervisor's own pid directly, since a
+/// wedged supervisor is not guaranteed to be a member of its own cgroup.
+fn force_kill_stepd(descriptor: &crate::stepd::StepdDescriptor) {
+    let cgroup_path = effective_cgroup_path(descriptor);
+    if let Err(error) = crate::executor::cgroup_kill(&cgroup_path) {
+        warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+            "force-reclaim: cgroup kill failed");
+    }
+    if let Err(error) = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(descriptor.pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    ) {
+        warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+            "force-reclaim: SIGKILL to the stepd pid failed");
+    }
+}
+
+/// Spawned once `wait_for_stepd_release`'s own bound elapses with a still-
+/// live descriptor. Waits out the wall-clock force window (from the
+/// original cancel, not from this spawn), then kills and fences
+/// unconditionally — attempt-scoped the same way the active-fence loop is,
+/// so a redispatch that already superseded this attempt is never touched.
+fn spawn_wedged_stepd_force_reclaim(
+    job_id: u32,
+    run_attempt: u32,
+    active_fence_deadline: tokio::time::Instant,
+    context: CompletionListenerContext,
+) {
+    let force_deadline = active_fence_deadline - CANCEL_REAP_TIMEOUT + force_reclaim_timeout();
+    tokio::spawn(async move {
+        tokio::time::sleep_until(force_deadline).await;
+        // `running` and `stepds` are locked in separate statements, never
+        // nested, so this can't invert release_stepd_tracking's stepds ->
+        // running order and deadlock against it.
+        let superseded = context
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_none_or(|tracked| tracked.run_attempt != run_attempt);
+        if superseded {
+            return;
+        }
+        let candidates = {
+            let sessions = context.stepds.lock().await;
+            stepds_for_attempt(&sessions, job_id, run_attempt)
+        };
+        for descriptor in candidates {
+            if descriptor.pid == 0
+                || !matches!(
+                    crate::stepd::stepd_liveness(&descriptor),
+                    Ok(crate::stepd::StepdLiveness::Live)
+                )
+            {
+                continue;
+            }
+            warn!(
+                job_id,
+                run_attempt,
+                pid = descriptor.pid,
+                window_secs = force_reclaim_timeout().as_secs(),
+                "stepd still alive past the force-reclaim window; force-reclaiming"
+            );
+            // Spawned per descriptor: a sibling step that never confirms dead
+            // must not stall fencing of this one, or one wedged step
+            // withholds every other step's resources too.
+            let context = context.clone();
+            tokio::spawn(async move {
+                // Never release on an unconfirmed kill — the workload may
+                // still hold its CPUs/GPUs. Retry instead of giving up; a
+                // fresh liveness check before each kill avoids a reused pid.
+                loop {
+                    force_kill_stepd(&descriptor);
+                    let confirm_deadline = tokio::time::Instant::now() + FORCE_KILL_CONFIRM_POLL;
+                    let mut confirmed_dead = false;
+                    while tokio::time::Instant::now() < confirm_deadline {
+                        if matches!(
+                            crate::stepd::stepd_liveness(&descriptor),
+                            Ok(crate::stepd::StepdLiveness::Stale)
+                        ) {
+                            confirmed_dead = true;
+                            break;
+                        }
+                        tokio::time::sleep(FORCE_KILL_CONFIRM_POLL_INTERVAL).await;
+                    }
+                    if confirmed_dead {
+                        break;
+                    }
+                    warn!(
+                        job_id,
+                        run_attempt,
+                        pid = descriptor.pid,
+                        "could not confirm the stepd was killed after force-reclaim; \
+                         retaining the ledger and retrying rather than releasing it"
+                    );
+                }
+                fence_dead_stepd(&context, descriptor).await;
+            });
+        }
+    });
 }
 
 /// Enforced per-node budget: the controller's allocation wins, the spec is the
@@ -995,9 +1490,8 @@ async fn release_stepd_tracking(
         other.job_id == descriptor.job_id && other.run_attempt == descriptor.run_attempt
     });
 
-    // Hold `running` across the allocation release too — matching the
-    // lock order commit_job uses — so a redispatch racing this can't have
-    // its brand-new allocation torn down by this stale, job_id-keyed release.
+    // Attempt-checked on both maps: `running`'s own check guards its entry,
+    // and `release_job_if` below guards the allocation the same way.
     let removed_tracked = was_last_step && {
         let mut jobs = running.lock().await;
         if jobs
@@ -1005,7 +1499,10 @@ async fn release_stepd_tracking(
             .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
         {
             jobs.remove(&descriptor.job_id);
-            allocation.lock().await.release_job(descriptor.job_id);
+            allocation
+                .lock()
+                .await
+                .release_job_if(descriptor.job_id, descriptor.run_attempt);
             true
         } else {
             false
@@ -1079,11 +1576,15 @@ pub async fn recover_stepds(
 ) {
     let mut jobs = running.lock().await;
     for descriptor in descriptors {
+        let owns_lifetime = spur_core::step::owns_job_lifetime(descriptor.step_id);
         let cgroup_path = (!descriptor.cgroup_path.as_os_str().is_empty())
             .then(|| descriptor.cgroup_path.clone());
         let tracked = jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
             job: executor::RunningJob::AllocationOnly,
-            cgroup_path,
+            // Only the job-owning step's cgroup is the job's own; a step
+            // arriving first in directory order must not seed this from its
+            // own per-step leaf.
+            cgroup_path: owns_lifetime.then(|| cgroup_path.clone()).flatten(),
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: String::new(),
             stderr_path: String::new(),
@@ -1105,9 +1606,10 @@ pub async fn recover_stepds(
         });
         // Sessions arrive in directory order, so only take these from the job's
         // own: a step's spool file and rootfs are the step's, not the job's.
-        if spur_core::step::is_user_step(descriptor.step_id) {
+        if !owns_lifetime {
             continue;
         }
+        tracked.cgroup_path = cgroup_path;
         if !descriptor.stdout_path.is_empty() {
             tracked.stdout_path = descriptor.stdout_path.clone();
         }
@@ -1304,7 +1806,6 @@ pub(crate) fn monitor_recovered_stepds(
     });
 }
 
-const REPARENTED_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 const WORKLOAD_DEATH_POLLS: u32 = 20;
 const WORKLOAD_DEATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const WORKLOAD_PID_POLLS: u32 = 40;
@@ -1423,6 +1924,10 @@ async fn fence_dead_stepd(
             "could not confirm the crashed stepd's cgroup is empty; releasing tracking anyway"
         );
     }
+    // Release the local allocation before reporting, so the controller never
+    // dispatches a new job into this slot before it's actually free.
+    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+
     // The supervisor cannot be recovered, but its death still has to reach the
     // controller: unreported, the job holds its allocation in Running forever.
     let reported = report_completion(
@@ -1452,8 +1957,6 @@ async fn fence_dead_stepd(
             "could not report a dead stepd's completion; the retry loop will replay it"
         );
     }
-
-    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
 
     // The supervisor is gone, so no completion push is coming; without this the
     // RPC that launched this step stays parked for the agent's lifetime.
@@ -1576,6 +2079,16 @@ async fn handle_completion_notification(
             crate::stepd::AgentNotificationResponse::Acknowledged
         }
         Some(descriptor) => {
+            // Release the local allocation before reporting, so the controller
+            // never dispatches a new job into this slot before it's actually free.
+            release_stepd_tracking(
+                &context.running,
+                &context.allocation,
+                &context.stepds,
+                &descriptor,
+                "runtime completion",
+            )
+            .await;
             let reported = report_completion(
                 &context.controller_addr,
                 CompletionReport {
@@ -1589,14 +2102,6 @@ async fn handle_completion_notification(
                     }),
                     step_id: Some(step_id),
                 },
-            )
-            .await;
-            release_stepd_tracking(
-                &context.running,
-                &context.allocation,
-                &context.stepds,
-                &descriptor,
-                "runtime completion",
             )
             .await;
             // A user step's exit ends the RPC that launched it, not the job, so
@@ -1756,6 +2261,9 @@ struct ActiveStep {
     cancel_requested: bool,
     pid: Option<u32>,
     epoch: u64,
+    /// The step's own run_attempt, so a job-wide cancel for one attempt
+    /// can't reach an unsupervised step of a different, still-live one.
+    run_attempt: u32,
     /// Spool files the step's stdout/stderr are redirected to, so
     /// `stream_job_output` can tail them live keyed on (job_id, step_id).
     stdout_path: String,
@@ -2172,20 +2680,220 @@ struct LaunchNamespaces {
     mount: bool,
 }
 
-/// A resumed terminal's shell was reparented to init when its old agent died,
-/// so there is no child handle to wait on; watch the pid instead.
-async fn wait_for_reparented_exit(pid: i32) -> i32 {
-    let path = std::path::PathBuf::from(format!("/proc/{pid}"));
-    while path.exists() {
-        tokio::time::sleep(REPARENTED_EXIT_POLL).await;
-    }
-    0
+/// The interactive step's workload is owned by its own `spurstepd`, not a
+/// child handle the agent can wait on — same as any other supervised step,
+/// its exit arrives over the step-completion channel.
+fn interactive_exit_future(
+    waiter: tokio::sync::oneshot::Receiver<crate::step_completion::StepOutcome>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>> {
+    Box::pin(async move {
+        match waiter.await {
+            Ok(outcome) => spur_core::process::shell_exit_code(&step_exit_status(outcome)),
+            Err(_) => 128,
+        }
+    })
 }
 
-/// A step that builds its own container keeps the agent in its exec path, so it
-/// cannot be handed to a supervisor. Entering a parent job's namespaces can.
-fn step_can_be_supervised(container_image: &str) -> bool {
-    container_image.is_empty()
+/// A one-shot stream reporting an already-recorded exit, for a client that
+/// reconnects after its terminal finished and was reaped before it could
+/// attach — so it gets the real exit code instead of the command re-running.
+fn settled_interactive_stream(
+    exit_code: i32,
+) -> tokio_stream::wrappers::ReceiverStream<Result<InteractiveOutput, Status>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let _ = tx.try_send(Ok(InteractiveOutput {
+        msg: Some(interactive_output::Msg::ExitStatus(exit_code)),
+    }));
+    tokio_stream::wrappers::ReceiverStream::new(rx)
+}
+
+/// A job's `STEP_INTERACTIVE` slot is shared by every `srun --pty` invocation,
+/// so a settled outcome recorded there belongs to this request only if the
+/// last launch to claim it was for the same numbered step — otherwise it is a
+/// different invocation and a stale exit must not be replayed onto it.
+/// `None` (nothing recorded, e.g. after a restart) still trusts the outcome.
+fn settled_outcome_belongs_to_this_invocation(
+    last_launched_step_id: Option<u32>,
+    requested_step_id: u32,
+) -> bool {
+    last_launched_step_id.is_none_or(|last| last == requested_step_id)
+}
+
+/// What a step's own `--container-image` resolves to once weighed against
+/// whether its parent job already provides one to join.
+enum StepContainerPlan {
+    /// No image requested, or requested but a live containerized parent takes
+    /// priority — the step joins the parent's namespaces instead.
+    None,
+    /// No containerized parent to join: build a fresh rootfs for this step.
+    Fresh(spur_proto::proto::ContainerSpec),
+}
+
+fn resolve_step_container_plan(
+    container: Option<&spur_proto::proto::ContainerSpec>,
+    joins_parent_namespaces: bool,
+) -> StepContainerPlan {
+    let Some(c) = container.filter(|c| !c.image.is_empty()) else {
+        return StepContainerPlan::None;
+    };
+    if joins_parent_namespaces {
+        return StepContainerPlan::None;
+    }
+    StepContainerPlan::Fresh(c.clone())
+}
+
+/// Everything needed to resolve an image and stage a fresh rootfs for a
+/// step building its own container rather than joining a parent's.
+struct ContainerLaunchRequest {
+    image: String,
+    mounts: Vec<String>,
+    workdir: Option<String>,
+    name: Option<String>,
+    readonly: bool,
+    mount_home: bool,
+    remap_root: bool,
+    gpu_devices: Vec<u64>,
+    environment: HashMap<String, String>,
+    container_env: HashMap<String, String>,
+    entrypoint: Option<String>,
+    uid: u32,
+    gid: u32,
+    username: String,
+    home_dir: String,
+    device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
+    resolve_user: Option<String>,
+    rootfs_base: String,
+}
+
+fn build_container_launch(
+    cluster_id: &str,
+    allow_root_jobs: bool,
+    req: ContainerLaunchRequest,
+) -> Result<
+    (
+        executor::ContainerLaunchConfig,
+        crate::container::RootfsMode,
+    ),
+    Status,
+> {
+    let mounts: Vec<crate::container::BindMount> = req
+        .mounts
+        .iter()
+        .filter_map(|m| crate::container::parse_mount(m).ok())
+        .collect();
+
+    let mut cfg = crate::container::ContainerConfig {
+        image: req.image.clone(),
+        mounts,
+        workdir: req.workdir,
+        name: req.name,
+        readonly: req.readonly,
+        mount_home: req.mount_home,
+        remap_root: req.remap_root,
+        gpu_devices: req.gpu_devices,
+        environment: req.environment,
+        container_env: req.container_env,
+        entrypoint: req.entrypoint,
+        uid: req.uid,
+        gid: req.gid,
+        username: if req.username.is_empty() {
+            "spur".to_string()
+        } else {
+            req.username
+        },
+        home_dir: req.home_dir,
+        device_plan: req.device_plan,
+    };
+    crate::container::maybe_bind_auth_socket(&mut cfg.mounts, cluster_id, req.uid, allow_root_jobs);
+
+    let image_path =
+        crate::container::resolve_image(&req.image, req.resolve_user.as_deref(), Some(req.uid))
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+    let (rootfs, rootfs_mode) =
+        crate::container::setup_rootfs(&image_path, &req.rootfs_base, cfg.name.as_deref())
+            .map_err(|e| Status::internal(format!("container setup failed: {e}")))?;
+
+    Ok((
+        executor::ContainerLaunchConfig {
+            config: cfg,
+            rootfs,
+        },
+        rootfs_mode,
+    ))
+}
+
+/// Per-caller inputs to [`stage_fresh_container_step`] that a supervised
+/// step and an interactive session resolve differently before converging on
+/// the shared build-and-stage path.
+struct FreshContainerContext {
+    gpu_devices: Vec<u64>,
+    device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
+    uid: u32,
+    gid: u32,
+    username: String,
+    home_dir: String,
+    environment: HashMap<String, String>,
+    workdir_default: Option<String>,
+    rootfs_base: String,
+}
+
+/// Builds a `StepContainerPlan::Fresh` step's rootfs and stages its in-rootfs
+/// entry script. Shared by `run_command`'s supervised path and the
+/// interactive session's fresh-launch path, which only differ in how they
+/// resolve `FreshContainerContext` beforehand.
+fn stage_fresh_container_step(
+    cluster_id: &str,
+    allow_root_jobs: bool,
+    c: &spur_proto::proto::ContainerSpec,
+    ctx: FreshContainerContext,
+    job_id: u32,
+    step_script: &str,
+) -> Result<
+    (
+        executor::ContainerLaunchConfig,
+        crate::container::RootfsMode,
+    ),
+    Status,
+> {
+    let mut container_env = c.env.clone();
+    maybe_deny_gpu_env(&mut container_env, &ctx.gpu_devices);
+    let (launch, rootfs_mode) = build_container_launch(
+        cluster_id,
+        allow_root_jobs,
+        ContainerLaunchRequest {
+            image: c.image.clone(),
+            mounts: c.mounts.clone(),
+            workdir: (!c.workdir.is_empty())
+                .then(|| c.workdir.clone())
+                .or(ctx.workdir_default),
+            name: (!c.name.is_empty()).then(|| c.name.clone()),
+            readonly: c.readonly,
+            mount_home: c.mount_home,
+            remap_root: c.remap_root,
+            gpu_devices: ctx.gpu_devices,
+            environment: ctx.environment,
+            container_env,
+            entrypoint: (!c.entrypoint.is_empty()).then(|| c.entrypoint.clone()),
+            uid: ctx.uid,
+            gid: ctx.gid,
+            username: ctx.username,
+            home_dir: ctx.home_dir,
+            device_plan: ctx.device_plan,
+            resolve_user: None,
+            rootfs_base: ctx.rootfs_base,
+        },
+    )?;
+    // `executor::launch_job`'s container path execs this fixed in-container
+    // path unconditionally for every freshly-containerized step.
+    let container_script = format!("{}/tmp/spur_job_{job_id}.sh", launch.rootfs.display());
+    std::fs::write(&container_script, step_script)
+        .map_err(|e| Status::internal(format!("failed to write container script: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&container_script, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok((launch, rootfs_mode))
 }
 
 /// The plan a step's supervisor hosts its PMIx server from. Re-keyed to the step
@@ -2230,18 +2938,55 @@ fn supervised_step_script(
     job_entry: &crate::job_entry::JobEntry,
     uid: u32,
     gid: u32,
+    work_dir: &str,
     command: &[String],
 ) -> Result<String, Status> {
     if !(job_entry.has_namespaces() && job_entry.pid > 0) {
         return build_one_shot_command_script(command);
     }
     let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid);
-    let plan = build_launch_plan(job_entry, priv_drop.as_ref(), command);
+    // Enter the step's work_dir *inside* the container by cd-ing in a shell
+    // that runs after nsenter — a host-side chdir does not survive entering
+    // the container's pivoted mount namespace, and nsenter --wd is unreliable
+    // under a rootless user namespace. The cd is best-effort (`;`, not `&&`)
+    // so a work_dir absent inside the container still runs the command
+    // rather than failing it.
+    let inner = shlex::try_join(command.iter().map(String::as_str))
+        .map_err(|e| Status::invalid_argument(format!("step command is not shell-safe: {e}")))?;
+    let wd = shlex::try_quote(work_dir)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| work_dir.to_string());
+    let namespaced_command = [
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!("cd {wd} 2>/dev/null; exec {inner}"),
+    ];
+    let plan = build_launch_plan(job_entry, priv_drop.as_ref(), &namespaced_command);
     let entering = shlex::try_join(
         std::iter::once(plan.program.as_str()).chain(plan.args.iter().map(String::as_str)),
     )
     .map_err(|e| Status::invalid_argument(format!("step command is not shell-safe: {e}")))?;
     Ok(format!("#!/bin/bash\nexec {entering}\n"))
+}
+
+/// The script an interactive session's own supervised launch runs. Empty argv
+/// means "just give me a shell" — reuses the same namespace-entering plan
+/// `supervised_step_script` already builds for a job with a containerized
+/// parent, so an interactive shell composes with that the same way any other
+/// step does.
+fn interactive_step_script(
+    job_entry: &crate::job_entry::JobEntry,
+    uid: u32,
+    gid: u32,
+    argv: &[String],
+) -> Result<String, Status> {
+    let default_shell = ["/bin/bash".to_string()];
+    let command = if argv.is_empty() {
+        &default_shell[..]
+    } else {
+        argv
+    };
+    supervised_step_script(job_entry, uid, gid, &job_entry.work_dir, command)
 }
 
 /// The same shape RunCommand would have returned, output included: a user
@@ -2281,25 +3026,58 @@ fn step_exit_status(outcome: crate::step_completion::StepOutcome) -> std::proces
     }
 }
 
+/// Builds a fresh interactive step's process environment, in the same
+/// precedence the old direct-fork paths used: a `TERM` default, the job's own
+/// session, its `SPUR_JOB_ID`/`SLURM_JOB_ID`, then host or fresh-container
+/// identity vars — later layers win so a fresh container's own GPU/identity
+/// vars are never shadowed by the parent session's.
+fn interactive_step_environment(
+    session_env: Vec<(String, String)>,
+    job_env_vars: Vec<(String, String)>,
+    host_identity_env: Option<HashMap<String, String>>,
+    fresh_container_env: Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let mut environment: HashMap<String, String> =
+        [("TERM".to_string(), "xterm-256color".to_string())].into();
+    environment.extend(session_env);
+    environment.extend(job_env_vars);
+    if let Some(host_identity) = host_identity_env {
+        environment.extend(host_identity);
+    }
+    if let Some(fresh) = fresh_container_env {
+        environment.extend(fresh);
+    }
+    environment
+}
+
 /// The supervisor forks the workload after the gate opens, so its pid is not
-/// available the instant `start_job` returns.
+/// available the instant `start_job` returns. Its control socket does not
+/// start serving requests until that fork (openpty, container rootfs staging,
+/// priv drop for a fresh container) has finished, so an early query can race
+/// a supervisor that is not listening yet — that is a "not ready", not a
+/// "never will be", so it is retried like a bare `job_pid == 0` rather than
+/// aborting the whole poll on its first attempt.
 async fn supervised_step_workload_pid(descriptor: &crate::stepd::StepdDescriptor) -> Option<u32> {
     for _ in 0..WORKLOAD_PID_POLLS {
         match crate::stepd::query_state(descriptor, uuid::Uuid::new_v4().to_string()).await {
             Ok(snapshot) if snapshot.job_pid > 0 => return Some(snapshot.job_pid as u32),
             Ok(_) => {}
             Err(error) => {
-                warn!(
+                trace!(
                     job_id = descriptor.job_id,
                     step_id = descriptor.step_id,
                     %error,
-                    "could not read the supervised step's workload pid"
+                    "workload pid query did not answer yet; retrying"
                 );
-                return None;
             }
         }
         tokio::time::sleep(WORKLOAD_PID_POLL_INTERVAL).await;
     }
+    warn!(
+        job_id = descriptor.job_id,
+        step_id = descriptor.step_id,
+        "gave up waiting for the supervised step to report a workload pid"
+    );
     None
 }
 
@@ -2352,21 +3130,12 @@ async fn run_tokio_step_to_spool(
     }
 }
 
-/// What a containerized child execs after `container_init`. Both the buffered
-/// step (a script file inside the rootfs) and the interactive PTY step (an
-/// interactive shell or inline command) route through the same fork core.
+/// What a containerized child execs after `container_init`: a script file
+/// inside the rootfs, the buffered step path.
 enum StepChildCommand {
-    /// Run `[entrypoint &&] <shell> <script_path>` — the buffered step path.
+    /// Run `[entrypoint &&] <shell> <script_path>`.
     Script {
         script_path: String,
-        entrypoint: Option<String>,
-    },
-    /// Exec an interactive shell in place. `None` cmdline = the image's default
-    /// shell; `Some(cmdline)` runs `<shell> -c "exec <cmdline>"` so the workload
-    /// replaces the shell (keeping the PTY session leader as the real process,
-    /// which job control and Ctrl-C depend on).
-    Shell {
-        cmdline: Option<String>,
         entrypoint: Option<String>,
     },
 }
@@ -2380,10 +3149,6 @@ fn reject_nul_bytes(cmd: &StepChildCommand) -> Result<(), Status> {
             script_path,
             entrypoint,
         } => [Some(script_path.as_str()), entrypoint.as_deref()],
-        StepChildCommand::Shell {
-            cmdline,
-            entrypoint,
-        } => [cmdline.as_deref(), entrypoint.as_deref()],
     };
     for s in strings.into_iter().flatten() {
         if s.as_bytes().contains(&0) {
@@ -2395,11 +3160,10 @@ fn reject_nul_bytes(cmd: &StepChildCommand) -> Result<(), Status> {
     Ok(())
 }
 
-/// Runs in a freshly forked child after its stdio has been wired (spool fds or a
-/// PTY slave): joins the job cgroup while still root, runs `container_init`
+/// Runs in a freshly forked child after its stdio has been wired to the spool
+/// files: joins the job cgroup while still root, runs `container_init`
 /// (namespace unshare, mounts, device injection, pivot_root, priv drop), signals
-/// readiness on `ready_w`, then execs `cmd`. Never returns. The whole namespace
-/// setup is shared by the buffered and PTY containerized-step paths.
+/// readiness on `ready_w`, then execs `cmd`. Never returns.
 fn container_child_exec(
     container_cfg: &crate::container::ContainerConfig,
     rootfs: &std::path::Path,
@@ -2467,27 +3231,6 @@ fn container_child_exec(
             ],
             None => vec![c_shell.clone(), cstr(&script_path)],
         },
-        StepChildCommand::Shell {
-            cmdline,
-            entrypoint,
-        } => match (cmdline, entrypoint) {
-            (None, None) => vec![c_shell.clone()],
-            (Some(cmd), None) => vec![c_shell.clone(), cstr("-c"), cstr(&format!("exec {cmd}"))],
-            (None, Some(ep)) => {
-                vec![
-                    c_shell.clone(),
-                    cstr("-c"),
-                    cstr(&format!("{ep} && exec {shell}")),
-                ]
-            }
-            (Some(cmd), Some(ep)) => {
-                vec![
-                    c_shell.clone(),
-                    cstr("-c"),
-                    cstr(&format!("{ep} && exec {cmd}")),
-                ]
-            }
-        },
     };
     let c_env: Vec<std::ffi::CString> = final_env
         .iter()
@@ -2539,17 +3282,6 @@ fn container_parent_ready(
         ));
     }
     Ok(())
-}
-
-/// Reap a directly-forked child and map its wait status to a shell-style exit
-/// code (128 + signal when killed). Used by the PTY bridge to await a container
-/// step that was forked raw (no `tokio::process::Child` to `wait()` on).
-fn waitpid_exit_code(pid: nix::unistd::Pid) -> i32 {
-    match nix::sys::wait::waitpid(pid, None) {
-        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
-        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
-        _ => 128,
-    }
 }
 
 /// Launch a step command inside a fresh container rootfs, wiring the step's
@@ -2701,10 +3433,18 @@ pub struct AgentService {
     /// Jobs this agent is currently bridging a terminal for. A job absent here
     /// with a terminal in custody has been orphaned by a restart.
     live_ptys: Arc<Mutex<std::collections::HashSet<u32>>>,
+    /// The numbered step id (a distinct `CreateJobStep` per `srun --pty`
+    /// invocation) whose launch most recently claimed a job's single
+    /// `STEP_INTERACTIVE` slot — so a settled outcome from a *different*
+    /// invocation is never replayed onto a genuinely new one. Absent after a
+    /// restart, in which case a settled outcome is still trusted.
+    interactive_launch_steps: Arc<Mutex<HashMap<(u32, u32), u32>>>,
     /// Serializes setup against teardown for a job id, which a re-dispatch reuses.
     lifecycle: crate::job_lifecycle::JobLifecycle,
     stepds: Arc<Mutex<StepdMap>>,
     stepd_state_dir: std::path::PathBuf,
+    /// Candidate roots `RunCommand`'s job spool is created under, in order.
+    job_spool_roots: Vec<std::path::PathBuf>,
     /// Unit tests exercise launch mechanics without a built `spurstepd`, so they
     /// keep the legacy path. Production always supervises.
     #[cfg(test)]
@@ -2714,6 +3454,13 @@ pub struct AgentService {
     /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
     /// path through a real RPC on an unprivileged runner.
     spurd_is_root: bool,
+    /// Native plugin handshake advertised on Ping. Empty when plugin is not `spur`.
+    auth_audience: String,
+    auth_epoch: u64,
+    cluster_id: String,
+    cred_keys: Option<Arc<spur_core::native_jwks::Ed25519VerifyKeySet>>,
+    launch_acceptance: Arc<spur_core::native_exec::LaunchAcceptance>,
+    auth_policy: spur_core::config::AuthConfig,
 }
 
 impl AgentService {
@@ -2770,7 +3517,7 @@ impl AgentService {
             hostname::get()
                 .map(|h| h.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "unknown".into()),
-            &reporter.resources,
+            &reporter.snapshot_resources(),
         );
 
         // Load SPANK plugins from plugstack.conf if available
@@ -2832,6 +3579,7 @@ impl AgentService {
             active_steps: Arc::new(Mutex::new(HashMap::new())),
             step_completions: crate::step_completion::StepCompletions::new(),
             live_ptys: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            interactive_launch_steps: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -2839,8 +3587,15 @@ impl AgentService {
             stepd_state_dir: std::env::var("SPUR_STEPD_STATE_DIR")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("/var/spool/spur")),
+            job_spool_roots: executor::default_job_spool_candidates(),
             allow_root_jobs,
             spurd_is_root: crate::privdrop::spurd_runs_as_root(),
+            auth_audience: String::new(),
+            auth_epoch: 0,
+            cluster_id: String::new(),
+            cred_keys: None,
+            launch_acceptance: Arc::new(spur_core::native_exec::LaunchAcceptance::new()),
+            auth_policy: spur_core::config::AuthConfig::default(),
         }
     }
 
@@ -2866,8 +3621,31 @@ impl AgentService {
         self.k0s.clone()
     }
 
+    pub fn apply_auth_handshake(&mut self, bearer: &spur_core::auth::BearerAuth) {
+        let (audience, epoch) = bearer.advertised_handshake();
+        self.auth_audience = audience;
+        self.auth_epoch = epoch;
+        if let Some(native) = &bearer.native {
+            self.cluster_id = native.cluster_id.clone();
+            self.cred_keys = native.cred_keys.clone();
+        }
+    }
+
+    pub fn apply_auth_policy(&mut self, auth: &spur_core::config::AuthConfig) {
+        self.auth_policy = auth.clone();
+        self.allow_root_jobs = auth.allow_root_jobs;
+    }
+
     pub fn with_runtime_state_dir(mut self, state_dir: impl Into<std::path::PathBuf>) -> Self {
         self.stepd_state_dir = state_dir.into();
+        self
+    }
+
+    /// Overrides `RunCommand`'s job-spool candidates so a test can force a
+    /// deterministic failure without depending on the runner's uid.
+    #[cfg(test)]
+    fn with_job_spool_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
+        self.job_spool_roots = roots;
         self
     }
 
@@ -2887,7 +3665,21 @@ impl AgentService {
                 );
                 descriptor.cgroup_path = std::path::PathBuf::new();
             }
-            sessions.insert(stepd_key(&descriptor), descriptor);
+            sessions.insert(stepd_key(&descriptor), descriptor.clone());
+            if let (Some(id), Some(digest)) = (
+                decode_fixed_b64::<{ spur_core::native_cred::CREDENTIAL_ID_LEN }>(
+                    &descriptor.cred_id,
+                ),
+                decode_fixed_b64::<{ spur_core::native_cred::DIGEST_LEN }>(&descriptor.cred_digest),
+            ) {
+                self.launch_acceptance.restore(
+                    descriptor.job_id,
+                    descriptor.step_id,
+                    descriptor.run_attempt,
+                    id,
+                    digest,
+                );
+            }
         }
     }
 
@@ -2913,20 +3705,43 @@ impl AgentService {
                      under-counted until it ends"
                 );
             }
+            // A legacy descriptor holds positional ids that no longer match the
+            // BDF-anchored stable_ids; translate through the live inventory so
+            // the adopt succeeds instead of leaving the job's GPUs reading free.
+            let translated = translate_legacy_gpu_ids(&resources.gpu_devices, &allocation.gpus);
+            let gpu_ids: Vec<u64> = match &translated {
+                Some(stable_ids) => {
+                    info!(
+                        job_id = descriptor.job_id,
+                        recorded = ?resources.gpu_devices,
+                        stable_ids = ?stable_ids,
+                        "translated a legacy positional gpu recording to stable_ids on adopt"
+                    );
+                    stable_ids.clone()
+                }
+                None => resources.gpu_devices.clone(),
+            };
             match allocation.restore_for_job(
                 descriptor.job_id,
                 descriptor.run_attempt,
                 &cpu_ids,
                 resources.memory_mb,
-                &resources.gpu_devices,
+                &gpu_ids,
             ) {
-                Ok(_) => info!(
-                    job_id = descriptor.job_id,
-                    run_attempt = descriptor.run_attempt,
-                    cpus = cpu_ids.len(),
-                    gpus = resources.gpu_devices.len(),
-                    "restored an adopted job's allocation"
-                ),
+                Ok(_) => {
+                    // Rewrite the descriptor forward so the translation is
+                    // one-time; harmless if it fails — restore re-translates.
+                    if let Some(stable_ids) = translated {
+                        rewrite_descriptor_gpu_ids(&self.stepd_state_dir, descriptor, stable_ids);
+                    }
+                    info!(
+                        job_id = descriptor.job_id,
+                        run_attempt = descriptor.run_attempt,
+                        cpus = cpu_ids.len(),
+                        gpus = gpu_ids.len(),
+                        "restored an adopted job's allocation"
+                    )
+                }
                 // Refusing to serve would strand the adopted job with no agent to
                 // report it, and nothing reconciles a job the ledger never saw.
                 Err(error) => warn!(
@@ -3004,6 +3819,12 @@ impl AgentService {
         self.stepds.clone()
     }
 
+    /// The live per-node allocation, for the periodic inventory-refresh task to
+    /// read held stable ids and apply fresh capacity without an RPC round-trip.
+    pub fn allocation_handle(&self) -> Arc<Mutex<NodeAllocation>> {
+        self.allocation.clone()
+    }
+
     /// The job's own process, asked of its supervisor over the control socket —
     /// live state, so it is not kept in the durable descriptor.
     async fn supervised_state(&self, job_id: u32) -> Option<crate::stepd::StepdSnapshot> {
@@ -3027,8 +3848,10 @@ impl AgentService {
         &self,
         cfg: &executor::JobLaunchConfig,
         pmix: Option<crate::stepd::StepdPmix>,
+        container_rootfs_mode: Option<crate::container::RootfsMode>,
         step_files: crate::executor::StepOutputFiles,
         step_key: (u32, u32),
+        persist_cred: (String, String, String),
     ) -> Result<Option<std::process::ExitStatus>, Status> {
         let (job_id, step_id) = step_key;
         let run_attempt = cfg.run_attempt;
@@ -3060,10 +3883,13 @@ impl AgentService {
             StepdLaunchOptions {
                 step_id,
                 allocation_only: false,
-                container_rootfs_mode: None,
+                container_rootfs_mode,
                 hooks: (*self.hooks).clone(),
                 plugstack_path: self.plugstack_path.clone(),
                 pmix,
+                cred_id: persist_cred.0,
+                cred_kid: persist_cred.1,
+                cred_digest: persist_cred.2,
             },
         )
         .await;
@@ -3073,6 +3899,7 @@ impl AgentService {
                 self.step_completions
                     .deregister(job_id, run_attempt, step_id)
                     .await;
+                self.drain_on_node_fault(&error, job_id);
                 return Err(Status::internal(format!(
                     "step supervisor failed to start: {error}"
                 )));
@@ -3140,6 +3967,136 @@ impl AgentService {
         }
     }
 
+    /// Launch the interactive session's own workload through `spurstepd`,
+    /// keyed by the reserved `STEP_INTERACTIVE` id (not a numbered step_id,
+    /// which `sattach`/`srun --pty` reuse). Unlike `run_supervised_step_to_spool`,
+    /// this returns once the supervisor has started — not once the workload
+    /// exits — so the caller can bridge output while a separate waiter (also
+    /// returned) resolves later, from inside that bridge.
+    async fn launch_interactive_step(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        cfg: &executor::JobLaunchConfig,
+        container_rootfs_mode: Option<crate::container::RootfsMode>,
+    ) -> Result<
+        (
+            crate::stepd::StepdDescriptor,
+            tokio::sync::oneshot::Receiver<crate::step_completion::StepOutcome>,
+        ),
+        Status,
+    > {
+        let step_id = spur_core::step::STEP_INTERACTIVE;
+
+        fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "failed to fence a stale terminal supervisor: {error}"
+                ))
+            })?;
+
+        // Registered before the spawn: a step that outruns this RPC would
+        // otherwise deliver its exit status to nobody.
+        let waiter = self
+            .step_completions
+            .register(job_id, run_attempt, step_id)
+            .await;
+
+        let launched = launch_stepd(
+            cfg,
+            run_attempt,
+            &self.reporter.controller_addr,
+            &self.reporter.hostname,
+            &self.stepd_state_dir,
+            StepdLaunchOptions {
+                step_id,
+                allocation_only: false,
+                container_rootfs_mode,
+                hooks: (*self.hooks).clone(),
+                plugstack_path: self.plugstack_path.clone(),
+                pmix: None,
+                cred_id: String::new(),
+                cred_kid: String::new(),
+                cred_digest: String::new(),
+            },
+        )
+        .await;
+        let descriptor = match launched {
+            Ok((_, descriptor)) => descriptor,
+            Err(error) => {
+                self.step_completions
+                    .deregister(job_id, run_attempt, step_id)
+                    .await;
+                self.drain_on_node_fault(&error, job_id);
+                return Err(Status::internal(format!(
+                    "terminal supervisor failed to start: {error}"
+                )));
+            }
+        };
+
+        if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor.clone()).await {
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
+            discard_stepd_session(&descriptor).await;
+            return Err(Status::aborted(
+                "terminal supervisor superseded before it could be tracked",
+            ));
+        }
+
+        if let Err(error) =
+            crate::stepd::start_job(&descriptor, uuid::Uuid::new_v4().to_string()).await
+        {
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
+            if let Err(stop_error) = stop_stepd_process(&descriptor).await {
+                warn!(job_id, %stop_error, "failed to stop an unreleased terminal supervisor");
+            }
+            release_stepd_tracking(
+                &self.running,
+                &self.allocation,
+                &self.stepds,
+                &descriptor,
+                "interactive step could not be released",
+            )
+            .await;
+            return Err(Status::internal(format!(
+                "failed to release the terminal supervisor: {error}"
+            )));
+        }
+
+        Ok((descriptor, waiter))
+    }
+
+    /// Tears down a `STEP_INTERACTIVE` stepd that launched successfully but
+    /// that this call cannot hand off to a client — otherwise it leaks as a
+    /// live supervisor and workload nobody ever attaches to.
+    async fn abandon_interactive_launch(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_key: (u32, u32),
+        descriptor: &crate::stepd::StepdDescriptor,
+    ) {
+        self.active_steps.lock().await.remove(&step_key);
+        self.step_completions
+            .deregister(job_id, run_attempt, spur_core::step::STEP_INTERACTIVE)
+            .await;
+        if let Err(error) = stop_stepd_process(descriptor).await {
+            warn!(job_id, %error, "failed to stop an abandoned terminal supervisor");
+        }
+        release_stepd_tracking(
+            &self.running,
+            &self.allocation,
+            &self.stepds,
+            descriptor,
+            "interactive session failed after launch",
+        )
+        .await;
+    }
+
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
         StepdRecoveryCleanup {
             running: self.running.clone(),
@@ -3158,6 +4115,29 @@ impl AgentService {
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
         }
+    }
+
+    /// Spawns the release wait (and force-reclaim escalation) for a
+    /// supervised job's cancel immediately, independent of the stepd-socket
+    /// round trip a caller may still attempt afterward. The controller's own
+    /// CancelJob RPC gives up after a few seconds — shorter than a stepd
+    /// control-socket request can legitimately take against a wedged
+    /// supervisor — and drops the in-flight call, which aborts this whole
+    /// handler on the agent. Anything that hasn't been spawned onto the
+    /// runtime by then simply never runs, so this can't be sequenced after
+    /// the signal attempt without risking never running at all.
+    fn spawn_stepd_release_wait(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> tokio::task::JoinHandle<()> {
+        let context = self.completion_listener_context();
+        tokio::spawn(async move {
+            // The caller already validated run_attempt via runs_attempt; a
+            // fresh running read here could pick up a newer attempt instead.
+            let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+            wait_for_stepd_release(job_id, run_attempt, deadline, &context).await;
+        })
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
@@ -3237,80 +4217,7 @@ impl AgentService {
                     reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
                 }
 
-                let local_hostname = hostname::get()
-                    .map(|h| h.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "localhost".into());
-
-                // job_id -> drain reason, piggybacked on each job's completion
-                // report so the node goes idle-and-drained in one message (no
-                // window where a bad node looks schedulable).
-                let mut drain_jobs: std::collections::HashMap<u32, String> =
-                    std::collections::HashMap::new();
-
-                // Run epilog hook for completed jobs
-                if let Some(ref epilog_script) = hooks.epilog {
-                    for c in &completed {
-                        let ctx = spur_core::hooks::HookContext {
-                            job_id: c.job_id,
-                            work_dir: c.work_dir.clone(),
-                            uid: c.uid,
-                            gid: c.gid,
-                            partition: c.partition.clone(),
-                            nodelist: c.nodelist.clone(),
-                            script_context: "epilog_slurmd".into(),
-                            gpu_devices: c.gpu_devices.clone(),
-                            cpus: c.cpus,
-                            memory_mb: c.memory_mb,
-                        };
-                        if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
-                            error!(
-                                job_id = c.job_id,
-                                error = %e,
-                                "epilog hook failed — requesting node drain"
-                            );
-                            drain_jobs.insert(c.job_id, "epilog script failed".into());
-                        }
-                    }
-                }
-
-                // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
-                if let Some(ref spank_host) = *spank {
-                    for c in &completed {
-                        let context = SpankContext {
-                            job_id: c.job_id,
-                            uid: c.uid,
-                            gid: c.gid,
-                            ..Default::default()
-                        };
-                        let mut handle = SpankHandle::new(context, HashMap::new());
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit, &mut handle) {
-                            warn!(c.job_id, error = %e, "SPANK TaskExit hook failed");
-                        }
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog, &mut handle) {
-                            warn!(c.job_id, error = %e, "SPANK JobEpilog hook failed");
-                        }
-                    }
-                }
-
-                for c in &completed {
-                    let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
-                        reason: reason.clone(),
-                    });
-                    report_completion(
-                        &controller_addr,
-                        CompletionReport {
-                            job_id: c.job_id,
-                            exit_code: c.exit_code,
-                            signal: c.signal,
-                            run_attempt: c.run_attempt,
-                            reporting_node: &local_hostname,
-                            drain: drain.as_ref(),
-                            // Unsupervised path: the report speaks for the job.
-                            step_id: None,
-                        },
-                    )
-                    .await;
-                }
+                run_completion_hooks_and_report(&completed, &hooks, &spank, &controller_addr).await;
             }
         });
     }
@@ -3939,6 +4846,9 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
                 );
                 ControllerRpcError::Connect(e)
             })?;
+        let mut client = crate::controller_auth::wrap(channel)
+            .await
+            .map_err(ControllerRpcError::Rpc)?;
         let req = ReportJobStatusRequest {
             step_id,
             job_id,
@@ -3951,18 +4861,15 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
             reporting_node: reporting_node.to_string(),
             run_attempt,
         };
-        spur_proto::controller_client(channel)
-            .report_job_status(req)
-            .await
-            .map_err(|e| {
-                warn!(
-                    job_id,
-                    attempt,
-                    error = %e,
-                    "ReportJobStatus RPC failed"
-                );
-                ControllerRpcError::Rpc(e)
-            })
+        client.report_job_status(req).await.map_err(|e| {
+            warn!(
+                job_id,
+                attempt,
+                error = %e,
+                "ReportJobStatus RPC failed"
+            );
+            ControllerRpcError::Rpc(e)
+        })
     })
     .await;
 
@@ -4024,23 +4931,23 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
                 );
                 ControllerRpcError::Connect(e)
             })?;
+        let mut client = crate::controller_auth::wrap(channel)
+            .await
+            .map_err(ControllerRpcError::Rpc)?;
         let req = DrainNodeRequest {
             name: node_name.to_string(),
             reason: reason.to_string(),
         };
-        spur_proto::controller_client(channel)
-            .drain_node(req)
-            .await
-            .map_err(|e| {
-                warn!(
-                    job_id,
-                    node = %node_name,
-                    attempt,
-                    error = %e,
-                    "DrainNode RPC failed"
-                );
-                ControllerRpcError::Rpc(e)
-            })
+        client.drain_node(req).await.map_err(|e| {
+            warn!(
+                job_id,
+                node = %node_name,
+                attempt,
+                error = %e,
+                "DrainNode RPC failed"
+            );
+            ControllerRpcError::Rpc(e)
+        })
     })
     .await;
 
@@ -4068,10 +4975,36 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
     }
 }
 
+/// Reject a dispatch whose stamped inventory generation no longer matches this
+/// node's live generation, so an out-of-band GPU repartition between schedule
+/// and launch cannot bind a job to devices that have since been renumbered.
+/// A zero on either side is unset/legacy and skips the check for compatibility
+/// with controllers and Raft entries predating the generation field.
+fn check_dispatch_generation(dispatch: u64, live: u64) -> Result<(), Status> {
+    if dispatch != 0 && live != 0 && dispatch != live {
+        return Err(Status::failed_precondition(format!(
+            "dispatch made against stale node inventory generation {dispatch} != {live}"
+        )));
+    }
+    Ok(())
+}
+
 #[tonic::async_trait]
 impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
     type InteractiveSessionStream = ReceiverStream<Result<InteractiveOutput, Status>>;
+
+    async fn ping(&self, _request: Request<()>) -> Result<Response<PingResponse>, Status> {
+        Ok(Response::new(PingResponse {
+            hostname: self.reporter.hostname.clone(),
+            server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            version: env!("CARGO_PKG_VERSION").into(),
+            federation_peers: Vec::new(),
+            cluster_name: String::new(),
+            auth_audience: self.auth_audience.clone(),
+            auth_epoch: self.auth_epoch,
+        }))
+    }
 
     async fn launch_job(
         &self,
@@ -4079,6 +5012,68 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<LaunchJobResponse>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        let spec = req
+            .spec
+            .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+        let mut persist_cred = (String::new(), String::new(), String::new());
+        if let Some(keys) = &self.cred_keys {
+            if req.execution_credential.is_empty() {
+                spur_core::native_metrics::inc_exec_fail();
+                return Err(Status::unauthenticated("execution credential required"));
+            }
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            let cred = spur_core::native_exec::verify_execution(
+                &req.execution_credential,
+                keys,
+                &self.cluster_id,
+                now,
+            )
+            .map_err(map_exec_err)?;
+            cred.require_kind(spur_core::native_cred::CredentialKind::Job)
+                .map_err(map_exec_err)?;
+            let hostname = if req.target_node.is_empty() {
+                self.reporter.hostname.as_str()
+            } else {
+                req.target_node.as_str()
+            };
+            cred.require_node(hostname).map_err(map_exec_err)?;
+            cred.require_run_attempt(req.run_attempt)
+                .map_err(map_exec_err)?;
+            cred.require_unix(spec.uid, spec.gid)
+                .map_err(map_exec_err)?;
+            let digest = spur_core::native_exec::command_digest(
+                &spec.script,
+                &spec.argv,
+                &spec.container_image,
+            );
+            cred.require_command_digest(&digest).map_err(map_exec_err)?;
+            let (cpus, memory_mb, devices) = proto_slice_devices(&req.allocated);
+            cred.require_slice(hostname, cpus, memory_mb, &devices)
+                .map_err(map_exec_err)?;
+            persist_cred = persist_execution_meta(&cred);
+            match self.launch_acceptance.accept(&cred) {
+                Ok(true) => spur_core::native_metrics::inc_exec_ok(),
+                Ok(false) => {
+                    spur_core::native_metrics::inc_exec_ok();
+                    let paths = self
+                        .running
+                        .lock()
+                        .await
+                        .get(&req.job_id)
+                        .filter(|tracked| tracked.run_attempt == req.run_attempt)
+                        .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
+                        .unwrap_or_default();
+                    return Ok(Response::new(LaunchJobResponse {
+                        success: true,
+                        error: String::new(),
+                        stdout_path: paths.0,
+                        stderr_path: paths.1,
+                        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                    }));
+                }
+                Err(e) => return Err(map_exec_err(e)),
+            }
+        }
         let job_id = req.job_id;
         // A launch names the node the controller scheduled it onto. If it does not name this host it
         // was aimed at the wrong agent — refuse rather than run another node's allocation here.
@@ -4095,16 +5090,12 @@ impl SlurmAgent for AgentService {
         let array_job_id = req.array_job_id;
         let array_task_id = req.array_task_id;
         let run_attempt = req.run_attempt;
-        let spec = req
-            .spec
-            .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
-        // A pty launch stays on the legacy path: its terminal is the agent's to own.
-        let stepd_enabled = !spec.pty;
+        let stepd_enabled = true;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
 
-        // The uid is part of the (user-supplied) job spec and no RPC authenticates its caller, so
-        // refuse root execution here — before anything is spawned — rather than relying on the
+        // The uid is part of the (user-supplied) job spec. Refuse root execution
+        // here — before anything is spawned — rather than relying on the
         // privilege drop, which treats uid 0 as "nothing to drop".
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
             spec.uid,
@@ -4285,7 +5276,7 @@ impl SlurmAgent for AgentService {
             let gid = spec.gid;
             let home_dir = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{}", username));
 
-            let cfg = crate::container::ContainerConfig {
+            let mut cfg = crate::container::ContainerConfig {
                 image: spec.container_image.clone(),
                 mounts,
                 workdir: if spec.container_workdir.is_empty() {
@@ -4319,6 +5310,12 @@ impl SlurmAgent for AgentService {
                 home_dir,
                 device_plan: None, // set after GRES allocation
             };
+            crate::container::maybe_bind_auth_socket(
+                &mut cfg.mounts,
+                &self.cluster_id,
+                uid,
+                self.allow_root_jobs,
+            );
 
             let image_path = crate::container::resolve_image(
                 &spec.container_image,
@@ -4400,49 +5397,63 @@ impl SlurmAgent for AgentService {
         // out when `task_fanout` is set (standalone `srun` routed through the batch
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
-        let launch_script =
-            if use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script) {
-                // Write the user script to disk first so the wrapper can reference it
-                let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
-                std::fs::write(&user_script_path, &launch_script)
-                    .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &user_script_path,
-                        std::fs::Permissions::from_mode(0o755),
-                    );
-                }
+        let shape = batch_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
+        let launch_script = if shape != BatchLaunch::Script {
+            let user_script_path = crate::executor::stage_user_script(
+                job_id,
+                launch_step,
+                &launch_script,
+                spec.uid,
+                spec.gid,
+            )
+            .map_err(|e| {
+                self.drain_on_node_fault(&e, job_id);
+                Status::internal(e.to_string())
+            })?
+            .to_string_lossy()
+            .into_owned();
 
-                if spec.mpi == MPI_PMIX {
-                    warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
-                    // The per-rank wrapper needs each rank's PMIx environment,
-                    // which only the process hosting the server can hand out.
-                    if let Some(pmix) = supervised_pmix.as_mut() {
-                        pmix.user_script_path = user_script_path.clone();
-                        launch_script
-                    } else {
-                        build_multi_task_pmix_wrapper(
-                            &user_script_path,
-                            tasks_per_node,
-                            pmix_per_local_rank_env.as_ref().ok_or_else(|| {
-                                Status::internal("missing PMIx per-rank env for multi-task launch")
-                            })?,
-                            Some(&spec.environment),
-                        )
-                        .map_err(Status::failed_precondition)?
-                    }
+            if shape == BatchLaunch::LoneRank {
+                // A lone rank on this node still needs `env.sh` and the
+                // `PMIX_SERVER_URI` aliases the per-rank wrapper carries.
+                spur_core::task_launch::build_single_task_wrapper(
+                    &user_script_path,
+                    req.task_offset,
+                    Some(&spec.environment),
+                    false,
+                    true,
+                )
+            } else if spec.mpi == MPI_PMIX {
+                warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
+                // The per-rank wrapper needs each rank's PMIx environment,
+                // which only the process hosting the server can hand out.
+                if let Some(pmix) = supervised_pmix.as_mut() {
+                    pmix.user_script_path = user_script_path.clone();
+                    launch_script
                 } else {
-                    build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
+                    build_multi_task_pmix_wrapper(
+                        &user_script_path,
+                        tasks_per_node,
+                        pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                            Status::internal("missing PMIx per-rank env for multi-task launch")
+                        })?,
+                        Some(&spec.environment),
+                    )
+                    .map_err(Status::failed_precondition)?
                 }
             } else {
-                launch_script
-            };
+                build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
+            }
+        } else {
+            launch_script
+        };
 
         let (cpus, memory_mb) =
             resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
 
+        // The generation check is performed inside `allocate_local_resources`
+        // under the same allocation lock as the allocate, so a refresh publish
+        // cannot slip a newer topology between the check and the bind.
         let (alloc_result, allocated_device_ids) = self
             .allocate_local_resources(
                 job_id,
@@ -4527,6 +5538,39 @@ impl SlurmAgent for AgentService {
 
         let cpu_ids: Vec<u32> = alloc_result.cpu_ids.clone();
 
+        // A pty job's own step is allocation-only like `salloc`'s STEP_EXTERN,
+        // so nothing inside its stepd creates the job's cgroup — set it up
+        // here, the same way RegisterAllocation does, or the STEP_INTERACTIVE
+        // step that later joins it finds nothing to join.
+        let pty_cgroup_path = if spec.pty {
+            let setup = executor::setup_cgroup(
+                executor::CgroupScope {
+                    job_id,
+                    run_attempt,
+                    step_id: launch_step,
+                },
+                &self.cgroup,
+                cpus,
+                memory_mb,
+                &cpu_ids,
+                &host_device_plan.device_paths,
+            );
+            match allocation_cgroup(setup, self.cgroup.required) {
+                AllocationCgroup::Record(path) => path,
+                AllocationCgroup::Degraded(reason) => {
+                    warn!(job_id, reason = %reason, "pty job registered without cgroup enforcement");
+                    None
+                }
+                AllocationCgroup::Refuse(reason) => {
+                    return Err(Status::resource_exhausted(format!(
+                        "cgroup setup failed for pty job: {reason}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         // Guard rather than unwrap: these are always Some when the image is
         // set. An early return here releases the reservation via the guard.
         let container_launch = if !spec.container_image.is_empty() {
@@ -4575,6 +5619,18 @@ impl SlurmAgent for AgentService {
             gid: spec.gid,
             container: container_launch,
             prolog_script: None,
+            // A --pty job takes the legacy path, whose teardown runs no TaskEpilog, so
+            // keep both task hooks off for this deferred mode rather than run an unpaired prolog.
+            task_prolog_script: if spec.pty {
+                None
+            } else {
+                self.hooks.task_prolog.clone()
+            },
+            task_epilog_script: if spec.pty {
+                None
+            } else {
+                self.hooks.task_epilog.clone()
+            },
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             mpi: spec.mpi.clone(),
@@ -4604,7 +5660,9 @@ impl SlurmAgent for AgentService {
                 &self.stepd_state_dir,
                 StepdLaunchOptions {
                     step_id: launch_step,
-                    allocation_only: false,
+                    // A `--pty` job's own step is a placeholder like `salloc`'s
+                    // extern step: the real command runs via InteractiveSession.
+                    allocation_only: spec.pty,
                     container_rootfs_mode: launch_cfg
                         .container
                         .as_ref()
@@ -4612,10 +5670,25 @@ impl SlurmAgent for AgentService {
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
                     pmix: supervised_pmix,
+                    cred_id: persist_cred.0,
+                    cred_kid: persist_cred.1,
+                    cred_digest: persist_cred.2,
                 },
             )
             .await
-            .map(|(result, descriptor)| (result, Some(descriptor)))
+            .map(|(result, mut descriptor)| {
+                // Mirrors RegisterAllocation: the supervisor's own launch
+                // never created a cgroup for an allocation-only step, so the
+                // one set up above has to be stamped on after the fact.
+                if let Some(path) = pty_cgroup_path.as_ref() {
+                    descriptor.cgroup_path = path.clone();
+                    let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+                    if let Err(error) = store.publish(&descriptor) {
+                        warn!(job_id, %error, "failed to record pty job cgroup in the runtime descriptor");
+                    }
+                }
+                (result, Some(descriptor))
+            })
         } else {
             executor::launch_job(&launch_cfg, (*self.spank).as_ref())
                 .await
@@ -4745,7 +5818,7 @@ impl SlurmAgent for AgentService {
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
                         run_attempt,
-                        cgroup_path: result.cgroup_path,
+                        cgroup_path: pty_cgroup_path.clone().or(result.cgroup_path),
                     },
                 );
                 drop(jobs);
@@ -4778,7 +5851,6 @@ impl SlurmAgent for AgentService {
             }
             Err(e) => {
                 // reservation_guard releases the allocation and PMI on this return.
-                let drain_reason = e.drain_reason();
                 let failure_kind = match e {
                     executor::LaunchError::PrologFailed(_) => {
                         LaunchFailureKind::LaunchFailureProlog
@@ -4787,14 +5859,7 @@ impl SlurmAgent for AgentService {
                 };
                 let err_msg = e.to_string();
                 error!(job_id, error = %err_msg, "failed to launch job");
-
-                if let Some(drain_reason) = drain_reason {
-                    let controller = self.reporter.controller_addr.clone();
-                    let node_name = self.reporter.hostname.clone();
-                    tokio::spawn(async move {
-                        request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
-                    });
-                }
+                self.drain_on_node_fault(&e, job_id);
 
                 Ok(Response::new(LaunchJobResponse {
                     success: false,
@@ -4811,6 +5876,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<PreparePmixRequest>,
     ) -> Result<Response<PreparePmixResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         let plan = req
             .pmix_plan
@@ -4837,6 +5903,7 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<ReleasePmixRequest>,
     ) -> Result<Response<ReleasePmixResponse>, Status> {
+        Self::require_controller(&request)?;
         // PreparePmix only validates, so a prepare that never launched left no
         // server here to roll back. Kept on the wire for controller compatibility.
         let _ = request.into_inner().job_id;
@@ -4856,7 +5923,7 @@ impl SlurmAgent for AgentService {
         let gated: Vec<crate::stepd::StepdDescriptor> =
             stepds_for_job(&*self.stepds.lock().await, job_id)
                 .into_iter()
-                .filter(|descriptor| !spur_core::step::is_user_step(descriptor.step_id))
+                .filter(|descriptor| spur_core::step::owns_job_lifetime(descriptor.step_id))
                 .filter(|descriptor| {
                     req.run_attempt == 0 || descriptor.run_attempt == req.run_attempt
                 })
@@ -4899,6 +5966,38 @@ impl SlurmAgent for AgentService {
         Self::require_controller(&request)?;
         let req = request.into_inner();
         let job_id = req.job_id;
+        self.launch_acceptance
+            .cancel_attempt(job_id, req.run_attempt);
+
+        // An attempt-less cancel has nothing to compare against below; snapshot
+        // whichever attempt is live now, before a same-job_id redispatch races in.
+        //
+        // Each lookup below is its own statement so its lock guard drops
+        // before the next is taken -- nesting as match/if scrutinees would
+        // invert against release_stepd_tracking's stepds -> running order.
+        let pre_cancel_attempt = match req.run_attempt {
+            0 => {
+                let running_attempt = self
+                    .running
+                    .lock()
+                    .await
+                    .get(&job_id)
+                    .map(|t| t.run_attempt);
+                if running_attempt.is_some() {
+                    running_attempt
+                } else {
+                    let stepd_attempt = stepds_for_job(&*self.stepds.lock().await, job_id)
+                        .first()
+                        .map(|descriptor| descriptor.run_attempt);
+                    if stepd_attempt.is_some() {
+                        stepd_attempt
+                    } else {
+                        self.allocation.lock().await.owner_attempt(job_id)
+                    }
+                }
+            }
+            named => Some(named),
+        };
 
         if req.signal > 0 {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
@@ -4916,11 +6015,10 @@ impl SlurmAgent for AgentService {
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         if !jobs.contains_key(&job_id) {
-            let mut alloc = self.allocation.lock().await;
-            if req.run_attempt == 0 {
-                alloc.release_job(job_id);
-            } else {
-                alloc.release_job_if(job_id, req.run_attempt);
+            // `pre_cancel_attempt` already checked the ledger; `None` means
+            // anything found now landed during the signal call and is not ours.
+            if let Some(attempt) = pre_cancel_attempt {
+                self.allocation.lock().await.release_job_if(job_id, attempt);
             }
         }
         drop(jobs);
@@ -4960,6 +6058,8 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<()>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        self.launch_acceptance
+            .cancel(req.job_id, req.step_id, req.run_attempt);
         // Step ids restart at 0 on a requeue, so a cancel from a superseded
         // attempt would otherwise signal the redispatch's step of the same id.
         if !self.runs_attempt(req.job_id, req.run_attempt).await {
@@ -5007,9 +6107,9 @@ impl SlurmAgent for AgentService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<NodeResourcesResponse>, Status> {
-        let resources = &self.reporter.resources;
+        let resources = self.reporter.snapshot_resources();
         Ok(Response::new(NodeResourcesResponse {
-            total: Some(crate::reporter::resource_to_proto(resources)),
+            total: Some(crate::reporter::resource_to_proto(&resources)),
             used: Some(crate::reporter::allocations_to_proto(
                 &spur_core::resource::ResourceAllocations::default(),
             )),
@@ -5131,7 +6231,9 @@ impl SlurmAgent for AgentService {
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
 
         let allocated = req.allocated.as_ref();
-        let mut controller_gpu_ids: Vec<u32> = allocated
+        // The generation check is performed under the allocation lock below, so a
+        // refresh publish cannot slip a newer topology between it and the bind.
+        let mut controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
             .unwrap_or_default();
@@ -5148,26 +6250,13 @@ impl SlurmAgent for AgentService {
 
         // Resolved before the running lock and the reservation: this is the one
         // step that awaits another lock, and failing here needs no release.
-        let device_paths = if controller_gpu_ids.is_empty() {
-            Vec::new()
-        } else {
-            let injection = self.device_registry.lock().await.build_job_injection_plans(
-                "gpu",
-                &controller_gpu_ids,
-                req.uid,
-                req.gid,
-            );
-            match injection {
-                Ok((host, _)) => host.device_paths,
-                Err(e) => {
-                    error!(job_id = req.job_id, error = %e, "device registry resolution failed");
-                    return Err(Status::failed_precondition(format!(
-                        "device resolution failed: {}",
-                        e
-                    )));
-                }
-            }
-        };
+        let host_device_plan = self
+            .resolve_host_device_plan(req.job_id, &controller_gpu_ids, req.uid, req.gid)
+            .await?;
+        let device_paths = host_device_plan
+            .as_ref()
+            .map(|p| p.device_paths.clone())
+            .unwrap_or_default();
 
         // Hold the running lock across the duplicate check, reserve+commit, and
         // insert (running → allocation, as in commit) so the job is never
@@ -5181,6 +6270,15 @@ impl SlurmAgent for AgentService {
         }
         let alloc_result = {
             let mut alloc = self.allocation.lock().await;
+            // Atomic with the bind: the refresh task publishes inventory via
+            // update_capacity under this same lock, so no newer generation can
+            // land between this check and allocate_for_job.
+            if let Some(a) = allocated {
+                check_dispatch_generation(
+                    a.generation,
+                    self.reporter.snapshot_resources().generation,
+                )?;
+            }
             let result = alloc
                 .allocate_for_job(
                     req.job_id,
@@ -5251,6 +6349,43 @@ impl SlurmAgent for AgentService {
             "registered srun allocation"
         );
 
+        // Node Prolog for standalone srun. The batch/salloc path runs it inline
+        // in `launch_job`; this srun path never reaches that RPC, so run it here
+        // — once per allocation on the node, before the extern stepd (and thus
+        // any step workload) starts. Pairs with the node Epilog the extern
+        // stepd runs on teardown (owns_job_lifetime(STEP_EXTERN)).
+        if let Some(ref prolog) = self.hooks.prolog {
+            let ctx = spur_core::hooks::HookContext {
+                job_id: req.job_id,
+                work_dir: req.work_dir.clone(),
+                uid: req.uid,
+                gid: req.gid,
+                partition: req.partition.clone(),
+                nodelist: req.nodelist.clone(),
+                script_context: "prolog_slurmd".into(),
+                gpu_devices: controller_gpu_ids.clone(),
+                cpus,
+                memory_mb,
+            };
+            if let Err(e) = spur_core::hooks::run_hook(prolog, &ctx).await {
+                error!(job_id = req.job_id, error = %e, "prolog hook failed before srun allocation");
+                // Release what the allocation set up so a failed prolog does not
+                // strand the cgroup; the reservation guard releases on return.
+                if let Some(path) = cgroup_path.as_ref() {
+                    executor::cleanup_cgroup(path);
+                }
+                // Typed failure, not a generic Status: the controller must drain
+                // the node and hold the job (hold_on_prolog_fail), as the
+                // LaunchJob path does, rather than cool the node and retry srun
+                // onto it. The allocation is not tracked, so returning Ok here
+                // leaves nothing registered.
+                return Ok(Response::new(RegisterJobAllocationResponse {
+                    failure_kind: LaunchFailureKind::LaunchFailureProlog as i32,
+                    error: format!("prolog failed: {e:#}"),
+                }));
+            }
+        }
+
         #[cfg(test)]
         let supervise_allocation = !self.force_legacy_launch;
         #[cfg(not(test))]
@@ -5282,10 +6417,12 @@ impl SlurmAgent for AgentService {
                 gid: req.gid,
                 container: None,
                 prolog_script: None,
+                task_prolog_script: None,
+                task_epilog_script: None,
                 partition: req.partition.clone(),
                 nodelist: req.nodelist.clone(),
                 mpi: req.mpi.clone(),
-                host_device_plan: None,
+                host_device_plan,
                 memlock: self.limits.memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
@@ -5316,10 +6453,14 @@ impl SlurmAgent for AgentService {
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
                     pmix: None,
+                    cred_id: String::new(),
+                    cred_kid: String::new(),
+                    cred_digest: String::new(),
                 },
             )
             .await
             .map_err(|error| {
+                self.drain_on_node_fault(&error, req.job_id);
                 Status::unavailable(format!("failed to start allocation stepd: {error}"))
             })?;
 
@@ -5414,7 +6555,10 @@ impl SlurmAgent for AgentService {
         reservation_guard.disarm();
         drop(jobs);
 
-        Ok(Response::new(RegisterJobAllocationResponse {}))
+        Ok(Response::new(RegisterJobAllocationResponse {
+            failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+            error: String::new(),
+        }))
     }
 
     /// Run a one-shot command on this node, used by srun inside an allocation.
@@ -5424,10 +6568,64 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<RunCommandRequest>,
     ) -> Result<Response<RunCommandResponse>, Status> {
-        Self::require_controller(&request)?;
+        let identity = Self::verified_identity(&request).cloned();
+        let has_step_cred = !request.get_ref().execution_credential.is_empty();
+        match identity.as_ref() {
+            Some(id) if id.is_controller() => {}
+            None => {}
+            Some(_) if has_step_cred && self.cred_keys.is_some() => {}
+            Some(id) => {
+                return Err(Status::permission_denied(format!(
+                    "this RPC is reachable only by the cluster controller; caller '{}' is not the \
+                     controller — route the request through spurctld",
+                    id.user
+                )))
+            }
+        }
         let req = request.into_inner();
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
+        }
+        let mut persist_cred = (String::new(), String::new(), String::new());
+        if let Some(keys) = &self.cred_keys {
+            if req.execution_credential.is_empty() {
+                spur_core::native_metrics::inc_exec_fail();
+                return Err(Status::unauthenticated("execution credential required"));
+            }
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            let cred = spur_core::native_exec::verify_execution(
+                &req.execution_credential,
+                keys,
+                &self.cluster_id,
+                now,
+            )
+            .map_err(map_exec_err)?;
+            cred.require_kind(spur_core::native_cred::CredentialKind::Step)
+                .map_err(map_exec_err)?;
+            let hostname = self.reporter.hostname.as_str();
+            cred.require_node(hostname).map_err(map_exec_err)?;
+            cred.require_unix(req.uid, req.gid).map_err(map_exec_err)?;
+            let image = req
+                .container
+                .as_ref()
+                .map(|c| c.image.as_str())
+                .unwrap_or("");
+            let digest = spur_core::native_exec::command_digest("", &req.command, image);
+            cred.require_command_digest(&digest).map_err(map_exec_err)?;
+            if let Some(attempt) = self
+                .running
+                .lock()
+                .await
+                .get(&req.job_id)
+                .map(|tracked| tracked.run_attempt)
+            {
+                cred.require_run_attempt(attempt).map_err(map_exec_err)?;
+            }
+            persist_cred = persist_execution_meta(&cred);
+            match self.launch_acceptance.accept(&cred) {
+                Ok(_) => spur_core::native_metrics::inc_exec_ok(),
+                Err(e) => return Err(map_exec_err(e)),
+            }
         }
         // Steps carry their own uid straight from the wire — gate them exactly like a batch launch.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
@@ -5449,6 +6647,10 @@ impl SlurmAgent for AgentService {
         if job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
         }
+        if identity.as_ref().is_some_and(|id| !id.is_controller()) {
+            self.check_job_access(job_id, identity.as_ref(), "", "run a step of")
+                .await?;
+        }
 
         let num_tasks = req.num_tasks.max(1);
         let step_num_tasks = if req.step_num_tasks > 0 {
@@ -5458,11 +6660,19 @@ impl SlurmAgent for AgentService {
         };
         let step_id = req.step_id;
         let step_key = (job_id, step_id);
+        let step_run_attempt = self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .map(|tracked| tracked.run_attempt)
+            .unwrap_or_default();
         {
             self.active_steps.lock().await.insert(
                 step_key,
                 ActiveStep {
                     epoch: next_step_epoch(),
+                    run_attempt: step_run_attempt,
                     ..Default::default()
                 },
             );
@@ -5548,10 +6758,10 @@ impl SlurmAgent for AgentService {
             .count()
             .max(1) as u32;
 
-        let (mut gpu_env, container_device_plan) = if gpu_devices.is_empty() {
-            (HashMap::new(), None)
+        let (mut gpu_env, host_device_plan, container_device_plan) = if gpu_devices.is_empty() {
+            (HashMap::new(), None, None)
         } else {
-            let (host_plan, container_plan) = self
+            let (mut host_plan, container_plan) = self
                 .device_registry
                 .lock()
                 .await
@@ -5559,7 +6769,11 @@ impl SlurmAgent for AgentService {
                 .map_err(|e| {
                     Status::failed_precondition(format!("GPU injection plan failed: {}", e))
                 })?;
-            (host_plan.env, Some(container_plan))
+            let env = host_plan.env.clone();
+            // Already merged into senv below with correct --gpu-bind precedence;
+            // clear so executor::launch_job doesn't re-apply it and clobber that.
+            host_plan.env.clear();
+            (env, Some(host_plan), Some(container_plan))
         };
         maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
 
@@ -5619,8 +6833,7 @@ impl SlurmAgent for AgentService {
         }
         // Decided here rather than at the dispatch chain below because who runs
         // the step also decides who hosts its PMIx server.
-        let supervise_step =
-            step_can_be_supervised(req.container.as_ref().map_or("", |c| c.image.as_str()));
+        let supervise_step = true;
         #[cfg(test)]
         let supervise_step = supervise_step && !self.force_legacy_launch;
 
@@ -5664,7 +6877,10 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(cancelled_step_response()));
         }
 
-        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
+        // A lone PMIx rank needs the wrapper too: it carries `env.sh` and the
+        // `PMIX_SERVER_URI` aliases, which no other part of the launch applies.
+        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label || step_mpi
+        {
             let step_dir =
                 crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
                     .map_err(|e| {
@@ -5715,10 +6931,12 @@ impl SlurmAgent for AgentService {
                     ))
                 }
             } else {
-                Some(spur_core::task_launch::build_labeled_single_task_wrapper(
+                Some(spur_core::task_launch::build_single_task_wrapper(
                     user_script_path.to_string_lossy().as_ref(),
                     req.task_offset,
                     Some(&req.environment),
+                    req.label,
+                    step_mpi,
                 ))
             };
             if let Some(wrapper) = wrapper {
@@ -5745,24 +6963,6 @@ impl SlurmAgent for AgentService {
             (program, args, None)
         };
         let _step_script_guard = step_script_cleanup;
-
-        if let Some(ref task_prolog) = self.hooks.task_prolog {
-            let ctx = spur_core::hooks::HookContext {
-                job_id,
-                work_dir: work_dir.clone(),
-                uid: req.uid,
-                gid: req.gid,
-                partition: partition.clone(),
-                nodelist: job_nodelist.clone(),
-                script_context: "prolog_task".into(),
-                gpu_devices: gpu_devices.clone(),
-                cpus,
-                memory_mb,
-            };
-            if let Err(e) = spur_core::hooks::run_hook(task_prolog, &ctx).await {
-                return Err(Status::aborted(format!("TaskProlog failed: {}", e)));
-            }
-        }
 
         let mut env = senv.into_map();
         if num_tasks > 1 && step_mpi {
@@ -5797,8 +6997,19 @@ impl SlurmAgent for AgentService {
         // Redirect the step's stdout/stderr to per-step spool files so
         // stream_job_output can tail them live and output stays bounded on this
         // node. Paths are recorded in active_steps so the tail can find them.
-        let step_files = crate::executor::open_step_output_files(job_id, step_id, req.uid, req.gid)
-            .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+        let mut step_files = match crate::executor::open_step_output_files_under(
+            &self.job_spool_roots,
+            job_id,
+            step_id,
+            req.uid,
+            req.gid,
+        ) {
+            Ok(files) => files,
+            Err(error) => {
+                self.drain_on_node_fault(&error, job_id);
+                return Err(Status::internal(format!("step output files: {error}")));
+            }
+        };
         let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
         let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
         {
@@ -5810,15 +7021,68 @@ impl SlurmAgent for AgentService {
         }
 
         let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
+        let mut supervised_rootfs_mode = None;
         let mut supervised_step_cfg = if supervise_step {
             let command: Vec<String> = std::iter::once(program.clone())
                 .chain(program_args.iter().cloned())
                 .collect();
+            let step_script =
+                supervised_step_script(&job_entry, req.uid, req.gid, &work_dir, &command)?;
+            let username = env
+                .get("USER")
+                .or_else(|| env.get("LOGNAME"))
+                .cloned()
+                .unwrap_or_default();
+            let container = match resolve_step_container_plan(
+                req.container.as_ref(),
+                joins_parent_namespaces,
+            ) {
+                StepContainerPlan::None => {
+                    if joins_parent_namespaces {
+                        if let Some(c) = req.container.as_ref().filter(|c| !c.image.is_empty()) {
+                            warn!(
+                                job_id,
+                                step_id,
+                                image = %c.image,
+                                "step --container-image ignored: joining the parent job's \
+                                 running container instead of building a new one"
+                            );
+                        }
+                    }
+                    None
+                }
+                StepContainerPlan::Fresh(c) => {
+                    let home_dir = env
+                        .get("HOME")
+                        .cloned()
+                        .unwrap_or_else(|| format!("/home/{username}"));
+                    let (launch, rootfs_mode) = stage_fresh_container_step(
+                        &self.cluster_id,
+                        self.allow_root_jobs,
+                        &c,
+                        FreshContainerContext {
+                            gpu_devices: gpu_devices.clone(),
+                            device_plan: container_device_plan.clone(),
+                            uid: req.uid,
+                            gid: req.gid,
+                            username,
+                            home_dir,
+                            environment: env.clone(),
+                            workdir_default: (!work_dir.is_empty()).then(|| work_dir.clone()),
+                            rootfs_base: crate::container::step_rootfs_base(job_id, step_id),
+                        },
+                        job_id,
+                        &step_script,
+                    )?;
+                    supervised_rootfs_mode = Some(rootfs_mode);
+                    Some(launch)
+                }
+            };
             Some(executor::JobLaunchConfig {
                 step_id,
                 job_id,
                 run_attempt: job_attempt,
-                script: supervised_step_script(&job_entry, req.uid, req.gid, &command)?,
+                script: step_script,
                 joins_parent_namespaces,
                 allocation_holder: false,
                 work_dir: work_dir.clone(),
@@ -5844,12 +7108,14 @@ impl SlurmAgent for AgentService {
                 cpu_ids: Vec::new(),
                 uid: req.uid,
                 gid: req.gid,
-                container: None,
+                container,
                 prolog_script: None,
+                task_prolog_script: None,
+                task_epilog_script: None,
                 partition: partition.clone(),
                 nodelist: job_nodelist.clone(),
                 mpi: job_mpi.clone(),
-                host_device_plan: None,
+                host_device_plan,
                 memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
@@ -5857,6 +7123,57 @@ impl SlurmAgent for AgentService {
             })
         } else {
             None
+        };
+
+        // Legacy (non-supervised) steps run the workload here, so their task hooks
+        // run here too — contained in the job cgroup as the job user. Supervised
+        // steps get task hooks from their own spurstepd.
+        let mut task_prolog_printed: Vec<u8> = Vec::new();
+        if !supervise_step {
+            if let Some(ref task_prolog) = self.hooks.task_prolog {
+                let ctx = spur_core::hooks::HookContext {
+                    job_id,
+                    work_dir: work_dir.clone(),
+                    uid: req.uid,
+                    gid: req.gid,
+                    partition: partition.clone(),
+                    nodelist: job_nodelist.clone(),
+                    script_context: "prolog_task".into(),
+                    gpu_devices: gpu_devices.clone(),
+                    cpus,
+                    memory_mb,
+                };
+                match crate::task_hook::run_task_prolog(
+                    task_prolog,
+                    &ctx,
+                    env,
+                    job_entry.cgroup_path.as_deref(),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        env = result.environment;
+                        task_prolog_printed = result.printed;
+                    }
+                    Err(e) => return Err(Status::aborted(format!("TaskProlog failed: {e}"))),
+                }
+            }
+        }
+
+        // Put TaskProlog's `print` on the spool stdout before the workload writes so
+        // srun's live tail and the read-back both include it (empty on supervised steps).
+        if !task_prolog_printed.is_empty() {
+            if let Err(e) = std::io::Write::write_all(&mut step_files.stdout, &task_prolog_printed)
+            {
+                warn!(job_id, error = %e, "failed to write TaskProlog print to step stdout");
+            }
+        }
+
+        // The legacy dispatch consumes `env`; keep a copy for TaskEpilog.
+        let task_epilog_env: HashMap<String, String> = if supervise_step {
+            HashMap::new()
+        } else {
+            env.clone()
         };
 
         // Dispatch paths, each wiring the step's stdio to the spool files above.
@@ -5870,8 +7187,10 @@ impl SlurmAgent for AgentService {
             self.run_supervised_step_to_spool(
                 &step_cfg,
                 supervised_pmix.take(),
+                supervised_rootfs_mode,
                 step_files,
                 step_key,
+                persist_cred,
             )
             .await?
         } else if job_entry.has_namespaces() && job_entry.pid > 0 {
@@ -5969,7 +7288,7 @@ impl SlurmAgent for AgentService {
                 .cloned()
                 .unwrap_or_else(|| format!("/home/{username}"));
 
-            let container_cfg = crate::container::ContainerConfig {
+            let mut container_cfg = crate::container::ContainerConfig {
                 image: c.image.clone(),
                 mounts,
                 // --container-workdir wins; fall back to --chdir (req.work_dir)
@@ -6016,6 +7335,12 @@ impl SlurmAgent for AgentService {
                 home_dir,
                 device_plan: container_device_plan,
             };
+            crate::container::maybe_bind_auth_socket(
+                &mut container_cfg.mounts,
+                &self.cluster_id,
+                step_uid,
+                self.allow_root_jobs,
+            );
 
             let image_path = crate::container::resolve_image(&c.image, None, Some(step_uid))
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;
@@ -6142,21 +7467,30 @@ impl SlurmAgent for AgentService {
             None => return Ok(Response::new(cancelled_step_response())),
         };
 
-        if let Some(ref task_epilog) = self.hooks.task_epilog {
-            let ctx = spur_core::hooks::HookContext {
-                job_id,
-                work_dir: work_dir.clone(),
-                uid: req.uid,
-                gid: req.gid,
-                partition,
-                nodelist: job_nodelist,
-                script_context: "epilog_task".into(),
-                gpu_devices,
-                cpus,
-                memory_mb,
-            };
-            if let Err(e) = spur_core::hooks::run_hook(task_epilog, &ctx).await {
-                warn!(error = %e, "TaskEpilog failed");
+        if !supervise_step {
+            if let Some(ref task_epilog) = self.hooks.task_epilog {
+                let ctx = spur_core::hooks::HookContext {
+                    job_id,
+                    work_dir: work_dir.clone(),
+                    uid: req.uid,
+                    gid: req.gid,
+                    partition,
+                    nodelist: job_nodelist,
+                    script_context: "epilog_task".into(),
+                    gpu_devices,
+                    cpus,
+                    memory_mb,
+                };
+                if let Err(e) = crate::task_hook::run_task_epilog(
+                    task_epilog,
+                    &ctx,
+                    &task_epilog_env,
+                    job_entry.cgroup_path.as_deref(),
+                )
+                .await
+                {
+                    warn!(error = %e, "TaskEpilog failed");
+                }
             }
         }
 
@@ -6174,9 +7508,10 @@ impl SlurmAgent for AgentService {
                 }
             }
         };
+        let stdout = read_back(stdout_path).await;
         Ok(Response::new(RunCommandResponse {
             exit_code: spur_core::process::shell_exit_code(&status),
-            stdout: read_back(stdout_path).await,
+            stdout,
             stderr: read_back(stderr_path).await,
         }))
     }
@@ -6525,6 +7860,41 @@ impl SlurmAgent for AgentService {
         self.check_job_access(init.job_id, identity.as_ref(), &init.user, "attach to")
             .await?;
 
+        if let Some(keys) = &self.cred_keys {
+            let launching = !init.execution_credential.is_empty()
+                || !init.argv.is_empty()
+                || init.container.as_ref().is_some_and(|c| !c.image.is_empty());
+            if launching {
+                if init.execution_credential.is_empty() {
+                    spur_core::native_metrics::inc_exec_fail();
+                    return Err(Status::unauthenticated("execution credential required"));
+                }
+                let now = spur_core::native_mint::unix_now().unwrap_or(0);
+                let cred = spur_core::native_exec::verify_execution(
+                    &init.execution_credential,
+                    keys,
+                    &self.cluster_id,
+                    now,
+                )
+                .map_err(map_exec_err)?;
+                cred.require_kind(spur_core::native_cred::CredentialKind::Step)
+                    .map_err(map_exec_err)?;
+                cred.require_node(self.reporter.hostname.as_str())
+                    .map_err(map_exec_err)?;
+                let image = init
+                    .container
+                    .as_ref()
+                    .map(|c| c.image.as_str())
+                    .unwrap_or("");
+                let digest = spur_core::native_exec::command_digest("", &init.argv, image);
+                cred.require_command_digest(&digest).map_err(map_exec_err)?;
+                match self.launch_acceptance.accept(&cred) {
+                    Ok(_) => spur_core::native_metrics::inc_exec_ok(),
+                    Err(e) => return Err(map_exec_err(e)),
+                }
+            }
+        }
+
         let entry = self.job_entry(init.job_id).await?;
 
         let winsize = init.winsize.as_ref().map(|ws| PtyWinSize {
@@ -6551,108 +7921,108 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        // Dispatch mirrors run_command's three cases. A parent job with live
-        // namespaces (containerized sbatch/salloc) is entered via nsenter; a step
-        // that requested its own image with no such parent builds a fresh
-        // container; otherwise the command runs on the host.
-        let step_image = init
-            .container
-            .as_ref()
-            .map(|c| c.image.as_str())
-            .unwrap_or("");
         let parent_has_namespaces = entry.has_namespaces() && entry.pid > 0;
+        let container_plan =
+            resolve_step_container_plan(init.container.as_ref(), parent_has_namespaces);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
-        if !parent_has_namespaces && !step_image.is_empty() {
-            // Case 2: fresh container for this interactive PTY step.
-            let container = init
-                .container
-                .as_ref()
-                .expect("image is non-empty in this arm");
-            let (master_fd, child_pid, rootfs_guard) = self
-                .spawn_containerized_pty_step(
-                    init.job_id,
-                    init.step_id,
-                    container,
-                    &argv,
-                    &entry,
-                    winsize.as_ref(),
-                )
-                .await?;
+        let step_id = spur_core::step::STEP_INTERACTIVE;
+        let (run_attempt, cpus, memory_mb, gpu_devices, partition, nodelist, user) = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&init.job_id).ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "job {} is not running on this node",
+                    init.job_id
+                ))
+            })?;
+            (
+                tracked.run_attempt,
+                tracked.cpus,
+                tracked.memory_mb,
+                tracked.gpu_devices.clone(),
+                tracked.partition.clone(),
+                tracked.nodelist.clone(),
+                tracked.user.clone(),
+            )
+        };
+        let mut host_device_plan: Option<spur_devices::inject::HostInjectionPlan> = None;
+        let custody_dir = crate::stepd::StepdStore::new(&self.stepd_state_dir).session_dir(
+            init.job_id,
+            run_attempt,
+            step_id,
+        );
 
-            info!(
-                job_id = init.job_id,
-                child_pid,
-                image = %step_image,
-                "interactive container session started"
-            );
-
-            let active_steps = self.active_steps.clone();
-            let step_key = (init.job_id, init.step_id);
-            let wait_pid = nix::unistd::Pid::from_raw(child_pid);
-            tokio::spawn(async move {
-                // Hold the rootfs guard and the active-steps entry for the whole
-                // session: both drop when the bridge returns (child exit, client
-                // disconnect, or scancel), cleaning up the rootfs and the
-                // cancellation registration.
-                let _rootfs_guard = rootfs_guard;
-                let _step_guard = ActiveStepGuard {
-                    steps: active_steps,
-                    key: step_key,
-                };
-                let wait_exit = async move {
-                    tokio::task::spawn_blocking(move || waitpid_exit_code(wait_pid))
-                        .await
-                        .unwrap_or(128)
-                };
-                Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx)
-                    .await;
-            });
-
-            return Ok(Response::new(ReceiverStream::new(rx)));
-        }
-
-        if !step_image.is_empty() {
-            // Case 1: the parent job already provides a container; the step joins
-            // its namespaces via nsenter rather than building a new one. Leave a
-            // trace rather than silently dropping the requested image.
-            warn!(
-                job_id = init.job_id,
-                image = %step_image,
-                "step --container-image ignored: joining the parent job's running container"
-            );
-        }
-
-        // The supervisor that outlives this agent, so a terminal it is holding
-        // can be found again after a restart.
-        let custody_dir = stepds_for_job(&*self.stepds.lock().await, init.job_id)
-            .into_iter()
-            .find(|descriptor| !spur_core::step::is_user_step(descriptor.step_id))
-            .and_then(|descriptor| descriptor.socket_path.parent().map(|dir| dir.to_path_buf()));
+        // Held from before the decision through the fresh-launch path's own
+        // `live_ptys` insert below, so a second attach racing this one blocks
+        // instead of reading a stale "nothing live yet" and fencing what this
+        // call just started.
+        let _lifecycle = self.lifecycle.acquire(init.job_id).await;
 
         // Resume rather than open a new one: a terminal held for a job this
-        // agent is not already bridging was orphaned when its agent went away,
-        // and its user wants it back.
+        // agent is not already bridging was either just launched (and just
+        // deposited its own master, below) or was orphaned when its agent
+        // went away, and either way the user wants it back.
         let already_bridging = self.live_ptys.lock().await.contains(&init.job_id);
-        let reclaimed = match custody_dir.as_deref() {
-            Some(dir) if !already_bridging => match crate::stepd::reclaim_orphaned_pty(dir).await {
-                Ok(found) => found,
-                Err(error) => {
-                    warn!(job_id = init.job_id, %error, "could not look for an orphaned terminal");
-                    None
-                }
-            },
-            _ => {
-                if custody_dir.is_none() {
-                    warn!(
-                        job_id = init.job_id,
-                        "no supervisor to hold this terminal; it will not survive a restart"
-                    );
-                }
+        if already_bridging {
+            // A live bridge already owns this job's one interactive slot.
+            // Silently fencing it to seat a second attach would kill a
+            // session that might still be in active use.
+            return Err(Status::already_exists(
+                "an interactive session for this job is already active on this node",
+            ));
+        }
+        let reclaimed = match crate::stepd::reclaim_orphaned_pty(&custody_dir).await {
+            Ok(found) => found,
+            Err(error) => {
+                warn!(job_id = init.job_id, %error, "could not look for an orphaned terminal");
                 None
             }
         };
+
+        let last_interactive_launch = self
+            .interactive_launch_steps
+            .lock()
+            .await
+            .get(&(init.job_id, run_attempt))
+            .copied();
+        let same_invocation =
+            settled_outcome_belongs_to_this_invocation(last_interactive_launch, init.step_id);
+
+        // Nothing to reclaim can mean "never launched" or "already finished
+        // and reaped" — the latter must return the recorded exit, not re-run
+        // the command.
+        if reclaimed.is_none() && same_invocation {
+            let settled = match self
+                .step_completions
+                .settled(init.job_id, run_attempt, step_id)
+                .await
+            {
+                Some(outcome) => Some((outcome.exit_code, outcome.signal)),
+                None => {
+                    let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+                    let recorded = if run_attempt == 0 {
+                        store.recorded_step_exit(init.job_id, step_id)
+                    } else {
+                        store.observed_exit(init.job_id, run_attempt, step_id)
+                    };
+                    recorded.unwrap_or_else(|error| {
+                        warn!(job_id = init.job_id, %error, "failed to read a settled terminal's recorded exit");
+                        None
+                    })
+                }
+            };
+            if let Some((exit_code, signal)) = settled {
+                let shell_code = spur_core::process::shell_exit_code(&step_exit_status(
+                    crate::step_completion::StepOutcome { exit_code, signal },
+                ));
+                info!(
+                    job_id = init.job_id,
+                    shell_code, "terminal already finished; reporting its recorded exit"
+                );
+                return Ok(Response::new(settled_interactive_stream(shell_code)));
+            }
+        }
 
         type ExitFuture = std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>>;
         let (master_fd, wait_exit, child_pid): (std::os::fd::OwnedFd, ExitFuture, i32) =
@@ -6660,28 +8030,256 @@ impl SlurmAgent for AgentService {
                 Some((session_id, master)) => {
                     let pid = session_id as i32;
                     info!(job_id = init.job_id, pid, "resumed an orphaned terminal");
-                    (master, Box::pin(wait_for_reparented_exit(pid)), pid)
+                    let waiter = self
+                        .step_completions
+                        .reregister(init.job_id, run_attempt, step_id)
+                        .await
+                        .ok_or_else(|| {
+                            Status::aborted(
+                                "another attach is already waiting on this terminal's exit",
+                            )
+                        })?;
+                    (master, interactive_exit_future(waiter), pid)
                 }
                 None => {
-                    let (master, mut child, pid) = Self::spawn_pty_in_job(
-                        &entry,
-                        &argv,
-                        init.job_id,
-                        winsize.as_ref(),
-                        self.cgroup.required,
-                    )?;
-                    // Deposited with the supervisor, which outlives this agent:
-                    // without a second holder the master closes when the agent
-                    // does and the terminal hangs up under the user.
-                    if let Some(dir) = custody_dir.as_deref() {
-                        if let Err(error) = crate::stepd::deposit_pty_master(
-                            dir,
-                            pid as u32,
-                            std::os::fd::AsFd::as_fd(&master),
+                    let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
+                    let mut container_rootfs_mode = None;
+                    let mut fresh_container_env: Option<HashMap<String, String>> = None;
+                    let mut host_identity_env: Option<HashMap<String, String>> = None;
+                    let container = match &container_plan {
+                        StepContainerPlan::None => {
+                            if parent_has_namespaces {
+                                if let Some(c) =
+                                    init.container.as_ref().filter(|c| !c.image.is_empty())
+                                {
+                                    warn!(
+                                        job_id = init.job_id,
+                                        image = %c.image,
+                                        "step --container-image ignored: joining the parent job's \
+                                         running container instead of building a new one"
+                                    );
+                                }
+                            }
+                            if entry.uid > 0 {
+                                if let Some(user) = nix::unistd::User::from_uid(
+                                    nix::unistd::Uid::from_raw(entry.uid),
+                                )
+                                .ok()
+                                .flatten()
+                                {
+                                    host_identity_env = Some(HashMap::from([
+                                        (
+                                            "HOME".to_string(),
+                                            user.dir.to_string_lossy().into_owned(),
+                                        ),
+                                        ("USER".to_string(), user.name.clone()),
+                                        ("LOGNAME".to_string(), user.name),
+                                        (
+                                            "SHELL".to_string(),
+                                            user.shell.to_string_lossy().into_owned(),
+                                        ),
+                                    ]));
+                                }
+                            }
+                            host_device_plan = self
+                                .resolve_host_device_plan(
+                                    init.job_id,
+                                    &gpu_devices,
+                                    entry.uid,
+                                    entry.gid,
+                                )
+                                .await?;
+                            None
+                        }
+                        StepContainerPlan::Fresh(c) => {
+                            let (gpu_env, container_device_plan) = if gpu_devices.is_empty() {
+                                (HashMap::new(), None)
+                            } else {
+                                let (host_plan, container_plan) = self
+                                    .device_registry
+                                    .lock()
+                                    .await
+                                    .build_job_injection_plans(
+                                        "gpu",
+                                        &gpu_devices,
+                                        entry.uid,
+                                        entry.gid,
+                                    )
+                                    .map_err(|e| {
+                                        Status::failed_precondition(format!(
+                                            "GPU injection plan failed: {e}"
+                                        ))
+                                    })?;
+                                let env = host_plan.env.clone();
+                                host_device_plan = Some(host_plan);
+                                (env, Some(container_plan))
+                            };
+                            let passwd_entry = (entry.uid > 0)
+                                .then(|| {
+                                    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(
+                                        entry.uid,
+                                    ))
+                                    .ok()
+                                    .flatten()
+                                })
+                                .flatten();
+                            let username = passwd_entry
+                                .as_ref()
+                                .map(|u| u.name.clone())
+                                .unwrap_or_else(|| "spur".to_string());
+                            let home_dir = passwd_entry
+                                .map(|u| u.dir.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| format!("/home/{username}"));
+                            let mut env = HashMap::new();
+                            env.extend(gpu_env.clone());
+                            env.insert("HOME".to_string(), home_dir.clone());
+                            env.insert("USER".to_string(), username.clone());
+                            env.insert("LOGNAME".to_string(), username.clone());
+                            let (launch, rootfs_mode) = stage_fresh_container_step(
+                                &self.cluster_id,
+                                self.allow_root_jobs,
+                                c,
+                                FreshContainerContext {
+                                    gpu_devices: gpu_devices.clone(),
+                                    device_plan: container_device_plan,
+                                    uid: entry.uid,
+                                    gid: entry.gid,
+                                    username,
+                                    home_dir,
+                                    environment: env.clone(),
+                                    workdir_default: (!entry.work_dir.is_empty())
+                                        .then(|| entry.work_dir.clone()),
+                                    rootfs_base: crate::container::step_rootfs_base(
+                                        init.job_id,
+                                        step_id,
+                                    ),
+                                },
+                                init.job_id,
+                                &script,
+                            )?;
+                            container_rootfs_mode = Some(rootfs_mode);
+                            fresh_container_env = Some(env);
+                            Some(launch)
+                        }
+                    };
+
+                    let cfg = executor::JobLaunchConfig {
+                        job_id: init.job_id,
+                        run_attempt,
+                        step_id,
+                        joins_parent_namespaces: parent_has_namespaces,
+                        allocation_holder: false,
+                        script,
+                        work_dir: entry.work_dir.clone(),
+                        name: format!("{}.{}", init.job_id, step_id),
+                        user,
+                        node: self.reporter.hostname.clone(),
+                        array_job_id: None,
+                        array_task_id: None,
+                        environment: interactive_step_environment(
+                            Self::session_environ(&entry),
+                            entry.env_vars(init.job_id),
+                            host_identity_env,
+                            fresh_container_env,
+                        ),
+                        stdout_path: String::new(),
+                        stderr_path: String::new(),
+                        stdin_path: String::new(),
+                        cpus,
+                        memory_mb,
+                        gpu_devices,
+                        cpu_ids: Vec::new(),
+                        open_mode: None,
+                        uid: entry.uid,
+                        gid: entry.gid,
+                        container,
+                        prolog_script: None,
+                        // This interactive session's teardown runs no TaskEpilog, so keep
+                        // both task hooks off rather than run an unpaired prolog.
+                        task_prolog_script: None,
+                        task_epilog_script: None,
+                        partition,
+                        nodelist,
+                        mpi: String::new(),
+                        host_device_plan,
+                        memlock: self.limits.memlock,
+                        cgroup: self.cgroup.clone(),
+                        io_mode: executor::LaunchIo::Pty,
+                        pmix_multi_task: false,
+                    };
+
+                    let (descriptor, waiter) = self
+                        .launch_interactive_step(
+                            init.job_id,
+                            run_attempt,
+                            &cfg,
+                            container_rootfs_mode,
                         )
-                        .await
-                        {
-                            warn!(job_id = init.job_id, pid, %error, "pty master custody failed");
+                        .await?;
+
+                    let Some(pid) = supervised_step_workload_pid(&descriptor).await else {
+                        self.abandon_interactive_launch(
+                            init.job_id,
+                            run_attempt,
+                            (init.job_id, init.step_id),
+                            &descriptor,
+                        )
+                        .await;
+                        // A supervisor that never reported a pid either never
+                        // finished launching (recorded no reason) or hit a real
+                        // failure it wrote down before giving up — surface that
+                        // instead of the generic message so a real bug isn't
+                        // misread as a timeout.
+                        let reason = crate::stepd::StepdStore::new(&self.stepd_state_dir)
+                            .recorded_failure(init.job_id, run_attempt, step_id);
+                        return Err(Status::internal(match reason {
+                            Some(reason) => {
+                                format!("terminal workload failed to launch: {reason}")
+                            }
+                            None => "terminal workload did not report a pid in time".to_string(),
+                        }));
+                    };
+                    self.active_steps.lock().await.insert(
+                        (init.job_id, init.step_id),
+                        ActiveStep {
+                            epoch: next_step_epoch(),
+                            pid: Some(pid),
+                            ..Default::default()
+                        },
+                    );
+                    let master = match crate::stepd::reclaim_pty_master(&custody_dir, pid).await {
+                        Ok(Some(master)) => master,
+                        Ok(None) => {
+                            self.abandon_interactive_launch(
+                                init.job_id,
+                                run_attempt,
+                                (init.job_id, init.step_id),
+                                &descriptor,
+                            )
+                            .await;
+                            return Err(Status::internal(
+                                "terminal launched but deposited no pty master",
+                            ));
+                        }
+                        Err(error) => {
+                            self.abandon_interactive_launch(
+                                init.job_id,
+                                run_attempt,
+                                (init.job_id, init.step_id),
+                                &descriptor,
+                            )
+                            .await;
+                            return Err(Status::internal(format!(
+                                "failed to reclaim the terminal's own pty master: {error}"
+                            )));
+                        }
+                    };
+                    // The launch itself has no winsize to give the pty, so apply
+                    // the client's requested size once the master is back.
+                    if let Some(ws) = winsize.as_ref() {
+                        use std::os::fd::AsRawFd;
+                        if let Err(error) = crate::pty::resize(master.as_raw_fd(), ws) {
+                            warn!(job_id = init.job_id, pid, %error, "initial pty resize failed");
                         }
                     }
                     info!(
@@ -6690,32 +8288,56 @@ impl SlurmAgent for AgentService {
                         overlap = init.overlap,
                         "interactive session started"
                     );
-                    let exit = async move {
-                        child
-                            .wait()
-                            .await
-                            .ok()
-                            .and_then(|s| s.code())
-                            .unwrap_or(128)
-                    };
-                    (master, Box::pin(exit), pid)
+                    (master, interactive_exit_future(waiter), pid as i32)
                 }
             };
 
         self.live_ptys.lock().await.insert(init.job_id);
+        self.interactive_launch_steps
+            .lock()
+            .await
+            .insert((init.job_id, run_attempt), init.step_id);
+        // Only past this point does `live_ptys` reflect this session, so hold
+        // the lock through the insert or a racing attach could still decide
+        // "nothing live" and fence what was just started.
+        drop(_lifecycle);
         let live_ptys = self.live_ptys.clone();
         let job_id = init.job_id;
+        let stepds = self.stepds.clone();
+        let active_step_guard = ActiveStepGuard {
+            steps: self.active_steps.clone(),
+            key: (init.job_id, init.step_id),
+        };
         let bridge =
             Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx);
         tokio::spawn(async move {
+            // Drops when the bridge returns, releasing the cancellation
+            // registration; the stepd itself owns its own rootfs/cgroup
+            // teardown now, so this task no longer has to.
+            let _step_guard = active_step_guard;
+            // Every exit path in `run_pty_bridge` awaits the real exit first,
+            // so its return already proves the workload is gone.
             bridge.await;
             live_ptys.lock().await.remove(&job_id);
             // The terminal is gone; stop holding its descriptor or it leaks for
             // as long as the job runs.
-            if let Some(dir) = custody_dir.as_deref() {
-                if let Err(error) = crate::stepd::release_pty_master(dir, child_pid as u32).await {
-                    warn!(job_id, child_pid, %error, "failed to release a closed terminal");
-                }
+            if let Err(error) =
+                crate::stepd::release_pty_master(&custody_dir, child_pid as u32).await
+            {
+                warn!(job_id, child_pid, %error, "failed to release a closed terminal");
+            }
+            // Best-effort: the stepd's own teardown already retires it once
+            // its workload exits; this only catches a supervisor that never
+            // got that far (e.g. a fresh launch that failed after this point).
+            if let Err(error) = fence_displaced_stepd(
+                &stepds,
+                job_id,
+                spur_core::step::STEP_INTERACTIVE,
+                run_attempt,
+            )
+            .await
+            {
+                warn!(job_id, %error, "failed to retire a closed terminal's supervisor");
             }
         });
 
@@ -6859,7 +8481,10 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<MeshMembership>,
     ) -> Result<Response<ApplyMeshResponse>, Status> {
-        let iface = std::env::var("SPUR_WG_INTERFACE").unwrap_or_else(|_| "spur0".into());
+        // Use the interface spurd resolved at startup (via the reporter), not a fresh env read
+        // that would ignore spur.conf and could diverge from the rest of spurd.
+        let iface = self.reporter.wg_iface.clone();
+        let config_path = self.reporter.wg_config_dir.join(format!("{iface}.conf"));
         // proto -> spur-net mesh types.
         let members: Vec<spur_net::mesh::MeshNode> = request
             .into_inner()
@@ -6896,6 +8521,19 @@ impl SlurmAgent for AgentService {
                         "this node is not in the pushed mesh membership".to_string(),
                     ));
                 };
+                // Peers in this node's persisted config are never this reconcile's to prune, even
+                // when absent from the pushed k0s membership.
+                let protected: std::collections::HashSet<String> =
+                    match spur_net::wireguard::WgConfig::read_from(&config_path) {
+                        Ok(c) => c.peers.into_iter().map(|p| p.public_key).collect(),
+                        // An unreadable config protects nothing, so say so — silently pruning
+                        // peers because the file moved or is unreadable is the bad outcome here.
+                        Err(e) if config_path.exists() => {
+                            tracing::warn!(path = %config_path.display(), error = %e, "cannot read persisted WireGuard config; its peers are not protected from the mesh prune");
+                            Default::default()
+                        }
+                        Err(_) => Default::default(),
+                    };
                 // Reconcile: prune peers no longer in the membership, then add/update the desired peers.
                 let current = spur_net::wireguard::list_peers(&iface).unwrap_or_default();
                 let (added, pruned) = spur_net::mesh::reconcile_mesh(
@@ -6903,6 +8541,7 @@ impl SlurmAgent for AgentService {
                     &self_mesh_ip,
                     &members,
                     &current,
+                    &protected,
                     false,
                 )?;
                 Ok((
@@ -6937,6 +8576,18 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    /// Self-drains this node in the background when `error` condemns it,
+    /// without blocking the caller's own failure response on the RPC.
+    fn drain_on_node_fault(&self, error: &executor::LaunchError, job_id: u32) {
+        if let Some(drain_reason) = error.drain_reason() {
+            let controller = self.reporter.controller_addr.clone();
+            let node_name = self.reporter.hostname.clone();
+            tokio::spawn(async move {
+                request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
+            });
+        }
+    }
+
     /// Drops the tracked entry for `job_id` only if it's still `run_attempt` —
     /// a concurrent redispatch can retrack the same job_id under a newer
     /// attempt between the caller's peek and this call, and that entry must
@@ -6954,6 +8605,9 @@ impl AgentService {
                 .is_some_and(|current| current.run_attempt == run_attempt)
             {
                 let (tracked, cgroup) = remove_tracked_job(&mut jobs, job_id);
+                // Once released the GPU leaves `allocated_gpu_ids`, so the next
+                // inventory tick classifies its real hardware as a free-pool
+                // change and converges — no explicit reconcile hook needed here.
                 self.allocation.lock().await.release_job(job_id);
                 (tracked.is_some(), cgroup)
             } else {
@@ -6964,6 +8618,10 @@ impl AgentService {
         if !removed {
             return;
         }
+        self.interactive_launch_steps
+            .lock()
+            .await
+            .remove(&(job_id, run_attempt));
         let stale_sessions = {
             let mut sessions = self.stepds.lock().await;
             let stale: Vec<_> = stepds_for_job(&sessions, job_id)
@@ -6985,6 +8643,30 @@ impl AgentService {
         }
     }
 
+    /// Host-side device injection plan for a launch that has no container of
+    /// its own. `None` for a zero-GPU launch (an empty plan either way).
+    async fn resolve_host_device_plan(
+        &self,
+        job_id: u32,
+        gpu_devices: &[u64],
+        uid: u32,
+        gid: u32,
+    ) -> Result<Option<spur_devices::inject::HostInjectionPlan>, Status> {
+        if gpu_devices.is_empty() {
+            return Ok(None);
+        }
+        let (host_plan, _) = self
+            .device_registry
+            .lock()
+            .await
+            .build_job_injection_plans("gpu", gpu_devices, uid, gid)
+            .map_err(|e| {
+                error!(job_id, error = %e, "device registry resolution failed");
+                Status::failed_precondition(format!("device resolution failed: {}", e))
+            })?;
+        Ok(Some(host_plan))
+    }
+
     /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
     /// `cpus`/`memory_mb` are the resolved grant, so the core IDs match it.
     async fn allocate_local_resources(
@@ -6995,8 +8677,8 @@ impl AgentService {
         allocated: Option<&ResourceAllocations>,
         cpus: u32,
         memory_mb: u64,
-    ) -> Result<(AllocationResult, Vec<u32>), Status> {
-        let controller_gpu_ids: Vec<u32> = allocated
+    ) -> Result<(AllocationResult, Vec<u64>), Status> {
+        let controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
             .unwrap_or_default();
@@ -7017,6 +8699,13 @@ impl AgentService {
         let live: std::collections::HashSet<u32> = running.keys().copied().collect();
 
         let mut alloc = self.allocation.lock().await;
+
+        // Generation check under the allocation lock: the refresh task mutates
+        // inventory via update_capacity under this same lock, so checking here
+        // is atomic with the bind below — no publish can interleave.
+        if let Some(a) = allocated {
+            check_dispatch_generation(a.generation, self.reporter.snapshot_resources().generation)?;
+        }
 
         let result = match alloc.allocate_for_job(
             job_id,
@@ -7113,7 +8802,7 @@ impl AgentService {
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
-    ) -> Result<(AllocationResult, Vec<u32>), Status> {
+    ) -> Result<(AllocationResult, Vec<u64>), Status> {
         let (cpus, memory_mb) = resolve_cgroup_budget(allocated, spec, 1);
         self.allocate_local_resources(job_id, 1, spec, allocated, cpus, memory_mb)
             .await
@@ -7152,6 +8841,25 @@ impl AgentService {
             .is_some_and(|tracked| tracked.run_attempt == run_attempt)
     }
 
+    /// Resolves a cancel's target attempt once for everything below to share.
+    /// `run_attempt == 0` (the reclaim wildcard) resolves via `stepds`/`running`.
+    async fn resolve_cancel_attempt(&self, job_id: u32, run_attempt: u32) -> Option<u32> {
+        if run_attempt != 0 {
+            return Some(run_attempt);
+        }
+        if let Some(attempt) = stepds_for_job(&*self.stepds.lock().await, job_id)
+            .first()
+            .map(|descriptor| descriptor.run_attempt)
+        {
+            return Some(attempt);
+        }
+        self.running
+            .lock()
+            .await
+            .get(&job_id)
+            .map(|tracked| tracked.run_attempt)
+    }
+
     /// Send a user-specified signal to a running job.
     async fn send_explicit_signal(&self, job_id: u32, run_attempt: u32, signal: i32) {
         // A signal naming an epoch this node no longer runs belongs to a
@@ -7164,13 +8872,30 @@ impl AgentService {
             );
             return;
         }
+        let Some(run_attempt) = self.resolve_cancel_attempt(job_id, run_attempt).await else {
+            // Neither stepds nor running names an attempt to scope to, but an
+            // orphaned unsupervised step can still outlive both maps — reach
+            // it via the wildcard rather than stranding it.
+            self.cancel_active_steps_for_job(job_id, 0, signal).await;
+            return;
+        };
         // A signal reaches every step the job holds; one failing must not
         // silently spare its siblings.
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = supervisor_owns_teardown(&runtimes);
-        for descriptor in runtimes {
+        // Any stepd — including a terminal placeholder or a container step,
+        // neither of which own the job's lifetime — can still wedge or die,
+        // so all of them need the active-fencing/force-reclaim safety net.
+        let supervised = !runtimes.is_empty();
+        let lethal = signal_expected_to_terminate(
+            nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM),
+        );
+        // Spawned before the signal loop below, not after — see
+        // spawn_stepd_release_wait's doc for why.
+        let release_wait =
+            (supervised && lethal).then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
+        for descriptor in &runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
-                &descriptor,
+                descriptor,
                 uuid::Uuid::new_v4().to_string(),
                 signal,
             )
@@ -7178,12 +8903,35 @@ impl AgentService {
             {
                 warn!(job_id, step_id = descriptor.step_id, %error,
                     "runtime signal request failed");
+                // Pre-`Start`, a signal has nothing to reach and is rejected outright;
+                // a lethal signal must fall back to shutdown or the job sits out the gate.
+                if lethal {
+                    if let Err(error) = crate::stepd::shutdown_allocation(
+                        descriptor,
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .await
+                    {
+                        warn!(job_id, step_id = descriptor.step_id, %error,
+                            "runtime shutdown fallback failed");
+                    }
+                }
             }
         }
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
-        self.cancel_active_steps_for_job(job_id, signal).await;
+        self.cancel_active_steps_for_job(job_id, run_attempt, signal)
+            .await;
         if supervised {
+            // A stepd already confirmed dead has no teardown coming; fence it
+            // now instead of waiting out the release-wait bound below.
+            self.reap_dead_supervised_stepds(&runtimes).await;
+            if let Some(handle) = release_wait {
+                // Best-effort observe: the spawned task itself keeps running
+                // to completion regardless of whether this await, or the RPC
+                // that called us, gets cut short.
+                let _ = handle.await;
+            }
             return;
         }
         let allocation_only_attempt = {
@@ -7197,14 +8945,31 @@ impl AgentService {
             return;
         }
 
-        let jobs = self.running.lock().await;
-        let Some(tracked) = jobs.get(&job_id) else {
-            return;
+        let (tracked_attempt, sig) = {
+            let jobs = self.running.lock().await;
+            let Some(tracked) = jobs.get(&job_id) else {
+                return;
+            };
+            let sig = nix::sys::signal::Signal::try_from(signal)
+                .unwrap_or(nix::sys::signal::Signal::SIGTERM);
+            info!(job_id, signal, "sending explicit signal to job");
+            let _ = tracked.job.kill_signal(sig);
+            (tracked.run_attempt, sig)
         };
-        let sig =
-            nix::sys::signal::Signal::try_from(signal).unwrap_or(nix::sys::signal::Signal::SIGTERM);
-        info!(job_id, signal, "sending explicit signal to job");
-        let _ = tracked.job.kill_signal(sig);
+        if signal_expected_to_terminate(sig) {
+            wait_for_exit_and_teardown(
+                job_id,
+                tracked_attempt,
+                &self.running,
+                &self.lifecycle,
+                &self.allocation,
+                &self.mpi_host,
+                self.hooks.clone(),
+                self.spank.clone(),
+                self.reporter.controller_addr.clone(),
+            )
+            .await;
+        }
     }
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
@@ -7258,9 +9023,12 @@ impl AgentService {
     /// grace period guarantees a container init dies.
     /// Steps with a supervisor are skipped: it runs its own ordered shutdown,
     /// and the escalation below would cut that short.
-    async fn cancel_active_steps_for_job(&self, job_id: u32, signal: i32) {
+    /// `run_attempt == 0` is a wildcard (`stepds_for_attempt`'s own
+    /// convention), reached only when nothing named a concrete attempt —
+    /// so an orphaned unsupervised step stays reachable, not stranded.
+    async fn cancel_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
         let supervised: Vec<spur_core::step::StepId> =
-            stepds_for_job(&*self.stepds.lock().await, job_id)
+            stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
                 .iter()
                 .map(|descriptor| descriptor.step_id)
                 .collect();
@@ -7272,7 +9040,10 @@ impl AgentService {
             let mut steps = self.active_steps.lock().await;
             let mut targets = Vec::new();
             for (key, step) in steps.iter_mut() {
-                if key.0 == job_id && !supervised.contains(&key.1) {
+                if key.0 == job_id
+                    && (run_attempt == 0 || step.run_attempt == run_attempt)
+                    && !supervised.contains(&key.1)
+                {
                     step.cancel_requested = true;
                     if let Some(pid) = step.pid {
                         targets.push((*key, pid, step.epoch));
@@ -7317,17 +9088,39 @@ impl AgentService {
             );
             return;
         }
+        let Some(run_attempt) = self.resolve_cancel_attempt(job_id, run_attempt).await else {
+            // Neither stepds nor running names an attempt to scope to, but an
+            // orphaned unsupervised step can still outlive both maps — reach
+            // it via the wildcard rather than stranding it.
+            self.cancel_active_steps_for_job(job_id, 0, nix::sys::signal::Signal::SIGTERM as i32)
+                .await;
+            return;
+        };
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = supervisor_owns_teardown(&runtimes);
-        for descriptor in runtimes {
-            match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string())
+        // Any stepd — including a terminal placeholder or a container step,
+        // neither of which own the job's lifetime — can still wedge or die,
+        // so all of them need the active-fencing/force-reclaim safety net.
+        let supervised = !runtimes.is_empty();
+        // Spawned before the shutdown_allocation loop below, not after — see
+        // spawn_stepd_release_wait's doc for why.
+        let release_wait = supervised.then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
+        for descriptor in &runtimes {
+            match crate::stepd::shutdown_allocation(descriptor, uuid::Uuid::new_v4().to_string())
                 .await
             {
                 Ok(()) => {
-                    let stepds = self.stepds.clone();
+                    // Timed from the signal, not after the job-level wait below, so a
+                    // slow (or bounded-out) wait can't push escalation past ~5s.
+                    let signaled_at = tokio::time::Instant::now();
+                    let context = self.completion_listener_context();
+                    let descriptor = descriptor.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                        let still_current = stepds
+                        tokio::time::sleep(
+                            GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()),
+                        )
+                        .await;
+                        let still_current = context
+                            .stepds
                             .lock()
                             .await
                             .get(&stepd_key(&descriptor))
@@ -7349,7 +9142,13 @@ impl AgentService {
                         {
                             warn!(job_id, run_attempt = descriptor.run_attempt, %error,
                                 "failed to SIGKILL stepd after grace period");
+                            return;
                         }
+                        // This descriptor's own attempt, not whatever `running`
+                        // shows now — a redispatch may already have moved it on.
+                        let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
+                        wait_for_stepd_release(job_id, descriptor.run_attempt, deadline, &context)
+                            .await;
                     });
                 }
                 Err(error) => {
@@ -7360,9 +9159,22 @@ impl AgentService {
         }
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
-        self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
-            .await;
+        self.cancel_active_steps_for_job(
+            job_id,
+            run_attempt,
+            nix::sys::signal::Signal::SIGTERM as i32,
+        )
+        .await;
         if supervised {
+            // A stepd already confirmed dead has no teardown coming; fence it
+            // now instead of waiting out the release-wait bound below.
+            self.reap_dead_supervised_stepds(&runtimes).await;
+            if let Some(handle) = release_wait {
+                // Best-effort observe: the spawned task itself keeps running
+                // to completion regardless of whether this await, or the RPC
+                // that called us, gets cut short.
+                let _ = handle.await;
+            }
             return;
         }
         let allocation_only_attempt = {
@@ -7378,30 +9190,80 @@ impl AgentService {
 
         // Epoch of the run we're cancelling; the delayed SIGKILL below must not
         // touch a newer run that reused this job_id after a requeue.
-        let cancel_attempt = {
+        let (cancel_attempt, signaled_at) = {
             let jobs = self.running.lock().await;
             let Some(tracked) = jobs.get(&job_id) else {
                 return;
             };
             info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
             let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
-            tracked.run_attempt
+            (tracked.run_attempt, tokio::time::Instant::now())
         };
+        wait_for_exit_and_teardown(
+            job_id,
+            cancel_attempt,
+            &self.running,
+            &self.lifecycle,
+            &self.allocation,
+            &self.mpi_host,
+            self.hooks.clone(),
+            self.spank.clone(),
+            self.reporter.controller_addr.clone(),
+        )
+        .await;
 
         let running = self.running.clone();
+        let lifecycle = self.lifecycle.clone();
+        let allocation = self.allocation.clone();
+        let mpi_host = self.mpi_host.clone();
+        let hooks = self.hooks.clone();
+        let spank = self.spank.clone();
+        let controller_addr = self.reporter.controller_addr.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let jobs = running.lock().await;
-            if let Some(tracked) = jobs.get(&job_id) {
-                // Skip if job_id was reused by a newer run after requeue.
-                if tracked.run_attempt != cancel_attempt {
-                    return;
+            // Timed from the signal, not from after the immediate wait above,
+            // so a slow (or bounded-out) wait can't push escalation past ~5s.
+            tokio::time::sleep(GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()))
+                .await;
+            let sigkilled = {
+                let jobs = running.lock().await;
+                match jobs.get(&job_id) {
+                    // Skip if job_id was reused by a newer run after requeue.
+                    Some(tracked) if tracked.run_attempt == cancel_attempt => {
+                        info!(job_id, "grace period expired, sending SIGKILL");
+                        let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                        true
+                    }
+                    _ => false,
                 }
-                info!(job_id, "grace period expired, sending SIGKILL");
-                let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                // Job stays in `running` and monitor loop reaps it and does full cleanup.
+            };
+            if sigkilled {
+                wait_for_exit_and_teardown(
+                    job_id,
+                    cancel_attempt,
+                    &running,
+                    &lifecycle,
+                    &allocation,
+                    &mpi_host,
+                    hooks,
+                    spank,
+                    controller_addr,
+                )
+                .await;
             }
         });
+    }
+
+    /// A cancel normally just signals a supervised job's stepd and waits for
+    /// its teardown. If every stepd for this attempt is already confirmed
+    /// dead, no teardown is coming — release the ledger ourselves.
+    async fn reap_dead_supervised_stepds(&self, runtimes: &[crate::stepd::StepdDescriptor]) {
+        if runtimes.is_empty() || !runtimes.iter().all(stepd_confirmed_dead) {
+            return;
+        }
+        let context = self.completion_listener_context();
+        for descriptor in runtimes {
+            fence_dead_stepd(&context, descriptor.clone()).await;
+        }
     }
 
     /// The verified identity for this request, if the auth layer authenticated one.
@@ -7470,7 +9332,24 @@ impl AgentService {
             .ok_or_else(|| Status::not_found(format!("job {} not running on this node", job_id)))?;
 
         let (user, is_internal) = match identity {
-            Some(id) => (id.user.as_str(), id.is_admin),
+            Some(id) => {
+                let groups = if self.auth_policy.admin_groups.is_empty()
+                    && self.auth_policy.operator_groups.is_empty()
+                {
+                    Vec::new()
+                } else {
+                    spur_core::privilege::named_user_groups(&id.user).unwrap_or_default()
+                };
+                let role = spur_core::rbac::resolve_role(
+                    id,
+                    &self.auth_policy,
+                    None,
+                    true,
+                    &groups,
+                    false,
+                );
+                (id.user.as_str(), id.is_controller() || role.operates_jobs())
+            }
             None => (asserted_user, false),
         };
         spur_core::auth::check_job_owner(user, is_internal, &tracked.user, action)
@@ -7549,6 +9428,18 @@ impl AgentService {
         tokio::pin!(wait_exit);
 
         let master_raw = master.as_raw_fd();
+        // The stepd that opened this pty has no async I/O of its own to do
+        // with it, so it never had a reason to set this — without it, a read
+        // AsyncFd expects to fail with EAGAIN blocks the whole task instead.
+        if let Err(e) = nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        ) {
+            let _ = tx
+                .send(Err(Status::internal(format!("fcntl O_NONBLOCK: {e}"))))
+                .await;
+            return;
+        }
         let async_fd = match AsyncFd::new(master) {
             Ok(fd) => fd,
             Err(e) => {
@@ -7719,338 +9610,6 @@ impl AgentService {
         Ok(())
     }
 
-    /// Launch an interactive PTY step in a fresh container rootfs, using the
-    /// controller-resolved effective image. Like `run_command`'s Case 2, but wires
-    /// the child's stdio to a PTY slave and returns the master fd for
-    /// [`Self::run_pty_bridge`]. The caller holds the returned rootfs guard for the
-    /// session so the rootfs is torn down when it ends.
-    async fn spawn_containerized_pty_step(
-        &self,
-        job_id: u32,
-        step_id: u32,
-        container: &ContainerSpec,
-        argv: &[String],
-        entry: &crate::job_entry::JobEntry,
-        winsize: Option<&crate::pty::WindowSize>,
-    ) -> Result<(std::os::fd::OwnedFd, i32, StepRootfsGuard), Status> {
-        use std::os::fd::AsRawFd;
-
-        let (gpu_devices, partition, nodelist) = {
-            let jobs = self.running.lock().await;
-            let tracked = jobs.get(&job_id).ok_or_else(|| {
-                Status::not_found(format!("job {job_id} not running on this node"))
-            })?;
-            let nodelist = if tracked.nodelist.is_empty() {
-                hostname::get()
-                    .map(|h| h.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "localhost".into())
-            } else {
-                tracked.nodelist.clone()
-            };
-            (
-                tracked.gpu_devices.clone(),
-                tracked.partition.clone(),
-                nodelist,
-            )
-        };
-
-        // GPU device injection plan for the step's allocated GPUs (mirror Case 2).
-        let (mut gpu_env, container_device_plan) = if gpu_devices.is_empty() {
-            (HashMap::new(), None)
-        } else {
-            let (host_plan, container_plan) = self
-                .device_registry
-                .lock()
-                .await
-                .build_job_injection_plans("gpu", &gpu_devices, entry.uid, entry.gid)
-                .map_err(|e| {
-                    Status::failed_precondition(format!("GPU injection plan failed: {e}"))
-                })?;
-            (host_plan.env, Some(container_plan))
-        };
-        maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
-
-        // User identity for the container shadow/home, resolved from the job's uid.
-        let user = (entry.uid > 0)
-            .then(|| {
-                nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
-                    .ok()
-                    .flatten()
-            })
-            .flatten();
-        let username = user
-            .as_ref()
-            .map(|u| u.name.clone())
-            .unwrap_or_else(|| "spur".to_string());
-        let home_dir = user
-            .as_ref()
-            .map(|u| u.dir.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("/home/{username}"));
-
-        // Session env: job identity + GPU visibility + user identity, layered later
-        // over the image's own config.Env.
-        let mut senv = SpurEnv::new();
-        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
-        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
-        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
-        senv.set_with_slurm_twin("SPUR_NODELIST", &nodelist);
-        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
-        let mut env = senv.into_map();
-        env.extend(gpu_env);
-        env.entry("TERM".to_string())
-            .or_insert_with(|| "xterm-256color".to_string());
-        env.insert("HOME".to_string(), home_dir.clone());
-        env.insert("USER".to_string(), username.clone());
-        env.insert("LOGNAME".to_string(), username.clone());
-
-        let mounts: Vec<crate::container::BindMount> = container
-            .mounts
-            .iter()
-            .filter_map(|m| crate::container::parse_mount(m).ok())
-            .collect();
-
-        let container_cfg = crate::container::ContainerConfig {
-            image: container.image.clone(),
-            mounts,
-            workdir: if !container.workdir.is_empty() {
-                Some(container.workdir.clone())
-            } else if !entry.work_dir.is_empty() {
-                Some(entry.work_dir.clone())
-            } else {
-                None
-            },
-            name: (!container.name.is_empty()).then(|| container.name.clone()),
-            readonly: container.readonly,
-            mount_home: container.mount_home,
-            remap_root: container.remap_root,
-            gpu_devices: gpu_devices.clone(),
-            environment: env.clone(),
-            container_env: {
-                let mut ce = container.env.clone();
-                maybe_deny_gpu_env(&mut ce, &gpu_devices);
-                ce
-            },
-            entrypoint: (!container.entrypoint.is_empty()).then(|| container.entrypoint.clone()),
-            uid: entry.uid,
-            gid: entry.gid,
-            username,
-            home_dir,
-            device_plan: container_device_plan,
-        };
-
-        let image_path = crate::container::resolve_image(&container.image, None, Some(entry.uid))
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        let step_base = crate::container::step_rootfs_base(job_id, step_id);
-        let (rootfs, rootfs_mode) =
-            crate::container::setup_rootfs(&image_path, &step_base, container_cfg.name.as_deref())
-                .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
-        let mut rootfs_guard = StepRootfsGuard {
-            base: step_base,
-            mode: rootfs_mode,
-            pid: None,
-        };
-
-        // Interactive command: the image's default shell (empty argv) or the
-        // requested command, exec'd in place so it owns the PTY.
-        let cmdline = if argv.is_empty() {
-            None
-        } else {
-            Some(
-                shlex::try_join(argv.iter().map(String::as_str)).map_err(|e| {
-                    Status::invalid_argument(format!("command is not shell-safe: {e}"))
-                })?,
-            )
-        };
-        let child_cmd = StepChildCommand::Shell {
-            cmdline,
-            entrypoint: container_cfg.entrypoint.clone(),
-        };
-        reject_nul_bytes(&child_cmd)?;
-
-        let env_base = spur_net::oci::container_base_env(&rootfs, env);
-
-        let (master, slave) = crate::pty::openpty_with_winsize(winsize)
-            .map_err(|e| Status::internal(format!("openpty: {e}")))?;
-        let raw_io = crate::executor::JobIoRaw::Pty {
-            master: master.as_raw_fd(),
-            slave: slave.as_raw_fd(),
-        };
-
-        let (ready_r, ready_w) =
-            nix::unistd::pipe().map_err(|e| Status::internal(format!("pipe failed: {e}")))?;
-        nix::fcntl::fcntl(
-            &ready_r,
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        )
-        .ok();
-
-        let cgroup_join = executor::CgroupJoin::for_cgroup(entry.cgroup_path.as_deref());
-        let memlock = self.limits.memlock;
-
-        match unsafe {
-            nix::unistd::fork().map_err(|e| Status::internal(format!("fork failed: {e}")))?
-        } {
-            nix::unistd::ForkResult::Child => {
-                // === CHILD PROCESS — synchronous only ===
-                drop(ready_r);
-                unsafe {
-                    libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-                    // Wire the PTY slave as the controlling terminal (setsid +
-                    // TIOCSCTTY + dup2 slave->0/1/2 + close master) before
-                    // container_init pivots into the rootfs.
-                    if raw_io.wire().is_err() {
-                        std::process::exit(127);
-                    }
-                }
-                container_child_exec(
-                    &container_cfg,
-                    &rootfs,
-                    ready_w,
-                    memlock,
-                    &cgroup_join,
-                    env_base,
-                    child_cmd,
-                );
-            }
-            nix::unistd::ForkResult::Parent { child: child_pid } => {
-                // === PARENT ===
-                drop(ready_w);
-                drop(slave);
-
-                container_parent_ready(
-                    child_pid,
-                    ready_r,
-                    self.cgroup.required,
-                    entry.cgroup_path.as_deref(),
-                )?;
-
-                // Non-blocking so the bridge's AsyncFd reads/writes are correct.
-                nix::fcntl::fcntl(
-                    &master,
-                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-                )
-                .map_err(|e| Status::internal(format!("fcntl O_NONBLOCK: {e}")))?;
-
-                let raw_pid = child_pid.as_raw();
-                rootfs_guard.pid = Some(raw_pid);
-
-                // Register so scancel and the allocation-cancel path can signal it.
-                self.active_steps.lock().await.insert(
-                    (job_id, step_id),
-                    ActiveStep {
-                        epoch: next_step_epoch(),
-                        pid: Some(raw_pid as u32),
-                        ..Default::default()
-                    },
-                );
-
-                Ok((master, raw_pid, rootfs_guard))
-            }
-        }
-    }
-
-    fn spawn_pty_in_job(
-        entry: &crate::job_entry::JobEntry,
-        argv: &[String],
-        job_id: u32,
-        winsize: Option<&crate::pty::WindowSize>,
-        cgroup_required: bool,
-    ) -> Result<(std::os::fd::OwnedFd, tokio::process::Child, i32), Status> {
-        use std::os::fd::AsRawFd;
-        use std::process::Stdio;
-
-        let (master, slave) = crate::pty::openpty_with_winsize(winsize)
-            .map_err(|e| Status::internal(format!("openpty: {e}")))?;
-
-        let shell = if argv.is_empty() {
-            let bash_exists = if entry.pid > 0 && entry.has_mount_namespace {
-                std::path::Path::new(&format!("/proc/{}/root/bin/bash", entry.pid)).exists()
-            } else {
-                std::path::Path::new("/bin/bash").exists()
-            };
-            if bash_exists {
-                vec!["/bin/bash".to_string()]
-            } else {
-                vec!["/bin/sh".to_string()]
-            }
-        } else {
-            argv.to_vec()
-        };
-
-        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
-
-        let plan = build_launch_plan(entry, priv_drop.as_ref(), &shell);
-        let containment = ChildContainment::for_plan(&plan, entry, priv_drop, cgroup_required);
-        let launch_cmd = plan.program;
-        let launch_args = plan.args;
-
-        let mut cmd = tokio::process::Command::new(&launch_cmd);
-        let work_dir = if entry.work_dir.is_empty() {
-            "/tmp"
-        } else {
-            &entry.work_dir
-        };
-        cmd.args(&launch_args)
-            .current_dir(work_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        // Start from an empty environment so spurd's own environment (which may
-        // hold daemon secrets) never leaks into the session; then apply the job's
-        // own environment.
-        cmd.env_clear();
-        cmd.env("TERM", "xterm-256color");
-        for (k, v) in Self::session_environ(entry) {
-            cmd.env(k, v);
-        }
-        for (k, v) in entry.env_vars(job_id) {
-            cmd.env(k, v);
-        }
-        if entry.uid > 0 {
-            if let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
-                .ok()
-                .flatten()
-            {
-                cmd.env("HOME", user.dir.to_string_lossy().as_ref());
-                cmd.env("USER", &user.name);
-                cmd.env("LOGNAME", &user.name);
-                cmd.env("SHELL", user.shell.to_string_lossy().as_ref());
-            }
-        }
-
-        let raw = crate::executor::JobIoRaw::Pty {
-            master: master.as_raw_fd(),
-            slave: slave.as_raw_fd(),
-        };
-        // Hooks run in registration order, so the child wires its PTY, then
-        // joins the job's cgroup, then drops privilege.
-        unsafe {
-            cmd.pre_exec(move || raw.wire());
-        }
-        containment.register(&mut cmd);
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| Status::internal(format!("spawn PTY shell: {e}")))?;
-        let child_pid = child
-            .id()
-            .ok_or_else(|| Status::internal("spawned PTY child exited before pid could be read"))?
-            as i32;
-
-        drop(slave);
-
-        // Set non-blocking so AsyncFd reads/writes are correct.
-        nix::fcntl::fcntl(
-            &master,
-            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-        )
-        .map_err(|e| Status::internal(format!("fcntl O_NONBLOCK: {e}")))?;
-
-        Ok((master, child, child_pid))
-    }
-
     /// Read environment variables from a running process via /proc.
     fn read_proc_environ(pid: u32) -> Vec<(String, String)> {
         const MAX_ENVIRON: usize = 1 << 20; // 1 MiB
@@ -8159,11 +9718,21 @@ impl AgentService {
     }
 
     async fn register_test_step(&self, job_id: u32, step_id: u32, pid: Option<u32>) {
+        // Mirrors production: the step's attempt is whatever `running` tracks
+        // for this job, not a value the caller has to keep in sync by hand.
+        let run_attempt = self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .map(|tracked| tracked.run_attempt)
+            .unwrap_or_default();
         self.active_steps.lock().await.insert(
             (job_id, step_id),
             ActiveStep {
                 cancel_requested: false,
                 pid,
+                run_attempt,
                 ..Default::default()
             },
         );
@@ -8346,6 +9915,65 @@ mod tests {
             "an exited pid with its old start-ticks recorded must read as stale"
         );
         assert!(stop_stepd_process(&descriptor).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn abandon_interactive_launch_releases_every_piece_of_tracked_state() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 5301;
+        let run_attempt = 1;
+        let step_id = spur_core::step::STEP_INTERACTIVE;
+        let step_key = (job_id, 0u32);
+
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = child.id();
+        let start_ticks =
+            crate::stepd::process_start_ticks(pid).expect("read start ticks before it exits");
+        child.wait().expect("reap so the pid is stale");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            pid,
+            start_ticks,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        svc.stepds
+            .lock()
+            .await
+            .insert((job_id, step_id), descriptor.clone());
+        svc.active_steps.lock().await.insert(
+            step_key,
+            ActiveStep {
+                pid: Some(pid),
+                ..Default::default()
+            },
+        );
+        let _waiter = svc
+            .step_completions
+            .register(job_id, run_attempt, step_id)
+            .await;
+
+        svc.abandon_interactive_launch(job_id, run_attempt, step_key, &descriptor)
+            .await;
+
+        assert!(
+            !svc.active_steps.lock().await.contains_key(&step_key),
+            "a launch abandoned after failure must not leave a stale active_steps entry behind"
+        );
+        assert!(
+            !svc.stepds.lock().await.contains_key(&(job_id, step_id)),
+            "the abandoned stepd must no longer be tracked as live"
+        );
     }
 
     #[test]
@@ -8878,9 +10506,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -8939,9 +10567,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -8972,6 +10600,60 @@ mod tests {
             allocation.lock().await.allocated_memory_mb,
             0,
             "the last step out releases the allocation"
+        );
+    }
+
+    // A redispatch can reserve a newer attempt in the allocator before
+    // `running` catches up; a reap for the old attempt landing in that
+    // window must not release the newer reservation.
+    #[tokio::test]
+    async fn release_stepd_tracking_spares_a_newer_attempts_reservation() {
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 1, 128, &[])
+            .expect("reserve old attempt");
+        allocation.lock().await.release_job(42);
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 2, 1, 128, &[])
+            .expect("reserve newer attempt");
+
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        running.lock().await.insert(42, tracked);
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        release_stepd_tracking(&running, &allocation, &sessions, &descriptor, "stale reap").await;
+
+        assert_eq!(
+            allocation.lock().await.allocated_memory_mb,
+            128,
+            "a same-job_id redispatch's newer reservation must survive a stale reap for the old attempt"
         );
     }
 
@@ -9066,9 +10748,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 1, 128, &[])
+            .allocate_for_job(42, 7, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42, 1));
+        assert!(allocation.lock().await.commit_job(42, 7));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -9312,7 +10994,7 @@ mod tests {
     // holds its allocation forever.
     #[tokio::test]
     async fn fencing_a_dead_stepd_reports_the_death_to_the_controller() {
-        let (controller_addr, reports) = spawn_mock_controller();
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
         let state = tempfile::tempdir().expect("runtime state directory");
         let store = crate::stepd::StepdStore::new(state.path());
 
@@ -9329,6 +11011,59 @@ mod tests {
             0,
             "an acknowledged report leaves nothing for the replay loop"
         );
+    }
+
+    #[tokio::test]
+    async fn fence_dead_stepd_releases_tracking_before_reporting() {
+        let (controller_addr, _reports, _drains, gate) = spawn_gated_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let descriptor = fenced_session(&store);
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(allocation.lock().await.commit_job(42, 1));
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut context = fence_context(
+            &running,
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            &store,
+        );
+        context.controller_addr = controller_addr;
+
+        let handler = tokio::spawn(async move { fence_dead_stepd(&context, descriptor).await });
+
+        // While the ReportJobStatus RPC is still withheld, local tracking must
+        // already be gone — proving release happens before the report, not after.
+        gate.started.notified().await;
+        assert!(!running.lock().await.contains_key(&42));
+        assert!(!sessions
+            .lock()
+            .await
+            .contains_key(&(42, spur_core::step::STEP_BATCH)));
+
+        gate.release.notify_one();
+        handler.await.expect("fence_dead_stepd task");
     }
 
     #[tokio::test]
@@ -9540,13 +11275,35 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_host_step_is_supervisable() {
-        assert!(step_can_be_supervised(""));
+    fn a_plain_step_with_no_container_needs_no_plan() {
+        assert!(matches!(
+            resolve_step_container_plan(None, false),
+            StepContainerPlan::None
+        ));
     }
 
     #[test]
-    fn a_step_building_its_own_container_is_not_supervisable() {
-        assert!(!step_can_be_supervised("docker://alpine"));
+    fn a_step_with_its_own_image_and_no_containerized_parent_builds_fresh() {
+        let container = spur_proto::proto::ContainerSpec {
+            image: "docker://alpine".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_step_container_plan(Some(&container), false),
+            StepContainerPlan::Fresh(c) if c.image == "docker://alpine"
+        ));
+    }
+
+    #[test]
+    fn a_step_s_own_image_is_ignored_when_joining_a_containerized_parent() {
+        let container = spur_proto::proto::ContainerSpec {
+            image: "docker://alpine".into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_step_container_plan(Some(&container), true),
+            StepContainerPlan::None
+        ));
     }
 
     fn proto_pmix_plan(
@@ -9694,6 +11451,40 @@ mod tests {
         );
     }
 
+    /// A pty `LaunchJob` used to always take the legacy path, which would have
+    /// succeeded here; it must now reach the same supervised spawn as any job.
+    #[tokio::test]
+    async fn launch_job_supervises_a_pty_job() {
+        let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
+        let work_dir = tempfile::tempdir().unwrap();
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 9002,
+                spec: Some(JobSpec {
+                    script: "true".into(),
+                    pty: true,
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: work_dir.path().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("the RPC itself succeeds; failure is reported in the response")
+            .into_inner();
+
+        assert!(
+            !resp.success && resp.error.contains("spurstepd"),
+            "a pty job must now reach the supervised spawn attempt (mentioning spurstepd), \
+             not the legacy path's direct exec failure; got success={} error={}",
+            resp.success,
+            resp.error
+        );
+    }
+
     // The supervised dispatch is unreachable without `with_supervised_launch`,
     // so this is the only unit-level cover for who hosts a step's PMIx server.
     #[tokio::test]
@@ -9829,8 +11620,14 @@ mod tests {
 
     #[test]
     fn a_plain_steps_script_runs_the_command_directly() {
-        let script = supervised_step_script(&plain_job_entry(), 1000, 1000, &["true".to_string()])
-            .expect("script");
+        let script = supervised_step_script(
+            &plain_job_entry(),
+            1000,
+            1000,
+            "/tmp",
+            &["true".to_string()],
+        )
+        .expect("script");
 
         assert!(
             !script.contains("nsenter"),
@@ -9845,8 +11642,8 @@ mod tests {
         entry.has_mount_namespace = true;
         entry.pid = 4242;
 
-        let script =
-            supervised_step_script(&entry, 1000, 1000, &["true".to_string()]).expect("script");
+        let script = supervised_step_script(&entry, 1000, 1000, "/tmp", &["true".to_string()])
+            .expect("script");
 
         // Inside the script, so the supervisor itself stays out of the job's
         // namespaces and outlives it.
@@ -9854,13 +11651,43 @@ mod tests {
         assert!(script.contains("4242"), "{script}");
     }
 
+    // A host-side chdir does not survive entering the container's pivoted
+    // mount namespace (nsenter --wd is unreliable under a rootless user
+    // namespace too), so the cd must run in a shell *inside* the namespace
+    // nsenter just entered — not before nsenter execs.
+    #[test]
+    fn a_namespaced_steps_script_cds_into_its_work_dir_after_entering() {
+        let mut entry = plain_job_entry();
+        entry.has_pid_namespace = true;
+        entry.has_mount_namespace = true;
+        entry.pid = 4242;
+
+        let script = supervised_step_script(
+            &entry,
+            1000,
+            1000,
+            "/srv/step-scratch",
+            &["true".to_string()],
+        )
+        .expect("script");
+
+        let nsenter_at = script.find("nsenter").expect("script enters the namespace");
+        let cd_at = script
+            .find("cd /srv/step-scratch")
+            .expect("script cds into the step's own work_dir");
+        assert!(
+            cd_at > nsenter_at,
+            "the cd must be part of what nsenter execs, not run before it on the host:\n{script}"
+        );
+    }
+
     #[test]
     fn a_namespaced_parent_with_no_live_pid_runs_the_command_directly() {
         let mut entry = plain_job_entry();
         entry.has_pid_namespace = true;
 
-        let script =
-            supervised_step_script(&entry, 1000, 1000, &["true".to_string()]).expect("script");
+        let script = supervised_step_script(&entry, 1000, 1000, "/tmp", &["true".to_string()])
+            .expect("script");
 
         assert!(!script.contains("nsenter"), "{script}");
     }
@@ -9890,6 +11717,73 @@ mod tests {
             Some(nix::sys::signal::Signal::SIGTERM as i32)
         );
         assert_eq!(status.code(), None);
+    }
+
+    #[tokio::test]
+    async fn interactive_exit_future_reports_the_waiters_exit_code() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(crate::step_completion::StepOutcome {
+            exit_code: 7,
+            signal: 0,
+        })
+        .expect("send");
+        assert_eq!(interactive_exit_future(rx).await, 7);
+    }
+
+    // A signal death has no exit code to report; the shell-style 128+signal
+    // encoding is what Slurm-compat scripts checking `$?` expect.
+    #[tokio::test]
+    async fn interactive_exit_future_reports_128_plus_signal_for_a_signal_death() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(crate::step_completion::StepOutcome {
+            exit_code: 0,
+            signal: nix::sys::signal::Signal::SIGKILL as i32,
+        })
+        .expect("send");
+        assert_eq!(interactive_exit_future(rx).await, 128 + 9);
+    }
+
+    // A dropped waiter (e.g. the stepd vanished without reporting) must not
+    // hang the pty bridge forever; it has to resolve to some exit code.
+    #[tokio::test]
+    async fn interactive_exit_future_falls_back_to_128_when_the_waiter_is_dropped() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        drop(tx);
+        assert_eq!(interactive_exit_future(rx).await, 128);
+    }
+
+    #[test]
+    fn a_settled_outcome_is_trusted_only_for_the_invocation_that_launched_it() {
+        assert!(
+            settled_outcome_belongs_to_this_invocation(None, 7),
+            "nothing recorded (e.g. after a restart) must still trust a settled outcome"
+        );
+        assert!(
+            settled_outcome_belongs_to_this_invocation(Some(7), 7),
+            "the same numbered step reconnecting must trust its own settled outcome"
+        );
+        assert!(
+            !settled_outcome_belongs_to_this_invocation(Some(7), 8),
+            "a different numbered step is a new invocation and must not replay the old exit"
+        );
+    }
+
+    #[test]
+    fn interactive_step_script_defaults_an_empty_argv_to_a_shell() {
+        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, &[])
+            .expect("script")
+            .trim()
+            .to_string();
+        assert!(script.ends_with("/bin/bash"), "{script}");
+    }
+
+    #[test]
+    fn interactive_step_script_honors_an_explicit_command() {
+        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, &["zsh".to_string()])
+            .expect("script")
+            .trim()
+            .to_string();
+        assert!(script.ends_with("zsh"), "{script}");
     }
 
     #[tokio::test]
@@ -10000,6 +11894,54 @@ mod tests {
             .lock()
             .await
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
+    }
+
+    #[tokio::test]
+    async fn handle_completion_notification_releases_tracking_before_reporting() {
+        let (controller_addr, _reports, _drains, gate) = spawn_gated_mock_controller();
+        let (context, running, sessions, _state_dir) =
+            completion_listener_fixture(&controller_addr).await;
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::stepd::AgentNotification::StepdCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            step_id: spur_core::step::STEP_BATCH,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+
+        // While the ReportJobStatus RPC is still withheld, local tracking must
+        // already be gone — proving release happens before the report, not after.
+        gate.started.notified().await;
+        assert!(!running.lock().await.contains_key(&42));
+        assert!(!sessions
+            .lock()
+            .await
+            .contains_key(&(42, spur_core::step::STEP_BATCH)));
+
+        gate.release.notify_one();
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::stepd::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
     }
 
     #[tokio::test]
@@ -10445,6 +12387,187 @@ mod tests {
         assert!(!running.lock().await.contains_key(&42));
     }
 
+    // Reproduces the gap between the launch gate opening and `run_supervisor`
+    // actually starting to accept control connections: `launch_job` (openpty,
+    // container rootfs staging, priv drop) runs in between, and nothing serves
+    // `QueryState` on the socket until it returns.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_step_workload_pid_survives_a_supervisor_that_is_slow_to_start_serving() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dummy workload");
+        let pid = child.id().expect("pid");
+        let job = executor::RunningJob::Managed { child };
+        let session = std::sync::Arc::new(crate::stepd::Stepd::new(
+            job,
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+        ));
+
+        let run_descriptor = descriptor.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            let _ = crate::stepd::run_supervisor(listener, run_descriptor, session).await;
+        });
+
+        let found = supervised_step_workload_pid(&descriptor).await;
+        assert_eq!(
+            found,
+            Some(pid),
+            "a supervisor that starts serving after the polling budget must still be found"
+        );
+    }
+
+    // A connection hiccup while the supervisor is mid-launch (e.g. a transient
+    // reset before it has bound and started accepting) must not burn the rest
+    // of the polling budget: only the second half of the queries below ever
+    // succeed, so a single failed attempt aborting early would never find it.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_step_workload_pid_retries_past_a_transient_query_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        // Nothing is listening at this path yet, so every connect attempt
+        // fails fast with a real `Err` from `query_state` — standing in for a
+        // supervisor that isn't reachable on its first few polls.
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            0,
+            0,
+            socket_path.clone(),
+            std::path::PathBuf::new(),
+        );
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn dummy workload");
+        let pid = child.id().expect("pid");
+        let job = executor::RunningJob::Managed { child };
+        let session = std::sync::Arc::new(crate::stepd::Stepd::new(
+            job,
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+        ));
+
+        let run_descriptor = descriptor.clone();
+        tokio::spawn(async move {
+            // Bind well after polling has already started failing to connect.
+            tokio::time::sleep(WORKLOAD_PID_POLL_INTERVAL * (WORKLOAD_PID_POLLS / 2)).await;
+            let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+            let _ = crate::stepd::run_supervisor(listener, run_descriptor, session).await;
+        });
+
+        let found = supervised_step_workload_pid(&descriptor).await;
+        assert_eq!(
+            found,
+            Some(pid),
+            "a transient early connect failure must not stop the rest of the poll budget"
+        );
+    }
+
+    // A fresh container step's own GPU grant only ever exists in the env this
+    // step just built for it — never in the parent job's own session — so it
+    // must survive being layered onto that session env, not get shadowed by it.
+    #[test]
+    fn interactive_step_environment_keeps_the_fresh_container_gpu_grant() {
+        let session_env = vec![
+            ("HOME".to_string(), "/root".to_string()),
+            ("SPUR_JOB_ID".to_string(), "42".to_string()),
+        ];
+        let mut fresh_container_env = HashMap::new();
+        fresh_container_env.insert("ROCR_VISIBLE_DEVICES".to_string(), "0,1".to_string());
+        fresh_container_env.insert("SPUR_JOB_GPUS".to_string(), "0,1".to_string());
+        fresh_container_env.insert("HOME".to_string(), "/home/spur".to_string());
+
+        let environment =
+            interactive_step_environment(session_env, Vec::new(), None, Some(fresh_container_env));
+
+        assert_eq!(
+            environment.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("0,1"),
+            "the step's own GPU grant must reach the process env"
+        );
+        assert_eq!(
+            environment.get("SPUR_JOB_GPUS").map(String::as_str),
+            Some("0,1")
+        );
+        assert_eq!(
+            environment.get("HOME").map(String::as_str),
+            Some("/home/spur"),
+            "the fresh container's own identity must win over the parent session's"
+        );
+        assert_eq!(
+            environment.get("SPUR_JOB_ID").map(String::as_str),
+            Some("42"),
+            "session vars the fresh container doesn't override must still pass through"
+        );
+    }
+
+    // An allocation-only pty job has no batch process, so session_env is
+    // empty; TERM, job identity, and host identity must not depend on it.
+    #[test]
+    fn interactive_step_environment_fills_in_term_job_identity_and_host_identity() {
+        let job_env_vars = vec![
+            ("SPUR_JOB_ID".to_string(), "7".to_string()),
+            ("SLURM_JOB_ID".to_string(), "7".to_string()),
+        ];
+        let host_identity_env = Some(HashMap::from([
+            ("HOME".to_string(), "/home/alice".to_string()),
+            ("USER".to_string(), "alice".to_string()),
+            ("LOGNAME".to_string(), "alice".to_string()),
+            ("SHELL".to_string(), "/bin/bash".to_string()),
+        ]));
+
+        let environment =
+            interactive_step_environment(Vec::new(), job_env_vars, host_identity_env, None);
+
+        assert_eq!(
+            environment.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            environment.get("SPUR_JOB_ID").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            environment.get("SLURM_JOB_ID").map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            environment.get("HOME").map(String::as_str),
+            Some("/home/alice")
+        );
+        assert_eq!(environment.get("USER").map(String::as_str), Some("alice"));
+        assert_eq!(
+            environment.get("LOGNAME").map(String::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            environment.get("SHELL").map(String::as_str),
+            Some("/bin/bash")
+        );
+    }
+
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
             pid: 1234,
@@ -10600,111 +12723,6 @@ mod tests {
         assert_eq!(plan.program, "echo");
         assert_eq!(plan.args, vec!["hi".to_string()]);
         assert!(plan.apply_priv_in_child);
-    }
-
-    #[tokio::test]
-    async fn spawn_pty_in_job_direct_spawn_runs_command() {
-        // Drives the real spawn_pty_in_job handler (not just the pure planner)
-        // on the direct-spawn path: no namespaces, uid 0 so no privilege drop.
-        // This exercises the build_launch_plan call site inside the handler.
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: None,
-        };
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
-                .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
-        assert!(pid > 0);
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-    }
-
-    // The device filter lives on the job cgroup, so a child that fails to join it runs
-    // unfiltered. Under `required` that must abort before exec, not exec and warn.
-    #[tokio::test]
-    async fn a_required_join_that_cannot_land_aborts_the_attach() {
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            // A path with no cgroup.procs: the pre-exec open fails, so the join cannot land.
-            cgroup_path: Some("/nonexistent/spur-required/job_1".into()),
-        };
-
-        let err = AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, true)
-            .expect_err("a required join that cannot land must fail the spawn");
-        assert_eq!(err.code(), tonic::Code::Internal);
-    }
-
-    // The same unjoinable cgroup without `required` is the degraded non-root-agent path:
-    // it must still run rather than refuse the user their shell.
-    #[tokio::test]
-    async fn a_best_effort_join_failure_still_runs_the_command() {
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: Some("/nonexistent/spur-besteffort/job_1".into()),
-        };
-
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, false)
-                .expect("a best-effort join failure must still spawn the command");
-        assert!(pid > 0);
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-    }
-
-    // An attach that keeps spurd's cgroup reaches every device on the node,
-    // including ones the job was never allocated.
-    #[tokio::test]
-    async fn a_pty_attach_joins_the_job_cgroup() {
-        // A plain file stands in for `cgroup.procs`: the child opens and writes
-        // it exactly as it would the kernel's, so no root and no cgroupfs.
-        let cgroup = tempfile::tempdir().expect("tempdir");
-        std::fs::write(cgroup.path().join("cgroup.procs"), "").expect("cgroup.procs");
-
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: Some(cgroup.path().to_path_buf()),
-        };
-
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
-                .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-
-        let joined =
-            std::fs::read_to_string(cgroup.path().join("cgroup.procs")).expect("read cgroup.procs");
-        assert_eq!(
-            joined.trim(),
-            pid.to_string(),
-            "the attached PTY child must join the job's cgroup"
-        );
     }
 
     #[test]
@@ -10866,7 +12884,9 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
         ))
     }
 
@@ -10876,6 +12896,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mut f = tempfile::NamedTempFile::new().unwrap();
         writeln!(f, "#!/bin/bash\nexit {code}").unwrap();
+        let path = f.into_temp_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn touch_hook_script(target: &std::path::Path) -> tempfile::TempPath {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "#!/bin/bash\ntouch {}", target.display()).unwrap();
         let path = f.into_temp_path();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
@@ -11003,6 +13033,86 @@ mod tests {
             resp.error.contains("prolog_slurmd script exited with"),
             "the operator needs the script's own failure, got {:?}",
             resp.error
+        );
+    }
+
+    #[tokio::test]
+    async fn node_prolog_runs_for_a_standalone_srun_allocation() {
+        // Standalone srun registers an allocation instead of going through
+        // launch_job, so the node Prolog was never invoked for it. It must
+        // now run once per allocation on the node, before the extern stepd.
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("prolog-ran");
+        let prolog = touch_hook_script(&sentinel);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 307,
+            cpus: 1,
+            ..Default::default()
+        }))
+        .await
+        .expect("register allocation");
+
+        assert!(
+            sentinel.exists(),
+            "the node Prolog must run for a standalone srun allocation"
+        );
+        assert!(
+            svc.running.lock().await.contains_key(&307),
+            "a successful prolog must not block the allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_prolog_fails_the_srun_allocation() {
+        // A prolog gates node access: if it fails, the srun allocation must not
+        // be registered, and the failure must be reported as a typed prolog
+        // failure so the controller drains+holds instead of retrying srun onto
+        // the same node, mirroring how launch_job classifies a batch prolog fail.
+        let prolog = failing_hook_script(1);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig {
+                prolog: Some(prolog.to_str().unwrap().to_string()),
+                ..Default::default()
+            },
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let resp = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 308,
+                cpus: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect("a prolog failure is a typed body response, not an RPC error")
+            .into_inner();
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailureProlog as i32,
+            "the failure must be classified as a prolog failure so the \
+             controller drains+holds, got {:?}",
+            resp.failure_kind
+        );
+        assert!(
+            resp.error.contains("prolog failed"),
+            "the failure must be attributable to the prolog, got {:?}",
+            resp.error
+        );
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a failed prolog must not leave a tracked allocation"
         );
     }
 
@@ -11408,6 +13518,8 @@ mod tests {
             gid: 1000,
             container: None,
             prolog_script: None,
+            task_prolog_script: None,
+            task_epilog_script: None,
             partition: String::new(),
             nodelist: String::new(),
             mpi: String::new(),
@@ -11775,6 +13887,51 @@ mod tests {
                 tracked.rootfs_mode,
                 crate::container::RootfsMode::Overlay,
                 "a step carries no rootfs mode and must not reset the job's (order {seen:?})"
+            );
+        }
+    }
+
+    // STEP_INTERACTIVE (a non-owning step, since this PR) sits between user
+    // steps and STEP_BATCH/STEP_EXTERN in id order; directory order is
+    // otherwise arbitrary, so the job's own cgroup must win regardless of
+    // which descriptor recovery processes first.
+    #[tokio::test]
+    async fn a_terminal_sessions_own_leaf_cgroup_never_becomes_the_jobs() {
+        let mut terminal = crate::stepd::StepdDescriptor::new(
+            55,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        terminal.cgroup_path = "/sys/fs/cgroup/spur/job_55_1/step_4294967292".into();
+        let mut batch = crate::stepd::StepdDescriptor::new(
+            55,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        batch.cgroup_path = "/sys/fs/cgroup/spur/job_55_1".into();
+
+        for order in [
+            vec![terminal.clone(), batch.clone()],
+            vec![batch.clone(), terminal.clone()],
+        ] {
+            let seen: Vec<_> = order.iter().map(|d| d.step_id).collect();
+            let running = new_running_jobs();
+            recover_stepds(&running, order).await;
+
+            let jobs = running.lock().await;
+            let tracked = jobs.get(&55).expect("the adopted job is tracked");
+            assert_eq!(
+                tracked.cgroup_path,
+                Some(std::path::PathBuf::from("/sys/fs/cgroup/spur/job_55_1")),
+                "the terminal's own leaf cgroup must never become the job's (order {seen:?})"
             );
         }
     }
@@ -12290,6 +14447,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin: false,
+            trusted_unix: false,
         }
     }
 
@@ -12299,6 +14457,7 @@ mod tests {
             uid: 0,
             gid: 0,
             is_admin: true,
+            trusted_unix: false,
         }
     }
 
@@ -13041,7 +15200,7 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         svc.register_test_step(79, 4, Some(child.id())).await;
 
-        svc.cancel_active_steps_for_job(79, nix::sys::signal::Signal::SIGTERM as i32)
+        svc.cancel_active_steps_for_job(79, 0, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
 
         assert!(
@@ -13051,6 +15210,46 @@ mod tests {
         assert!(
             child.try_wait().expect("try_wait").is_none(),
             "the agent must not signal a step its supervisor is shutting down"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // An orphaned unsupervised step can outlive both `running` and `stepds`
+    // for its job -- an attempt-less cancel must still reach it, not strand
+    // it via resolve_cancel_attempt's `None`.
+    #[tokio::test]
+    async fn an_attempt_less_cancel_still_reaches_an_orphaned_unsupervised_step() {
+        use std::os::unix::process::CommandExt;
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        // Neither insert_test_job nor track_test_stepds: this job has no
+        // running/stepds entry at all, only the orphaned active_steps one.
+        svc.register_test_step(85, 4, Some(child.id())).await;
+        // register_test_step defaults to 0, the same as the wildcard sentinel
+        // -- stamp a real non-zero attempt so the wildcard match is actually exercised.
+        svc.active_steps
+            .lock()
+            .await
+            .get_mut(&(85, 4))
+            .expect("step registered above")
+            .run_attempt = 3;
+
+        svc.send_explicit_signal(85, 0, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+
+        assert!(
+            svc.step_cancel_requested(85, 4).await,
+            "an attempt-less cancel must still reach an orphaned unsupervised \
+             step even when neither running nor stepds names an attempt"
         );
         let _ = child.kill();
         let _ = child.wait();
@@ -13197,6 +15396,53 @@ mod tests {
         })
         .expect("step stdout spool file should exist on disk");
         assert_eq!(contents.trim(), "spooled-marker");
+    }
+
+    // Isolated candidate roots make both failures deterministic regardless of
+    // the runner's uid, unlike relying on /var/spool/spur's real permissions.
+    #[tokio::test]
+    async fn run_command_drains_the_node_when_its_spool_root_is_unwritable() {
+        let (controller_addr, _reports, drains) = spawn_mock_controller();
+        let owned_root = tempfile::tempdir().expect("isolated owned root");
+        let fallback_root = tempfile::tempdir().expect("isolated fallback root");
+        let job_id = 9001;
+        std::fs::write(
+            owned_root.path().join(format!("job{job_id}")),
+            b"blocking the owned root",
+        )
+        .expect("block owned root");
+        std::fs::write(
+            fallback_root.path().join(format!("job{job_id}")),
+            b"blocking the fallback root",
+        )
+        .expect("block fallback root");
+
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr))
+            .with_job_spool_roots(vec![
+                owned_root.path().to_path_buf(),
+                fallback_root.path().to_path_buf(),
+            ]);
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+
+        let status = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["echo".into(), "unreachable".into()],
+                uid: 0,
+                gid: 0,
+                job_id,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("spool dir blocked on both candidates; launch must fail");
+        assert!(
+            status.message().contains("step output files"),
+            "{}",
+            status.message()
+        );
+
+        let drained = expect_drain(&drains, 5_000).await;
+        assert_eq!(drained.len(), 1, "exactly one drain request expected");
+        assert_eq!(drained[0].name, "test-node");
     }
 
     #[tokio::test]
@@ -13467,6 +15713,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: device_id as u64,
             })
             .collect();
         Arc::new(NodeReporter::new(
@@ -13487,7 +15734,9 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             "spur0".into(),
+            std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
         ))
     }
 
@@ -13532,6 +15781,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices,
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -13546,6 +15796,166 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "GPU allocation must be released after a post-record launch failure"
+        );
+    }
+
+    /// The generation guard rejects only a genuine mismatch; a zero on either
+    /// side is unset/legacy and passes so pre-generation controllers still work.
+    #[test]
+    fn dispatch_generation_guard_matrix() {
+        assert!(check_dispatch_generation(7, 7).is_ok(), "equal passes");
+        assert!(
+            check_dispatch_generation(0, 7).is_ok(),
+            "unset dispatch skips"
+        );
+        assert!(check_dispatch_generation(7, 0).is_ok(), "unset live skips");
+        assert!(check_dispatch_generation(0, 0).is_ok(), "both unset skips");
+        let err = check_dispatch_generation(5, 7).expect_err("mismatch rejects");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("5 != 7"), "names both generations");
+    }
+
+    fn test_reporter_with_generation(generation: u64) -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                generation,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            "spur0".into(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
+        ))
+    }
+
+    /// A dispatch stamped under a superseded inventory generation is refused
+    /// before any resource is committed, so a repartition between schedule and
+    /// launch cannot bind the job to devices that have since been renumbered.
+    #[tokio::test]
+    async fn register_job_allocation_rejects_stale_generation() {
+        let svc = AgentService::new(
+            test_reporter_with_generation(7),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let req = Request::new(RegisterJobAllocationRequest {
+            job_id: 51,
+            cpus: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                generation: 5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let err = svc
+            .register_job_allocation(req)
+            .await
+            .expect_err("a dispatch under a stale generation must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused dispatch must not leave a tracked job"
+        );
+    }
+
+    /// launch_job runs the generation check inside allocate_local_resources under
+    /// the allocation lock; a stale-generation dispatch is refused before any
+    /// resource is bound, leaving no tracked job and no GPU held.
+    #[tokio::test]
+    async fn launch_job_rejects_stale_generation_before_binding() {
+        let reporter = Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                gpus: vec![spur_core::resource::GpuResource {
+                    device_id: 0,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: spur_core::resource::GpuLinkType::XGMI,
+                    stable_id: 128,
+                }],
+                generic: Default::default(),
+                generation: 7,
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            "spur0".into(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
+        ));
+        let svc = AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 128,
+                    count: 1,
+                }],
+            },
+        );
+        let req = Request::new(LaunchJobRequest {
+            job_id: 52,
+            spec: Some(JobSpec {
+                script: "#!/bin/sh\ntrue\n".into(),
+                cpus_per_task: 1,
+                gres: vec!["gpu:1".into()],
+                ..Default::default()
+            }),
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                memory_mb: 0,
+                devices,
+                generation: 5,
+            }),
+            ..Default::default()
+        });
+
+        let err = svc
+            .launch_job(req)
+            .await
+            .expect_err("a launch under a stale generation must be refused");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            svc.running.lock().await.is_empty(),
+            "a refused launch must not leave a tracked job"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a refused launch must not hold the GPU"
         );
     }
 
@@ -13576,6 +15986,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -13686,6 +16097,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             // Default (false): a genuine sbatch batch script, not an
             // explicit srun task fan-out.
@@ -13742,6 +16154,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             task_fanout: true,
             ..Default::default()
@@ -13788,6 +16201,7 @@ mod tests {
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             // Default (false): a genuine sbatch job, not a routed srun
             // request — no pmix_plan is supplied either, so if this reached
@@ -13836,6 +16250,7 @@ mod tests {
                 cpus: 2,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         });
@@ -14002,6 +16417,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -14051,6 +16467,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -14096,6 +16513,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices,
+            generation: 0,
         };
 
         let res = svc
@@ -14112,7 +16530,7 @@ mod tests {
         );
     }
 
-    fn gpu_alloc_request(device_ids: &[u32]) -> ResourceAllocations {
+    fn gpu_alloc_request(device_ids: &[u64]) -> ResourceAllocations {
         let devices = device_ids
             .iter()
             .map(|id| AllocatedDevice {
@@ -14126,6 +16544,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: map,
+            generation: 0,
         }
     }
 
@@ -14226,6 +16645,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices,
+                generation: 0,
             }),
             ..Default::default()
         }))
@@ -14320,7 +16740,9 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
+            crate::reporter::ReporterTimeouts::default(),
         ));
         let svc = AgentService::with_cluster_config(
             reporter.clone(),
@@ -14352,6 +16774,7 @@ mod tests {
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
+                generation: 0,
             }),
             ..Default::default()
         }))
@@ -14441,6 +16864,97 @@ mod tests {
             svc.free_gpu_count().await,
             0,
             "a stale cancel must not release the current attempt's reservation"
+        );
+    }
+
+    // spurctld's abort-then-retry redispatches to the same node right after
+    // CancelJob returns, so the GPU must already be free by then.
+    #[tokio::test]
+    async fn cancel_releases_running_jobs_gpu_before_returning() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // No start_monitor: the release must not depend on its tick.
+
+        let job_id = 99;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
+            assert!(
+                alloc.commit_job(job_id, 1),
+                "commit must find its own reservation"
+            );
+        }
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "GPU must be free immediately after CancelJob returns"
+        );
+    }
+
+    // A cancel wait left over from a run that's since been replaced by a
+    // redispatch must never act on the newer attempt sharing its job_id.
+    #[tokio::test]
+    async fn wait_for_exit_and_teardown_spares_a_newer_attempt() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let job_id = 905;
+        // Short-lived on purpose: without the attempt check, the wait loop
+        // would poll long enough to see this exit and tear it down anyway.
+        let child = tokio::process::Command::new("/bin/true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn short-lived job");
+        let mut redispatch = TrackedJob::dummy(0);
+        redispatch.job = executor::RunningJob::Managed { child };
+        redispatch.run_attempt = 2;
+        svc.insert_test_job(job_id, redispatch).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 2, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id, 2);
+        }
+
+        // A cancel wait for the run this job_id replaced (attempt 1).
+        wait_for_exit_and_teardown(
+            job_id,
+            1,
+            &svc.running,
+            &svc.lifecycle,
+            &svc.allocation,
+            &svc.mpi_host,
+            svc.hooks.clone(),
+            svc.spank.clone(),
+            svc.reporter.controller_addr.clone(),
+        )
+        .await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a stale wait must not remove the newer attempt"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "a stale wait must not release the newer attempt's GPU"
         );
     }
 
@@ -14633,10 +17147,74 @@ mod tests {
         );
     }
 
-    /// Records the completion reports it receives. Every other RPC reports
-    /// unimplemented, so drifting onto an unmocked call fails loudly.
+    #[tokio::test]
+    async fn resolve_host_device_plan_is_none_for_a_zero_gpu_job() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let plan = svc.resolve_host_device_plan(700, &[], 0, 0).await.unwrap();
+        assert!(plan.is_none());
+    }
+
+    // Regression guard for run_command/interactive_session/register_job_allocation
+    // dropping their computed device plan (host_device_plan hardcoded to None),
+    // which left the per-step /dev/dri namespace mount unpopulated.
+    #[tokio::test]
+    async fn resolve_host_device_plan_wires_the_injection_plan_for_a_gpu_job() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let plan = svc
+            .resolve_host_device_plan(700, &[0, 1], 0, 0)
+            .await
+            .unwrap()
+            .expect("a non-empty gpu_devices list must produce a host device plan");
+        assert!(
+            plan.device_paths.iter().any(|p| p.contains("renderD128")),
+            "expected renderD128 among {:?}",
+            plan.device_paths
+        );
+        assert!(
+            plan.device_paths.iter().any(|p| p.contains("renderD129")),
+            "expected renderD129 among {:?}",
+            plan.device_paths
+        );
+        // visible_devices is filtered to nodes that exist on this filesystem
+        // (see HostInjector::plan), so it's not asserted here: CI runners have
+        // no real /dev/dri, unlike the GPU dev box this was authored on.
+    }
+
+    /// Records the completion reports and drain requests it receives. Every
+    /// other RPC reports unimplemented, so drifting onto an unmocked call
+    /// fails loudly.
     struct MockController {
         reports: Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>,
+        drains: DrainRequests,
+        report_gate: Option<Arc<ReportGate>>,
+    }
+
+    /// Lets a test observe a `ReportJobStatus` RPC genuinely in flight: the
+    /// mock notifies `started` on receipt, then blocks on `release` before
+    /// responding, so the caller can assert state while the report is withheld.
+    #[derive(Default)]
+    struct ReportGate {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    /// Notify-backed so a positive-case test can await the drain instead of
+    /// polling; the mutex alone is enough for a negative-case test, which
+    /// only needs a synchronous read once its own RPC call has resolved.
+    #[derive(Default)]
+    struct DrainLog {
+        requests: std::sync::Mutex<Vec<spur_proto::proto::DrainNodeRequest>>,
+        notify: tokio::sync::Notify,
     }
 
     /// The `async_trait` attribute has to be applied by the macro: it rewrites
@@ -14653,7 +17231,23 @@ mod tests {
                         .lock()
                         .expect("completion reports")
                         .push(request.into_inner());
+                    if let Some(gate) = &self.report_gate {
+                        gate.started.notify_one();
+                        gate.release.notified().await;
+                    }
                     Ok(tonic::Response::new(()))
+                }
+                async fn drain_node(
+                    &self,
+                    request: tonic::Request<spur_proto::proto::DrainNodeRequest>,
+                ) -> Result<tonic::Response<spur_proto::proto::DrainNodeResponse>, tonic::Status> {
+                    self.drains
+                        .requests
+                        .lock()
+                        .expect("drain requests")
+                        .push(request.into_inner());
+                    self.drains.notify.notify_one();
+                    Ok(tonic::Response::new(spur_proto::proto::DrainNodeResponse::default()))
                 }
                 $(
                     async fn $method(
@@ -14681,7 +17275,6 @@ mod tests {
             get_nodes(spur_proto::proto::GetNodesRequest) -> spur_proto::proto::GetNodesResponse;
             get_node(spur_proto::proto::GetNodeRequest) -> spur_proto::proto::NodeInfo;
             update_node(spur_proto::proto::UpdateNodeRequest) -> ();
-            drain_node(spur_proto::proto::DrainNodeRequest) -> spur_proto::proto::DrainNodeResponse;
             deregister_node(spur_proto::proto::DeregisterNodeRequest) -> spur_proto::proto::DeregisterNodeResponse;
             deregister_agent(spur_proto::proto::DeregisterAgentRequest) -> ();
             get_partitions(spur_proto::proto::GetPartitionsRequest) -> spur_proto::proto::GetPartitionsResponse;
@@ -14721,16 +17314,42 @@ mod tests {
     }
 
     type CompletionReports = Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>;
+    type DrainRequests = Arc<DrainLog>;
 
-    fn spawn_mock_controller() -> (String, CompletionReports) {
+    fn spawn_mock_controller() -> (String, CompletionReports, DrainRequests) {
+        let (addr, reports, drains, _gate) = spawn_mock_controller_with_gate(None);
+        (addr, reports, drains)
+    }
+
+    /// Like `spawn_mock_controller`, but `ReportJobStatus` withholds its
+    /// response until the test calls `gate.release.notify_one()`, so a test
+    /// can observe state while that RPC is genuinely still in flight.
+    fn spawn_gated_mock_controller() -> (String, CompletionReports, DrainRequests, Arc<ReportGate>)
+    {
+        let gate = Arc::new(ReportGate::default());
+        let (addr, reports, drains, _) = spawn_mock_controller_with_gate(Some(gate.clone()));
+        (addr, reports, drains, gate)
+    }
+
+    fn spawn_mock_controller_with_gate(
+        report_gate: Option<Arc<ReportGate>>,
+    ) -> (
+        String,
+        CompletionReports,
+        DrainRequests,
+        Option<Arc<ReportGate>>,
+    ) {
         let incoming = tonic::transport::server::TcpIncoming::bind(
             "127.0.0.1:0".parse().expect("loopback address"),
         )
         .expect("bind mock controller");
         let addr = incoming.local_addr().expect("mock controller address");
         let reports: CompletionReports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drains: DrainRequests = Arc::new(DrainLog::default());
         let service = MockController {
             reports: reports.clone(),
+            drains: drains.clone(),
+            report_gate: report_gate.clone(),
         };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
@@ -14738,7 +17357,169 @@ mod tests {
                 .serve_with_incoming(incoming)
                 .await;
         });
-        (format!("http://{addr}"), reports)
+        (format!("http://{addr}"), reports, drains, report_gate)
+    }
+
+    fn test_reporter_with_controller(controller_addr: &str) -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            controller_addr.into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            new_running_jobs(),
+            crate::reporter::ReporterTimeouts::default(),
+        ))
+    }
+
+    /// Registers interest before checking, per `Notify`'s documented pattern,
+    /// so a drain landing between the check and the await is never missed.
+    async fn expect_drain(
+        drains: &DrainRequests,
+        timeout_ms: u64,
+    ) -> Vec<spur_proto::proto::DrainNodeRequest> {
+        let notified = drains.notify.notified();
+        if drains.requests.lock().expect("drain requests").is_empty() {
+            let _ = tokio::time::timeout(tokio::time::Duration::from_millis(timeout_ms), notified)
+                .await;
+        }
+        drains.requests.lock().expect("drain requests").clone()
+    }
+
+    fn test_agent_service(reporter: Arc<NodeReporter>) -> AgentService {
+        AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    // A disk-full launch failure must self-drain the node exactly once,
+    // whichever RPC surfaced it — this is what both `launch_job`'s NodeFault
+    // arm and `register_job_allocation`'s stepd failure now share.
+    #[tokio::test]
+    async fn node_fault_self_drains_the_node() {
+        let (controller_addr, _reports, drains) = spawn_mock_controller();
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr));
+
+        let fault = executor::LaunchError::NodeFault(anyhow::anyhow!(
+            "prepare stepd directory: No space left on device (os error 28)"
+        ));
+        svc.drain_on_node_fault(&fault, 55);
+
+        let drained = expect_drain(&drains, 5_000).await;
+        assert_eq!(drained.len(), 1, "exactly one drain request expected");
+        assert_eq!(drained[0].name, "test-node");
+        assert!(
+            drained[0].reason.contains("No space left on device"),
+            "drain reason must carry the underlying errno: {}",
+            drained[0].reason
+        );
+    }
+
+    // A failure specific to this job (bad image, prolog script, etc.) must
+    // never take a healthy node out of rotation.
+    #[tokio::test]
+    async fn a_job_specific_launch_failure_does_not_drain_the_node() {
+        let (controller_addr, _reports, drains) = spawn_mock_controller();
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr));
+
+        let other = executor::LaunchError::Other(anyhow::anyhow!("container image not found"));
+        svc.drain_on_node_fault(&other, 56);
+        let prolog = executor::LaunchError::PrologFailed(anyhow::anyhow!("exit status 1"));
+        svc.drain_on_node_fault(&prolog, 57);
+
+        // No spawn happens for a non-`NodeFault` error, so this is deterministic.
+        assert!(
+            drains.requests.lock().expect("drain requests").is_empty(),
+            "neither a job-specific nor a prolog failure should self-drain"
+        );
+    }
+
+    // Drives the real RPC into launch_stepd's failure arm (no spurstepd binary
+    // in test env), pinning that the drain check is reached from this call site.
+    #[tokio::test]
+    async fn register_job_allocation_reaches_the_drain_check_on_a_stepd_launch_failure() {
+        let (controller_addr, _reports, drains) = spawn_mock_controller();
+        let state_dir = tempfile::tempdir().expect("runtime state dir");
+        let svc = test_agent_service(test_reporter_with_controller(&controller_addr))
+            .with_runtime_state_dir(state_dir.path().to_path_buf())
+            .with_supervised_launch();
+
+        let status = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 4242,
+                cpus: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("no spurstepd binary in test env; the stepd spawn must fail");
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(
+            status
+                .message()
+                .contains("failed to start allocation stepd"),
+            "{}",
+            status.message()
+        );
+        // Job-specific (no spawn happens), so this is deterministic, not a race.
+        assert!(drains.requests.lock().expect("drain requests").is_empty());
+    }
+
+    #[test]
+    fn stepd_session_dir_enospc_under_the_owned_root_is_a_node_fault() {
+        let state_dir = std::path::PathBuf::from("/var/spool/spur");
+        let dir = state_dir.join("runtime/1.1.0");
+        let err = session_dir_prepare_error(
+            &dir,
+            &state_dir,
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert!(matches!(err, executor::LaunchError::NodeFault(_)));
+        let reason = err.drain_reason().expect("node fault must drain");
+        assert!(reason.contains("No space left on device"), "{reason}");
+    }
+
+    // The owned root is whatever this agent is configured with, not the
+    // hardcoded job-spool default.
+    #[test]
+    fn stepd_session_dir_enospc_under_a_relocated_state_dir_is_a_node_fault() {
+        let state_dir = std::path::PathBuf::from("/data/spur");
+        let dir = state_dir.join("runtime/1.1.0");
+        let err = session_dir_prepare_error(
+            &dir,
+            &state_dir,
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert!(matches!(err, executor::LaunchError::NodeFault(_)));
+        assert!(err.drain_reason().is_some());
+    }
+
+    #[test]
+    fn stepd_session_dir_error_outside_the_owned_root_does_not_drain() {
+        let state_dir = std::path::PathBuf::from("/var/spool/spur");
+        let dir = std::env::temp_dir().join("spur-test").join("runtime/1.1.0");
+        let err = session_dir_prepare_error(
+            &dir,
+            &state_dir,
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert!(matches!(err, executor::LaunchError::Other(_)));
+        assert!(err.drain_reason().is_none());
     }
 
     fn fence_context(
@@ -14924,6 +17705,384 @@ mod tests {
         ));
     }
 
+    // Real time deliberately, not `start_paused`: paused time auto-advances
+    // through idle periods, letting the simulated push "complete" regardless.
+    #[tokio::test]
+    async fn send_explicit_signal_waits_for_stepd_release_before_returning() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime socket directory");
+        let socket_path = state.path().join("runtime.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            906,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "explicit-signal-wait-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        // The job-level `running` entry a stepd-supervised launch creates — what
+        // release_stepd_tracking clears and wait_for_stepd_release polls.
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        let server_descriptor = descriptor.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = crate::stepd::accept_hello(
+                &listener,
+                &server_descriptor,
+                &server_descriptor.capability,
+            )
+            .await
+            .expect("accept runtime hello");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .expect("read runtime request");
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
+                            .expect("encode acknowledgement")
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("acknowledge runtime request");
+        });
+
+        // Simulates the supervisor's completion push clearing the job's `running`
+        // entry shortly after the signal, not instantly.
+        let running = svc.running.clone();
+        let job_id = descriptor.job_id;
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            running.lock().await.remove(&job_id);
+        });
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&descriptor.job_id),
+            "send_explicit_signal must not return before the job's running entry clears"
+        );
+        server.await.expect("runtime control server");
+    }
+
+    // A session cancelled before `Start` has nothing that pushes completion; left
+    // to the 15s crash watchdog, GPU release would lag well past the cancel RPC.
+    #[tokio::test]
+    async fn send_explicit_signal_fences_a_session_that_never_started() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            907,
+            1,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            state.path().join("never-bound.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "never-started-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(descriptor.job_id, descriptor.run_attempt, 1, 0, &[0])
+                .unwrap();
+            assert!(alloc.commit_job(descriptor.job_id, descriptor.run_attempt));
+        }
+
+        tokio::time::timeout(
+            CANCEL_REAP_TIMEOUT,
+            svc.send_explicit_signal(
+                descriptor.job_id,
+                0,
+                nix::sys::signal::Signal::SIGKILL as i32,
+            ),
+        )
+        .await
+        .expect("send_explicit_signal must resolve within the cancel-reap bound");
+
+        assert!(
+            !svc.running.lock().await.contains_key(&descriptor.job_id),
+            "a never-started session's ledger entry must clear without waiting on the crash watchdog"
+        );
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "the GPU must be free immediately, not after the crash watchdog's next tick"
+        );
+    }
+
+    /// A real, separate long-lived process standing in for a wedged stepd:
+    /// genuinely alive (real pid, matching start ticks), so `stepd_liveness`
+    /// reports it `Live` exactly like a frozen or deadlocked supervisor would.
+    async fn spawn_wedged_stepd_stub(
+        job_id: u32,
+        run_attempt: u32,
+    ) -> (tokio::process::Child, crate::stepd::StepdDescriptor) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn wedged-stepd stand-in");
+        let pid = child.id().expect("child pid");
+        let start_ticks = crate::stepd::process_start_ticks(pid).expect("start ticks");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            start_ticks,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "wedged-stepd-test".into();
+        (child, descriptor)
+    }
+
+    /// `/proc`-based liveness can't tell a zombie from a running process, and
+    /// this test is the direct parent of its stand-in (production's stepd is
+    /// double-forked onto init, which reaps it) — so check via `try_wait`,
+    /// which actually reaps, instead of re-reading `/proc/<pid>/stat`.
+    async fn child_has_exited(child: &mut tokio::process::Child) -> bool {
+        matches!(child.try_wait(), Ok(Some(_)))
+    }
+
+    #[tokio::test]
+    async fn force_reclaim_kills_a_stepd_that_never_reports_dead() {
+        let _shortened = ShortenedForceReclaim::new(std::time::Duration::from_millis(200));
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (child, descriptor) = spawn_wedged_stepd_stub(920, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        // Production double-forks stepd onto init, which reaps it promptly;
+        // this test is the direct parent, so it must reap the same way or
+        // force-reclaim retries forever against an unreaped zombie.
+        let reaped = Arc::new(tokio::sync::Notify::new());
+        let reaped_signal = reaped.clone();
+        tokio::spawn(async move {
+            let mut child = child;
+            loop {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped_signal.notify_one();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if !svc.running.lock().await.contains_key(&descriptor.job_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            !svc.running.lock().await.contains_key(&descriptor.job_id),
+            "a wedged stepd's ledger entry must clear once the force-reclaim window elapses"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), reaped.notified())
+                .await
+                .is_ok(),
+            "the force-reclaim path must have SIGKILLed the wedged stepd"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reclaim_does_not_fire_before_the_hard_deadline() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(921, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+        // Lets a wrongly-immediate force-reclaim task (spawned right as
+        // send_explicit_signal returned) actually run once before checking —
+        // otherwise this assertion can win a race against it and pass for
+        // the wrong reason regardless of what the deadline math says.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&descriptor.job_id),
+            "the ledger must still be held well before the (real, un-shortened) \
+             force-reclaim window elapses"
+        );
+        assert!(
+            !child_has_exited(&mut child).await,
+            "the stepd must not be force-killed before its hard deadline"
+        );
+    }
+
+    // Well past CANCEL_REAP_TIMEOUT (3s), which send_explicit_signal itself
+    // blocks for before returning — the test's own action must land with
+    // real margin before this window closes, not race it by ~1s.
+    const FORCE_RECLAIM_TEST_WINDOW: std::time::Duration = std::time::Duration::from_millis(8000);
+
+    #[tokio::test]
+    async fn force_reclaim_spares_a_superseded_attempt() {
+        let _shortened = ShortenedForceReclaim::new(FORCE_RECLAIM_TEST_WINDOW);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(922, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        // A redispatch supersedes this attempt before the force window
+        // fires — the running job_id now points at a newer run_attempt.
+        let mut redispatched = TrackedJob::allocation_only(None);
+        redispatched.run_attempt = descriptor.run_attempt + 1;
+        svc.insert_test_job(descriptor.job_id, redispatched).await;
+
+        tokio::time::sleep(FORCE_RECLAIM_TEST_WINDOW).await;
+
+        assert_eq!(
+            svc.running
+                .lock()
+                .await
+                .get(&descriptor.job_id)
+                .map(|t| t.run_attempt),
+            Some(descriptor.run_attempt + 1),
+            "the redispatched attempt's tracking must be untouched"
+        );
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a superseded attempt's stepd must not be force-killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_reclaim_is_a_noop_once_already_released_normally() {
+        let _shortened = ShortenedForceReclaim::new(FORCE_RECLAIM_TEST_WINDOW);
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(923, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        svc.send_explicit_signal(
+            descriptor.job_id,
+            0,
+            nix::sys::signal::Signal::SIGKILL as i32,
+        )
+        .await;
+
+        // Simulates the job's tracking clearing by some other path (leaving
+        // the stepd session itself, still genuinely alive, sitting in the
+        // stepds map) before the force window elapses — a bare
+        // release_stepd_tracking would also clear the stepds entry
+        // atomically, which would make stepds_for_attempt return nothing
+        // regardless of the running-tracked check this test means to cover.
+        svc.running.lock().await.remove(&descriptor.job_id);
+
+        tokio::time::sleep(FORCE_RECLAIM_TEST_WINDOW).await;
+
+        assert!(
+            !child_has_exited(&mut child).await,
+            "a stepd session whose job no longer appears in `running` must not \
+             be force-killed by a force-reclaim task spawned for that job"
+        );
+    }
+
     // The immediate shutdown needs the same epoch guard as the grace-period
     // SIGKILL, or a cancel for a superseded run tears down its replacement.
     #[tokio::test(start_paused = true)]
@@ -15045,6 +18204,477 @@ mod tests {
         svc.running.lock().await.remove(&job_id);
     }
 
+    // If a supervised job's stepd pid is already confirmed gone, its teardown
+    // will never come, so the cancel must force the release itself.
+    #[tokio::test]
+    async fn graceful_cancel_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 960;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-stepd-960.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "dead-stepd-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id, 0).await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a confirmed-dead supervised job must be dropped from the running set"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "a confirmed-dead supervised job's allocation must be released"
+        );
+    }
+
+    // The mirror case: the stepd is still alive, so the ledger must stay put
+    // and wait for its own teardown, exactly as before this fix.
+    #[tokio::test]
+    async fn graceful_cancel_does_not_reclaim_a_live_supervised_jobs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 961;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            std::path::PathBuf::from("/tmp/spur-test-live-stepd-961.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "live-stepd-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id, 0).await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a live supervised job must not be dropped from the running set"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            128,
+            "a live supervised job's allocation must not be released"
+        );
+    }
+
+    // A terminal placeholder or container step owns no workload of its own
+    // (excluded from `owns_job_lifetime`), but its stepd can still wedge — it
+    // must get the same active-fencing safety net as a batch supervisor, not
+    // the unconditional, liveness-blind release `drop_tracked_job` gives an
+    // allocation with no stepd at all.
+    #[tokio::test]
+    async fn graceful_cancel_does_not_reclaim_a_live_interactive_only_jobs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 965;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_INTERACTIVE,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            std::path::PathBuf::from("/tmp/spur-test-live-interactive-965.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "live-interactive-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id, 0).await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a live interactive-only job must not be dropped from the running set"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            128,
+            "a live interactive-only job's allocation must not be released"
+        );
+    }
+
+    // An older attempt's stepd can be confirmed dead while a newer attempt
+    // legitimately owns the job; naming the old one must spare the new one.
+    #[tokio::test]
+    async fn graceful_cancel_for_a_superseded_attempt_spares_the_newer_runs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 962;
+        let dead_attempt = 1;
+        let live_attempt = 2;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            dead_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-superseded-stepd-962.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "superseded-dead-stepd-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, live_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, live_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = live_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        // Names the older, now-dead attempt explicitly, as an eviction-style
+        // cancel targeting one stale run would.
+        svc.graceful_cancel(job_id, dead_attempt).await;
+
+        assert_eq!(
+            svc.running.lock().await.get(&job_id).map(|t| t.run_attempt),
+            Some(live_attempt),
+            "cancelling a dead older attempt must not evict the newer legitimate run"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            128,
+            "cancelling a dead older attempt must not release the newer run's allocation"
+        );
+    }
+
+    // send_explicit_signal has the identical gap as graceful_cancel for a
+    // supervised job; cover it through this entry point too.
+    #[tokio::test]
+    async fn send_explicit_signal_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 963;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-stepd-963.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "dead-stepd-signal-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.send_explicit_signal(job_id, 0, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a confirmed-dead supervised job must be dropped from the running set"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "a confirmed-dead supervised job's allocation must be released"
+        );
+    }
+
+    // A non-lethal signal never spawns spawn_stepd_release_wait (release_wait
+    // is None unless supervised && lethal), so reap_dead_supervised_stepds is
+    // the only thing that can notice an already-dead stepd on this path.
+    #[tokio::test]
+    async fn send_explicit_signal_reclaims_a_confirmed_dead_stepd_on_a_non_lethal_signal() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 965;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-stepd-965.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "dead-stepd-non-lethal-signal-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.send_explicit_signal(job_id, 0, nix::sys::signal::Signal::SIGUSR1 as i32)
+            .await;
+
+        assert!(
+            !svc.running.lock().await.contains_key(&job_id),
+            "a confirmed-dead supervised job must be dropped even on a non-lethal signal"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "a confirmed-dead supervised job's allocation must be released \
+             even when no release-wait task was ever spawned for it"
+        );
+    }
+
+    // A multi-step job with one dead and one still-live stepd must not be
+    // reaped at all: the live sibling may still need its allocation.
+    #[tokio::test]
+    async fn graceful_cancel_spares_a_job_with_one_live_sibling_stepd() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 964;
+        let run_attempt = 1;
+        let pid = std::process::id();
+        let mut dead = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-dead-sibling-964.sock"),
+            std::path::PathBuf::new(),
+        );
+        dead.capability = "dead-sibling-test".into();
+        let mut alive = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            5,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            std::path::PathBuf::from("/tmp/spur-test-live-sibling-964.sock"),
+            std::path::PathBuf::new(),
+        );
+        alive.capability = "live-sibling-test".into();
+        {
+            let mut sessions = svc.stepds.lock().await;
+            sessions.insert(stepd_key(&dead), dead.clone());
+            sessions.insert(stepd_key(&alive), alive.clone());
+        }
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, run_attempt, 1, 128, &[])
+            .expect("reserve allocation");
+        svc.allocation.lock().await.commit_job(job_id, run_attempt);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id, 0).await;
+
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "a job with a live sibling stepd must not be dropped from running"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            128,
+            "a job with a live sibling stepd must not have its allocation released"
+        );
+    }
+
+    // An attempt-less (reclaim-heartbeat) cancel resolves its doomed attempt
+    // from a still-registered dead stepd; a redispatch that already reserved
+    // a newer attempt for the same job_id by then must survive it.
+    #[tokio::test]
+    async fn cancel_with_no_named_attempt_spares_a_reused_job_ids_newer_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 970;
+        let dead_attempt = 1;
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            dead_attempt,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            std::path::PathBuf::from("/tmp/spur-test-reused-jobid-970.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "reused-jobid-no-attempt-cancel-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+
+        // A redispatch reserved a newer attempt but hasn't registered a stepd
+        // or `running` entry yet -- exactly the window a wildcard cancel lands in.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(job_id, dead_attempt, 1, 0, &[0])
+                .expect("reserve dead attempt");
+            alloc.release_job(job_id);
+            alloc
+                .allocate_for_job(job_id, 2, 1, 0, &[0])
+                .expect("reserve newer attempt");
+        }
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "an attempt-less cancel resolved only against a dead stepd must not \
+             release a reused job_id's newer reservation"
+        );
+    }
+
+    // A launching reservation with neither a `running` entry nor a stepd has
+    // nothing but the allocation ledger itself to name its attempt; an
+    // attempt-less cancel must still find and release it through that.
+    #[tokio::test]
+    async fn cancel_with_no_named_attempt_and_no_tracking_releases_via_the_allocation_ledger() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 972;
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(job_id, 1, 1, 0, &[0])
+            .expect("reserve launching");
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 0,
+            run_attempt: 0,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "a launching reservation with no running/stepd tracking must still \
+             be released by an attempt-less cancel via the allocation ledger"
+        );
+    }
+
     // A stale-epoch drop (peeked before a concurrent redispatch retracked the
     // same job_id under a newer attempt) must not evict the new tracking.
     #[tokio::test]
@@ -15093,6 +18723,38 @@ mod tests {
                 .map(|job| job.run_attempt),
             Some(2),
             "a stale-epoch drop must not evict a newer, already-retracked job"
+        );
+    }
+
+    // interactive_launch_steps tracks which step a job's own interactive
+    // launch used, keyed the same as `running`/`stepds` — it must be pruned
+    // alongside them or it grows for the life of the process.
+    #[tokio::test]
+    async fn drop_tracked_job_prunes_interactive_launch_steps() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 966;
+        let run_attempt = 1;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, tracked).await;
+        svc.interactive_launch_steps
+            .lock()
+            .await
+            .insert((job_id, run_attempt), spur_core::step::STEP_INTERACTIVE);
+
+        svc.drop_tracked_job(job_id, run_attempt).await;
+
+        assert!(
+            !svc.interactive_launch_steps
+                .lock()
+                .await
+                .contains_key(&(job_id, run_attempt)),
+            "a dropped job must not leave its interactive-launch step entry behind"
         );
     }
 
@@ -15616,7 +19278,7 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
         let state = tempfile::tempdir().expect("runtime state directory");
-        let descriptor = |job_id: u32, cpu_ids: Vec<u32>, gpu: u32| {
+        let descriptor = |job_id: u32, cpu_ids: Vec<u32>, gpu: u64| {
             let mut descriptor = crate::stepd::StepdDescriptor::new(
                 job_id,
                 1,
@@ -15654,6 +19316,132 @@ mod tests {
         alloc.release_job(911);
         assert!(alloc.allocated_cpus[2]);
         assert!(!alloc.allocated_cpus[3]);
+    }
+
+    fn gpu_with_stable_id(device_id: u32, stable_id: u64) -> spur_core::resource::GpuResource {
+        spur_core::resource::GpuResource {
+            device_id,
+            gpu_type: "mi300x".into(),
+            memory_mb: 192_000,
+            peer_gpus: vec![],
+            link_type: spur_core::resource::GpuLinkType::XGMI,
+            stable_id,
+        }
+    }
+
+    #[test]
+    fn legacy_positional_ids_translate_to_current_stable_ids() {
+        // Two BDF-anchored stable_ids; a pre-stable_id descriptor recorded the
+        // GPUs positionally as [0, 1], which must map to [A, B] by index.
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(
+            translate_legacy_gpu_ids(&[0, 1], &gpus),
+            Some(vec![0x0063_0000, 0x0083_0000])
+        );
+    }
+
+    #[test]
+    fn already_current_stable_ids_are_not_translated() {
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(
+            translate_legacy_gpu_ids(&[0x0063_0000, 0x0083_0000], &gpus),
+            None
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_positional_id_is_not_translated() {
+        // Index 5 exceeds a 2-GPU inventory: ambiguous, so under-adopt rather
+        // than guess.
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(translate_legacy_gpu_ids(&[0, 5], &gpus), None);
+    }
+
+    #[test]
+    fn duplicate_positional_ids_are_not_translated() {
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(translate_legacy_gpu_ids(&[0, 0], &gpus), None);
+    }
+
+    #[test]
+    fn a_render_minor_looking_id_is_not_translated() {
+        // 128 is neither a valid index nor a current stable_id — the unreleased
+        // render_minor scheme is out of scope, so it under-adopts.
+        let gpus = vec![
+            gpu_with_stable_id(0, 0x0063_0000),
+            gpu_with_stable_id(1, 0x0083_0000),
+        ];
+        assert_eq!(translate_legacy_gpu_ids(&[128, 129], &gpus), None);
+    }
+
+    // A rolling upgrade adopts a running GPU job whose descriptor still holds
+    // pre-stable_id positional ids [0, 1]; driven through the real replay path,
+    // restore must succeed holding the current BDF stable_ids (no double-book)
+    // and the descriptor must be rewritten forward so the next restart is clean.
+    #[tokio::test]
+    async fn a_legacy_positional_descriptor_adopts_onto_current_stable_ids() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0x0063_0000, 0x0083_0000]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            920,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.path().join("runtime/920.1.batch.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            memory_mb: 1024,
+            gpu_devices: vec![0, 1],
+            cpu_ids: vec![0, 1],
+            ..Default::default()
+        };
+        store
+            .publish(&descriptor)
+            .expect("publish legacy descriptor");
+
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor))
+            .await;
+
+        // The job holds the real current stable_ids, so a later dispatch sees
+        // zero free GPUs — no double-book.
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.free_gpus(None), 0);
+        assert_eq!(alloc.allocated_gpu_ids(), vec![0x0063_0000, 0x0083_0000]);
+        drop(alloc);
+
+        // The descriptor was rewritten forward to stable_ids, so a second
+        // restart needs no translation.
+        let session_dir = store.session_dir(920, 1, spur_core::step::STEP_BATCH);
+        let reloaded = store
+            .load_descriptor(&session_dir)
+            .expect("reload rewritten descriptor");
+        assert_eq!(
+            reloaded.resources.gpu_devices,
+            vec![0x0063_0000, 0x0083_0000]
+        );
     }
 
     // An empty ledger was only correct while a restart killed every job: it now
@@ -15835,32 +19623,6 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
-    // The PTY bridge reaps a raw-forked container step through `waitpid_exit_code`
-    // (there is no `tokio::process::Child` to `wait()` on), so exit-code mapping
-    // must match what the bridge reports to the client.
-    #[test]
-    fn waitpid_exit_code_reports_normal_exit() {
-        match unsafe { nix::unistd::fork() }.expect("fork") {
-            nix::unistd::ForkResult::Child => unsafe { libc::_exit(7) },
-            nix::unistd::ForkResult::Parent { child } => {
-                assert_eq!(waitpid_exit_code(child), 7);
-            }
-        }
-    }
-
-    #[test]
-    fn waitpid_exit_code_reports_signal_death_as_128_plus_signal() {
-        match unsafe { nix::unistd::fork() }.expect("fork") {
-            nix::unistd::ForkResult::Child => loop {
-                unsafe { libc::pause() };
-            },
-            nix::unistd::ForkResult::Parent { child } => {
-                unsafe { libc::kill(child.as_raw(), libc::SIGKILL) };
-                assert_eq!(waitpid_exit_code(child), 128 + libc::SIGKILL);
-            }
-        }
-    }
-
     #[tokio::test]
     async fn run_pty_bridge_echo_and_exit() {
         use spur_proto::proto::{interactive_input, interactive_output, InteractiveInput};
@@ -15949,6 +19711,71 @@ mod tests {
             }
         }
         panic!("did not receive exit status from bridge");
+    }
+
+    // A pty opened by a stepd (which does no async I/O of its own on it) is
+    // never put in non-blocking mode before spurd bridges it — `run_pty_bridge`
+    // itself has to do that, or a read `AsyncFd` expects to fail with EAGAIN
+    // blocks the whole bridging task instead of yielding.
+    #[tokio::test]
+    async fn run_pty_bridge_sets_the_master_non_blocking_before_use() {
+        use spur_proto::proto::InteractiveInput;
+
+        let (master, slave) = crate::pty::openpty_with_winsize(None).expect("openpty");
+        // A dup shares the same open file description, so its flags reflect
+        // whatever `run_pty_bridge` sets on `master` after this call.
+        let master_dup = nix::unistd::dup(&master).expect("dup master");
+
+        let raw = crate::executor::JobIoRaw::Pty {
+            master: std::os::fd::AsRawFd::as_raw_fd(&master),
+            slave: std::os::fd::AsRawFd::as_raw_fd(&slave),
+        };
+        let mut cmd = tokio::process::Command::new("cat");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+        let mut child = cmd.spawn().expect("spawn cat");
+        let child_pid = child.id().expect("child pid") as i32;
+        drop(slave);
+
+        let (_in_tx, in_rx) =
+            tokio::sync::mpsc::channel::<Result<InteractiveInput, tonic::Status>>(64);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel::<
+            Result<spur_proto::proto::InteractiveOutput, tonic::Status>,
+        >(64);
+        let inbound = tokio_stream::wrappers::ReceiverStream::new(in_rx);
+        let wait_exit = async move {
+            child
+                .wait()
+                .await
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(128)
+        };
+        let bridge = tokio::spawn(AgentService::run_pty_bridge(
+            master, wait_exit, child_pid, true, inbound, out_tx,
+        ));
+
+        // The fcntl call under test happens before the select loop even
+        // starts, so a short, bounded wait is enough to run past it — no
+        // need to run the bridge to completion.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let flags = nix::fcntl::fcntl(&master_dup, nix::fcntl::FcntlArg::F_GETFL)
+            .expect("fcntl F_GETFL on the surviving dup");
+        let flags = nix::fcntl::OFlag::from_bits_truncate(flags);
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        bridge.abort();
+        assert!(
+            flags.contains(nix::fcntl::OFlag::O_NONBLOCK),
+            "run_pty_bridge must leave the master non-blocking, or its AsyncFd reads/writes can block the whole task"
+        );
     }
 
     // A non-interactive client (no TTY) closes its input stream on stdin-EOF while

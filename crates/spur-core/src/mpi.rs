@@ -452,7 +452,7 @@ mod tests {
             0,
             vec!["10.0.0.1".into()],
         );
-        assert_eq!(plan.namespace, "spur.42.4294967294");
+        assert_eq!(plan.namespace, "spur.42.4294967291");
         assert_eq!(plan.universe_size, 4);
         assert_eq!(plan.local_procs.len(), 4);
         assert_eq!(plan.local_procs[0].rank, 0);
@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(modex_port_for_step(0, 0), 16819);
         assert_eq!(modex_port_for_step(1, 0), 20580);
         assert_eq!(modex_port_for_step(42, 0), 24381);
-        assert_eq!(modex_port_for_step(42, crate::step::STEP_BATCH), 24379);
+        assert_eq!(modex_port_for_step(42, crate::step::STEP_BATCH), 24376);
     }
 
     #[test]

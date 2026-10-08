@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
@@ -12,8 +13,50 @@ use spur_proto::proto::{
     RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus, StepdRecoveryRequest,
     StepdRecoveryResponse,
 };
+use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+/// Channel dial/keepalive and RPC/failover timeouts a [`NodeReporter`] applies to every
+/// controller connection. A caller with its own config (spurd's `[spurd]` section) should
+/// build this from it; [`Default`] reproduces today's fixed values for tests and any
+/// caller with no config of its own.
+#[derive(Debug, Clone, Copy)]
+pub struct ReporterTimeouts {
+    pub channel: spur_client::ChannelTimeouts,
+    /// Ceiling on a single register/heartbeat/deregister/recovery RPC — these are fast,
+    /// bounded calls, unlike a controller-to-agent launch, so a hung one means wedged.
+    pub controller_rpc_timeout: Duration,
+    /// How long a controller endpoint that just failed is deprioritized, so it can't
+    /// "recapture" every reconnect attempt before the next one is due.
+    pub failover_cooldown: Duration,
+}
+
+impl Default for ReporterTimeouts {
+    fn default() -> Self {
+        Self {
+            channel: spur_client::ChannelTimeouts::default(),
+            controller_rpc_timeout: Duration::from_secs(10),
+            failover_cooldown: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Lock a `std::sync::Mutex`, recovering the inner state on poison rather than
+/// panicking — none of this module's critical sections can leave data inconsistent.
+fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Same recovery as [`lock_recover`], for a `RwLock` read guard.
+fn read_recover<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Same recovery as [`lock_recover`], for a `RwLock` write guard.
+fn write_recover<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Source of the job ids this node currently holds. The controller decides from
 /// its own authoritative state whether any reported id is stale.
@@ -34,7 +77,7 @@ impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
 pub struct NodeReporter {
     pub hostname: String,
     pub controller_addr: String,
-    pub resources: ResourceSet,
+    pub resources: RwLock<ResourceSet>,
     pub node_address: spur_net::NodeAddress,
     pub labels: HashMap<String, String>,
     pub free_memory_mb: AtomicU64,
@@ -44,12 +87,25 @@ pub struct NodeReporter {
     /// re-read on every register/heartbeat via [`wg_pubkey`](Self::wg_pubkey) so a key that appears
     /// or changes after startup (late mesh join, `spur0` recreated) reaches the controller.
     pub wg_iface: String,
+    /// Directory holding `<wg_iface>.conf` (e.g. `/etc/wireguard`), so `apply_mesh` can read which
+    /// peers were persisted by `spur net add-peer` and exempt them from the k0s reconcile's prune.
+    pub wg_config_dir: std::path::PathBuf,
     node_token: RwLock<String>,
     /// Job ids this node holds, reported each heartbeat so the controller can
     /// reclaim allocations it no longer tracks. Shares the agent's running map.
     held_jobs: Arc<dyn HeldJobs>,
+    /// The live per-node allocation, read each heartbeat for the translated GPU
+    /// stable_ids each held job occupies so the controller can converge its
+    /// used-view. Authoritative post-translation source (an adopted legacy job's
+    /// `owners` entry holds the current stable_ids, unlike its running-map
+    /// descriptor). Wired once, after the AgentService is built.
+    allocation: std::sync::OnceLock<Arc<Mutex<NodeAllocation>>>,
     /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
     k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
+    /// Endpoint a dial/RPC most recently failed against, and until when to prefer a
+    /// different one. Left stale once the cooldown lapses; never read past then.
+    last_failed_endpoint: std::sync::Mutex<Option<(String, Instant)>>,
+    timeouts: ReporterTimeouts,
 }
 
 impl NodeReporter {
@@ -62,21 +118,135 @@ impl NodeReporter {
         labels: HashMap<String, String>,
         join_token: String,
         wg_iface: String,
+        wg_config_dir: std::path::PathBuf,
         held_jobs: Arc<dyn HeldJobs>,
+        timeouts: ReporterTimeouts,
     ) -> Self {
         Self {
             hostname,
             controller_addr,
-            resources,
+            resources: RwLock::new(resources),
             node_address,
             labels,
             free_memory_mb: AtomicU64::new(0),
             cpu_load: AtomicU64::new(0),
             join_token,
             wg_iface,
+            wg_config_dir,
             node_token: RwLock::new(String::new()),
             held_jobs,
+            allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
+            last_failed_endpoint: std::sync::Mutex::new(None),
+            timeouts,
+        }
+    }
+
+    /// Controller endpoints for the next dial. Skips a host that failed within the last
+    /// [`ReporterTimeouts::failover_cooldown`], provided there's another one to prefer instead.
+    fn dial_endpoints(&self) -> String {
+        let guard = lock_recover(&self.last_failed_endpoint);
+        match &*guard {
+            Some((bad, until)) if Instant::now() < *until => {
+                spur_client::deprioritize(&self.controller_addr, bad)
+            }
+            _ => self.controller_addr.clone(),
+        }
+    }
+
+    /// Record that `endpoint` just failed to dial or answer, so the next attempt
+    /// (from any RPC on this reporter) prefers a different host for a while.
+    fn note_dial_failure(&self, endpoint: &str) {
+        if endpoint.is_empty() {
+            return;
+        }
+        *lock_recover(&self.last_failed_endpoint) = Some((
+            endpoint.to_string(),
+            Instant::now() + self.timeouts.failover_cooldown,
+        ));
+    }
+
+    /// Connect, run `op`, bound to [`ReporterTimeouts::controller_rpc_timeout`]. A transport
+    /// failure or timeout deprioritizes the endpoint that was actually dialed; an app-level
+    /// rejection doesn't.
+    async fn with_controller<T, F, Fut>(
+        &self,
+        op: F,
+    ) -> Result<T, crate::controller_auth::ConnectAuthError>
+    where
+        F: FnOnce(crate::controller_auth::ControllerClient) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        self.with_controller_timeout(self.timeouts.controller_rpc_timeout, op)
+            .await
+    }
+
+    /// Same as [`Self::with_controller`] with an explicit bound, so tests can exercise
+    /// the real timeout/failover mechanism without waiting out the production value.
+    async fn with_controller_timeout<T, F, Fut>(
+        &self,
+        timeout: Duration,
+        op: F,
+    ) -> Result<T, crate::controller_auth::ConnectAuthError>
+    where
+        F: FnOnce(crate::controller_auth::ControllerClient) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+    {
+        let endpoints = self.dial_endpoints();
+        // `connect_channel_tracked` may skip past a dead-fast entry before dialing
+        // succeeds; this records which one actually answered the dial so a later
+        // failure blames that host, not just whichever entry is listed first.
+        let dialed = Arc::new(std::sync::Mutex::new(None::<String>));
+        let record_dialed = Arc::clone(&dialed);
+        let channel_timeouts = self.timeouts.channel;
+        let attempt = async move {
+            let (channel, endpoint) =
+                spur_client::connect_channel_tracked_with_timeouts(&endpoints, channel_timeouts)
+                    .await
+                    .map_err(crate::controller_auth::ConnectAuthError::Transport)?;
+            *lock_recover(&record_dialed) = Some(endpoint);
+            let client = crate::controller_auth::wrap(channel)
+                .await
+                .map_err(crate::controller_auth::ConnectAuthError::Status)?;
+            op(client)
+                .await
+                .map(tonic::Response::into_inner)
+                .map_err(crate::controller_auth::ConnectAuthError::Status)
+        };
+        let blame = move || lock_recover(&dialed).clone().unwrap_or_default();
+        match tokio::time::timeout(timeout, attempt).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(e)) => {
+                if is_transport_failure(&e) {
+                    self.note_dial_failure(&blame());
+                }
+                Err(e)
+            }
+            Err(_elapsed) => {
+                self.note_dial_failure(&blame());
+                Err(crate::controller_auth::ConnectAuthError::Status(
+                    tonic::Status::deadline_exceeded(format!(
+                        "controller RPC timed out after {timeout:?}"
+                    )),
+                ))
+            }
+        }
+    }
+
+    /// Wire the live per-node allocation so heartbeats can report each held job's
+    /// translated GPU stable_ids. Called once, after the AgentService is built.
+    pub fn set_allocation(&self, allocation: Arc<Mutex<NodeAllocation>>) {
+        let _ = self.allocation.set(allocation);
+    }
+
+    /// Per-held-job translated GPU stable_ids for this heartbeat. Empty when the
+    /// allocation is unwired or its lock is momentarily contended — a heartbeat
+    /// then omits the field and the controller keeps its prior view, which the
+    /// next heartbeat corrects.
+    fn held_job_gpu_ids(&self) -> HashMap<u32, Vec<u64>> {
+        match self.allocation.get().and_then(|a| a.try_lock().ok()) {
+            Some(alloc) => alloc.held_job_gpu_ids(),
+            None => HashMap::new(),
         }
     }
 
@@ -97,35 +267,54 @@ impl NodeReporter {
         self.held_jobs.held_job_ids()
     }
 
-    /// Register with the controller.
-    pub async fn register(&self) -> anyhow::Result<()> {
-        let channel = spur_client::connect_channel(&self.controller_addr)
-            .await
-            .context("failed to connect to spurctld for registration")?;
-        let mut client = spur_proto::controller_client(channel);
+    pub fn snapshot_resources(&self) -> ResourceSet {
+        read_recover(&self.resources).clone()
+    }
 
+    /// Swap the reported inventory if its schedulable content changed. Ignores
+    /// `generation` so a pure generation bump does not itself count as a change.
+    pub fn update_resources(&self, fresh: ResourceSet) -> bool {
+        let mut cur = write_recover(&self.resources);
+        let changed = cur.cpus != fresh.cpus
+            || cur.memory_mb != fresh.memory_mb
+            || cur.gpus != fresh.gpus
+            || cur.generic != fresh.generic;
+        *cur = fresh;
+        changed
+    }
+
+    /// Register with the controller, reporting the reporter's current inventory.
+    pub async fn register(&self) -> anyhow::Result<()> {
+        self.register_with(&self.snapshot_resources()).await
+    }
+
+    /// Register with the controller reporting a specific inventory. The refresh
+    /// task uses this to converge on a fresh set WITHOUT first committing it to
+    /// the reporter baseline, so a failed register leaves the baseline unchanged
+    /// and the next tick re-detects the same delta and retries.
+    pub async fn register_with(&self, resources: &ResourceSet) -> anyhow::Result<()> {
         let mut labels = self.labels.clone();
         labels.insert("spur.stepd".into(), "1".into());
 
-        let resp = client
-            .register_agent(RegisterAgentRequest {
-                hostname: self.hostname.clone(),
-                resources: Some(resource_to_proto(&self.resources)),
-                version: env!("CARGO_PKG_VERSION").into(),
-                address: self.node_address.ip.clone(),
-                port: self.node_address.port as u32,
-                wg_pubkey: self.wg_pubkey(),
-                labels,
-                join_token: self.join_token.clone(),
-            })
+        let req = RegisterAgentRequest {
+            hostname: self.hostname.clone(),
+            resources: Some(resource_to_proto(resources)),
+            version: env!("CARGO_PKG_VERSION").into(),
+            address: self.node_address.ip.clone(),
+            port: self.node_address.port as u32,
+            wg_pubkey: self.wg_pubkey(),
+            labels,
+            join_token: self.join_token.clone(),
+        };
+        let inner = self
+            .with_controller(move |mut client| async move { client.register_agent(req).await })
             .await
             .context("registration failed")?;
 
-        let inner = resp.into_inner();
         if inner.accepted {
             warn_without_node_identity(&inner.node_token);
             if !inner.node_token.is_empty() {
-                *self.node_token.write().unwrap() = inner.node_token;
+                *write_recover(&self.node_token) = inner.node_token;
             }
             info!("registered with controller");
         } else {
@@ -137,18 +326,12 @@ impl NodeReporter {
 
     /// Notify the controller that this agent is shutting down.
     pub async fn deregister(&self, reason: &str) -> anyhow::Result<()> {
-        let current_token = self.node_token.read().unwrap().clone();
-        let channel = spur_client::connect_channel(&self.controller_addr)
-            .await
-            .context("failed to connect to spurctld for deregistration")?;
-        let mut client = spur_proto::controller_client(channel);
-
-        client
-            .deregister_agent(spur_proto::proto::DeregisterAgentRequest {
-                hostname: self.hostname.clone(),
-                node_token: current_token,
-                reason: reason.to_string(),
-            })
+        let req = spur_proto::proto::DeregisterAgentRequest {
+            hostname: self.hostname.clone(),
+            node_token: read_recover(&self.node_token).clone(),
+            reason: reason.to_string(),
+        };
+        self.with_controller(move |mut client| async move { client.deregister_agent(req).await })
             .await
             .context("deregistration RPC failed")?;
 
@@ -163,27 +346,24 @@ impl NodeReporter {
         step_id: spur_core::step::StepId,
         stale_descriptor: bool,
     ) -> anyhow::Result<StepdRecoveryResponse> {
-        let channel = spur_client::connect_channel(&self.controller_addr)
-            .await
-            .context("failed to connect to spurctld for runtime recovery")?;
-        let mut client = spur_proto::controller_client(channel);
         let node_token = self
             .node_token
             .read()
             .map_err(|_| anyhow::anyhow!("runtime recovery node token lock poisoned"))?
             .clone();
-        let response = client
-            .report_stepd_recovery(StepdRecoveryRequest {
-                hostname: self.hostname.clone(),
-                job_id,
-                run_attempt,
-                node_token,
-                stale_descriptor,
-                step_id,
-            })
-            .await
-            .context("runtime recovery report failed")?;
-        Ok(response.into_inner())
+        let req = StepdRecoveryRequest {
+            hostname: self.hostname.clone(),
+            job_id,
+            run_attempt,
+            node_token,
+            stale_descriptor,
+            step_id,
+        };
+        self.with_controller(
+            move |mut client| async move { client.report_stepd_recovery(req).await },
+        )
+        .await
+        .context("runtime recovery report failed")
     }
 
     /// Periodic heartbeat loop.
@@ -196,56 +376,64 @@ impl NodeReporter {
             let (load, free_mem) = read_system_metrics();
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
-            let current_token = self.node_token.read().unwrap().clone();
-            let running_jobs: Vec<RunningJobStatus> = self
-                .held_job_ids()
-                .into_iter()
-                .map(|job_id| RunningJobStatus {
-                    job_id,
-                    ..Default::default()
-                })
-                .collect();
+            let current_token = read_recover(&self.node_token).clone();
+            let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
+            let req = spur_proto::proto::HeartbeatRequest {
+                hostname: self.hostname.clone(),
+                cpu_load: load,
+                free_memory_mb: free_mem,
+                running_jobs,
+                node_token: current_token,
+                wg_pubkey: self.wg_pubkey(),
+                k0s_status: self.k0s_status.get().map(|s| {
+                    let (unit_active, restart_count, install_secs) = s.take_for_heartbeat();
+                    spur_proto::proto::K0sNodeStatus {
+                        unit_active,
+                        restart_count,
+                        install_duration_seconds: install_secs,
+                    }
+                }),
+            };
 
-            match spur_client::connect_channel(&self.controller_addr).await {
-                Ok(channel) => {
-                    let mut client = spur_proto::controller_client(channel);
-                    match client
-                        .heartbeat(spur_proto::proto::HeartbeatRequest {
-                            hostname: self.hostname.clone(),
-                            cpu_load: load,
-                            free_memory_mb: free_mem,
-                            running_jobs,
-                            node_token: current_token,
-                            wg_pubkey: self.wg_pubkey(),
-                            k0s_status: self.k0s_status.get().map(|s| {
-                                let (unit_active, restart_count, install_secs) =
-                                    s.take_for_heartbeat();
-                                spur_proto::proto::K0sNodeStatus {
-                                    unit_active,
-                                    restart_count,
-                                    install_duration_seconds: install_secs,
-                                }
-                            }),
-                        })
-                        .await
-                    {
-                        Ok(_) => debug!(load, free_mem, "heartbeat sent"),
-                        Err(e) if should_reregister(&e) => {
-                            warn!(
-                                error = %e,
-                                "controller does not recognize this node; re-registering"
-                            );
-                            if let Err(e) = self.register().await {
-                                warn!(error = %e, "re-registration after heartbeat rejection failed");
-                            }
-                        }
-                        Err(e) => warn!(error = %e, "heartbeat failed"),
+            // Bounded by `with_controller`'s own timeout, so a controller that goes
+            // silent on the network can't stall this loop past one tick.
+            match self
+                .with_controller(move |mut client| async move { client.heartbeat(req).await })
+                .await
+            {
+                Ok(_) => debug!(load, free_mem, "heartbeat sent"),
+                Err(crate::controller_auth::ConnectAuthError::Status(status))
+                    if should_reregister(&status) =>
+                {
+                    warn!(
+                        error = %status,
+                        "controller does not recognize this node; re-registering"
+                    );
+                    if let Err(e) = self.register().await {
+                        warn!(error = %e, "re-registration after heartbeat rejection failed");
                     }
                 }
-                Err(e) => warn!(error = %e, "heartbeat connection failed"),
+                Err(e) => warn!(error = %e, "heartbeat failed"),
             }
         }
     }
+}
+
+/// Build the heartbeat's per-job status list. Each held job carries its
+/// translated GPU stable_ids (empty when it holds no GPUs), so the controller
+/// can converge its per-node used-view to what the job actually occupies.
+fn build_running_jobs(
+    held_ids: Vec<u32>,
+    gpu_ids: &HashMap<u32, Vec<u64>>,
+) -> Vec<RunningJobStatus> {
+    held_ids
+        .into_iter()
+        .map(|job_id| RunningJobStatus {
+            job_id,
+            gpu_stable_ids: gpu_ids.get(&job_id).cloned().unwrap_or_default(),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// A `NOT_FOUND` heartbeat means the controller lost this node's registration
@@ -254,6 +442,17 @@ impl NodeReporter {
 /// this the agent would heartbeat into the same rejection forever.
 fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
+}
+
+/// Whether a connect/RPC failure means the dialed endpoint is unreachable or wedged,
+/// as opposed to a healthy host answering with an application-level rejection.
+fn is_transport_failure(e: &crate::controller_auth::ConnectAuthError) -> bool {
+    match e {
+        crate::controller_auth::ConnectAuthError::Transport(_) => true,
+        crate::controller_auth::ConnectAuthError::Status(status) => {
+            spur_proto::controller_rpc_retryable(status)
+        }
+    }
 }
 
 /// Jobs are supervised either way; without a signing key the controller takes a
@@ -267,6 +466,167 @@ fn warn_without_node_identity(node_token: &str) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InventoryDelta {
+    Unchanged,
+    FreeCapacityChanged,
+    AllocatedDevicesLost,
+}
+
+/// Default cadence of the periodic inventory-refresh task.
+pub const DEFAULT_INVENTORY_REFRESH_SECS: u64 = 60;
+
+/// What a debounced refresh tick resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshAction {
+    /// Nothing to do: inventory unchanged, or a change not yet seen twice.
+    Wait,
+    /// Apply the fresh set as new free capacity, then converge the controller.
+    ApplyCapacity,
+    /// A held device vanished; converge so the controller's advertised GRES
+    /// reflects the shrunk inventory. This does not drain the affected job.
+    ReportLost,
+}
+
+/// Fingerprint of a schedulable set, used to debounce on inventory identity.
+pub type InventoryFingerprint = (u32, u64, Vec<u64>, Vec<(String, u64)>);
+
+/// Debounced per-tick decision. A non-`Unchanged` delta acts only when it
+/// repeats AND the fresh inventory identity matches the previous tick's, so two
+/// DIFFERENT partial reads that both classify the same delta never converge on
+/// a topology observed only once. Returns the action plus the delta and
+/// fingerprint to carry into the next tick.
+pub fn next_refresh_action(
+    delta: &InventoryDelta,
+    fresh_fp: &InventoryFingerprint,
+    last_delta: &InventoryDelta,
+    last_fp: &InventoryFingerprint,
+) -> (RefreshAction, InventoryDelta) {
+    // Reset on unchanged; arm (but don't act) on a first sighting or when either
+    // the delta or the observed inventory differs from the prior tick.
+    if *delta == InventoryDelta::Unchanged || delta != last_delta || fresh_fp != last_fp {
+        return (RefreshAction::Wait, delta.clone());
+    }
+    let action = match delta {
+        InventoryDelta::FreeCapacityChanged => RefreshAction::ApplyCapacity,
+        InventoryDelta::AllocatedDevicesLost => RefreshAction::ReportLost,
+        InventoryDelta::Unchanged => RefreshAction::Wait,
+    };
+    (action, InventoryDelta::Unchanged)
+}
+
+/// Whether the reporter baseline should be advanced to the just-converged set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineCommit {
+    Commit,
+    Keep,
+}
+
+/// Resolve the baseline commit and debounce carry after a converge attempt.
+///
+/// The reporter baseline is the source `classify` compares against, so it must
+/// advance ONLY once the controller has acknowledged the fresh set. On success
+/// commit and reset the carry; on failure keep the old baseline (so the next
+/// tick re-detects the same delta) and re-arm that delta so the retry fires on
+/// the very next tick instead of re-serving the seen-twice debounce.
+pub fn post_converge(
+    acted_delta: &InventoryDelta,
+    registered_ok: bool,
+) -> (BaselineCommit, InventoryDelta) {
+    if registered_ok {
+        (BaselineCommit::Commit, InventoryDelta::Unchanged)
+    } else {
+        (BaselineCommit::Keep, acted_delta.clone())
+    }
+}
+
+/// A zero, empty, or unparseable value falls back to the default; zero would
+/// otherwise panic `tokio::time::interval`.
+fn parse_refresh_secs(raw: Option<String>) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_INVENTORY_REFRESH_SECS)
+}
+
+/// Cadence of the inventory-refresh task, from `SPUR_INVENTORY_REFRESH_SECS`
+/// (so e2e can drive convergence fast) or the default.
+pub fn inventory_refresh_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(parse_refresh_secs(
+        std::env::var("SPUR_INVENTORY_REFRESH_SECS").ok(),
+    ))
+}
+
+/// Classify how the reported inventory changed between refreshes. Distinguishes a device that
+/// is merely absent (free capacity shrank) from one that is absent AND currently allocated to a
+/// job (the refresh task must fence/hold instead of silently losing track of it).
+pub fn classify(
+    old: &ResourceSet,
+    new: &ResourceSet,
+    allocated_stable_ids: &std::collections::HashSet<u64>,
+) -> InventoryDelta {
+    if old.cpus == new.cpus
+        && old.memory_mb == new.memory_mb
+        && old.gpus == new.gpus
+        && old.generic == new.generic
+    {
+        return InventoryDelta::Unchanged;
+    }
+    let new_ids: std::collections::HashSet<u64> = new.gpus.iter().map(|g| g.stable_id).collect();
+    let lost_held = allocated_stable_ids.iter().any(|id| !new_ids.contains(id));
+    if lost_held {
+        InventoryDelta::AllocatedDevicesLost
+    } else {
+        InventoryDelta::FreeCapacityChanged
+    }
+}
+
+/// Physical-GPU identity (BDF anchor) of a stable_id: mask off the low
+/// partition bits so two ids on the same silicon compare equal.
+fn bdf_anchor(stable_id: u64) -> u64 {
+    stable_id & !spur_devices::cdi::STABLE_ID_PARTITION_MASK
+}
+
+/// Converge only the free pool without ever advertising silicon a job holds.
+/// Keep a fresh device ONLY if its BDF anchor is not shared by any held device;
+/// a fresh partition on a held GPU's BDF is a repartition of held silicon and
+/// must not be offered as free (that is the physical double-book the reviewer
+/// named). Then re-insert every held device from `baseline` (the last-reported
+/// set, which still carries it) so the held device stays present and
+/// `total_resources ⊇ allocated` holds. Net: for a physical GPU with a held
+/// allocation only the baseline held device(s) are advertised; GPUs with no
+/// held allocation flow through unchanged.
+/// Pure: `fresh`'s cpus/memory/generation are preserved; pinned held GPUs are
+/// appended in ascending stable_id order for a deterministic fingerprint.
+pub fn reconcile_free_pool(
+    fresh: &ResourceSet,
+    baseline: &ResourceSet,
+    held_ids: &std::collections::HashSet<u64>,
+) -> ResourceSet {
+    let held_bdfs: std::collections::HashSet<u64> =
+        held_ids.iter().map(|&id| bdf_anchor(id)).collect();
+
+    let mut reconciled = fresh.clone();
+    reconciled
+        .gpus
+        .retain(|g| !held_bdfs.contains(&bdf_anchor(g.stable_id)));
+
+    let present: std::collections::HashSet<u64> =
+        reconciled.gpus.iter().map(|g| g.stable_id).collect();
+    let mut missing: Vec<u64> = held_ids
+        .iter()
+        .copied()
+        .filter(|id| !present.contains(id))
+        .collect();
+    missing.sort_unstable();
+
+    for id in missing {
+        if let Some(gpu) = baseline.gpus.iter().find(|g| g.stable_id == id) {
+            reconciled.gpus.push(gpu.clone());
+        }
+    }
+    reconciled
+}
+
 /// Discover local node resources from sysfs / /proc + device registry.
 pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
     let cpus = discover_cpus();
@@ -278,6 +638,8 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         memory_mb,
         gpus,
         generic: generic_from_registry(registry),
+        // Bumped by the periodic refresh task on topology rebuild, not here.
+        generation: 0,
     }
 }
 
@@ -316,6 +678,7 @@ fn gpus_from_registry(registry: &DeviceRegistry) -> Vec<GpuResource> {
             memory_mb: entry.memory_mb,
             peer_gpus: build_peer_gpus(entry.links.as_deref(), &gpu_device_ids),
             link_type: link_type_to_gpu(resolve_link_type(entry)),
+            stable_id: entry.stable_id,
         })
         .collect()
 }
@@ -463,6 +826,7 @@ pub fn allocations_to_proto(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        generation: r.generation,
     }
 }
 
@@ -483,9 +847,11 @@ pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
                     GpuLinkType::NVLink => spur_proto::proto::GpuLinkType::GpuLinkNvlink as i32,
                     GpuLinkType::PCIe => spur_proto::proto::GpuLinkType::GpuLinkPcie as i32,
                 },
+                stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic.clone(),
+        generation: r.generation,
     }
 }
 
@@ -536,6 +902,47 @@ mod tests {
         let gpus = gpus_from_registry(&reg);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].link_type, GpuLinkType::XGMI);
+    }
+
+    #[test]
+    fn gpus_from_registry_sets_stable_id_from_annotation() {
+        let spec = CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: vec![CdiDevice {
+                name: "0".into(),
+                annotations: [
+                    (annotations::GPU_TYPE.into(), "mi300x".into()),
+                    (annotations::STABLE_ID.into(), "129".into()),
+                ]
+                .into(),
+                container_edits: Some(ContainerEdits {
+                    device_nodes: vec![DeviceNode {
+                        path: "/dev/dri/renderD129".into(),
+                        host_path: None,
+                        r#type: None,
+                        major: None,
+                        minor: None,
+                        file_mode: None,
+                        permissions: None,
+                        uid: None,
+                        gid: None,
+                    }],
+                    ..Default::default()
+                }),
+            }],
+            container_edits: None,
+        };
+
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec]);
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&cache, &GresCache::from_entries(&[]));
+
+        let gpus = gpus_from_registry(&reg);
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].stable_id, 129);
     }
 
     #[test]
@@ -651,10 +1058,635 @@ mod tests {
     }
 
     #[test]
+    fn build_running_jobs_carries_each_jobs_translated_gpu_ids() {
+        // A held job reports the (translated) stable_ids its allocation owns; a
+        // held job with no GPUs reports an empty list.
+        let mut held = vec![7u32, 9u32];
+        held.sort_unstable();
+        let gpu_ids: HashMap<u32, Vec<u64>> = [(7u32, vec![0x63_0000u64, 0x83_0000u64])]
+            .into_iter()
+            .collect();
+
+        let mut jobs = build_running_jobs(held, &gpu_ids);
+        jobs.sort_by_key(|j| j.job_id);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].job_id, 7);
+        assert_eq!(jobs[0].gpu_stable_ids, vec![0x63_0000, 0x83_0000]);
+        assert_eq!(jobs[1].job_id, 9);
+        assert!(
+            jobs[1].gpu_stable_ids.is_empty(),
+            "a job with no GPUs carries an empty list"
+        );
+    }
+
+    #[test]
+    fn held_job_gpu_ids_reads_translated_ids_from_the_allocation() {
+        use spur_sched::cons_tres::NodeAllocation;
+        // The authoritative post-translation source is the allocation's owners:
+        // an adopted job's restore recorded the current stable_ids there, so the
+        // reporter reads those, not the legacy positional descriptor ids.
+        let sid_a: u64 = 0x63_0000;
+        let sid_b: u64 = 0x83_0000;
+        let inv = rset(8, 0, vec![gpu(0, sid_a), gpu(1, sid_b)]);
+        let mut node = NodeAllocation::new("n".into(), &inv);
+        node.restore_for_job(7, 0, &[], 0, &[sid_a, sid_b]).unwrap();
+
+        let reporter = test_reporter(inv);
+        reporter.set_allocation(Arc::new(Mutex::new(node)));
+
+        let map = reporter.held_job_gpu_ids();
+        let mut ids = map.get(&7).cloned().unwrap_or_default();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![sid_a, sid_b]);
+    }
+
+    #[test]
+    fn held_job_gpu_ids_empty_when_allocation_unwired() {
+        let reporter = test_reporter(rset(8, 0, vec![]));
+        assert!(reporter.held_job_gpu_ids().is_empty());
+    }
+
+    #[test]
     fn held_job_ids_accepts_send_but_not_sync_values() {
         // Cell is Send but !Sync; this fails to compile if the bound re-tightens to Sync.
         let map: Mutex<HashMap<u32, std::cell::Cell<u8>>> =
             Mutex::new(HashMap::from([(7, std::cell::Cell::new(0))]));
         assert_eq!(map.held_job_ids(), vec![7]);
+    }
+
+    fn test_reporter(resources: ResourceSet) -> NodeReporter {
+        test_reporter_with_addr(resources, "http://localhost:6817".into())
+    }
+
+    fn test_reporter_with_addr(resources: ResourceSet, controller_addr: String) -> NodeReporter {
+        NodeReporter::new(
+            "test-node".into(),
+            controller_addr,
+            resources,
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            Arc::new(Mutex::new(HashMap::<u32, ()>::new())),
+            ReporterTimeouts::default(),
+        )
+    }
+
+    #[test]
+    fn dial_endpoints_prefers_original_order_once_the_cooldown_lapses() {
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), "http://a:1,http://b:1".into());
+        *reporter.last_failed_endpoint.lock().unwrap() =
+            Some(("http://a:1".into(), Instant::now() - Duration::from_secs(1)));
+        assert_eq!(reporter.dial_endpoints(), "http://a:1,http://b:1");
+    }
+
+    #[test]
+    fn dial_endpoints_deprioritizes_a_still_cooling_down_endpoint() {
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), "http://a:1,http://b:1".into());
+        *reporter.last_failed_endpoint.lock().unwrap() = Some((
+            "http://a:1".into(),
+            Instant::now() + Duration::from_secs(30),
+        ));
+        assert_eq!(reporter.dial_endpoints(), "http://b:1,http://a:1");
+    }
+
+    /// Accept a TCP connection and never read or write on it again — the shape of
+    /// the production incident this fix targets.
+    async fn stuck_listener() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _stream = stream;
+            std::future::pending::<()>().await
+        });
+        addr
+    }
+
+    /// A real tonic server that doesn't implement SlurmController, so any RPC on it
+    /// answers fast with an error instead of hanging — a stand-in for a healthy peer.
+    async fn responsive_non_controller_server() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let (_health_reporter, health) = tonic_health::server::health_reporter();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(health)
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        addr
+    }
+
+    async fn heartbeat_op(
+        mut client: crate::controller_auth::ControllerClient,
+    ) -> Result<tonic::Response<spur_proto::proto::HeartbeatResponse>, tonic::Status> {
+        client
+            .heartbeat(spur_proto::proto::HeartbeatRequest::default())
+            .await
+    }
+
+    /// The RPC status code behind a dial/app-level failure, so a test can prove
+    /// which peer actually answered instead of only inferring it from timing.
+    fn err_code(err: &crate::controller_auth::ConnectAuthError) -> tonic::Code {
+        match err {
+            crate::controller_auth::ConnectAuthError::Status(s) => s.code(),
+            crate::controller_auth::ConnectAuthError::Transport(_) => {
+                panic!("expected an app-level status, got a transport error: {err}")
+            }
+        }
+    }
+
+    /// Bind then release a port, yielding an address that refuses connections fast —
+    /// distinct from `stuck_listener`, which accepts but never answers.
+    async fn refusing_addr() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        listener.local_addr().expect("local addr")
+    }
+
+    #[tokio::test]
+    async fn rpc_against_a_stuck_peer_errors_out_instead_of_hanging_forever() {
+        let stuck = stuck_listener().await;
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{stuck}"));
+
+        let result = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    /// Proves `ReporterTimeouts.controller_rpc_timeout` actually reaches the public
+    /// `with_controller` path, not just the test-only explicit-override seam above: a
+    /// reporter built with a short configured timeout must give up well before the
+    /// 10-second module default would.
+    #[tokio::test]
+    async fn a_configured_rpc_timeout_bounds_the_public_with_controller_call() {
+        let stuck = stuck_listener().await;
+        let mut reporter = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{stuck}"));
+        reporter.timeouts.controller_rpc_timeout = Duration::from_millis(200);
+
+        let start = Instant::now();
+        let result = reporter
+            .with_controller(move |mut client| async move {
+                client
+                    .heartbeat(spur_proto::proto::HeartbeatRequest::default())
+                    .await
+            })
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a stuck peer must not satisfy the RPC");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must fail close to the configured 200ms, not the 10s module default; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_rpc_makes_the_next_dial_prefer_the_other_host() {
+        let stuck = stuck_listener().await;
+        let healthy = responsive_non_controller_server().await;
+        let reporter = test_reporter_with_addr(
+            rset(8, 0, vec![]),
+            format!("http://{stuck},http://{healthy}"),
+        );
+
+        let first = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
+        assert!(first.is_err(), "the stuck peer must not answer");
+
+        assert_eq!(
+            reporter.dial_endpoints(),
+            format!("http://{healthy},http://{stuck}"),
+            "the endpoint that just timed out must be deprioritized"
+        );
+
+        let start = Instant::now();
+        let second = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
+        let err = second.expect_err("unimplemented on the stand-in server");
+        assert_eq!(
+            err_code(&err),
+            tonic::Code::Unimplemented,
+            "must have reached the healthy stand-in, not the stuck host"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "a dial that reaches the responsive host must not wait out the stuck one's timeout"
+        );
+    }
+
+    /// A dead-fast entry can precede the wedged host; blame must still land on the
+    /// one actually dialed, and the reorder must reach past it to the healthy third.
+    #[tokio::test]
+    async fn failover_reaches_a_healthy_host_behind_a_wedged_middle_entry() {
+        let dead = refusing_addr().await;
+        let stuck = stuck_listener().await;
+        let healthy = responsive_non_controller_server().await;
+        let reporter = test_reporter_with_addr(
+            rset(8, 0, vec![]),
+            format!("http://{dead},http://{stuck},http://{healthy}"),
+        );
+
+        let first = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
+        assert!(first.is_err(), "the wedged middle host must not answer");
+
+        assert_eq!(
+            reporter.dial_endpoints(),
+            format!("http://{dead},http://{healthy},http://{stuck}"),
+            "blame must land on the host actually dialed (stuck), not the dead-fast one"
+        );
+
+        let start = Instant::now();
+        let second = reporter
+            .with_controller_timeout(Duration::from_millis(300), heartbeat_op)
+            .await;
+        let err = second.expect_err("unimplemented on the stand-in server");
+        assert_eq!(
+            err_code(&err),
+            tonic::Code::Unimplemented,
+            "must have reached the healthy stand-in, not the still-wedged host"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "the next dial must reach the healthy host instead of the still-wedged one"
+        );
+    }
+
+    #[test]
+    fn classify_detects_free_growth_and_allocated_loss() {
+        use std::collections::HashSet;
+        let g = |d: u32, s: u64| GpuResource {
+            device_id: d,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            stable_id: s,
+        };
+        let rs = |gpus: Vec<GpuResource>| ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus,
+            generic: Default::default(),
+            generation: 0,
+        };
+        let two = rs(vec![g(0, 128), g(1, 129)]);
+        let three = rs(vec![g(0, 128), g(1, 129), g(2, 130)]);
+        let one = rs(vec![g(0, 128)]);
+
+        // unchanged
+        assert_eq!(
+            classify(&two, &two, &HashSet::new()),
+            InventoryDelta::Unchanged
+        );
+        // grew, nothing allocated -> free capacity change
+        assert_eq!(
+            classify(&two, &three, &HashSet::new()),
+            InventoryDelta::FreeCapacityChanged
+        );
+        // 129 removed but not allocated -> free capacity change
+        assert_eq!(
+            classify(&two, &one, &HashSet::new()),
+            InventoryDelta::FreeCapacityChanged
+        );
+        // 129 removed AND held -> allocated loss
+        let held: HashSet<u64> = [129].into_iter().collect();
+        assert_eq!(
+            classify(&two, &one, &held),
+            InventoryDelta::AllocatedDevicesLost
+        );
+    }
+
+    fn gpu(device_id: u32, stable_id: u64) -> GpuResource {
+        GpuResource {
+            device_id,
+            gpu_type: "mi300x".into(),
+            memory_mb: 0,
+            peer_gpus: vec![],
+            link_type: GpuLinkType::XGMI,
+            stable_id,
+        }
+    }
+
+    fn rset(cpus: u32, generation: u64, gpus: Vec<GpuResource>) -> ResourceSet {
+        ResourceSet {
+            cpus,
+            memory_mb: 1024,
+            gpus,
+            generic: Default::default(),
+            generation,
+        }
+    }
+
+    /// stable_id encoded like `encode_stable_id`: BDF anchor (`bus` in the high
+    /// bits) plus a low-8-bit partition rank. Two ids with the same `bus` share
+    /// physical silicon.
+    fn sid(bus: u64, partition: u64) -> u64 {
+        (bus << 16) | (partition & spur_devices::cdi::STABLE_ID_PARTITION_MASK)
+    }
+
+    #[test]
+    fn reconcile_pins_missing_held_and_keeps_fresh_free() {
+        use std::collections::HashSet;
+        // Job holds a device on BDF 5. The fresh scan dropped it; free devices on
+        // BDFs 7 and 9 remain/appear (different silicon, so they flow through).
+        let baseline = rset(8, 1, vec![gpu(0, sid(5, 0)), gpu(1, sid(7, 0))]);
+        let fresh = rset(8, 2, vec![gpu(0, sid(7, 0)), gpu(1, sid(9, 0))]);
+        let held: HashSet<u64> = [sid(5, 0)].into_iter().collect();
+
+        let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
+
+        // Held device pinned back AND the fresh free devices kept; total ⊇ allocated.
+        let ids: Vec<u64> = reconciled.gpus.iter().map(|g| g.stable_id).collect();
+        assert_eq!(reconciled.gpus.len(), 3);
+        assert!(ids.contains(&sid(5, 0)), "held device must be pinned");
+        assert!(ids.contains(&sid(7, 0)) && ids.contains(&sid(9, 0)));
+        // generation is taken from fresh, not baseline.
+        assert_eq!(reconciled.generation, 2);
+    }
+
+    #[test]
+    fn reconcile_drops_fresh_partition_sharing_a_held_bdf() {
+        use std::collections::HashSet;
+        // The reviewer's scenario: the held GPU (BDF 5) is repartitioned into two
+        // CPX slices sid(5,0) and sid(5,1); an unrelated free GPU sits on BDF 7.
+        // The two BDF-5 slices overlap held silicon and MUST NOT be advertised as
+        // free; only the baseline held device and the BDF-7 free device remain.
+        let baseline = rset(8, 1, vec![gpu(0, sid(5, 0)), gpu(1, sid(7, 0))]);
+        let fresh = rset(
+            8,
+            2,
+            vec![gpu(0, sid(5, 0)), gpu(1, sid(5, 1)), gpu(2, sid(7, 0))],
+        );
+        let held: HashSet<u64> = [sid(5, 0)].into_iter().collect();
+
+        let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
+
+        let ids: Vec<u64> = reconciled.gpus.iter().map(|g| g.stable_id).collect();
+        assert!(ids.contains(&sid(5, 0)), "held device stays advertised");
+        assert!(
+            !ids.contains(&sid(5, 1)),
+            "a fresh partition on the held BDF must be suppressed"
+        );
+        assert!(
+            ids.contains(&sid(7, 0)),
+            "an unrelated free GPU still flows through"
+        );
+        assert_eq!(reconciled.gpus.len(), 2);
+        // No BDF-5 device other than the pinned held one is present.
+        let bdf5 = ids.iter().filter(|&&id| id & 0xFF_0000 == 5 << 16).count();
+        assert_eq!(bdf5, 1);
+    }
+
+    #[test]
+    fn reconcile_does_not_over_suppress_free_on_a_different_bdf() {
+        use std::collections::HashSet;
+        // Held device on BDF 5 is unchanged; a FREE device on BDF 7 was replaced
+        // by one on BDF 9. The held silicon is untouched, so the free-pool change
+        // must flow through: 7 gone, 9 present, held 5 still advertised.
+        let baseline = rset(8, 1, vec![gpu(0, sid(5, 0)), gpu(1, sid(7, 0))]);
+        let fresh = rset(8, 2, vec![gpu(0, sid(5, 0)), gpu(1, sid(9, 0))]);
+        let held: HashSet<u64> = [sid(5, 0)].into_iter().collect();
+
+        let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
+        let ids: Vec<u64> = reconciled.gpus.iter().map(|g| g.stable_id).collect();
+        assert_eq!(reconciled.gpus.len(), 2);
+        assert!(ids.contains(&sid(5, 0)) && ids.contains(&sid(9, 0)));
+        assert!(
+            !ids.contains(&sid(7, 0)),
+            "the freed BDF-7 device converged out"
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_double_insert_present_held() {
+        use std::collections::HashSet;
+        // The held id is still in fresh; it must appear exactly once (dropped by
+        // the BDF filter, then re-inserted from baseline).
+        let baseline = rset(8, 1, vec![gpu(0, sid(5, 0)), gpu(1, sid(7, 0))]);
+        let fresh = rset(8, 2, vec![gpu(0, sid(5, 0)), gpu(1, sid(7, 0))]);
+        let held: HashSet<u64> = [sid(5, 0)].into_iter().collect();
+
+        let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
+        assert_eq!(reconciled.gpus.len(), 2);
+        let count_held = reconciled
+            .gpus
+            .iter()
+            .filter(|g| g.stable_id == sid(5, 0))
+            .count();
+        assert_eq!(count_held, 1);
+    }
+
+    #[test]
+    fn reconcile_of_a_held_repartition_equals_baseline_fingerprint() {
+        use std::collections::HashSet;
+        // Oscillation guard: while a held device (BDF 5) stays held, every fresh
+        // scan that only repartitions its silicon reconciles to the SAME
+        // schedulable set as the baseline. The refresh loop compares fingerprints
+        // and skips the re-register/warn, so repeated ReportLost ticks register at
+        // most once (here: zero, the set is unchanged).
+        let baseline = rset(8, 1, vec![gpu(0, sid(5, 0)), gpu(1, sid(7, 0))]);
+        // The held render node vanished, replaced by a CPX slice sid(5,1).
+        let fresh = rset(8, 2, vec![gpu(0, sid(5, 1)), gpu(1, sid(7, 0))]);
+        let held: HashSet<u64> = [sid(5, 0)].into_iter().collect();
+
+        let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
+        assert_eq!(
+            reconciled.schedulable_fingerprint(),
+            baseline.schedulable_fingerprint()
+        );
+    }
+
+    #[test]
+    fn after_release_next_classify_applies_current_baseline() {
+        use spur_sched::cons_tres::{CapacityChange, NodeAllocation};
+        use std::collections::HashSet;
+        // Real release_job + classify/update_capacity path (no simulation).
+        // A job holds the GPU on BDF 5; the node repartitions it into two CPX
+        // slices sid(5,0),sid(5,1) while an unrelated free GPU sits on BDF 7.
+        // While held the vanished-held classify fires; after release the held id
+        // is gone, so the current hardware is a plain free-pool change.
+        let held_id = sid(5, 9);
+        let baseline = rset(8, 1, vec![gpu(0, held_id), gpu(1, sid(7, 0))]);
+        let real_hw = rset(
+            8,
+            2,
+            vec![gpu(0, sid(5, 0)), gpu(1, sid(5, 1)), gpu(2, sid(7, 0))],
+        );
+
+        let mut node = NodeAllocation::new("n".into(), &baseline);
+        node.allocate_for_job(7, 0, 0, 0, &[held_id]).unwrap();
+
+        // While held: held_id is allocated and absent from real_hw -> held loss.
+        let held: HashSet<u64> = node.allocated_gpu_ids().into_iter().collect();
+        assert_eq!(
+            classify(&baseline, &real_hw, &held),
+            InventoryDelta::AllocatedDevicesLost
+        );
+
+        // Release the job; the held id leaves the allocated set.
+        assert!(node.release_job(7));
+        let held_after: HashSet<u64> = node.allocated_gpu_ids().into_iter().collect();
+        assert!(held_after.is_empty());
+
+        // Now the real hardware is just a free-pool change and applies cleanly.
+        assert_eq!(
+            classify(&baseline, &real_hw, &held_after),
+            InventoryDelta::FreeCapacityChanged
+        );
+        assert!(matches!(
+            node.update_capacity(&real_hw),
+            CapacityChange::Applied
+        ));
+        assert_eq!(node.gpus.len(), 3);
+        assert_eq!(node.free_gpus(None), 3);
+    }
+
+    #[test]
+    fn update_resources_reports_change_ignoring_generation() {
+        let base = ResourceSet {
+            cpus: 4,
+            memory_mb: 512,
+            gpus: vec![],
+            generic: Default::default(),
+            generation: 1,
+        };
+        let reporter = test_reporter(base.clone());
+        // same content, different generation -> not a change
+        let mut same = base.clone();
+        same.generation = 2;
+        assert!(!reporter.update_resources(same));
+        // different cpu count -> change
+        let mut diff = base.clone();
+        diff.cpus = 8;
+        assert!(reporter.update_resources(diff));
+        assert_eq!(reporter.snapshot_resources().cpus, 8);
+    }
+
+    fn fp(cpus: u32, gpu_ids: &[u64]) -> InventoryFingerprint {
+        (cpus, 1024, gpu_ids.to_vec(), Vec::new())
+    }
+
+    #[test]
+    fn unchanged_tick_never_acts_and_resets_last_delta() {
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::Unchanged,
+            &fp(8, &[0, 1]),
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[0, 1]),
+        );
+        assert_eq!(action, RefreshAction::Wait);
+        assert_eq!(last, InventoryDelta::Unchanged);
+    }
+
+    #[test]
+    fn a_change_seen_once_only_arms_then_acts_on_the_second() {
+        // First sighting: arm, do not act.
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[0, 1]),
+            &InventoryDelta::Unchanged,
+            &fp(0, &[]),
+        );
+        assert_eq!(action, RefreshAction::Wait);
+        assert_eq!(last, InventoryDelta::FreeCapacityChanged);
+        // Same delta AND same inventory again: act, and reset the carry.
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[0, 1]),
+            &last,
+            &fp(8, &[0, 1]),
+        );
+        assert_eq!(action, RefreshAction::ApplyCapacity);
+        assert_eq!(last, InventoryDelta::Unchanged);
+    }
+
+    #[test]
+    fn allocated_loss_seen_twice_selects_report_lost() {
+        let (action, _) = next_refresh_action(
+            &InventoryDelta::AllocatedDevicesLost,
+            &fp(8, &[0]),
+            &InventoryDelta::AllocatedDevicesLost,
+            &fp(8, &[0]),
+        );
+        assert_eq!(action, RefreshAction::ReportLost);
+    }
+
+    #[test]
+    fn a_different_change_on_the_second_tick_re_arms_instead_of_acting() {
+        // Free-capacity armed last tick, but this tick reads a held-device loss:
+        // the two disagree, so re-arm on the new delta rather than act on either.
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::AllocatedDevicesLost,
+            &fp(8, &[0]),
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[0]),
+        );
+        assert_eq!(action, RefreshAction::Wait);
+        assert_eq!(last, InventoryDelta::AllocatedDevicesLost);
+    }
+
+    #[test]
+    fn same_delta_but_different_inventory_does_not_act() {
+        // Two ticks both classify FreeCapacityChanged, but the observed GPU sets
+        // differ (one topology was never seen twice) -> arm, do not act.
+        let (action, last) = next_refresh_action(
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[128, 129]),
+            &InventoryDelta::FreeCapacityChanged,
+            &fp(8, &[130, 131]),
+        );
+        assert_eq!(action, RefreshAction::Wait);
+        assert_eq!(last, InventoryDelta::FreeCapacityChanged);
+    }
+
+    #[test]
+    fn a_failed_register_keeps_the_baseline_and_re_arms_for_retry() {
+        // The invariant that fixes convergence-loss: on register failure the
+        // baseline must NOT advance, and the acted delta is re-armed so the very
+        // next tick retries instead of re-serving the seen-twice debounce.
+        let (commit, next) = post_converge(&InventoryDelta::AllocatedDevicesLost, false);
+        assert_eq!(commit, BaselineCommit::Keep);
+        assert_eq!(next, InventoryDelta::AllocatedDevicesLost);
+    }
+
+    #[test]
+    fn a_successful_register_commits_the_baseline_and_resets() {
+        let (commit, next) = post_converge(&InventoryDelta::FreeCapacityChanged, true);
+        assert_eq!(commit, BaselineCommit::Commit);
+        assert_eq!(next, InventoryDelta::Unchanged);
+    }
+
+    #[test]
+    fn refresh_secs_falls_back_on_unset_zero_and_garbage() {
+        assert_eq!(parse_refresh_secs(None), DEFAULT_INVENTORY_REFRESH_SECS);
+        assert_eq!(
+            parse_refresh_secs(Some("0".into())),
+            DEFAULT_INVENTORY_REFRESH_SECS
+        );
+        assert_eq!(
+            parse_refresh_secs(Some("nope".into())),
+            DEFAULT_INVENTORY_REFRESH_SECS
+        );
+        assert_eq!(parse_refresh_secs(Some("5".into())), 5);
     }
 }

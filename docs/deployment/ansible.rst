@@ -81,6 +81,15 @@ published release via ``install.sh`` instead, selected by ``spur_version``
 restarts daemons. Binaries roll out by content checksum, so an unchanged re-run is a
 near no-op.
 
+.. note::
+
+   The toolkit does not set up native credentials (``[auth] plugin = "spur"``). It
+   never starts ``spurauthd`` or distributes the key sets, and a ``spur_binary_src``
+   deploy does not copy the binary at all (an ``install.sh`` deploy does). To use
+   native credentials on a toolkit-deployed cluster, follow :ref:`native-auth-plugin`
+   by hand on every host. A run with ``-e spur_overwrite_conf=true`` re-renders
+   ``spur.conf`` from the template and drops the ``[auth]`` section you added.
+
 Topologies
 ----------
 

@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::partition::{Partition, PartitionState, PreemptMode, PreemptType};
@@ -124,6 +125,11 @@ pub struct SlurmConfig {
     /// pool and on an interval; a failure drains the node (spurd).
     #[serde(default)]
     pub health: HealthConfig,
+
+    /// spurd's own channel/RPC timeouts for talking to the controller. Inverse
+    /// direction of `[controller] agent_*`.
+    #[serde(default)]
+    pub spurd: SpurdConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -237,6 +243,11 @@ pub struct RestApiConfig {
     /// loopback/administrative interface.
     #[serde(default)]
     pub enabled: bool,
+    /// Allow REST on a non-loopback address when native auth is `plugin = "spur"` and
+    /// `mode = "required"`. Off by default: that combination otherwise refuses to start.
+    /// Set this only when a trusted gateway sits in front of the listen address.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
 }
 
 /// Prolog and epilog hook script configuration.
@@ -365,36 +376,6 @@ pub struct ControllerConfig {
     /// How long to wait for a ping response before dropping the connection (default 10).
     #[serde(default = "default_agent_keepalive_timeout_secs")]
     pub agent_keepalive_timeout_secs: u64,
-
-    /// How much of another user's job a non-owner may see via `get_job` /
-    /// `get_job_steps`. See [`JobInfoVisibility`]. Owners and admins always see
-    /// the full record; this governs everyone else. Default: `redacted`.
-    #[serde(default)]
-    pub job_info_visibility: JobInfoVisibility,
-}
-
-/// Controls how much of another user's job a non-owner (non-admin) caller can
-/// read back from `get_job` / `get_job_steps`.
-///
-/// The list RPC `get_jobs` already scopes to the caller; the single-fetch paths
-/// historically did not, exposing every job's work_dir, command line, stdio
-/// paths, and — most usefully to an attacker — its allocated nodelist. This
-/// setting closes that leak while leaving the Slurm-standard cluster-visible
-/// queue intact for the fields that are not targeting-sensitive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum JobInfoVisibility {
-    /// Non-owners see identity/state/timing/account/priority, but work_dir,
-    /// command, stdio paths, allocated nodelist, comment, and resource detail are
-    /// blanked. The default: preserves visibility, removes the targeting oracle.
-    #[default]
-    Redacted,
-    /// Non-owners get `NOT_FOUND` — the job is invisible unless you own it (or
-    /// are an admin). Strictest; matches `get_jobs`' owner-scoped behaviour.
-    OwnerOnly,
-    /// Legacy: every field is visible to any caller. Opt-in for deployments that
-    /// relied on the previous unscoped behaviour.
-    Full,
 }
 
 fn default_max_batch_requeue() -> u32 {
@@ -497,7 +478,6 @@ impl Default for ControllerConfig {
             agent_connect_timeout_secs: default_agent_connect_timeout_secs(),
             agent_keepalive_interval_secs: default_agent_keepalive_interval_secs(),
             agent_keepalive_timeout_secs: default_agent_keepalive_timeout_secs(),
-            job_info_visibility: JobInfoVisibility::default(),
         }
     }
 }
@@ -671,6 +651,27 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
+    /// Master switch for idle-fill scheduling. `false` (default) means no
+    /// behavior change anywhere: an over-quota job never borrows spare capacity.
+    #[serde(default)]
+    pub idle_fill_enabled: bool,
+    /// Minimum seconds a borrowed (idle-fill) job must have been running before
+    /// it may be reclaimed. Deliberately separate from `preempt_exempt_time`,
+    /// which is unbounded and user-raisable; this is the only guard on reclaim,
+    /// so it is short and bounded.
+    #[serde(default = "default_idle_fill_exempt_secs")]
+    pub idle_fill_exempt_secs: u32,
+    /// Ceiling on how many nodes one QOS may hold on loan at once, as a multiple
+    /// of that QOS's own group node cap. `0.0` (default) means no ceiling from
+    /// this dimension. Bounds a single team's blast radius.
+    #[serde(default)]
+    pub idle_fill_max_borrow_factor: f64,
+    /// Ceiling on how many nodes one QOS may hold on loan at once, as a fraction
+    /// of the cluster's registered nodes. `0.0` (default) means no ceiling from
+    /// this dimension. Bounds one team against the whole cluster, which the
+    /// factor above cannot do because it scales with the team's own quota.
+    #[serde(default)]
+    pub idle_fill_max_cluster_fraction: f64,
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -696,6 +697,9 @@ fn default_complete_wait() -> u32 {
 fn default_max_user_priority() -> u32 {
     crate::job::DEFAULT_PRIORITY
 }
+fn default_idle_fill_exempt_secs() -> u32 {
+    60
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -712,6 +716,10 @@ impl Default for SchedulerConfig {
             max_user_priority: default_max_user_priority(),
             preempt_type: PreemptType::None,
             preempt_exempt_time: 0,
+            idle_fill_enabled: false,
+            idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
+            idle_fill_max_borrow_factor: 0.0,
+            idle_fill_max_cluster_fraction: 0.0,
         }
     }
 }
@@ -745,10 +753,50 @@ impl AuthMode {
     }
 }
 
+/// A category of information a site chooses to hide from ordinary users, mirroring
+/// Slurm's `PrivateData`. The default is empty: every authenticated user sees
+/// everything, as a stock `slurm.conf` does. Operators and Administrators are
+/// never subject to these restrictions.
+///
+/// Any string parses, so agents and the CLI keep reading a `spur.conf` that names a
+/// category from a newer release. Only `spurctld` enforces it, so it alone rejects
+/// [`PrivateData::Unsupported`] via [`AuthConfig::check_private_data`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum PrivateData {
+    /// Hide other users' jobs and job steps from `squeue`, `scontrol show job`,
+    /// `scontrol show step`, and the REST job surface.
+    Jobs,
+    /// Pin `scontrol show assoc_mgr` to the scopes the caller takes part in.
+    Usage,
+    Unsupported(String),
+}
+
+impl From<String> for PrivateData {
+    fn from(name: String) -> Self {
+        match name.as_str() {
+            "jobs" => PrivateData::Jobs,
+            "usage" => PrivateData::Usage,
+            _ => PrivateData::Unsupported(name),
+        }
+    }
+}
+
+impl From<PrivateData> for String {
+    fn from(category: PrivateData) -> Self {
+        match category {
+            PrivateData::Jobs => "jobs".into(),
+            PrivateData::Usage => "usage".into(),
+            PrivateData::Unsupported(name) => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-    /// Auth plugin: "jwt" (implemented) or "none". "munge" is recognised but not implemented and is
-    /// rejected at startup rather than silently ignored.
+    /// Auth plugin: `"jwt"` (bearer tokens), `"spur"` (native per-RPC mint), or `"none"`.
+    /// `"munge"` is recognised but not implemented and is rejected at startup rather
+    /// than silently ignored.
     pub plugin: String,
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
@@ -767,6 +815,23 @@ pub struct AuthConfig {
     /// cluster where every submitter is already trusted with root.
     #[serde(default)]
     pub allow_root_jobs: bool,
+    /// Usernames that bind Administrator regardless of accounting.
+    #[serde(default)]
+    pub cluster_admins: Vec<String>,
+    /// NSS groups that bind Administrator. Matching is case-insensitive.
+    #[serde(default)]
+    pub admin_groups: Vec<String>,
+    /// NSS groups that bind Operator.
+    #[serde(default)]
+    pub operator_groups: Vec<String>,
+    /// When true, a verified UID 0 native identity is Administrator.
+    #[serde(default)]
+    pub allow_uid_zero_administrator: bool,
+    /// Categories of information hidden from ordinary users, mirroring Slurm's
+    /// `PrivateData`. Empty (the default) means every authenticated user sees
+    /// everything. Operators and Administrators are always exempt.
+    #[serde(default)]
+    pub private_data: BTreeSet<PrivateData>,
 }
 
 impl Default for AuthConfig {
@@ -777,11 +842,53 @@ impl Default for AuthConfig {
             jwt_key: None,
             jwt_key_file: None,
             allow_root_jobs: false,
+            cluster_admins: Vec::new(),
+            admin_groups: Vec::new(),
+            operator_groups: Vec::new(),
+            allow_uid_zero_administrator: false,
+            private_data: BTreeSet::new(),
         }
     }
 }
 
 impl AuthConfig {
+    /// Whether other users' jobs are hidden from an ordinary caller.
+    pub fn jobs_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Jobs)
+    }
+
+    /// Whether other users' usage is hidden from an ordinary caller.
+    pub fn usage_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Usage)
+    }
+
+    /// A warning when `private_data` is set but a caller can bypass it by sending no credential.
+    pub fn private_data_warning(&self) -> Option<&'static str> {
+        if self.private_data.is_empty() || self.mode == AuthMode::Required {
+            return None;
+        }
+        Some(
+            "[auth] private_data restricts only callers that present a credential; without \
+             mode = \"required\", a caller that sends none still sees every job and scope",
+        )
+    }
+
+    /// Reject a `private_data` category this release does not enforce, so a typo or
+    /// an unimplemented Slurm category fails loudly instead of leaving data visible.
+    pub fn check_private_data(&self) -> Result<(), ConfigError> {
+        let unsupported = self.private_data.iter().find_map(|c| match c {
+            PrivateData::Unsupported(name) => Some(name.as_str()),
+            _ => None,
+        });
+        match unsupported {
+            Some(name) => Err(ConfigError::InvalidValue {
+                field: "auth.private_data".into(),
+                value: format!("{name:?} (supported: \"jobs\", \"usage\")"),
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Resolve the signing key once at process startup.
     ///
     /// `jwt_key` is always treated as a literal secret. `jwt_key_file` is the explicit
@@ -892,10 +999,16 @@ pub struct NodeConfig {
     /// Label selector: apply this config to nodes matching ALL key-value pairs.
     #[serde(default)]
     pub selector: HashMap<String, String>,
+    /// Cap on schedulable CPUs. 0 = unset (use detected). Never exceeds detected.
     #[serde(default)]
     pub cpus: u32,
+    /// Cap on schedulable memory (MiB). 0 = unset (use detected). Never exceeds detected.
     #[serde(default)]
     pub memory_mb: u64,
+    /// Memory (MiB) reserved for the OS/runtime, subtracted from detected memory
+    /// so jobs cannot be packed into headroom the host needs. 0 = none.
+    #[serde(default)]
+    pub reserved_memory_mb: u64,
     #[serde(default)]
     pub gres: Vec<String>,
     #[serde(default)]
@@ -960,17 +1073,56 @@ impl Default for NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
+    // Defaulted because `audit_rpcs` gave this section its first reason to exist
+    // in a config file, and requiring the two inert fields alongside it is noise.
+    #[serde(default = "default_log_level")]
     pub level: String,
+    #[serde(default = "default_log_format")]
     pub format: String,
     pub file: Option<String>,
+    /// Every authenticated controller RPC, reads included, on the `audit_rpc`
+    /// target. Slurm's `DebugFlags=AuditRPCs`; off by default as the largest log.
+    #[serde(default)]
+    pub audit_rpcs: bool,
+}
+
+fn default_log_level() -> String {
+    "info".into()
+}
+
+fn default_log_format() -> String {
+    "text".into()
+}
+
+#[cfg(test)]
+mod logging_config_tests {
+    use super::*;
+
+    #[test]
+    fn audit_rpcs_alone_parses() {
+        // Enabling the audit log must not force an operator to also restate the
+        // two fields no daemon reads.
+        let cfg: LoggingConfig = toml::from_str("audit_rpcs = true").expect("must parse");
+        assert!(cfg.audit_rpcs);
+        assert_eq!(cfg.level, "info");
+        assert_eq!(cfg.format, "text");
+    }
+
+    #[test]
+    fn an_empty_logging_section_keeps_the_defaults() {
+        let cfg: LoggingConfig = toml::from_str("").expect("must parse");
+        assert!(!cfg.audit_rpcs);
+        assert_eq!(cfg.level, "info");
+    }
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: "info".into(),
-            format: "text".into(),
+            level: default_log_level(),
+            format: default_log_format(),
             file: None,
+            audit_rpcs: false,
         }
     }
 }
@@ -1047,7 +1199,8 @@ pub struct ClusterConfig {
     /// Filesystem path to the k0s binary (install target + what the systemd unit runs).
     #[serde(default = "default_k0s_binary")]
     pub k0s_binary: String,
-    /// CNI mode: "kuberouter" (k0s default) or "calico" (`bird` native routing over the mesh when
+    /// CNI mode: "kuberouter" (k0s default, run with `overlay-type=full` so pod traffic is
+    /// IPIP-tunnelled on any underlay) or "calico" (`bird` native routing over the mesh when
     /// `network.wg_enabled`, else its own `vxlan` overlay; kubelet `--node-ip` is pinned to its
     /// advertised address for Calico only). Both carry `pod_cidr`/`service_cidr` into the generated
     /// k0s config.
@@ -1715,6 +1868,115 @@ impl HealthConfig {
     }
 }
 
+/// spurd's own channel/RPC tuning for its connection to the controller (the inverse
+/// direction of `[controller] agent_*`, which bounds the controller's connections to agents).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpurdConfig {
+    /// Budget for establishing a spurd-to-controller connection (default 2; shorter than the
+    /// controller-side default of 5 since it only needs to bound the dial, not app-layer silence).
+    #[serde(default = "default_controller_connect_timeout_secs")]
+    pub controller_connect_timeout_secs: u64,
+
+    /// HTTP/2 ping interval on an open controller connection (default 10, 0 disables keepalive).
+    /// Detection of a silent peer takes roughly this plus `controller_keepalive_timeout_secs`.
+    #[serde(default = "default_controller_keepalive_interval_secs")]
+    pub controller_keepalive_interval_secs: u64,
+
+    /// How long to wait for a ping response before dropping the connection (default 5).
+    #[serde(default = "default_controller_keepalive_timeout_secs")]
+    pub controller_keepalive_timeout_secs: u64,
+
+    /// Ceiling on a single register/heartbeat/deregister/recovery RPC to the controller
+    /// (default 10). These are fast, bounded calls, so a hung one means wedged, not slow.
+    #[serde(default = "default_controller_rpc_timeout_secs")]
+    pub controller_rpc_timeout_secs: u64,
+
+    /// How long a controller endpoint that just failed to dial or answer is deprioritized
+    /// (default 60), so it can't "recapture" every reconnect attempt before the next is due.
+    #[serde(default = "default_controller_failover_cooldown_secs")]
+    pub controller_failover_cooldown_secs: u64,
+
+    /// Ceiling on one native-auth credential mint over the local Unix socket (default 5), only
+    /// consulted under `[auth] plugin = "spur"`. See [`MAX_NATIVE_MINT_TIMEOUT_SECS`].
+    #[serde(default = "default_native_mint_timeout_secs")]
+    pub native_mint_timeout_secs: u64,
+}
+
+pub const DEFAULT_CONTROLLER_CONNECT_TIMEOUT_SECS: u64 = 2;
+pub const DEFAULT_CONTROLLER_KEEPALIVE_INTERVAL_SECS: u64 = 10;
+pub const DEFAULT_CONTROLLER_KEEPALIVE_TIMEOUT_SECS: u64 = 5;
+pub const DEFAULT_CONTROLLER_RPC_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_CONTROLLER_FAILOVER_COOLDOWN_SECS: u64 = 60;
+pub const DEFAULT_NATIVE_MINT_TIMEOUT_SECS: u64 = 5;
+
+/// A fast local Unix-socket round trip, not a network RPC — tighter than
+/// `MAX_LAUNCH_BACKOFF_SECS` on purpose so a misconfigured value can't reopen the
+/// worker-thread-starvation hang this timeout exists to close.
+pub const MAX_NATIVE_MINT_TIMEOUT_SECS: u64 = 60;
+
+fn default_controller_connect_timeout_secs() -> u64 {
+    DEFAULT_CONTROLLER_CONNECT_TIMEOUT_SECS
+}
+
+fn default_controller_keepalive_interval_secs() -> u64 {
+    DEFAULT_CONTROLLER_KEEPALIVE_INTERVAL_SECS
+}
+
+fn default_controller_keepalive_timeout_secs() -> u64 {
+    DEFAULT_CONTROLLER_KEEPALIVE_TIMEOUT_SECS
+}
+
+fn default_controller_rpc_timeout_secs() -> u64 {
+    DEFAULT_CONTROLLER_RPC_TIMEOUT_SECS
+}
+
+fn default_controller_failover_cooldown_secs() -> u64 {
+    DEFAULT_CONTROLLER_FAILOVER_COOLDOWN_SECS
+}
+
+fn default_native_mint_timeout_secs() -> u64 {
+    DEFAULT_NATIVE_MINT_TIMEOUT_SECS
+}
+
+impl Default for SpurdConfig {
+    fn default() -> Self {
+        Self {
+            controller_connect_timeout_secs: default_controller_connect_timeout_secs(),
+            controller_keepalive_interval_secs: default_controller_keepalive_interval_secs(),
+            controller_keepalive_timeout_secs: default_controller_keepalive_timeout_secs(),
+            controller_rpc_timeout_secs: default_controller_rpc_timeout_secs(),
+            controller_failover_cooldown_secs: default_controller_failover_cooldown_secs(),
+            native_mint_timeout_secs: default_native_mint_timeout_secs(),
+        }
+    }
+}
+
+impl SpurdConfig {
+    pub fn controller_connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.controller_connect_timeout_secs)
+    }
+
+    pub fn controller_keepalive_interval(&self) -> Duration {
+        Duration::from_secs(self.controller_keepalive_interval_secs)
+    }
+
+    pub fn controller_keepalive_timeout(&self) -> Duration {
+        Duration::from_secs(self.controller_keepalive_timeout_secs)
+    }
+
+    pub fn controller_rpc_timeout(&self) -> Duration {
+        Duration::from_secs(self.controller_rpc_timeout_secs)
+    }
+
+    pub fn controller_failover_cooldown(&self) -> Duration {
+        Duration::from_secs(self.controller_failover_cooldown_secs)
+    }
+
+    pub fn native_mint_timeout(&self) -> Duration {
+        Duration::from_secs(self.native_mint_timeout_secs)
+    }
+}
+
 /// Resolved cgroup-v2 control-file values for one job. `None`/empty means
 /// "leave the kernel default", which is not the same as a limit of zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1895,6 +2157,81 @@ impl SlurmConfig {
                     .into(),
             });
         }
+        // Mirrors the controller-side agent-channel checks above, for spurd's own
+        // outbound connection to the controller.
+        for (field, value) in [
+            (
+                "spurd.controller_connect_timeout_secs",
+                self.spurd.controller_connect_timeout_secs,
+            ),
+            (
+                "spurd.controller_keepalive_interval_secs",
+                self.spurd.controller_keepalive_interval_secs,
+            ),
+            (
+                "spurd.controller_keepalive_timeout_secs",
+                self.spurd.controller_keepalive_timeout_secs,
+            ),
+        ] {
+            if value > MAX_AGENT_CHANNEL_TIMEOUT_SECS {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: format!("{value} (must be at most {MAX_AGENT_CHANNEL_TIMEOUT_SECS})"),
+                });
+            }
+        }
+        if self.spurd.controller_keepalive_interval_secs > 0
+            && self.spurd.controller_keepalive_timeout_secs == 0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "spurd.controller_keepalive_timeout_secs".into(),
+                value: "0 (must be greater than 0 unless controller_keepalive_interval_secs is 0)"
+                    .into(),
+            });
+        }
+        // Same reasoning as controller.dispatch_reject_cooldown_secs: a day-long cooldown or
+        // RPC ceiling has no legitimate operational use. Unlike dispatch_reject_cooldown_secs,
+        // zero is rejected for the RPC timeout: this ceiling is the only thing bounding the
+        // stuck-controller hang this config exists to fix, so "0 disables it" would silently
+        // reopen that hang rather than skip an optional cooldown.
+        if self.spurd.controller_rpc_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "spurd.controller_rpc_timeout_secs".into(),
+                value: "0 (must be at least 1; a zero timeout would make every controller RPC \
+                        fail instantly instead of bounding a hang)"
+                    .into(),
+            });
+        }
+        for (field, value) in [
+            (
+                "spurd.controller_rpc_timeout_secs",
+                self.spurd.controller_rpc_timeout_secs,
+            ),
+            (
+                "spurd.controller_failover_cooldown_secs",
+                self.spurd.controller_failover_cooldown_secs,
+            ),
+        ] {
+            if value > MAX_LAUNCH_BACKOFF_SECS {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: format!("{value} (must be at most {MAX_LAUNCH_BACKOFF_SECS})"),
+                });
+            }
+        }
+        // A fast local IPC call, not a network RPC — bounded far tighter than the
+        // day-scale ceiling above, and zero would fail every mint before it dials.
+        if self.spurd.native_mint_timeout_secs == 0
+            || self.spurd.native_mint_timeout_secs > MAX_NATIVE_MINT_TIMEOUT_SECS
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "spurd.native_mint_timeout_secs".into(),
+                value: format!(
+                    "{} (must be between 1 and {MAX_NATIVE_MINT_TIMEOUT_SECS})",
+                    self.spurd.native_mint_timeout_secs
+                ),
+            });
+        }
         // A timed-out node is cooled down for this span, so it feeds the same map and needs the
         // same ceiling.
         if self.controller.dispatch_timeout_secs > MAX_LAUNCH_BACKOFF_SECS {
@@ -1945,17 +2282,18 @@ impl SlurmConfig {
         // and get no authentication with no warning — worse than the field not existing. Reject
         // anything unimplemented instead of silently ignoring it.
         match self.auth.plugin.as_str() {
-            "jwt" | "none" => {}
+            "jwt" | "none" | "spur" => {}
             "munge" => {
                 return Err(ConfigError::InvalidValue {
                     field: "auth.plugin".into(),
-                    value: "munge (not implemented; use \"jwt\", or \"none\" to disable)".into(),
+                    value: "munge (not implemented; use \"jwt\", \"spur\", or \"none\" to disable)"
+                        .into(),
                 })
             }
             other => {
                 return Err(ConfigError::InvalidValue {
                     field: "auth.plugin".into(),
-                    value: format!("{other} (expected \"jwt\" or \"none\")"),
+                    value: format!("{other} (expected \"jwt\", \"spur\", or \"none\")"),
                 })
             }
         }
@@ -1967,10 +2305,12 @@ impl SlurmConfig {
                     .into(),
             });
         }
-        // Without a key, `required` would fall back to a well-known signing constant —
+        // Without a key, JWT `required` would fall back to a well-known signing constant —
         // forgeable, so strictly worse than the default. Refuse to start instead.
+        // Native `plugin = "spur"` verifies HMAC JWKS, not `jwt_key`.
         let resolved_jwt_key = self.auth.resolved_jwt_key()?;
         if self.auth.mode == AuthMode::Required
+            && self.auth.plugin != "spur"
             && resolved_jwt_key.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::InvalidValue {
@@ -1980,6 +2320,25 @@ impl SlurmConfig {
                         mode cannot verify credentials without one)"
                         .into(),
             });
+        }
+        if self.rest_api.enabled
+            && self.auth.plugin == "spur"
+            && self.auth.mode == AuthMode::Required
+            && !self.rest_api.allow_non_loopback
+        {
+            match self.controller.rest_addr.parse::<std::net::SocketAddr>() {
+                Ok(addr) if !addr.ip().is_loopback() => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "controller.rest_addr".into(),
+                        value: format!(
+                            "{addr} (native auth mode \"required\" refuses REST on a non-loopback \
+                             address; bind loopback or set rest_api.allow_non_loopback = true \
+                             behind a trusted gateway)"
+                        ),
+                    });
+                }
+                _ => {}
+            }
         }
 
         if self.cluster.enabled {
@@ -2160,6 +2519,19 @@ impl SlurmConfig {
                     self.health.max_unavailable
                 ),
             });
+        }
+        // A reservation at or above the memory cap would advertise zero schedulable
+        // memory, silently making the node unschedulable. Reject at load instead.
+        for nc in &self.nodes {
+            if nc.memory_mb > 0 && nc.reserved_memory_mb >= nc.memory_mb {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("nodes.{}.reserved_memory_mb", nc.names),
+                    value: format!(
+                        "{} (must be less than memory_mb {})",
+                        nc.reserved_memory_mb, nc.memory_mb
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -2417,6 +2789,40 @@ pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn node_config_parses_reserved_memory_mb() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"gpu[001-008]\"\nmemory_mb = 480000\nreserved_memory_mb = 32000\n",
+        )
+        .unwrap();
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].memory_mb, 480_000);
+        assert_eq!(config.nodes[0].reserved_memory_mb, 32_000);
+    }
+
+    #[test]
+    fn node_config_defaults_reserved_memory_mb_to_zero() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"gpu[001-008]\"\nmemory_mb = 480000\n",
+        )
+        .unwrap();
+        assert_eq!(config.nodes[0].reserved_memory_mb, 0);
+    }
+
+    #[test]
+    fn node_config_rejects_reserved_memory_at_or_above_cap() {
+        // reserved >= memory_mb cap would advertise 0 schedulable memory — an
+        // unschedulable node. Must fail at load, not silently.
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"gpu[001-008]\"\nmemory_mb = 32000\nreserved_memory_mb = 32000\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ConfigError::InvalidValue { ref field, .. } if field.contains("reserved_memory_mb")),
+            "unexpected error: {error:?}"
+        );
+    }
 
     #[test]
     fn auth_config_reads_an_explicit_jwt_key_file() {
@@ -2773,6 +3179,26 @@ mod tests {
         ));
         let cfg = SlurmConfig::load_from_str(example).expect("examples/spur.conf parses");
         assert!(cfg.cgroup.constrain_swap, "example should bound swap");
+    }
+
+    #[test]
+    fn kubernetes_example_config_parses() {
+        // The Kubernetes guide tells operators to build the spur-config Secret
+        // from this file as it is, so it must load without edits.
+        let example = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/k8s/spur.conf"
+        ));
+        let cfg = SlurmConfig::load_from_str(example).expect("examples/k8s/spur.conf parses");
+        assert_eq!(
+            cfg.controller.peers.len(),
+            3,
+            "example runs a three-controller raft"
+        );
+        assert!(
+            !cfg.accounting.enabled(),
+            "the template must not ship a credential"
+        );
     }
 
     #[test]
@@ -3828,6 +4254,93 @@ jwt_key = "a-real-secret"
     }
 
     #[test]
+    fn auth_plugin_spur_is_accepted_without_jwt_key() {
+        let toml = r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+"#;
+        let config = SlurmConfig::load_from_str(toml).expect("native plugin does not use jwt_key");
+        assert_eq!(config.auth.plugin, "spur");
+        assert_eq!(config.auth.mode, AuthMode::Required);
+    }
+
+    #[test]
+    fn native_required_rest_on_non_loopback_is_refused() {
+        let err = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("rest_addr") || err.to_string().contains("non-loopback"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn native_required_rest_non_loopback_allowed_with_override() {
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+allow_non_loopback = true
+"#,
+        )
+        .expect("explicit override must start");
+        assert!(config.rest_api.allow_non_loopback);
+    }
+
+    #[test]
+    fn native_required_rest_on_loopback_is_accepted() {
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "test"
+
+[controller]
+rest_addr = "127.0.0.1:6820"
+
+[auth]
+plugin = "spur"
+mode = "required"
+
+[rest_api]
+enabled = true
+"#,
+        )
+        .expect("loopback REST is allowed without override");
+        assert!(!config.rest_api.allow_non_loopback);
+    }
+
+    #[test]
+    fn auth_plugin_unknown_is_refused() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"not-a-plugin\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("auth.plugin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn auth_permissive_without_jwt_key_is_accepted() {
         // Only `required` is refused key-less; permissive must still come up so a cluster can adopt
         // authentication incrementally.
@@ -3843,6 +4356,74 @@ mode = "permissive"
     }
 
     #[test]
+    fn private_data_defaults_to_everything_visible() {
+        let config =
+            SlurmConfig::load_from_str("cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\n")
+                .unwrap();
+        assert!(config.auth.private_data.is_empty());
+        assert!(!config.auth.jobs_private());
+        assert!(!config.auth.usage_private());
+    }
+
+    #[test]
+    fn private_data_parses_jobs_and_usage() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\", \"usage\"]\n",
+        )
+        .unwrap();
+        assert!(config.auth.jobs_private());
+        assert!(config.auth.usage_private());
+    }
+
+    #[test]
+    fn private_data_parses_an_unknown_category_but_the_controller_check_rejects_it() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\", \"nodes\"]\n",
+        )
+        .expect("agents and the CLI must still load a conf naming a newer category");
+        assert!(config.auth.jobs_private());
+
+        let err = config.auth.check_private_data().unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, value }
+                if field == "auth.private_data" && value.contains("\"nodes\"")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn private_data_check_accepts_supported_categories() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\", \"usage\"]\n",
+        )
+        .unwrap();
+        config.auth.check_private_data().unwrap();
+    }
+
+    #[test]
+    fn private_data_warns_unless_credentials_are_required() {
+        let auth = |body: &str| {
+            SlurmConfig::load_from_str(&format!("cluster_name = \"test\"\n[auth]\n{body}"))
+                .unwrap()
+                .auth
+        };
+        assert!(auth("plugin = \"jwt\"\nprivate_data = [\"jobs\"]\n")
+            .private_data_warning()
+            .is_some());
+        assert!(
+            auth("plugin = \"jwt\"\nmode = \"disabled\"\nprivate_data = [\"usage\"]\n")
+                .private_data_warning()
+                .is_some()
+        );
+        assert!(auth(
+            "plugin = \"jwt\"\njwt_key = \"k\"\nmode = \"required\"\nprivate_data = [\"jobs\"]\n"
+        )
+        .private_data_warning()
+        .is_none());
+        assert!(auth("plugin = \"jwt\"\n").private_data_warning().is_none());
+    }
+
+    #[test]
     fn controller_config_parses_max_launch_backoff_secs() {
         let toml = r#"
 cluster_name = "test"
@@ -3852,6 +4433,52 @@ max_launch_backoff_secs = 90
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.max_launch_backoff_secs, 90);
+    }
+
+    #[test]
+    fn idle_fill_scheduler_defaults_are_off_and_bounded() {
+        let toml = r#"
+cluster_name = "test"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(!config.scheduler.idle_fill_enabled);
+        assert_eq!(config.scheduler.idle_fill_exempt_secs, 60);
+    }
+
+    #[test]
+    fn idle_fill_scheduler_settings_parse() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+idle_fill_enabled = true
+idle_fill_exempt_secs = 120
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert!(config.scheduler.idle_fill_enabled);
+        assert_eq!(config.scheduler.idle_fill_exempt_secs, 120);
+    }
+
+    #[test]
+    fn idle_fill_borrow_ceilings_default_to_unbounded() {
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"").unwrap();
+        assert_eq!(config.scheduler.idle_fill_max_borrow_factor, 0.0);
+        assert_eq!(config.scheduler.idle_fill_max_cluster_fraction, 0.0);
+    }
+
+    #[test]
+    fn idle_fill_borrow_ceilings_parse() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+idle_fill_enabled = true
+idle_fill_max_borrow_factor = 2.0
+idle_fill_max_cluster_fraction = 0.25
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.scheduler.idle_fill_max_borrow_factor, 2.0);
+        assert_eq!(config.scheduler.idle_fill_max_cluster_fraction, 0.25);
     }
 
     #[test]
@@ -3987,6 +4614,143 @@ agent_keepalive_interval_secs = 0
 agent_keepalive_timeout_secs = 0
 "#;
         assert!(SlurmConfig::load_from_str(ok).is_ok());
+    }
+
+    #[test]
+    fn spurd_config_rejects_out_of_range_channel_timeouts() {
+        for field in [
+            "controller_connect_timeout_secs",
+            "controller_keepalive_interval_secs",
+            "controller_keepalive_timeout_secs",
+        ] {
+            let toml = format!(
+                "cluster_name = \"test\"\n\n[spurd]\n{field} = {}\n",
+                MAX_AGENT_CHANNEL_TIMEOUT_SECS + 1
+            );
+            let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "{field} past the ceiling must be rejected, got: {err}"
+            );
+        }
+        // The bound itself must be accepted, for all three fields.
+        let ok = format!(
+            "cluster_name = \"test\"\n\n[spurd]\ncontroller_connect_timeout_secs = {max}\ncontroller_keepalive_interval_secs = {max}\ncontroller_keepalive_timeout_secs = {max}\n",
+            max = MAX_AGENT_CHANNEL_TIMEOUT_SECS
+        );
+        assert!(SlurmConfig::load_from_str(&ok).is_ok());
+    }
+
+    #[test]
+    fn spurd_config_rejects_a_zero_keepalive_timeout_while_keepalive_is_on() {
+        let toml = r#"
+cluster_name = "test"
+
+[spurd]
+controller_keepalive_interval_secs = 10
+controller_keepalive_timeout_secs = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("controller_keepalive_timeout_secs"),
+            "a zero ping timeout marks every ping overdue; it must be rejected: {err}"
+        );
+
+        // Harmless once keepalive itself is off.
+        let ok = r#"
+cluster_name = "test"
+
+[spurd]
+controller_keepalive_interval_secs = 0
+controller_keepalive_timeout_secs = 0
+"#;
+        assert!(SlurmConfig::load_from_str(ok).is_ok());
+    }
+
+    #[test]
+    fn spurd_config_rejects_out_of_range_rpc_timeout_and_cooldown() {
+        for field in [
+            "controller_rpc_timeout_secs",
+            "controller_failover_cooldown_secs",
+        ] {
+            let toml = format!(
+                "cluster_name = \"test\"\n\n[spurd]\n{field} = {}\n",
+                MAX_LAUNCH_BACKOFF_SECS + 1
+            );
+            let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "{field} past the ceiling must be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn spurd_config_rejects_a_zero_controller_rpc_timeout() {
+        // Unlike dispatch_reject_cooldown_secs, 0 is not a valid "disable" value here: it would
+        // make every controller RPC fail instantly rather than bounding a hang.
+        let toml = r#"
+cluster_name = "test"
+
+[spurd]
+controller_rpc_timeout_secs = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("controller_rpc_timeout_secs"),
+            "a zero RPC timeout must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn spurd_config_rejects_out_of_range_native_mint_timeout() {
+        let toml = format!(
+            "cluster_name = \"test\"\n\n[spurd]\nnative_mint_timeout_secs = {}\n",
+            MAX_NATIVE_MINT_TIMEOUT_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("native_mint_timeout_secs"),
+            "a mint timeout past its (tighter, fast-IPC) ceiling must be rejected: {err}"
+        );
+
+        let ok = format!(
+            "cluster_name = \"test\"\n\n[spurd]\nnative_mint_timeout_secs = {MAX_NATIVE_MINT_TIMEOUT_SECS}\n"
+        );
+        assert!(SlurmConfig::load_from_str(&ok).is_ok());
+    }
+
+    #[test]
+    fn spurd_config_rejects_a_zero_native_mint_timeout() {
+        let toml = r#"
+cluster_name = "test"
+
+[spurd]
+native_mint_timeout_secs = 0
+"#;
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("native_mint_timeout_secs"),
+            "a zero mint timeout means every call fails before dialing; must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn spurd_config_defaults_match_todays_hardcoded_values() {
+        // No [spurd] section at all: the cluster admin never opted in, so every field must
+        // fall back to its serde default rather than fail to load or zero out.
+        let cfg = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        // A deployed config with no [spurd] section must fall back to exactly these
+        // values (2/10/5/10/60/5): the keepalive ack timeout matches the operator and
+        // leader-forwarding channels' own 5s default, since both of those already rely
+        // on it as their live stuck-peer detector.
+        assert_eq!(cfg.spurd.controller_connect_timeout_secs, 2);
+        assert_eq!(cfg.spurd.controller_keepalive_interval_secs, 10);
+        assert_eq!(cfg.spurd.controller_keepalive_timeout_secs, 5);
+        assert_eq!(cfg.spurd.controller_rpc_timeout_secs, 10);
+        assert_eq!(cfg.spurd.controller_failover_cooldown_secs, 60);
+        assert_eq!(cfg.spurd.native_mint_timeout_secs, 5);
     }
 
     #[test]

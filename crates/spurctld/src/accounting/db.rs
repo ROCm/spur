@@ -162,9 +162,11 @@ ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS idle_fill_preemptable BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS idle_fill BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -174,7 +176,8 @@ DECLARE
 BEGIN
     FOR target IN
         SELECT *
-        FROM (VALUES ('jobs', 'job_id'), ('jobs', 'preempted_by'), ('tres_usage', 'job_id'))
+        FROM (VALUES ('jobs', 'job_id'), ('jobs', 'preempted_by'), ('tres_usage', 'job_id'),
+                     ('txn', 'actor_uid'))
              AS t(tbl, col)
     LOOP
         IF EXISTS (
@@ -224,9 +227,8 @@ WHERE default_account IS NOT NULL
 CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
     ON users (name) WHERE default_account IS NOT NULL;
 
--- Administrative action / audit log. Records who ran reservation admin commands
--- (create/update/delete) and their outcome. Entity-agnostic so other admin ops
--- can reuse it later. `details` is a JSON string (sqlx has no json feature).
+-- Administrative action / audit log: who ran a mutating action, from where, and
+-- its outcome. `details` is a JSON string (sqlx has no json feature).
 CREATE TABLE IF NOT EXISTS txn (
     id           BIGSERIAL PRIMARY KEY,
     ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -243,6 +245,8 @@ CREATE TABLE IF NOT EXISTS txn (
 CREATE INDEX IF NOT EXISTS idx_txn_ts ON txn(ts);
 CREATE INDEX IF NOT EXISTS idx_txn_actor ON txn(actor);
 CREATE INDEX IF NOT EXISTS idx_txn_entity ON txn(entity_type, entity_name);
+-- Added after the table shipped, so it must follow the CREATE above.
+ALTER TABLE txn ADD COLUMN IF NOT EXISTS peer_addr TEXT NOT NULL DEFAULT '';
 "#;
 
 /// What accounting persists when a job starts. Named fields rather than positional
@@ -262,6 +266,11 @@ pub struct JobStartRecord {
     pub submit_time: DateTime<Utc>,
     pub start_time: DateTime<Utc>,
     pub reservation: Option<String>,
+    /// True when this run was borrowed: the job exceeded its QOS group node cap and
+    /// ran on capacity nobody with a claim wanted. Reported by `sacct` so operators
+    /// can tell which runs were opportunistic, and read back when the run ends to
+    /// decide whether fairshare should be charged for it.
+    pub idle_fill: bool,
 }
 
 /// Record a job start in the database.
@@ -275,8 +284,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation, idle_fill)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13, $14)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -293,7 +302,15 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             exit_code = 0,
             exit_signal = 0,
             derived_exit_code = 0,
-            end_time = NULL
+            end_time = NULL,
+            idle_fill = EXCLUDED.idle_fill,
+            -- A requeued job starts again on the same row, so provenance from the
+            -- run that was evicted must be cleared or the job reads as
+            -- `COMPLETED, PreemptMode=Requeue` forever once it finally succeeds.
+            -- Reclaim makes this routine rather than rare (D12).
+            preempted_by = NULL,
+            preempt_mode = '',
+            preempt_qos = ''
         "#,
     )
     .bind(rec.job_id as i64)
@@ -309,13 +326,14 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.submit_time)
     .bind(rec.start_time)
     .bind(rec.reservation.as_deref().unwrap_or_default())
+    .bind(rec.idle_fill)
     .execute(&mut *conn)
     .await?;
 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
     let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time FROM jobs WHERE job_id = $1",
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
     )
     .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
@@ -359,7 +377,7 @@ pub async fn record_job_end(
             preempted_by = $7,
             preempt_mode = $8,
             preempt_qos = $9
-        RETURNING user_name, account, start_time, num_tasks, cpus_per_task
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, state, idle_fill
         "#,
     )
     .bind(job_id as i64)
@@ -434,6 +452,20 @@ async fn update_usage(
         // End arrived before start; usage will be computed when start lands.
         return Ok(());
     };
+    // A borrowed run that was reclaimed is not charged to fairshare. Charging it
+    // creates a self-reinforcing loop: the borrower is billed for a run it did not
+    // get to finish, its priority drops, and a lower priority makes it the preferred
+    // next victim — so the more capacity it loses, the more it loses (D9).
+    //
+    // Keyed on the stamp, so a burst-pattern victim (reclaimable only because its
+    // QOS is marked preemptable, while running inside its own quota) keeps today's
+    // treatment and is charged as before.
+    let state: String = row.get("state");
+    let idle_fill: bool = row.get("idle_fill");
+    if idle_fill && state == "PREEMPTED" {
+        return Ok(());
+    }
+
     let num_tasks: i32 = row.get("num_tasks");
     let cpus_per_task: i32 = row.get("cpus_per_task");
 
@@ -490,6 +522,8 @@ pub struct JobRecord {
     pub preempted_by: Option<JobId>,
     pub preempt_mode: String,
     pub preempt_qos: String,
+    /// True when the run took borrowed capacity rather than the job's own quota.
+    pub idle_fill: bool,
 }
 
 /// Filters for [`get_job_history`]. A `None` or empty-slice field is an
@@ -514,7 +548,7 @@ pub async fn get_job_history(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
          submit_time, start_time, end_time, reservation, \
-         preempted_by, preempt_mode, preempt_qos \
+         preempted_by, preempt_mode, preempt_qos, idle_fill \
          FROM jobs WHERE 1=1",
     );
 
@@ -576,6 +610,7 @@ pub async fn get_job_history(
                 .map(|id| id as JobId),
             preempt_mode: row.get("preempt_mode"),
             preempt_qos: row.get("preempt_qos"),
+            idle_fill: row.get("idle_fill"),
         })
         .collect();
 
@@ -595,6 +630,7 @@ pub struct TxnRow {
     pub entity_name: String,
     pub outcome: String,
     pub details: String,
+    pub peer_addr: String,
 }
 
 /// Optional filters for `get_transactions`. Empty string filters are ignored.
@@ -605,6 +641,7 @@ pub struct TxnFilter<'a> {
     pub entity_name: Option<&'a str>,
     pub action: Option<&'a str>,
     pub outcome: Option<&'a str>,
+    pub peer_addr: Option<&'a str>,
     pub start_after: Option<DateTime<Utc>>,
     pub start_before: Option<DateTime<Utc>>,
     pub limit: u32,
@@ -619,8 +656,8 @@ pub async fn record_txn(
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO txn (ts, actor, actor_uid, verified, source, action, entity_type, entity_name, outcome, details)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO txn (ts, actor, actor_uid, verified, source, action, entity_type, entity_name, outcome, details, peer_addr)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         "#,
     )
     .bind(rec.ts)
@@ -633,6 +670,7 @@ pub async fn record_txn(
     .bind(&rec.entity_name)
     .bind(rec.outcome.as_str())
     .bind(&rec.details)
+    .bind(&rec.peer_addr)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -659,7 +697,7 @@ pub async fn get_transactions(
 ) -> anyhow::Result<Vec<TxnRow>> {
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT id, ts, actor, actor_uid, verified, source, action, entity_type, \
-         entity_name, outcome, details FROM txn WHERE 1=1",
+         entity_name, outcome, details, peer_addr FROM txn WHERE 1=1",
     );
     if let Some(v) = filter.actor.filter(|s| !s.is_empty()) {
         qb.push(" AND actor = ").push_bind(v);
@@ -675,6 +713,18 @@ pub async fn get_transactions(
     }
     if let Some(v) = filter.outcome.filter(|s| !s.is_empty()) {
         qb.push(" AND outcome = ").push_bind(v);
+    }
+    // Host:port boundary, not a raw prefix, so `10.0.0.4` misses `10.0.0.42`.
+    // The bracketed arm covers IPv6, rendered `[addr]:port` by `SocketAddr`.
+    if let Some(v) = filter.peer_addr.filter(|s| !s.is_empty()) {
+        let host = escape_like(v);
+        qb.push(" AND (peer_addr = ")
+            .push_bind(v)
+            .push(" OR peer_addr LIKE ")
+            .push_bind(format!("{host}:%"))
+            .push(" OR peer_addr LIKE ")
+            .push_bind(format!("[{host}]:%"))
+            .push(")");
     }
     if let Some(after) = filter.start_after {
         qb.push(" AND ts >= ").push_bind(after);
@@ -701,9 +751,19 @@ pub async fn get_transactions(
             entity_name: row.get("entity_name"),
             outcome: row.get("outcome"),
             details: row.get("details"),
+            peer_addr: row.get("peer_addr"),
         })
         .collect();
     Ok(records)
+}
+
+/// Neutralize `LIKE` wildcards so a filter value containing `%` or `_` matches
+/// literally instead of widening the query.
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('%', r"\%")
+        .replace('_', r"\_")
 }
 
 /// Delete audit rows older than `older_than`, returning the number removed.
@@ -838,16 +898,78 @@ enum SqlVal<'a> {
     Int(i32),
     NullInt(Option<i32>),
     Real(f64),
+    Bool(bool),
 }
 
 fn push_bound(qb: &mut QueryBuilder<sqlx::Postgres>, val: SqlVal<'_>) {
     match val {
+        SqlVal::Bool(v) => qb.push_bind(v),
         SqlVal::Text(v) => qb.push_bind(v),
         SqlVal::NullText(v) => qb.push_bind(v),
         SqlVal::Int(v) => qb.push_bind(v),
         SqlVal::NullInt(v) => qb.push_bind(v),
         SqlVal::Real(v) => qb.push_bind(v),
     };
+}
+
+/// Which half of an upsert ran. `sacctmgr modify` reaches the same RPC as
+/// `add`, so only the write itself can tell the audit log which verb to record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Upserted {
+    Created,
+    Updated,
+    /// The row existed and the request restated nothing, so `ON CONFLICT DO
+    /// NOTHING` matched without touching it.
+    Unchanged,
+}
+
+/// What an upsert did, and to which columns.
+pub struct Upsert {
+    pub outcome: Upserted,
+    /// `{column: {"from": .., "to": ..}}` for the columns the write actually
+    /// changed. Empty on an insert, where there is no prior value.
+    pub changed: serde_json::Value,
+}
+
+impl Upsert {
+    fn unchanged() -> Self {
+        Self {
+            outcome: Upserted::Unchanged,
+            changed: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
+
+/// Columns whose value differs between the two row snapshots. Both sides come
+/// from `to_jsonb` on the same table, so like is compared with like.
+fn changed_columns(before: &serde_json::Value, after: &serde_json::Value) -> serde_json::Value {
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return serde_json::Value::Object(serde_json::Map::new());
+    };
+    let diff = after.iter().filter_map(|(col, new)| {
+        let old = before.get(col)?;
+        (old != new).then(|| (col.clone(), serde_json::json!({ "from": old, "to": new })))
+    });
+    serde_json::Value::Object(diff.collect())
+}
+
+impl Upserted {
+    fn from_xmax(inserted: Option<bool>) -> Self {
+        match inserted {
+            Some(true) => Self::Created,
+            Some(false) => Self::Updated,
+            None => Self::Unchanged,
+        }
+    }
+
+    /// The verb to audit. An unchanged row still existed beforehand, so
+    /// recording `create` would claim something that did not happen.
+    pub fn action(self) -> super::TxnAction {
+        match self {
+            Self::Created => super::TxnAction::Create,
+            Self::Updated | Self::Unchanged => super::TxnAction::Update,
+        }
+    }
 }
 
 /// The tables `upsert_row` can target. A closed set of variants (not a free
@@ -880,11 +1002,28 @@ impl UpsertTable {
 /// take the schema default on insert — the partial-patch contract). No `updates`
 /// = create-if-absent. Table is a closed enum, columns `&'static str` — injection-safe.
 async fn upsert_row(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     table: UpsertTable,
     keys: &[(&'static str, SqlVal<'_>)],
     updates: &[(&'static str, SqlVal<'_>)],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Upsert> {
+    // Locked so the prior row cannot change before the write lands. Not a CTE:
+    // Postgres does not evaluate one referenced only from RETURNING.
+    let mut pq: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("SELECT to_jsonb(p) FROM ");
+    pq.push(table.name()).push(" p WHERE ");
+    let mut first = true;
+    for (col, val) in keys {
+        if !first {
+            pq.push(" AND ");
+        }
+        first = false;
+        pq.push("p.").push(*col).push(" = ");
+        push_bound(&mut pq, *val);
+    }
+    pq.push(" FOR UPDATE");
+    let before: Option<serde_json::Value> =
+        pq.build_query_scalar().fetch_optional(&mut *conn).await?;
+
     let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("INSERT INTO ");
     qb.push(table.name()).push(" (");
     let mut first = true;
@@ -920,8 +1059,24 @@ async fn upsert_row(
             qb.push(*col).push(" = EXCLUDED.").push(*col);
         }
     }
-    qb.build().execute(pool).await?;
-    Ok(())
+    // `xmax` is zero only on a fresh insert, so this distinguishes the two
+    // halves of the upsert in the same statement — no pre-read, no race.
+    qb.push(" RETURNING (xmax = 0), to_jsonb(");
+    qb.push(table.name()).push(".*)");
+    let row: Option<(bool, serde_json::Value)> =
+        qb.build_query_as().fetch_optional(&mut *conn).await?;
+
+    let Some((inserted, after)) = row else {
+        // `DO NOTHING` matched an existing row and returned none.
+        return Ok(Upsert::unchanged());
+    };
+    Ok(Upsert {
+        outcome: Upserted::from_xmax(Some(inserted)),
+        changed: match before {
+            Some(before) => changed_columns(&before, &after),
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        },
+    })
 }
 
 /// Partial-patch fields for [`upsert_account`]. Outer `None` leaves the column
@@ -941,10 +1096,10 @@ pub struct AccountUpdate<'a> {
 /// sends just the restated fields, so unset columns are preserved; `add` sets
 /// all of them.
 pub async fn upsert_account<'a>(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     name: &'a str,
     u: AccountUpdate<'a>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Upsert> {
     let keys = [("name", SqlVal::Text(name))];
     let mut updates: Vec<(&'static str, SqlVal)> = Vec::new();
     if let Some(v) = u.description {
@@ -965,14 +1120,14 @@ pub async fn upsert_account<'a>(
     if let Some(v) = u.grp_tres {
         updates.push(("grp_tres", SqlVal::NullText(v)));
     }
-    upsert_row(pool, UpsertTable::Accounts, &keys, &updates).await
+    upsert_row(conn, UpsertTable::Accounts, &keys, &updates).await
 }
 
 /// Delete an account.
-pub async fn delete_account(pool: &PgPool, name: &str) -> anyhow::Result<()> {
+pub async fn delete_account(conn: &mut PgConnection, name: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM accounts WHERE name = $1")
         .bind(name)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
@@ -1076,18 +1231,18 @@ pub struct UserUpdate<'a> {
 /// user's others), `Some(false)` clears it, `None` preserves it but still defaults a
 /// brand-new user's first account. Limits/QOS live in a separate association row.
 pub async fn add_user<'a>(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     user: &'a str,
     account: &'a str,
     u: UserUpdate<'a>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Upserted> {
     // Per-user advisory lock so concurrent modifies of two different accounts
     // for the same user serialize — otherwise both could win the demote race
-    // below and end up default. Cheap: add_user is admin-path.
-    let mut tx = pool.begin().await?;
+    // below and end up default. Cheap: add_user is admin-path. The lock is
+    // transaction-scoped, so it needs the caller's transaction to hold it.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
         .bind(user)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     // Clear the default on the user's other rows *before* the upsert sets it
@@ -1100,13 +1255,13 @@ pub async fn add_user<'a>(
         )
         .bind(user)
         .bind(account)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
 
     // Partial-patch: COALESCE/CASE keep stored admin_level/default_account when
     // omitted ($3/$4 NULL); a brand-new user's first row still claims the default.
-    sqlx::query(
+    let inserted: bool = sqlx::query_scalar(
         r#"
         INSERT INTO users (name, account, admin_level, default_account)
         VALUES ($1, $2, COALESCE($3, 'none'), CASE
@@ -1122,14 +1277,16 @@ pub async fn add_user<'a>(
                 WHEN $4::bool THEN $2
                 ELSE NULL
             END
+        RETURNING (xmax = 0)
         "#,
     )
     .bind(user)
     .bind(account)
     .bind(u.admin_level)
     .bind(u.is_default)
-    .execute(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
+    let outcome = Upserted::from_xmax(Some(inserted));
 
     let mut assoc: Vec<(&'static str, SqlVal)> = Vec::new();
     if let Some(v) = u.default_qos {
@@ -1158,28 +1315,29 @@ pub async fn add_user<'a>(
     }
     // Touch the association row (limits/QOS) only when a field was restated.
     if !assoc.is_empty() {
-        upsert_association(&mut tx, user, account, &assoc).await?;
+        upsert_association(&mut *conn, user, account, &assoc).await?;
     }
 
-    tx.commit().await?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Remove a user from one account, or every account when `account` is empty.
-pub async fn remove_user(pool: &PgPool, user: &str, account: &str) -> anyhow::Result<u64> {
-    let mut tx = pool.begin().await?;
+pub async fn remove_user(
+    conn: &mut PgConnection,
+    user: &str,
+    account: &str,
+) -> anyhow::Result<u64> {
     let associations =
         sqlx::query("DELETE FROM associations WHERE user_name = $1 AND ($2 = '' OR account = $2)")
             .bind(user)
             .bind(account)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     let users = sqlx::query("DELETE FROM users WHERE name = $1 AND ($2 = '' OR account = $2)")
         .bind(user)
         .bind(account)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
     Ok(associations.rows_affected() + users.rows_affected())
 }
 
@@ -1314,13 +1472,18 @@ pub struct QosUpdate<'a> {
     pub grp_tres: Option<Option<&'a str>>,
     pub grp_wall_min: Option<Option<i32>>,
     pub preempt_exempt_time: Option<Option<i32>>,
+    pub idle_fill_preemptable: Option<bool>,
     pub flags: Option<&'a str>,
 }
 
 /// Create or update a QOS, writing only the fields set in `u`. `modify` sends
 /// just the restated fields, so unset columns are preserved; `add` sets all of
 /// them.
-pub async fn upsert_qos<'a>(pool: &PgPool, name: &'a str, u: QosUpdate<'a>) -> anyhow::Result<()> {
+pub async fn upsert_qos<'a>(
+    conn: &mut PgConnection,
+    name: &'a str,
+    u: QosUpdate<'a>,
+) -> anyhow::Result<Upsert> {
     let keys = [("name", SqlVal::Text(name))];
     let mut updates: Vec<(&'static str, SqlVal)> = Vec::new();
     if let Some(v) = u.description {
@@ -1365,20 +1528,23 @@ pub async fn upsert_qos<'a>(pool: &PgPool, name: &'a str, u: QosUpdate<'a>) -> a
     if let Some(v) = u.preempt {
         updates.push(("preempt", SqlVal::Text(v)));
     }
+    if let Some(v) = u.idle_fill_preemptable {
+        updates.push(("idle_fill_preemptable", SqlVal::Bool(v)));
+    }
     if let Some(v) = u.preempt_exempt_time {
         updates.push(("preempt_exempt_time", SqlVal::NullInt(v)));
     }
     if let Some(v) = u.flags {
         updates.push(("flags", SqlVal::Text(v)));
     }
-    upsert_row(pool, UpsertTable::Qos, &keys, &updates).await
+    upsert_row(conn, UpsertTable::Qos, &keys, &updates).await
 }
 
 /// Delete a QOS.
-pub async fn delete_qos(pool: &PgPool, name: &str) -> anyhow::Result<()> {
+pub async fn delete_qos(conn: &mut PgConnection, name: &str) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM qos WHERE name = $1")
         .bind(name)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
@@ -1416,7 +1582,7 @@ pub async fn missing_qos(pool: &PgPool, names: &[&str]) -> anyhow::Result<Vec<St
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, flags FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, flags, idle_fill_preemptable FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1439,6 +1605,7 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             grp_tres: r.get("grp_tres"),
             grp_wall_min: r.get("grp_wall_min"),
             preempt_exempt_time: r.get("preempt_exempt_time"),
+            idle_fill_preemptable: r.get("idle_fill_preemptable"),
             flags: r.get("flags"),
         })
         .collect())
@@ -1463,6 +1630,7 @@ pub struct QosRecord {
     pub grp_tres: Option<String>,
     pub grp_wall_min: Option<i32>,
     pub preempt_exempt_time: Option<i32>,
+    pub idle_fill_preemptable: bool,
     pub flags: String,
 }
 
@@ -1568,6 +1736,7 @@ mod job_history_tests {
                 submit_time,
                 start_time,
                 reservation: Some(reservation.to_string()),
+                idle_fill: false,
             },
         )
         .await
@@ -1624,6 +1793,7 @@ mod job_history_tests {
                 submit_time: start_time,
                 start_time,
                 reservation: Some(String::new()),
+                idle_fill: false,
             },
         )
         .await?;
@@ -2427,6 +2597,100 @@ mod job_history_tests {
         Ok(())
     }
 
+    /// The before/after pair a reader needs. Both snapshots come from `to_jsonb`
+    /// on the same table, so unchanged columns compare equal and drop out.
+    #[test]
+    fn changed_columns_reports_only_what_moved() {
+        let before = serde_json::json!({
+            "name": "normal", "max_wall_min": 60, "priority": 5, "grp_tres": null
+        });
+        let after = serde_json::json!({
+            "name": "normal", "max_wall_min": 120, "priority": 5, "grp_tres": "cpu=4"
+        });
+
+        assert_eq!(
+            changed_columns(&before, &after),
+            serde_json::json!({
+                "max_wall_min": { "from": 60, "to": 120 },
+                "grp_tres": { "from": null, "to": "cpu=4" },
+            }),
+            "unchanged columns must not appear"
+        );
+    }
+
+    #[test]
+    fn changed_columns_is_empty_when_nothing_moved() {
+        let row = serde_json::json!({ "name": "normal", "max_wall_min": 60 });
+        assert_eq!(changed_columns(&row, &row), serde_json::json!({}));
+        // An insert has no prior snapshot at all.
+        assert_eq!(
+            changed_columns(&serde_json::Value::Null, &row),
+            serde_json::json!({})
+        );
+    }
+
+    /// `sacctmgr modify` and `add` share one RPC, so the audit verb comes from
+    /// this mapping rather than the method.
+    #[test]
+    fn an_upsert_that_found_a_row_audits_as_an_update() {
+        assert_eq!(Upserted::Created.action(), super::super::TxnAction::Create);
+        assert_eq!(Upserted::Updated.action(), super::super::TxnAction::Update);
+        assert_eq!(
+            Upserted::Unchanged.action(),
+            super::super::TxnAction::Update
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn upsert_qos_reports_whether_it_created_or_updated() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut conn = pool.acquire().await?;
+        let name = format!("spur_upsert_{}", std::process::id());
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&mut *conn)
+            .await?;
+
+        let wall = |m: i32| QosUpdate {
+            max_wall_min: Some(Some(m)),
+            ..Default::default()
+        };
+
+        let created = upsert_qos(&mut conn, &name, wall(60)).await?;
+        assert_eq!(created.outcome, Upserted::Created, "first write inserts");
+        assert_eq!(
+            created.changed,
+            serde_json::json!({}),
+            "an insert has no prior value to diff against"
+        );
+
+        // The `sacctmgr modify qos ... set maxwall=120` case: a real UPDATE,
+        // and the pair a reader needs to answer "what did it used to be".
+        let updated = upsert_qos(&mut conn, &name, wall(120)).await?;
+        assert_eq!(updated.outcome, Upserted::Updated);
+        assert_eq!(
+            updated.changed,
+            serde_json::json!({ "max_wall_min": { "from": 60, "to": 120 } }),
+            "only the column that moved, with both sides"
+        );
+
+        // Restating the same value touches the row but changes nothing.
+        let same = upsert_qos(&mut conn, &name, wall(120)).await?;
+        assert_eq!(same.outcome, Upserted::Updated);
+        assert_eq!(same.changed, serde_json::json!({}), "no column moved");
+
+        // No fields restated, so the statement is ON CONFLICT DO NOTHING.
+        let untouched = upsert_qos(&mut conn, &name, QosUpdate::default()).await?;
+        assert_eq!(untouched.outcome, Upserted::Unchanged);
+
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn list_qos_round_trips_all_limits() -> anyhow::Result<()> {
@@ -2441,9 +2705,10 @@ mod job_history_tests {
             .await?;
 
         upsert_qos(
-            &pool,
+            &mut *pool.acquire().await?,
             &name,
             QosUpdate {
+                idle_fill_preemptable: Some(true),
                 description: Some("d"),
                 priority: Some(5),
                 preempt_mode: Some("cluster"),
@@ -2481,6 +2746,7 @@ mod job_history_tests {
         assert_eq!(got.grp_tres.as_deref(), Some("cpu=64"));
         assert_eq!(got.grp_wall_min, Some(120));
         assert_eq!(got.flags, "DenyOnLimit");
+        assert!(got.idle_fill_preemptable);
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)
@@ -2516,7 +2782,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -2526,7 +2792,7 @@ mod job_history_tests {
         )
         .await?;
         upsert_qos(
-            &pool,
+            &mut *pool.acquire().await?,
             &qos_name,
             QosUpdate {
                 description: Some("d"),
@@ -2536,7 +2802,7 @@ mod job_history_tests {
         .await?;
 
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2557,7 +2823,7 @@ mod job_history_tests {
         // An unrestated default_qos must be preserved while the restated field
         // is still applied.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2575,7 +2841,7 @@ mod job_history_tests {
 
         // An explicit empty default_qos clears it.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2633,7 +2899,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -2654,7 +2920,7 @@ mod job_history_tests {
 
         // add with is_default=true records this account as the user's default.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2672,7 +2938,7 @@ mod job_history_tests {
 
         // An unrestated is_default must leave default_account untouched.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2691,7 +2957,7 @@ mod job_history_tests {
 
         // Restating is_default=false clears default_account.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2707,7 +2973,7 @@ mod job_history_tests {
 
         // Restating is_default=true sets it back.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -2761,7 +3027,7 @@ mod job_history_tests {
                 .execute(&pool)
                 .await?;
             upsert_account(
-                &pool,
+                &mut *pool.acquire().await?,
                 a,
                 AccountUpdate {
                     description: Some("d"),
@@ -2773,7 +3039,7 @@ mod job_history_tests {
 
         // alice's default starts as account A, then B is made the default.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &acct_a,
             UserUpdate {
@@ -2783,7 +3049,7 @@ mod job_history_tests {
         )
         .await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &acct_b,
             UserUpdate {
@@ -2849,7 +3115,7 @@ mod job_history_tests {
                 .execute(&pool)
                 .await?;
             upsert_account(
-                &pool,
+                &mut *pool.acquire().await?,
                 a,
                 AccountUpdate {
                     description: Some("d"),
@@ -2860,9 +3126,21 @@ mod job_history_tests {
         }
 
         // A plain add (is_default = None) makes a user's first account the default.
-        add_user(&pool, &user, &acct_a, UserUpdate::default()).await?;
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &acct_a,
+            UserUpdate::default(),
+        )
+        .await?;
         // A later plain add to another account must not demote that default.
-        add_user(&pool, &user, &acct_b, UserUpdate::default()).await?;
+        add_user(
+            &mut *pool.acquire().await?,
+            &user,
+            &acct_b,
+            UserUpdate::default(),
+        )
+        .await?;
 
         let users = list_users(&pool, None, Some(&user)).await?;
         let a_row = users
@@ -2924,7 +3202,7 @@ mod job_history_tests {
                 .execute(&pool)
                 .await?;
             upsert_account(
-                &pool,
+                &mut *pool.acquire().await?,
                 a,
                 AccountUpdate {
                     description: Some("d"),
@@ -3050,7 +3328,7 @@ mod job_history_tests {
         }
         for q in [&present_a, &present_b] {
             upsert_qos(
-                &pool,
+                &mut *pool.acquire().await?,
                 q,
                 QosUpdate {
                     description: Some("d"),
@@ -3110,7 +3388,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3121,7 +3399,7 @@ mod job_history_tests {
         .await?;
 
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -3151,7 +3429,7 @@ mod job_history_tests {
         // A partial update that restates only max_running_jobs must overwrite
         // that one limit while preserving every limit it didn't restate.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -3173,7 +3451,7 @@ mod job_history_tests {
 
         // Explicitly clearing each limit (inner None) sets it back to no-limit.
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -3237,7 +3515,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3247,7 +3525,7 @@ mod job_history_tests {
         )
         .await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &matching_user,
             &account,
             UserUpdate {
@@ -3258,7 +3536,7 @@ mod job_history_tests {
         )
         .await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &other_user,
             &account,
             UserUpdate {
@@ -3321,7 +3599,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3337,10 +3615,10 @@ mod job_history_tests {
             max_running_jobs: Some(Some(1)),
             ..Default::default()
         };
-        add_user(&pool, &user, &account, base()).await?;
-        add_user(&pool, &user, &account, base()).await?;
+        add_user(&mut *pool.acquire().await?, &user, &account, base()).await?;
+        add_user(&mut *pool.acquire().await?, &user, &account, base()).await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account,
             UserUpdate {
@@ -3406,10 +3684,10 @@ mod job_history_tests {
             fairshare: Some(1),
             ..Default::default()
         };
-        upsert_account(&pool, &account_one, acct_update()).await?;
-        upsert_account(&pool, &account_two, acct_update()).await?;
+        upsert_account(&mut *pool.acquire().await?, &account_one, acct_update()).await?;
+        upsert_account(&mut *pool.acquire().await?, &account_two, acct_update()).await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account_one,
             UserUpdate {
@@ -3421,7 +3699,7 @@ mod job_history_tests {
         )
         .await?;
         add_user(
-            &pool,
+            &mut *pool.acquire().await?,
             &user,
             &account_two,
             UserUpdate {
@@ -3433,7 +3711,7 @@ mod job_history_tests {
         )
         .await?;
 
-        let deleted = remove_user(&pool, &user, &account_one).await?;
+        let deleted = remove_user(&mut *pool.acquire().await?, &user, &account_one).await?;
         assert_eq!(deleted, 2);
         let remaining = list_users(&pool, None, None).await?;
         assert!(!remaining
@@ -3443,7 +3721,7 @@ mod job_history_tests {
             .iter()
             .any(|record| record.name == user && record.account == account_two));
 
-        let deleted = remove_user(&pool, &user, "").await?;
+        let deleted = remove_user(&mut *pool.acquire().await?, &user, "").await?;
         assert_eq!(deleted, 2);
         let remaining = list_users(&pool, None, None).await?;
         assert!(!remaining.iter().any(|record| record.name == user));
@@ -3454,7 +3732,7 @@ mod job_history_tests {
                 .await?;
         assert_eq!(association_count, 0);
 
-        let deleted = remove_user(&pool, &user, "").await?;
+        let deleted = remove_user(&mut *pool.acquire().await?, &user, "").await?;
         assert_eq!(deleted, 0);
 
         sqlx::query("DELETE FROM accounts WHERE name IN ($1, $2)")
@@ -3490,7 +3768,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3553,7 +3831,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3605,7 +3883,7 @@ mod job_history_tests {
             .await?;
 
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 description: Some("d"),
@@ -3625,7 +3903,7 @@ mod job_history_tests {
         // An unrestated grp_tres must be preserved while the restated field is
         // still applied.
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 fairshare: Some(5),
@@ -3643,7 +3921,7 @@ mod job_history_tests {
 
         // An explicit empty grp_tres (inner None) clears it.
         upsert_account(
-            &pool,
+            &mut *pool.acquire().await?,
             &account,
             AccountUpdate {
                 grp_tres: Some(None),
@@ -3705,6 +3983,7 @@ mod txn_tests {
             actor: format!("actor_{}", std::process::id()),
             actor_uid: Some(1000),
             verified: true,
+            peer_addr: "10.11.99.42:51234".to_string(),
             source: TxnSource::Api,
             action,
             entity_type: TxnEntity::Reservation,
@@ -3765,6 +4044,7 @@ mod txn_tests {
         assert_eq!(rows[0].actor, actor);
         assert_eq!(rows[0].actor_uid, Some(1000));
         assert!(rows[0].verified);
+        assert_eq!(rows[0].peer_addr, "10.11.99.42:51234");
 
         let denied = get_transactions(
             &pool,
@@ -3777,6 +4057,70 @@ mod txn_tests {
         .await?;
         assert_eq!(denied.len(), 1);
         assert_eq!(denied[0].action, "delete");
+
+        // A bare host matches whichever ephemeral port the caller used.
+        let by_host = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                peer_addr: Some("10.11.99.42"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(by_host.len(), 2);
+
+        // But a shorter host must not match a longer one that shares its prefix.
+        let near_miss = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                peer_addr: Some("10.11.99.4"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert!(
+            near_miss.is_empty(),
+            "10.11.99.4 must not match 10.11.99.42"
+        );
+
+        // An exact host:port still works, for narrowing to one connection.
+        let exact = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&entity),
+                peer_addr: Some("10.11.99.42:51234"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(exact.len(), 2);
+
+        // IPv6 is stored bracketed by `SocketAddr`, so a bare address must
+        // still find it.
+        let v6_entity = format!("{entity}_v6");
+        let mut v6 = sample(&v6_entity, TxnAction::Create, TxnOutcome::Success, now);
+        v6.peer_addr = "[2001:db8::1]:6817".to_string();
+        record_txn(&mut conn, &v6).await?;
+        let by_v6_host = get_transactions(
+            &pool,
+            &TxnFilter {
+                entity_name: Some(&v6_entity),
+                peer_addr: Some("2001:db8::1"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(
+            by_v6_host.len(),
+            1,
+            "a bare IPv6 host must match [addr]:port"
+        );
+        sqlx::query("DELETE FROM txn WHERE entity_name = $1")
+            .bind(&v6_entity)
+            .execute(&pool)
+            .await?;
 
         sqlx::query("DELETE FROM txn WHERE entity_name = $1")
             .bind(&entity)

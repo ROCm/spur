@@ -251,6 +251,59 @@ fn bdf_from_location_id(location_id: u64, domain: u32) -> String {
     format!("{:04x}:{:02x}:{:02x}.{}", domain, bus, dev, func)
 }
 
+/// Low 8 bits of a stable_id are the partition index; the rest is the PCIe BDF
+/// anchor (domain:bus:dev.func). Mask these off (`id & !STABLE_ID_PARTITION_MASK`)
+/// to get the physical GPU identity — two stable_ids share silicon iff their BDF
+/// anchors are equal.
+pub const STABLE_ID_PARTITION_MASK: u64 = 0xFF;
+
+/// Encode a reload-invariant device id from the PCIe BDF (domain:bus:dev.func
+/// anchor) plus a per-partition rank. The domain occupies bits 24..39, so two
+/// GPUs on different PCI domains with the same bus:dev.func no longer collide.
+fn encode_stable_id(location_id: u64, domain: u32, partition_index: u32) -> u64 {
+    let func = location_id & 0x07;
+    let dev = (location_id >> 3) & 0x1f;
+    let bus = (location_id >> 8) & 0xff;
+    let domain = (domain as u64) & 0xffff;
+    (domain << 24)
+        | (bus << 16)
+        | (dev << 11)
+        | (func << 8)
+        | (partition_index as u64 & STABLE_ID_PARTITION_MASK)
+}
+
+/// Decode a stable_id's BDF anchor back to the k8s-DRA `dddd:bb:dd.f` form
+/// (e.g. `0000:19:00.0`), the value the DRA driver publishes as
+/// `resource.kubernetes.io/pciBusID`.
+pub fn stable_id_to_bdf(stable_id: u64) -> String {
+    let domain = (stable_id >> 24) & 0xffff;
+    let bus = (stable_id >> 16) & 0xff;
+    let dev = (stable_id >> 11) & 0x1f;
+    let func = (stable_id >> 8) & 0x07;
+    format!("{:04x}:{:02x}:{:02x}.{}", domain, bus, dev, func)
+}
+
+/// Rank each node's render_minor WITHIN its BDF group, returning
+/// render_minor -> partition_index. SPX yields 0; CPX yields 0..N-1 per BDF.
+/// Global render_minor order is wrong across multiple physical GPUs, so the
+/// grouping is by BDF first.
+fn partition_indices_by_bdf(nodes: &[KfdGpuNode]) -> HashMap<u32, u32> {
+    let mut by_bdf: HashMap<u64, Vec<u32>> = HashMap::new();
+    for node in nodes {
+        let bdf_high = encode_stable_id(node.location_id, node.domain, 0);
+        by_bdf.entry(bdf_high).or_default().push(node.render_minor);
+    }
+
+    let mut map = HashMap::new();
+    for minors in by_bdf.values_mut() {
+        minors.sort_unstable();
+        for (idx, &rm) in minors.iter().enumerate() {
+            map.insert(rm, idx as u32);
+        }
+    }
+    map
+}
+
 fn format_unique_id(unique_id: u64) -> String {
     format!("{:016x}", unique_id)
 }
@@ -270,6 +323,7 @@ fn parse_u64(s: &str) -> Option<u64> {
 struct DiscoveredGpu {
     device_index: u32,
     render_minor: u32,
+    stable_id: u64,
     card_id: Option<u32>,
     gpu_type: String,
     memory_mb: u64,
@@ -299,6 +353,8 @@ impl DiscoveredGpu {
             compute_partition: self.compute_partition.clone(),
             memory_partition: self.memory_partition.clone(),
             unique_id: self.unique_id.clone(),
+            render_minor: Some(self.render_minor),
+            stable_id: Some(self.stable_id),
         };
 
         let render_stat = stat_device_node(&render_path);
@@ -411,6 +467,8 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
         .map(|(i, g)| (g.node_id, i))
         .collect();
 
+    let partition_index_by_render_minor = partition_indices_by_bdf(&kfd_nodes);
+
     kfd_nodes
         .iter()
         .enumerate()
@@ -444,10 +502,16 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
                 read_sysfs_string(&device_path.join("unique_id"))
             };
             let card_id = find_card_for_render_minor(node.render_minor);
+            let partition_index = partition_index_by_render_minor
+                .get(&node.render_minor)
+                .copied()
+                .unwrap_or(0);
+            let stable_id = encode_stable_id(node.location_id, node.domain, partition_index);
 
             debug!(
                 device_index,
                 render_minor = node.render_minor,
+                stable_id,
                 gpu_type = %gpu_type,
                 memory_mb,
                 numa_node = ?numa_node,
@@ -459,6 +523,7 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
             DiscoveredGpu {
                 device_index,
                 render_minor: node.render_minor,
+                stable_id,
                 card_id,
                 gpu_type,
                 memory_mb,
@@ -812,6 +877,7 @@ mod tests {
         let gpu = DiscoveredGpu {
             device_index: 3,
             render_minor: 131,
+            stable_id: encode_stable_id(0xc100, 0, 0),
             card_id: Some(4),
             gpu_type: "mi300x".into(),
             memory_mb: 196608,
@@ -867,6 +933,7 @@ mod tests {
         let gpu = DiscoveredGpu {
             device_index: 0,
             render_minor: 128,
+            stable_id: 0,
             card_id: None,
             gpu_type: "mi300x".into(),
             memory_mb: 196608,
@@ -894,6 +961,155 @@ mod tests {
         let json = serde_json::to_string_pretty(&spec).unwrap();
         let parsed: CdiSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec, parsed);
+    }
+
+    fn kfd_node(node_id: u32, render_minor: u32, location_id: u64) -> KfdGpuNode {
+        KfdGpuNode {
+            node_id,
+            render_minor,
+            device_id: 0x74a1,
+            location_id,
+            domain: 0,
+            hive_id: 0,
+            unique_id: 0,
+            num_xcc: 4,
+            vram_bytes: 0,
+            gfx_target_version: 0,
+            io_links: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn encode_stable_id_is_collision_free_and_decodes_bdf() {
+        // location_id 0x0500 => bus 0x05, dev 0x00, func 0x00.
+        let bdf_a = 0x0500u64;
+        // location_id 0x2900 => bus 0x29, dev 0x00, func 0x00.
+        let bdf_b = 0x2900u64;
+
+        let a0 = encode_stable_id(bdf_a, 0, 0);
+        let a1 = encode_stable_id(bdf_a, 0, 1);
+        let b0 = encode_stable_id(bdf_b, 0, 0);
+
+        // Same BDF, different partition rank -> distinct ids.
+        assert_ne!(a0, a1);
+        // Different BDF -> distinct ids.
+        assert_ne!(a0, b0);
+        // SPX (partition 0) high bits carry only the BDF (bus 0x05, dev/func 0).
+        assert_eq!(a0, 0x05u64 << 16);
+
+        // Decoding the high bits reproduces the original bus/dev/func.
+        let loc = 0x1234u64 & 0x7ff | (0x29 << 8);
+        let sid = encode_stable_id(loc, 0, 0);
+        let bus = (sid >> 16) & 0xff;
+        let dev = (sid >> 11) & 0x1f;
+        let func = (sid >> 8) & 0x07;
+        assert_eq!(bus, (loc >> 8) & 0xff);
+        assert_eq!(dev, (loc >> 3) & 0x1f);
+        assert_eq!(func, loc & 0x07);
+    }
+
+    /// The bug `pre` reported: two GPUs with the SAME bus:dev.func but on
+    /// DIFFERENT PCI domains must not collide as allocation ids.
+    #[test]
+    fn encode_stable_id_disambiguates_by_pci_domain() {
+        // bus 0x19, dev 0x00, func 0x00 on domain 0 vs domain 1.
+        let loc = 0x1900u64;
+        let dom0_spx = encode_stable_id(loc, 0, 0);
+        let dom1_spx = encode_stable_id(loc, 1, 0);
+        assert_ne!(
+            dom0_spx, dom1_spx,
+            "same BDF on different domains must yield distinct stable_ids"
+        );
+        // The domain lives in bits 24..39, above the BDF anchor.
+        assert_eq!(dom1_spx - dom0_spx, 1u64 << 24);
+
+        // CPX ranks stay distinct within each domain too.
+        let dom0_cpx1 = encode_stable_id(loc, 0, 1);
+        let dom1_cpx1 = encode_stable_id(loc, 1, 1);
+        let ids = [dom0_spx, dom1_spx, dom0_cpx1, dom1_cpx1];
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), 4, "all four (domain,rank) ids are distinct");
+    }
+
+    /// A known (domain,bus,dev,func,partition) round-trips through the decode
+    /// helper to the k8s-DRA `dddd:bb:dd.f` string form.
+    #[test]
+    fn stable_id_decodes_to_dra_pci_bus_id_form() {
+        // domain 0, bus 0x19, dev 0x00, func 0x00, SPX.
+        let sid = encode_stable_id(0x1900u64, 0, 0);
+        assert_eq!(stable_id_to_bdf(sid), "0000:19:00.0");
+
+        // A non-zero domain and a func bit also round-trip.
+        // bus 0x3a, dev 0x02, func 0x01 on domain 0x0001.
+        let loc = (0x3a << 8) | (0x02 << 3) | 0x01;
+        let sid = encode_stable_id(loc, 1, 0);
+        assert_eq!(stable_id_to_bdf(sid), "0001:3a:02.1");
+    }
+
+    #[test]
+    fn partition_index_ranks_within_bdf_not_globally() {
+        // Two physical GPUs (two BDFs), each with 2 CPX partitions.
+        // render_minors are interleaved across the BDFs to prove the rank is
+        // per-BDF, not a global 0..3 ordering.
+        let bdf_a = 0x0500u64;
+        let bdf_b = 0x2900u64;
+        let nodes = vec![
+            kfd_node(2, 128, bdf_a),
+            kfd_node(3, 129, bdf_b),
+            kfd_node(4, 130, bdf_a),
+            kfd_node(5, 131, bdf_b),
+        ];
+
+        let map = partition_indices_by_bdf(&nodes);
+        // Within BDF A: minors 128,130 -> ranks 0,1.
+        assert_eq!(map.get(&128), Some(&0));
+        assert_eq!(map.get(&130), Some(&1));
+        // Within BDF B: minors 129,131 -> ranks 0,1 (NOT global 1,3).
+        assert_eq!(map.get(&129), Some(&0));
+        assert_eq!(map.get(&131), Some(&1));
+
+        let sids: Vec<u64> = nodes
+            .iter()
+            .map(|n| encode_stable_id(n.location_id, n.domain, map[&n.render_minor]))
+            .collect();
+        // All four stable_ids are distinct.
+        let unique: std::collections::HashSet<_> = sids.iter().collect();
+        assert_eq!(unique.len(), 4);
+    }
+
+    #[test]
+    fn stable_ids_unchanged_when_render_minor_pool_shifts() {
+        let bdf_a = 0x0500u64;
+        let bdf_b = 0x2900u64;
+        let base = vec![
+            kfd_node(2, 128, bdf_a),
+            kfd_node(3, 129, bdf_b),
+            kfd_node(4, 130, bdf_a),
+            kfd_node(5, 131, bdf_b),
+        ];
+        // Simulate a driver reload that shifted the whole DRM minor pool up by a
+        // constant while BDFs stayed fixed.
+        const SHIFT: u32 = 64;
+        let shifted: Vec<KfdGpuNode> = base
+            .iter()
+            .map(|n| kfd_node(n.node_id, n.render_minor + SHIFT, n.location_id))
+            .collect();
+
+        let map_base = partition_indices_by_bdf(&base);
+        let map_shifted = partition_indices_by_bdf(&shifted);
+
+        let sids_base: Vec<u64> = base
+            .iter()
+            .map(|n| encode_stable_id(n.location_id, n.domain, map_base[&n.render_minor]))
+            .collect();
+        let sids_shifted: Vec<u64> = shifted
+            .iter()
+            .map(|n| encode_stable_id(n.location_id, n.domain, map_shifted[&n.render_minor]))
+            .collect();
+
+        // Keying on render_minor directly would have changed every id by SHIFT;
+        // keying on BDF + intra-BDF rank keeps them identical.
+        assert_eq!(sids_base, sids_shifted);
     }
 
     #[test]

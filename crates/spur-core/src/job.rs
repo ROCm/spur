@@ -335,6 +335,10 @@ pub enum PendingReason {
     /// association state on disk and refuses to start without it, so it never
     /// schedules in this state to begin with.
     AccountingUnavailable,
+
+    /// No eligible node could host the request even when completely empty, so
+    /// neither waiting nor preemption can place it. Re-derived every pass.
+    NodeConfigUnavailable,
 }
 
 impl PendingReason {
@@ -424,6 +428,9 @@ impl PendingReason {
             Self::K8sReserved => "ReqNodeNotAvail, Reserved for Kubernetes cluster",
             Self::Preempted => "Preempted",
             Self::AccountingUnavailable => "AccountingUnavailable",
+            Self::NodeConfigUnavailable => {
+                "ReqNodeNotAvail, Requested node configuration is not available"
+            }
         }
     }
 
@@ -805,8 +812,9 @@ pub struct Job {
     #[serde(default)]
     pub user_requeue_count: u32,
 
-    /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
-    /// the controller drop a completion report from a superseded run.
+    /// Monotonic run epoch, bumped on every dispatch attempt (confirmed,
+    /// aborted, or held). Lets the controller drop a completion report
+    /// from a superseded run.
     #[serde(default)]
     pub run_attempt: u32,
 
@@ -834,6 +842,11 @@ pub struct Job {
     /// period from scratch.
     #[serde(default)]
     pub time_limit_signaled_at: Option<DateTime<Utc>>,
+
+    /// Instant the controller signalled this run for cancellation. Replicated so
+    /// every replica reads the run as cancelled, not as a plain signal death.
+    #[serde(default)]
+    pub cancel_signaled_at: Option<DateTime<Utc>>,
 
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
@@ -872,6 +885,15 @@ pub struct Job {
     /// the preemption. `None` for plain priority-based preemption.
     #[serde(default)]
     pub preempt_qos: Option<String>,
+
+    /// This run started on spare capacity the job's QOS group node quota did not
+    /// cover (idle-fill). A stamped job is borrowed: it is held outside every
+    /// QOS quota aggregate and is reclaimable on demand. `#[serde(default)]` is
+    /// mandatory — `Job` is serialized whole into the cluster snapshot, whose
+    /// restore hard-fails on a deserialize error, so a missing default would
+    /// crash a controller replaying older state.
+    #[serde(default)]
+    pub idle_fill: bool,
 
     /// Nodes the QOS/account grp-node admission check credited this job for
     /// reusing (they had spare capacity), recomputed fresh every scheduling
@@ -928,6 +950,7 @@ impl Job {
             het_group: None,
             node_completions: HashMap::new(),
             time_limit_signaled_at: None,
+            cancel_signaled_at: None,
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
@@ -938,6 +961,7 @@ impl Job {
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,
+            idle_fill: false,
             preferred_nodes: HashSet::new(),
             last_sched_eval: None,
         }
@@ -1016,6 +1040,8 @@ impl Job {
             JobState::OutOfMemory
         } else if self.time_limit_signaled_at.is_some() {
             JobState::Timeout
+        } else if self.cancel_signaled_at.is_some() {
+            JobState::Cancelled
         } else {
             derived_state
         };
@@ -1023,12 +1049,23 @@ impl Job {
         let reason = match state {
             JobState::OutOfMemory => PendingReason::OutOfMemory,
             JobState::Timeout => PendingReason::TimeLimit,
+            // A cancel, user or scheduler, is not a fault to explain.
+            JobState::Cancelled => PendingReason::None,
             _ if signal != 0 => PendingReason::RaisedSignal,
             _ if exit_code != 0 => PendingReason::NonZeroExitCode,
             _ => PendingReason::None,
         };
 
         (state, reason)
+    }
+
+    /// State to report to accounting for a finished run. A preempt-cancelled
+    /// run ends PREEMPTED in `sacct` while its live state is CANCELLED.
+    pub fn end_of_run_state(&self, final_state: JobState) -> JobState {
+        if self.cancel_signaled_at.is_some() && self.preempt_mode.as_deref() == Some("Cancel") {
+            return JobState::Preempted;
+        }
+        final_state
     }
 
     pub fn all_nodes_completed(&self) -> bool {
@@ -1348,6 +1385,9 @@ impl Job {
             (JobState::Timeout, JobState::Pending) => true,
             (JobState::Preempted, JobState::Pending) => true,
             (JobState::Preempted, JobState::Cancelled) => true,
+            // Preempt-cancel holds the allocation until the nodes report, so the
+            // killed run waits in Completing like any other (Slurm's PREEMPTED|CG).
+            (JobState::Preempted, JobState::Completing) => true,
             (JobState::NodeFail, JobState::Pending) => true,
             (JobState::Failed, JobState::Pending) => true,
             _ => false,
@@ -1887,6 +1927,125 @@ mod tests {
         assert_eq!(reason, PendingReason::OutOfMemory);
     }
 
+    fn cancelled_job() -> Job {
+        let mut job = make_job();
+        job.cancel_signaled_at = Some(Utc::now());
+        job
+    }
+
+    #[test]
+    fn completion_verdict_reports_cancelled_for_a_signalled_run() {
+        // Without the marker the SIGTERM death reads as Failed and the user who
+        // ran scancel is told their job crashed.
+        let (state, reason) = cancelled_job().completion_verdict(JobState::Failed, 0, 15, false);
+        assert_eq!(state, JobState::Cancelled);
+        assert_eq!(reason, PendingReason::None);
+    }
+
+    #[test]
+    fn completion_verdict_reports_cancelled_when_the_job_exits_cleanly_on_sigterm() {
+        let (state, _) = cancelled_job().completion_verdict(JobState::Completed, 0, 0, false);
+        assert_eq!(state, JobState::Cancelled);
+    }
+
+    #[test]
+    fn completion_verdict_lets_the_time_limit_and_oom_outrank_a_cancel() {
+        let mut job = cancelled_job();
+        job.time_limit_signaled_at = Some(Utc::now());
+        let (state, _) = job.completion_verdict(JobState::Failed, 0, 15, false);
+        assert_eq!(state, JobState::Timeout);
+
+        let (state, _) = cancelled_job().completion_verdict(JobState::Failed, 0, 9, true);
+        assert_eq!(state, JobState::OutOfMemory);
+    }
+
+    #[test]
+    fn end_of_run_state_reports_a_preempt_cancel_as_preempted() {
+        let mut job = cancelled_job();
+        job.preempt_mode = Some("Cancel".into());
+        assert_eq!(
+            job.end_of_run_state(JobState::Cancelled),
+            JobState::Preempted
+        );
+
+        // A plain scancel, and a preempt-requeue, keep their own verdict.
+        assert_eq!(
+            cancelled_job().end_of_run_state(JobState::Cancelled),
+            JobState::Cancelled
+        );
+        let mut requeued = cancelled_job();
+        requeued.preempt_mode = Some("Requeue".into());
+        assert_eq!(
+            requeued.end_of_run_state(JobState::Cancelled),
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_preempt_cancelled_run_may_wait_in_completing() {
+        let mut job = make_job();
+        job.state = JobState::Preempted;
+        job.transition(JobState::Completing).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        job.transition(JobState::Cancelled).unwrap();
+    }
+
+    // Frozen pre-`cancel_signaled_at` payload: replay of an older Raft log or
+    // snapshot must still deserialize, or spurctld crashes on restart.
+    #[test]
+    fn job_deserializes_without_cancel_signaled_at_field() {
+        let json = r#"{
+            "job_id": 7,
+            "spec": {
+                "name": "old", "user": "alice", "uid": 0, "gid": 0,
+                "cpus_per_task": 1, "num_nodes": 1, "num_tasks": 1,
+                "gres": [],
+                "argv": [],
+                "environment": {},
+                "dependency": [],
+                "requeue": false,
+                "exclusive": false,
+                "hold": false,
+                "interactive": false,
+                "mail_type": [],
+                "container_mounts": [],
+                "container_readonly": false,
+                "container_mount_home": false,
+                "container_env": {},
+                "container_remap_root": false,
+                "spread_job": false,
+                "host_network": false,
+                "privileged": false,
+                "host_ipc": false,
+                "extra_resources": {},
+                "work_dir": "/tmp"
+            },
+            "state": "RUNNING",
+            "pending_reason": "None",
+            "priority": 1000,
+            "submit_time": "2026-01-02T03:04:05Z",
+            "start_time": null,
+            "end_time": null,
+            "allocated_nodes": ["n1"],
+            "allocated_resources": null,
+            "exit_code": null,
+            "exit_signal": 0,
+            "derived_exit_code": 0,
+            "requeue_count": 0,
+            "preempt_requeue_count": 0,
+            "user_requeue_count": 0,
+            "run_attempt": 0,
+            "node_completions": {},
+            "time_limit_signaled_at": null,
+            "suspended_secs": 0
+        }"#;
+        let job: Job = serde_json::from_str(json).unwrap();
+        assert_eq!(job.job_id, 7);
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
+        assert!(job.cancel_signaled_at.is_none());
+    }
+
     #[test]
     fn a_timed_out_job_finalizes_from_completing() {
         // The completion path routes every job through Completing, so without
@@ -2359,6 +2518,19 @@ mod tests {
         assert_eq!(json, "\"AccountingUnavailable\"");
         let back: PendingReason = serde_json::from_str(&json).unwrap();
         assert_eq!(back, PendingReason::AccountingUnavailable);
+    }
+
+    // Same compatibility surface as the variant above.
+    #[test]
+    fn node_config_unavailable_reason_displays_and_roundtrips() {
+        assert_eq!(
+            PendingReason::NodeConfigUnavailable.display(),
+            "ReqNodeNotAvail, Requested node configuration is not available"
+        );
+        let json = serde_json::to_string(&PendingReason::NodeConfigUnavailable).unwrap();
+        assert_eq!(json, "\"NodeConfigUnavailable\"");
+        let back: PendingReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PendingReason::NodeConfigUnavailable);
     }
 
     #[test]

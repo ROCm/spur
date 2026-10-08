@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::env_defaults::{
-    apply_csv, apply_flag, apply_num, apply_num_opt, apply_str, was_cli_set,
+    apply_csv, apply_flag, apply_num, apply_num_opt, apply_str, apply_string, was_cli_set,
 };
 use anyhow::{Context, Result};
-use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgMatches, CommandFactory, Parser};
 use spur_core::config::HooksConfig;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
@@ -191,6 +191,10 @@ pub struct SrunArgs {
     #[arg(long)]
     pub epilog: Option<String>,
 
+    /// Export environment variables
+    #[arg(long, default_value = "ALL", overrides_with = "export")]
+    pub export: String,
+
     /// Allocate a pseudo-terminal for the job
     #[arg(long)]
     pub pty: bool,
@@ -222,8 +226,8 @@ pub async fn main() -> Result<()> {
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let submit_line = crate::submitline::render(&args);
-    let matches = SrunArgs::command().try_get_matches_from(&args)?;
-    let mut args = SrunArgs::from_arg_matches(&matches)?;
+    let matches = crate::clap_exit::matches_or_exit(SrunArgs::command(), &args);
+    let mut args = crate::clap_exit::from_matches_or_exit::<SrunArgs>(&matches);
 
     if args.jobid.is_some() && !args.overlap {
         anyhow::bail!("--jobid requires --overlap");
@@ -516,6 +520,16 @@ fn resolve_srun_env(matches: &ArgMatches, args: &mut SrunArgs) -> Result<()> {
         &["SPUR_EPILOG", "SLURM_EPILOG"],
         &mut args.epilog,
     );
+    // Slurm's sbatch sets SLURM_EXPORT_ENV so nested steps inherit its mode.
+    // An explicit `srun --export=ALL` still wins, undoing an inherited NONE.
+    // SRUN_EXPORT_ENV is Slurm's srun-only override, taking precedence over the
+    // inherited SLURM_EXPORT_ENV.
+    apply_string(
+        matches,
+        "export",
+        &["SPUR_EXPORT_ENV", "SRUN_EXPORT_ENV", "SLURM_EXPORT_ENV"],
+        &mut args.export,
+    );
 
     Ok(())
 }
@@ -550,8 +564,11 @@ struct StepDispatchResult {
     exit_code: i32,
 }
 
-fn srun_dispatch_environment(args: &SrunArgs) -> HashMap<String, String> {
-    let mut environment: HashMap<String, String> = std::env::vars().collect();
+fn srun_dispatch_environment(
+    args: &SrunArgs,
+    source: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut environment = crate::export_env::resolve_export_env(&args.export, source);
     if let Some(ref cpu_bind) = args.cpu_bind {
         environment.insert("SPUR_CPU_BIND".into(), cpu_bind.clone());
     }
@@ -592,7 +609,7 @@ fn build_srun_job_spec(
             nanos: 0,
         });
 
-    let environment = srun_dispatch_environment(args);
+    let environment = srun_dispatch_environment(args, std::env::vars().collect());
 
     let memory_mb = args
         .mem
@@ -600,6 +617,16 @@ fn build_srun_job_spec(
         .map(|m| parse_memory_mb(m))
         .transpose()?
         .unwrap_or(0);
+
+    // A --pty job's own placeholder never runs the command — the interactive
+    // session does, via its own CreateJobStep + container spec — so giving the
+    // placeholder the same script and container image just runs it a second,
+    // unwatched time in a redundant container. Give it an inert placeholder.
+    let (script, container) = if args.pty {
+        ("#!/bin/bash\nsleep infinity\n".to_string(), None)
+    } else {
+        (build_command_script(&args.command)?, Some(args))
+    };
 
     Ok(JobSpec {
         name: args
@@ -621,7 +648,7 @@ fn build_srun_job_spec(
         gpus,
         gpus_per_node,
         gpus_per_task,
-        script: build_command_script(&args.command)?,
+        script,
         work_dir: work_dir.to_string(),
         stdout_path: io.stdout.clone(),
         stderr_path: io.stderr.clone(),
@@ -636,22 +663,35 @@ fn build_srun_job_spec(
         exclusive: args.exclusive,
         mpi: mpi.to_string(),
         licenses: args.licenses.clone(),
-        container_image: args.container_image.clone().unwrap_or_default(),
-        container_mounts: args.container_mounts.clone(),
-        container_workdir: args.container_workdir.clone().unwrap_or_default(),
-        container_name: args.container_name.clone().unwrap_or_default(),
-        container_readonly: args.container_readonly,
-        container_mount_home: args.container_mount_home,
-        container_env: args
-            .container_env
-            .iter()
-            .filter_map(|s| {
-                s.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+        container_image: container
+            .and_then(|a| a.container_image.clone())
+            .unwrap_or_default(),
+        container_mounts: container
+            .map(|a| a.container_mounts.clone())
+            .unwrap_or_default(),
+        container_workdir: container
+            .and_then(|a| a.container_workdir.clone())
+            .unwrap_or_default(),
+        container_name: container
+            .and_then(|a| a.container_name.clone())
+            .unwrap_or_default(),
+        container_readonly: container.is_some_and(|a| a.container_readonly),
+        container_mount_home: container.is_some_and(|a| a.container_mount_home),
+        container_env: container
+            .map(|a| {
+                a.container_env
+                    .iter()
+                    .filter_map(|s| {
+                        s.split_once('=')
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                    })
+                    .collect()
             })
-            .collect(),
-        container_entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
-        container_remap_root: args.container_remap_root,
+            .unwrap_or_default(),
+        container_entrypoint: container
+            .and_then(|a| a.container_entrypoint.clone())
+            .unwrap_or_default(),
+        container_remap_root: container.is_some_and(|a| a.container_remap_root),
         srun_job: true,
         pty: args.pty,
         ..Default::default()
@@ -693,23 +733,7 @@ fn install_ctrl_c_cancel(
     job_id: u32,
     submit_user: String,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut client = client;
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\nsrun: cancelling job {}...", job_id);
-            let cancel_user =
-                crate::interactive::resolve_job_owner_for_cancel(&mut client, job_id, &submit_user)
-                    .await;
-            let _ = client
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 2,
-                    user: cancel_user,
-                })
-                .await;
-            std::process::exit(130);
-        }
-    })
+    crate::interactive::install_ctrl_c_cancel(client, job_id, submit_user, "srun")
 }
 
 struct RunningAllocation {
@@ -812,7 +836,7 @@ async fn dispatch_step(
     let io = params.io;
     let step_mpi = params.mpi;
     let ntasks = crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes);
-    let step_id = client
+    let created = client
         .create_job_step(CreateJobStepRequest {
             job_id,
             command: args.command.clone(),
@@ -824,22 +848,21 @@ async fn dispatch_step(
             node: String::new(),
             user: params.user.to_string(),
             uid: nix::unistd::geteuid().as_raw(),
-            // The buffered path carries the container on RunStep; this call only
-            // registers the step to obtain its id.
-            container: None,
+            container: container_spec_from_srun_args(args),
             num_nodes: params.explicit_num_nodes.unwrap_or(0),
             nodelist: params.requested_nodelist.unwrap_or_default().to_string(),
         })
         .await
         .context("failed to create job step")?
-        .into_inner()
-        .step_id;
+        .into_inner();
+    let step_id = created.step_id;
+    let execution_credential = created.execution_credential;
 
     for warning in step_unsupported_warnings(args) {
         eprintln!("{warning}");
     }
 
-    let environment = srun_dispatch_environment(args);
+    let environment = srun_dispatch_environment(args, std::env::vars().collect());
     validate_step_cpu_bind(&environment, ntasks)?;
     // Live-stream the step's output when it lands on a single node and the user
     // has not redirected to a file. The tail runs concurrently with the blocking
@@ -870,6 +893,7 @@ async fn dispatch_step(
             mpi: step_mpi.to_string(),
             user: params.user.to_string(),
             container: container_spec_from_srun_args(args),
+            execution_credential,
         })
         .await
         .context("RunStep dispatch failed")?
@@ -933,6 +957,28 @@ async fn release_srun_allocation(
                 "srun: warning: failed to cancel job {} after CompleteJob failure: {}",
                 job_id, ce
             );
+        }
+    }
+}
+
+/// Job-level counterpart to `run_interactive_pty`'s step completion: `Ok`
+/// releases via `CompleteJob` like a non-pty step; `Err` still cancels.
+async fn conclude_pty_session(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    owner: &str,
+    result: &Result<i32>,
+) {
+    match result {
+        Ok(exit_code) => release_srun_allocation(client, job_id, owner, *exit_code).await,
+        Err(_) => {
+            let _ = client
+                .cancel_job(CancelJobRequest {
+                    job_id,
+                    signal: 0,
+                    user: owner.to_string(),
+                })
+                .await;
         }
     }
 }
@@ -1012,13 +1058,7 @@ async fn run_standalone_srun(
             container_spec_from_srun_args(args),
         )
         .await;
-        let _ = client
-            .cancel_job(CancelJobRequest {
-                job_id,
-                signal: 0,
-                user: owner.clone(),
-            })
-            .await;
+        conclude_pty_session(&mut client, job_id, &owner, &result).await;
         // SrunProlog already ran for this invocation; pair it.
         run_srun_epilog(hooks, work_dir).await;
         std::process::exit(result?);
@@ -1525,6 +1565,34 @@ async fn complete_interactive_step(
 
 /// Create an interactive PTY step on a running job and attach to it, reporting
 /// the step's exit code on every exit path once the step exists.
+// Wide enough to ride out a real agent restart (binary swap, not just a
+// network blip), at 500ms between attempts.
+const RECONNECT_ATTEMPTS: u32 = 20;
+/// Bounds connecting and opening the session for one reconnect attempt. A
+/// dead peer's socket isn't always torn down promptly, and neither of these
+/// calls has its own timeout — without this, one bad attempt hangs forever
+/// instead of being retried.
+const RECONNECT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+// Shrinks the timeout above for tests that need to actually hit it: real
+// gRPC sockets defeat `start_paused`'s auto-advance, so the alternative is a
+// real 20s sleep per test.
+#[cfg(test)]
+thread_local! {
+    static TEST_RECONNECT_SETUP_TIMEOUT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn reconnect_setup_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        if let Some(d) = TEST_RECONNECT_SETUP_TIMEOUT.with(|cell| cell.get()) {
+            return d;
+        }
+    }
+    RECONNECT_SETUP_TIMEOUT
+}
+
 async fn run_interactive_pty(
     ctrl: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
@@ -1536,7 +1604,7 @@ async fn run_interactive_pty(
     let winsize = crate::interactive::get_terminal_size();
 
     let mut created_step: Option<u32> = None;
-    let mut cached_step: Option<(u32, String)> = None;
+    let mut cached_step: Option<(u32, String, String)> = None;
     // The controller resolves the step's own container against the parent job's
     // (inheriting `salloc/sbatch --container-image`) and echoes the effective spec;
     // persisted across retries since a cached step skips the CreateJobStep call.
@@ -1545,12 +1613,12 @@ async fn run_interactive_pty(
     let outcome: Result<i32> = 'session: {
         let mut last_err: Option<anyhow::Error> = None;
 
-        for attempt in 0..5 {
+        for attempt in 0..RECONNECT_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
 
-            let (step_id, node_addr) = if let Some(ref cached) = cached_step {
+            let (step_id, node_addr, step_cred) = if let Some(ref cached) = cached_step {
                 cached.clone()
             } else {
                 let step_resp = match ctrl
@@ -1573,7 +1641,9 @@ async fn run_interactive_pty(
                     .await
                 {
                     Ok(resp) => resp.into_inner(),
-                    Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                    Err(status)
+                        if is_retryable_status(&status) && attempt < RECONNECT_ATTEMPTS - 1 =>
+                    {
                         last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
                         continue;
                     }
@@ -1593,41 +1663,87 @@ async fn run_interactive_pty(
                         job_id
                     ));
                 }
-                let pair = (step_resp.step_id, format!("http://{}", step_resp.node_addr));
+                let pair = (
+                    step_resp.step_id,
+                    format!("http://{}", step_resp.node_addr),
+                    step_resp.execution_credential,
+                );
                 cached_step = Some(pair.clone());
                 pair
             };
 
-            let mut agent = match crate::interactive::connect_agent(&node_addr).await {
-                Ok(agent) => agent,
-                Err(e) => break 'session Err(e),
-            };
-
-            match crate::interactive::open_interactive_session(
-                &mut agent,
-                job_id,
-                step_id,
-                command.clone(),
-                winsize,
-                true,
-                user,
-                effective_container.clone(),
+            // The agent may still be mid-restart right after a dropped stream,
+            // so a failed reconnect is worth another attempt, not a hard stop.
+            // Bounded: a dead peer's socket isn't always torn down promptly.
+            let mut agent = match tokio::time::timeout(
+                reconnect_setup_timeout(),
+                crate::interactive::connect_agent(&node_addr),
             )
             .await
             {
-                Ok(handle) => {
-                    break 'session crate::interactive::drive_interactive_session(handle).await
+                Ok(Ok(agent)) => agent,
+                Ok(Err(e)) if attempt < RECONNECT_ATTEMPTS - 1 => {
+                    last_err = Some(e);
+                    continue;
                 }
-                Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                Ok(Err(e)) => break 'session Err(e),
+                Err(_) if attempt < RECONNECT_ATTEMPTS - 1 => {
+                    last_err = Some(anyhow::anyhow!("connecting to the agent timed out"));
+                    continue;
+                }
+                Err(_) => break 'session Err(anyhow::anyhow!("connecting to the agent timed out")),
+            };
+
+            let open_result = tokio::time::timeout(
+                reconnect_setup_timeout(),
+                crate::interactive::open_interactive_session(
+                    &mut agent,
+                    job_id,
+                    step_id,
+                    command.clone(),
+                    winsize,
+                    true,
+                    user,
+                    effective_container.clone(),
+                    step_cred,
+                ),
+            )
+            .await;
+
+            match open_result {
+                Ok(Ok(handle)) => {
+                    match crate::interactive::drive_interactive_session(handle).await {
+                        Ok(code) => break 'session Ok(code),
+                        // The step's supervisor outlives an agent restart, so a
+                        // dropped stream is worth reattaching to, not failing on.
+                        Err(err) if attempt < RECONNECT_ATTEMPTS - 1 => {
+                            eprintln!(
+                                "srun: warning: session disconnected ({err}); reconnecting..."
+                            );
+                            last_err = Some(err);
+                            continue;
+                        }
+                        Err(err) => break 'session Err(err),
+                    }
+                }
+                Ok(Err(status))
+                    if is_retryable_status(&status) && attempt < RECONNECT_ATTEMPTS - 1 =>
+                {
                     last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));
                     continue;
                 }
-                Err(status) => {
+                Ok(Err(status)) => {
                     break 'session Err(anyhow::anyhow!(
                         "InteractiveSession RPC failed: {}",
                         status.message()
                     ))
                 }
+                Err(_) if attempt < RECONNECT_ATTEMPTS - 1 => {
+                    eprintln!("srun: warning: reconnect attempt timed out; retrying...");
+                    last_err = Some(anyhow::anyhow!("InteractiveSession RPC timed out"));
+                    continue;
+                }
+                Err(_) => break 'session Err(anyhow::anyhow!("InteractiveSession RPC timed out")),
             }
         }
 
@@ -1645,7 +1761,12 @@ async fn run_interactive_pty(
 fn is_retryable_status(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
-        tonic::Code::NotFound | tonic::Code::FailedPrecondition | tonic::Code::Unavailable
+        tonic::Code::NotFound
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::Unavailable
+            // The agent reports this when its own bridge hasn't yet noticed a
+            // prior attempt's connection died; retrying lets that unwind.
+            | tonic::Code::AlreadyExists
     )
 }
 
@@ -1700,11 +1821,12 @@ fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<S
     let env_scoped = args.cpu_bind.is_some()
         || args.gpu_bind.is_some()
         || args.label
-        || crate::env_defaults::was_cli_set(matches, "mpi");
+        || crate::env_defaults::was_cli_set(matches, "mpi")
+        || crate::env_defaults::was_cli_set(matches, "export");
     if env_scoped {
         warnings.push(
             "srun: warning: a --pty step runs in the job's environment; \
-             --cpu-bind/--gpu-bind/--label/--mpi are ignored"
+             --cpu-bind/--gpu-bind/--label/--mpi/--export are ignored"
                 .into(),
         );
     }
@@ -1858,6 +1980,7 @@ fn srun_hook_context(script_context: &str, work_dir: &str) -> spur_core::hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::FromArgMatches;
 
     /// A --pty step now runs inside the requested container, so it no longer
     /// warns that container options are dropped.
@@ -2251,6 +2374,52 @@ mod tests {
         assert!(spec.script.contains("hostname"));
     }
 
+    // The interactive session runs the real command; giving the job's own
+    // placeholder the same script would run it a second, unwatched time.
+    #[test]
+    fn build_srun_job_spec_gives_a_pty_job_an_inert_placeholder() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "--pty",
+            "--container-image=img.sqsh",
+            "bash",
+            "-c",
+            "echo hi",
+        ])
+        .expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").expect("spec");
+        assert_eq!(spec.script, "#!/bin/bash\nsleep infinity\n");
+        assert!(
+            spec.container_image.is_empty(),
+            "the placeholder needs no container of its own"
+        );
+    }
+
+    /// Standalone srun creates the job, so --export scopes that job's environment
+    /// even for --pty, whose shell inherits it.
+    #[test]
+    fn build_srun_job_spec_applies_export_to_a_pty_job() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "--pty", "--export=NONE", "bash"]).expect("parse");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --pty --export=NONE")
+            .expect("spec");
+        assert!(spec
+            .environment
+            .keys()
+            .all(|k| k.starts_with("SLURM_") || k.starts_with("SPUR_")));
+    }
+
     /// Launchers like PRTE's `plm:slurm` always pass `--ntasks-per-node`, so
     /// srun must accept both spellings rather than rejecting the command line.
     #[test]
@@ -2480,6 +2649,131 @@ mod tests {
         env.set("SLURM_PARTITION", "gpu");
         let args = resolve_from(&["srun", "--partition=cpu", "hostname"]);
         assert_eq!(args.partition.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_env_default_applied() {
+        let env = EnvGuard::new();
+        env.set("SLURM_EXPORT_ENV", "NONE");
+        assert_eq!(resolve_from(&["srun", "hostname"]).export, "NONE");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_cli_overrides_env() {
+        let env = EnvGuard::new();
+        env.set("SLURM_EXPORT_ENV", "NONE");
+        assert_eq!(
+            resolve_from(&["srun", "--export=ALL", "hostname"]).export,
+            "ALL"
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_spur_var_precedes_slurm_var() {
+        let env = EnvGuard::new();
+        env.set("SPUR_EXPORT_ENV", "ALL");
+        env.set("SLURM_EXPORT_ENV", "NONE");
+        assert_eq!(resolve_from(&["srun", "hostname"]).export, "ALL");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_srun_var_precedes_slurm_var() {
+        let env = EnvGuard::new();
+        env.set("SRUN_EXPORT_ENV", "NONE");
+        env.set("SLURM_EXPORT_ENV", "ALL");
+        assert_eq!(resolve_from(&["srun", "hostname"]).export, "NONE");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn export_spur_var_precedes_srun_var() {
+        let env = EnvGuard::new();
+        env.set("SPUR_EXPORT_ENV", "ALL");
+        env.set("SRUN_EXPORT_ENV", "NONE");
+        assert_eq!(resolve_from(&["srun", "hostname"]).export, "ALL");
+    }
+
+    fn dispatch_source() -> HashMap<String, String> {
+        [("PATH", "/usr/bin"), ("SLURM_JOB_ID", "42")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn dispatch_environment_default_forwards_source_unchanged() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(
+            srun_dispatch_environment(&args, dispatch_source()),
+            dispatch_source()
+        );
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn dispatch_environment_none_drops_non_scheduler_vars() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&["srun", "--export=NONE", "hostname"]);
+        let dispatch = srun_dispatch_environment(&args, dispatch_source());
+        assert_eq!(dispatch.get("SLURM_JOB_ID").map(String::as_str), Some("42"));
+        assert!(!dispatch.contains_key("PATH"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn dispatch_environment_all_keeps_full_env_and_adds_bindings() {
+        let _env = EnvGuard::new();
+        let args = resolve_from(&[
+            "srun",
+            "--cpu-bind=cores",
+            "--export=ALL,FOO=bar",
+            "hostname",
+        ]);
+        let dispatch = srun_dispatch_environment(&args, dispatch_source());
+        assert_eq!(dispatch.get("PATH").map(String::as_str), Some("/usr/bin"));
+        assert_eq!(dispatch.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(
+            dispatch.get("SPUR_CPU_BIND").map(String::as_str),
+            Some("cores")
+        );
+    }
+
+    // The two sides of the inheritance chain meet here: sbatch --export=NONE
+    // records the mode, and a plain srun run in that job's environment picks it
+    // up and strips non-scheduler vars from the step.
+    #[test]
+    #[serial(env_injection)]
+    fn sbatch_none_mode_restricts_a_nested_step() {
+        let env = EnvGuard::new();
+        let argv = ["sbatch", "--export=NONE", "--wrap", "hostname"].map(String::from);
+        let sbatch_args = crate::sbatch::resolve_sbatch_args(&[], &argv).expect("args");
+        let line = crate::submitline::render(&argv);
+        let spec = crate::sbatch::build_sbatch_job_spec(sbatch_args, None, &line).expect("spec");
+        assert_eq!(
+            spec.environment.get("SLURM_EXPORT_ENV").map(String::as_str),
+            Some("NONE")
+        );
+
+        for (k, v) in &spec.environment {
+            env.set(k, v);
+        }
+        let step_args = resolve_from(&["srun", "hostname"]);
+        assert_eq!(step_args.export, "NONE");
+
+        let mut shell_env = spec.environment.clone();
+        shell_env.insert("MYVAR".into(), "v".into());
+        let dispatch = srun_dispatch_environment(&step_args, shell_env);
+        assert!(!dispatch.contains_key("MYVAR"));
+        assert_eq!(
+            dispatch.get("SLURM_EXPORT_ENV").map(String::as_str),
+            Some("NONE")
+        );
     }
 
     #[test]
@@ -2911,6 +3205,244 @@ mod tests {
         assert!(
             capture.complete_step_calls().is_empty(),
             "no step exists, so nothing may be reported complete"
+        );
+    }
+
+    /// Job-level counterpart to `run_interactive_pty`'s step completion — the
+    /// standalone `--pty` path has nothing else to release the job's allocation.
+    #[tokio::test]
+    async fn conclude_pty_session_completes_the_job_on_a_clean_exit() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        conclude_pty_session(&mut client, 55, "alice", &Ok(0)).await;
+
+        assert_eq!(
+            capture.complete_job_calls(),
+            vec![(55, 0, "alice".to_string())],
+            "a session that reported a real exit code must release through CompleteJob"
+        );
+        assert_eq!(
+            capture.cancel_job_calls(),
+            0,
+            "a clean exit must not also be recorded as a cancellation"
+        );
+    }
+
+    /// A nonzero exit is still a real answer from the remote session, not
+    /// evidence the job should read as cancelled.
+    #[tokio::test]
+    async fn conclude_pty_session_completes_the_job_with_a_nonzero_exit_code() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        conclude_pty_session(&mut client, 55, "alice", &Ok(137)).await;
+
+        assert_eq!(
+            capture.complete_job_calls(),
+            vec![(55, 137, "alice".to_string())],
+            "the remote's own reported exit code must be forwarded verbatim"
+        );
+        assert_eq!(capture.cancel_job_calls(), 0);
+    }
+
+    /// Only a session that never got to report an outcome leaves the job
+    /// genuinely unaccounted for.
+    #[tokio::test]
+    async fn conclude_pty_session_cancels_only_when_no_exit_code_ever_came_back() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+
+        conclude_pty_session(
+            &mut client,
+            55,
+            "alice",
+            &Err(anyhow::anyhow!(
+                "InteractiveSession RPC failed: transport error"
+            )),
+        )
+        .await;
+
+        assert_eq!(
+            capture.cancel_job_calls(),
+            1,
+            "with no real outcome ever reported, cancelling is the only safe option"
+        );
+        assert!(capture.complete_job_calls().is_empty());
+    }
+
+    /// `release_srun_allocation`'s own fallback still applies when reached
+    /// through the pty path: a rejected `CompleteJob` still cancels the job.
+    #[tokio::test]
+    async fn conclude_pty_session_falls_back_to_cancel_when_complete_job_is_rejected() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_complete_job_error(tonic::Code::FailedPrecondition);
+        let mut client = crate::mock_controller::client(addr).await;
+
+        conclude_pty_session(&mut client, 55, "alice", &Ok(0)).await;
+
+        assert_eq!(
+            capture.complete_job_calls().len(),
+            1,
+            "the real exit code must still be offered to CompleteJob first"
+        );
+        assert_eq!(
+            capture.cancel_job_calls(),
+            1,
+            "a rejected CompleteJob must still fall back to cancelling the job"
+        );
+    }
+
+    /// The step's supervisor outlives an agent restart, so a stream dropped
+    /// mid-session is worth reattaching to instead of reporting as an exit.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_pty_reconnects_after_a_dropped_stream_without_recreating_the_step() {
+        let _env = EnvGuard::new();
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(vec![
+            crate::mock_agent::ScriptedSession::Disconnect,
+            crate::mock_agent::ScriptedSession::Exit(3),
+        ]);
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        let exit_code = run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
+        )
+        .await
+        .expect("the dropped stream must be retried, not reported as a failure");
+
+        assert_eq!(
+            exit_code, 3,
+            "must return the reconnect attempt's exit code"
+        );
+        assert_eq!(
+            agent_capture.session_count(),
+            2,
+            "a dropped stream must reopen InteractiveSession"
+        );
+        assert_eq!(
+            ctrl_capture.complete_step_calls(),
+            vec![(crate::mock_controller::MOCK_STEP_ID, 3)],
+            "the step must be created once and completed once, not per attempt"
+        );
+    }
+
+    /// A permanently dead stream must not retry forever, and the one step it
+    /// created must still be reported complete exactly once.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_pty_gives_up_after_all_attempts_are_exhausted() {
+        let _env = EnvGuard::new();
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(
+            std::iter::repeat_with(|| crate::mock_agent::ScriptedSession::Disconnect)
+                .take(RECONNECT_ATTEMPTS as usize)
+                .collect(),
+        );
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
+        )
+        .await
+        .expect_err("a permanently dead stream must give up, not retry forever");
+
+        assert_eq!(
+            agent_capture.session_count(),
+            RECONNECT_ATTEMPTS,
+            "must stop after the last attempt"
+        );
+        assert_eq!(
+            ctrl_capture.complete_step_calls(),
+            vec![(crate::mock_controller::MOCK_STEP_ID, 1)],
+            "the one step created must still be reported complete exactly once"
+        );
+    }
+
+    /// A peer whose socket isn't torn down promptly must not hang the client
+    /// forever — the reconnect loop's own bound must fire and retry.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_pty_retries_past_a_hung_reconnect_attempt() {
+        let _env = EnvGuard::new();
+        TEST_RECONNECT_SETUP_TIMEOUT
+            .with(|cell| cell.set(Some(std::time::Duration::from_millis(200))));
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(vec![
+            crate::mock_agent::ScriptedSession::Hang,
+            crate::mock_agent::ScriptedSession::Exit(3),
+        ]);
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        let exit_code = run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
+        )
+        .await
+        .expect("the second attempt must succeed after the first times out");
+        TEST_RECONNECT_SETUP_TIMEOUT.with(|cell| cell.set(None));
+
+        assert_eq!(exit_code, 3, "must return the successful retry's exit code");
+        assert_eq!(
+            agent_capture.session_count(),
+            2,
+            "a hung attempt must be abandoned and retried, not left open"
+        );
+    }
+
+    /// The agent reports `AlreadyExists` when its own bridge hasn't yet
+    /// noticed a prior attempt's connection died — this must be retried, not
+    /// treated as a fatal error.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn interactive_pty_retries_past_an_already_exists_status() {
+        let _env = EnvGuard::new();
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script_sessions(vec![
+            crate::mock_agent::ScriptedSession::AlreadyExists,
+            crate::mock_agent::ScriptedSession::Exit(3),
+        ]);
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        let mut client = crate::mock_controller::client(ctrl_addr).await;
+
+        let exit_code = run_interactive_pty(
+            &mut client,
+            1,
+            vec!["bash".into()],
+            String::new(),
+            "tester",
+            None,
+        )
+        .await
+        .expect("the second attempt must succeed after the first reports already_exists");
+
+        assert_eq!(exit_code, 3, "must return the successful retry's exit code");
+        assert_eq!(
+            agent_capture.session_count(),
+            2,
+            "an already_exists status must be retried, not treated as fatal"
         );
     }
 

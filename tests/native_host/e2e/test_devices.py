@@ -75,6 +75,16 @@ def _max_gpus_per_node(cluster: SpurCluster) -> int:
     return max(cluster.node_gpu_count(name) for name in cluster.node_names)
 
 
+def _node_with_most_gpus(cluster: SpurCluster) -> tuple[str, int]:
+    """Return (node_name, gpu_count) for the node with the most GPUs. Tests that
+    pin work to a node must target this one, not node 0, so a heterogeneous bed
+    (node 0 with fewer GPUs than another node) doesn't leave the job pending."""
+    return max(
+        ((name, cluster.node_gpu_count(name)) for name in cluster.node_names),
+        key=lambda pair: pair[1],
+    )
+
+
 def _render_video_user(cluster: SpurCluster) -> str | None:
     """Return a non-root user that is a member of both the render and video
     groups on node 0, or None if none exists.
@@ -328,6 +338,74 @@ echo "SPUR_JOB_GPUS=$SPUR_JOB_GPUS" > '{rd}/hook-out/prolog-gpu.log'
         assert "SPUR_JOB_GPUS=" in hook_log, hook_log
         spur_gpus = hook_log.strip().split("=", 1)[1]
         assert len(spur_gpus.split(",")) == 2, hook_log
+
+    def test_prolog_spur_job_gpus_distinct_across_concurrent_jobs(self, gpu_cluster):
+        """SPUR_JOB_GPUS in the node Prolog must reflect each job's actual,
+        distinct GPU assignment, not a fixed/always-same index.
+
+        Device IDs are assigned by enumeration order (spur-devices
+        discovery), so "0" alone for a single-GPU job is expected, not a
+        bug. This locks the real signal -- two *concurrent* single-GPU jobs
+        on the same multi-GPU node must be forced onto disjoint devices, so
+        their Prolog-reported IDs differ.
+        """
+        cluster = gpu_cluster
+        cluster.gpu_preflight(1)
+        target, target_gpus = _node_with_most_gpus(cluster)
+        if target_gpus < 2:
+            pytest.skip("need a node with >= 2 GPUs to observe distinct assignment")
+
+        rd = cluster.remote_dir
+        prolog_body = f"""\
+#!/bin/bash
+mkdir -p '{rd}/hook-out'
+echo "SPUR_JOB_GPUS=$SPUR_JOB_GPUS" > "{rd}/hook-out/prolog-gpu-$SPUR_JOB_ID.log"
+"""
+        cluster.write_file("hooks/prolog-gpu-distinct.sh", prolog_body, all_nodes=True)
+        cluster.stop()
+        cluster.start(
+            {
+                **SpurCluster.devices_config(auto_detect=True),
+                "hooks": {"prolog": f"{rd}/hooks/prolog-gpu-distinct.sh"},
+            }
+        )
+
+        hold = cluster.write_file("hold-gpu.sh", "#!/bin/bash\nsleep 30\n")
+        sb_a = cluster.sbatch(["-J", "gpu-a", "-N", "1", "-w", target, "--gres=gpu:1", hold])
+        sb_b = cluster.sbatch(["-J", "gpu-b", "-N", "1", "-w", target, "--gres=gpu:1", hold])
+        id_a = parse_job_id(sb_a)
+        id_b = parse_job_id(sb_b)
+        assert id_a is not None and id_b is not None, f"sbatch failed: {sb_a} / {sb_b}"
+
+        # Both must be RUNNING concurrently -- back-to-back sequential jobs
+        # could both land on device 0 (freed between runs) even if per-job
+        # assignment were broken, so a race would mask the exact bug this
+        # test targets.
+        running = False
+        for _ in range(30):
+            sq = cluster.squeue_all()
+            if job_state(sq, id_a) == "R" and job_state(sq, id_b) == "R":
+                running = True
+                break
+            time.sleep(1)
+        assert running, f"both jobs should run concurrently:\n{cluster.squeue_all()}"
+
+        def _read_prolog_gpu(job_id: int) -> str:
+            path = f"{rd}/hook-out/prolog-gpu-{job_id}.log"
+            raw = cluster.read_output_on_any_node(path)
+            assert raw.strip(), f"prolog log not found: {path}"
+            return raw.strip().split("=", 1)[1]
+
+        gpus_a = _read_prolog_gpu(id_a)
+        gpus_b = _read_prolog_gpu(id_b)
+        assert gpus_a and gpus_b, f"prolog must report a GPU id: {gpus_a!r} / {gpus_b!r}"
+        assert gpus_a != gpus_b, (
+            f"concurrent jobs must get distinct GPU assignments in the "
+            f"Prolog, both reported {gpus_a!r}"
+        )
+
+        cluster.scancel(str(id_a))
+        cluster.scancel(str(id_b))
 
 
 class TestConcurrentAllocation:
@@ -722,4 +800,4 @@ class TestNsenterSupplementaryGroups:
                 f"groups={sorted(step_groups)}\nraw: {step_id}"
             )
         finally:
-            cluster.scancel(str(job_id))
+            cluster.cli_as_user(user, ["scancel", str(job_id)], check=True)

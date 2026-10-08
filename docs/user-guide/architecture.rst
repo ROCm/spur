@@ -3,8 +3,9 @@ Architecture
 
 Spur runs as four binaries: a controller daemon (``spurctld``), a node agent
 (``spurd``), a per-job supervisor (``spurstepd``), and a command-line client
-(``spur``). This page describes what each component does, which ports they use,
-and the core scheduling concepts.
+(``spur``). Clusters that use native credentials add a fifth, the credential
+mint (``spurauthd``). This page describes what each component does, which ports
+they use, and the core scheduling concepts.
 
 Components
 ----------
@@ -54,12 +55,22 @@ scheduling, admin, and accounting. Invoke it as ``spur <command>`` (for example
 ``sbatch``, ``squeue``, and ``sinfo``. See :doc:`slurm-compatibility` for the
 full command map.
 
+``spurauthd`` — Credential mint
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Only clusters that set ``[auth] plugin = "spur"`` need the mint. It runs on
+every host that makes calls — login nodes for the CLI, compute nodes for
+``spurd`` — and listens on a local Unix socket, not the network. Before each
+call the CLI or agent asks it for a short-lived credential, and it takes the
+caller's identity from the kernel rather than from anything the caller sends.
+See :ref:`native-auth-plugin` for setup.
+
 .. note::
 
    Unlike Slurm, Spur has **no** separate accounting or REST daemons — there is
    no ``slurmdbd`` and no ``slurmrestd``. The controller (``spurctld``) handles
-   accounting and the REST API itself. The entire distribution is four binaries:
-   ``spurctld``, ``spurd``, ``spurstepd``, and ``spur``.
+   accounting and the REST API itself. The entire distribution is five binaries:
+   ``spurctld``, ``spurd``, ``spurstepd``, ``spur``, and ``spurauthd``.
 
 Ports
 -----

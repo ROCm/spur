@@ -261,14 +261,7 @@ impl BackfillScheduler {
             node.total_resources.can_satisfy(&required)
         };
 
-        if placement.nodelist_is_additive()
-            && nodes.iter().any(|node| {
-                placement.is_listed(&node.name)
-                    && placement.eligible(node, reservations, now)
-                    && node.total_resources.can_satisfy(&required)
-                    && !suitable(node)
-            })
-        {
+        if placement.additive_listed_node_unavailable(nodes.iter(), reservations, now, &required) {
             return Vec::new();
         }
 
@@ -709,6 +702,13 @@ impl Scheduler for BackfillScheduler {
                     nodes: node_names,
                     per_node_alloc,
                 });
+            } else if job.idle_fill {
+                // A borrowed job that cannot start now should simply not start. It has
+                // no claim on the capacity, so holding a future slot would publish a
+                // StartTime and SchedNodeList for a job that simultaneously reports
+                // being over quota — contradictory, and it buys nothing, since the only
+                // jobs behind a borrow candidate are other borrow candidates (D15).
+                note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
             } else {
                 for (ni, _) in &assigned_nodes {
                     let node_alloc = per_node_alloc
@@ -783,6 +783,7 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
         memory_mb: memory,
         gpus: Vec::new(),
         generic,
+        generation: 0,
     }
 }
 
@@ -797,6 +798,7 @@ fn placeholder_gpus(count: u32, gpu_type: Option<&str>) -> Vec<spur_core::resour
             memory_mb: 0,
             peer_gpus: Vec::new(),
             link_type: spur_core::resource::GpuLinkType::PCIe,
+            stable_id: 0,
         })
         .collect()
 }
@@ -1343,6 +1345,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                stable_id: i as u64,
             })
             .collect();
         let mut node = Node::new(
@@ -1376,7 +1379,7 @@ mod tests {
         )
     }
 
-    fn gpu_ids_from_assignment(assignment: &Assignment) -> HashSet<u32> {
+    fn gpu_ids_from_assignment(assignment: &Assignment) -> HashSet<u64> {
         assignment
             .per_node_alloc
             .values()

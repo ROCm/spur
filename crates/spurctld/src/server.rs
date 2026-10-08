@@ -17,21 +17,110 @@ use spur_core::reservation::Reservation;
 use spur_core::task_launch::{
     batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
 };
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
 
-use crate::accounting::{txn, TxnAction, TxnEntity, TxnRecord, TxnSource};
-use crate::cluster::{ClusterManager, JobFilter, PartitionError, ReservationError};
+use crate::accounting::txn;
+use crate::audit::{annotate, Annotation};
+use crate::cluster::{CancelError, ClusterManager, JobFilter, PartitionError, ReservationError};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 use crate::rpc_middleware::RpcStatsLayer;
 use crate::rpc_stats::RpcStatsCollector;
 use crate::sched_stats::SchedStatsCollector;
 
-const FORWARDED_HEADER: &str = "x-spur-forwarded";
+use spur_core::native_peer::FORWARDED_HEADER;
 const LEADER_HEADER: &str = "x-spur-leader";
 const STEPD_RECOVERY_COHORT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Where a request should run: locally on the leader, or forwarded to it.
+enum Route {
+    Local,
+    Forward,
+}
+
+/// How a forwarded request carries its caller to the leader.
+enum ForwardAuth<'a> {
+    /// Native plugin with a verified identity: sign an envelope for this caller.
+    /// A signing failure on this path is an error, never a silent downgrade.
+    Envelope(&'a spur_core::auth::Identity),
+    /// Anonymous caller, or the JWT plugin (no peer keys): forward with no
+    /// envelope, preserving any Authorization header.
+    Preserve,
+}
+
+/// Pick the forwarding auth mode. Split out so the anonymous-vs-identity choice
+/// is unit-testable without the process-wide signing key.
+fn forward_auth_decision(
+    peer_present: bool,
+    identity: Option<&spur_core::auth::Identity>,
+) -> ForwardAuth<'_> {
+    match (peer_present, identity) {
+        (true, Some(id)) => ForwardAuth::Envelope(id),
+        _ => ForwardAuth::Preserve,
+    }
+}
+
+/// A tonic codec that sends a request body verbatim from pre-encoded bytes and
+/// decodes the response with prost.
+///
+/// A follower encodes the request once, signs the SHA-256 of those bytes, and must
+/// then put exactly those bytes on the wire. The generated typed client would encode
+/// the message a second time, and prost `map` fields have no canonical byte order, so
+/// the re-encode could diverge from what was signed. This codec removes that gap: the
+/// bytes signed are the bytes sent.
+struct PassthroughCodec<D>(std::marker::PhantomData<D>);
+
+impl<D> PassthroughCodec<D> {
+    fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+struct BytesEncoder;
+
+impl tonic::codec::Encoder for BytesEncoder {
+    type Item = bytes::Bytes;
+    type Error = Status;
+
+    fn encode(
+        &mut self,
+        item: bytes::Bytes,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Status> {
+        use bytes::BufMut;
+        dst.put(item);
+        Ok(())
+    }
+}
+
+struct ProstDecoder<D>(std::marker::PhantomData<D>);
+
+impl<D: prost::Message + Default> tonic::codec::Decoder for ProstDecoder<D> {
+    type Item = D;
+    type Error = Status;
+
+    fn decode(&mut self, src: &mut tonic::codec::DecodeBuf<'_>) -> Result<Option<D>, Status> {
+        let item = prost::Message::decode(src)
+            .map_err(|e| Status::internal(format!("decode forwarded response: {e}")))?;
+        Ok(Some(item))
+    }
+}
+
+impl<D: prost::Message + Default + Send + 'static> tonic::codec::Codec for PassthroughCodec<D> {
+    type Encode = bytes::Bytes;
+    type Decode = D;
+    type Encoder = BytesEncoder;
+    type Decoder = ProstDecoder<D>;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        BytesEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        ProstDecoder(std::marker::PhantomData)
+    }
+}
 
 /// Resolve the comm address for an agent registration.
 ///
@@ -114,6 +203,9 @@ fn read_forwarding_policy(is_leader: bool, is_forwarded: bool) -> bool {
     !is_leader && !is_forwarded
 }
 
+/// Every field is an `Arc` or immutable config, so clones share state rather
+/// than fork it — the recovery fences below must be one map, not several.
+#[derive(Clone)]
 pub struct ControllerService {
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
@@ -133,7 +225,10 @@ pub struct ControllerService {
     /// Stepd agents need an explicit signing secret. The built-in
     /// compatibility fallback is public and cannot establish node identity.
     node_identity_key_configured: bool,
-    incomplete_stepd_recoveries: Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>,
+    incomplete_stepd_recoveries: Arc<Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>>,
+    /// Native plugin handshake advertised on Ping. Empty when plugin is not `spur`.
+    auth_audience: String,
+    auth_epoch: u64,
 }
 
 enum StepdRecoveryCohortState {
@@ -143,10 +238,16 @@ enum StepdRecoveryCohortState {
     Fencing(std::time::Instant),
 }
 
+/// The leader's node id and an open channel to it.
+type CachedLeader = Option<(u64, tonic::transport::Channel)>;
+
+/// The cache is shared rather than copied, or each clone would separately dial
+/// the leader it already has a connection to.
+#[derive(Clone)]
 struct LeaderProxy {
     raft: Arc<RaftHandle>,
     client_addrs: BTreeMap<u64, String>,
-    cached_client: Mutex<Option<(u64, SlurmControllerClient<tonic::transport::Channel>)>>,
+    cached_channel: Arc<Mutex<CachedLeader>>,
 }
 
 impl LeaderProxy {
@@ -154,23 +255,23 @@ impl LeaderProxy {
         Self {
             raft,
             client_addrs,
-            cached_client: Mutex::new(None),
+            cached_channel: Arc::new(Mutex::new(None)),
         }
     }
 
-    async fn get_leader_client(
-        &self,
-    ) -> Result<SlurmControllerClient<tonic::transport::Channel>, Status> {
+    /// An open channel to the current leader. Forwarding drives the RPC over this
+    /// with a codec (see [`PassthroughCodec`]); a typed client is not needed.
+    async fn get_leader_channel(&self) -> Result<tonic::transport::Channel, Status> {
         let leader_id = self
             .raft
             .current_leader()
             .ok_or_else(|| Status::unavailable("no leader elected yet"))?;
 
-        let mut cached = self.cached_client.lock().await;
+        let mut cached = self.cached_channel.lock().await;
 
-        if let Some((id, ref client)) = *cached {
+        if let Some((id, ref channel)) = *cached {
             if id == leader_id {
-                return Ok(client.clone());
+                return Ok(channel.clone());
             }
         }
 
@@ -185,22 +286,14 @@ impl LeaderProxy {
             format!("http://{}", addr)
         };
 
-        let client = SlurmControllerClient::connect(url)
+        let channel = tonic::transport::Endpoint::from_shared(url)
+            .map_err(|e| Status::unavailable(format!("invalid leader endpoint: {e}")))?
+            .connect()
             .await
-            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?
-            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+            .map_err(|e| Status::unavailable(format!("cannot reach leader: {e}")))?;
 
-        *cached = Some((leader_id, client.clone()));
-        Ok(client)
-    }
-
-    /// `None` instead of an error when no leader is reachable, so read RPCs can
-    /// fall back to local state rather than failing.
-    async fn try_get_leader_client(
-        &self,
-    ) -> Option<SlurmControllerClient<tonic::transport::Channel>> {
-        self.get_leader_client().await.ok()
+        *cached = Some((leader_id, channel.clone()));
+        Ok(channel)
     }
 }
 
@@ -282,16 +375,98 @@ pub(crate) fn resolve_startup_jwt_key(
 impl ControllerService {
     // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
     #[allow(clippy::result_large_err)]
-    fn check_leader<T>(&self, request: &Request<T>) -> Result<(), Status> {
+    /// Decide whether to run this request here or forward it to the leader.
+    ///
+    /// The forwarded body digest is verified once, in `auth_middleware`, against the
+    /// received wire bytes, so a request that reaches here has already passed it.
+    fn route<T: prost::Message>(&self, request: &Request<T>) -> Route {
         if self.raft.is_leader() {
-            return Ok(());
+            // The single point that decides execute-vs-forward, so the audit
+            // layer keys off this rather than sampling leadership again.
+            crate::audit::mark_executed_locally(request);
+            return Route::Local;
         }
+        Route::Forward
+    }
 
-        if request.metadata().get(FORWARDED_HEADER).is_some() {
+    /// A request already carrying a forwarded envelope that reaches a non-leader
+    /// means a stale leader view. Return not-leader (with the current leader hint)
+    /// rather than bouncing it on and minting a second envelope over the same body.
+    fn is_already_forwarded<T>(request: &Request<T>) -> bool {
+        request
+            .extensions()
+            .get::<spur_core::native_peer::ForwardedBinding>()
+            .is_some()
+            || request.metadata().get(FORWARDED_HEADER).is_some()
+    }
+
+    /// Forward a write RPC to the leader, driving it over the leader channel with a
+    /// [`PassthroughCodec`] so the bytes signed are the bytes sent.
+    async fn forward_to_leader<Req, Resp>(
+        &self,
+        request: Request<Req>,
+    ) -> Result<Response<Resp>, Status>
+    where
+        Req: prost::Message,
+        Resp: prost::Message + Default + Send + 'static,
+    {
+        if Self::is_already_forwarded(&request) {
             return Err(self.not_leader_status());
         }
+        let channel = match self.leader_proxy.get_leader_channel().await {
+            Ok(channel) => channel,
+            Err(e) => {
+                warn!("failed to forward to leader: {e}");
+                return Err(self.not_leader_status());
+            }
+        };
+        let path = rpc_path(&request).ok_or_else(|| {
+            Status::internal("cannot forward a request with no recorded RPC path")
+        })?;
+        let identity = request
+            .extensions()
+            .get::<spur_core::auth::Identity>()
+            .cloned();
+        self.send_to_leader(
+            channel,
+            request.metadata(),
+            request.get_ref(),
+            identity,
+            &path,
+        )
+        .await
+    }
 
-        Err(self.not_leader_status())
+    /// Encode the body once, sign those exact bytes, and send them to the leader
+    /// through [`PassthroughCodec`].
+    async fn send_to_leader<Resp>(
+        &self,
+        channel: tonic::transport::Channel,
+        orig_meta: &tonic::metadata::MetadataMap,
+        message: &impl prost::Message,
+        identity: Option<spur_core::auth::Identity>,
+        path: &str,
+    ) -> Result<Response<Resp>, Status>
+    where
+        Resp: prost::Message + Default + Send + 'static,
+    {
+        let mut body = Vec::new();
+        message
+            .encode(&mut body)
+            .map_err(|e| Status::internal(format!("encode forwarded request: {e}")))?;
+        let body = bytes::Bytes::from(body);
+        let digest = spur_core::native_peer::request_digest(&body);
+        let meta = Self::forwarded_metadata_for(orig_meta, identity.as_ref(), digest, path)?;
+        let fwd = Request::from_parts(meta, http::Extensions::default(), body);
+        let mut grpc = tonic::client::Grpc::new(channel)
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+        grpc.ready()
+            .await
+            .map_err(|e| Status::unavailable(format!("leader connection not ready: {e}")))?;
+        let path = http::uri::PathAndQuery::try_from(path)
+            .map_err(|e| Status::internal(format!("invalid RPC path: {e}")))?;
+        grpc.unary(fwd, path, PassthroughCodec::<Resp>::new()).await
     }
 
     // Claims the right to fence an incomplete cohort past its grace period.
@@ -358,10 +533,9 @@ impl ControllerService {
             ));
         }
 
-        // A numbered step may run on a subset of the job's nodes, so a job-wide
-        // cohort counts the non-participants as missing and requeues the whole job.
-        // Only the steps that span the allocation can be checked this way.
-        if spur_core::step::is_user_step(step_id) {
+        // Only the step that owns the job's lifetime spans the whole
+        // allocation; anything else may run on a node subset.
+        if !spur_core::step::owns_job_lifetime(step_id) {
             return Ok(StepdRecoveryProbe::Retained);
         }
 
@@ -493,7 +667,7 @@ impl ControllerService {
     ) -> Result<StepdReporter, Status> {
         // Without a signing key there is nothing to verify the node against, so
         // the report is taken on trust rather than dropping a live supervisor.
-        if !self.node_identity_key_configured {
+        if !self.node_identity_key_configured && crate::native_keys::node_signer().is_none() {
             warn!(
                 hostname,
                 "accepting unverified stepd recovery ([auth] jwt_key unset); \
@@ -520,11 +694,7 @@ impl ControllerService {
             );
             return Ok(StepdReporter::Unproven);
         }
-        let identity = spur_core::admission::verify_node_token(node_token, self.jwt_key.as_bytes())
-            .map_err(|error| Status::unauthenticated(error.to_string()))?;
-        if identity.hostname != hostname {
-            return Err(Status::permission_denied("node token hostname mismatch"));
-        }
+        self.verify_issued_node_token(hostname, node_token)?;
         if self.cluster.get_node(hostname).is_none() {
             return Err(Status::not_found(format!(
                 "node {hostname} is not registered"
@@ -602,32 +772,41 @@ impl ControllerService {
         )
     }
 
+    /// Whether a read should hop to the leader. The forwarded body digest, if any,
+    /// was already verified in `auth_middleware` against the received wire bytes.
+    fn prepare_read<T: prost::Message>(&self, request: &Request<T>) -> bool {
+        self.read_should_forward(request)
+    }
+
     /// Best-effort forward of a read to the leader: `Some(payload)` forwards
     /// (clone lazily via `forward.then(|| ...)`), `None` serves local state. Any
     /// forward error is swallowed to local — safe only while read handlers return
     /// Ok/NotFound; a handler with a real error (e.g. InvalidArgument) masks it.
-    async fn forward_read_optional<T, R, F, Fut>(
+    ///
+    /// `path` is the RPC method path, signed into the envelope so the leader's action
+    /// check accepts it. It must be captured before `into_inner`, since it lives in the
+    /// request extensions; `None` (no recorded path) serves locally.
+    async fn forward_read<Req, Resp>(
         &self,
         meta: tonic::metadata::MetadataMap,
-        payload: Option<T>,
-        rpc: &str,
-        call: F,
-    ) -> Option<Response<R>>
+        payload: Option<Req>,
+        identity: Option<spur_core::auth::Identity>,
+        path: Option<String>,
+    ) -> Option<Response<Resp>>
     where
-        F: FnOnce(SlurmControllerClient<tonic::transport::Channel>, Request<T>) -> Fut,
-        Fut: std::future::Future<Output = Result<Response<R>, Status>>,
+        Req: prost::Message,
+        Resp: prost::Message + Default + Send + 'static,
     {
         let payload = payload?;
-        let client = self.leader_proxy.try_get_leader_client().await?;
-        let mut fwd = Request::new(payload);
-        // Carry the caller's credential, so a forwarded read is authorized as the original caller
-        // rather than arriving anonymous — otherwise `auth.mode = required` would reject every hop
-        // and silently degrade these reads to local (stale) answers.
-        *fwd.metadata_mut() = Self::forwarded_metadata_preserving(&meta);
-        match call(client, fwd).await {
+        let path = path?;
+        let channel = self.leader_proxy.get_leader_channel().await.ok()?;
+        match self
+            .send_to_leader::<Resp>(channel, &meta, &payload, identity, &path)
+            .await
+        {
             Ok(resp) => Some(resp),
             Err(e) => {
-                warn!("forwarding {rpc} to leader failed, serving locally: {e}");
+                warn!("forwarding {path} to leader failed, serving locally: {e}");
                 None
             }
         }
@@ -682,102 +861,110 @@ impl ControllerService {
     /// Bind a submitted spec to the authenticated caller.
     ///
     /// Overwrites `user`/`uid`/`gid` from the verified identity rather than trusting what the client
-    /// sent, and derives uid/gid from the username through NSS (the token carries no gid, and a
-    /// client-chosen uid is what allowed a job to run as an arbitrary user). Unauthenticated callers
-    /// are left as-is so `permissive` keeps working; `required` never reaches here without an
-    /// identity because the auth layer rejects first.
+    /// sent. JWT identities re-resolve uid/gid through NSS on this host (the token's uid is
+    /// untrusted and it carries no gid). Native identities already carry mint-host uid/gid and
+    /// must not be looked up again. Unauthenticated callers are left as-is so `permissive` keeps
+    /// working; `required` never reaches here without an identity because the auth layer rejects first.
     fn bind_spec_to_identity(
         spec: &mut spur_core::job::JobSpec,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Result<(), Status> {
-        let Some(id) = identity else { return Ok(()) };
-        let (uid, gid) = spur_core::auth::resolve_unix_credentials(&id.user).map_err(|e| {
-            // Fail closed: never fall back to the wire's uid (or to 0) for a user we cannot resolve.
-            Status::failed_precondition(format!(
-                "cannot resolve UNIX credentials for authenticated user '{}': {e}",
-                id.user
-            ))
-        })?;
-        if spec.user != id.user && !spec.user.is_empty() {
-            warn!(
-                claimed = %spec.user,
-                authenticated = %id.user,
-                "job spec claimed a different user than the credential; using the authenticated one"
-            );
+        if let Some(id) = identity {
+            if spec.user != id.user && !spec.user.is_empty() {
+                warn!(
+                    claimed = %spec.user,
+                    authenticated = %id.user,
+                    "job spec claimed a different user than the credential; using the authenticated one"
+                );
+            }
         }
-        spec.user = id.user.clone();
-        spec.uid = uid;
-        spec.gid = gid;
-        Ok(())
-    }
-
-    /// Whether the verified caller is an administrator for policy decisions that are neither
-    /// job-ownership nor k0s-cluster gates: priority ceilings, job-info visibility.
-    ///
-    /// Accepts either the token's `admin` claim or the accounting `Admin` level, so the check works
-    /// before the accounting DB is populated and stays consistent with the rest of the control plane
-    /// (`is_k0s_admin`). An unauthenticated caller (permissive/disabled) is not an admin.
-    fn caller_is_admin(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
-        identity.is_some_and(|id| {
-            id.is_admin || is_k0s_admin(self.cluster.association_cache(), &id.user)
+        spur_core::auth::bind_job_spec(spec, identity).map_err(|e| {
+            Status::failed_precondition(format!(
+                "cannot resolve UNIX credentials for authenticated user: {e}"
+            ))
         })
     }
 
-    /// Fire a best-effort audit record and a structured log line for a reservation
-    /// admin action, so operators keep attribution even when the accounting DB is
-    /// down. Never alters the RPC result.
-    fn audit_reservation(
-        &self,
-        action: TxnAction,
-        entity_name: &str,
-        actor: &str,
+    /// Overwrite wire identity fields from a verified native credential (uid/gid).
+    fn authoritative_unix(
+        uid: &mut u32,
+        gid: Option<&mut u32>,
         identity: Option<&spur_core::auth::Identity>,
-        details_base: serde_json::Value,
-        result: &Result<(), Status>,
     ) {
-        let record =
-            Self::build_reservation_txn(action, entity_name, actor, identity, details_base, result);
-        info!(
-            actor = %record.actor,
-            entity = %record.entity_name,
-            action = record.action.as_str(),
-            outcome = record.outcome.as_str(),
-            "reservation admin action"
-        );
-        self.cluster.record_txn(record);
-    }
-
-    /// Build the audit record from the resolved outcome and caller identity.
-    /// `verified` is true only for a verified JWT identity, and the actor uid is
-    /// taken from that identity — never the forgeable wire value.
-    fn build_reservation_txn(
-        action: TxnAction,
-        entity_name: &str,
-        actor: &str,
-        identity: Option<&spur_core::auth::Identity>,
-        details_base: serde_json::Value,
-        result: &Result<(), Status>,
-    ) -> TxnRecord {
-        TxnRecord {
-            ts: Utc::now(),
-            actor: actor.to_string(),
-            actor_uid: identity.map(|id| i64::from(id.uid)),
-            verified: identity.is_some(),
-            source: TxnSource::Api,
-            action,
-            entity_type: TxnEntity::Reservation,
-            entity_name: entity_name.to_string(),
-            outcome: txn::outcome_from_status(result),
-            details: txn::finalize_details(
-                details_base,
-                result.as_ref().err().map(|s| s.message()),
-            ),
+        let Some(id) = identity.filter(|i| i.trusted_unix) else {
+            return;
+        };
+        *uid = id.uid;
+        if let Some(g) = gid {
+            *g = id.gid;
         }
     }
 
-    /// Parse, validate, and submit a create-reservation request. Split out so the
-    /// handler audits the outcome uniformly, including `invalid_argument` parse
-    /// failures that occur before the cluster call.
+    /// Whether the verified caller is an administrator: JWT `admin`, `[auth]
+    /// cluster_admins` / NSS groups, uid-0 when enabled, or accounting Admin
+    /// once the cache is loaded. Unauthenticated callers are not admin.
+    fn caller_is_admin(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
+        self.caller_role(identity)
+            .is_some_and(|r| r.administers_cluster())
+    }
+
+    fn k0s_caller_is_admin(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+        caller: &str,
+    ) -> bool {
+        k0s_admin_allowed(
+            self.caller_is_admin(identity),
+            identity.is_some(),
+            self.cluster.association_cache(),
+            caller,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn require_k0s_admin(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+        caller: &str,
+        op: &str,
+    ) -> Result<(), Status> {
+        if self.k0s_caller_is_admin(identity, caller) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(format!(
+                "{op} requires cluster admin"
+            )))
+        }
+    }
+
+    fn caller_is_operator(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
+        identity_operates_jobs(&self.cluster, identity)
+    }
+
+    /// Who may cancel a job they do not own.
+    ///
+    /// Verified Operators/Administrators always may. The k8s operator talks to
+    /// spurctld with no bearer and `CancelJobRequest.user = ""`; that pair is the
+    /// in-cluster daemon, not an anonymous REST caller (REST cancel requires a
+    /// Bearer before it reaches `ClusterManager`). A named unauthenticated user
+    /// is still an ordinary owner check — `"root"` is not special.
+    fn caller_may_cancel_unowned(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+        user: &str,
+    ) -> bool {
+        self.caller_is_operator(identity) || (identity.is_none() && user.is_empty())
+    }
+
+    fn caller_role(
+        &self,
+        identity: Option<&spur_core::auth::Identity>,
+    ) -> Option<spur_core::rbac::Role> {
+        identity_role(&self.cluster, identity)
+    }
+
+    /// Split out so the audit layer records the outcome uniformly, including
+    /// `invalid_argument` parse failures that occur before the cluster call.
     fn build_and_create_reservation(&self, req: CreateReservationRequest) -> Result<(), Status> {
         let start_time = if req.start_time.is_empty() || req.start_time.eq_ignore_ascii_case("now")
         {
@@ -813,6 +1000,8 @@ impl ControllerService {
         if self.caller_is_privileged(Self::verified_identity(request)) {
             Ok(())
         } else {
+            spur_core::native_metrics::inc_role_deny();
+            tracing::warn!(op, "rbac denied: cluster administrator required");
             Err(Status::permission_denied(format!(
                 "{op} requires cluster admin"
             )))
@@ -838,7 +1027,7 @@ impl ControllerService {
     ) -> Result<(), Status> {
         // Skipping the lookup for a verified admin keeps a credential working on a controller that
         // shares no user directory with the login nodes and cannot resolve the name at all.
-        if self.caller_is_admin(identity) {
+        if self.caller_is_admin(identity) || self.caller_is_operator(identity) {
             return Ok(());
         }
         // NSS can reach sssd/LDAP over the network, so it must not run on a runtime worker.
@@ -877,22 +1066,15 @@ impl ControllerService {
         }
     }
 
-    /// Apply `[controller] job_info_visibility` for `get_job`. Owner, admin, and unauthenticated
-    /// callers (see [`viewer_is_privileged`]) get the full record; an identified non-owner gets
-    /// `Full` (legacy), `None` → `NOT_FOUND` (`OwnerOnly`), or the targeting-sensitive fields blanked
-    /// (`Redacted`, the default).
-    /// Disclosure level for one job. Split out so the single-job and list handlers share one policy
-    /// decision; the list path annotates in a single batch and so cannot reuse `scoped_job_info`.
-    fn disclosure_for(
+    /// Identified Users cannot fetch another tenant's job once `jobs` is private
+    /// (same scope as `get_jobs`). Operators, Administrators, unauthenticated
+    /// callers, and everyone when `jobs` is not private see every job in full.
+    fn caller_may_see_job(
         &self,
         owner: &str,
         identity: Option<&spur_core::auth::Identity>,
-    ) -> JobInfoDisclosure {
-        let privileged = viewer_is_privileged(identity, owner, self.caller_is_admin(identity));
-        job_info_disclosure(
-            privileged,
-            self.cluster.config().controller.job_info_visibility,
-        )
+    ) -> bool {
+        job_read_scope(&self.cluster, identity).permits(owner)
     }
 
     fn scoped_job_info(
@@ -900,22 +1082,12 @@ impl ControllerService {
         job: &spur_core::job::Job,
         identity: Option<&spur_core::auth::Identity>,
     ) -> Option<JobInfo> {
-        match self.disclosure_for(&job.spec.user, identity) {
-            JobInfoDisclosure::Hidden => None,
-            disclosure => {
-                let mut info = job_to_proto(job);
-                // Annotate before redacting, so the redacted branch strips the
-                // planned nodelist rather than having it added back after.
-                annotate_jobs_with_planned_reservations(
-                    std::slice::from_mut(&mut info),
-                    &self.cluster,
-                );
-                if disclosure == JobInfoDisclosure::Redacted {
-                    redact_sensitive_job_info(&mut info);
-                }
-                Some(info)
-            }
+        if !self.caller_may_see_job(&job.spec.user, identity) {
+            return None;
         }
+        let mut info = job_to_proto(job);
+        annotate_jobs_with_planned_reservations(std::slice::from_mut(&mut info), &self.cluster);
+        Some(info)
     }
 
     /// Forwarding metadata that carries the caller's credential through to the leader.
@@ -934,12 +1106,43 @@ impl ControllerService {
         meta
     }
 
-    /// Re-wrap a request for forwarding to the leader, preserving the caller's credential.
-    fn forward_request<T>(request: Request<T>) -> Request<T> {
-        let meta = Self::forwarded_metadata_preserving(request.metadata());
-        let mut fwd = Request::new(request.into_inner());
-        *fwd.metadata_mut() = meta;
-        fwd
+    #[allow(clippy::result_large_err)]
+    fn forwarded_metadata_for(
+        orig: &tonic::metadata::MetadataMap,
+        identity: Option<&spur_core::auth::Identity>,
+        digest: [u8; 32],
+        action: &str,
+    ) -> Result<tonic::metadata::MetadataMap, Status> {
+        let peer = crate::native_keys::peer();
+        match forward_auth_decision(peer.is_some(), identity) {
+            // Native plugin with a verified identity: sign an envelope. A failure
+            // here must NOT degrade to an unsigned forward, which would silently
+            // drop the caller's identity; surface it so the request fails closed.
+            ForwardAuth::Envelope(id) => {
+                let peer = peer.expect("peer present when the decision is Envelope");
+                let now = spur_core::native_mint::unix_now().unwrap_or(0);
+                let (dest, term) = crate::native_keys::leader_and_term();
+                let token = peer
+                    .sign(id, dest, term, action, digest, now)
+                    .map_err(|e| {
+                        warn!("failed to sign forwarded identity envelope: {e}");
+                        Status::unavailable("failed to sign forwarded identity envelope")
+                    })?;
+                let value = token
+                    .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+                    .map_err(|e| {
+                        warn!("forwarded identity envelope is not a valid header value: {e}");
+                        Status::internal("failed to encode forwarded identity envelope")
+                    })?;
+                let mut meta = Self::forwarded_metadata();
+                meta.insert(spur_core::native_peer::IDENTITY_HEADER, value);
+                Ok(meta)
+            }
+            // Anonymous caller (permissive/disabled), or the JWT plugin (no peer
+            // keys): forward without an envelope, preserving any Authorization
+            // header so the leader authorizes the original caller.
+            ForwardAuth::Preserve => Ok(Self::forwarded_metadata_preserving(orig)),
+        }
     }
 
     fn spawn_cancel_for_evicted(&self, evicted: &[crate::raft::JobFinalized]) {
@@ -984,18 +1187,29 @@ impl ControllerService {
             return Ok(String::new());
         }
 
-        spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
-            .map_err(|e| Status::internal(e.to_string()))
+        self.mint_node_token(hostname)
     }
 
     /// Whether node identity is attested at all. Both halves are required: token
     /// admission issues the credential, the signing key is what can verify it.
     fn enforces_node_identity(&self) -> bool {
-        self.node_identity_key_configured
+        (self.node_identity_key_configured || crate::native_keys::node_signer().is_some())
             && matches!(
                 self.cluster.config().admission.mode,
                 spur_core::config::AdmissionMode::Token
             )
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn mint_node_token(&self, hostname: &str) -> Result<String, Status> {
+        if let Some(signer) = crate::native_keys::node_signer() {
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            return signer
+                .mint(hostname, now)
+                .map_err(|e| Status::internal(e.to_string()));
+        }
+        spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
+            .map_err(|e| Status::internal(e.to_string()))
     }
 
     /// Gates on controller configuration, never on whether the request carried a
@@ -1007,6 +1221,18 @@ impl ControllerService {
         }
         if node_token.is_empty() {
             return Err(Status::unauthenticated("node token required"));
+        }
+        self.verify_issued_node_token(hostname, node_token)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn verify_issued_node_token(&self, hostname: &str, node_token: &str) -> Result<(), Status> {
+        if let Some(signer) = crate::native_keys::node_signer() {
+            let now = spur_core::native_mint::unix_now().unwrap_or(0);
+            signer
+                .verify(node_token, hostname, now)
+                .map_err(|e| Status::unauthenticated(e.to_string()))?;
+            return Ok(());
         }
         let identity = spur_core::admission::verify_node_token(node_token, self.jwt_key.as_bytes())
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
@@ -1062,20 +1288,24 @@ fn resolve_user_namespace_sa(
     ))
 }
 
-/// Whether `caller` may perform k0s cluster-admin ops: `root` always, otherwise an accounting
-/// `Admin`. An empty caller is NOT privileged. Fails closed when accounting is off (the cache
-/// reports no admins), leaving only `root`.
+/// Whether `caller` may perform k0s cluster-admin ops when no verified identity
+/// is present: `root` always, otherwise an accounting `Admin`. An empty caller
+/// is NOT privileged. Fails closed when accounting is off (the cache reports no
+/// admins), leaving only `root`.
+///
+/// Authenticated callers must use [`k0s_admin_allowed`] / `resolve_role` instead
+/// of this string check, so `[auth] cluster_admins` cannot be ignored.
 fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str) -> bool {
-    // NOTE: `caller` is supplied by the client and is not authenticated, so this check is an
-    // operator-error guard, not a security boundary. Anything that hands out a credential must
-    // carry its own opt-in (see `cluster.allow_admin_kubeconfig`) until user auth is enforced.
-    //
-    // The former `caller.is_empty()` bypass is gone: nothing in-tree sends an empty caller (the CLI
-    // always fills it, falling back to "unknown"), so it granted admin to a two-character forgery
-    // and bought nothing. `root` is retained deliberately — with accounting disabled the cache
-    // reports no admins at all, and removing it would strand `spur k8s up` on every cluster that
-    // does not run accounting.
     caller == "root" || cache.is_admin(caller)
+}
+
+fn k0s_admin_allowed(
+    resolved_admin: bool,
+    has_identity: bool,
+    cache: &crate::association_cache::AssociationCache,
+    caller: &str,
+) -> bool {
+    resolved_admin || (!has_identity && is_k0s_admin(cache, caller))
 }
 
 /// Ruling for a non-admin caller, split from the lookup so the policy is testable without the
@@ -1098,11 +1328,24 @@ fn reservation_manager_ruling(
     }
 }
 
+/// Twice the agent's own kill budget (SIGTERM grace plus reap). Past it, a node
+/// still claiming the job missed the cancel rather than being mid-teardown.
+const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(16);
+
 /// Whether `node` may release what it holds for `job_id`: the run is over, the
 /// job is active elsewhere, or the id is untracked but was issued by us.
 fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
     match cluster.get_job(job_id) {
         Some(job) if job.state.is_terminal() => true,
+        // A cancel this old that the node is still claiming never reached it
+        // (an agent that was down when it was sent); the run is over regardless.
+        Some(job)
+            if job
+                .cancel_signaled_at
+                .is_some_and(|at| Utc::now() - at > CANCEL_RECLAIM_GRACE) =>
+        {
+            true
+        }
         // An active job's nodelist is authoritative only once populated: state
         // and allocation commit as two separate WAL entries, so a job can be
         // observed as Running with `allocated_nodes` still empty. Spare it, same
@@ -1114,6 +1357,17 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
         }
         None => job_id < cluster.peek_next_job_id(),
     }
+}
+
+/// Jobs a heartbeat reported with a non-empty translated GPU set, for the
+/// used-view reconcile. A job with no GPUs (or an old agent that never sets the
+/// field) is omitted, leaving that job's slice untouched.
+fn reported_held_gpu_ids(reported: &[RunningJobStatus]) -> Vec<(u32, Vec<u64>)> {
+    reported
+        .iter()
+        .filter(|r| !r.gpu_stable_ids.is_empty())
+        .map(|r| (r.job_id, r.gpu_stable_ids.clone()))
+        .collect()
 }
 
 /// Reported ids `node` may release; ids still allocated here, not yet started,
@@ -1135,23 +1389,14 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<SubmitJobRequest>,
     ) -> Result<Response<SubmitJobResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.submit_job(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward submit_job to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         // Bind to the authenticated caller BEFORE the spec reaches the cluster, so a stale or
         // hostile client cannot choose the user/uid the job runs as.
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let spec = request
             .into_inner()
             .spec
@@ -1168,10 +1413,23 @@ impl SlurmController for ControllerService {
             self.cluster.config().scheduler.max_user_priority,
         );
 
+        let submitted = txn::requested(&[
+            ("name", Some(core_spec.name.clone().into())),
+            ("partition", core_spec.partition.clone().map(Into::into)),
+            ("account", core_spec.account.clone().map(Into::into)),
+            ("qos", core_spec.qos.clone().map(Into::into)),
+            ("num_nodes", Some(core_spec.num_nodes.into())),
+            ("num_tasks", Some(core_spec.num_tasks.into())),
+        ]);
         let outcome = self
             .cluster
             .submit_job(core_spec)
             .map_err(submit_rpc_status)?;
+        // The id is the target, and only the submission assigns it.
+        annotate(
+            &audit,
+            Annotation::new(&outcome.job_id.to_string(), submitted),
+        );
 
         let mut warnings = outcome.warnings;
         warnings.extend(priority_warning);
@@ -1185,22 +1443,26 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobsRequest>,
     ) -> Result<Response<GetJobsResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
         let __identity = Self::verified_identity(&request).cloned();
-        let mut req = request.into_inner();
-        Self::authoritative_user(&mut req.user, __identity.as_ref());
+        let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then(|| req.clone()),
-                "get_jobs",
-                |mut c, r| async move { c.get_jobs(r).await },
-            )
+            .forward_read(meta, forward.then(|| req.clone()), __identity.clone(), path)
             .await
         {
             return Ok(resp);
         }
+
+        // Scope the list to the caller when `jobs` is private. A query naming a
+        // user the caller may not see returns an empty list, matching Slurm's
+        // `squeue -u other`.
+        let scope = job_read_scope(&self.cluster, __identity.as_ref());
+        let requested_user = (!req.user.is_empty()).then_some(req.user.as_str());
+        let Some(scoped_user) = scope.job_user_filter(requested_user) else {
+            return Ok(Response::new(GetJobsResponse { jobs: Vec::new() }));
+        };
 
         let states: Vec<spur_core::job::JobState> = req
             .states
@@ -1208,11 +1470,7 @@ impl SlurmController for ControllerService {
             .filter_map(|s| spur_core::job::JobState::from_proto_i32(*s))
             .collect();
 
-        let user = if req.user.is_empty() {
-            None
-        } else {
-            Some(req.user.as_str())
-        };
+        let user = scoped_user.as_deref();
         let partition = if req.partition.is_empty() {
             None
         } else {
@@ -1228,6 +1486,16 @@ impl SlurmController for ControllerService {
         } else {
             Some(req.name.as_str())
         };
+        let qos = if req.qos.is_empty() {
+            None
+        } else {
+            Some(req.qos.as_str())
+        };
+        let reservation = if req.reservation.is_empty() {
+            None
+        } else {
+            Some(req.reservation.as_str())
+        };
 
         let jobs = self.cluster.get_jobs(&JobFilter {
             states: &states,
@@ -1235,6 +1503,8 @@ impl SlurmController for ControllerService {
             partition,
             account,
             name,
+            qos,
+            reservation,
             job_ids: &req.job_ids,
             nodes: &req.nodes,
         });
@@ -1242,30 +1512,13 @@ impl SlurmController for ControllerService {
         let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
         annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
 
-        // An identified caller is already scoped to their own jobs by the user filter above, so
-        // this only bites if that scoping is ever loosened — but it keeps the two read paths from
-        // disagreeing about what a non-owner may see.
-        let proto_jobs: Vec<JobInfo> = jobs
-            .iter()
-            .zip(proto_jobs)
-            .filter_map(|(job, mut info)| {
-                match self.disclosure_for(&job.spec.user, __identity.as_ref()) {
-                    JobInfoDisclosure::Hidden => None,
-                    JobInfoDisclosure::Redacted => {
-                        redact_sensitive_job_info(&mut info);
-                        Some(info)
-                    }
-                    JobInfoDisclosure::Full => Some(info),
-                }
-            })
-            .collect();
-
         Ok(Response::new(GetJobsResponse { jobs: proto_jobs }))
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
         // Capture identity before the forward so the serving node (leader or read-allowed follower)
         // can scope the record to the caller; the credential is preserved on forward, so a forwarded
         // read is scoped on the leader instead.
@@ -1273,12 +1526,7 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let job_id = req.job_id;
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then_some(req),
-                "get_job",
-                |mut c, r| async move { c.get_job(r).await },
-            )
+            .forward_read(meta, forward.then_some(req), identity.clone(), path)
             .await
         {
             return Ok(resp);
@@ -1289,46 +1537,51 @@ impl SlurmController for ControllerService {
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
 
-        // A non-owner, non-admin caller does not get another tenant's work_dir, command, stdio
-        // paths, or (the targeting-sensitive one) allocated nodelist. Policy is configurable; the
-        // default redacts those fields while leaving the Slurm-standard queue view intact.
         self.scoped_job_info(&job, identity.as_ref())
             .map(Response::new)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))
     }
 
     async fn cancel_job(&self, request: Request<CancelJobRequest>) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.cancel_job(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward cancel_job to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
-
-        // Snapshot the job before cancelling so we have allocated_nodes
-        let job = self.cluster.get_job(job_id);
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                txn::requested(&[("signal", (req.signal != 0).then(|| req.signal.into()))]),
+            )
+            .asserted_actor(&req.user),
+        );
 
         self.cluster
-            .cancel_job(job_id, &req.user)
-            .map_err(cluster_err_to_status)?;
+            .cancel_job_for(
+                job_id,
+                &req.user,
+                self.caller_may_cancel_unowned(__identity.as_ref(), &req.user),
+            )
+            .map_err(cancel_err_to_status)?;
 
-        // Send cancel signal to agents so the process is actually killed
-        if let Some(job) = job {
+        // Read the allocation after the cancel, not before: a job that started
+        // in between would otherwise be signalled on the nodes it used to hold.
+        if let Some(job) = self.cluster.get_job(job_id) {
             let cluster = self.cluster.clone();
             tokio::spawn(async move {
-                crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
+                crate::scheduler_loop::send_cancel_to_nodes(
+                    &cluster,
+                    job.job_id,
+                    job.run_attempt,
+                    &job.allocated_nodes,
+                    0,
+                )
+                .await;
             });
         }
 
@@ -1339,18 +1592,8 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<CompleteJobRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.complete_job(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward complete_job to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
@@ -1358,7 +1601,12 @@ impl SlurmController for ControllerService {
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job = self
             .cluster
-            .finish_srun_job(req.job_id, req.exit_code, &req.user)
+            .finish_srun_job_for(
+                req.job_id,
+                req.exit_code,
+                &req.user,
+                self.caller_is_operator(__identity.as_ref()),
+            )
             .map_err(|e| match e {
                 crate::cluster::SrunCompleteError::NotFound(id) => {
                     Status::not_found(format!("job {id} not found"))
@@ -1397,18 +1645,8 @@ impl SlurmController for ControllerService {
         request: Request<JobKeepaliveRequest>,
     ) -> Result<Response<JobKeepaliveResponse>, Status> {
         // Recorded only on the leader, where the reaper reads it.
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.job_keepalive(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward job_keepalive to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
@@ -1428,7 +1666,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             None,
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -1449,23 +1687,18 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<SuspendJobRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.suspend_job(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward suspend_job to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
+        );
         // Unknown job ids are NOT_FOUND (consistent with get_job), not a
         // precondition failure. Snapshot up-front for agent dispatch.
         let job = self
@@ -1473,7 +1706,11 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
-            .suspend_job(job_id, &req.user)
+            .suspend_job_for(
+                job_id,
+                &req.user,
+                self.caller_is_operator(__identity.as_ref()),
+            )
             .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
@@ -1483,23 +1720,18 @@ impl SlurmController for ControllerService {
     }
 
     async fn resume_job(&self, request: Request<ResumeJobRequest>) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.resume_job(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward resume_job to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(&job_id.to_string(), serde_json::json!({})).asserted_actor(&req.user),
+        );
         // Unknown job ids are NOT_FOUND (consistent with get_job), not a
         // precondition failure. Allocation is retained across resume, so this
         // up-front snapshot's allocated_nodes is still valid for agent dispatch.
@@ -1508,7 +1740,11 @@ impl SlurmController for ControllerService {
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
         self.cluster
-            .resume_job(job_id, &req.user)
+            .resume_job_for(
+                job_id,
+                &req.user,
+                self.caller_is_operator(__identity.as_ref()),
+            )
             .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
@@ -1518,24 +1754,28 @@ impl SlurmController for ControllerService {
     }
 
     async fn update_job(&self, request: Request<UpdateJobRequest>) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.update_job(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward update_job to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
         let caller_is_privileged = self.caller_is_privileged(__identity.as_ref());
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.job_id.to_string(),
+                txn::requested(&[
+                    ("partition", req.partition.clone().map(Into::into)),
+                    ("account", req.account.clone().map(Into::into)),
+                    ("priority", req.priority.map(Into::into)),
+                    ("comment", req.comment.clone().map(Into::into)),
+                ]),
+            )
+            .asserted_actor(&req.user),
+        );
 
         // Reject a caller who does not own the target job before any mutation —
         // including the hold/release branch below. Mirrors cancel_job / exec_in_job:
@@ -1549,7 +1789,7 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| Status::not_found(format!("job {} not found", req.job_id)))?;
         spur_core::auth::check_job_owner(
             &req.user,
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             "modify",
         )
@@ -1601,25 +1841,23 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<RequeueJobRequest>,
     ) -> Result<Response<RequeueJobResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
-                    return client.requeue_job(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward requeue_job to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
-        let caller_is_admin = self.caller_is_admin(__identity.as_ref());
+        let caller_is_admin = self.caller_is_operator(__identity.as_ref());
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.job_id.to_string(),
+                txn::requested(&[("hold", req.hold.then_some(true.into()))]),
+            )
+            .asserted_actor(&req.user),
+        );
         let outcome = self
             .cluster
             .requeue_job_by_user(req.job_id, &req.user, caller_is_admin, req.hold)
@@ -1644,16 +1882,13 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodesRequest>,
     ) -> Result<Response<GetNodesResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then(|| req.clone()),
-                "get_nodes",
-                |mut c, r| async move { c.get_nodes(r).await },
-            )
+            .forward_read(meta, forward.then(|| req.clone()), identity, path)
             .await
         {
             return Ok(resp);
@@ -1687,16 +1922,13 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetNodeRequest>,
     ) -> Result<Response<NodeInfo>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then(|| req.clone()),
-                "get_node",
-                |mut c, r| async move { c.get_node(r).await },
-            )
+            .forward_read(meta, forward.then(|| req.clone()), identity, path)
             .await
         {
             return Ok(resp);
@@ -1725,27 +1957,42 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<UpdateNodeRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.update_node(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward update_node to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+
+        // Annotate before the gate and before validating, so a refused or
+        // malformed request is still attributed to the node it targeted.
+        let audit = crate::audit::slot(&request);
+        let parsed = request
+            .get_ref()
+            .state
+            .map(spur_core::node::NodeState::from_proto_i32);
+        {
+            let r = request.get_ref();
+            annotate(
+                &audit,
+                Annotation::new(
+                    &r.name,
+                    txn::node_update_details(
+                        requested_node_state(r.state, parsed.flatten()).as_deref(),
+                        r.reason.as_deref(),
+                        &r.labels,
+                        &r.remove_labels,
+                    ),
+                ),
+            );
         }
 
         self.require_admin(&request, "update node")?;
 
-        let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
+        let reason_uid = trusted_uid(Self::verified_identity(&request));
         let req = request.into_inner();
-        if let Some(state) = req.state {
-            let node_state = spur_core::node::NodeState::from_proto_i32(state)
-                .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
+        let node_state = match parsed {
+            Some(None) => return Err(Status::invalid_argument("invalid node state")),
+            other => other.flatten(),
+        };
+        if let Some(node_state) = node_state {
             self.cluster
                 .update_node_state(&req.name, node_state, req.reason, reason_uid)
                 .map_err(|e| Status::internal(e.to_string()))?;
@@ -1762,25 +2009,26 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<spur_proto::proto::DrainNodeRequest>,
     ) -> Result<Response<spur_proto::proto::DrainNodeResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.drain_node(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward drain_node to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
+
+        // Annotate before the gate so a refused attempt still names the node it
+        // targeted, which is the whole question the audit log answers.
+        let audit = crate::audit::slot(&request);
+        annotate(
+            &audit,
+            Annotation::new(
+                &request.get_ref().name,
+                txn::node_drain_details(&request.get_ref().reason),
+            ),
+        );
 
         // Draining a node takes it out of service cluster-wide, so it needs the
         // same bar as `update_node`, which reaches the identical state change.
         self.require_admin(&request, "drain node")?;
 
-        let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
+        let reason_uid = trusted_uid(Self::verified_identity(&request));
         let req = request.into_inner();
         let reason = if req.reason.is_empty() {
             None
@@ -1804,19 +2052,18 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<spur_proto::proto::DeregisterNodeRequest>,
     ) -> Result<Response<spur_proto::proto::DeregisterNodeResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.deregister_node(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward deregister_node to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
+
+        let audit = crate::audit::slot(&request);
+        annotate(
+            &audit,
+            Annotation::new(
+                &request.get_ref().name,
+                txn::node_remove_details(&request.get_ref().reason, request.get_ref().force),
+            ),
+        );
 
         // Removing a node evicts its running jobs, so it needs the same bar as
         // the other operator-driven node RPCs.
@@ -1846,31 +2093,29 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<spur_proto::proto::DeregisterAgentRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.deregister_agent(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward deregister_agent to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(&req.hostname, txn::node_deregister_details(&req.reason)),
+        );
 
         self.verify_node_identity(&req.hostname, &req.node_token)?;
 
         if self.cluster.get_node(&req.hostname).is_none() {
             return Ok(Response::new(()));
         }
+        // A stopping agent is Down, not gone. Deleting the record here would
+        // drop the node from the WireGuard membership, every other node would
+        // prune its peer, and the node could not register again over the mesh
+        // after a reboot. See `ClusterManager::mark_node_down`.
         let evicted = self
             .cluster
-            .remove_node(
+            .mark_node_down(
                 &req.hostname,
-                true,
                 Some(req.reason.clone()).filter(|r| !r.is_empty()),
             )
             .map_err(|e| Status::internal(e.to_string()))?;
@@ -1883,15 +2128,12 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetPartitionsRequest>,
     ) -> Result<Response<GetPartitionsResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then(|| request.into_inner()),
-                "get_partitions",
-                |mut c, r| async move { c.get_partitions(r).await },
-            )
+            .forward_read(meta, forward.then(|| request.into_inner()), identity, path)
             .await
         {
             return Ok(resp);
@@ -1922,19 +2164,18 @@ impl SlurmController for ControllerService {
             version: env!("CARGO_PKG_VERSION").into(),
             federation_peers,
             cluster_name: self.cluster.config().cluster_name.clone(),
+            auth_audience: self.auth_audience.clone(),
+            auth_epoch: self.auth_epoch,
         }))
     }
 
     async fn get_job_metrics(&self, request: Request<()>) -> Result<Response<JobMetrics>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then_some(()),
-                "get_job_metrics",
-                |mut c, r| async move { c.get_job_metrics(r).await },
-            )
+            .forward_read(meta, forward.then_some(()), identity, path)
             .await
         {
             return Ok(resp);
@@ -1950,15 +2191,12 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<()>,
     ) -> Result<Response<NodeMetrics>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then_some(()),
-                "get_node_metrics",
-                |mut c, r| async move { c.get_node_metrics(r).await },
-            )
+            .forward_read(meta, forward.then_some(()), identity, path)
             .await
         {
             return Ok(resp);
@@ -1971,13 +2209,8 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_rpc_stats(&self, request: Request<()>) -> Result<Response<RpcStats>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
-                return client.get_rpc_stats(fwd).await;
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         Ok(Response::new(crate::metrics_proto::rpc_stats_to_proto(
@@ -1986,13 +2219,8 @@ impl SlurmController for ControllerService {
     }
 
     async fn get_sched_stats(&self, request: Request<()>) -> Result<Response<SchedStats>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
-                return client.get_sched_stats(fwd).await;
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         Ok(Response::new(crate::metrics_proto::sched_stats_to_proto(
@@ -2005,17 +2233,14 @@ impl SlurmController for ControllerService {
         request: Request<GetAssocMgrInfoRequest>,
     ) -> Result<Response<GetAssocMgrInfoResponse>, Status> {
         // Usage is read from the leader's job table, the same one admission reads.
-        if self.check_leader(&request).is_err() {
-            let proxy = &self.leader_proxy;
-            let mut client = proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
-            return client.get_assoc_mgr_info(fwd).await;
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let identity = Self::verified_identity(&request).cloned();
-        let caller_is_admin = self.caller_is_admin(identity.as_ref());
         let req = request.into_inner();
-        let filter = assoc_mgr_scope_user(identity.as_ref(), &req.user, caller_is_admin);
+        let scope = usage_read_scope(&self.cluster, identity.as_ref());
+        let filter = assoc_mgr_user_filter(&scope, &req.user);
         let info = self.cluster.assoc_mgr_info(filter.as_deref());
 
         Ok(Response::new(GetAssocMgrInfoResponse {
@@ -2034,13 +2259,8 @@ impl SlurmController for ControllerService {
     }
 
     async fn reset_diag_stats(&self, request: Request<()>) -> Result<Response<()>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
-                return client.reset_diag_stats(fwd).await;
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         self.rpc_stats.reset();
@@ -2052,18 +2272,8 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<RegisterAgentRequest>,
     ) -> Result<Response<RegisterAgentResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.register_agent(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward register_agent to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         // Extract the remote IP from the gRPC connection as fallback
@@ -2131,18 +2341,8 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ReportJobStatusRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.report_job_status(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward report_job_status to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let req = request.into_inner();
@@ -2260,18 +2460,8 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.heartbeat(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward heartbeat to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let req = request.into_inner();
@@ -2290,6 +2480,14 @@ impl SlurmController for ControllerService {
             {
                 info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
             }
+            // Converge the used-view to the agent's translated held GPU set
+            // before the stale-job scan, so an upgraded node's live GPUs stop
+            // reading free. Only jobs that reported a set participate.
+            let reported_gpu_ids = reported_held_gpu_ids(&req.running_jobs);
+            if !reported_gpu_ids.is_empty() {
+                self.cluster
+                    .reconcile_node_gpu_allocations(&req.hostname, &reported_gpu_ids);
+            }
             self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
@@ -2307,18 +2505,8 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<StepdRecoveryRequest>,
     ) -> Result<Response<StepdRecoveryResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.report_stepd_recovery(fwd).await;
-                }
-                Err(error) => {
-                    warn!("failed to forward runtime recovery report to leader: {error}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let request = request.into_inner();
@@ -2335,9 +2523,9 @@ impl SlurmController for ControllerService {
             .await?;
 
         if request.stale_descriptor {
-            // A numbered step losing its supervisor is that step's failure, not the
-            // job's; fencing here would requeue the batch script and every sibling.
-            if spur_core::step::is_user_step(request.step_id) {
+            // Fencing here would requeue the batch script and every sibling,
+            // so only the step that owns the job's lifetime may trigger it.
+            if !spur_core::step::owns_job_lifetime(request.step_id) {
                 self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
                     .await;
                 return Ok(Response::new(StepdRecoveryResponse {
@@ -2481,21 +2669,13 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<CreateTokenRequest>,
     ) -> Result<Response<CreateTokenResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    // Preserve the caller's credential (and set the forwarded marker) so the leader
-                    // authorizes the ORIGINAL caller, not an anonymous forwarded request.
-                    let fwd = Self::forward_request(request);
-                    return client.create_token(fwd).await;
-                }
-                Err(_) => return Err(status),
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         self.require_admin(&request, "create token")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
         let ttl_secs = req.ttl_secs.filter(|&v| v > 0);
 
@@ -2503,6 +2683,14 @@ impl SlurmController for ControllerService {
             .cluster
             .create_token(ttl_secs)
             .map_err(|e| Status::internal(e.to_string()))?;
+        // The id only; `full_string` carries the secret and must never be logged.
+        annotate(
+            &audit,
+            Annotation::new(
+                &token.id,
+                txn::requested(&[("ttl_secs", ttl_secs.map(Into::into))]),
+            ),
+        );
 
         Ok(Response::new(CreateTokenResponse {
             token: full_string,
@@ -2537,22 +2725,18 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<RevokeTokenRequest>,
     ) -> Result<Response<RevokeTokenResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    // Preserve the caller's credential (and set the forwarded marker) so the leader
-                    // authorizes the ORIGINAL caller, not an anonymous forwarded request.
-                    let fwd = Self::forward_request(request);
-                    return client.revoke_token(fwd).await;
-                }
-                Err(_) => return Err(status),
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         self.require_admin(&request, "revoke token")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(&req.token_id, txn::delete_details(None)),
+        );
         self.cluster
             .revoke_token(&req.token_id)
             .map_err(|e| Status::not_found(e.to_string()))?;
@@ -2564,47 +2748,27 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<GetJobStepsRequest>,
     ) -> Result<Response<GetJobStepsResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         let job_id = req.job_id;
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then_some(req),
-                "get_job_steps",
-                |mut c, r| async move { c.get_job_steps(r).await },
-            )
+            .forward_read(meta, forward.then_some(req), identity.clone(), path)
             .await
         {
             return Ok(resp);
         }
 
-        // Scope step visibility to the same policy as get_job: step names can leak intent, so they
-        // are blanked under `redacted` and the list is empty under `owner_only`. Resolve the parent
-        // job first and return NOT_FOUND if it is gone — matching get_job, and so the owner is never
-        // mis-derived as `""` (which would treat the true owner as unprivileged).
+        // Same visibility as get_job: identified Users cannot probe another tenant's steps.
         let job = self
             .cluster
             .get_job_for_display(job_id)
             .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
-        let privileged = viewer_is_privileged(
-            identity.as_ref(),
-            &job.spec.user,
-            self.caller_is_admin(identity.as_ref()),
-        );
-        let redact_names = match job_info_disclosure(
-            privileged,
-            self.cluster.config().controller.job_info_visibility,
-        ) {
-            JobInfoDisclosure::Full => false,
-            JobInfoDisclosure::Redacted => true,
-            // Owner-only: the job is invisible to this caller, so are its steps.
-            JobInfoDisclosure::Hidden => {
-                return Ok(Response::new(GetJobStepsResponse { steps: Vec::new() }));
-            }
-        };
+        if !self.caller_may_see_job(&job.spec.user, identity.as_ref()) {
+            return Err(Status::not_found(format!("job {job_id} not found")));
+        }
 
         let steps = self.cluster.get_steps(job_id);
         let step_infos: Vec<JobStepInfo> = steps
@@ -2612,11 +2776,7 @@ impl SlurmController for ControllerService {
             .map(|s| JobStepInfo {
                 job_id: s.job_id,
                 step_id: s.step_id,
-                name: if redact_names {
-                    String::new()
-                } else {
-                    s.name.clone()
-                },
+                name: s.name.clone(),
                 state: s.state.display().to_string(),
                 num_tasks: s.num_tasks,
             })
@@ -2628,23 +2788,14 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<CreateJobStepRequest>,
     ) -> Result<Response<CreateJobStepResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.create_job_step(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward create_job_step to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
@@ -2655,7 +2806,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             Some(req.uid),
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -2704,7 +2855,7 @@ impl SlurmController for ControllerService {
             num_tasks: req.num_tasks.max(1),
             cpus_per_task: req.cpus_per_task.max(1),
             resources: spur_core::resource::ResourceAllocations::default(),
-            nodes: step_nodes,
+            nodes: step_nodes.clone(),
             distribution: spur_core::step::TaskDistribution::Block,
             start_time: Some(chrono::Utc::now()),
             end_time: None,
@@ -2715,6 +2866,20 @@ impl SlurmController for ControllerService {
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
+        let execution_credential = crate::native_keys::sign_step_credential(
+            &self.cluster.config().cluster_name,
+            &job,
+            step_id,
+            &req.command,
+            &step_nodes,
+            req.container
+                .as_ref()
+                .map(|c| c.image.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| job.spec.container_image.as_deref().unwrap_or("")),
+        )
+        .map_err(|e| Status::internal(format!("failed to sign step credential: {e}")))?;
+
         // Resolve the effective container so the interactive-PTY client can forward it
         // to the agent: the agent connects directly (bypassing the controller) and cannot
         // see the parent job spec to inherit `salloc/sbatch --container-image`.
@@ -2724,6 +2889,7 @@ impl SlurmController for ControllerService {
             step_id,
             node_addr,
             container,
+            execution_credential,
         }))
     }
 
@@ -2731,23 +2897,14 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<CompleteJobStepRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.complete_job_step(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward complete_job_step to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
 
         let job = self
@@ -2758,7 +2915,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             Some(req.uid),
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -2793,23 +2950,34 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<CreatePartitionRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.create_partition(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward create_partition to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         self.require_admin(&request, "create partition")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::requested(&[
+                    (
+                        "nodes",
+                        (!req.nodes.is_empty()).then(|| req.nodes.clone().into()),
+                    ),
+                    (
+                        "selector",
+                        (!req.selector.is_empty()).then(|| serde_json::json!(req.selector)),
+                    ),
+                    (
+                        "max_time",
+                        (!req.max_time.is_empty()).then(|| req.max_time.clone().into()),
+                    ),
+                ]),
+            ),
+        );
 
         if req.nodes.is_empty() && req.selector.is_empty() {
             return Err(Status::invalid_argument(
@@ -2900,23 +3068,25 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<UpdatePartitionRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.update_partition(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward update_partition to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         self.require_admin(&request, "update partition")?;
 
+        let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::requested(&[
+                    ("state", req.state.clone().map(Into::into)),
+                    ("nodes", req.nodes.clone().map(Into::into)),
+                    ("max_time", req.max_time.clone().map(Into::into)),
+                ]),
+            ),
+        );
 
         let state = req
             .state
@@ -3011,23 +3181,15 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<DeletePartitionRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.delete_partition(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward delete_partition to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         self.require_admin(&request, "delete partition")?;
 
+        let audit = crate::audit::slot(&request);
         let name = request.into_inner().name;
+        annotate(&audit, Annotation::new(&name, txn::delete_details(None)));
         self.cluster
             .delete_partition(&name)
             .map_err(partition_rpc_status)?;
@@ -3036,18 +3198,8 @@ impl SlurmController for ControllerService {
     }
 
     async fn reconfigure(&self, request: Request<()>) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.reconfigure(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward reconfigure to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         self.require_admin(&request, "reconfigure")?;
@@ -3063,87 +3215,70 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<CreateReservationRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.create_reservation(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward create_reservation to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::create_details(
+                    &req.start_time,
+                    req.duration_minutes,
+                    &req.nodes,
+                    &req.accounts,
+                    &req.users,
+                    &req.flags,
+                ),
+            )
+            .asserted_actor(&req.user),
+        );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
 
-        let details = txn::create_details(
-            &req.start_time,
-            req.duration_minutes,
-            &req.nodes,
-            &req.accounts,
-            &req.users,
-            &req.flags,
-        );
-        let entity_name = req.name.clone();
-        let actor = req.user.clone();
-
-        let result = self.build_and_create_reservation(req);
-        self.audit_reservation(
-            TxnAction::Create,
-            &entity_name,
-            &actor,
-            identity.as_ref(),
-            details,
-            &result,
-        );
-        result.map(|()| Response::new(()))
+        self.build_and_create_reservation(req)
+            .map(|()| Response::new(()))
     }
 
     async fn update_reservation(
         &self,
         request: Request<UpdateReservationRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.update_reservation(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward update_reservation to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.name,
+                txn::update_details(
+                    req.duration_minutes,
+                    &req.add_nodes,
+                    &req.remove_nodes,
+                    &req.add_users,
+                    &req.remove_users,
+                    &req.add_accounts,
+                    &req.remove_accounts,
+                ),
+            )
+            .asserted_actor(&req.user),
+        );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
 
-        let details = txn::update_details(
-            req.duration_minutes,
-            &req.add_nodes,
-            &req.remove_nodes,
-            &req.add_users,
-            &req.remove_users,
-            &req.add_accounts,
-            &req.remove_accounts,
-        );
-        let entity_name = req.name.clone();
-        let actor = req.user.clone();
-
-        let result = self
-            .cluster
+        self.cluster
             .update_reservation(
                 &req.name,
                 req.duration_minutes,
@@ -3154,74 +3289,47 @@ impl SlurmController for ControllerService {
                 &req.add_accounts,
                 &req.remove_accounts,
             )
-            .map_err(reservation_rpc_status);
-        self.audit_reservation(
-            TxnAction::Update,
-            &entity_name,
-            &actor,
-            identity.as_ref(),
-            details,
-            &result,
-        );
-        result.map(|()| Response::new(()))
+            .map_err(reservation_rpc_status)
+            .map(|()| Response::new(()))
     }
 
     async fn delete_reservation(
         &self,
         request: Request<DeleteReservationRequest>,
     ) -> Result<Response<()>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            let proxy = &self.leader_proxy;
-            match proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.delete_reservation(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward delete_reservation to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, identity.as_ref());
+
+        annotate(
+            &audit,
+            Annotation::new(&req.name, txn::delete_details(None)).asserted_actor(&req.user),
+        );
         self.require_reservation_manager(&req.user, identity.as_ref())
             .await?;
 
-        let entity_name = req.name.clone();
-        let actor = req.user.clone();
-
-        let result = self
-            .cluster
+        self.cluster
             .delete_reservation(&req.name)
-            .map_err(reservation_rpc_status);
-        self.audit_reservation(
-            TxnAction::Delete,
-            &entity_name,
-            &actor,
-            identity.as_ref(),
-            txn::delete_details(None),
-            &result,
-        );
-        result.map(|()| Response::new(()))
+            .map_err(reservation_rpc_status)
+            .map(|()| Response::new(()))
     }
 
     async fn list_reservations(
         &self,
         request: Request<ListReservationsRequest>,
     ) -> Result<Response<ListReservationsResponse>, Status> {
-        let forward = self.read_should_forward(&request);
+        let forward = self.prepare_read(&request);
         let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(
-                meta,
-                forward.then(|| req.clone()),
-                "list_reservations",
-                |mut c, r| async move { c.list_reservations(r).await },
-            )
+            .forward_read(meta, forward.then(|| req.clone()), identity, path)
             .await
         {
             return Ok(resp);
@@ -3253,19 +3361,23 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ExecInJobRequest>,
     ) -> Result<Response<ExecInJobResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            {
-                let proxy = &self.leader_proxy;
-                let mut client = proxy.get_leader_client().await?;
-                let fwd = Self::forward_request(request);
-                return client.exec_in_job(fwd).await;
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                serde_json::json!({ "command": req.command.join(" ") }),
+            )
+            .asserted_actor(&req.user),
+        );
 
         let job = self
             .cluster
@@ -3275,7 +3387,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             None,
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -3329,17 +3441,24 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<RunStepRequest>,
     ) -> Result<Response<RunStepResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            let proxy = &self.leader_proxy;
-            let mut client = proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
-            return client.run_step(fwd).await;
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
 
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
+        Self::authoritative_unix(&mut req.uid, None, __identity.as_ref());
         let job_id = req.job_id;
+        annotate(
+            &audit,
+            Annotation::new(
+                &job_id.to_string(),
+                serde_json::json!({ "command": req.command.join(" ") }),
+            )
+            .asserted_actor(&req.user),
+        );
 
         let job = self
             .cluster
@@ -3351,7 +3470,7 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_caller(
             &req.user,
             Some(req.uid),
-            self.caller_is_admin(__identity.as_ref()),
+            self.caller_is_operator(__identity.as_ref()),
             &job.spec.user,
             job.spec.uid,
             __identity.as_ref(),
@@ -3571,6 +3690,7 @@ impl SlurmController for ControllerService {
             let container = step_container.clone();
             let step_nodelist = step_nodelist.clone();
             let step_user = job.spec.user.clone();
+            let execution_credential = req.execution_credential.clone();
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -3598,6 +3718,7 @@ impl SlurmController for ControllerService {
                         pmix_prepared: needs_pmix_prepare,
                         container,
                         nodelist: step_nodelist.clone(),
+                        execution_credential: execution_credential.clone(),
                     })
                     .await;
 
@@ -3716,26 +3837,13 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ClusterUpRequest>,
     ) -> Result<Response<ClusterUpResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            match self.leader_proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.cluster_up(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward cluster_up to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
-        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
-            return Err(Status::permission_denied(
-                "k0s cluster up requires cluster admin",
-            ));
-        }
+        self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster up")?;
         let state = self.cluster.k0s_state();
         let nodes = self.cluster.get_nodes();
         let assigned = nodes.iter().any(|n| n.k0s_role.is_some());
@@ -3847,25 +3955,31 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ClusterAddNodesRequest>,
     ) -> Result<Response<ClusterAddNodesResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            match self.leader_proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
-                    return client.cluster_add_nodes(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward cluster_add_nodes to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
-        let req = request.into_inner();
-        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
-            return Err(Status::permission_denied(
-                "k0s cluster add-nodes requires cluster admin",
-            ));
-        }
+        let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.nodes,
+                txn::requested(&[
+                    (
+                        "partition",
+                        (!req.partition.is_empty()).then(|| req.partition.clone().into()),
+                    ),
+                    (
+                        "selector",
+                        (!req.selector.is_empty()).then(|| serde_json::json!(req.selector)),
+                    ),
+                ]),
+            )
+            .asserted_actor(&req.caller),
+        );
+        self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster add-nodes")?;
 
         let state = self.cluster.k0s_state();
         // Online add only makes sense on a running cluster.
@@ -3927,25 +4041,22 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ClusterRemoveNodesRequest>,
     ) -> Result<Response<ClusterRemoveNodesResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            match self.leader_proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let mut fwd = Request::new(request.into_inner());
-                    *fwd.metadata_mut() = Self::forwarded_metadata();
-                    return client.cluster_remove_nodes(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward cluster_remove_nodes to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
-        let req = request.into_inner();
-        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
-            return Err(Status::permission_denied(
-                "k0s cluster remove-nodes requires cluster admin",
-            ));
-        }
+        let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
+        let mut req = request.into_inner();
+        Self::authoritative_user(&mut req.caller, __identity.as_ref());
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.nodes,
+                txn::requested(&[("drain_timeout_secs", req.drain_timeout_secs.map(Into::into))]),
+            )
+            .asserted_actor(&req.caller),
+        );
+        self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster remove-nodes")?;
 
         let state = self.cluster.k0s_state();
         if !matches!(
@@ -4065,26 +4176,13 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ClusterDownRequest>,
     ) -> Result<Response<ClusterDownResponse>, Status> {
-        if let Err(status) = self.check_leader(&request) {
-            match self.leader_proxy.get_leader_client().await {
-                Ok(mut client) => {
-                    let fwd = Self::forward_request(request);
-                    return client.cluster_down(fwd).await;
-                }
-                Err(e) => {
-                    warn!("failed to forward cluster_down to leader: {e}");
-                    return Err(status);
-                }
-            }
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
-        if !is_k0s_admin(self.cluster.association_cache(), &req.caller) {
-            return Err(Status::permission_denied(
-                "k0s cluster down requires cluster admin",
-            ));
-        }
+        self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster down")?;
         self.cluster
             .set_k0s_phase(
                 spur_core::k0s::K0sPhase::Down,
@@ -4104,10 +4202,8 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ClusterStatusRequest>,
     ) -> Result<Response<ClusterStatusResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            let mut client = self.leader_proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
-            return client.cluster_status(fwd).await;
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
         let state = self.cluster.k0s_state();
         let control_plane_nodes = state.controllers();
@@ -4124,15 +4220,24 @@ impl SlurmController for ControllerService {
         &self,
         request: Request<ClusterKubeconfigRequest>,
     ) -> Result<Response<ClusterKubeconfigResponse>, Status> {
-        if self.check_leader(&request).is_err() {
-            let mut client = self.leader_proxy.get_leader_client().await?;
-            let fwd = Self::forward_request(request);
-            return client.cluster_kubeconfig(fwd).await;
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
         }
         let __identity = Self::verified_identity(&request).cloned();
+        let audit = crate::audit::slot(&request);
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
-        let is_admin = is_k0s_admin(self.cluster.association_cache(), &req.caller);
+        // The subject the credential is minted for, which is what a reader needs
+        // to know; `--admin` mints the cluster-admin one instead of a user's.
+        annotate(
+            &audit,
+            Annotation::new(
+                &req.user,
+                txn::requested(&[("admin", req.admin.then_some(true.into()))]),
+            )
+            .asserted_actor(&req.caller),
+        );
+        let is_admin = self.k0s_caller_is_admin(__identity.as_ref(), &req.caller);
 
         if req.admin {
             // Admin check first, opt-in second — deliberately in that order. Both must pass, so the
@@ -4144,10 +4249,9 @@ impl SlurmController for ControllerService {
                     "the cluster-admin kubeconfig requires cluster admin",
                 ));
             }
-            // Serving the cluster-admin credential is gated on an explicit opt-in, not just on the
-            // admin check above: `caller` is client-supplied and unauthenticated, so without this
-            // any peer that can reach the controller could ask for a cluster-admin kubeconfig by
-            // claiming to be root. Off by default; get it on the control-plane node instead.
+            // Serving the cluster-admin credential is gated on an explicit opt-in in addition to
+            // the admin check: under permissive auth an unidentified caller can still claim `root`.
+            // Off by default; get it on the control-plane node instead.
             if !self.cluster.config().cluster.allow_admin_kubeconfig {
                 return Err(Status::permission_denied(
                     "serving the cluster-admin kubeconfig over RPC is disabled \
@@ -4199,16 +4303,17 @@ impl SlurmController for ControllerService {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn serve(
-    addr: SocketAddr,
+/// Separate from [`serve`] so `main` can hand a clone to the REST server, which
+/// dispatches into these handlers instead of reaching past them into the cluster.
+pub fn build_service(
     cluster: Arc<ClusterManager>,
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
-    accounting_service: Option<crate::accounting::AccountingService>,
     control_plane_replicas: u32,
     jwt_key: String,
-) -> anyhow::Result<()> {
+    bearer: &spur_core::auth::BearerAuth,
+) -> ControllerService {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
         .iter()
@@ -4224,46 +4329,115 @@ pub async fn serve(
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
-    let node_identity_key_configured = cluster.config().auth.has_jwt_key();
-    let auth_mode = cluster.config().auth.mode;
-    // Unlike node admission, an unset key here must reject every credential, never fall back
-    // to a forgeable constant; `required` mode refuses to start key-less (see config validation).
-    let auth_verification_key = cluster
-        .config()
-        .auth
-        .resolved_jwt_key()?
-        .unwrap_or_default();
+    let node_identity_key_configured =
+        cluster.config().auth.has_jwt_key() || crate::native_keys::node_signer().is_some();
+    let (auth_audience, auth_epoch) = bearer.advertised_handshake();
 
-    let service = ControllerService {
+    ControllerService {
         cluster,
         client_addrs,
-        raft: raft_handle.clone(),
+        raft: raft_handle,
         leader_proxy,
-        rpc_stats: rpc_stats.clone(),
-        sched_stats: sched_stats.clone(),
+        rpc_stats,
+        sched_stats,
         control_plane_replicas,
         jwt_key,
         node_identity_key_configured,
-        incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
-    };
+        incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
+        auth_audience,
+        auth_epoch,
+    }
+}
 
-    let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
+pub async fn serve(
+    addr: SocketAddr,
+    service: ControllerService,
+    accounting_service: Option<crate::accounting::AccountingService>,
+    bearer: spur_core::auth::BearerAuth,
+) -> anyhow::Result<()> {
+    let audit_cluster = service.cluster.clone();
+    let audit_rpcs = service.cluster.config().logging.audit_rpcs;
+
+    let stats_layer = RpcStatsLayer::new(service.rpc_stats.clone(), service.raft.clone());
     // Applied as a layer, not a per-service interceptor, so it also covers the accounting service —
     // which carries no authorization of its own yet exposes `add_user(admin_level)`.
-    let auth_layer = crate::auth_middleware::AuthLayer::new(auth_mode, &auth_verification_key);
+    let mut auth_layer = crate::auth_middleware::AuthLayer::from_bearer(bearer);
+    if let Some(peer) = crate::native_keys::peer() {
+        auth_layer = auth_layer.with_peer(peer);
+    }
+    let audit_layer = crate::audit::AuditLayer::new(
+        Arc::new(crate::audit::ControllerAudit::new(audit_cluster)),
+        audit_rpcs,
+    );
 
+    // Order is load-bearing: each `.layer` sits closer to the service, so audit
+    // runs inside auth and sees the `Identity` it inserted.
     let mut builder = tonic::transport::Server::builder()
         .layer(stats_layer)
-        .layer(auth_layer);
+        .layer(auth_layer)
+        .layer(audit_layer);
 
     let mut router = builder.add_service(spur_proto::controller_server(service));
     if let Some(service) = accounting_service {
         router = router.add_service(crate::accounting::accounting_server(service));
     }
 
-    router.serve(addr).await?;
+    router.serve_with_shutdown(addr, shutdown_signal()).await?;
 
     Ok(())
+}
+
+/// Resolves on SIGTERM or Ctrl-C, so the caller can flush work that a dropped
+/// runtime would discard.
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            // Without the handler this arm must never win the select.
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = interrupt => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutdown signal received, draining");
+}
+
+/// A uid only when the kernel vouched for it. A JWT claims its own, possibly 0,
+/// so recording it would attribute an action to an unproven uid. Cf. `bind_job_spec`.
+pub(crate) fn trusted_uid(identity: Option<&spur_core::auth::Identity>) -> Option<u32> {
+    identity.filter(|id| id.trusted_unix).map(|id| id.uid)
+}
+
+/// The gRPC method path this request arrived on, as recorded by the auth layer.
+pub(crate) fn rpc_path<T>(request: &Request<T>) -> Option<String> {
+    request
+        .extensions()
+        .get::<spur_core::native_peer::RpcPath>()
+        .map(|p| p.0.clone())
+}
+
+/// Keeps an unrecognized value verbatim rather than dropping it, so the audit
+/// row still answers what a rejected request tried to set.
+fn requested_node_state(
+    raw: Option<i32>,
+    parsed: Option<spur_core::node::NodeState>,
+) -> Option<String> {
+    let raw = raw?;
+    Some(match parsed {
+        Some(state) => state.display().to_string(),
+        None => format!("invalid({raw})"),
+    })
 }
 
 /// Resolve the target node for a job step. Empty = first allocated (legacy
@@ -4663,7 +4837,8 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
 }
 
 fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resource::ResourceSet {
-    spur_core::resource::ResourceSet {
+    // Backfill so no stable_id==0 from a legacy/mixed-version agent reaches accounting.
+    let mut rs = spur_core::resource::ResourceSet {
         cpus: r.cpus,
         memory_mb: r.memory_mb,
         gpus: r
@@ -4679,97 +4854,82 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
                     2 => spur_core::resource::GpuLinkType::NVLink,
                     _ => spur_core::resource::GpuLinkType::PCIe,
                 },
+                stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic,
-    }
+        generation: r.generation,
+    };
+    rs.backfill_stable_ids();
+    rs
 }
 
-/// What a caller may see of a job, once ownership/admin status and the visibility policy are known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobInfoDisclosure {
-    /// Full record.
-    Full,
-    /// Full record minus the targeting-sensitive fields (see [`redact_sensitive_job_info`]).
-    Redacted,
-    /// Not disclosed at all — the caller sees `NOT_FOUND`.
-    Hidden,
-}
-
-/// Whether a caller may see a job's full record unconditionally: the owner, an admin, or a caller
-/// with no verified identity at all. The last case preserves the pre-auth behaviour — scoping only
-/// bites once callers are actually identified, so no-auth/permissive deployments and internal
-/// unauthenticated consumers (the k8s operator's nodelist read) are unaffected. Pure for testing.
-fn viewer_is_privileged(
+pub(crate) fn identity_role(
+    cluster: &crate::cluster::ClusterManager,
     identity: Option<&spur_core::auth::Identity>,
-    owner: &str,
-    caller_is_admin: bool,
+) -> Option<spur_core::rbac::Role> {
+    let id = identity?;
+    let auth = &cluster.config().auth;
+    let cache = cluster.association_cache();
+    let groups = if auth.admin_groups.is_empty() && auth.operator_groups.is_empty() {
+        Vec::new()
+    } else {
+        spur_core::privilege::named_user_groups(&id.user).unwrap_or_default()
+    };
+    Some(spur_core::rbac::resolve_role(
+        id,
+        auth,
+        cache.admin_level(&id.user).as_deref(),
+        cache.is_loaded(),
+        &groups,
+        false,
+    ))
+}
+
+pub(crate) fn identity_operates_jobs(
+    cluster: &crate::cluster::ClusterManager,
+    identity: Option<&spur_core::auth::Identity>,
 ) -> bool {
-    match identity {
-        None => true,
-        Some(id) => id.user == owner || caller_is_admin,
-    }
+    identity.is_some_and(|id| {
+        cluster.association_cache().is_operator(&id.user)
+            || identity_role(cluster, Some(id)).is_some_and(|r| r.operates_jobs())
+    })
 }
 
-/// The user an assoc-mgr read is scoped to. A privileged caller — an admin, or
-/// an unauthenticated one under `permissive`/`disabled`, the same treatment
-/// `viewer_is_privileged` gives — reads whichever user the request names, or
-/// every user when it names none. A non-admin authenticated caller is pinned to
-/// their own identity, so they can neither read another tenant's usage nor
-/// enumerate the cluster-wide scope inventory. Pure so the policy is testable
-/// without a live service.
-fn assoc_mgr_scope_user(
+/// The read scope for job records: `All` for an unauthenticated caller, an
+/// Operator, an Administrator, or any caller when `[auth] private_data` does not
+/// list `jobs`; `Caller` for a plain User once `jobs` is private.
+pub(crate) fn job_read_scope(
+    cluster: &crate::cluster::ClusterManager,
     identity: Option<&spur_core::auth::Identity>,
-    requested: &str,
-    caller_is_admin: bool,
-) -> Option<String> {
-    if identity.is_none() || caller_is_admin {
-        return (!requested.is_empty()).then(|| requested.to_string());
-    }
-    identity.map(|id| id.user.clone())
+) -> spur_core::rbac::ReadScope {
+    spur_core::rbac::read_scope(
+        identity,
+        identity_role(cluster, identity),
+        cluster.config().auth.jobs_private(),
+    )
 }
 
-/// Resolve the disclosure level for a job-info read. The owner and admins (`privileged`) always get
-/// the full record; everyone else is governed by the configured policy. Pure so the policy matrix is
-/// unit-testable without a live service.
-fn job_info_disclosure(
-    privileged: bool,
-    visibility: spur_core::config::JobInfoVisibility,
-) -> JobInfoDisclosure {
-    use spur_core::config::JobInfoVisibility;
-    if privileged {
-        return JobInfoDisclosure::Full;
-    }
-    match visibility {
-        JobInfoVisibility::Full => JobInfoDisclosure::Full,
-        JobInfoVisibility::Redacted => JobInfoDisclosure::Redacted,
-        JobInfoVisibility::OwnerOnly => JobInfoDisclosure::Hidden,
-    }
+/// The read scope for `scontrol show assoc_mgr`, gated by
+/// `[auth] private_data = ["usage"]`.
+fn usage_read_scope(
+    cluster: &crate::cluster::ClusterManager,
+    identity: Option<&spur_core::auth::Identity>,
+) -> spur_core::rbac::ReadScope {
+    spur_core::rbac::read_scope(
+        identity,
+        identity_role(cluster, identity),
+        cluster.config().auth.usage_private(),
+    )
 }
 
-/// Blank what a non-owner should not see, keeping identity/state/timing/account
-/// so the Slurm-standard queue view still works.
-fn redact_sensitive_job_info(info: &mut JobInfo) {
-    info.work_dir = String::new();
-    info.command = String::new();
-    info.stdout_path = String::new();
-    info.stderr_path = String::new();
-    info.stdin_path = String::new();
-    info.comment = String::new();
-    info.nodelist = String::new();
-    info.resources = None;
-    // The submit line re-exposes most of the above, and the requested lists are
-    // the same targeting oracle as the allocated one.
-    info.submit_line = String::new();
-    info.req_nodelist = String::new();
-    info.exc_nodelist = String::new();
-    info.sched_nodelist = String::new();
-    // The requested shape restates the resource detail blanked above.
-    info.req_tres = String::new();
-    info.features = String::new();
-    info.min_cpus_node = 0;
-    info.min_memory_node_mb = 0;
-    info.min_memory_is_per_cpu = false;
+/// The assoc-mgr `users=` filter: an unrestricted caller keeps the selector
+/// (empty means every user), a scoped caller is pinned to their own user.
+fn assoc_mgr_user_filter(scope: &spur_core::rbac::ReadScope, requested: &str) -> Option<String> {
+    match scope {
+        spur_core::rbac::ReadScope::All => (!requested.is_empty()).then(|| requested.to_string()),
+        spur_core::rbac::ReadScope::Caller(user) => Some(user.clone()),
+    }
 }
 
 fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
@@ -4850,6 +5010,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         min_memory_node_mb: min_memory_requested_mb(&job.spec),
         min_memory_is_per_cpu: job.spec.memory_per_node_mb.is_none()
             && job.spec.memory_per_cpu_mb.is_some(),
+        idle_fill: job.idle_fill,
         eligible_time: Some(datetime_to_proto(job.eligible_time())),
         accrue_time: Some(datetime_to_proto(job.accrue_time())),
         last_sched_eval: job.last_sched_eval.map(datetime_to_proto),
@@ -5176,6 +5337,7 @@ pub(crate) fn allocations_to_proto(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        generation: r.generation,
     }
 }
 
@@ -5203,6 +5365,7 @@ pub(crate) fn proto_to_allocations(
                 )
             })
             .collect::<HashMap<_, _>>(),
+        generation: r.generation,
     }
 }
 
@@ -5231,9 +5394,11 @@ pub(crate) fn resource_to_proto(
                         spur_proto::proto::GpuLinkType::GpuLinkPcie as i32
                     }
                 },
+                stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic.clone(),
+        generation: r.generation,
     }
 }
 
@@ -5374,18 +5539,22 @@ fn resolve_max_nodes_update(max_nodes_value: Option<u32>, clear_flag: bool) -> (
     (max_nodes, clear)
 }
 
-fn cluster_err_to_status(err: anyhow::Error) -> Status {
-    if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
-        return Status::permission_denied(err.to_string());
-    }
-    Status::internal(err.to_string())
-}
-
 fn cluster_err_to_precondition_status(err: anyhow::Error) -> Status {
     if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
         return Status::permission_denied(err.to_string());
     }
     Status::failed_precondition(err.to_string())
+}
+
+fn cancel_err_to_status(err: CancelError) -> Status {
+    let message = err.to_string();
+    let code = match err {
+        CancelError::NotFound(_) => Code::NotFound,
+        CancelError::AlreadyTerminal { .. } => Code::FailedPrecondition,
+        CancelError::NotOwner(_) => Code::PermissionDenied,
+        CancelError::Internal(_) => Code::Internal,
+    };
+    Status::new(code, message)
 }
 
 fn node_complete_to_status(err: NodeCompleteError) -> Status {
@@ -5398,10 +5567,13 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
     Status::new(code, message)
 }
 
-/// A numbered step's supervisor speaks only for that step; finalizing the job on
-/// it would end the allocation while its siblings still run.
+/// Only the step that owns the job's lifetime may finalize it; a numbered
+/// step or the terminal placeholder speaks for itself, not the allocation.
 fn reports_whole_job(step_id: Option<spur_core::step::StepId>) -> bool {
-    step_id.is_none_or(|id| !spur_core::step::is_user_step(id))
+    match step_id {
+        Some(id) => spur_core::step::owns_job_lifetime(id),
+        None => true,
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -5411,6 +5583,96 @@ fn validate_completion_report_state_for_rpc(
 ) -> Result<(), Status> {
     spur_core::job::JobState::validate_completion_report_state(state, exit_code)
         .map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
+/// Shared fixtures for the gRPC tests here and the REST handler tests in
+/// `rest::handlers`. Lives in `server` so it can build a `ControllerService`
+/// from its private fields.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Identity for a viewer in the read-path handler tests. No NSS resolution
+    /// happens on the read path (only ownership/admin comparison), so any
+    /// username works.
+    pub(crate) fn viewer(user: &str, is_admin: bool) -> spur_core::auth::Identity {
+        spur_core::auth::Identity {
+            user: user.to_string(),
+            uid: 1000,
+            gid: 1000,
+            is_admin,
+            trusted_unix: false,
+        }
+    }
+
+    pub(crate) fn test_slurm_config() -> spur_core::config::SlurmConfig {
+        serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap()
+    }
+
+    /// A config with `[auth] private_data` set to the given categories.
+    pub(crate) fn test_slurm_config_private(categories: &[&str]) -> spur_core::config::SlurmConfig {
+        let list = categories
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        serde_json::from_str(&format!(
+            r#"{{"cluster_name":"test","auth":{{"plugin":"jwt","private_data":[{list}]}}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// A `ControllerService` on a node that can never elect a leader: three
+    /// unreachable peers mean no quorum, so `current_leader` stays `None`.
+    pub(crate) async fn no_leader_service(
+        cluster: Arc<crate::cluster::ClusterManager>,
+        dir: &std::path::Path,
+    ) -> ControllerService {
+        let handle = crate::raft::start_raft(
+            1,
+            &[
+                "[::1]:0".to_string(),
+                "[::1]:0".to_string(),
+                "[::1]:0".to_string(),
+            ],
+            dir,
+            cluster.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(!handle.is_leader());
+        assert_eq!(handle.current_leader(), None);
+
+        let raft = Arc::new(handle);
+        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
+        ControllerService {
+            cluster,
+            raft: raft.clone(),
+            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
+            client_addrs,
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
+            control_plane_replicas: 1,
+            jwt_key: String::new(),
+            node_identity_key_configured: false,
+            incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
+            auth_audience: String::new(),
+            auth_epoch: 0,
+        }
+    }
+
+    /// A `RestState` backed by the same leaderless service, for REST handler tests.
+    pub(crate) async fn no_leader_rest_state(
+        cluster: Arc<crate::cluster::ClusterManager>,
+        dir: &std::path::Path,
+    ) -> Arc<crate::rest::RestState> {
+        let controller = no_leader_service(cluster, dir).await;
+        Arc::new(crate::rest::RestState {
+            cluster: controller.cluster.clone(),
+            raft: controller.raft.clone(),
+            controller,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -5486,10 +5748,13 @@ mod tests {
         assert!(reports_whole_job(None));
         assert!(reports_whole_job(Some(STEP_BATCH)));
         assert!(reports_whole_job(Some(STEP_EXTERN)));
-        assert!(reports_whole_job(Some(STEP_INTERACTIVE)));
+        // A terminal's custody placeholder runs no workload of its own — its
+        // retirement must not end a job whose real allocation is still alive.
+        assert!(!reports_whole_job(Some(STEP_INTERACTIVE)));
         assert!(!reports_whole_job(Some(0)));
         assert!(!reports_whole_job(Some(7)));
     }
+    use super::test_support::*;
     use super::*;
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};
@@ -5498,6 +5763,29 @@ mod tests {
 
     fn job_state(cluster: &crate::cluster::ClusterManager, job_id: u32) -> Option<JobState> {
         cluster.get_job(job_id).map(|j| j.state)
+    }
+
+    #[test]
+    fn resource_set_proto_round_trip_preserves_stable_id_and_generation() {
+        use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
+        let rs = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: vec![GpuResource {
+                device_id: 1,
+                gpu_type: "mi300x".into(),
+                memory_mb: 196_608,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::XGMI,
+                stable_id: 129,
+            }],
+            generic: Default::default(),
+            generation: 42,
+        };
+        let back = proto_to_resource_set(resource_to_proto(&rs));
+        assert_eq!(back.generation, 42);
+        assert_eq!(back.gpus[0].stable_id, 129);
+        assert_eq!(back.gpus[0].device_id, 1);
     }
 
     #[test]
@@ -5651,103 +5939,6 @@ mod tests {
         assert!(warning.is_none());
     }
 
-    #[test]
-    fn job_info_disclosure_matrix() {
-        use spur_core::config::JobInfoVisibility::*;
-        // The owner/admin (privileged) always sees the full record, whatever the policy.
-        for v in [Redacted, OwnerOnly, Full] {
-            assert_eq!(job_info_disclosure(true, v), JobInfoDisclosure::Full);
-        }
-        // A non-owner is governed by the policy.
-        assert_eq!(
-            job_info_disclosure(false, Redacted),
-            JobInfoDisclosure::Redacted
-        );
-        assert_eq!(
-            job_info_disclosure(false, OwnerOnly),
-            JobInfoDisclosure::Hidden
-        );
-        assert_eq!(job_info_disclosure(false, Full), JobInfoDisclosure::Full);
-    }
-
-    #[test]
-    fn viewer_privilege_owner_admin_and_anonymous() {
-        use spur_core::auth::Identity;
-        let bob = Identity {
-            user: "bob".into(),
-            uid: 1000,
-            gid: 1000,
-            is_admin: false,
-        };
-        let alice = Identity {
-            user: "alice".into(),
-            uid: 1001,
-            gid: 1001,
-            is_admin: false,
-        };
-        // Owner and admin are privileged.
-        assert!(viewer_is_privileged(Some(&bob), "bob", false));
-        assert!(viewer_is_privileged(Some(&alice), "bob", true));
-        // A different, non-admin identified user is not.
-        assert!(!viewer_is_privileged(Some(&alice), "bob", false));
-        // No verified identity (auth disabled, or permissive with no credential, or an internal
-        // consumer like the k8s operator) is privileged: scoping only applies to identified callers.
-        assert!(viewer_is_privileged(None, "bob", false));
-    }
-
-    #[test]
-    fn redact_blanks_sensitive_fields_and_keeps_the_rest() {
-        let mut info = JobInfo {
-            job_id: 42,
-            name: "train".into(),
-            user: "bob".into(),
-            account: "team-b".into(),
-            state_reason: "Running".into(),
-            // sensitive
-            work_dir: "/home/bob/run".into(),
-            command: "python train.py --secret".into(),
-            stdout_path: "/home/bob/out".into(),
-            stderr_path: "/home/bob/err".into(),
-            stdin_path: "/home/bob/in".into(),
-            comment: "internal".into(),
-            nodelist: "gpu-b-[01-04]".into(),
-            submit_line: "sbatch --wrap 'python train.py --secret'".into(),
-            req_nodelist: "gpu-b-[01-04]".into(),
-            exc_nodelist: "gpu-b-05".into(),
-            ..Default::default()
-        };
-        redact_sensitive_job_info(&mut info);
-        // Sensitive fields are gone — the nodelist in particular (the co-residency targeting oracle).
-        assert!(info.work_dir.is_empty());
-        assert!(info.command.is_empty());
-        assert!(info.stdout_path.is_empty());
-        assert!(info.stderr_path.is_empty());
-        assert!(info.stdin_path.is_empty());
-        assert!(info.comment.is_empty());
-        assert!(info.nodelist.is_empty());
-        assert!(info.resources.is_none());
-        assert!(info.submit_line.is_empty());
-        assert!(info.req_nodelist.is_empty());
-        assert!(info.exc_nodelist.is_empty());
-        // Non-sensitive identity/state fields survive so the queue view still works.
-        assert_eq!(info.job_id, 42);
-        assert_eq!(info.name, "train");
-        assert_eq!(info.user, "bob");
-        assert_eq!(info.account, "team-b");
-        assert_eq!(info.state_reason, "Running");
-    }
-
-    /// Identity for a viewer in the get_job/get_job_steps handler tests. No NSS resolution happens
-    /// on the read path (only ownership/admin comparison), so any username works.
-    fn viewer(user: &str, is_admin: bool) -> spur_core::auth::Identity {
-        spur_core::auth::Identity {
-            user: user.to_string(),
-            uid: 1000,
-            gid: 1000,
-            is_admin,
-        }
-    }
-
     fn get_job_req(job_id: u32, id: Option<spur_core::auth::Identity>) -> Request<GetJobRequest> {
         let mut req = Request::new(GetJobRequest { job_id });
         if let Some(id) = id {
@@ -5833,10 +6024,19 @@ mod tests {
         assert!(resolve_step_container(Some(ContainerSpec::default()), &job).is_none());
     }
 
+    fn jobs_private_config() -> spur_core::config::SlurmConfig {
+        let mut config = step_test_config();
+        config
+            .auth
+            .private_data
+            .insert(spur_core::config::PrivateData::Jobs);
+        config
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_job_scopes_by_identity_under_default_redacted_policy() {
+    async fn get_job_hides_other_tenants_under_private_jobs() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with(&dir, jobs_private_config()).await;
         let job_id = svc
             .cluster
             .submit_job(owned_job("bob", "/home/bob"))
@@ -5857,39 +6057,31 @@ mod tests {
             assert_eq!(info.work_dir, "/home/bob");
         }
 
-        // An identified non-owner is redacted: the work_dir (and other sensitive fields) are blanked,
-        // but the non-sensitive identity fields survive.
-        let other = svc
+        // An identified User cannot fetch another tenant's job (same pin as get_jobs).
+        let err = svc
             .get_job(get_job_req(job_id, Some(viewer("alice", false))))
             .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(other.work_dir, "", "a non-owner must not see the work_dir");
-        assert_eq!(other.user, "bob", "non-sensitive fields survive redaction");
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_job_owner_only_hides_the_job_from_a_non_owner() {
+    async fn get_job_shows_other_tenants_by_default() {
+        // With `private_data` unset, any authenticated user sees any job.
         let dir = tempfile::TempDir::new().unwrap();
-        let mut config = step_test_config();
-        config.controller.job_info_visibility = spur_core::config::JobInfoVisibility::OwnerOnly;
-        let svc = test_service_with(&dir, config).await;
+        let svc = test_service(&dir).await;
         let job_id = svc
             .cluster
             .submit_job(owned_job("bob", "/home/bob"))
             .unwrap()
             .job_id;
 
-        // Owner still sees the job; a non-owner gets NOT_FOUND rather than a redacted record.
-        assert!(svc
-            .get_job(get_job_req(job_id, Some(viewer("bob", false))))
-            .await
-            .is_ok());
-        let err = svc
+        let info = svc
             .get_job(get_job_req(job_id, Some(viewer("alice", false))))
             .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound);
+            .expect("alice may read bob's job when jobs are not private")
+            .into_inner();
+        assert_eq!(info.work_dir, "/home/bob");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5917,6 +6109,17 @@ mod tests {
     }
 
     #[test]
+    fn k0s_admin_honors_resolved_role_and_blocks_spoofed_root() {
+        let cache = crate::association_cache::AssociationCache::new();
+        assert!(k0s_admin_allowed(true, true, &cache, "erin"));
+        assert!(!k0s_admin_allowed(false, true, &cache, "root"));
+        assert!(k0s_admin_allowed(false, false, &cache, "root"));
+        cache.insert_admin_level("carol", "Admin");
+        assert!(k0s_admin_allowed(false, false, &cache, "carol"));
+        assert!(!k0s_admin_allowed(false, true, &cache, "carol"));
+    }
+
+    #[test]
     fn read_forwards_only_when_follower_and_not_already_forwarded() {
         // Leader serves reads locally; never forwards.
         assert!(!read_forwarding_policy(true, false));
@@ -5925,50 +6128,6 @@ mod tests {
         assert!(read_forwarding_policy(false, false));
         // An already-forwarded read is served locally to avoid forward loops.
         assert!(!read_forwarding_policy(false, true));
-    }
-
-    fn test_slurm_config() -> spur_core::config::SlurmConfig {
-        serde_json::from_str(r#"{"cluster_name":"test"}"#).unwrap()
-    }
-
-    /// A `ControllerService` on a node that can never elect a leader: three
-    /// unreachable peers mean no quorum, so `current_leader` stays `None`.
-    async fn no_leader_service(
-        cluster: Arc<crate::cluster::ClusterManager>,
-        dir: &std::path::Path,
-    ) -> ControllerService {
-        use crate::rpc_stats::RpcStatsCollector;
-        use crate::sched_stats::SchedStatsCollector;
-
-        let handle = crate::raft::start_raft(
-            1,
-            &[
-                "[::1]:0".to_string(),
-                "[::1]:0".to_string(),
-                "[::1]:0".to_string(),
-            ],
-            dir,
-            cluster.clone(),
-        )
-        .await
-        .unwrap();
-        assert!(!handle.is_leader());
-        assert_eq!(handle.current_leader(), None);
-
-        let raft = Arc::new(handle);
-        let client_addrs: BTreeMap<u64, String> = BTreeMap::new();
-        ControllerService {
-            cluster,
-            raft: raft.clone(),
-            leader_proxy: LeaderProxy::new(raft.clone(), client_addrs.clone()),
-            client_addrs,
-            rpc_stats: Arc::new(RpcStatsCollector::new()),
-            sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
-            control_plane_replicas: 1,
-            jwt_key: String::new(),
-            node_identity_key_configured: false,
-            incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
-        }
     }
 
     /// A non-leader that can't reach a leader must still answer reads
@@ -6014,19 +6173,20 @@ mod tests {
         assert_eq!(jobs[0].job_id, 1);
     }
 
-    /// `scontrol show job` and `squeue` both read through `get_jobs`, so this — not the
-    /// `get_job` redaction — is what stops one user reading another's submit line and
-    /// requested nodes. Spoofing the wire `user` field, and naming the job id outright,
-    /// must both come back empty.
+    /// `scontrol show job` and `squeue` both read through `get_jobs`. Under
+    /// `private_data = ["jobs"]`, spoofing the wire `user` field, and naming the
+    /// job id outright, must both come back empty.
     #[tokio::test]
-    async fn get_jobs_never_returns_another_users_job_to_an_identified_caller() {
+    async fn get_jobs_never_returns_another_users_job_under_private_jobs() {
         use crate::raft::StateMachineApply;
         use spur_core::job::JobSpec;
         use spur_core::wal::WalOperation;
 
         let dir = tempfile::TempDir::new().unwrap();
-        let cluster =
-            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(test_slurm_config_private(&["jobs"]), dir.path())
+                .unwrap(),
+        );
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
@@ -6069,6 +6229,113 @@ mod tests {
                 "{label} let bob read alice's job: {jobs:?}"
             );
         }
+
+        for (label, user) in [("a bare query", ""), ("-u alice", "alice")] {
+            let mut req = Request::new(GetJobsRequest {
+                user: user.into(),
+                ..Default::default()
+            });
+            req.extensions_mut().insert(viewer("carol", true));
+            let jobs = service.get_jobs(req).await.unwrap().into_inner().jobs;
+            assert_eq!(
+                jobs.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+                vec![1],
+                "an administrator is exempt from private jobs ({label})"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_pins_users_but_not_admins_under_private_usage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config
+            .auth
+            .private_data
+            .insert(spur_core::config::PrivateData::Usage);
+        let service = test_service_with(&dir, config).await;
+        let mut spec = owned_job("alice", "/tmp");
+        spec.qos = Some("alice-qos".into());
+        <crate::cluster::ClusterManager as crate::raft::StateMachineApply>::apply_operation(
+            service.cluster.as_ref(),
+            &spur_core::wal::WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(spec),
+            },
+        );
+
+        let qos_seen = |viewer_id: spur_core::auth::Identity, users: &str| {
+            let mut req = Request::new(GetAssocMgrInfoRequest { user: users.into() });
+            req.extensions_mut().insert(viewer_id);
+            let service = &service;
+            async move {
+                service
+                    .get_assoc_mgr_info(req)
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .qos_records
+                    .into_iter()
+                    .map(|r| r.scope)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert!(qos_seen(viewer("bob", false), "").await.is_empty());
+        assert!(
+            qos_seen(viewer("bob", false), "alice").await.is_empty(),
+            "users=alice from bob stays pinned to bob"
+        );
+        assert_eq!(qos_seen(viewer("carol", true), "").await, ["alice-qos"]);
+        assert_eq!(
+            qos_seen(viewer("carol", true), "alice").await,
+            ["alice-qos"]
+        );
+    }
+
+    /// With `private_data` unset (the default, matching a stock slurm.conf),
+    /// every authenticated user sees every job. A bare query returns all jobs,
+    /// and `-u alice` from bob returns alice's job.
+    #[tokio::test]
+    async fn get_jobs_shows_all_users_by_default() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "alice-job".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            },
+        );
+        let service = no_leader_service(cluster, dir.path()).await;
+
+        let mut bare = Request::new(GetJobsRequest::default());
+        bare.extensions_mut().insert(viewer("bob", false));
+        let jobs = service.get_jobs(bare).await.unwrap().into_inner().jobs;
+        assert_eq!(jobs.len(), 1, "a bare query lists every user's jobs");
+        assert_eq!(jobs[0].user, "alice");
+
+        let mut by_user = Request::new(GetJobsRequest {
+            user: "alice".into(),
+            ..Default::default()
+        });
+        by_user.extensions_mut().insert(viewer("bob", false));
+        let jobs = service.get_jobs(by_user).await.unwrap().into_inner().jobs;
+        assert_eq!(jobs.len(), 1, "bob may filter to alice's jobs");
+        assert_eq!(jobs[0].user, "alice");
     }
 
     /// The write side of the contract: with no leader, writes must fail rather
@@ -6107,6 +6374,98 @@ mod tests {
         let status = submit_rpc_status(SubmitError::unavailable("associations unavailable"));
         assert_eq!(status.code(), Code::Unavailable);
         assert!(spur_proto::controller_rpc_retryable(&status));
+    }
+
+    #[test]
+    fn reported_held_gpu_ids_keeps_only_jobs_with_a_reported_set() {
+        let reported = vec![
+            RunningJobStatus {
+                job_id: 1,
+                gpu_stable_ids: vec![0x63_0000, 0x83_0000],
+                ..Default::default()
+            },
+            // No GPUs, or an old agent that never set the field: skipped.
+            RunningJobStatus {
+                job_id: 2,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            reported_held_gpu_ids(&reported),
+            vec![(1u32, vec![0x63_0000u64, 0x83_0000u64])]
+        );
+    }
+
+    /// A node still claiming a long-signalled cancel missed the kill; one inside
+    /// the grace is mid-teardown and must keep its slice until it reports.
+    #[tokio::test]
+    async fn stale_reported_jobs_reclaims_a_cancel_the_node_never_received() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+            generation: 0,
+        };
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        for id in [20, 21] {
+            apply(&WalOperation::JobSubmit {
+                job_id: id,
+                spec: Box::new(JobSpec {
+                    name: "cancelled".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            });
+            apply(&WalOperation::job_start(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node.clone(),
+            ));
+            apply(&WalOperation::job_state_change(
+                id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+        }
+        apply(&WalOperation::JobCancelSignaled {
+            job_id: 20,
+            at: Utc::now() - chrono::Duration::seconds(300),
+        });
+        apply(&WalOperation::JobCancelSignaled {
+            job_id: 21,
+            at: Utc::now(),
+        });
+        assert_eq!(job_state(&cluster, 20), Some(JobState::Completing));
+        assert_eq!(job_state(&cluster, 21), Some(JobState::Completing));
+
+        let reported: Vec<RunningJobStatus> = [20, 21]
+            .into_iter()
+            .map(|job_id| RunningJobStatus {
+                job_id,
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(stale_reported_jobs(&cluster, "n1", &reported), vec![20]);
     }
 
     /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,
@@ -6151,6 +6510,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
@@ -6341,6 +6701,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n2".to_string(), res.clone());
@@ -6488,6 +6849,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
+            generation: 0,
         };
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
@@ -6643,7 +7005,9 @@ mod tests {
             control_plane_replicas: 1,
             jwt_key,
             node_identity_key_configured,
-            incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
+            auth_audience: String::new(),
+            auth_epoch: 0,
         }
     }
 
@@ -6655,6 +7019,21 @@ mod tests {
         let svc = test_service(&dir).await;
         let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
         assert_eq!(resp.cluster_name, "test");
+        assert!(
+            resp.auth_audience.is_empty(),
+            "jwt-plugin tests advertise no native audience"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ping_reports_native_auth_handshake() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut svc = test_service(&dir).await;
+        svc.auth_audience = "spur/test/controller/ctld".into();
+        svc.auth_epoch = 42;
+        let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
+        assert_eq!(resp.auth_audience, "spur/test/controller/ctld");
+        assert_eq!(resp.auth_epoch, 42);
     }
 
     /// A service with a configured node-identity signing key, for stepd
@@ -6699,6 +7078,12 @@ mod tests {
             _request: Request<spur_proto::proto::LaunchJobRequest>,
         ) -> Result<Response<spur_proto::proto::LaunchJobResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
+        }
+        async fn ping(
+            &self,
+            _request: Request<()>,
+        ) -> Result<Response<spur_proto::proto::PingResponse>, Status> {
+            Ok(Response::new(spur_proto::proto::PingResponse::default()))
         }
         async fn start_job(
             &self,
@@ -6958,14 +7343,19 @@ mod tests {
         }))
         .await
         .expect("the same node must be able to deregister cleanly");
-        // Deregistering an unknown node is also Ok, so assert the node really went.
+        // Deregistering an unknown node is also Ok, so assert the node really
+        // went Down. The record itself stays, it carries the mesh membership.
         for _ in 0..200 {
-            if svc.cluster.get_node("n1").is_none() {
+            if svc
+                .cluster
+                .get_node("n1")
+                .is_some_and(|n| n.state == spur_core::node::NodeState::Down)
+            {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        panic!("deregistration left the node registered");
+        panic!("deregistration left the node up");
     }
 
     // The relaxation keys on the controller having no key, never on the request
@@ -8113,6 +8503,69 @@ mod tests {
         assert!(resp.skipped.is_empty());
     }
 
+    // Exercises the cancel RPC boundary. The operator relies on NotFound and
+    // FailedPrecondition to tell "nothing left to cancel" from a real failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_rpc_maps_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let spec = spur_core::job::JobSpec {
+            name: "cancel".into(),
+            user: "alice".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let cancel = |job_id: u32, user: &str| {
+            Request::new(CancelJobRequest {
+                job_id,
+                signal: 0,
+                user: user.into(),
+            })
+        };
+
+        let err = svc
+            .cancel_job(cancel(999_999, "alice"))
+            .await
+            .expect_err("unknown job must error");
+        assert_eq!(err.code(), Code::NotFound);
+        assert_eq!(err.message(), "job 999999 not found");
+
+        let err = svc
+            .cancel_job(cancel(job_id, "mallory"))
+            .await
+            .expect_err("non-owner must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        svc.cancel_job(cancel(job_id, "alice"))
+            .await
+            .expect("owner cancel must succeed");
+        for _ in 0..200 {
+            if job_state(&svc.cluster, job_id) == Some(JobState::Cancelled) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let err = svc
+            .cancel_job(cancel(job_id, "alice"))
+            .await
+            .expect_err("a terminal job must not be cancelled twice");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(err.message(), format!("job {job_id} is already Cancelled"));
+    }
+
     // An authenticated non-admin cannot requeue another user's job by setting user="root" on
     // the wire. authoritative_user overwrites the field before the owner check.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8324,6 +8777,82 @@ mod tests {
             .await
             .expect_err("a still-Pending job must not accept a new step");
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_caps_the_stored_name() {
+        use spur_core::step::MAX_STEP_NAME_BYTES;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.create_job_step(Request::new(CreateJobStepRequest {
+            job_id,
+            command: vec!["python".into(), "-c".into(), "€".repeat(40_000)],
+            user: "ubuntu".into(),
+            num_tasks: 1,
+            cpus_per_task: 1,
+            overlap: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("step creation must succeed");
+
+        let stored = svc.cluster.get_steps(job_id);
+        let step = stored
+            .iter()
+            .find(|s| spur_core::step::is_user_step(s.step_id))
+            .expect("the srun step must be recorded");
+        assert!(
+            step.name.len() <= MAX_STEP_NAME_BYTES,
+            "stored name is {} bytes",
+            step.name.len()
+        );
+        assert!(step.name.starts_with("python -c "), "{}", step.name);
+        assert!(step.name.ends_with("..."), "{}", step.name);
+
+        let resp = svc
+            .get_job_steps(Request::new(GetJobStepsRequest { job_id }))
+            .await
+            .expect("steps must be readable")
+            .into_inner();
+        let wire = resp
+            .steps
+            .iter()
+            .find(|s| spur_core::step::is_user_step(s.step_id))
+            .expect("the srun step must be served");
+        assert_eq!(wire.name, step.name);
+
+        // Entries are serialized when proposed, so capping in the apply path
+        // instead would leave the raw argv here and diverge a mixed quorum.
+        let proposed = read_job_step_create_name(dir.path());
+        assert_eq!(proposed, step.name);
+    }
+
+    fn read_job_step_create_name(state_dir: &std::path::Path) -> String {
+        use crate::raft::SpurTypeConfig;
+        use openraft::{Entry, EntryPayload};
+        use spur_core::wal::WalOperation;
+
+        let log_dir = state_dir.join("raft").join("log");
+        let mut names: Vec<String> = std::fs::read_dir(&log_dir)
+            .expect("raft log dir must exist")
+            .map(|e| std::fs::read(e.expect("log entry").path()).expect("read log entry"))
+            .map(|raw| {
+                serde_json::from_slice::<Entry<SpurTypeConfig>>(&raw).expect("decode log entry")
+            })
+            .filter_map(|entry| match entry.payload {
+                EntryPayload::Normal(WalOperation::JobStepCreate { step })
+                    if spur_core::step::is_user_step(step.step_id) =>
+                {
+                    Some(step.name)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names.len(), 1, "expected exactly one user-step propose");
+        names.remove(0)
     }
 
     /// Submit and start a single-node job owned by `owner`, returning its id.
@@ -8991,6 +9520,7 @@ mod tests {
             uid: 1001,
             gid: 1001,
             is_admin: false,
+            trusted_unix: false,
         });
 
         let err = svc
@@ -9004,6 +9534,29 @@ mod tests {
             None,
             "a denied update must not mutate the job"
         );
+    }
+
+    /// A node's `reason_uid` and the audit log both attribute through this, so a
+    /// token claiming uid 0 must not leave a root fingerprint on either.
+    #[test]
+    fn only_a_kernel_vouched_uid_is_attributable() {
+        let native = spur_core::auth::Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+            trusted_unix: true,
+        };
+        assert_eq!(super::trusted_uid(Some(&native)), Some(1000));
+
+        let jwt = spur_core::auth::Identity {
+            user: "mallory".into(),
+            uid: 0,
+            trusted_unix: false,
+            ..native.clone()
+        };
+        assert_eq!(super::trusted_uid(Some(&jwt)), None);
+        assert_eq!(super::trusted_uid(None), None);
     }
 
     // `is_internal` is derived from the verified identity (an admin), not the wire `user` string, so
@@ -9037,6 +9590,64 @@ mod tests {
             }))
             .await
             .expect_err("claiming root without a credential must not bypass ownership");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_allows_operator_non_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let mut req = Request::new(CancelJobRequest {
+            job_id,
+            user: "carol".into(),
+            ..Default::default()
+        });
+        req.extensions_mut().insert(viewer("carol", true));
+        svc.cancel_job(req)
+            .await
+            .expect("a verified operator/admin must be able to cancel another user's job");
+        // Cancel of a job holding nodes lands in Completing until they report.
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            spur_core::job::JobState::Completing
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_unauthenticated_empty_user_is_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        svc.cancel_job(Request::new(CancelJobRequest {
+            job_id,
+            user: String::new(),
+            ..Default::default()
+        }))
+        .await
+        .expect("k8s operator cancel uses empty user and no bearer");
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            spur_core::job::JobState::Completing
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_job_unauthenticated_root_string_is_not_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let err = svc
+            .cancel_job(Request::new(CancelJobRequest {
+                job_id,
+                user: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the root username is not an internal caller");
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
@@ -9410,6 +10021,55 @@ mod tests {
             .expect("an Admin-level caller may bring the cluster up")
             .into_inner();
         assert!(resp.accepted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_allowed_for_cluster_admins_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.auth.cluster_admins = vec!["erin".into()];
+        let svc = test_service_with(&dir, config).await;
+        register_plain_node(&svc, "cp-a", 6818).await;
+        let mut request = Request::new(ClusterUpRequest {
+            caller: "mallory".into(),
+            control_plane_replicas: Some(1),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(spur_core::auth::Identity {
+            user: "erin".into(),
+            uid: 1001,
+            gid: 1001,
+            is_admin: false,
+            trusted_unix: true,
+        });
+        let resp = svc
+            .cluster_up(request)
+            .await
+            .expect("cluster_admins identity may bring the cluster up")
+            .into_inner();
+        assert!(resp.accepted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_bound_user_cannot_claim_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let mut request = Request::new(ClusterUpRequest {
+            caller: "root".into(),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(spur_core::auth::Identity {
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+            trusted_unix: true,
+        });
+        let err = svc
+            .cluster_up(request)
+            .await
+            .expect_err("a bound non-admin must not become root by request field");
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     async fn register_plain_node(svc: &ControllerService, name: &str, port: u16) {
@@ -10152,29 +10812,6 @@ mod tests {
     }
 
     #[test]
-    fn redaction_strips_the_planned_nodelist() {
-        // Ordering guard: annotation runs before redaction, so the planned list
-        // must not reappear on a redacted record.
-        let mut info = JobInfo {
-            sched_nodelist: "gpu-b-[01-04]".into(),
-            req_tres: "cpu=16,mem=64G,gres/gpu=8".into(),
-            features: "mi300x".into(),
-            min_cpus_node: 16,
-            min_memory_node_mb: 65536,
-            min_memory_is_per_cpu: true,
-            ..Default::default()
-        };
-        redact_sensitive_job_info(&mut info);
-        assert!(info.sched_nodelist.is_empty());
-        // The requested shape restates the allocated detail, so it goes too.
-        assert!(info.req_tres.is_empty());
-        assert!(info.features.is_empty());
-        assert_eq!(info.min_cpus_node, 0);
-        assert_eq!(info.min_memory_node_mb, 0);
-        assert!(!info.min_memory_is_per_cpu);
-    }
-
-    #[test]
     fn batch_flag_marks_only_batch_submissions() {
         use spur_core::job::{Job, JobSpec};
 
@@ -10612,6 +11249,39 @@ mod tests {
             assert_eq!(status.code(), want_code);
             let agent_retryable = spur_proto::controller_rpc_retryable(&status);
             assert_eq!(retry, agent_retryable, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn cancel_err_to_status_maps_each_variant() {
+        let cases = [
+            (CancelError::NotFound(7), Code::NotFound),
+            (
+                CancelError::AlreadyTerminal {
+                    job_id: 7,
+                    state: JobState::Cancelled,
+                },
+                Code::FailedPrecondition,
+            ),
+            (
+                CancelError::NotOwner(spur_core::auth::AuthError::NotJobOwner {
+                    user: "mallory".into(),
+                    owner: "alice".into(),
+                    action: "cancel".into(),
+                }),
+                Code::PermissionDenied,
+            ),
+            (
+                CancelError::Internal(anyhow::anyhow!("raft propose failed")),
+                Code::Internal,
+            ),
+        ];
+
+        for (err, want_code) in cases {
+            let message = err.to_string();
+            let status = cancel_err_to_status(err);
+            assert_eq!(status.code(), want_code, "{message}");
+            assert_eq!(status.message(), message);
         }
     }
 
@@ -11265,6 +11935,40 @@ mod tests {
         );
     }
 
+    /// `caller` is client-supplied, so a verified non-admin must not reach the
+    /// k0s gate by asserting `root`. Every k0s RPC binds it from the identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn k0s_membership_rejects_a_spoofed_root_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let mut add = Request::new(spur_proto::proto::ClusterAddNodesRequest {
+            caller: "root".into(), // spoofed on the wire
+            ..Default::default()
+        });
+        add.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.cluster_add_nodes(add)
+                .await
+                .expect_err("a spoofed root caller must not add k0s nodes")
+                .code(),
+            Code::PermissionDenied
+        );
+
+        let mut remove = Request::new(spur_proto::proto::ClusterRemoveNodesRequest {
+            caller: "root".into(),
+            ..Default::default()
+        });
+        remove.extensions_mut().insert(viewer("mallory", false));
+        assert_eq!(
+            svc.cluster_remove_nodes(remove)
+                .await
+                .expect_err("a spoofed root caller must not remove k0s nodes")
+                .code(),
+            Code::PermissionDenied
+        );
+    }
+
     /// Draining and removing a node both take it out of service and evict
     /// running work, so neither may be reachable by a valid non-admin token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11300,9 +12004,8 @@ mod tests {
         );
     }
 
-    /// `spurd` drains a node from its launch-failure path over an unauthenticated
-    /// channel, so the gate must keep waving through a caller with no identity —
-    /// which is also how `update_node` has always behaved.
+    /// `spurd` drains a node over an unauthenticated channel on launch failure,
+    /// so the gate must keep admitting a caller with no identity.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unidentified_caller_still_passes_the_node_gates() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -11330,6 +12033,58 @@ mod tests {
         );
     }
 
+    /// A refused mutation must still name what it targeted — "who tried to drain
+    /// node07 and was denied" is exactly what the audit log is for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_node_action_is_annotated_before_the_gate() {
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        for (name, run) in [("DrainNode", 0), ("DeregisterNode", 1), ("UpdateNode", 2)] {
+            let slot = Arc::new(crate::audit::AuditSlot::default());
+            let err = match run {
+                0 => {
+                    let mut r = Request::new(spur_proto::proto::DrainNodeRequest {
+                        name: "node07".into(),
+                        reason: "dc cycle".into(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.drain_node(r).await.unwrap_err()
+                }
+                1 => {
+                    let mut r = Request::new(spur_proto::proto::DeregisterNodeRequest {
+                        name: "node07".into(),
+                        force: true,
+                        reason: String::new(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.deregister_node(r).await.unwrap_err()
+                }
+                _ => {
+                    let mut r = Request::new(UpdateNodeRequest {
+                        name: "node07".into(),
+                        state: None,
+                        reason: None,
+                        labels: Default::default(),
+                        remove_labels: Vec::new(),
+                    });
+                    r.extensions_mut().insert(viewer("mallory", false));
+                    r.extensions_mut().insert(slot.clone());
+                    svc.update_node(r).await.unwrap_err()
+                }
+            };
+
+            assert_eq!(err.code(), Code::PermissionDenied, "{name}");
+            let annotation = crate::audit::take_for_test(&slot)
+                .unwrap_or_else(|| panic!("{name} must annotate before refusing"));
+            assert_eq!(annotation.target, "node07", "{name}");
+        }
+    }
+
     // --- authoritative_user ---
 
     #[test]
@@ -11347,6 +12102,7 @@ mod tests {
             uid: 1001,
             gid: 1001,
             is_admin: false,
+            trusted_unix: false,
         };
         ControllerService::authoritative_user(&mut user, Some(&id));
         assert_eq!(user, "bob");
@@ -11360,12 +12116,13 @@ mod tests {
             uid: 1002,
             gid: 1002,
             is_admin: false,
+            trusted_unix: false,
         };
         ControllerService::authoritative_user(&mut user, Some(&id));
         assert_eq!(user, "carol");
     }
 
-    // --- assoc_mgr_scope_user (assoc-mgr read authorization) ---
+    // --- assoc_mgr_user_filter (assoc-mgr read scoping) ---
 
     fn ident(user: &str) -> spur_core::auth::Identity {
         spur_core::auth::Identity {
@@ -11373,45 +12130,53 @@ mod tests {
             uid: 1001,
             gid: 1001,
             is_admin: false,
+            trusted_unix: false,
         }
     }
 
     #[test]
-    fn assoc_mgr_scope_user_unauthenticated_honors_the_request() {
-        // permissive/disabled: no identity is privileged, so the request stands —
-        // empty means every user, a name means that user.
-        assert_eq!(assoc_mgr_scope_user(None, "", false), None);
+    fn assoc_mgr_user_filter_under_all_scope_honors_the_selector() {
+        use spur_core::rbac::ReadScope;
+        assert_eq!(assoc_mgr_user_filter(&ReadScope::All, ""), None);
         assert_eq!(
-            assoc_mgr_scope_user(None, "alice", false).as_deref(),
+            assoc_mgr_user_filter(&ReadScope::All, "alice").as_deref(),
             Some("alice")
         );
     }
 
     #[test]
-    fn assoc_mgr_scope_user_pins_a_non_admin_to_itself() {
-        // A non-admin cannot widen (empty request) or retarget (another user) the
-        // view: both collapse to their own identity.
-        let id = ident("bob");
+    fn assoc_mgr_user_filter_pins_a_scoped_caller_to_itself() {
+        use spur_core::rbac::ReadScope;
+        let scope = ReadScope::Caller("bob".into());
+        assert_eq!(assoc_mgr_user_filter(&scope, "").as_deref(), Some("bob"));
         assert_eq!(
-            assoc_mgr_scope_user(Some(&id), "", false).as_deref(),
-            Some("bob")
-        );
-        assert_eq!(
-            assoc_mgr_scope_user(Some(&id), "alice", false).as_deref(),
+            assoc_mgr_user_filter(&scope, "alice").as_deref(),
             Some("bob")
         );
     }
 
+    /// A request already carrying a forwarded envelope reached a non-leader: a
+    /// stale leader view. It must not be forwarded on (which would mint a second
+    /// envelope over the same body); the handler returns not-leader instead.
     #[test]
-    fn assoc_mgr_scope_user_lets_an_admin_target_anyone() {
-        // An admin keeps the request: every user when empty, an arbitrary user
-        // when named.
-        let id = ident("root");
-        assert_eq!(assoc_mgr_scope_user(Some(&id), "", true), None);
-        assert_eq!(
-            assoc_mgr_scope_user(Some(&id), "alice", true).as_deref(),
-            Some("alice")
-        );
+    fn an_already_forwarded_request_is_detected() {
+        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: true,
+            reason: "tampered".into(),
+        });
+        req.extensions_mut()
+            .insert(spur_core::native_peer::ForwardedBinding {
+                action: "/slurm.SlurmController/DeregisterNode".into(),
+                request_digest: [0u8; 32],
+            });
+        assert!(ControllerService::is_already_forwarded(&req));
+
+        let mut header_only = Request::new(spur_proto::proto::DeregisterNodeRequest::default());
+        header_only
+            .metadata_mut()
+            .insert(FORWARDED_HEADER, "true".parse().unwrap());
+        assert!(ControllerService::is_already_forwarded(&header_only));
     }
 
     #[test]
@@ -11442,48 +12207,63 @@ mod tests {
         assert_eq!(opt_consumed(Some(u64::MAX)), INFINITE - 1);
     }
 
-    // --- build_reservation_txn (audit attribution) ---
-
+    /// A verified identity is always signed into an envelope, never quietly
+    /// downgraded to an unsigned forward; anonymous and JWT callers preserve the
+    /// Authorization header instead.
     #[test]
-    fn build_reservation_txn_records_verified_identity_and_large_uid() {
+    fn forward_auth_signs_an_envelope_only_for_a_verified_identity() {
         let id = spur_core::auth::Identity {
-            user: "alice".to_string(),
-            uid: 4_000_000_000, // > i32::MAX: must survive as i64, not wrap negative
-            gid: 0,
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
             is_admin: false,
+            trusted_unix: true,
         };
-        let rec = ControllerService::build_reservation_txn(
-            TxnAction::Create,
-            "resv1",
-            "alice",
-            Some(&id),
-            serde_json::json!({}),
-            &Ok(()),
-        );
-        assert!(rec.verified);
-        assert_eq!(rec.actor_uid, Some(4_000_000_000));
-        assert_eq!(rec.actor, "alice");
-        assert_eq!(rec.source, TxnSource::Api);
-        assert_eq!(rec.entity_type, TxnEntity::Reservation);
-        assert_eq!(rec.outcome, crate::accounting::TxnOutcome::Success);
+        assert!(matches!(
+            forward_auth_decision(true, Some(&id)),
+            ForwardAuth::Envelope(_)
+        ));
+        assert!(matches!(
+            forward_auth_decision(true, None),
+            ForwardAuth::Preserve
+        ));
+        assert!(matches!(
+            forward_auth_decision(false, Some(&id)),
+            ForwardAuth::Preserve
+        ));
+        assert!(matches!(
+            forward_auth_decision(false, None),
+            ForwardAuth::Preserve
+        ));
+    }
+
+    /// Ordinary client traffic carries no binding and is exactly what forwarding
+    /// exists for, so it is not flagged as already-forwarded.
+    #[test]
+    fn a_first_hop_client_request_is_not_already_forwarded() {
+        let mut req = Request::new(spur_proto::proto::DeregisterNodeRequest {
+            name: "n1".into(),
+            force: false,
+            reason: String::new(),
+        });
+        req.extensions_mut().insert(spur_core::native_peer::RpcPath(
+            "/slurm.SlurmController/DeregisterNode".into(),
+        ));
+        assert!(!ControllerService::is_already_forwarded(&req));
     }
 
     #[test]
-    fn build_reservation_txn_anonymous_is_unverified_and_captures_error() {
-        let rec = ControllerService::build_reservation_txn(
-            TxnAction::Delete,
-            "resv1",
-            "bob",
-            None,
-            serde_json::json!({}),
-            &Err(Status::permission_denied(
-                "user 'bob' cannot delete reservation",
-            )),
+    fn requested_node_state_keeps_an_unrecognized_value_verbatim() {
+        assert_eq!(requested_node_state(None, None), None);
+        assert_eq!(
+            requested_node_state(Some(99), None).as_deref(),
+            Some("invalid(99)")
         );
-        assert!(!rec.verified);
-        assert_eq!(rec.actor_uid, None);
-        assert_eq!(rec.outcome, crate::accounting::TxnOutcome::Denied);
-        assert!(rec.details.contains("cannot delete"));
+        let drain = spur_core::node::NodeState::Drain;
+        assert_eq!(
+            requested_node_state(Some(4), Some(drain)).as_deref(),
+            Some(drain.display())
+        );
     }
 
     // --- bind_spec_to_identity ---
@@ -11515,6 +12295,7 @@ mod tests {
             uid: 9999,
             gid: 9999,
             is_admin: true,
+            trusted_unix: false,
         };
         ControllerService::bind_spec_to_identity(&mut spec, Some(&id)).unwrap();
         assert_eq!(spec.user, "root");
@@ -11531,6 +12312,7 @@ mod tests {
             uid: 0,
             gid: 0,
             is_admin: false,
+            trusted_unix: false,
         };
         let err = ControllerService::bind_spec_to_identity(&mut spec, Some(&id)).unwrap_err();
         assert_eq!(
@@ -11541,5 +12323,18 @@ mod tests {
         // Spec must not be partially mutated.
         assert_eq!(spec.user, "alice");
         assert_eq!(spec.uid, 1000);
+    }
+
+    #[test]
+    fn bind_spec_uses_mint_uid_gid_without_nss() {
+        let mut spec = spec_for("impersonated", 1, 1);
+        let mut id = ident("this_user_does_not_exist_in_nss_7f3a");
+        id.uid = 4242;
+        id.gid = 4243;
+        id.trusted_unix = true;
+        ControllerService::bind_spec_to_identity(&mut spec, Some(&id)).unwrap();
+        assert_eq!(spec.user, "this_user_does_not_exist_in_nss_7f3a");
+        assert_eq!(spec.uid, 4242);
+        assert_eq!(spec.gid, 4243);
     }
 }

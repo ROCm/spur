@@ -3,7 +3,7 @@
 
 use crate::env_defaults::{apply_csv, apply_flag, apply_str, apply_string};
 use anyhow::{Context, Result};
-use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgMatches, CommandFactory, Parser};
 use spur_core::spur_env::SpurEnv;
 use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobSpec, SubmitJobRequest};
 use std::collections::HashMap;
@@ -113,8 +113,8 @@ pub async fn main() -> Result<()> {
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let submit_line = crate::submitline::render(&args);
-    let matches = SallocArgs::command().try_get_matches_from(&args)?;
-    let mut args = SallocArgs::from_arg_matches(&matches)?;
+    let matches = crate::clap_exit::matches_or_exit(SallocArgs::command(), &args);
+    let mut args = crate::clap_exit::from_matches_or_exit::<SallocArgs>(&matches);
     resolve_salloc_env(&matches, &mut args);
     let nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
@@ -141,29 +141,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let job_id = response.job_id;
     eprintln!("salloc: Pending job allocation {}...", job_id);
 
-    // Set up Ctrl+C handler to cancel the job on interrupt
-    let cancel_client = client.clone();
-    let cancel_submit_user = submit_user.clone();
-    tokio::spawn(async move {
-        let mut cancel_client = cancel_client;
-        if tokio::signal::ctrl_c().await.is_ok() {
-            eprintln!("\nsalloc: cancelling job {}...", job_id);
-            let cancel_user = crate::interactive::resolve_job_owner_for_cancel(
-                &mut cancel_client,
-                job_id,
-                &cancel_submit_user,
-            )
-            .await;
-            let _ = cancel_client
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 2, // SIGINT
-                    user: cancel_user,
-                })
-                .await;
-            std::process::exit(130); // Standard SIGINT exit code
-        }
-    });
+    crate::interactive::install_ctrl_c_cancel(
+        client.clone(),
+        job_id,
+        submit_user.clone(),
+        "salloc",
+    );
 
     // Wait for the job to start running (with timeout and progress)
     let job_info;
@@ -432,6 +415,7 @@ fn parse_memory_mb(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::FromArgMatches;
 
     #[test]
     fn build_salloc_job_spec_records_the_submit_line() {

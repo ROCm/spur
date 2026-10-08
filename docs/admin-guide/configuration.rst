@@ -14,11 +14,13 @@ and meaning.
 
    ``spurctld`` reads every section of ``spur.conf``. ``spurd`` reads the same file
    but only for local agent settings (``[hooks]``, ``[devices]``, ``rlimits.memlock``,
-   ``[cgroup]``, ``[cluster]``, and ``[mpi]``); its identity and networking come from
-   CLI flags.
-   Node CPU, memory, and GRES are reported by each agent when it registers, not
-   declared here — ``[[nodes]]`` only overlays scheduling policy onto nodes that
-   have already registered.
+   ``[cgroup]``, ``[cluster]``, ``[mpi]``, and ``[spurd]``); its identity and
+   networking come from CLI flags.
+   Node CPU, memory, and GRES are reported by each agent when it registers;
+   ``[[nodes]]`` overlays scheduling policy onto nodes that have already registered.
+   The exception is ``cpus`` / ``memory_mb`` / ``reserved_memory_mb``, which cap the
+   agent-reported CPU and memory (see the ``[[nodes]]`` table below); GRES is always
+   agent-reported.
 
 Minimal configuration
 ----------------------
@@ -108,11 +110,21 @@ and the plugin set also require a daemon restart.
 **Leader-only, in an HA cluster.** ``reconfigure`` is handled by the Raft leader and
 swaps only that controller's in-memory config; no Raft log entry carries the new
 file, so followers keep the config they loaded at startup until they restart (in
-Kubernetes they re-read the same ConfigMap). ``[[partitions]]`` is the exception —
+Kubernetes they re-read the same Secret). ``[[partitions]]`` is the exception —
 partition changes replicate through the write-ahead log — but a follower re-derives
-node features and weight from its own pre-reconfigure ``[[nodes]]`` blocks. Do not
-rely on reconfigured non-partition state surviving an immediate failover; roll the
-controllers to converge them.
+node features, weight, and resource caps (``cpus`` / ``memory_mb`` /
+``reserved_memory_mb``) from its own pre-reconfigure ``[[nodes]]`` blocks. In
+particular, a cap you *lower* via ``reconfigure`` is not enforced by a follower that
+has not restarted, so after an immediate failover the new leader may briefly admit
+against the old (higher) cap. Do not rely on reconfigured non-partition state
+surviving an immediate failover; roll the controllers to converge them.
+
+Resource caps are applied by the controller when it stores a node's inventory, so a
+controller that predates cap support stores the raw agent-reported inventory
+uncapped. During a rolling upgrade, caps are only guaranteed once **every**
+controller runs a cap-aware build; until then a failover to an old controller can
+admit against the uncapped inventory. Finish the controller upgrade before relying
+on caps for oversubscription/OOM protection.
 
 .. warning::
 
@@ -299,23 +311,71 @@ and Raft high-availability topology.
        bounded only by this value. A node that exceeds it is skipped for new
        dispatch for the same span, and is not marked down, so it still
        appears available in ``sinfo`` while being skipped.
-   * - ``job_info_visibility``
-     - string
-     - ``redacted``
-     - Live
-     - How much of another user's job an identified non-owner (non-admin) may
-       read via ``get_job`` / ``get_job_steps``. ``redacted`` (default) shows
-       identity, state, timing, and account but blanks the working directory,
-       command, submit line, stdio paths, comment, the allocated, requested,
-       and planned node lists, and both the allocated and requested resource
-       detail (``ReqTRES``, ``Features``, and the per-node minima);
-       ``owner_only`` returns ``NOT_FOUND`` for other users' jobs; ``full`` is the
-       legacy behaviour where every field is visible to any caller. Owners and
-       admins always see the full record. Scoping applies only to identified
-       callers — under ``auth.mode = required``, or when a credential is
-       presented under ``permissive``; with authentication disabled or no
-       credential presented, the full record is returned (so no-auth deployments
-       and internal consumers are unaffected).
+
+``[spurd]``
+-----------
+
+``spurd``'s own channel and RPC tuning for its connection to the controller — the
+inverse direction of ``[controller] agent_connect_timeout_secs`` /
+``agent_keepalive_interval_secs`` / ``agent_keepalive_timeout_secs`` above, which
+bound the controller's connections to agents instead.
+
+**Reload: Agent restart.**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 10 12 50
+
+   * - Field
+     - Type
+     - Default
+     - Description
+   * - ``controller_connect_timeout_secs``
+     - integer
+     - ``2``
+     - Budget for establishing spurd's connection to the controller. Range 0-600;
+       ``0`` falls back to the OS TCP timeout. Deliberately shorter than
+       ``[controller] agent_connect_timeout_secs``'s default of ``5``: this only
+       bounds the dial, which a controller that accepts TCP and never engages at
+       the app layer still completes quickly, so a short budget just means
+       spurd fails over to another configured endpoint sooner.
+   * - ``controller_keepalive_interval_secs``
+     - integer
+     - ``10``
+     - HTTP/2 ping interval on spurd's open connection to the controller. Range
+       0-600. ``0`` disables keepalive entirely. This is what detects a
+       controller that accepted the connection and then went silent — total
+       detection time is roughly this plus ``controller_keepalive_timeout_secs``.
+   * - ``controller_keepalive_timeout_secs``
+     - integer
+     - ``5``
+     - How long spurd waits for a ping response before dropping the connection.
+       Range 1-600 whenever keepalive is on; ``0`` is rejected because it marks
+       every ping overdue the moment it is sent. Ignored entirely when
+       ``controller_keepalive_interval_secs`` is ``0``.
+   * - ``controller_rpc_timeout_secs``
+     - integer
+     - ``10``
+     - Ceiling on a single register/heartbeat/deregister/recovery RPC to the
+       controller. These are fast, bounded calls — unlike a controller-to-agent
+       launch — so a hung one means wedged, not slow. Range 1-86400; ``0`` is
+       rejected (it would fail every RPC instantly rather than bound a hang).
+   * - ``controller_failover_cooldown_secs``
+     - integer
+     - ``60``
+     - How long a controller endpoint that just failed to dial or answer is
+       deprioritized in favor of another configured endpoint, so it can't
+       "recapture" every reconnect attempt before the next one is due. Range
+       0-86400; ``0`` disables the cooldown.
+   * - ``native_mint_timeout_secs``
+     - integer
+     - ``5``
+     - Ceiling on one native-auth credential mint over the local Unix socket.
+       Only consulted under ``[auth] plugin = "spur"``. The mint read runs
+       inside a synchronous tonic interceptor, so this is the only thing that
+       bounds a mint that accepts the connection and never replies — an
+       ``async`` timeout around the RPC cannot preempt it. Range 1-60 (a fast
+       local call, bounded tighter than the RPC/cooldown fields above).
 
 ``[accounting]``
 ----------------
@@ -510,7 +570,46 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        immediately eligible. Can be overridden per-partition (``preempt_exempt_time``
        in ``[[partitions]]``) and per-QOS (``preemptexempttime`` via
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
-       Mirrors Slurm's ``PreemptExemptTime``.
+       Mirrors Slurm's ``PreemptExemptTime``. Does not apply to idle-fill reclaim,
+       which uses ``idle_fill_exempt_secs`` instead.
+   * - ``idle_fill_enabled``
+     - boolean
+     - ``false``
+     - Live
+     - Let a job that has exceeded its QOS group node quota run anyway, on nodes
+       no job with a quota claim wants. Such a run is *borrowed*: it consumes no
+       quota, and it is reclaimed when a job that does hold a claim needs the
+       capacity. Off by default; enabling it narrows a preemption guarantee, so
+       read :doc:`idle-fill-scheduling` before turning it on.
+   * - ``idle_fill_exempt_secs``
+     - integer
+     - ``60``
+     - Live
+     - Minimum number of seconds a borrowed job runs before it may be reclaimed,
+       and the only guard standing between a borrowed job and reclaim. The window
+       doubles on each successive eviction of the same job, capped at one hour, so
+       repeated lend-and-reclaim converges instead of churning. Deliberately
+       separate from ``preempt_exempt_time``, which is unbounded and which a user
+       can raise for their own job by submitting to several partitions.
+   * - ``idle_fill_max_borrow_factor``
+     - float
+     - ``0.0``
+     - Live
+     - Ceiling on how many nodes one QOS may hold on loan at once, as a multiple
+       of that QOS's own group node cap: ``2.0`` lets a QOS capped at 4 nodes
+       borrow 8 more. ``0.0`` means no ceiling from this dimension. Bounds a
+       single team's blast radius. The ceiling only ever denies a *new* loan, so
+       lowering it never evicts a run that is already borrowing.
+   * - ``idle_fill_max_cluster_fraction``
+     - float
+     - ``0.0``
+     - Live
+     - Ceiling on how many nodes one QOS may hold on loan at once, as a fraction
+       of the cluster's registered nodes: ``0.25`` on a 100-node cluster allows 25.
+       ``0.0`` means no ceiling from this dimension. Needed alongside the factor
+       because a multiple of a large quota can still swallow the cluster. When
+       both are set the tighter one wins, and fractions floor, so a ceiling never
+       overshoots.
 
 .. note::
 
@@ -562,11 +661,103 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 ``[auth]``
 ----------
 
-How client requests are authenticated.
+Two settings decide how callers are authenticated. ``plugin`` picks the kind of
+credential the cluster accepts, and ``mode`` decides how strictly one is
+demanded. Who may drain a node or touch another user's job is configured in the
+same section, under `Roles and access control`_.
+
+Each plugin below is documented on its own: what it gives you, what it does not,
+every field it needs, and a complete example. Read only the one you intend to
+run.
+
+Choosing a plugin
+~~~~~~~~~~~~~~~~~
 
 .. list-table::
    :header-rows: 1
-   :widths: 20 10 16 14 40
+   :widths: 14 29 28 29
+
+   * - Plugin
+     - What the caller presents
+     - What you get
+     - What it costs
+   * - ``"none"``
+     - Nothing. The username in the request is believed as sent.
+     - Nothing to install, nothing to distribute.
+     - No enforcement. Anyone who can reach the port can act as any user.
+   * - ``"jwt"`` (default)
+     - A bearer token minted by ``spur token user``, kept in ``~/.spur/token``
+       or ``$SPUR_AUTH_TOKEN``.
+     - Verified usernames from one shared secret held on the controller, and
+       node identity for token-based admission.
+     - Tokens are copyable files valid until they expire. Revoking one means
+       rotating the key and reissuing every token.
+   * - ``"spur"``
+     - A short-lived credential minted for that one call by a local
+       ``spurauthd``, which reads the caller's UID from the kernel.
+     - Identity that cannot be copied, forwarded, or handed to a colleague,
+       plus signed job and step launch credentials.
+     - ``spurauthd`` and key files must be installed on every host that makes
+       or verifies calls.
+
+Choose ``"none"`` only where the network is the real boundary: a laptop, a CI
+sandbox, a single-user test rig. Choose ``"jwt"`` when you need enforcement
+without running another daemon on every host, or when nodes join using
+admission tokens. Choose ``"spur"`` for a shared cluster where people log in to
+a submit host — the credential comes from their Unix session, so there is
+nothing for a user to leak and nothing for you to hand out per person.
+
+``"munge"`` is recognised but not implemented. It, and any unrecognised value,
+is rejected at startup rather than quietly ignored.
+
+Authentication modes
+~~~~~~~~~~~~~~~~~~~~
+
+``mode`` means the same thing whichever plugin is selected.
+
+``"disabled"``
+   Credentials are ignored, even valid ones. Every caller is anonymous and its
+   asserted username is trusted.
+
+``"permissive"`` (default)
+   A request carrying no credential is allowed, and its asserted username is
+   trusted. A request that does carry one must pass verification — an invalid,
+   expired, or malformed credential is refused in this mode too, so presenting
+   a forgery is never better than presenting nothing. An unauthenticated
+   caller is never subject to :ref:`private_data <private-data>`, so they can
+   list and fetch every job. This is the migration setting: start here, watch
+   the logs name each caller that is still unauthenticated, then tighten.
+
+``"required"``
+   Every request must carry a valid credential. Unauthenticated callers are
+   refused before any handler runs.
+
+Liveness checks are exempt in every mode: gRPC ``Ping`` and REST ``/ping``
+never need a credential.
+
+An unauthenticated gRPC ``CancelJob`` that sends an empty user is treated as
+the in-cluster daemon and can cancel any job. REST cancel still demands a
+bearer token. That applies to ``"disabled"`` and credential-less ``"permissive"``
+under every plugin, including default ``jwt``, not only ``"none"``.
+
+``plugin = "none"``
+~~~~~~~~~~~~~~~~~~~
+
+Use ``mode = "disabled"``. Then no caller is identified: job ownership,
+reservation management, and who may read another tenant's job all rest on the
+username the client chose to send.
+
+**You get:** a cluster that runs with zero authentication setup.
+
+**You do not get:** any enforcement. With no verified identity, role bindings
+such as ``cluster_admins`` have nothing to bind to, so every privileged
+operation is open to every caller that reaches the port. Leave this plugin on
+``"permissive"`` and a presented bearer token is still verified — including
+against a built-in key when no ``jwt_key`` is set (see the warning below).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 16 14 42
 
    * - Field
      - Type
@@ -577,86 +768,498 @@ How client requests are authenticated.
      - string
      - ``"jwt"``
      - Restart
-     - Constrains startup only: ``"munge"`` and any unrecognised value are
-       rejected rather than silently ignored, and ``"none"`` with
-       ``mode = "required"`` is refused as contradictory. Nothing reads it
-       afterwards — whether a presented credential is verified is decided by
-       ``mode`` and the configured signing key alone, so ``plugin = "none"``
-       does **not** turn verification off.
+     - Set to ``"none"``.
    * - ``mode``
      - string
      - ``"permissive"``
      - Restart
-     - ``"disabled"`` ignores credentials entirely, even valid ones.
-       ``"permissive"`` verifies a credential that is presented — an invalid or
-       malformed one is always refused — but allows a request that carries none.
-       ``"required"`` refuses every request without a valid credential.
+     - Use ``"disabled"``. ``"required"`` is refused at startup, because no
+       credential exists to require.
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "none"
+   mode = "disabled"
+
+.. warning::
+
+   Restrict the controller port (6817) at the network layer — it is the only
+   boundary this configuration has. ``spurctld`` warns at startup whenever it
+   binds a non-loopback address without ``mode = "required"``. An
+   unauthenticated gRPC ``CancelJob`` that sends an empty user is treated as
+   the in-cluster daemon and can cancel any job; REST cancel still demands a
+   bearer token.
+
+   Prefer ``mode = "disabled"`` over ``"permissive"`` here. ``"none"`` does not
+   switch the verification path off: under ``"permissive"`` a request that
+   presents a bearer token is still checked, and with no ``jwt_key`` configured
+   that check falls back to a built-in key, so a token signed with that
+   well-known value verifies as a real identity — including an admin one.
+
+``plugin = "jwt"``
+~~~~~~~~~~~~~~~~~~
+
+Callers present a bearer token signed with one secret that the controller
+holds. The token carries a username, an expiry, and an optional admin claim.
+The controller re-resolves the UID from the username through NSS, so a UID
+inside a token cannot influence what a job runs as.
+
+**You get:** verified usernames with no extra daemon anywhere, plus attested
+node identity when ``[admission] mode = "token"`` is in use — the same key
+signs both.
+
+**You do not get:** containment of a leaked token. It is a file; whoever reads
+it is that user until it expires. There is no per-token revocation for user
+credentials — rotating the signing key invalidates all of them at once.
+
+Fields
+""""""
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 16 14 42
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``plugin``
+     - string
+     - ``"jwt"``
+     - Restart
+     - Already the default; set explicitly for clarity.
+   * - ``mode``
+     - string
+     - ``"permissive"``
+     - Restart
+     - ``"required"`` to enforce, ``"permissive"`` while rolling tokens out.
    * - ``jwt_key``
      - string
      - none
      - Restart
-     - Signing key for user credentials (``spur token user``) and node admission
-       tokens, given inline. The value is used literally as the secret — a path
-       here is the secret itself, not a file to read from. Deliberately not
-       reloadable: swapping it live would immediately invalidate every
-       outstanding token.
+     - The signing secret, inline. Used literally: a path written here is the
+       secret itself, not a file to read. Required only when
+       ``mode = "required"``.
    * - ``jwt_key_file``
      - string
      - none
      - Restart
-     - Path to a regular file whose contents are the signing key, for keeping the
-       secret out of ``spur.conf``. A single trailing line ending is ignored.
-       Mutually exclusive with ``jwt_key``: setting both is rejected at startup.
-   * - ``allow_root_jobs``
-     - bool
-     - ``false``
-     - Agent restart
-     - Permit jobs to run as UID 0. Consumed by ``spurd`` at its own startup.
+     - Path to a regular file whose contents are the secret, to keep it out of
+       ``spur.conf``. One trailing line ending is ignored. Alternative to
+       ``jwt_key``; same ``mode = "required"`` rule.
 
-.. warning::
+Set at most one of ``jwt_key`` or ``jwt_key_file``; setting both is rejected at
+startup, and so is ``mode = "required"`` with neither. Neither is reloadable:
+``scontrol reconfigure`` keeps the key captured at startup, because adopting a
+new one live would invalidate every outstanding token at once.
 
-   Under the default ``mode = "permissive"``, a caller that presents no
-   credential is unauthenticated, and the username it asserts in the request is
-   taken at face value. Identity-dependent decisions — job ownership, reservation
-   management, job-info visibility — are then only as trustworthy as the network.
-   Set ``mode = "required"`` (with ``jwt_key`` or ``jwt_key_file``) to make them
-   enforceable, and restrict the controller port at the network layer either way.
-   ``spurctld`` warns at startup whenever it binds a non-loopback address without
-   ``required``.
+Under the default ``mode = "permissive"``, a missing key is allowed: the
+controller still verifies any bearer token that is presented, falling back to a
+built-in signing key. A token signed with that well-known value is accepted as
+a real identity, including an admin one. Set an explicit key before you issue
+tokens, even while still on ``"permissive"``.
+
+Example
+"""""""
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "jwt"
+   mode = "required"
+   jwt_key_file = "/etc/spur/jwt.key"
+
+Issuing user credentials
+""""""""""""""""""""""""
+
+Run this on a controller host — it signs locally from the configured key rather
+than calling the controller, so it still works under ``mode = "required"``:
+
+.. code-block:: console
+
+   $ spur token user --user alice --ttl 24h
+   $ spur token user --user erin --admin
+
+The token is printed on stdout; everything else goes to ``stderr``, so it can be
+redirected straight into a file. Users store it as ``~/.spur/token`` with mode
+``0600`` or export it as ``$SPUR_AUTH_TOKEN``. A token file readable by other
+users is ignored with a warning rather than used. The default lifetime is 24
+hours; ``--ttl`` accepts values like ``24h``, ``7d``, or ``3600s``.
+
+Rolling this out to a live cluster
+""""""""""""""""""""""""""""""""""
+
+Start with ``mode = "permissive"`` and a key configured, distribute tokens,
+then restart with ``mode = "required"`` once the logs no longer name
+unauthenticated callers.
 
 .. note::
 
-   Token admission needs a signing key to attest node identity. When neither
-   ``jwt_key`` nor ``jwt_key_file`` is set, ``[admission] mode = "token"`` still
-   gates which nodes may register — the join token is checked — but registered
-   agents are issued no node credential and none is demanded of them afterwards,
-   so a caller that reaches the controller port can act as any registered node.
-   ``spurctld`` warns at startup in this configuration; set an explicit key
-   before relying on token admission.
+   Token-based node admission is attested by this same key. With
+   ``[admission] mode = "token"`` but no key set, join tokens still gate which
+   nodes may register, yet registered agents are issued no node credential and
+   none is demanded afterwards — so a caller that reaches the controller port
+   can act as any registered node. ``spurctld`` warns at startup in that state.
+
+.. _native-auth-plugin:
+
+``plugin = "spur"``
+~~~~~~~~~~~~~~~~~~~
+
+Spur's native plugin. There is no token to hand out: on every call the CLI (or
+``spurd``) asks a local ``spurauthd`` over a Unix socket for a fresh
+credential, and ``spurauthd`` takes the caller's UID, GID, and PID straight
+from the kernel (PID is not on the wire). The credential is bound to one
+verifier: its audience and boot epoch. A nonce is remembered until it expires,
+so the same credential cannot be accepted twice at that audience.
+
+**You get:** an identity a user cannot copy, forward, or lend; automatic
+expiry with no distribution step; signed job and step launch credentials that
+agents verify before executing anything; and a separate controller identity
+for controller-to-agent calls.
+
+**You do not get:** JWT compatibility — ``spur token user`` refuses to mint
+against this plugin and JWT user tokens are rejected on the wire. Every host
+that makes calls needs ``spurauthd`` running and the caller must be resolvable
+by NSS on that host.
+
+Step 1 — generate the key sets
+""""""""""""""""""""""""""""""
+
+Run as root on one controller. Files are written mode ``0600``:
+
+.. code-block:: console
+
+   $ spur auth-keys hmac --kid auth-1 --out /etc/spur/auth.jwks
+   $ spur auth-keys ed25519 --kid ctrl-1 \
+       --signing /etc/spur/controller-signing.jwks \
+       --verify  /etc/spur/controller-verification.jwks
+   $ spur auth-keys ed25519 --kid cred-1 \
+       --signing /etc/spur/cred-signing.jwks \
+       --verify  /etc/spur/cred-verification.jwks
+   $ spur auth-keys ed25519 --kid node-1 \
+       --signing /etc/spur/node-signing.jwks \
+       --verify  /tmp/node-verification.jwks
+
+Step 2 — distribute them
+""""""""""""""""""""""""
+
+Copy only what each host needs. A host that is both controller and agent needs
+both sets. A missing required file stops the daemon at startup.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 12 12 12 30
+
+   * - File (under ``/etc/spur``)
+     - Controller
+     - Agent
+     - Login node
+     - Purpose
+   * - ``auth.jwks``
+     - yes
+     - yes
+     - yes
+     - Mints and verifies user credentials.
+   * - ``controller-signing.jwks``
+     - yes
+     - no
+     - no
+     - Signs controller-to-agent calls and forwarded identities.
+   * - ``controller-verification.jwks``
+     - no
+     - yes
+     - no
+     - Lets an agent verify the controller.
+   * - ``cred-signing.jwks``
+     - yes
+     - no
+     - no
+     - Signs job and step launch credentials.
+   * - ``cred-verification.jwks``
+     - no
+     - yes
+     - no
+     - Lets an agent verify a launch credential.
+   * - ``node-signing.jwks``
+     - yes
+     - no
+     - no
+     - Attests node identity at admission. The controller both signs and
+       verifies these, so the matching verification file is not distributed.
+
+Step 3 — run ``spurauthd`` on every host that makes calls
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+That means login nodes (for the CLI) and compute nodes (``spurd`` authenticates
+its own register, heartbeat, and completion calls). Controllers need it too if
+anyone runs the CLI there:
+
+.. code-block:: console
+
+   $ spurauthd --cluster mi300x-cluster --jwks /etc/spur/auth.jwks
+
+It listens on ``/run/spur/<cluster-name>/auth.sock``, mode ``0666`` so ordinary
+users can connect; the signing keys stay in ``/etc/spur`` and are never
+readable through the socket. Run it under systemd so it starts before
+``spurctld`` and ``spurd``. Without a reachable mint, ``mode = "required"``
+rejects those callers.
+
+``spurauthd`` ships in the release and nightly tarballs, so ``install.sh``
+installs it with the other binaries. From source, build it with
+``cargo build --release -p spurauthd``.
+
+Step 4 — configure the cluster
+""""""""""""""""""""""""""""""
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 16 14 42
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``plugin``
+     - string
+     - ``"jwt"``
+     - Restart
+     - Set to ``"spur"``.
+   * - ``mode``
+     - string
+     - ``"permissive"``
+     - Restart
+     - ``"required"`` to enforce. ``jwt_key`` is **not** needed for this plugin,
+       in any mode.
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "spur"
+   mode = "required"
+
+The same values go in ``spur.conf`` on controllers and agents. Where no config
+file is present, set ``$SPUR_AUTH_PLUGIN=spur`` and ``$SPUR_CLUSTER_NAME``
+instead; the cluster name is mandatory there and startup fails without it.
+
+.. warning::
+
+   With ``mode = "required"``, ``spurctld`` refuses to start when the REST API
+   is enabled on a non-loopback address, because REST has no mint handshake.
+   Bind ``controller.rest_addr`` to loopback, or set
+   ``[rest_api] allow_non_loopback = true`` if a trusted gateway sits in front
+   of it.
+
+.. note::
+
+   Each ``spurctld`` or ``spurd`` restart picks a new random boot epoch, and
+   credentials minted against the previous one stop verifying. Clients re-learn
+   the epoch on their next ``Ping`` and mint again, so this is invisible in
+   normal use — but it does mean an in-flight credential is never valid across
+   a restart.
+
+Roles and access control
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every authenticated caller resolves to exactly one of four fixed roles. Sites
+assign them; new roles cannot be defined. A caller with no verified identity is
+not a User. For visibility that only matters once :ref:`private_data
+<private-data>` is set: by default every caller, identified or not, sees every
+job and every assoc_mgr scope. An unauthenticated caller is the path
+``"disabled"`` and credential-less ``"permissive"`` take, including the default
+``jwt`` configuration until you set ``mode = "required"``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 82
+
+   * - Role
+     - May do
+   * - User
+     - Submit and manage their own jobs. Sees every tenant's jobs and assoc_mgr
+       scopes by default; see :ref:`private-data` to pin their view to their
+       own.
+   * - Coordinator
+     - Reserved for a future grant hierarchy. Not assigned today.
+   * - Operator
+     - Everything a User may do, plus manage anyone's jobs and reservations and
+       change accounting records. May not drain or remove nodes, edit
+       partitions, mint admission tokens, or reconfigure the cluster.
+   * - Administrator
+     - Full control of the cluster, including every operation listed under
+       `Privileged operations`_.
+
+Spur checks each source below and grants the highest role any of them yields; a
+caller matching none is a User.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 10 14 50
+
+   * - Field
+     - Type
+     - Reload
+     - Grants
+   * - ``cluster_admins``
+     - list of strings
+     - Restart
+     - Administrator to these usernames, whatever accounting says.
+   * - ``admin_groups``
+     - list of strings
+     - Restart
+     - Administrator to members of these groups. Matched case-insensitively.
+   * - ``operator_groups``
+     - list of strings
+     - Restart
+     - Operator to members of these groups. Matched case-insensitively.
+   * - ``allow_uid_zero_administrator``
+     - bool
+     - Restart
+     - Administrator to a caller the native mint verified as UID 0. Applies to
+       ``plugin = "spur"`` only, and is off by default: root on a login node is
+       not automatically root on the cluster.
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "spur"
+   mode = "required"
+   cluster_admins = ["erin"]
+   admin_groups = ["gpu-admins"]
+   operator_groups = ["acct-ops"]
+   allow_uid_zero_administrator = false
+
+Two sources live outside this section. A user whose accounting record sets an
+admin level — ``sacctmgr modify user name=bob set adminlevel=Operator``, or
+``Admin`` for Administrator — gets that role as well. And under
+``plugin = "jwt"``, a token minted with ``spur token user --admin`` is
+Administrator on its own.
+
+Group membership is read through NSS on the host doing the verifying, so both
+the controller and every agent must be able to resolve the caller's groups
+(``/etc/group``, LDAP, SSSD — whatever is configured there). Agents have no
+accounting database, so on a node only the config lists and the plugin's own
+admin signal apply.
+
+.. note::
+
+   Accounting-derived roles are read from an in-memory cache. Until the first
+   successful load — the first moments after a restart, or if PostgreSQL never
+   answers — accounting is not consulted and the caller is treated as a plain
+   User. Spur denies rather than guesses, so a privileged command may be
+   refused briefly after a restart. Retry once the controller has finished
+   loading. After that first load, a later PostgreSQL outage keeps the last
+   snapshot: cached Operator and Administrator bindings still apply until a
+   refresh succeeds. Under ``private_data``, an Operator whose role comes only
+   from accounting sees just their own jobs during that window.
+
+.. _private-data:
+
+Job and usage visibility (``private_data``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default every caller sees every job and every ``scontrol show assoc_mgr``
+scope, as a stock ``slurm.conf`` does. That includes each job's ``command``, the
+first non-comment line of its batch script, so a credential written there is
+readable by every user. ``private_data`` under ``[auth]`` is the equivalent of
+Slurm's ``PrivateData`` and narrows what a User sees.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 10 10 52
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``private_data``
+     - list of strings
+     - ``[]``
+     - Live
+     - Categories to hide from Users. Must be a TOML list:
+       ``private_data = "jobs,usage"`` is a parse error.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 82
+
+   * - Category
+     - Hides from a User
+   * - ``"jobs"``
+     - Other users' jobs and steps: ``squeue``/``spur queue``, ``sprio``,
+       ``sstat``, ``scontrol show job``/``step``, the jobs that ``scancel -p``,
+       ``-A``, or ``-n`` selects, and REST ``/jobs`` and ``/job/{id}``.
+       ``squeue -u other``, ``squeue -j``, and ``scontrol show job`` print
+       nothing for another user's job; ``sstat``, ``scontrol show step``, and
+       REST ``/job/{id}`` report it as not found.
+   * - ``"usage"``
+     - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
+       part in, and only their own ``User=`` lines. A ``users=`` selector is
+       replaced with their own name. ``Grp*`` totals still include every user's
+       jobs.
+
+``sacct``, ``sshare``, and ``sreport`` are not restricted by either category yet.
+Set both categories for the visibility closest to what Spur v0.13 and v0.14
+enforced:
+
+.. code-block:: toml
+
+   [auth]
+   plugin = "spur"
+   mode = "required"
+   private_data = ["jobs", "usage"]
+
+Operators and Administrators are exempt. Root is exempt only through a role
+(``cluster_admins``, ``admin_groups``, an accounting admin level, or
+``allow_uid_zero_administrator``), and account coordinators are not exempt.
+
+.. warning::
+
+   ``private_data`` restricts identified callers only. Under ``"permissive"`` or
+   ``"disabled"``, a caller that sends no credential is not restricted at all,
+   and ``spurctld`` logs a warning at startup and on ``reconfigure``. Use the
+   native plugin with ``mode = "required"``, as above. Under ``plugin = "jwt"``,
+   ``spurd`` presents no credential to the controller, so ``"required"`` stops
+   agents from registering; on a JWT cluster ``private_data`` only hides data
+   from users who keep their token set.
+
+``scontrol reconfigure`` applies a change on the leader, which serves every gRPC
+read. Followers keep their startup value for REST and for any read they serve
+while the leader is unreachable, so restart every controller after changing it.
+``spurctld`` refuses to start, or to reconfigure, on a category it does not
+support; agents and the CLI ignore unknown category names.
 
 .. _privileged-operations:
 
 Privileged operations
 ~~~~~~~~~~~~~~~~~~~~~
 
-The control-plane mutations that define cluster tenancy — partitions, node state
-and labels (``scontrol update NodeName=``, ``spur node drain``, ``spur node
-remove``), ``reconfigure``, admission tokens, reservations, and the accounting
-account/user/QOS records — require a **cluster admin**. A caller with
-a verified non-admin identity is refused with ``PermissionDenied``. A caller with
-*no* verified identity is allowed, so that ``disabled`` and credential-less
-``permissive`` deployments keep working; under ``mode = "required"`` every caller
-is authenticated, so the bar binds everyone.
+These control-plane mutations define cluster tenancy and require
+**Administrator**:
 
-Admin means one of the following:
+* partitions;
+* node state and labels — ``scontrol update NodeName=``, ``spur node drain``,
+  ``spur node remove``;
+* ``scontrol reconfigure``;
+* admission tokens;
+* the k0s cluster manager.
 
-* a credential minted with ``spur token user --admin``;
-* a credential for the user ``root``;
-* an accounting admin level of ``Admin`` (see :doc:`accounting`).
+Managing anyone's jobs and reservations, and writing accounting records,
+requires **Operator** or above — as does *reading* the ``txn`` audit log with
+``sacctmgr show txn``, which exposes every user's actions and the addresses they
+came from. After a user, account, or QOS write, the association cache is
+refreshed immediately so a new role binding takes effect without waiting for the
+next poll.
 
-Only the first counts for the accounting service's own mutations: it holds no
-association cache and does not special-case ``root``, so it accepts the token
-claim alone. The controller RPCs honour all three.
+A caller whose verified role is below the bar is refused with
+``PermissionDenied``. A caller with *no* verified identity is allowed through,
+so that ``disabled`` and credential-less ``permissive`` deployments keep
+working — which is exactly why those modes are not a security boundary. Under
+``mode = "required"`` every caller is authenticated, so the bar binds everyone.
 
 Reservations are the one exception, and are stricter in two ways. An
 unidentified caller is **not** waved through, and membership of ``sudo`` or
@@ -686,6 +1289,30 @@ update or delete any reservation, matching Slurm's operator semantics.
    asserted, so under ``permissive`` this stops an unprivileged client but not a
    deliberately crafted request. ``mode = "required"`` is what makes it a
    boundary, because there the name comes from the verified credential.
+
+Running jobs as root
+~~~~~~~~~~~~~~~~~~~~
+
+One field in this section is about what a job may run as, not about who the
+caller is. It is read by ``spurd``, so it applies whichever plugin is selected.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 10 16 14 42
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``allow_root_jobs``
+     - bool
+     - ``false``
+     - Agent restart
+     - Permit jobs to execute as UID 0.
+
+The UID arrives as part of the job spec, so enable this only on a cluster where
+everyone allowed to submit is already trusted with root on the compute nodes.
 
 ``[[partitions]]``
 ------------------
@@ -795,12 +1422,34 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
        that node exclusively will have to wait until the paused job either
        finishes or is cancelled.
        ``"off"`` (default) — running jobs in this partition are never kicked
-       out. The scheduler will wait for a free slot instead of preempting.
+       out *by preemption*. The scheduler will wait for a free slot instead.
 
        A job's QOS can change what happens to *that specific job* when it is
        kicked out (see ``preemptmode`` in :doc:`accounting`). The partition
        field is the on/off switch: preemption is only attempted at all when
        this is set to something other than ``"off"``.
+
+       .. important::
+
+          This setting governs **preemption**, and preemption arbitrates between
+          two jobs that both hold a claim on the capacity. It does not cover
+          :doc:`idle-fill-scheduling`, which is a different question: a borrowed
+          job holds no claim at all, having exceeded its QOS group node quota and
+          run only on capacity nobody with a claim wanted.
+
+          Reclaim therefore consults none of ``preempt_mode``, the priority gap,
+          the QOS allow list, or ``preempt_exempt_time``. With idle-fill enabled,
+          the guarantee narrows from "running jobs in this partition are never
+          kicked out" to **"jobs with a quota claim are never kicked out"**. The
+          only guard on a borrowed job is ``idle_fill_exempt_secs``.
+
+          A borrowed job is *defined* by being reclaimable, so shielding it would
+          not produce a safer job — it would produce capacity that was lent out
+          and can never be recovered, which is worse than never lending it. Two
+          things bound the change: ``idle_fill_enabled`` is off by default, so no
+          existing cluster behaves differently until an operator turns it on, and
+          for every job running inside its quota ``"off"`` still means exactly
+          what it says.
    * - ``preempt_exempt_time``
      - integer or null
      - ``null`` (inherit global)
@@ -842,13 +1491,27 @@ matches, and the first matching entry wins.
    * - ``cpus``
      - integer
      - ``0``
-     - Not implemented
-     - CPU count. Reported by the agent at registration; this value is ignored.
+     - Live
+     - Cap on schedulable CPUs. The agent autodetects the host; a configured value
+       below the detected count wins, a value above it is ignored (config cannot
+       invent hardware). ``0`` means unset (use detected). Set this to the core
+       count you want to schedule regardless of the host's BIOS SMT setting — it
+       is the equivalent of Slurm's ``CPUs=``.
    * - ``memory_mb``
      - integer
      - ``0``
-     - Not implemented
-     - Memory in MB. Reported by the agent at registration; this value is ignored.
+     - Live
+     - Cap on schedulable memory in MB. Applied like ``cpus``: a value below
+       detected wins, above is ignored. ``0`` means unset. Equivalent of Slurm's
+       ``RealMemory=``. See also ``reserved_memory_mb``.
+   * - ``reserved_memory_mb``
+     - integer
+     - ``0``
+     - Live
+     - Memory in MB held back from the detected total for the OS and runtime
+       (e.g. ROCm), so jobs cannot be packed into headroom the host needs. Applied
+       together with ``memory_mb``; the smaller resulting value wins. Must be less
+       than ``memory_mb`` when both are set (rejected at config load otherwise).
    * - ``gres``
      - [string]
      - ``[]``
@@ -878,9 +1541,13 @@ matches, and the first matching entry wins.
 
    ``[[nodes]]`` is not a node roster. A node joins the cluster when ``spurd``
    registers with the controller, so adding a block here does not create a node,
-   and removing one does not remove a node — it only clears that node's features
-   and weight. Remove a node with ``spur node remove <node>``, which takes a
-   :ref:`cluster admin <privileged-operations>`. This differs from Slurm, where
+   and removing one does not remove a node — it only clears that node's features,
+   weight, and resource caps (reverting to the agent-detected inventory). Remove a
+   node with ``spur node remove <node>``, which takes a
+   :ref:`cluster admin <privileged-operations>`. When ``spurd`` stops, the node
+   stays in the inventory as ``down`` with the reason ``agent shutdown``. It
+   returns to service when the agent registers and sends heartbeats again. An
+   operator drain is kept through the restart. This differs from Slurm, where
    ``NodeName=`` lines in ``slurm.conf`` define the roster.
 
 ``[network]``
@@ -939,32 +1606,45 @@ WireGuard mesh networking and the agent port.
 ``[logging]``
 -------------
 
-**Reload: Not implemented** for every field below. The section is parsed but no
-daemon reads it.
-
 .. list-table::
    :header-rows: 1
-   :widths: 20 14 20 46
+   :widths: 18 12 12 18 40
 
    * - Field
      - Type
+     - Reload
      - Default
      - Description
    * - ``level``
      - string
+     - Not implemented
      - ``"info"``
      - Intended log level. Use the ``--log-level`` flag or the ``RUST_LOG``
        environment variable instead.
    * - ``format``
      - string
+     - Not implemented
      - ``"text"``
      - Intended log format. Output format is not configurable.
    * - ``file``
      - string
+     - Not implemented
      - none
      - Intended log file path. Logging to a file is not implemented; daemons log
        to stderr, so redirect via the service manager (for example systemd's
        journal) instead.
+   * - ``audit_rpcs``
+     - bool
+     - Restart
+     - ``false``
+     - Log every authenticated controller RPC, reads included, on the
+       ``audit_rpc`` tracing target with the method, authenticated user, peer
+       address, and outcome. Slurm's ``DebugFlags=AuditRPCs``. Off by default
+       because it is the highest-volume log Spur emits. Requests refused during
+       authentication are logged unconditionally on the main log instead, so
+       they do not depend on this setting. The controller reads this at startup,
+       so changing it needs a restart rather than ``scontrol reconfigure``. See
+       :doc:`accounting`.
 
 ``[rlimits]``
 -------------
@@ -1133,8 +1813,12 @@ See :doc:`accounting` for managing admission tokens with ``spur token``.
 GPU and generic-resource discovery.
 
 **Reload: Agent restart** for every field below, including each
-``[[devices.gres]]`` entry — the device registry is built once when ``spurd``
-starts.
+``[[devices.gres]]`` entry — the device registry built from these settings is
+first read when ``spurd`` starts. After startup, ``spurd`` periodically
+re-discovers the live device inventory and re-registers with the controller
+when the schedulable inventory changed, so ``scontrol show node`` GRES
+converges to hardware changes without an agent restart — see
+`Node inventory convergence`_ below.
 
 .. list-table::
    :header-rows: 1
@@ -1174,6 +1858,29 @@ and ``flags`` ([string]). Examples:
    type = "lustre"
    count = 4096
    flags = ["count_only"]
+
+Node inventory convergence
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Beyond the startup scan, ``spurd`` re-discovers device inventory on an interval
+and re-registers with the controller whenever the schedulable inventory
+changed. This is how an out-of-band AMD MI300X compute-partition switch
+(SPX/CPX, via ``amd-smi``) reaches the controller: ``scontrol show node`` GRES
+converges to the new device count without restarting ``spurd``.
+
+* The refresh interval defaults to 60s and is overridable per-agent with the
+  ``SPUR_INVENTORY_REFRESH_SECS`` environment variable.
+* A partition switch is a hardware constraint: it must be performed on a
+  **drained, idle** node. Once the switch completes, the agent's next refresh
+  picks up the new inventory and converges automatically.
+
+.. note::
+
+   Convergence only sees changes on the AMD KFD auto-detect path
+   (``auto_detect = true``). On nodes provisioned with static on-disk CDI specs
+   (``cdi_spec_dirs``), re-discovery re-reads the same spec files each tick, so
+   the reported inventory only changes if those specs are regenerated out of
+   band.
 
 ``[isolation]``
 ---------------
@@ -1583,9 +2290,19 @@ OpenMetrics HTTP export from ``spurctld``.
      - ``false``
      - Restart
      - Start the Slurm-compatible REST server (default port 6820). Off by
-       default: the REST surface performs no authentication, so enabling it on a
-       reachable address exposes unauthenticated job submission. Enable it only
-       behind an authenticating proxy or on a loopback interface.
+       default. REST uses the same ``[auth]`` plugin and mode as gRPC: list and
+       cancel require a Bearer credential when ``mode = required``, and submit
+       binds the job to that identity. Submit and cancel dispatch into the same
+       controller handlers the gRPC surface uses, so they share its
+       authorization, validation, leader forwarding and ``txn`` audit row.
+       Enable it only where that policy is acceptable.
+   * - ``allow_non_loopback``
+     - bool
+     - ``false``
+     - Restart
+     - Permit REST on a non-loopback ``controller.rest_addr`` when
+       ``[auth] plugin = "spur"`` and ``mode = "required"``. Without this,
+       ``spurctld`` refuses to start. Set it only behind a trusted gateway.
 
 ``[hooks]``
 -----------
@@ -1598,6 +2315,20 @@ Reload scope follows whichever process executes the hook: controller hooks are
 live, node hooks need an agent restart, and ``srun`` hooks are read from the
 submitting host on each invocation.
 
+.. warning::
+
+   Each hook is validated before it runs, or refused: it must be a
+   **fully-qualified absolute path** (a relative one could resolve through
+   ``$PATH``), **not group- or world-writable**, and **owned by root or by the
+   account that launches it**. That launching account varies by hook: the
+   compute-node agent (root) launches ``prolog``/``epilog`` and
+   ``task_prolog``/``task_epilog`` — so these must be root-owned, though task
+   hooks then drop to the job user inside the step cgroup; the controller launches
+   ``prolog_slurmctld``, ``epilog_slurmctld``, ``job_submit``, and
+   ``job_submit_lua`` as its own account (root or a service user); and
+   ``srun_prolog``/``srun_epilog`` are launched by the invoking user, whose own
+   scripts are accepted.
+
 .. list-table::
    :header-rows: 1
    :widths: 22 24 32 22
@@ -1608,7 +2339,7 @@ submitting host on each invocation.
      - Reload
    * - ``prolog``
      - ``Prolog``
-     - compute node, before job launch
+     - compute node, before job launch — once per job on each allocated node, for every submission method (``sbatch``, ``salloc``, and standalone ``srun``)
      - Agent restart
    * - ``epilog``
      - ``Epilog``
@@ -1624,11 +2355,11 @@ submitting host on each invocation.
      - Live
    * - ``task_prolog``
      - ``TaskProlog``
-     - compute node, before each step
+     - compute node, before each step — as the job user in the step cgroup; supports ``export``/``unset``/``print``
      - Agent restart
    * - ``task_epilog``
      - ``TaskEpilog``
-     - compute node, after each step
+     - compute node, after each step — as the job user in the step cgroup
      - Agent restart
    * - ``srun_prolog``
      - ``SrunProlog``

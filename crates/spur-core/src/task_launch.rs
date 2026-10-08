@@ -121,6 +121,32 @@ pub fn use_multi_task_launch(
     mpi == MPI_PMIX && !batch_script_uses_step_launch(script)
 }
 
+/// How batch `launch_job` runs the user script on this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchLaunch {
+    /// Unwrapped: not an MPI rank, or a driver that launches its own steps.
+    Script,
+    /// The node's only rank, which still needs the rank wrapper's environment.
+    LoneRank,
+    /// One wrapper per local task.
+    FanOut,
+}
+
+pub fn batch_launch(
+    tasks_per_node: u32,
+    task_fanout: bool,
+    mpi: &str,
+    script: &str,
+) -> BatchLaunch {
+    if use_multi_task_launch(tasks_per_node, task_fanout, mpi, script) {
+        return BatchLaunch::FanOut;
+    }
+    if mpi == MPI_PMIX && !batch_script_uses_step_launch(script) {
+        return BatchLaunch::LoneRank;
+    }
+    BatchLaunch::Script
+}
+
 /// True when batch dispatch already ran multi-node PMIx prepare for this job.
 ///
 /// Direct `#SBATCH --mpi=pmix` on multiple nodes prepares PMIx before launch.
@@ -209,7 +235,7 @@ pub fn build_step_task_plan(
 pub fn apply_gpu_bind_env(
     target: &mut HashMap<String, String>,
     source: &HashMap<String, String>,
-    allocated: &[u32],
+    allocated: &[u64],
 ) {
     let Some(bind_str) = source
         .get("SPUR_GPU_BIND")
@@ -516,7 +542,7 @@ pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> S
     )
 }
 
-/// Bash prefix shared by PMIx direct-launch wrappers (multi-node per-rank fork).
+/// Bash prefix every PMIx rank needs, however many share the node.
 ///
 /// Open MPI 4.x expects `PMIX_SERVER_URI4`/`URI3`; the same aliases exist in
 /// `spurd::mpi_plugin` and `crates/spur-mpi-pmix/c/pmix_server.c`.
@@ -525,7 +551,6 @@ fn mpi_direct_task_preamble(indent: &str) -> String {
         concat!(
             "{indent}unset PMI_RANK PMI_SIZE PMI_FD PMI_PORT PMI_PROCESS_KVS_ID 2>/dev/null || true\n",
             "{indent}unset OMPI_MCA_ess OMPI_MCA_ess_base_env 2>/dev/null || true\n",
-            "{indent}unset SLURM_PROCID SLURM_LOCALID SLURM_NODEID SLURM_TASKS_PER_NODE 2>/dev/null || true\n",
             "{indent}export SLURM_STEP_ID=${{SLURM_STEP_ID:-0}}\n",
             "{indent}export SLURM_STEPID=${{SLURM_STEPID:-0}}\n",
             "{indent}export OMPI_MCA_ess='^singleton,^slurm,^srun'\n",
@@ -675,11 +700,17 @@ pub fn build_multi_task_wrapper(
     wrapper
 }
 
-/// Bash wrapper for a single labeled task (one task per node in fan-out steps).
-pub fn build_labeled_single_task_wrapper(
+/// Bash wrapper for the sole task on a node.
+///
+/// A PMIx rank needs this wrapper even unlabeled: it is the only place
+/// `$HOME/spur/mpi/env.sh` and the `PMIX_SERVER_URI` aliases are applied, and a
+/// rank that misses them cannot find the MPI it was linked against.
+pub fn build_single_task_wrapper(
     user_script_path: &str,
     procid: u32,
     environment: Option<&HashMap<String, String>>,
+    label: bool,
+    mpi: bool,
 ) -> String {
     let escaped = user_script_path.replace('"', "\\\"");
     let bind = environment.map(parse_cpu_bind).unwrap_or(CpuBind::None);
@@ -697,7 +728,18 @@ pub fn build_labeled_single_task_wrapper(
         _ => Vec::new(),
     };
     let taskset_prefix = cpu_bind_bash_prefix(&bind, &map_cpus);
-    format!("#!/bin/bash\n{taskset_prefix}bash \"{escaped}\" 2>&1 | sed \"s/^/[{procid}] /\"\n")
+    let mut wrapper = String::from("#!/bin/bash\n");
+    if mpi {
+        wrapper.push_str(&mpi_direct_task_preamble(""));
+    }
+    if label {
+        wrapper.push_str(&format!(
+            "{taskset_prefix}bash \"{escaped}\" 2>&1 | sed \"s/^/[{procid}] /\"\n"
+        ));
+    } else {
+        wrapper.push_str(&format!("{taskset_prefix}bash \"{escaped}\"\n"));
+    }
+    wrapper
 }
 
 #[cfg(test)]
@@ -798,6 +840,64 @@ mod tests {
         assert!(!use_multi_task_launch(4, false, "none", "echo hi"));
         assert!(use_multi_task_launch(4, true, "none", "hostname"));
         assert!(!use_multi_task_launch(1, true, "none", "hostname"));
+    }
+
+    #[test]
+    fn a_lone_pmix_batch_rank_is_wrapped() {
+        let direct = "#!/bin/bash\n#SBATCH --mpi=pmix\n/tmp/hello_mpi\n";
+        assert_eq!(
+            batch_launch(1, false, MPI_PMIX, direct),
+            BatchLaunch::LoneRank
+        );
+    }
+
+    #[test]
+    fn a_pmix_batch_driver_runs_unwrapped() {
+        let driver = "#!/bin/bash\n#SBATCH --mpi=pmix\nsrun --mpi=pmix /tmp/hello_mpi\n";
+        assert_eq!(
+            batch_launch(1, false, MPI_PMIX, driver),
+            BatchLaunch::Script
+        );
+        assert_eq!(
+            batch_launch(4, false, MPI_PMIX, driver),
+            BatchLaunch::Script
+        );
+    }
+
+    #[test]
+    fn a_non_mpi_batch_script_runs_unwrapped() {
+        assert_eq!(
+            batch_launch(1, false, "none", "hostname"),
+            BatchLaunch::Script
+        );
+        assert_eq!(
+            batch_launch(4, false, "none", "hostname"),
+            BatchLaunch::Script
+        );
+    }
+
+    #[test]
+    fn several_local_tasks_fan_out() {
+        assert_eq!(
+            batch_launch(4, false, MPI_PMIX, "/tmp/hello_mpi"),
+            BatchLaunch::FanOut
+        );
+        assert_eq!(
+            batch_launch(4, true, "none", "hostname"),
+            BatchLaunch::FanOut
+        );
+    }
+
+    #[test]
+    fn a_lone_standalone_srun_task_is_wrapped_only_for_pmix() {
+        assert_eq!(
+            batch_launch(1, true, "none", "hostname"),
+            BatchLaunch::Script
+        );
+        assert_eq!(
+            batch_launch(1, true, MPI_PMIX, "/tmp/hello_mpi"),
+            BatchLaunch::LoneRank
+        );
     }
 
     #[test]
@@ -1102,8 +1202,60 @@ mod tests {
 
     #[test]
     fn labeled_single_task_wrapper_applies_sed_prefix() {
-        let script = build_labeled_single_task_wrapper("/tmp/step.sh", 4, None);
+        let script = build_single_task_wrapper("/tmp/step.sh", 4, None, true, false);
         assert!(script.contains("sed \"s/^/[4] /\""));
+    }
+
+    #[test]
+    fn a_lone_rank_still_gets_the_mpi_environment() {
+        let script = build_single_task_wrapper("/tmp/step.sh", 0, None, false, true);
+        assert!(
+            script.contains("${HOME}/spur/mpi/env.sh"),
+            "one rank on a node must source env.sh too, or it cannot find its MPI:\n{script}"
+        );
+        assert!(
+            script.contains("PMIX_SERVER_URI4"),
+            "Open MPI 4.x needs the URI aliases whatever the rank count:\n{script}"
+        );
+    }
+
+    #[test]
+    fn a_lone_non_mpi_task_gets_no_mpi_environment() {
+        let script = build_single_task_wrapper("/tmp/step.sh", 0, None, false, false);
+        assert!(!script.contains("spur/mpi/env.sh"), "{script}");
+        assert!(!script.contains("PMIX_SERVER_URI4"), "{script}");
+        assert!(script.ends_with("\nbash \"/tmp/step.sh\"\n"), "{script}");
+    }
+
+    #[test]
+    fn a_lone_rank_runs_its_script_after_the_map_cpu_bounds_check() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_CPU_BIND".into(), "map_cpu:0,4".into());
+        let script = build_single_task_wrapper("/tmp/step.sh", 0, Some(&env), false, true);
+        assert!(script.contains("_CPU_MAP=(0 4)"), "{script}");
+        assert!(!script.contains("exec _CPU_MAP"), "{script}");
+        assert!(
+            script.ends_with("taskset -c ${_CPU_MAP[$_CPU_IDX]} bash \"/tmp/step.sh\"\n"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn the_mpi_preamble_keeps_the_ranks_slurm_ids() {
+        let preamble = mpi_direct_task_preamble("");
+        for id in [
+            "SLURM_PROCID",
+            "SLURM_LOCALID",
+            "SLURM_NODEID",
+            "SLURM_TASKS_PER_NODE",
+        ] {
+            assert!(
+                !preamble
+                    .lines()
+                    .any(|line| line.starts_with("unset") && line.contains(id)),
+                "{id} must reach the rank:\n{preamble}"
+            );
+        }
     }
 
     #[test]

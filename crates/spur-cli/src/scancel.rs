@@ -62,7 +62,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = ScancelArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<ScancelArgs>(&args);
 
     if !has_selection(&args) {
         bail!("scancel: no job IDs or filters specified");
@@ -82,6 +82,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
+    let mut failed = false;
 
     if !args.job_ids.is_empty() {
         // Cancel specific jobs
@@ -94,14 +95,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 })
                 .await
             {
-                Ok(_) => {
-                    if !args.quiet {
-                        // scancel is silent on success by default (like Slurm)
-                    }
-                }
-                Err(e) => {
-                    eprintln!("scancel: error cancelling job {}: {}", job_id, e.message());
-                }
+                Ok(_) => {}
+                Err(e) => failed |= report_refusal(*job_id, &e, signal, args.quiet),
             }
         }
     } else {
@@ -117,6 +112,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 job_ids: Vec::new(),
                 name: args.name.clone().unwrap_or_default(),
                 nodes: Vec::new(),
+                qos: String::new(),
+                reservation: String::new(),
             })
             .await
             .context("failed to get jobs")?;
@@ -140,18 +137,48 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .await
             {
                 Ok(_) => {}
-                Err(e) => {
-                    eprintln!(
-                        "scancel: error cancelling job {}: {}",
-                        job.job_id,
-                        e.message()
-                    );
-                }
+                Err(e) => failed |= report_refusal(job.job_id, &e, signal, args.quiet),
             }
         }
     }
 
+    if failed {
+        std::process::exit(1);
+    }
     Ok(())
+}
+
+/// Print a refused cancel unless it is ignored, and return whether it fails the command.
+fn report_refusal(job_id: u32, status: &tonic::Status, signal: i32, quiet: bool) -> bool {
+    if should_report(status.code(), signal, quiet) {
+        eprintln!(
+            "scancel: error cancelling job {}: {}",
+            job_id,
+            status.message()
+        );
+    }
+    counts_as_failure(status.code(), signal)
+}
+
+/// Slurm's scancel stays silent on an ignored refusal, and `-Q` also hides a
+/// job that is already gone when signalling it.
+fn should_report(code: tonic::Code, signal: i32, quiet: bool) -> bool {
+    counts_as_failure(code, signal) && !(quiet && already_gone(code))
+}
+
+/// Whether a refused cancel makes scancel exit non-zero. Like Slurm, a job that is
+/// unknown or already finished does not fail a cancel (it is gone either way), but
+/// does fail a signal, and anything else, such as another user's job, fails both.
+fn counts_as_failure(code: tonic::Code, signal: i32) -> bool {
+    let cancels = matches!(signal, 0 | 9);
+    !(cancels && already_gone(code))
+}
+
+fn already_gone(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::NotFound | tonic::Code::FailedPrecondition
+    )
 }
 
 /// Whether a job in the given proto state can still be cancelled. Unknown
@@ -377,6 +404,36 @@ mod tests {
                 "{state:?} should not be cancellable"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_cancel_of_another_users_job_fails_the_command() {
+        assert!(counts_as_failure(tonic::Code::PermissionDenied, 0));
+        assert!(counts_as_failure(tonic::Code::PermissionDenied, 15));
+    }
+
+    #[test]
+    fn a_job_already_gone_fails_a_signal_but_not_a_cancel() {
+        for code in [tonic::Code::NotFound, tonic::Code::FailedPrecondition] {
+            assert!(!counts_as_failure(code, 0), "{code:?} with a cancel");
+            assert!(!counts_as_failure(code, 9), "{code:?} with SIGKILL");
+            assert!(counts_as_failure(code, 15), "{code:?} with SIGTERM");
+        }
+    }
+
+    #[test]
+    fn an_ignored_refusal_is_not_reported() {
+        for code in [tonic::Code::NotFound, tonic::Code::FailedPrecondition] {
+            assert!(!should_report(code, 0, false), "{code:?} with a cancel");
+            assert!(!should_report(code, 9, false), "{code:?} with SIGKILL");
+        }
+    }
+
+    #[test]
+    fn quiet_hides_a_gone_job_on_a_signal_but_not_a_denial() {
+        assert!(should_report(tonic::Code::NotFound, 15, false));
+        assert!(!should_report(tonic::Code::NotFound, 15, true));
+        assert!(should_report(tonic::Code::PermissionDenied, 0, true));
     }
 
     #[test]

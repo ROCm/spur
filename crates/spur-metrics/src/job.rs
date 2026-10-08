@@ -92,7 +92,9 @@ mod tests {
         if gpu_count > 0 {
             alloc.devices.insert(
                 "gpu".into(),
-                (0..gpu_count).map(AllocatedDevice::injectable).collect(),
+                (0..gpu_count as u64)
+                    .map(AllocatedDevice::injectable)
+                    .collect(),
             );
         }
         job.allocated_resources = Some(alloc);

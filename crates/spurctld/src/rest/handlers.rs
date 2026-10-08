@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::response::Json;
+use axum::Extension;
 
 use super::convert::{job_to_json, node_to_json, parse_states_query, partition_to_json};
 use super::types::*;
 use super::RestState;
+use crate::server::job_read_scope;
 
 pub async fn ping(
     State(state): State<Arc<RestState>>,
@@ -35,26 +37,39 @@ pub async fn ping(
 pub async fn get_jobs(
     State(state): State<Arc<RestState>>,
     Query(query): Query<JobsQuery>,
+    identity: Option<Extension<spur_core::auth::Identity>>,
 ) -> Result<Json<ApiResponse<JobsData>>, RestError> {
+    let identity = identity.map(|Extension(id)| id);
     let states = match query.state.as_deref() {
         Some(s) => parse_states_query(s).map_err(|e| bad_request_response(&e))?,
         None => Vec::new(),
     };
 
-    let user = query.user.as_deref();
+    let scope = job_read_scope(&state.cluster, identity.as_ref());
+    let requested_user = query.user.as_deref().filter(|u| !u.is_empty());
+    let Some(scoped_user) = scope.job_user_filter(requested_user) else {
+        return Ok(ApiResponse::ok(JobsData { jobs: Vec::new() }));
+    };
     let partition = query.partition.as_deref();
     let account = query.account.as_deref();
     let name = query.name.as_deref();
+    let qos = empty_to_none(&query.qos);
+    let reservation = empty_to_none(&query.reservation);
 
     let jobs = state.cluster.get_jobs(&crate::cluster::JobFilter {
         states: &states,
-        user,
+        user: scoped_user.as_deref(),
         partition,
         account,
         name,
+        qos: qos.as_deref(),
+        reservation: reservation.as_deref(),
         ..Default::default()
     });
-    let json_jobs: Vec<serde_json::Value> = jobs.iter().map(job_to_json).collect();
+    let json_jobs: Vec<serde_json::Value> = jobs
+        .iter()
+        .filter_map(|job| rest_job_json(job, identity.as_ref(), &state.cluster))
+        .collect();
 
     Ok(ApiResponse::ok(JobsData { jobs: json_jobs }))
 }
@@ -62,15 +77,26 @@ pub async fn get_jobs(
 pub async fn get_job(
     State(state): State<Arc<RestState>>,
     Path(job_id): Path<u32>,
+    identity: Option<Extension<spur_core::auth::Identity>>,
 ) -> Result<Json<ApiResponse<JobsData>>, RestError> {
+    let identity = identity.map(|Extension(id)| id);
     let job = state
         .cluster
         .get_job_for_display(job_id)
         .ok_or_else(|| not_found_response(&format!("job {job_id} not found")))?;
+    let json = rest_job_json(&job, identity.as_ref(), &state.cluster)
+        .ok_or_else(|| not_found_response(&format!("job {job_id} not found")))?;
 
-    Ok(ApiResponse::ok(JobsData {
-        jobs: vec![job_to_json(&job)],
-    }))
+    Ok(ApiResponse::ok(JobsData { jobs: vec![json] }))
+}
+
+/// Treat an empty query value the same as an absent one, so `?qos=` does not
+/// filter on the empty QOS. Mirrors the gRPC handler's empty-string normalization.
+fn empty_to_none(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
 }
 
 /// Default an absent or zero REST `ntasks` to one task per requested node
@@ -83,61 +109,96 @@ fn rest_effective_ntasks(ntasks: Option<u32>, nodes: Option<u32>) -> u32 {
 
 pub async fn submit_job(
     State(state): State<Arc<RestState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    identity: Option<Extension<spur_core::auth::Identity>>,
     Json(body): Json<SubmitRequest>,
 ) -> Result<Json<ApiResponse<SubmitResponse>>, RestError> {
-    if !state.raft.is_leader() {
-        return Err(unavailable_response("not the Raft leader"));
-    }
+    // REST carries no uid, so an unauthenticated submission could only run as
+    // uid 0. Refused here rather than attributed to root.
+    let Some(Extension(identity)) = identity else {
+        return Err(bad_request_response(
+            "REST job submission requires an authenticated caller (Authorization: Bearer). \
+             Submit via `sbatch`/`srun`, or pass a credential so the job can be attributed \
+             to that user rather than uid 0.",
+        ));
+    };
 
     let time_limit = body
         .job
         .time_limit
         .as_ref()
         .and_then(|t| spur_core::config::parse_time_minutes(t))
-        .map(|mins| chrono::Duration::minutes(mins as i64));
+        .map(|mins| prost_types::Duration {
+            seconds: mins as i64 * 60,
+            nanos: 0,
+        });
 
-    let spec = spur_core::job::JobSpec {
+    let spec = spur_proto::proto::JobSpec {
         name: body.job.name.unwrap_or_default(),
         user: body.job.user.unwrap_or_default(),
-        partition: body.job.partition,
-        account: body.job.account,
+        partition: body.job.partition.unwrap_or_default(),
+        account: body.job.account.unwrap_or_default(),
         num_nodes: body.job.nodes.unwrap_or(1),
         num_tasks: rest_effective_ntasks(body.job.ntasks, body.job.nodes),
         cpus_per_task: body.job.cpus_per_task.unwrap_or(1),
         time_limit,
-        script: body.job.script,
+        script: body.job.script.unwrap_or_default(),
         environment: body.job.environment,
         gres: body.job.gres,
-        gpus: parse_rest_gpu(body.job.gpus.as_deref())?,
-        gpus_per_node: parse_rest_gpu(body.job.gpus_per_node.as_deref())?,
-        gpus_per_task: parse_rest_gpu(body.job.gpus_per_task.as_deref())?,
+        gpus: proto_gpu(body.job.gpus.as_deref())?,
+        gpus_per_node: proto_gpu(body.job.gpus_per_node.as_deref())?,
+        gpus_per_task: proto_gpu(body.job.gpus_per_task.as_deref())?,
         ..Default::default()
     };
 
-    // REST job submission is not supported yet, and this is where that becomes visible.
-    //
-    // The request body carries no uid, so the spec always inherits `JobSpec::default()`'s uid 0 —
-    // i.e. every REST submission would ask to run as root, which the agent refuses. Without this
-    // check the refusal lands only after the job has been accepted, queued and dispatched, so the
-    // caller gets a job_id back and discovers the failure late, or never. Reject up front instead.
-    //
-    // Supporting it means deriving the uid server-side from an authenticated caller rather than
-    // defaulting it; until then the honest answer is that this endpoint cannot submit work.
-    if spec.uid == 0 {
-        return Err(bad_request_response(
-            "REST job submission is not supported yet: the request carries no authenticated \
-             caller, so a job could only be attributed to uid 0 (root), which is refused. Submit \
-             via `sbatch`/`srun`, which carry the submitting user's credentials.",
-        ));
-    }
-
-    // GPU demand is validated in submit_job after node-count normalization.
-    let outcome = state.cluster.submit_job(spec).map_err(submit_rest_error)?;
+    let response = dispatch(
+        &state,
+        "SubmitJob",
+        peer,
+        identity,
+        spur_proto::proto::SubmitJobRequest { spec: Some(spec) },
+        |svc, req| async move {
+            spur_proto::proto::slurm_controller_server::SlurmController::submit_job(&svc, req).await
+        },
+    )
+    .await?
+    .into_inner();
 
     Ok(ApiResponse::ok(SubmitResponse {
-        job_id: outcome.job_id,
-        warnings: outcome.warnings,
+        job_id: response.job_id,
+        warnings: response.warnings,
     }))
+}
+
+/// Hand a request to the controller handler that owns this RPC, so REST shares
+/// its authorization, validation, leader forwarding and audit row.
+async fn dispatch<Req, Resp, F, Fut>(
+    state: &Arc<RestState>,
+    method: &str,
+    peer: std::net::SocketAddr,
+    identity: spur_core::auth::Identity,
+    message: Req,
+    call: F,
+) -> Result<tonic::Response<Resp>, RestError>
+where
+    F: FnOnce(crate::server::ControllerService, tonic::Request<Req>) -> Fut,
+    Fut: std::future::Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+{
+    let mut request = tonic::Request::new(message);
+    // `rest_auth` inserts an identity only after verifying the credential, so
+    // anything reaching here is verified.
+    request.extensions_mut().insert(identity);
+    request
+        .extensions_mut()
+        .insert(crate::auth_middleware::Verified);
+
+    let service = state.controller.clone();
+    let context = crate::audit::ControllerAudit::new(state.cluster.clone());
+    crate::audit::recorded(&context, method, Some(peer.to_string()), request, |req| {
+        call(service, req)
+    })
+    .await
+    .map_err(status_to_rest)
 }
 
 /// Parse a REST GPU field ("4" or "mi300x:4") into a core GPU request.
@@ -152,35 +213,75 @@ fn parse_rest_gpu(
     }
 }
 
-fn submit_rest_error(err: crate::cluster::SubmitError) -> RestError {
-    match err {
-        crate::cluster::SubmitError::InvalidArgument(m) => bad_request_response(&m),
-        crate::cluster::SubmitError::Unavailable(m) => unavailable_response(&m),
-        crate::cluster::SubmitError::Internal(m) => error_response(&format!("submit failed: {m}")),
+/// Mutations run through the controller handlers, which speak gRPC codes.
+fn status_to_rest(status: tonic::Status) -> RestError {
+    let msg = status.message();
+    match status.code() {
+        tonic::Code::InvalidArgument => bad_request_response(msg),
+        tonic::Code::NotFound => not_found_response(msg),
+        tonic::Code::PermissionDenied => forbidden_response(msg),
+        tonic::Code::Unauthenticated => unauthorized_response(msg),
+        tonic::Code::Unavailable => unavailable_response(msg),
+        // A job already in a terminal state, and the like: the caller's view is
+        // stale rather than the request being malformed.
+        tonic::Code::FailedPrecondition | tonic::Code::Aborted => {
+            api_error_response(axum::http::StatusCode::CONFLICT, msg)
+        }
+        _ => error_response(msg),
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn proto_gpu(value: Option<&str>) -> Result<Option<spur_proto::proto::GpuRequest>, RestError> {
+    Ok(
+        parse_rest_gpu(value)?.map(|g| spur_proto::proto::GpuRequest {
+            count: g.count,
+            gpu_type: g.gpu_type.unwrap_or_default(),
+        }),
+    )
+}
+
+fn rest_job_json(
+    job: &spur_core::job::Job,
+    identity: Option<&spur_core::auth::Identity>,
+    cluster: &crate::cluster::ClusterManager,
+) -> Option<serde_json::Value> {
+    job_read_scope(cluster, identity)
+        .permits(&job.spec.user)
+        .then(|| job_to_json(job))
 }
 
 pub async fn cancel_job(
     State(state): State<Arc<RestState>>,
     Path(job_id): Path<u32>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    request: axum::extract::Request,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, RestError> {
-    if !state.raft.is_leader() {
-        return Err(unavailable_response("not the Raft leader"));
-    }
+    let Some(identity) = request
+        .extensions()
+        .get::<spur_core::auth::Identity>()
+        .cloned()
+    else {
+        return Err(unauthorized_response(
+            "REST job cancel requires an authenticated caller (Authorization: Bearer).",
+        ));
+    };
 
-    let job = state.cluster.get_job(job_id);
-
-    state
-        .cluster
-        .cancel_job(job_id, "")
-        .map_err(|e| error_response(&format!("cancel failed: {e}")))?;
-
-    if let Some(job) = job {
-        let cluster = state.cluster.clone();
-        tokio::spawn(async move {
-            crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
-        });
-    }
+    // Ownership, agent fan-out and the audit row all live in the handler.
+    dispatch(
+        &state,
+        "CancelJob",
+        peer,
+        identity,
+        spur_proto::proto::CancelJobRequest {
+            job_id,
+            ..Default::default()
+        },
+        |svc, req| async move {
+            spur_proto::proto::slurm_controller_server::SlurmController::cancel_job(&svc, req).await
+        },
+    )
+    .await?;
 
     Ok(ApiResponse::ok(serde_json::json!({})))
 }
@@ -274,6 +375,26 @@ mod tests {
     }
 
     #[test]
+    fn empty_to_none_treats_blank_query_as_absent() {
+        assert_eq!(empty_to_none(&None), None);
+        // `?qos=` must not filter on the empty QOS.
+        assert_eq!(empty_to_none(&Some(String::new())), None);
+        // A comma-separated list is passed through verbatim for the matcher to split.
+        assert_eq!(
+            empty_to_none(&Some("high,low".to_string())),
+            Some("high,low".to_string())
+        );
+    }
+
+    #[test]
+    fn jobs_query_deserializes_qos_and_reservation() {
+        let q: JobsQuery =
+            serde_urlencoded::from_str("qos=high,low&reservation=maint").expect("valid query");
+        assert_eq!(q.qos.as_deref(), Some("high,low"));
+        assert_eq!(q.reservation.as_deref(), Some("maint"));
+    }
+
+    #[test]
     fn conflict_error_text_is_neutral() {
         let msg = spur_core::gpu_request::GpuRequestError::Conflict.to_string();
         assert!(
@@ -281,5 +402,177 @@ mod tests {
             "error message should not contain CLI flags"
         );
         assert!(msg.contains("gres"));
+    }
+
+    /// Mutations now come back as gRPC codes, so the HTTP status a client sees
+    /// is decided here. A denial must not surface as a server fault.
+    #[test]
+    fn status_to_rest_maps_handler_codes() {
+        use axum::http::StatusCode;
+        use tonic::{Code, Status};
+
+        for (code, want) in [
+            (Code::PermissionDenied, StatusCode::FORBIDDEN),
+            (Code::Unauthenticated, StatusCode::UNAUTHORIZED),
+            (Code::NotFound, StatusCode::NOT_FOUND),
+            (Code::InvalidArgument, StatusCode::BAD_REQUEST),
+            (Code::Unavailable, StatusCode::SERVICE_UNAVAILABLE),
+            // Cancelling an already-finished job: a stale client view.
+            (Code::FailedPrecondition, StatusCode::CONFLICT),
+            (Code::Internal, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let (status, _) = status_to_rest(Status::new(code, "x"));
+            assert_eq!(status, want, "{code:?}");
+        }
+    }
+
+    use crate::server::test_support::{
+        no_leader_rest_state, test_slurm_config, test_slurm_config_private, viewer,
+    };
+
+    /// A leaderless REST backend holding a single job owned by alice.
+    async fn rest_state_with_alice_job(
+        cfg: spur_core::config::SlurmConfig,
+        dir: &std::path::Path,
+    ) -> Arc<RestState> {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(cfg, dir).expect("cluster manager"));
+        <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+            cluster.as_ref(),
+            &WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "alice-job".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            },
+        );
+        no_leader_rest_state(cluster, dir).await
+    }
+
+    fn jobs_query(user: Option<&str>) -> JobsQuery {
+        JobsQuery {
+            user: user.map(str::to_string),
+            partition: None,
+            state: None,
+            account: None,
+            name: None,
+            qos: None,
+            reservation: None,
+        }
+    }
+
+    async fn list_jobs(
+        state: &Arc<RestState>,
+        user: Option<&str>,
+        identity: Option<spur_core::auth::Identity>,
+    ) -> Vec<serde_json::Value> {
+        get_jobs(
+            State(state.clone()),
+            Query(jobs_query(user)),
+            identity.map(Extension),
+        )
+        .await
+        .ok()
+        .expect("get_jobs returned an error")
+        .0
+        .data
+        .jobs
+    }
+
+    async fn job_is_visible(
+        state: &Arc<RestState>,
+        identity: Option<spur_core::auth::Identity>,
+    ) -> bool {
+        get_job(State(state.clone()), Path(1), identity.map(Extension))
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn rest_default_lets_any_caller_see_every_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = rest_state_with_alice_job(test_slurm_config(), dir.path()).await;
+
+        assert_eq!(
+            list_jobs(&state, None, Some(viewer("bob", false)))
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_jobs(&state, Some("alice"), Some(viewer("bob", false)))
+                .await
+                .len(),
+            1
+        );
+        assert!(job_is_visible(&state, Some(viewer("bob", false))).await);
+    }
+
+    #[tokio::test]
+    async fn rest_private_jobs_hides_other_tenants() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state =
+            rest_state_with_alice_job(test_slurm_config_private(&["jobs"]), dir.path()).await;
+
+        assert!(
+            list_jobs(&state, None, Some(viewer("bob", false)))
+                .await
+                .is_empty(),
+            "bob must not list alice's job"
+        );
+        assert!(
+            list_jobs(&state, Some("alice"), Some(viewer("bob", false)))
+                .await
+                .is_empty(),
+            "an explicit ?user=alice must not leak alice's job to bob"
+        );
+        assert!(
+            !job_is_visible(&state, Some(viewer("bob", false))).await,
+            "GET /job/1 must be 404 for a non-owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_private_jobs_still_shows_owner_admin_and_anonymous() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state =
+            rest_state_with_alice_job(test_slurm_config_private(&["jobs"]), dir.path()).await;
+
+        assert_eq!(
+            list_jobs(&state, None, Some(viewer("alice", false)))
+                .await
+                .len(),
+            1,
+            "alice sees her own job"
+        );
+        assert!(job_is_visible(&state, Some(viewer("alice", false))).await);
+
+        for user in [None, Some("alice")] {
+            assert_eq!(
+                list_jobs(&state, user, Some(viewer("carol", true)))
+                    .await
+                    .len(),
+                1,
+                "an administrator is exempt (user filter = {user:?})"
+            );
+        }
+        assert!(job_is_visible(&state, Some(viewer("carol", true))).await);
+
+        assert_eq!(
+            list_jobs(&state, None, None).await.len(),
+            1,
+            "an unauthenticated caller is unrestricted on the permissive path"
+        );
+        assert!(job_is_visible(&state, None).await);
     }
 }

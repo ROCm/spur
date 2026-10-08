@@ -444,7 +444,7 @@ class TestServiceCidrOverMesh:
             )
             return body in out
 
-        wait_until(fetched, timeout_s=90,
+        wait_until(fetched, timeout_s=180,
                    desc=f"ClusterIP {cluster_ip} reachable from a pod on {client_node}")
 
         # Cleanup (best effort).

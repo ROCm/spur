@@ -129,6 +129,36 @@ class WgMesh:
             args += ["--program-routes"]
         return self._spur(self.nodes[on_index], args)
 
+    def reload_interface(self, index: int) -> None:
+        """`wg-quick down` + `up` on a node — simulates a reboot or service
+        restart, rebuilding the interface strictly from the persisted conf."""
+        node = self.nodes[index]
+        node.exec(f"{self._sudo}wg-quick down '{self.iface}'")
+        node.exec(f"{self._sudo}wg-quick up '{self.iface}'")
+
+    def conf_peer_keys(self, index: int) -> list[str]:
+        """Public keys of every `[Peer]` block in the node's persisted
+        `/etc/wireguard/<iface>.conf` — the durable half of `net add-peer`."""
+        out = self.nodes[index].exec_allow_fail(
+            f"{self._sudo}grep -oP '(?<=^PublicKey = ).*' "
+            f"'/etc/wireguard/{self.iface}.conf'"
+        )
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def conf_text(self, index: int) -> str:
+        """The node's persisted `/etc/wireguard/<iface>.conf`, verbatim."""
+        return self.nodes[index].exec_allow_fail(
+            f"{self._sudo}cat '/etc/wireguard/{self.iface}.conf'"
+        )
+
+    def add_interface_directive(self, index: int, directive: str) -> None:
+        """Insert a directive into the conf's `[Interface]` block, standing in for
+        one an operator hand-maintains outside Spur's model."""
+        self.nodes[index].exec(
+            f"{self._sudo}sed -i '/^\\[Interface\\]/a {directive}' "
+            f"'/etc/wireguard/{self.iface}.conf'"
+        )
+
     # --- wg introspection ---
 
     def wg_pubkey(self, index: int) -> str:
@@ -268,7 +298,8 @@ class WgMesh:
             self.nodes[i].exec_allow_fail(f"{self._sudo}wg-quick down '{self.iface}' 2>/dev/null || true")
             self.nodes[i].exec_allow_fail(f"{self._sudo}ip link del '{self.iface}' 2>/dev/null || true")
             self.nodes[i].exec_allow_fail(
-                f"{self._sudo}rm -f '/etc/wireguard/{self.iface}.conf' 2>/dev/null || true"
+                f"{self._sudo}rm -f '/etc/wireguard/{self.iface}.conf' "
+                f"'/etc/wireguard/{self.iface}.lock' 2>/dev/null || true"
             )
 
 

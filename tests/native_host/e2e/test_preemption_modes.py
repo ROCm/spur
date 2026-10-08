@@ -8,7 +8,8 @@ Each class covers one user-observable property:
 
   CancelMode         — a preempted job is permanently removed from the queue
   RequeueMode        — a preempted job returns to PENDING and reruns automatically
-  SuspendMode        — a preempted job is frozen in place and thaws once the slot is free
+  SuspendMode        — a satisfiable suspend-only victim set is never acted on, since
+                       suspend keeps the allocation and could not place the pending job
   PreemptOff         — no eviction occurs regardless of how high the pending job's priority is
   PriorityThreshold  — preemption requires a substantially higher priority; equal priority
                        must not displace a running job
@@ -181,15 +182,16 @@ class TestRequeueMode:
 
 
 class TestSuspendMode:
-    """preempt_mode=suspend: the preempted job is frozen (SIGSTOP) but its node
-    allocation is NOT released — the node stays occupied. The pending aggressor must
-    remain pending for as long as the victim holds the node suspended."""
+    """preempt_mode=suspend: suspend keeps the node allocation, so a victim set
+    found only in the suspend pool could never place the pending job. The
+    scheduler finds but discards that set rather than freezing a victim for
+    no benefit — only an explicit `scontrol suspend` still suspends anyone."""
 
     @pytest.fixture
     def cluster_config_overrides(self):
         return {**_AUTH_ROOT, "partitions": [{**_PARTITION, "preempt_mode": "suspend"}]}
 
-    def test_preempt_mode_suspend_freezes_job_and_retains_node(self, cluster):
+    def test_preempt_mode_suspend_never_fires_automatically(self, cluster):
         node = cluster.node_names[0]
 
         victim = cluster.write_file("victim.sh", _SLEEP_SCRIPT)
@@ -210,24 +212,17 @@ class TestSuspendMode:
         cluster.scontrol("update", f"JobId={aggressor_id}", "Priority=1000000")
 
         try:
-            # Victim must be suspended (S) — frozen but NOT terminated.
-            wait_job_state(cluster, victim_id, "S", timeout=_WAIT_PREEMPT)
-            _assert_scontrol_state(cluster, victim_id, "SUSPENDED", "victim after suspend")
-
-            # Suspend retains the node allocation — aggressor must stay pending
-            # because the node is still held by the suspended victim.
             time.sleep(_GUARD_SECS)
             sq = cluster.squeue_all()
-            assert job_state(sq, victim_id) == "S", (
-                "suspended victim must remain frozen, not cancelled or requeued"
+            assert job_state(sq, victim_id) == "R", (
+                "a satisfiable suspend-only set must not be acted on"
             )
-            _assert_scontrol_state(cluster, victim_id, "SUSPENDED", "victim still suspended")
+            _assert_scontrol_state(cluster, victim_id, "RUNNING", "victim never suspended")
             assert job_state(sq, aggressor_id) == "PD", (
-                "aggressor must stay pending — suspend does not release the node allocation"
+                "nothing was evicted, so the aggressor stays pending"
             )
-            _assert_scontrol_state(cluster, aggressor_id, "PENDING", "aggressor while victim suspended")
+            _assert_scontrol_state(cluster, aggressor_id, "PENDING", "aggressor still pending")
         finally:
-            cluster.cli_allow_fail(["scontrol", "resume", str(victim_id)])
             cluster.cli_allow_fail(["scancel", str(victim_id)])
             cluster.cli_allow_fail(["scancel", str(aggressor_id)])
 

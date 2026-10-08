@@ -21,7 +21,9 @@ pub struct SinfoArgs {
     #[arg(short = 'p', long)]
     pub partition: Option<String>,
 
-    /// Show only nodes in these states
+    /// Show only nodes in these states (comma-separated). Accepts the base
+    /// states and the display-only labels resv, maint, and plnd. `all` disables
+    /// the filter.
     #[arg(short = 't', long)]
     pub states: Option<String>,
 
@@ -71,7 +73,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SinfoArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SinfoArgs>(&args);
 
     let fmt = if let Some(ref f) = args.format {
         f.clone()
@@ -92,7 +94,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let fields = format_engine::parse_format(&fmt, &format_engine::sinfo_header);
 
     // Built before connecting so an invalid `-t` fails without a round-trip.
-    let nodes_req = build_get_nodes_request(&args)?;
+    let filter = StateFilter::parse(args.states.as_deref())?;
+    let nodes_req = build_get_nodes_request(&args, &filter);
 
     let channel = crate::authclient::connect(&args.controller)
         .await
@@ -115,7 +118,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to get nodes")?;
 
-    let nodes = nodes_resp.into_inner().nodes;
+    let mut nodes = nodes_resp.into_inner().nodes;
+    // Overlay labels (plnd/resv/maint) are computed client-side, so the
+    // controller's raw-state filter can only narrow to idle; drop the rest here.
+    nodes.retain(|n| filter.keeps(n));
 
     // Print header
     if !args.noheader {
@@ -134,46 +140,125 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn build_get_nodes_request(args: &SinfoArgs) -> Result<GetNodesRequest> {
-    let states = match args.states.as_deref() {
-        Some(s) => parse_states_arg(s)?,
-        None => Vec::new(),
-    };
-
-    Ok(GetNodesRequest {
-        states: states.iter().map(|s| *s as i32).collect(),
+fn build_get_nodes_request(args: &SinfoArgs, filter: &StateFilter) -> GetNodesRequest {
+    GetNodesRequest {
+        states: filter.request_states(),
         partition: args.partition.clone().unwrap_or_default(),
         nodelist: args.nodes.clone().unwrap_or_default(),
-    })
+    }
 }
 
-/// Parse `-t` / `--states` (comma-separated). Whole-string `all` means no state filter.
-/// Unknown tokens are rejected (Slurm exits with an error rather than showing all nodes).
-fn parse_states_arg(s: &str) -> Result<Vec<spur_proto::proto::NodeState>> {
-    use spur_core::node::NodeState;
+/// A `-t` token that names a display-only overlay rather than a real
+/// [`NodeState`]. These are computed client-side, so they cannot be pushed
+/// into the controller's state filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayFilter {
+    Reserved,
+    Maint,
+    Planned,
+}
 
-    let trimmed = s.trim();
-    if trimmed.eq_ignore_ascii_case("all") {
-        return Ok(Vec::new());
+impl OverlayFilter {
+    fn parse(token: &str) -> Option<Self> {
+        match token.to_lowercase().as_str() {
+            "resv" | "reserved" => Some(Self::Reserved),
+            "maint" => Some(Self::Maint),
+            "plnd" | "planned" => Some(Self::Planned),
+            _ => None,
+        }
     }
 
-    let tokens: Vec<&str> = trimmed
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
+    /// A maint node is still a reservation, so `resv` matches it too (as in Slurm).
+    fn matches(self, overlay: Option<spur_core::node::NodeOverlay>) -> bool {
+        use spur_core::node::NodeOverlay;
+        match self {
+            Self::Reserved => matches!(overlay, Some(NodeOverlay::Reserved { .. })),
+            Self::Maint => matches!(overlay, Some(NodeOverlay::Reserved { maint: true })),
+            Self::Planned => matches!(overlay, Some(NodeOverlay::Planned)),
+        }
+    }
+}
 
-    if tokens.is_empty() {
-        anyhow::bail!("Invalid node state specified: (empty)");
+/// Parsed `-t` / `--states` filter. `base` holds real node states pushed to the
+/// controller; `overlays` hold display-only labels filtered client-side.
+struct StateFilter {
+    base: Vec<spur_proto::proto::NodeState>,
+    overlays: Vec<OverlayFilter>,
+}
+
+impl StateFilter {
+    fn empty() -> Self {
+        Self {
+            base: Vec::new(),
+            overlays: Vec::new(),
+        }
     }
 
-    let mut states = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        let core = NodeState::from_short_or_name(token)
-            .ok_or_else(|| anyhow::anyhow!("Invalid node state specified: {token}"))?;
-        states.push(core.to_proto());
+    /// Parse the comma-separated `-t` argument. Whole-string `all` (or a missing
+    /// argument) means no filter. Unknown tokens are rejected (Slurm exits with
+    /// an error rather than showing all nodes).
+    fn parse(arg: Option<&str>) -> Result<Self> {
+        use spur_core::node::NodeState;
+
+        let Some(s) = arg else {
+            return Ok(Self::empty());
+        };
+
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("all") {
+            return Ok(Self::empty());
+        }
+
+        let tokens: Vec<&str> = trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        if tokens.is_empty() {
+            anyhow::bail!("Invalid node state specified: (empty)");
+        }
+
+        let mut base = Vec::new();
+        let mut overlays = Vec::new();
+        for token in tokens {
+            if let Some(core) = NodeState::from_short_or_name(token) {
+                base.push(core.to_proto());
+            } else if let Some(overlay) = OverlayFilter::parse(token) {
+                overlays.push(overlay);
+            } else {
+                anyhow::bail!("Invalid node state specified: {token}");
+            }
+        }
+        Ok(Self { base, overlays })
     }
-    Ok(states)
+
+    /// States sent to the controller. Overlays only apply to idle nodes, so
+    /// their presence pulls idle into the query; that overlay-implied idle is
+    /// deduplicated against existing base states.
+    fn request_states(&self) -> Vec<i32> {
+        let mut states: Vec<i32> = self.base.iter().map(|s| *s as i32).collect();
+        if !self.overlays.is_empty() {
+            let idle = spur_proto::proto::NodeState::NodeIdle as i32;
+            if !states.contains(&idle) {
+                states.push(idle);
+            }
+        }
+        states
+    }
+
+    /// Whether a node survives the client-side overlay filter. With no overlays
+    /// the controller already applied the full filter, so everything is kept.
+    fn keeps(&self, node: &NodeInfo) -> bool {
+        if self.overlays.is_empty() {
+            return true;
+        }
+        if self.base.iter().any(|s| *s as i32 == node.state) {
+            return true;
+        }
+        let overlay = spur_core::node::node_overlay(node);
+        self.overlays.iter().any(|o| o.matches(overlay))
+    }
 }
 
 /// Group nodes by an arbitrary string key, returning groups sorted by key.
@@ -471,10 +556,28 @@ mod tests {
         SinfoArgs::try_parse_from(argv).unwrap()
     }
 
+    /// Parse the `-t` filter and build the request the way `main_with_args` does.
+    fn build_req(args: &SinfoArgs) -> Result<GetNodesRequest> {
+        let filter = StateFilter::parse(args.states.as_deref())?;
+        Ok(build_get_nodes_request(args, &filter))
+    }
+
+    fn overlay_node(name: &str, planned: bool, reserved: bool, maint: bool) -> NodeInfo {
+        let mut node = make_node(name, NodeState::NodeIdle, "batch");
+        if planned {
+            node.planned_job_id = 42;
+        }
+        if reserved || maint {
+            node.active_reservation = "resv1".into();
+            node.reservation_maint = maint;
+        }
+        node
+    }
+
     #[test]
     fn state_filter_reaches_the_request() {
         let args = parse_sinfo_args(&["sinfo", "-t", "idle"]);
-        let req = build_get_nodes_request(&args).unwrap();
+        let req = build_req(&args).unwrap();
         assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
     }
 
@@ -520,7 +623,7 @@ mod tests {
     #[test]
     fn state_filter_accepts_comma_separated_short_and_long_names() {
         let args = parse_sinfo_args(&["sinfo", "--states", "alloc,DOWN,draining"]);
-        let req = build_get_nodes_request(&args).unwrap();
+        let req = build_req(&args).unwrap();
         assert_eq!(
             req.states,
             vec![
@@ -534,7 +637,7 @@ mod tests {
     #[test]
     fn no_state_filter_leaves_request_states_empty() {
         let args = parse_sinfo_args(&["sinfo"]);
-        let req = build_get_nodes_request(&args).unwrap();
+        let req = build_req(&args).unwrap();
         assert!(req.states.is_empty());
     }
 
@@ -542,29 +645,97 @@ mod tests {
     fn state_filter_all_means_no_filter() {
         for spec in ["all", "ALL"] {
             let args = parse_sinfo_args(&["sinfo", "-t", spec]);
-            assert!(build_get_nodes_request(&args).unwrap().states.is_empty());
+            assert!(build_req(&args).unwrap().states.is_empty());
         }
     }
 
     #[test]
     fn state_filter_rejects_unknown_state() {
         let args = parse_sinfo_args(&["sinfo", "-t", "BOGUS"]);
-        let err = build_get_nodes_request(&args).unwrap_err();
+        let err = build_req(&args).unwrap_err();
         assert!(err.to_string().contains("BOGUS"), "{err}");
     }
 
     #[test]
     fn state_filter_rejects_empty_list() {
         let args = parse_sinfo_args(&["sinfo", "-t", "  ,  "]);
-        assert!(build_get_nodes_request(&args).is_err());
+        assert!(build_req(&args).is_err());
     }
 
     #[test]
     fn partition_and_nodelist_still_reach_the_request() {
         let args = parse_sinfo_args(&["sinfo", "-p", "batch", "-n", "n[1-2]"]);
-        let req = build_get_nodes_request(&args).unwrap();
+        let req = build_req(&args).unwrap();
         assert_eq!(req.partition, "batch");
         assert_eq!(req.nodelist, "n[1-2]");
+    }
+
+    #[test]
+    fn overlay_tokens_pull_idle_into_the_request() {
+        for token in ["plnd", "planned", "PLND", "resv", "reserved", "maint"] {
+            let args = parse_sinfo_args(&["sinfo", "-t", token]);
+            let req = build_req(&args).unwrap();
+            assert_eq!(
+                req.states,
+                vec![NodeState::NodeIdle as i32],
+                "token: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_and_overlay_tokens_combine_in_the_request() {
+        let args = parse_sinfo_args(&["sinfo", "-t", "alloc,plnd"]);
+        let req = build_req(&args).unwrap();
+        assert_eq!(
+            req.states,
+            vec![NodeState::NodeAllocated as i32, NodeState::NodeIdle as i32]
+        );
+    }
+
+    #[test]
+    fn idle_plus_overlay_does_not_duplicate_idle() {
+        let args = parse_sinfo_args(&["sinfo", "-t", "idle,plnd"]);
+        let req = build_req(&args).unwrap();
+        assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
+    }
+
+    #[test]
+    fn plnd_keeps_only_planned_nodes() {
+        let filter = StateFilter::parse(Some("plnd")).unwrap();
+        assert!(filter.keeps(&overlay_node("p", true, false, false)));
+        assert!(!filter.keeps(&overlay_node("i", false, false, false)));
+        assert!(!filter.keeps(&overlay_node("r", false, true, false)));
+    }
+
+    #[test]
+    fn resv_includes_maint_but_maint_does_not_include_plain_resv() {
+        let resv = StateFilter::parse(Some("resv")).unwrap();
+        assert!(resv.keeps(&overlay_node("r", false, true, false)));
+        assert!(resv.keeps(&overlay_node("m", false, false, true)));
+
+        let maint = StateFilter::parse(Some("maint")).unwrap();
+        assert!(maint.keeps(&overlay_node("m", false, false, true)));
+        assert!(!maint.keeps(&overlay_node("r", false, true, false)));
+    }
+
+    #[test]
+    fn idle_overlay_union_keeps_plain_idle_but_alloc_overlay_does_not() {
+        let idle_plnd = StateFilter::parse(Some("idle,plnd")).unwrap();
+        assert!(idle_plnd.keeps(&overlay_node("i", false, false, false)));
+
+        let alloc_plnd = StateFilter::parse(Some("alloc,plnd")).unwrap();
+        assert!(alloc_plnd.keeps(&make_node("a", NodeState::NodeAllocated, "batch")));
+        assert!(!alloc_plnd.keeps(&overlay_node("i", false, false, false)));
+        // The case the union exists for: an idle node earmarked by backfill is
+        // kept via the overlay match even though its base state isn't `alloc`.
+        assert!(alloc_plnd.keeps(&overlay_node("p", true, false, false)));
+    }
+
+    #[test]
+    fn no_overlay_filter_keeps_every_node() {
+        let filter = StateFilter::parse(Some("idle")).unwrap();
+        assert!(filter.keeps(&make_node("a", NodeState::NodeAllocated, "batch")));
     }
 
     #[test]
@@ -682,8 +853,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
-    #[tokio::test]
-    async fn state_filter_reaches_the_controller() {
+    async fn states_on_the_wire_for(token: &str) -> Vec<i32> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -700,7 +870,7 @@ mod tests {
         main_with_args(vec![
             "sinfo".into(),
             "-t".into(),
-            "idle".into(),
+            token.into(),
             "--controller".into(),
             format!("http://{addr}"),
         ])
@@ -708,7 +878,23 @@ mod tests {
         .expect("sinfo against the stub controller");
 
         let req = seen.lock().unwrap().clone().expect("get_nodes was called");
-        assert_eq!(req.states, vec![NodeState::NodeIdle as i32]);
+        req.states
+    }
+
+    #[tokio::test]
+    async fn state_filter_reaches_the_controller() {
+        assert_eq!(
+            states_on_the_wire_for("idle").await,
+            vec![NodeState::NodeIdle as i32]
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_filter_sends_idle_to_the_controller() {
+        assert_eq!(
+            states_on_the_wire_for("plnd").await,
+            vec![NodeState::NodeIdle as i32]
+        );
     }
 
     #[test]
@@ -859,6 +1045,22 @@ mod tests {
 
         let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
         assert_eq!(lines, ["empty|0|n/a|"]);
+    }
+
+    #[test]
+    fn overlay_filter_retains_only_matching_nodes_before_render() {
+        let fields = format_engine::parse_format("%P|%D|%t|%N", &format_engine::sinfo_header);
+        let partitions = vec![make_partition("batch", true)];
+        let nodes = vec![
+            overlay_node("plan1", true, false, false),
+            make_node("idle1", NodeState::NodeIdle, "batch"),
+        ];
+
+        let filter = StateFilter::parse(Some("plnd")).unwrap();
+        let kept: Vec<NodeInfo> = nodes.into_iter().filter(|n| filter.keeps(n)).collect();
+        let lines = render_sinfo_output(&fields, &partitions, &kept, false);
+
+        assert_eq!(lines, ["batch*|1|plnd|plan1"]);
     }
 
     #[test]

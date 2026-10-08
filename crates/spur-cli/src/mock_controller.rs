@@ -34,6 +34,8 @@ pub(crate) struct StepCapture {
     get_job_calls: Arc<AtomicU32>,
     /// When set, `get_job` returns `JobInfo { user: ... }` or the configured error.
     get_job_response: Arc<Mutex<Option<Result<String, tonic::Code>>>>,
+    /// Sequence of `JobInfo` for successive `get_job` calls; last entry repeats.
+    get_job_sequence: Arc<Mutex<Vec<proto::JobInfo>>>,
     create_step_num_tasks: Arc<AtomicU32>,
     create_step_num_nodes: Arc<AtomicU32>,
     create_step_nodelist: Arc<Mutex<String>>,
@@ -48,6 +50,14 @@ pub(crate) struct StepCapture {
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
+    submit_job_id: Arc<AtomicU32>,
+    cancel_job_calls: Arc<AtomicU32>,
+    /// `(job_id, exit_code, user)` for every `CompleteJob` the mock received.
+    complete_job_calls: Arc<Mutex<Vec<(u32, i32, String)>>>,
+    complete_job_error: Arc<Mutex<Option<tonic::Code>>>,
+    /// `node_addr` handed back from `CreateJobStep`, so a test can point an
+    /// interactive step at a mock agent instead of an empty address.
+    create_step_node_addr: Arc<Mutex<String>>,
 }
 
 impl StepCapture {
@@ -120,6 +130,32 @@ impl StepCapture {
     pub(crate) fn set_update_node_fail_names(&self, names: HashSet<String>) {
         *self.update_node_fail_names.lock().unwrap() = names;
     }
+
+    pub(crate) fn set_submit_job_id(&self, id: u32) {
+        self.submit_job_id.store(id, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_get_job_sequence(&self, seq: Vec<proto::JobInfo>) {
+        *self.get_job_sequence.lock().unwrap() = seq;
+    }
+
+    pub(crate) fn cancel_job_calls(&self) -> u32 {
+        self.cancel_job_calls.load(Ordering::SeqCst)
+    }
+
+    /// Every `CompleteJob` the mock received, in call order.
+    pub(crate) fn complete_job_calls(&self) -> Vec<(u32, i32, String)> {
+        self.complete_job_calls.lock().unwrap().clone()
+    }
+
+    /// Make `complete_job` fail, so a test can drive the cancel-on-failure fallback.
+    pub(crate) fn set_complete_job_error(&self, code: tonic::Code) {
+        *self.complete_job_error.lock().unwrap() = Some(code);
+    }
+
+    pub(crate) fn set_create_step_node_addr(&self, addr: impl Into<String>) {
+        *self.create_step_node_addr.lock().unwrap() = addr.into();
+    }
 }
 
 struct MockController {
@@ -169,8 +205,9 @@ mock_controller_impl! {
             }
             Ok(tonic::Response::new(proto::CreateJobStepResponse {
                 step_id: MOCK_STEP_ID,
-                node_addr: String::new(),
+                node_addr: self.capture.create_step_node_addr.lock().unwrap().clone(),
                 container: None,
+                execution_credential: String::new(),
             }))
         }
 
@@ -191,7 +228,16 @@ mock_controller_impl! {
             &self,
             _request: tonic::Request<proto::GetJobRequest>,
         ) -> Result<tonic::Response<proto::JobInfo>, tonic::Status> {
-            self.capture.get_job_calls.fetch_add(1, Ordering::SeqCst);
+            let call_idx = self.capture.get_job_calls.fetch_add(1, Ordering::SeqCst) as usize;
+
+            {
+                let seq = self.capture.get_job_sequence.lock().unwrap();
+                if !seq.is_empty() {
+                    let idx = call_idx.min(seq.len() - 1);
+                    return Ok(tonic::Response::new(seq[idx].clone()));
+                }
+            }
+
             match self.capture.get_job_response.lock().unwrap().clone() {
                 Some(Ok(user)) => Ok(tonic::Response::new(proto::JobInfo {
                     user,
@@ -200,6 +246,40 @@ mock_controller_impl! {
                 Some(Err(code)) => Err(tonic::Status::new(code, "mock get_job failure")),
                 None => Err(tonic::Status::unimplemented("get_job")),
             }
+        }
+
+        async fn submit_job(
+            &self,
+            _request: tonic::Request<proto::SubmitJobRequest>,
+        ) -> Result<tonic::Response<proto::SubmitJobResponse>, tonic::Status> {
+            Ok(tonic::Response::new(proto::SubmitJobResponse {
+                job_id: self.capture.submit_job_id.load(Ordering::SeqCst),
+                warnings: Vec::new(),
+            }))
+        }
+
+        async fn cancel_job(
+            &self,
+            _request: tonic::Request<proto::CancelJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            self.capture.cancel_job_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(tonic::Response::new(()))
+        }
+
+        async fn complete_job(
+            &self,
+            request: tonic::Request<proto::CompleteJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            let request = request.into_inner();
+            self.capture.complete_job_calls.lock().unwrap().push((
+                request.job_id,
+                request.exit_code,
+                request.user,
+            ));
+            if let Some(code) = *self.capture.complete_job_error.lock().unwrap() {
+                return Err(tonic::Status::new(code, "mock complete_job failure"));
+            }
+            Ok(tonic::Response::new(()))
         }
 
         async fn run_step(
@@ -240,6 +320,13 @@ mock_controller_impl! {
             let name = request.into_inner().name;
             self.capture.get_node_requests.lock().unwrap().push(name.clone());
             Err(tonic::Status::not_found(format!("node {name} not found")))
+        }
+
+        async fn get_jobs(
+            &self,
+            _request: tonic::Request<proto::GetJobsRequest>,
+        ) -> Result<tonic::Response<proto::GetJobsResponse>, tonic::Status> {
+            Ok(tonic::Response::new(proto::GetJobsResponse::default()))
         }
 
         async fn get_nodes(
@@ -286,10 +373,6 @@ mock_controller_impl! {
         }
     }
     unimplemented {
-        submit_job(proto::SubmitJobRequest) -> proto::SubmitJobResponse;
-        get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
-        cancel_job(proto::CancelJobRequest) -> ();
-        complete_job(proto::CompleteJobRequest) -> ();
         job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
@@ -367,7 +450,10 @@ pub(crate) fn lazy_client(
     let channel = Endpoint::from_shared(format!("http://{addr}"))
         .expect("valid endpoint")
         .connect_lazy();
-    spur_proto::controller_client(crate::authclient::wrap(channel))
+    spur_proto::controller_client(crate::authclient::wrap_with_audience(
+        channel,
+        &format!("http://{addr}"),
+    ))
 }
 
 /// Reserve a localhost port and release it, so connecting to it is refused

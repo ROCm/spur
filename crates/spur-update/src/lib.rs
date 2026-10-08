@@ -21,7 +21,7 @@ use check::{Channel, UpdateCheckResult};
 use tracing::{debug, info, warn};
 
 /// Spur binary names included in release tarballs.
-pub const SPUR_BINARIES: &[&str] = &["spur", "spurctld", "spurd", "spurstepd"];
+pub const SPUR_BINARIES: &[&str] = &["spur", "spurctld", "spurd", "spurstepd", "spurauthd"];
 
 /// Spawn a non-blocking background update check.
 ///
@@ -162,7 +162,7 @@ pub async fn self_update_cli(
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     println!("Updated spur to {}", result.latest.tag);
-    println!("Note: Restart running daemons (spurctld, spurd) to use the new version.");
+    println!("Note: Restart running daemons (spurctld, spurd, spurauthd) to use the new version.");
 
     Ok(())
 }

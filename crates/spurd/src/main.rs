@@ -14,7 +14,7 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use spurd::reporter::NodeReporter;
-use spurd::{agent_server, auth_middleware, executor, reporter, stepd};
+use spurd::{agent_server, auth_middleware, controller_auth, executor, reporter, stepd};
 
 /// Raise spurd's own `RLIMIT_MEMLOCK` as high as it is allowed to go.
 ///
@@ -338,6 +338,22 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Absent a loaded config, these fall back to `SpurdConfig::default()` — the same
+    // values a present-but-empty `[spurd]` section would resolve to via `#[serde(default)]`.
+    let spurd_config = config.as_ref().map(|c| c.spurd.clone()).unwrap_or_default();
+    match config.as_ref() {
+        Some(c) => controller_auth::install(
+            &c.auth.plugin,
+            &c.cluster_name,
+            spurd_config.native_mint_timeout(),
+        ),
+        None => {
+            let plugin = std::env::var("SPUR_AUTH_PLUGIN").unwrap_or_default();
+            let cluster = std::env::var("SPUR_CLUSTER_NAME").unwrap_or_default();
+            controller_auth::install(&plugin, &cluster, spurd_config.native_mint_timeout());
+        }
+    }
+
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
 
     let stepd_state_dir = args.state_dir.clone().unwrap_or_else(|| {
@@ -414,6 +430,10 @@ async fn main() -> anyhow::Result<()> {
             .map(|c| c.network.wg_interface.clone())
             .unwrap_or_else(|| "spur0".into())
     });
+    // Directory holding `<wg_iface>.conf`, matching `spur net init/join/add-peer`'s own default.
+    let wg_config_dir: std::path::PathBuf = std::env::var("SPUR_WG_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/etc/wireguard"));
 
     // Background update check (non-blocking)
     spur_update::spawn_startup_check(
@@ -522,6 +542,15 @@ async fn main() -> anyhow::Result<()> {
     agent_server::recover_stepds(&running_jobs, recovered_stepds.clone()).await;
 
     // Create the node reporter
+    let reporter_timeouts = reporter::ReporterTimeouts {
+        channel: spur_client::ChannelTimeouts {
+            connect: spurd_config.controller_connect_timeout(),
+            keep_alive_interval: spurd_config.controller_keepalive_interval(),
+            keep_alive_timeout: spurd_config.controller_keepalive_timeout(),
+        },
+        controller_rpc_timeout: spurd_config.controller_rpc_timeout(),
+        failover_cooldown: spurd_config.controller_failover_cooldown(),
+    };
     let reporter = Arc::new(NodeReporter::new(
         hostname.clone(),
         args.controller.clone(),
@@ -530,7 +559,9 @@ async fn main() -> anyhow::Result<()> {
         labels,
         args.token.unwrap_or_default(),
         wg_iface,
+        wg_config_dir,
         running_jobs.clone(),
+        reporter_timeouts,
     ));
 
     // Register with controller
@@ -611,7 +642,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let agent_service = agent_server::AgentService::with_cluster_config(
+    let mut agent_service = agent_server::AgentService::with_cluster_config(
         reporter.clone(),
         hooks_config,
         registry.clone(),
@@ -623,6 +654,13 @@ async fn main() -> anyhow::Result<()> {
         allow_root_jobs,
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
+    if let Some(config) = config.as_ref() {
+        agent_service.apply_auth_policy(&config.auth);
+    }
+    // Give the reporter the live allocation so heartbeats carry each held job's
+    // translated GPU stable_ids. Wired before the replay below records adopted
+    // jobs; the OnceLock only shares the handle, so the ordering is immaterial.
+    reporter.set_allocation(agent_service.allocation_handle());
     agent_service.adopt_stepds(&recovered_stepds).await;
     agent_service
         .replay_adopted_allocations(&recovered_stepds)
@@ -677,10 +715,19 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?
         .flatten()
         .unwrap_or_default();
+    let bearer = match config.as_ref() {
+        Some(c) => spur_core::auth::BearerAuth::from_config(
+            c,
+            jwt_key.as_bytes(),
+            spur_core::auth::VerifierKind::Agent,
+        )?,
+        None => spur_core::auth::BearerAuth::jwt(auth_mode, jwt_key.as_bytes()),
+    };
+    agent_service.apply_auth_handshake(&bearer);
     match auth_mode {
-        spur_core::config::AuthMode::Required if jwt_key.is_empty() => {
+        spur_core::config::AuthMode::Required if bearer.native.is_none() && jwt_key.is_empty() => {
             anyhow::bail!(
-                "[auth] mode = \"required\" but no jwt_key or jwt_key_file is configured on this \
+                "[auth] mode = \"required\" but no jwt_key or auth.jwks is configured on this \
                  node: the agent could never verify a credential and would refuse every launch"
             )
         }
@@ -698,8 +745,21 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // Periodic inventory re-discovery: converge the controller on out-of-band
+    // device changes (e.g. an MI300X SPX/CPX partition switch on a drained node)
+    // without a spurd restart. Detection is debounced (seen-twice) so a
+    // mid-transition partial read never triggers a spurious converge.
+    spawn_inventory_refresh(
+        registry.clone(),
+        reporter.clone(),
+        agent_service.allocation_handle(),
+        config.clone(),
+    );
+
+    // `agent_service` is moved into the gRPC server below, so anything the
+    // refresh task needs was cloned out of it above.
     let server_future = tonic::transport::Server::builder()
-        .layer(auth_middleware::AgentAuthLayer::new(auth_mode, &jwt_key))
+        .layer(auth_middleware::AgentAuthLayer::from_bearer(bearer))
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
     let server_task = tokio::spawn(server_future);
@@ -886,6 +946,165 @@ fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
     registry
 }
 
+/// Spawn the periodic inventory-refresh loop. Every interval it rebuilds the
+/// registry from a fresh discovery, classifies the change against the live
+/// allocation's held ids, debounces (seen-twice), then converges the controller.
+fn spawn_inventory_refresh(
+    registry: Arc<Mutex<DeviceRegistry>>,
+    reporter: Arc<NodeReporter>,
+    allocation: Arc<Mutex<spur_sched::cons_tres::NodeAllocation>>,
+    config: Option<SlurmConfig>,
+) {
+    use spur_sched::cons_tres::CapacityChange;
+
+    tokio::spawn(async move {
+        let mut last_delta = reporter::InventoryDelta::Unchanged;
+        let mut last_fp: reporter::InventoryFingerprint = Default::default();
+        let mut interval = tokio::time::interval(reporter::inventory_refresh_interval());
+        // `interval` fires immediately on the first tick; skip it so the first
+        // real refresh is one full interval in, not at startup.
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+
+            // Build the candidate registry locally WITHOUT swapping the shared
+            // one: GPU injection must keep using the old positional mapping until
+            // this tick commits. Generation is bumped off the currently-reported set.
+            let candidate = init_device_registry(config.as_ref());
+            let mut fresh = reporter::discover_resources(&candidate);
+            fresh.generation = reporter.snapshot_resources().generation + 1;
+
+            let old = reporter.snapshot_resources();
+
+            // Refuse to converge a full-GPU dropout: a zeroed scan is more likely
+            // a loader read error than a real GPU-less node.
+            if is_suspect_gpu_dropout(&old, &fresh) {
+                warn!(
+                    old_gpus = old.gpus.len(),
+                    "discovery returned zero GPUs where some were present; ignoring suspect scan"
+                );
+                continue;
+            }
+
+            let held: std::collections::HashSet<u64> = {
+                let a = allocation.lock().await;
+                a.allocated_gpu_ids().into_iter().collect()
+            };
+            let delta = reporter::classify(&old, &fresh, &held);
+
+            let fresh_fp = fresh.schedulable_fingerprint();
+            let (action, next_last) =
+                reporter::next_refresh_action(&delta, &fresh_fp, &last_delta, &last_fp);
+            last_delta = next_last;
+            last_fp = fresh_fp;
+            match action {
+                reporter::RefreshAction::Wait => continue,
+                reporter::RefreshAction::ApplyCapacity => {
+                    // Applying the same fresh set twice is idempotent, so a retry
+                    // after a failed register re-applies safely.
+                    let change = {
+                        let mut a = allocation.lock().await;
+                        a.update_capacity(&fresh)
+                    };
+                    match change {
+                        CapacityChange::Applied => {
+                            let commit = converge(&reporter, &fresh, &delta, &mut last_delta).await;
+                            publish_registry(&registry, candidate, commit).await;
+                        }
+                        // A concurrent allocation grabbed a device that the fresh
+                        // read dropped; leave capacity untouched and re-detect.
+                        CapacityChange::AllocatedDevicesLost(v) => {
+                            warn!(?v, "inventory change raced an allocation; deferring");
+                        }
+                    }
+                }
+                reporter::RefreshAction::ReportLost => {
+                    let lost: Vec<u64> = {
+                        let new_ids: std::collections::HashSet<u64> =
+                            fresh.gpus.iter().map(|g| g.stable_id).collect();
+                        held.iter()
+                            .copied()
+                            .filter(|id| !new_ids.contains(id))
+                            .collect()
+                    };
+                    // A change to a held device is not an inventory event: pin
+                    // the held devices from the last-reported set so the total
+                    // stays ⊇ allocated (dropping it would let the controller
+                    // double-book the still-held silicon). Only the free pool
+                    // converges.
+                    let reconciled = reporter::reconcile_free_pool(&fresh, &old, &held);
+                    // Register only when the reconciled set differs from what the
+                    // controller already has (schedulable content, ignoring
+                    // generation). While a held device stays held the reconciled
+                    // set equals the baseline every tick, so this skips the warn
+                    // and re-register that would otherwise fire each tick for the
+                    // job's lifetime. A failed register leaves the baseline at
+                    // `old`, so reconciled still differs next tick and retries.
+                    if reconciled.schedulable_fingerprint() == old.schedulable_fingerprint() {
+                        continue;
+                    }
+                    warn!(
+                        ?lost,
+                        "allocated device changed; pinning held gpus, converging free pool only"
+                    );
+                    // Do NOT publish `candidate`: the still-held job injects from
+                    // the shared registry, which the fresh discovery may no longer
+                    // contain. Converge the reconciled REPORTED inventory but leave
+                    // the registry as-is so injection keeps resolving the held device.
+                    let _ = converge(&reporter, &reconciled, &delta, &mut last_delta).await;
+                }
+            }
+        }
+    });
+}
+
+/// Converge the controller on `fresh`, then commit the reporter baseline ONLY
+/// if the controller acknowledged. On failure the baseline is left untouched so
+/// the next tick re-detects the same delta and retries; `last_delta` is set from
+/// `post_converge` so a failed register re-arms rather than being lost.
+async fn converge(
+    reporter: &NodeReporter,
+    fresh: &spur_core::resource::ResourceSet,
+    acted_delta: &reporter::InventoryDelta,
+    last_delta: &mut reporter::InventoryDelta,
+) -> reporter::BaselineCommit {
+    let registered = reporter.register_with(fresh).await;
+    if let Err(e) = &registered {
+        warn!(error = %e, "inventory re-register failed; will retry next tick");
+    }
+    let (commit, next_last) = reporter::post_converge(acted_delta, registered.is_ok());
+    *last_delta = next_last;
+    if commit == reporter::BaselineCommit::Commit {
+        reporter.update_resources(fresh.clone());
+    }
+    commit
+}
+
+/// A >0 -> 0 GPU discovery is a suspect scan: KFD/CDI loaders turn a read/parse
+/// error into an empty registry, indistinguishable from a GPU-less node. Refuse
+/// to auto-converge a full-GPU dropout; a real loss is a fault, not a partition.
+fn is_suspect_gpu_dropout(
+    old: &spur_core::resource::ResourceSet,
+    fresh: &spur_core::resource::ResourceSet,
+) -> bool {
+    fresh.gpus.is_empty() && !old.gpus.is_empty()
+}
+
+/// Swap the candidate registry into the shared one ONLY once the tick committed
+/// (controller acked + baseline advanced), so GPU injection never adopts a new
+/// positional mapping the controller has not yet scheduled from. Lock held only
+/// for the swap, never across an await.
+async fn publish_registry(
+    registry: &Arc<Mutex<DeviceRegistry>>,
+    candidate: DeviceRegistry,
+    commit: reporter::BaselineCommit,
+) {
+    if commit == reporter::BaselineCommit::Commit {
+        let mut reg = registry.lock().await;
+        *reg = candidate;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +1129,29 @@ mod tests {
     #[test]
     fn parse_label_just_equals() {
         assert!(parse_label("=").is_err());
+    }
+
+    /// Built the same way `report_stepd_recovery` builds it: a `ConnectAuthError`
+    /// wrapped in `.context(...)`, not a bare `tonic::Status`. Catches a regression
+    /// where `ConnectAuthError` stops exposing its inner status via `source()`.
+    #[test]
+    fn permanent_recovery_error_is_detected_through_connect_auth_error() {
+        use anyhow::Context;
+        let err: anyhow::Result<()> = Err(controller_auth::ConnectAuthError::Status(
+            tonic::Status::unauthenticated("node token rejected"),
+        ))
+        .context("runtime recovery report failed");
+        assert!(is_permanent_recovery_error(&err.unwrap_err()));
+    }
+
+    #[test]
+    fn a_transient_recovery_error_is_not_permanent() {
+        use anyhow::Context;
+        let err: anyhow::Result<()> = Err(controller_auth::ConnectAuthError::Status(
+            tonic::Status::unavailable("controller unreachable"),
+        ))
+        .context("runtime recovery report failed");
+        assert!(!is_permanent_recovery_error(&err.unwrap_err()));
     }
 
     #[test]
@@ -1069,5 +1311,78 @@ mod tests {
         // Parses, then fails validation — settings the operator wrote are ignored.
         let err = SlurmConfig::load_from_str("cluster_name = \"\"").expect_err("must not validate");
         assert!(!absent_optional_config(false, &err));
+    }
+
+    fn rs_with_gpus(n: usize) -> spur_core::resource::ResourceSet {
+        use spur_core::resource::{GpuLinkType, GpuResource};
+        spur_core::resource::ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            gpus: (0..n as u32)
+                .map(|i| GpuResource {
+                    device_id: i,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 0,
+                    peer_gpus: vec![],
+                    link_type: GpuLinkType::XGMI,
+                    stable_id: 128 + i as u64,
+                })
+                .collect(),
+            generic: Default::default(),
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn suspect_gpu_dropout_guards_full_loss_but_allows_growth() {
+        // >0 -> 0 is a suspect scan (likely a loader error), so refuse to converge.
+        assert!(is_suspect_gpu_dropout(&rs_with_gpus(2), &rs_with_gpus(0)));
+        // 2 -> 4 (real growth) and 0 -> 0 (genuinely GPU-less) are not suspect.
+        assert!(!is_suspect_gpu_dropout(&rs_with_gpus(2), &rs_with_gpus(4)));
+        assert!(!is_suspect_gpu_dropout(&rs_with_gpus(0), &rs_with_gpus(0)));
+    }
+
+    fn registry_with_one_countable_pool() -> DeviceRegistry {
+        let gres = spur_devices::GresEntry {
+            name: "bandwidth".into(),
+            count: Some(100),
+            flags: vec!["count_only".into()],
+            ..Default::default()
+        };
+        let gres_cache = spur_devices::GresCache::from_entries(&[gres]);
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&CdiCache::new(), &gres_cache);
+        reg
+    }
+
+    #[tokio::test]
+    async fn publish_registry_swaps_only_on_commit() {
+        let shared = Arc::new(Mutex::new(DeviceRegistry::new()));
+
+        // Keep signal must NOT publish, even though the candidate is non-empty.
+        publish_registry(
+            &shared,
+            registry_with_one_countable_pool(),
+            reporter::BaselineCommit::Keep,
+        )
+        .await;
+        assert_eq!(
+            shared.lock().await.countable_count(),
+            0,
+            "keep must not swap"
+        );
+
+        // Commit signal publishes the candidate into the shared registry.
+        publish_registry(
+            &shared,
+            registry_with_one_countable_pool(),
+            reporter::BaselineCommit::Commit,
+        )
+        .await;
+        assert_eq!(
+            shared.lock().await.countable_count(),
+            1,
+            "commit swaps the candidate in"
+        );
     }
 }

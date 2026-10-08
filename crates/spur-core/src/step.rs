@@ -18,10 +18,12 @@ use crate::resource::ResourceAllocations;
 /// Job step identifier.
 pub type StepId = u32;
 
-/// Special step IDs (matching Slurm conventions).
-pub const STEP_BATCH: StepId = 0xFFFF_FFFE;
-pub const STEP_EXTERN: StepId = 0xFFFF_FFFD;
-pub const STEP_INTERACTIVE: StepId = 0xFFFF_FFFC;
+/// Special step IDs — the exact Slurm sentinel values from `slurm.h`
+/// (`SLURM_BATCH_SCRIPT`, `SLURM_EXTERN_CONT`, `SLURM_INTERACTIVE_STEP`), so a
+/// Slurm-compatible client speaks the same ids on the wire and in the C FFI.
+pub const STEP_BATCH: StepId = 0xFFFF_FFFB;
+pub const STEP_EXTERN: StepId = 0xFFFF_FFFC;
+pub const STEP_INTERACTIVE: StepId = 0xFFFF_FFFA;
 
 /// Step IDs at or above this are reserved (batch/extern/interactive); real
 /// user `srun` steps are numbered below it (0, 1, 2, ...).
@@ -33,10 +35,54 @@ pub fn is_user_step(step_id: StepId) -> bool {
     step_id < STEP_RESERVED_MIN
 }
 
+/// The batch or extern step — the job's own workload, unlike a user step or
+/// the interactive-terminal custody placeholder.
+pub fn owns_job_lifetime(step_id: StepId) -> bool {
+    !is_user_step(step_id) && step_id != STEP_INTERACTIVE
+}
+
 /// Default for a step id deserialized from a payload written before this
 /// field existed — the batch step, since that was the only kind in flight.
 pub fn default_step_id() -> StepId {
     STEP_BATCH
+}
+
+/// Render a step id the way Slurm does for user-facing output: the reserved
+/// sentinels become `batch`/`extern`/`interactive`, a numbered `srun` step stays
+/// its decimal index. Shared by CLI output and (prefixed) the cgroup leaf name.
+pub fn step_display_name(step_id: StepId) -> String {
+    match step_id {
+        STEP_BATCH => "batch".to_string(),
+        STEP_EXTERN => "extern".to_string(),
+        STEP_INTERACTIVE => "interactive".to_string(),
+        id => id.to_string(),
+    }
+}
+
+/// The cgroup leaf directory for a step, matching Slurm's `step_batch`,
+/// `step_extern`, `step_interactive`, and `step_<n>` layout.
+pub fn step_dir_name(step_id: StepId) -> String {
+    format!("step_{}", step_display_name(step_id))
+}
+
+/// Upper bound on a stored step name — inclusive of the marker a truncated
+/// name ends with.
+pub const MAX_STEP_NAME_BYTES: usize = 256;
+
+const STEP_NAME_TRUNCATION_MARKER: &str = "...";
+
+const _: () = assert!(MAX_STEP_NAME_BYTES > STEP_NAME_TRUNCATION_MARKER.len());
+
+/// Bound a step name. Callers must apply this before proposing the step, never
+/// in apply or snapshot restore — a mixed-version quorum would then diverge.
+pub fn truncate_step_name(mut name: String) -> String {
+    if name.len() <= MAX_STEP_NAME_BYTES {
+        return name;
+    }
+    let end = name.floor_char_boundary(MAX_STEP_NAME_BYTES - STEP_NAME_TRUNCATION_MARKER.len());
+    name.truncate(end);
+    name.push_str(STEP_NAME_TRUNCATION_MARKER);
+    name
 }
 
 /// A step within a job.
@@ -352,13 +398,119 @@ mod tests {
 
     #[test]
     fn test_step_special_ids() {
-        assert_eq!(STEP_BATCH, 0xFFFF_FFFE);
-        assert_eq!(STEP_EXTERN, 0xFFFF_FFFD);
-        assert_eq!(STEP_INTERACTIVE, 0xFFFF_FFFC);
+        // The exact Slurm sentinels from slurm.h: SLURM_BATCH_SCRIPT (0xfffffffb),
+        // SLURM_EXTERN_CONT (0xfffffffc), SLURM_INTERACTIVE_STEP (0xfffffffa).
+        assert_eq!(STEP_BATCH, 0xFFFF_FFFB);
+        assert_eq!(STEP_EXTERN, 0xFFFF_FFFC);
+        assert_eq!(STEP_INTERACTIVE, 0xFFFF_FFFA);
         // All special IDs should be distinct
         assert_ne!(STEP_BATCH, STEP_EXTERN);
         assert_ne!(STEP_BATCH, STEP_INTERACTIVE);
         assert_ne!(STEP_EXTERN, STEP_INTERACTIVE);
+    }
+
+    #[test]
+    fn step_display_name_renders_slurm_names() {
+        assert_eq!(step_display_name(STEP_BATCH), "batch");
+        assert_eq!(step_display_name(STEP_EXTERN), "extern");
+        assert_eq!(step_display_name(STEP_INTERACTIVE), "interactive");
+        assert_eq!(step_display_name(0), "0");
+        assert_eq!(step_display_name(42), "42");
+    }
+
+    #[test]
+    fn step_dir_name_matches_slurm_cgroup_layout() {
+        assert_eq!(step_dir_name(STEP_BATCH), "step_batch");
+        assert_eq!(step_dir_name(STEP_EXTERN), "step_extern");
+        assert_eq!(step_dir_name(STEP_INTERACTIVE), "step_interactive");
+        assert_eq!(step_dir_name(0), "step_0");
+        assert_eq!(step_dir_name(42), "step_42");
+    }
+
+    #[test]
+    fn truncate_step_name_passes_short_names_through() {
+        assert_eq!(truncate_step_name(String::new()), "");
+        assert_eq!(truncate_step_name("hostname".into()), "hostname");
+        let under = "a".repeat(MAX_STEP_NAME_BYTES - 1);
+        assert_eq!(truncate_step_name(under.clone()), under);
+    }
+
+    #[test]
+    fn truncate_step_name_keeps_a_name_exactly_at_the_bound() {
+        let exact = "a".repeat(MAX_STEP_NAME_BYTES);
+        assert_eq!(truncate_step_name(exact.clone()), exact);
+    }
+
+    #[test]
+    fn truncate_step_name_caps_a_name_one_byte_over_the_bound() {
+        let over_by_one = "a".repeat(MAX_STEP_NAME_BYTES + 1);
+        let capped = truncate_step_name(over_by_one);
+        assert_eq!(capped.len(), MAX_STEP_NAME_BYTES);
+        assert!(capped.ends_with("..."));
+    }
+
+    #[test]
+    fn truncate_step_name_caps_an_oversized_name() {
+        let huge = "x".repeat(80_000);
+        let capped = truncate_step_name(huge);
+        assert_eq!(capped.len(), MAX_STEP_NAME_BYTES);
+        assert_eq!(
+            capped,
+            format!("{}...", "x".repeat(MAX_STEP_NAME_BYTES - 3))
+        );
+    }
+
+    #[test]
+    fn truncate_step_name_never_splits_a_multibyte_char() {
+        // An ASCII prefix of 0/1/2 puts the cut at all three in-char offsets of
+        // a 3-byte char, so backing off to a boundary loses 1/0/2 bytes.
+        for (pad, expected) in [(0, 255), (1, 256), (2, 254)] {
+            let name = format!("{}{}", "a".repeat(pad), "€".repeat(MAX_STEP_NAME_BYTES));
+            let capped = truncate_step_name(name);
+            assert_eq!(capped.len(), expected, "pad {pad}");
+            assert!(capped.ends_with("..."), "pad {pad}");
+            let body = capped.trim_end_matches("...");
+            assert!(
+                body.chars().all(|c| c == 'a' || c == '€'),
+                "pad {pad}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_step_name_handles_a_4_byte_char_at_the_boundary() {
+        let name = "🚀".repeat(MAX_STEP_NAME_BYTES);
+        let capped = truncate_step_name(name);
+        assert_eq!(capped.len(), 255);
+        assert!(capped.ends_with("..."));
+        let body = capped.trim_end_matches("...");
+        assert!(body.chars().all(|c| c == '🚀'), "{body}");
+    }
+
+    #[test]
+    fn truncated_step_name_round_trips_through_serde() {
+        let step = JobStep {
+            job_id: 1,
+            step_id: 0,
+            name: truncate_step_name("€".repeat(50_000)),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: ResourceAllocations::default(),
+            nodes: vec!["node001".into()],
+            distribution: TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        };
+        let encoded = serde_json::to_string(&step).expect("serialize");
+        assert!(
+            encoded.len() < 600,
+            "encoded step still oversized: {}",
+            encoded.len()
+        );
+        let decoded: JobStep = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.name, step.name);
     }
 
     #[test]

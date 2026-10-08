@@ -38,6 +38,7 @@ flate2 = { workspace = true }
 serial_test = { workspace = true }
 tempfile = "3"
 zstd = { workspace = true }
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

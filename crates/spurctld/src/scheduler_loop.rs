@@ -111,6 +111,13 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
     let scheduler_notify = cluster.scheduler_notify.clone();
+    // Nodes freed by reclaim are held out of dispatch for the agent's kill grace, so
+    // the next pass cannot see them and would conclude the reclaimer still needs
+    // capacity -- taking a second victim for a shortfall already closed. That extra
+    // eviction is not just churn: it defeats the priority order, because the cheapest
+    // victim goes first and the dearer one follows a second later anyway. Remember
+    // which reclaimer has capacity in flight and leave it alone until it lands.
+    let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -150,8 +157,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
-        let pending = cluster.pending_jobs_and_tag_reasons();
-        if pending.is_empty() {
+        let (mut pending, idle_fill_candidates) = cluster.pending_jobs_with_idle_fill_candidates();
+        if pending.is_empty() && idle_fill_candidates.is_empty() {
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
@@ -163,6 +170,34 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let nodes = cluster.nodes_off_dispatch_cooldown(&pending);
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
+
+        // Append the borrow candidates below every in-quota job, strictly after the
+        // node set and the depth metric are derived from the in-quota list alone. A
+        // candidate's `--nodelist` would otherwise unpin a node held back by dispatch
+        // cooldown, and an in-quota job could then be placed on it (§5.3, D16).
+        //
+        // Tail position is real precedence: the pass walks the list in caller order
+        // and either places a job now, reserving its nodes on the timeline, or
+        // reserves the future slot it would need. A tail job is therefore offered
+        // exactly the capacity left after every in-quota job has taken what it can
+        // start on and reserved what it is waiting for — the definition of spare
+        // capacity, computed by the code that already owns the question (§5.1).
+        let borrow_ids: HashSet<spur_core::job::JobId> =
+            idle_fill_candidates.iter().map(|j| j.job_id).collect();
+        // The appended copies carry the stamp so the pass itself can tell a candidate
+        // from an in-quota job — that is how the future-slot reservation is suppressed
+        // (D15). These are clones; the stored job is stamped only if it actually
+        // starts, through the `borrowed` flag threaded into the dispatch below.
+        pending.extend(idle_fill_candidates.into_iter().map(|mut job| {
+            job.idle_fill = true;
+            job
+        }));
+        if pending.is_empty() {
+            cluster.set_planned_reservations(HashMap::new());
+            cluster.set_planned_job_starts(HashMap::new());
+            scheduler.clear_outcomes();
+            continue;
+        }
 
         if nodes.is_empty() {
             debug!("no schedulable nodes, skipping scheduling cycle");
@@ -218,9 +253,16 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
         if assignments.len() < pending.len() {
+            // An unplaced borrow candidate is deliberately absent from this list. It
+            // has no claim on the capacity it wanted, so it must not evict anyone via
+            // `try_preempt`; `update_pending_reasons` must not relabel it
+            // `NoSuitableNodes` when being over quota is the true reason; and it must
+            // not be exported to a federated peer, since forwarding a job that is over
+            // its local quota is a policy nobody has chosen (§5.4).
             let unscheduled: Vec<_> = pending
                 .iter()
                 .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
+                .filter(|p| !borrow_ids.contains(&p.job_id))
                 .collect();
 
             if !unscheduled.is_empty() {
@@ -228,10 +270,67 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // This helps users distinguish "waiting for higher-priority jobs" vs
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
+            }
 
+            {
+                // Deliberately outside the `unscheduled` guard: that list excludes
+                // borrow candidates, so gating reclaim on it made rule (B) reachable
+                // only when some unrelated in-quota job happened to be pending too.
+                // Reclaim runs before preemption: recovering capacity that was lent
+                // out is always preferable to evicting a job that holds a claim to
+                // it. A job whose shortfall reclaim closes never reaches
+                // `try_preempt` this cycle.
+                let sched_cfg = cluster.config().scheduler.clone();
+                if sched_cfg.idle_fill_enabled {
+                    let now = Utc::now();
+                    reclaim_in_flight.retain(|_, until| *until > now);
+                    // Reclaim considers borrow candidates too, unlike `try_preempt`
+                    // and federation: rule (B) lets a higher-priority idle-fill job
+                    // displace strictly-lower-priority opportunistic work. The
+                    // ceiling inside keeps it from touching anything with a claim.
+                    let reclaimers: Vec<_> = pending
+                        .iter()
+                        .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
+                        .filter(|j| !reclaim_in_flight.contains_key(&j.job_id))
+                        .collect();
+                    let (freed, freed_for) = reclaim_for_unplaced(
+                        &cluster,
+                        &reclaimers,
+                        &borrow_ids,
+                        &cluster_state,
+                        sched_cfg.idle_fill_exempt_secs,
+                    )
+                    .await;
+                    if !freed.is_empty() {
+                        // The cancel has been *delivered*, which is not the same as the
+                        // workload being gone: the agent then sends SIGTERM, waits its
+                        // grace, and only then SIGKILLs. Hold the freed nodes out for
+                        // that long so the reclaimer is not dispatched onto a node
+                        // whose previous occupant still holds GPU memory and its
+                        // cgroup (D3).
+                        const AGENT_KILL_GRACE: std::time::Duration =
+                            std::time::Duration::from_secs(5);
+                        for node in &freed {
+                            cluster.cool_down_node_for(node, AGENT_KILL_GRACE);
+                        }
+                        // Give the reclaimer the whole grace period plus a cycle to be
+                        // dispatched onto what it was just given.
+                        if let Some(job_id) = freed_for {
+                            let settle = chrono::Duration::seconds(
+                                AGENT_KILL_GRACE.as_secs() as i64 + interval_secs as i64 + 1,
+                            );
+                            reclaim_in_flight.insert(job_id, Utc::now() + settle);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if !unscheduled.is_empty() {
                 try_preempt(
                     &cluster,
                     &partitions,
+                    &nodes,
                     &unscheduled,
                     &cluster.config().scheduler,
                 )
@@ -251,7 +350,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         let mut jobs_started_cycle = 0u64;
         for assignment in assignments {
-            if process_assignment(cluster.clone(), assignment).await {
+            // `Assignment` carries no tier information, but this loop appended the
+            // candidates, so results are tagged by job-ID membership rather than by
+            // changing the scheduler's signature (§5.2).
+            let borrowed = borrow_ids.contains(&assignment.job_id);
+            if process_assignment(cluster.clone(), assignment, borrowed).await {
                 jobs_started_cycle += 1;
             }
         }
@@ -278,6 +381,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 async fn process_assignment(
     cluster: Arc<ClusterManager>,
     assignment: spur_sched::traits::Assignment,
+    borrowed: bool,
 ) -> bool {
     let job = match cluster.get_job(assignment.job_id) {
         Some(j) => j,
@@ -363,14 +467,28 @@ async fn process_assignment(
         )
         .await
         {
-            // Both arms tear down identically: with a deadline in play, even "all failed" can mean
-            // every node registered and answered too late, so none of them may be left holding one.
-            AllocationRegisterOutcome::AllFailed | AllocationRegisterOutcome::PartialFailed => {
+            // With a deadline in play, even "all failed" can mean every node registered and
+            // answered too late, so none of them may be left holding one — cancel wide regardless.
+            AllocationRegisterOutcome::Failed { prolog_failed } => {
                 cancel_job_on_nodes(&cluster, job_id, prospective_run_attempt, &all_nodes, 9).await;
-                // The job never left Pending, so plain requeue is a no-op here — the same
-                // Pending-aware backoff the launch path uses is what actually throttles a retry.
-                if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
-                    error!(job_id, error = %e, "failed to back off after registration failure");
+                let detail = "srun allocation registration failed".to_string();
+                let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
+                // A prolog failure drains the node and holds the job, as the launch path does;
+                // otherwise the job never left Pending, so the same Pending-aware backoff the
+                // launch path uses is what actually throttles a retry.
+                if !settle_prolog_failures(
+                    &cluster,
+                    job_id,
+                    &spec,
+                    &prolog_failed,
+                    &detail,
+                    prospective_run_attempt,
+                ) {
+                    if let Err(e) = cluster
+                        .backoff_pending_job_after_dispatch_failure(job_id, prospective_run_attempt)
+                    {
+                        error!(job_id, error = %e, "failed to back off after registration failure");
+                    }
                 }
                 return false;
             }
@@ -475,6 +593,14 @@ async fn process_assignment(
             resources,
             assignment.per_node_alloc.clone(),
             true,
+            borrowed,
+        )
+    } else if borrowed {
+        cluster.start_borrowed_job(
+            job_id,
+            assignment.nodes.clone(),
+            resources,
+            assignment.per_node_alloc.clone(),
         )
     } else {
         cluster.start_job(
@@ -503,6 +629,13 @@ async fn process_assignment(
             error = %e,
             "failed to start job"
         );
+        // No-op if the job already left Pending; otherwise persists the bump
+        // so a retry doesn't re-present the epoch cancel just poisoned above.
+        if let Err(e) =
+            cluster.backoff_pending_job_after_dispatch_failure(job_id, prospective_run_attempt)
+        {
+            error!(job_id, error = %e, "failed to back off after start_job failure");
+        }
         return false;
     }
 
@@ -656,23 +789,45 @@ pub(crate) fn compute_job_allocation(
 
 /// Real per-node "free again at" times derived from running jobs, so backfill
 /// doesn't fall back to a flat placeholder for every busy node.
-fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
+pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
     let running = cluster.get_jobs(&JobFilter {
-        states: &[spur_core::job::JobState::Running],
+        states: &[
+            spur_core::job::JobState::Running,
+            spur_core::job::JobState::Completing,
+        ],
         ..Default::default()
     });
-    busy_until_from_running_jobs(&running)
+    busy_until_from_running_jobs(&running, cluster.config().scheduler.complete_wait_secs)
 }
 
 /// Pure core of [`running_jobs_busy_until`], split out so it's testable
 /// without a full `ClusterManager` harness.
-fn busy_until_from_running_jobs(running: &[spur_core::job::Job]) -> HashMap<String, DateTime<Utc>> {
+fn busy_until_from_running_jobs(
+    running: &[spur_core::job::Job],
+    complete_wait_secs: u32,
+) -> HashMap<String, DateTime<Utc>> {
     use spur_sched::UNLIMITED_JOB_DURATION as UNLIMITED_FALLBACK;
 
     let now = Utc::now();
     let far_future = now + UNLIMITED_FALLBACK;
     let mut busy_until: HashMap<String, DateTime<Utc>> = HashMap::new();
     for job in running {
+        // A job tearing down is bounded by the completing timeout, not by its
+        // own time limit — an unlimited one would otherwise read as a year out.
+        if job.state == spur_core::job::JobState::Completing {
+            let since = job.end_time.unwrap_or(now);
+            let end = since
+                .checked_add_signed(chrono::Duration::seconds(complete_wait_secs as i64))
+                .unwrap_or(far_future)
+                .max(now);
+            for node in &job.allocated_nodes {
+                busy_until
+                    .entry(node.clone())
+                    .and_modify(|e| *e = (*e).max(end))
+                    .or_insert(end);
+            }
+            continue;
+        }
         let start = job.start_time.unwrap_or(now);
         let mut suspended = job.suspended_secs;
         if let Some(since) = job.suspended_at {
@@ -746,10 +901,14 @@ fn effective_exempt_secs(
 }
 
 /// Preempt lower-priority running jobs per their partition PreemptMode
-/// (Off jobs are never preempted).
+/// (Off jobs are never preempted). A non-`gone` failure mid-set leaves the
+/// already-evicted victims evicted with the pending job still unplaced.
 pub(crate) async fn try_preempt(
     cluster: &Arc<ClusterManager>,
     partitions: &[spur_core::partition::Partition],
+    // The pass's own node view, not a fresh read: a node held back by dispatch
+    // cooldown is empty, and counting it would prove a placement the pass refused.
+    cluster_nodes: &[spur_core::node::Node],
     unscheduled: &[&spur_core::job::Job],
     sched: &spur_core::config::SchedulerConfig,
 ) {
@@ -760,7 +919,6 @@ pub(crate) async fn try_preempt(
 
     let now = chrono::Utc::now();
     let reservations = cluster.get_reservations();
-    let cluster_nodes = cluster.get_nodes();
 
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
         spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
@@ -768,13 +926,26 @@ pub(crate) async fn try_preempt(
             .max_by_key(|p| p.preempt_mode.aggressiveness())
     };
 
-    let mut running: Vec<spur_core::job::Job> = cluster
-        .get_jobs(&JobFilter {
-            states: &[JobState::Running],
-            ..Default::default()
-        })
-        .into_iter()
+    // Suspended and completing jobs still hold their allocation, so a node one of
+    // them sits on cannot be handed over by evicting the running jobs beside it.
+    // One read covers both: a job finishing between two separate reads would
+    // otherwise appear as a running candidate but vanish from the occupant map,
+    // making its node look falsely empty to `satisfiable_victim_set`.
+    let holders = cluster.get_jobs(&JobFilter {
+        states: &[JobState::Running, JobState::Suspended, JobState::Completing],
+        ..Default::default()
+    });
+    let mut running: Vec<spur_core::job::Job> = holders
+        .iter()
+        .filter(|j| j.state == JobState::Running)
+        .cloned()
         .collect();
+    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
+    for job in &holders {
+        for node in &job.allocated_nodes {
+            occupants.entry(node.as_str()).or_default().push(job.job_id);
+        }
+    }
     // Resolve once, reuse for both the priority recompute and the
     // preempt-mode decision below.
     let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
@@ -789,6 +960,11 @@ pub(crate) async fn try_preempt(
         .map(|j| (j.job_id, cluster.current_effective_priority(j, partitions)))
         .collect();
     running.sort_by_key(|j| running_priority[&j.job_id]);
+    // Lets the satisfiability search spend the cheapest victims first.
+    let victim_cost: HashMap<spur_core::job::JobId, i32> = running_priority
+        .iter()
+        .map(|(id, p)| (*id, i32::try_from(*p).unwrap_or(i32::MAX)))
+        .collect();
 
     // Pending job's QOS is resolved once per pending job; used for the
     // QosPriority hierarchy check.
@@ -800,7 +976,27 @@ pub(crate) async fn try_preempt(
         .map(|j| (j.job_id, cluster.resolve_qos(j)))
         .collect();
 
+    // Victims of an earlier tick that are still tearing down. Their nodes stay
+    // allocated until each agent reports, so their preemptor must not kill again.
+    let draining_victims: Vec<spur_core::job::Job> = cluster
+        .get_jobs(&JobFilter {
+            states: &[JobState::Completing],
+            ..Default::default()
+        })
+        .into_iter()
+        .filter(|j| j.preempted_by.is_some())
+        .collect();
+
     for pending in unscheduled {
+        // Scoped to the nodes this job could actually use: a victim wedged
+        // elsewhere must not block preemption across the whole cluster.
+        let waiting_on_release = draining_victims.iter().any(|victim| {
+            victim.preempted_by == Some(pending.job_id)
+                && preempt_overlaps_pending_nodes(pending, victim, cluster_nodes)
+        });
+        if waiting_on_release {
+            continue;
+        }
         let Some(pending_part) = partition_for(pending) else {
             continue;
         };
@@ -810,13 +1006,16 @@ pub(crate) async fn try_preempt(
         let pending_tier = pending_part.priority_tier;
         let pending_qos = &pending_qos_map[&pending.job_id];
 
+        // Merely permitted, not chosen: which of these actually go is decided
+        // below, by whether their removal would place the job.
+        let mut eligible: Vec<(&spur_core::job::Job, PreemptMode)> = Vec::new();
         for candidate in &running {
             let candidate_priority = running_priority[&candidate.job_id];
             if candidate_priority >= pending.priority / 2 {
                 continue;
             }
 
-            if !preempt_overlaps_pending_nodes(pending, candidate, &cluster_nodes) {
+            if !preempt_overlaps_pending_nodes(pending, candidate, cluster_nodes) {
                 continue;
             }
 
@@ -855,44 +1054,405 @@ pub(crate) async fn try_preempt(
             if mode == PreemptMode::Off {
                 continue;
             }
+            eligible.push((candidate, mode));
+        }
+
+        // Suspend keeps the allocation, so it is a configured outcome rather than a
+        // way to free a node: searched alone, never mixed into a releasing set.
+        let by_mode = |suspend: bool| -> HashSet<spur_core::job::JobId> {
+            eligible
+                .iter()
+                .filter(|(_, m)| (*m == PreemptMode::Suspend) == suspend)
+                .map(|(j, _)| j.job_id)
+                .collect()
+        };
+        // A job no node can host finds no set in either pool, so it stops spending a
+        // victim per cycle on a placement that will never happen. A set found in
+        // the suspend pool is discarded rather than acted on: suspend never frees
+        // the node, so it could not place the pending job either.
+        let mut found = None;
+        for (is_suspend_pool, pool_ids) in [(false, by_mode(false)), (true, by_mode(true))] {
+            if pool_ids.is_empty() {
+                continue;
+            }
+            let set = satisfiable_victim_set(
+                pending,
+                &VictimPool {
+                    evictable: &pool_ids,
+                    occupants: &occupants,
+                    priority: &victim_cost,
+                    max_priority: None,
+                },
+                cluster_nodes,
+                &reservations,
+                now,
+            );
+            if set.is_some() {
+                found = if is_suspend_pool { None } else { set };
+                break;
+            }
+        }
+        let Some(victims) = found else {
+            continue;
+        };
+
+        let preempt_qos = if sched.preempt_type == PreemptType::QosPriority {
+            Some(pending_qos.name.clone())
+        } else {
+            None
+        };
+        let mut preempted = false;
+        let mut evicted_so_far = Vec::new();
+        for (candidate, mode) in eligible.iter().filter(|(j, _)| victims.contains(&j.job_id)) {
             info!(
                 preempted_job = candidate.job_id,
-                preempted_priority = candidate_priority,
+                preempted_priority = running_priority[&candidate.job_id],
                 pending_job = pending.job_id,
                 pending_priority = pending.priority,
                 mode = ?mode,
                 "preempting lower-priority job"
             );
-            let preempt_qos = if sched.preempt_type == PreemptType::QosPriority {
-                Some(pending_qos.name.clone())
-            } else {
-                None
-            };
             match cluster.preempt_job_with_provenance(
                 candidate.job_id,
-                mode,
+                *mode,
                 Some(pending.job_id),
-                preempt_qos,
+                preempt_qos.clone(),
             ) {
                 Ok(PreemptOutcome::Killed) => {
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
+                    preempted = true;
+                    evicted_so_far.push(candidate.job_id);
                 }
                 Ok(PreemptOutcome::Suspended) => {
                     send_suspend_to_agents(cluster, candidate, false).await;
+                    preempted = true;
+                    evicted_so_far.push(candidate.job_id);
                 }
                 Err(e) => {
-                    warn!(
-                        job_id = candidate.job_id,
-                        error = %e,
-                        "failed to preempt job"
-                    );
-                    continue;
+                    // A victim gone since the snapshot already released its node, so
+                    // the set still holds. Any other failure leaves it held, with
+                    // `evicted_so_far` already gone and the rest of the set abandoned.
+                    let gone = cluster
+                        .get_job(candidate.job_id)
+                        .is_none_or(|j| j.state != JobState::Running);
+                    if gone {
+                        warn!(
+                            job_id = candidate.job_id,
+                            error = %e,
+                            "failed to preempt job already gone"
+                        );
+                    } else {
+                        error!(
+                            job_id = candidate.job_id,
+                            error = %e,
+                            already_evicted = ?evicted_so_far,
+                            "failed to preempt job, abandoning the rest of its victim set"
+                        );
+                        break;
+                    }
                 }
             }
-            break; // One preemption per cycle, re-evaluate next cycle
+        }
+        if preempted {
+            // `occupants` is now stale, so a second pending job could otherwise
+            // prove placement on nodes already promised away.
+            break;
         }
     }
+}
+
+/// A borrowed run that reclaim is permitted to evict, and the nodes it holds.
+struct ReclaimableRun {
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    nodes: Vec<String>,
+    /// The QOS priority, which is what the design means by standing within the
+    /// opportunistic tier. Deliberately not `Job::priority`: that is
+    /// `base * fair_share * age_factor * partition_tier`, so a long-waiting burst
+    /// job would outrank a high-priority borrowed run purely for having queued
+    /// longer. A burst QOS sits at a large negative delta by construction, so QOS
+    /// priority sorts it ahead of stamped idle-fill without special-casing.
+    priority: i32,
+}
+
+/// The minimum time a borrowed job runs before it may be reclaimed.
+///
+/// `preempt_exempt_time` is deliberately not reused: it resolves through the QOS,
+/// then the most protective matched partition, then a cluster fallback, and is
+/// unbounded — so an ordinary cluster-wide hour would make every borrowed job
+/// unreclaimable for an hour, leaving a job with a real claim waiting for capacity
+/// that was lent away. Worse, a user can raise their own window with
+/// `--partition=fast,protected`, since the maximum across matched partitions wins,
+/// and that needs no privilege (D10).
+///
+/// The window doubles per eviction. The anti-thrash hold elsewhere is five seconds
+/// at defaults — exactly the agent's SIGTERM-to-SIGKILL grace — so without this a
+/// job could be lent, evicted and re-lent every five seconds indefinitely,
+/// completing nothing while each round costs a Raft entry, an epilog, an accounting
+/// upsert and an agent RPC. Doubling turns unbounded churn into a converging series
+/// (D11).
+fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
+    const CAP_SECS: i64 = 3600;
+    (base_secs as i64)
+        .saturating_mul(1i64 << preempt_requeue_count.min(16))
+        .min(CAP_SECS)
+}
+
+/// Reclaim capacity lent to borrowed jobs, on behalf of in-quota jobs the pass could
+/// not place. Returns the nodes freed, which the caller holds out of the next cycle
+/// until the agents have confirmed the kill.
+///
+/// Separate from `try_preempt`: the pool is borrowed runs, an opportunistic
+/// reclaimer sits under a QOS priority ceiling, and the eviction is always
+/// `Requeue`. Both prove the shortfall closes first (D2, §8.1).
+async fn reclaim_for_unplaced(
+    cluster: &Arc<ClusterManager>,
+    unplaced: &[&spur_core::job::Job],
+    // Pending jobs that are themselves opportunistic: the stamped borrow candidates.
+    // A job whose QOS is `idle_fill_preemptable` is opportunistic too, and is
+    // recognised from its QOS rather than needing to be listed here.
+    opportunistic: &HashSet<spur_core::job::JobId>,
+    cluster_state: &ClusterState<'_>,
+    exempt_secs: u32,
+) -> (Vec<String>, Option<spur_core::job::JobId>) {
+    let now = Utc::now();
+    let running = cluster.get_jobs(&JobFilter {
+        states: &[spur_core::job::JobState::Running],
+        ..Default::default()
+    });
+
+    // Both sources of "borrowed" (§4.1): jobs stamped `idle_fill` because they
+    // exceeded their own quota, and jobs whose QOS is marked
+    // `idle_fill_preemptable` — the migration path for the burst pattern, which
+    // never exceeds a quota and so is never stamped.
+    // The became-legitimate question is asked once per QOS, not once per run. Asking it
+    // per run is wrong the moment a QOS has two or more borrowed runs: each measures
+    // itself against the same headroom, all of them read as legitimate, and the
+    // reclaimable set is empty while the team sits over its cap. Cached because several
+    // runs usually share a QOS and the answer walks every job.
+    let mut over_quota: HashMap<String, bool> = HashMap::new();
+    let mut reclaimable: Vec<ReclaimableRun> = Vec::new();
+    for job in &running {
+        if job.allocated_nodes.is_empty() {
+            continue;
+        }
+        let borrowed = if job.idle_fill {
+            match job.spec.qos.as_deref() {
+                Some(qos) => *over_quota
+                    .entry(qos.to_string())
+                    .or_insert_with(|| cluster.qos_over_node_quota(qos)),
+                // No QOS means no cap to exceed, so nothing to reclaim.
+                None => false,
+            }
+        } else {
+            cluster.resolve_qos(job).idle_fill_preemptable
+        };
+        if !borrowed {
+            continue;
+        }
+        let ran_for = job
+            .start_time
+            .map(|start| (now - start).num_seconds())
+            .unwrap_or(0);
+        if ran_for < idle_fill_exempt_window(exempt_secs, job.preempt_requeue_count) {
+            continue;
+        }
+        reclaimable.push(ReclaimableRun {
+            priority: cluster.resolve_qos(job).priority,
+            job_id: job.job_id,
+            run_attempt: job.run_attempt,
+            nodes: job.allocated_nodes.clone(),
+        });
+    }
+    if reclaimable.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    // Suspended and completing jobs hold their nodes too, so a node they sit on is
+    // not free for the reclaimer even once every running job on it is evicted.
+    let holders = cluster.get_jobs(&JobFilter {
+        states: &[
+            spur_core::job::JobState::Running,
+            spur_core::job::JobState::Suspended,
+            spur_core::job::JobState::Completing,
+        ],
+        ..Default::default()
+    });
+    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
+    for job in &holders {
+        for node in &job.allocated_nodes {
+            occupants.entry(node.as_str()).or_default().push(job.job_id);
+        }
+    }
+    let reclaimable_ids: HashSet<spur_core::job::JobId> =
+        reclaimable.iter().map(|r| r.job_id).collect();
+    let victim_priority: HashMap<spur_core::job::JobId, i32> =
+        reclaimable.iter().map(|r| (r.job_id, r.priority)).collect();
+
+    for reclaimer in unplaced {
+        // An opportunistic reclaimer displaces only opportunistic work strictly
+        // below it. A job with a genuine quota claim has no such ceiling: borrowed
+        // capacity is a loan and anyone with a claim can call it in.
+        let reclaimer_is_opportunistic = opportunistic.contains(&reclaimer.job_id)
+            || cluster.resolve_qos(reclaimer).idle_fill_preemptable;
+        let ceiling = reclaimer_is_opportunistic.then(|| cluster.resolve_qos(reclaimer).priority);
+
+        let Some(victims) = satisfiable_victim_set(
+            reclaimer,
+            &VictimPool {
+                evictable: &reclaimable_ids,
+                occupants: &occupants,
+                priority: &victim_priority,
+                max_priority: ceiling,
+            },
+            cluster_state.nodes,
+            cluster_state.reservations,
+            now,
+        ) else {
+            continue;
+        };
+
+        let mut freed = Vec::new();
+        for victim in reclaimable.iter().filter(|r| victims.contains(&r.job_id)) {
+            // Always requeue, whatever PreemptMode the victim's QOS or partition
+            // configures. Suspend never releases the allocation, which is the one
+            // thing reclaim needs, and cancel destroys work the run had no claim to
+            // lose when requeue preserves it at no cost to the reclaimer.
+            match cluster.preempt_job_with_provenance(
+                victim.job_id,
+                spur_core::partition::PreemptMode::Requeue,
+                Some(reclaimer.job_id),
+                None,
+            ) {
+                Ok(_) => {
+                    info!(
+                        reclaimed_job = victim.job_id,
+                        for_job = reclaimer.job_id,
+                        nodes = ?victim.nodes,
+                        "reclaimed a borrowed job for a job with a quota claim"
+                    );
+                    // Await the kill before the caller may reuse these nodes. The
+                    // requeue apply deallocates inside Raft and only then fires a
+                    // fire-and-forget cancel, while the agent does SIGTERM, waits five
+                    // seconds, then SIGKILL. At a one-second cycle the reclaimer would
+                    // otherwise be dispatched onto a node whose victim still holds GPU
+                    // memory and its cgroup — failing in exactly the case this feature
+                    // exists for (D3).
+                    cancel_job_on_nodes(
+                        cluster,
+                        victim.job_id,
+                        victim.run_attempt,
+                        &victim.nodes,
+                        0,
+                    )
+                    .await;
+                    freed.extend(victim.nodes.iter().cloned());
+                }
+                Err(e) => {
+                    warn!(job_id = victim.job_id, error = %e, "failed to reclaim borrowed job");
+                }
+            }
+        }
+        if !freed.is_empty() {
+            // One reclaim per cycle: the next pass re-derives everything from the
+            // committed state rather than reasoning about a half-applied plan.
+            return (freed, Some(reclaimer.job_id));
+        }
+    }
+    (Vec::new(), None)
+}
+
+/// The candidate victims a satisfiability search is allowed to spend.
+struct VictimPool<'a> {
+    /// Jobs the caller's own eligibility rules already cleared for eviction.
+    evictable: &'a HashSet<spur_core::job::JobId>,
+    /// Every job holding each node, evictable or not, so a node only counts as
+    /// recovered when the whole set on it is being evicted.
+    occupants: &'a HashMap<&'a str, Vec<spur_core::job::JobId>>,
+    /// What each victim costs, so the cheapest sufficient set is chosen.
+    priority: &'a HashMap<spur_core::job::JobId, i32>,
+    /// Set for an opportunistic reclaimer, which may only displace opportunistic
+    /// work of strictly lower priority. `None` when `evictable` is already final.
+    max_priority: Option<i32>,
+}
+
+/// The set of evictable jobs whose removal would let `reclaimer` actually run, or
+/// `None` when no such set exists. Shared by reclaim and preemption.
+///
+/// Atomic by construction: a node counts as recovered only when every job on it is
+/// evictable, so the reclaimer either gets a full allocation or nothing is
+/// touched. A partial eviction destroys work without helping anyone, and an
+/// unplaceable job has no satisfiable set at all — which is what stops a job that
+/// can never be placed from evicting one victim per cycle forever (§8.2).
+fn satisfiable_victim_set(
+    reclaimer: &spur_core::job::Job,
+    pool: &VictimPool<'_>,
+    nodes: &[spur_core::node::Node],
+    reservations: &[spur_core::reservation::Reservation],
+    now: DateTime<Utc>,
+) -> Option<HashSet<spur_core::job::JobId>> {
+    let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
+    let required = spur_sched::backfill::job_resource_request(reclaimer);
+    // Total rather than currently-free resources: an evacuated node is empty, so
+    // what matters is whether the whole node can host the job. Same suitability
+    // rules the scheduler applies, so reclaim cannot free a node placement would
+    // then refuse — including reservations and the k0s gate.
+    let suitable = |node: &spur_core::node::Node| {
+        placement.matches_for_reservation(node, reservations, now)
+            && node.total_resources.can_satisfy(&required)
+    };
+
+    let needed = (reclaimer.spec.num_nodes as usize).max(1);
+    let mut have = 0usize;
+    let mut victims = HashSet::new();
+    let mut evacuable = Vec::new();
+
+    for node in nodes {
+        if !suitable(node) {
+            continue;
+        }
+        match pool.occupants.get(node.name.as_str()) {
+            // Already empty and suitable, yet the pass still could not place the
+            // job — so these alone are never enough, but they count toward the total.
+            None => have += 1,
+            Some(on_node)
+                if on_node.iter().all(|id| {
+                    pool.evictable.contains(id)
+                        && pool
+                            .max_priority
+                            .is_none_or(|bound| pool.priority.get(id).copied().unwrap_or(0) < bound)
+                }) =>
+            {
+                evacuable.push((node.name.as_str(), on_node));
+            }
+            Some(_) => {}
+        }
+    }
+
+    // Spend the cheapest opportunistic work first, and only climb to a more
+    // valuable victim if that is still not enough. A node's cost is the highest
+    // priority it carries, since evacuating it forfeits every run on it, and
+    // ties break on node name so the choice is deterministic rather than
+    // dependent on registration order.
+    evacuable.sort_by_key(|(name, on_node)| {
+        let cost = on_node
+            .iter()
+            .map(|id| pool.priority.get(id).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        (cost, *name)
+    });
+
+    for (_, on_node) in evacuable {
+        if have >= needed {
+            break;
+        }
+        have += 1;
+        victims.extend(on_node.iter().copied());
+    }
+
+    (have >= needed && !victims.is_empty()).then_some(victims)
 }
 
 /// True when `candidate` occupies a node the pending job could target.
@@ -1109,6 +1669,7 @@ struct AgentDispatchParams<'a> {
     modex_fence_timeout_secs: u32,
     modex_verify_timeout_secs: u32,
     pmix_prepared: bool,
+    execution_credential: &'a str,
 }
 
 /// Resolved output paths reported by an agent after a successful launch.
@@ -1337,12 +1898,18 @@ async fn dispatch_to_agent(
             pmix_plan,
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
+            execution_credential: params.execution_credential.to_string(),
         })
         .await
         .map_err(|s| match s.code() {
             tonic::Code::ResourceExhausted => DispatchError::ResourcesUnavailable,
             tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
                 DispatchError::Unreachable(s.into())
+            }
+            // The agent answered and refused. Reporting this as unreachable sent
+            // the operator looking for a network fault that does not exist.
+            tonic::Code::NotFound | tonic::Code::FailedPrecondition => {
+                DispatchError::AgentRejected(s.message().to_string())
             }
             _ => DispatchError::Other(s.into()),
         })?;
@@ -1403,8 +1970,12 @@ fn build_pmix_plan_proto(
 /// Outcome of parallel RegisterJobAllocation RPCs for a standalone srun job.
 pub(crate) enum AllocationRegisterOutcome {
     AllSucceeded,
-    AllFailed,
-    PartialFailed,
+    // Any node failed to register. Full and partial failure tear down the job
+    // identically, so they share one arm; `prolog_failed` carries the nodes
+    // whose prolog rejected the allocation, for drain+hold.
+    Failed {
+        prolog_failed: Vec<(String, String)>,
+    },
 }
 
 /// Why one RegisterJobAllocation RPC did not succeed. Split so the caller can tell a node that
@@ -1412,6 +1983,10 @@ pub(crate) enum AllocationRegisterOutcome {
 enum RegisterError {
     Failed(anyhow::Error),
     TimedOut(Duration),
+    // The node ran the job's prolog and it failed. Kept distinct from Failed so
+    // the caller drains+holds instead of cooling the node and retrying srun onto
+    // it, matching the LaunchJob path's DispatchError::PrologFailed handling.
+    PrologFailed(String),
 }
 
 impl std::fmt::Display for RegisterError {
@@ -1421,6 +1996,7 @@ impl std::fmt::Display for RegisterError {
             Self::TimedOut(limit) => {
                 write!(f, "allocation register RPC exceeded {}s", limit.as_secs())
             }
+            Self::PrologFailed(reason) => write!(f, "prolog failed: {reason}"),
         }
     }
 }
@@ -1443,13 +2019,14 @@ struct AllocationRegisterParams {
 async fn register_allocation_to_agent(
     agent_addr: &str,
     params: &AllocationRegisterParams,
-) -> anyhow::Result<()> {
+) -> Result<(), RegisterError> {
     let mut client = crate::agent_client::connect(agent_addr.to_string())
-        .await?
+        .await
+        .map_err(|e| RegisterError::Failed(e.into()))?
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
-    client
+    let response = client
         .register_job_allocation(RegisterJobAllocationRequest {
             job_id: params.job_id,
             partition: params.partition.clone(),
@@ -1470,7 +2047,16 @@ async fn register_allocation_to_agent(
             user: params.user.clone(),
             run_attempt: params.run_attempt,
         })
-        .await?;
+        .await
+        .map_err(|s| RegisterError::Failed(s.into()))?
+        .into_inner();
+
+    // A prolog failure comes back as a successful RPC carrying a typed
+    // failure_kind (mirroring LaunchJobResponse), not a gRPC error, so it is not
+    // conflated with an unreachable/rejecting node.
+    if response.failure_kind == spur_proto::proto::LaunchFailureKind::LaunchFailureProlog as i32 {
+        return Err(RegisterError::PrologFailed(response.error));
+    }
 
     info!(
         job_id = params.job_id,
@@ -1478,6 +2064,49 @@ async fn register_allocation_to_agent(
     );
 
     Ok(())
+}
+
+/// Drain every node whose prolog failed and settle the job under
+/// `hold_on_prolog_fail`, shared by the LaunchJob (`confirm_dispatch_on_nodes`)
+/// and the srun-allocation (`register_allocation_on_nodes`) paths so they cannot
+/// re-diverge. Slurm semantics: hold a detached batch job rather than walk it
+/// onto the same failing node; cancel one with a client blocking on it (salloc's
+/// `interactive`, or a standalone `srun` waiting on its step), which would
+/// otherwise hang forever on a held job with nothing to release it. The drain is
+/// issued here, not by the agent, because only the controller can pair it with
+/// the hold.
+///
+/// Returns true when it applied a hold/cancel and the caller should do nothing
+/// more; false when the caller should fall back to its generic dispatch-failure
+/// backoff (no prolog failures, or `hold_on_prolog_fail` disabled).
+fn settle_prolog_failures(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    spec: &spur_core::job::JobSpec,
+    prolog_failed: &[(String, String)],
+    detail: &str,
+    run_attempt: u32,
+) -> bool {
+    if prolog_failed.is_empty() {
+        return false;
+    }
+    for (node_name, reason) in prolog_failed {
+        warn!(job_id, node = %node_name, reason = %reason, "draining node after prolog failure");
+        if let Err(e) = cluster.drain_node(node_name, Some(reason.clone()), Some(0)) {
+            error!(job_id, node = %node_name, error = %e, "failed to drain node after prolog failure");
+        }
+    }
+    if !cluster.config().controller.hold_on_prolog_fail {
+        return false;
+    }
+    if spec.interactive || spec.srun_job {
+        if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
+            error!(job_id, error = %e, "failed to cancel client-attached job after prolog failure");
+        }
+    } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(detail), run_attempt) {
+        error!(job_id, error = %e, "failed to hold job after prolog failure");
+    }
+    true
 }
 
 /// Register a srun-only allocation on every assigned node.
@@ -1541,16 +2170,16 @@ async fn register_allocation_on_nodes(
             let register = register_allocation_to_agent(&agent_addr, &params);
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, register).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(RegisterError::Failed(e)),
+                    Ok(inner) => inner,
                     Err(_) => Err(RegisterError::TimedOut(limit)),
                 },
-                None => register.await.map_err(RegisterError::Failed),
+                None => register.await,
             };
             (result_node, result)
         });
     }
 
+    let mut prolog_failed: Vec<(String, String)> = Vec::new();
     while let Some(result) = set.join_next().await {
         match result {
             Ok((_node_name, Ok(()))) => {
@@ -1564,10 +2193,12 @@ async fn register_allocation_on_nodes(
                     "allocation registration on agent failed"
                 );
                 // Mirrors the launch fan-out: an unreachable node is cooled briefly, one that
-                // burned a deadline is held for it, so neither is re-picked on the next tick.
+                // burned a deadline is held for it, so neither is re-picked on the next tick. A
+                // prolog failure is deferred to the caller, which drains the node and holds the job.
                 match e {
                     RegisterError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
                     RegisterError::Failed(_) => cluster.cool_down_node(&node_name),
+                    RegisterError::PrologFailed(reason) => prolog_failed.push((node_name, reason)),
                 }
                 failures += 1;
             }
@@ -1580,13 +2211,13 @@ async fn register_allocation_on_nodes(
 
     if successes == 0 && total > 0 {
         error!(job_id, failures, "all allocation registrations failed");
-        AllocationRegisterOutcome::AllFailed
+        AllocationRegisterOutcome::Failed { prolog_failed }
     } else if failures > 0 {
         warn!(
             job_id,
             successes, failures, "partial allocation registration failure"
         );
-        AllocationRegisterOutcome::PartialFailed
+        AllocationRegisterOutcome::Failed { prolog_failed }
     } else {
         AllocationRegisterOutcome::AllSucceeded
     }
@@ -1613,9 +2244,10 @@ fn abort_pending_pmix_dispatch(
     cluster: &ClusterManager,
     job_id: spur_core::job::JobId,
     detail: String,
+    run_attempt: u32,
 ) -> DispatchConfirmOutcome {
     let _ = cluster.set_job_launch_failure_detail(job_id, detail);
-    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt) {
         error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
     }
     DispatchConfirmOutcome::Aborted
@@ -1739,6 +2371,26 @@ async fn confirm_dispatch_on_nodes(
         node_agents.push((node_name.clone(), agent_addr));
     }
 
+    let execution_credential = match crate::native_keys::sign_dispatch_credential(
+        &cluster.config().cluster_name,
+        job_id,
+        run_attempt,
+        &spec,
+        &per_node_allocs,
+        node_agents.iter().map(|(n, _)| n.as_str()),
+    ) {
+        Ok(token) => token,
+        Err(e) => {
+            error!(job_id, error = %e, "failed to sign job execution credential");
+            return abort_pending_pmix_dispatch(
+                &cluster,
+                job_id,
+                format!("failed to sign job execution credential: {e}"),
+                run_attempt,
+            );
+        }
+    };
+
     let mut pmix_prepare_guard = None;
 
     if needs_pmix_prepare {
@@ -1755,7 +2407,7 @@ async fn confirm_dispatch_on_nodes(
                 node_agents.len(),
                 dispatch_nodes.len()
             );
-            return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+            return abort_pending_pmix_dispatch(&cluster, job_id, detail, run_attempt);
         }
 
         if let Some(detail) = pmix_dispatch::multi_node_pmix_unsupported(
@@ -1765,7 +2417,8 @@ async fn confirm_dispatch_on_nodes(
         ) {
             error!(job_id, "{detail}");
             let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
-            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail)) {
+            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail), run_attempt)
+            {
                 error!(job_id, error = %e, "failed to hold job for unsupported multi-node PMIx");
             }
             return DispatchConfirmOutcome::Aborted;
@@ -1792,18 +2445,19 @@ async fn confirm_dispatch_on_nodes(
                 modex_fence_timeout_secs,
                 modex_verify_timeout_secs,
                 pmix_prepared: false,
+                execution_credential: "",
             };
             let pmix_plan = match build_pmix_plan_proto(&params, &spec, tasks_per_node) {
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
                     let detail = format!("job is not configured for PMIx on node {node_name}");
                     error!(job_id, node = %node_name, "{detail}");
-                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                    return abort_pending_pmix_dispatch(&cluster, job_id, detail, run_attempt);
                 }
                 Err(detail) => {
                     let detail = format!("invalid PMIx launch plan for node {node_name}: {detail}");
                     error!(job_id, node = %node_name, "{detail}");
-                    return abort_pending_pmix_dispatch(&cluster, job_id, detail);
+                    return abort_pending_pmix_dispatch(&cluster, job_id, detail, run_attempt);
                 }
             };
             prepare_nodes.push(PmixPrepareNode {
@@ -1826,6 +2480,7 @@ async fn confirm_dispatch_on_nodes(
                 &cluster,
                 job_id,
                 format!("PMIx prepare failed: {detail}"),
+                run_attempt,
             );
         }
         let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
@@ -1849,6 +2504,7 @@ async fn confirm_dispatch_on_nodes(
         let allocated_nodelist = allocated_nodelist.clone();
         let pmix_tmpdir = pmix_tmpdir.clone();
         let agent_addr = agent_addr.clone();
+        let execution_credential = execution_credential.clone();
         set.spawn(async move {
             let params = AgentDispatchParams {
                 job_id,
@@ -1867,6 +2523,7 @@ async fn confirm_dispatch_on_nodes(
                 modex_fence_timeout_secs,
                 modex_verify_timeout_secs,
                 pmix_prepared: needs_pmix_prepare,
+                execution_credential: &execution_credential,
             };
             let dispatch = dispatch_to_agent(&agent_addr, &params);
             // The join below drains every node, so one agent that accepts the call and never answers
@@ -1959,31 +2616,19 @@ async fn confirm_dispatch_on_nodes(
     // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
     cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9).await;
 
-    // Drain before deciding the job's fate, so the failing node is already out
-    // of the candidate set on the next scheduling attempt. The drain is issued
-    // here rather than by the agent because only the controller can pair it
-    // with the hold that stops the job walking the cluster.
-    for (node_name, reason) in &prolog_failed {
-        warn!(job_id, node = %node_name, reason = %reason, "draining node after prolog failure");
-        if let Err(e) = cluster.drain_node(node_name, Some(reason.clone()), Some(0)) {
-            error!(job_id, node = %node_name, error = %e, "failed to drain node after prolog failure");
+    // Drain+hold the prolog-failing nodes before deciding the job's fate, so a
+    // failing node is already out of the candidate set on the next attempt.
+    if !settle_prolog_failures(
+        &cluster,
+        job_id,
+        &spec,
+        &prolog_failed,
+        &confirmation_detail,
+        run_attempt,
+    ) {
+        if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, run_attempt) {
+            error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
         }
-    }
-
-    if !prolog_failed.is_empty() && cluster.config().controller.hold_on_prolog_fail {
-        if spec.interactive {
-            // Holding an interactive job would strand its waiting srun forever
-            // with nothing to wait for; Slurm cancels these too.
-            if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
-                error!(job_id, error = %e, "failed to cancel interactive job after prolog failure");
-            }
-        } else if let Err(e) =
-            cluster.hold_job_for_launch_failure(job_id, Some(&confirmation_detail))
-        {
-            error!(job_id, error = %e, "failed to hold job after prolog failure");
-        }
-    } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
-        error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
     }
 
     DispatchConfirmOutcome::Aborted
@@ -2228,21 +2873,32 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
         });
 
         for job in completing {
-            let Some(completing_since) = job.end_time else {
-                continue;
-            };
-            if now - completing_since < wait {
+            if !completing_job_is_overdue(&job, now, wait) {
                 continue;
             }
-
+            if job.end_time.is_none() {
+                warn!(
+                    job_id = job.job_id,
+                    "job is COMPLETING with no end time — force-finishing"
+                );
+            }
             force_finish_completing_job(&cluster, &job).await;
         }
     }
 }
 
-/// Force-finish a job stuck in Completing past `complete_wait_secs`, cancelling
-/// it on the unreported nodes first so their agents release the allocation
-/// before the controller frees those nodes. Best-effort; the agent reclaim backs it.
+/// Whether a COMPLETING job has waited long enough to be force-finished. No
+/// production path leaves the end time unset, so a missing one is corrupt state.
+fn completing_job_is_overdue(
+    job: &spur_core::job::Job,
+    now: DateTime<Utc>,
+    wait: chrono::Duration,
+) -> bool {
+    job.end_time.is_none_or(|since| now - since >= wait)
+}
+
+/// Force-finishes a job stuck in Completing past `complete_wait_secs`. Cancels
+/// unreported nodes in the background so a slow cancel can't race this verdict.
 async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) {
     let missing: Vec<_> = job
         .allocated_nodes
@@ -2273,7 +2929,12 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
     }
 
     if !missing.is_empty() {
-        cancel_job_on_nodes(cluster, job.job_id, job.run_attempt, &missing, 9).await;
+        let cluster = cluster.clone();
+        let job_id = job.job_id;
+        let run_attempt = job.run_attempt;
+        tokio::spawn(async move {
+            cancel_job_on_nodes(&cluster, job_id, run_attempt, &missing, 9).await;
+        });
     }
 
     info!(
@@ -2688,6 +3349,56 @@ mod tests {
     }
 
     #[test]
+    fn a_completing_job_with_no_end_time_is_already_overdue() {
+        // The silent-skip bug: an unstamped job was never force-finished, so a
+        // node that stopped reporting stranded its allocation forever.
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now, 10);
+        job.state = spur_core::job::JobState::Completing;
+        job.end_time = None;
+        assert!(completing_job_is_overdue(
+            &job,
+            now,
+            chrono::Duration::seconds(300)
+        ));
+    }
+
+    #[test]
+    fn a_completing_job_is_overdue_only_after_the_wait_elapses() {
+        let now = Utc::now();
+        let wait = chrono::Duration::seconds(300);
+        let mut job = running_job_on("node001", now, 10);
+        job.state = spur_core::job::JobState::Completing;
+
+        job.end_time = Some(now - chrono::Duration::seconds(299));
+        assert!(!completing_job_is_overdue(&job, now, wait));
+
+        job.end_time = Some(now - chrono::Duration::seconds(300));
+        assert!(completing_job_is_overdue(&job, now, wait));
+    }
+
+    #[test]
+    fn busy_until_bounds_a_completing_job_by_the_completing_timeout() {
+        // An unlimited job tearing down would otherwise read as a year out and
+        // block every backfill reservation on its nodes.
+        let now = Utc::now();
+        let mut job = running_job_on("node001", now - chrono::Duration::days(2), 0);
+        job.spec.time_limit = None;
+        job.state = spur_core::job::JobState::Completing;
+        job.end_time = Some(now);
+
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
+        let got = busy_until["node001"];
+        assert!(
+            (got - (now + chrono::Duration::seconds(300)))
+                .num_seconds()
+                .abs()
+                < 2,
+            "expected the completing timeout to bound it, got {got}"
+        );
+    }
+
+    #[test]
     fn busy_until_takes_the_max_across_jobs_sharing_a_node() {
         let now = Utc::now();
         let sooner = running_job_on("node001", now, 10);
@@ -2695,7 +3406,7 @@ mod tests {
 
         // Larger-ending job processed first: a "last wins" bug (instead of a
         // true max) would incorrectly keep the smaller value here.
-        let busy_until = busy_until_from_running_jobs(&[later, sooner]);
+        let busy_until = busy_until_from_running_jobs(&[later, sooner], 300);
 
         let expected =
             now + chrono::Duration::minutes(60) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
@@ -2712,7 +3423,7 @@ mod tests {
         let mut job = running_job_on("node001", now, 60);
         job.suspended_secs = i64::MAX;
 
-        let busy_until = busy_until_from_running_jobs(&[job]);
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
         let got = busy_until["node001"];
         assert!(got > now, "expected a sane future timestamp, got {got}");
     }
@@ -2723,7 +3434,7 @@ mod tests {
         let mut job = running_job_on("node001", now - chrono::Duration::days(400), 0);
         job.spec.time_limit = None;
 
-        let busy_until = busy_until_from_running_jobs(&[job]);
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
         let got = busy_until["node001"];
         assert!(
             got >= now,
@@ -2737,7 +3448,7 @@ mod tests {
         let mut job = running_job_on("node001", now, 10);
         job.suspended_at = Some(now - chrono::Duration::minutes(5));
 
-        let busy_until = busy_until_from_running_jobs(&[job]);
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
         let expected = now
             + chrono::Duration::minutes(10)
             + chrono::Duration::minutes(5)
@@ -2755,7 +3466,7 @@ mod tests {
         let mut job = running_job_on("node001", now, 10);
         job.start_time = None;
 
-        let busy_until = busy_until_from_running_jobs(&[job]);
+        let busy_until = busy_until_from_running_jobs(&[job], 300);
         let expected =
             now + chrono::Duration::minutes(10) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
         let got = busy_until["node001"];
@@ -2771,6 +3482,7 @@ mod tests {
             memory_mb,
             gpus,
             generic: HashMap::new(),
+            generation: 0,
         }
     }
 
@@ -2781,6 +3493,7 @@ mod tests {
             memory_mb: 192_000,
             peer_gpus: vec![],
             link_type: GpuLinkType::PCIe,
+            stable_id: device_id as u64,
         }
     }
 
@@ -2928,6 +3641,7 @@ mod tests {
             memory_mb: 256_000,
             gpus: vec![],
             generic: gen_a,
+            generation: 0,
         };
 
         let mut gen_b = HashMap::new();
@@ -2937,6 +3651,7 @@ mod tests {
             memory_mb: 256_000,
             gpus: vec![],
             generic: gen_b,
+            generation: 0,
         };
 
         let nodes = vec!["n1".to_string(), "n2".to_string()];
@@ -3196,6 +3911,372 @@ mod tests {
     // agent over the network, so the eviction + cancel-RPC behavior it
     // drives is verified end-to-end rather than by calling evict_job
     // directly on an already-Running job.
+    mod idle_fill_reclaim_tests {
+        use super::*;
+
+        fn no_priorities() -> HashMap<spur_core::job::JobId, i32> {
+            HashMap::new()
+        }
+
+        fn node(name: &str, cpus: u32) -> Node {
+            let mut n = Node::new(
+                name.into(),
+                ResourceSet {
+                    cpus,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+            );
+            n.state = spur_core::node::NodeState::Idle;
+            n
+        }
+
+        fn reclaimer(num_nodes: u32, cpus_per_task: u32) -> Job {
+            job_with_spec(JobSpec {
+                num_nodes,
+                num_tasks: num_nodes,
+                cpus_per_task,
+                time_limit: Some(chrono::Duration::minutes(10)),
+                ..Default::default()
+            })
+        }
+
+        #[test]
+        fn an_unplaceable_job_evicts_nothing_however_long_it_waits() {
+            // The denial-of-service `try_preempt` would have allowed (D2): a job that
+            // can never be placed anywhere must have no satisfiable victim set, so it
+            // evicts nothing — not one borrowed job per cycle, forever.
+            let nodes = vec![node("n1", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+
+            // Wants 16 CPUs on one node; the only node has 4. No eviction can help.
+            let greedy = reclaimer(1, 16);
+            assert!(
+                satisfiable_victim_set(
+                    &greedy,
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &no_priorities(),
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
+                    Utc::now()
+                )
+                .is_none(),
+                "an unplaceable job must never find a victim set"
+            );
+
+            // Control: a job that fits does find one, so the refusal above is caused by
+            // unplaceability and not by the fixture being unsatisfiable for everyone.
+            let fits = reclaimer(1, 2);
+            assert_eq!(
+                satisfiable_victim_set(
+                    &fits,
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &no_priorities(),
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
+                    Utc::now()
+                ),
+                Some([7].into_iter().collect())
+            );
+        }
+
+        #[test]
+        fn a_victim_set_that_cannot_close_the_shortfall_evicts_nothing() {
+            // Atomicity: the reclaimer needs two nodes but only one can be evacuated,
+            // so nothing is touched. A partial eviction destroys work without helping.
+            let nodes = vec![node("n1", 4), node("n2", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]); // borrowed, evacuable
+            occupants.insert("n2", vec![9]); // in-quota, not evacuable
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+
+            assert!(
+                satisfiable_victim_set(
+                    &reclaimer(2, 1),
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &no_priorities(),
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
+                    Utc::now()
+                )
+                .is_none(),
+                "one evacuable node cannot satisfy a two-node job, so evict nothing"
+            );
+
+            // Both evacuable: now the whole allocation is recoverable and both go.
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            occupants.insert("n2", vec![8]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 8].into_iter().collect();
+            let victims = satisfiable_victim_set(
+                &reclaimer(2, 1),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &no_priorities(),
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
+                Utc::now(),
+            )
+            .expect("both nodes recoverable");
+            assert_eq!(victims, [7, 8].into_iter().collect());
+        }
+
+        #[test]
+        fn reclaim_spends_the_lowest_priority_opportunistic_run_first() {
+            // The design's eviction order: "lowest-priority opportunistic jobs first
+            // (typically burst), then higher-priority idle-fill if still insufficient."
+            // Previously victims were taken in node-iteration order, so a legitimate
+            // claim could evict a high-priority borrowed run while a low-priority burst
+            // job on another node kept running.
+            let nodes = vec![node("n1", 4), node("n2", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]); // high-priority idle-fill
+            occupants.insert("n2", vec![9]); // low-priority burst
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 9].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> =
+                [(7, 5000), (9, 10)].into_iter().collect();
+
+            // One node needed, so exactly one victim: the cheaper one.
+            let victims = satisfiable_victim_set(
+                &reclaimer(1, 1),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &priorities,
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
+                Utc::now(),
+            )
+            .expect("one evacuable node is enough");
+            assert_eq!(
+                victims,
+                [9].into_iter().collect(),
+                "the low-priority burst run must be evicted, not the high-priority borrower"
+            );
+
+            // n1 is listed first, so a node-order implementation would have picked 7.
+            assert!(
+                !victims.contains(&7),
+                "high-priority borrower must be spared"
+            );
+        }
+
+        #[test]
+        fn reclaim_climbs_to_a_costlier_victim_only_when_it_must() {
+            // Two nodes needed and only two available, so both go regardless of
+            // priority -- the ordering decides *which first*, never whether enough is
+            // taken to satisfy the claim.
+            let nodes = vec![node("n1", 4), node("n2", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            occupants.insert("n2", vec![9]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 9].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> =
+                [(7, 5000), (9, 10)].into_iter().collect();
+
+            let victims = satisfiable_victim_set(
+                &reclaimer(2, 1),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &priorities,
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
+                Utc::now(),
+            )
+            .expect("both nodes recoverable");
+            assert_eq!(victims, [7, 9].into_iter().collect());
+        }
+
+        #[test]
+        fn an_opportunistic_reclaimer_cannot_displace_dearer_opportunistic_work() {
+            // Rule (B): "A burst job (low priority, idle_fill_preemptable = true)
+            // cannot displace a higher-priority idle-fill job." The ceiling is the
+            // reclaimer's own priority, so a cheap opportunistic job finds no victim
+            // set at all when the only candidate outranks it.
+            let nodes = vec![node("n1", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]); // dear borrowed run
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> = [(7, 6000)].into_iter().collect();
+
+            let cheap = reclaimer(1, 1); // priority 0 in the fixture
+            assert!(
+                satisfiable_victim_set(
+                    &cheap,
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &priorities,
+                        // An opportunistic reclaimer at burst priority.
+                        max_priority: Some(1001),
+                    },
+                    &nodes,
+                    &[],
+                    Utc::now()
+                )
+                .is_none(),
+                "a low-priority opportunistic job must not evict a dearer one"
+            );
+
+            // Control: with no ceiling -- a job holding a real quota claim -- the same
+            // victim is fair game, so the refusal above is the ceiling and not the
+            // fixture being unsatisfiable.
+            assert_eq!(
+                satisfiable_victim_set(
+                    &cheap,
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &priorities,
+                        max_priority: None,
+                    },
+                    &nodes,
+                    &[],
+                    Utc::now()
+                ),
+                Some([7].into_iter().collect()),
+                "a legitimate claim may reclaim any borrowed capacity"
+            );
+        }
+
+        #[test]
+        fn an_opportunistic_reclaimer_may_displace_strictly_cheaper_work() {
+            // The other half of rule (B): a higher-priority idle-fill job does outrank
+            // a lower-priority burst job. Strictly lower, so an equal-priority victim
+            // is still protected.
+            let nodes = vec![node("n1", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![9]); // cheap burst victim
+            let reclaimable: HashSet<spur_core::job::JobId> = [9].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> = [(9, 1001)].into_iter().collect();
+
+            let dear = reclaimer(1, 1);
+            assert_eq!(
+                satisfiable_victim_set(
+                    &dear,
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &priorities,
+                        max_priority: Some(6000),
+                    },
+                    &nodes,
+                    &[],
+                    Utc::now()
+                ),
+                Some([9].into_iter().collect()),
+                "a dearer opportunistic job displaces a strictly cheaper one"
+            );
+
+            // Equal priority is not "strictly lower", so nothing moves.
+            assert!(
+                satisfiable_victim_set(
+                    &dear,
+                    &VictimPool {
+                        evictable: &reclaimable,
+                        occupants: &occupants,
+                        priority: &priorities,
+                        max_priority: Some(1001),
+                    },
+                    &nodes,
+                    &[],
+                    Utc::now()
+                )
+                .is_none(),
+                "equal priority must not be displaced"
+            );
+        }
+
+        #[test]
+        fn victim_order_is_deterministic_when_priorities_tie() {
+            // Equal priority must not leave the choice to node registration order.
+            let nodes = vec![node("n2", 4), node("n1", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            occupants.insert("n2", vec![9]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 9].into_iter().collect();
+            let priorities: HashMap<spur_core::job::JobId, i32> =
+                [(7, 100), (9, 100)].into_iter().collect();
+
+            let victims = satisfiable_victim_set(
+                &reclaimer(1, 1),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &priorities,
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
+                Utc::now(),
+            )
+            .expect("one evacuable node is enough");
+            assert_eq!(
+                victims,
+                [7].into_iter().collect(),
+                "ties break on node name, so n1's occupant goes even though n2 is listed first"
+            );
+        }
+
+        #[test]
+        fn a_node_sharing_with_an_in_quota_job_is_never_counted_as_recovered() {
+            // Evicting the borrowed job would not empty the node, so it must not count
+            // toward closing the shortfall.
+            let nodes = vec![node("n1", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7, 9]); // 7 borrowed, 9 has a claim
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+
+            assert!(satisfiable_victim_set(
+                &reclaimer(1, 1),
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: &no_priorities(),
+                    max_priority: None,
+                },
+                &nodes,
+                &[],
+                Utc::now()
+            )
+            .is_none());
+        }
+
+        #[test]
+        fn the_exempt_window_doubles_per_eviction_and_is_capped() {
+            // A borrowed job evicted repeatedly is protected for longer each time, so
+            // lend/evict/re-lend converges instead of spinning every five seconds (D11).
+            assert_eq!(idle_fill_exempt_window(60, 0), 60);
+            assert_eq!(idle_fill_exempt_window(60, 1), 120);
+            assert_eq!(idle_fill_exempt_window(60, 4), 960);
+            // Capped, and an absurd count must not overflow into a panic.
+            assert_eq!(idle_fill_exempt_window(60, 20), 3600);
+            assert_eq!(idle_fill_exempt_window(u32::MAX, u32::MAX), 3600);
+        }
+    }
+
     mod dispatch_trigger_tests {
         use super::*;
         use spur_core::config::SlurmConfig;
@@ -3219,9 +4300,13 @@ mod tests {
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
             register_delay: Duration,
-            /// launch_job returns a ResourceExhausted status, standing in for a
-            /// node whose local allocation table already holds the GPUs.
-            reject_resources: bool,
+            /// Sleeps inside `cancel_job` before acknowledging, standing in for a slow
+            /// agent — used to race a real completion report against force-finish.
+            cancel_delay: Duration,
+            /// launch_job fails with this gRPC status instead of answering, for
+            /// example ResourceExhausted from a node whose local allocation table
+            /// already holds the GPUs, or NotFound from an operator with no SpurJob.
+            reject_with_status: Option<tonic::Status>,
             /// Records each `LaunchJobRequest.task_fanout` this agent receives,
             /// so tests can assert on it without a real spurd behind the RPC.
             fanout_calls: Option<Arc<std::sync::Mutex<Vec<bool>>>>,
@@ -3247,6 +4332,16 @@ mod tests {
                 Ok(tonic::Response::new(()))
             }
 
+            async fn ping(
+                &self,
+                _request: tonic::Request<()>,
+            ) -> Result<tonic::Response<spur_proto::proto::PingResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(
+                    spur_proto::proto::PingResponse::default(),
+                ))
+            }
+
             async fn await_step(
                 &self,
                 _request: tonic::Request<spur_proto::proto::AwaitStepRequest>,
@@ -3263,10 +4358,8 @@ mod tests {
                 if !self.launch_delay.is_zero() {
                     tokio::time::sleep(self.launch_delay).await;
                 }
-                if self.reject_resources {
-                    return Err(tonic::Status::resource_exhausted(
-                        "controller-allocated GPUs unavailable on this node",
-                    ));
+                if let Some(status) = &self.reject_with_status {
+                    return Err(status.clone());
                 }
                 if let Some(kind) = self.reject_launch_as {
                     return Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
@@ -3321,6 +4414,9 @@ mod tests {
                 &self,
                 _request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
             ) -> Result<tonic::Response<()>, tonic::Status> {
+                if !self.cancel_delay.is_zero() {
+                    tokio::time::sleep(self.cancel_delay).await;
+                }
                 self.cancel_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(()))
             }
@@ -3380,6 +4476,17 @@ mod tests {
             > {
                 if !self.register_delay.is_zero() {
                     tokio::time::sleep(self.register_delay).await;
+                }
+                // A prolog-rejecting node fails both dispatch paths the same way:
+                // register_job_allocation carries the typed failure_kind, just as
+                // launch_job does, so the controller drains+holds either way.
+                if let Some(kind) = self.reject_launch_as {
+                    return Ok(tonic::Response::new(
+                        spur_proto::proto::RegisterJobAllocationResponse {
+                            failure_kind: kind as i32,
+                            error: "mock prolog failure".into(),
+                        },
+                    ));
                 }
                 Ok(tonic::Response::new(Default::default()))
             }
@@ -3498,8 +4605,14 @@ mod tests {
         async fn spawn_mock_agent_with_register_delay(
             delay: Duration,
         ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
-            let (addr, cancel_calls, _, _) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, delay, false).await;
+            let (addr, cancel_calls, _, _) = spawn_mock_agent_capturing_fanout(
+                None,
+                Duration::ZERO,
+                delay,
+                false,
+                Duration::ZERO,
+            )
+            .await;
             (addr, cancel_calls)
         }
 
@@ -3512,6 +4625,23 @@ mod tests {
                 launch_delay,
                 Duration::ZERO,
                 false,
+                Duration::ZERO,
+            )
+            .await;
+            (addr, cancel_calls)
+        }
+
+        /// Like [`spawn_mock_agent`], but `cancel_job` sleeps `delay` before
+        /// acknowledging, widening the window before the agent's release lands.
+        async fn spawn_mock_agent_with_cancel_delay(
+            delay: Duration,
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>) {
+            let (addr, cancel_calls, _, _) = spawn_mock_agent_capturing_fanout(
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                false,
+                delay,
             )
             .await;
             (addr, cancel_calls)
@@ -3527,6 +4657,7 @@ mod tests {
             launch_delay: Duration,
             register_delay: Duration,
             capture: bool,
+            cancel_delay: Duration,
         ) -> (
             std::net::SocketAddr,
             Arc<AtomicU32>,
@@ -3544,9 +4675,10 @@ mod tests {
                 reject_launch_as,
                 launch_delay,
                 register_delay,
-                reject_resources: false,
+                reject_with_status: None,
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
+                cancel_delay,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3559,8 +4691,10 @@ mod tests {
             (addr, cancel_calls, release_pmix_calls, fanout_calls)
         }
 
-        /// Mock agent whose launch_job always rejects with ResourceExhausted.
-        async fn spawn_mock_agent_rejecting_resources() -> std::net::SocketAddr {
+        /// Mock agent whose launch_job always fails with `status`.
+        async fn spawn_mock_agent_rejecting_with_status(
+            status: tonic::Status,
+        ) -> std::net::SocketAddr {
             let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = incoming.local_addr().unwrap();
             let agent = MockAgent {
@@ -3568,10 +4702,11 @@ mod tests {
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
-                reject_resources: true,
+                reject_with_status: Some(status),
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
                 reject_start: false,
+                cancel_delay: Duration::ZERO,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3595,10 +4730,11 @@ mod tests {
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
-                reject_resources: false,
+                reject_with_status: None,
                 release_pmix_calls: Arc::new(AtomicU32::new(0)),
                 fanout_calls: None,
                 reject_start: true,
+                cancel_delay: Duration::ZERO,
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -3609,6 +4745,15 @@ mod tests {
                     .await;
             });
             (addr, cancel_calls)
+        }
+
+        /// Mock agent whose launch_job always rejects with ResourceExhausted,
+        /// standing in for a node whose local allocation table already holds the GPUs.
+        async fn spawn_mock_agent_rejecting_resources() -> std::net::SocketAddr {
+            spawn_mock_agent_rejecting_with_status(tonic::Status::resource_exhausted(
+                "controller-allocated GPUs unavailable on this node",
+            ))
+            .await
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -3672,6 +4817,7 @@ mod tests {
                 cgroup: Default::default(),
                 mpi: Default::default(),
                 health: Default::default(),
+                spurd: Default::default(),
             }
         }
 
@@ -3850,8 +4996,8 @@ mod tests {
             );
         }
 
-        // Force-finish must cancel the job on the unreported node before freeing
-        // it, or the agent keeps the stale allocation and rejects the next dispatch.
+        // Force-finish cancels the unreported node in the background so a slow
+        // agent can't delay the Failed verdict long enough for a race to win instead.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn completing_timeout_cancels_only_the_unreported_node() {
             use spur_core::job::JobState;
@@ -3897,11 +5043,7 @@ mod tests {
             let job = cm.get_job(job_id).unwrap();
             force_finish_completing_job(&cm, &job).await;
 
-            assert_eq!(
-                cancel2.load(Ordering::SeqCst),
-                1,
-                "the unreported node n2 must be cancelled before its resources are freed"
-            );
+            wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
             assert_eq!(
                 cancel1.load(Ordering::SeqCst),
                 0,
@@ -3949,15 +5091,80 @@ mod tests {
             settle(&cm, job_id, JobState::Running);
 
             // Suspend routes through Completing; no node reports completion.
-            cm.suspend_job(job_id, "").unwrap();
+            cm.suspend_job_for(job_id, "", true).unwrap();
             settle(&cm, job_id, JobState::Suspended);
             let mut job = cm.get_job(job_id).unwrap();
             job.transition(JobState::Completing).unwrap();
 
             force_finish_completing_job(&cm, &job).await;
 
-            assert_eq!(cancel1.load(Ordering::SeqCst), 1, "n1 must be cancelled");
-            assert_eq!(cancel2.load(Ordering::SeqCst), 1, "n2 must be cancelled");
+            wait_for("n1 cancelled", || cancel1.load(Ordering::SeqCst) == 1);
+            wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
+        }
+
+        // A completion report for the unreported node landing mid-force-finish must
+        // not flip the Failed verdict to Completed via derived_completion.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_survives_a_completion_report_racing_the_cancel() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (addr1, _) = spawn_mock_agent().await;
+            // n2's mock agent holds its `CancelJob` ack open, standing in for a slow
+            // release — the window this test's racing report is timed to land inside.
+            let (addr2, _) = spawn_mock_agent_with_cancel_delay(Duration::from_millis(200)).await;
+            register_node_at(&cm, "n1", addr1);
+            register_node_at(&cm, "n2", addr2);
+
+            let spec = JobSpec {
+                name: "completing-race".into(),
+                user: "testuser".into(),
+                num_nodes: 2,
+                num_tasks: 2,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec);
+
+            let nodes = vec!["n1".to_string(), "n2".to_string()];
+            let per_node_allocs: HashMap<String, ResourceAllocations> = nodes
+                .iter()
+                .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes,
+                    ResourceAllocations::with_scalar(2, 0),
+                    per_node_allocs,
+                )
+                .unwrap();
+            settle(&cm, job_id, JobState::Running);
+
+            // n1 (the primary) reports a clean exit; n2 never does.
+            cm.node_complete(job_id, "n1", 0, 0, run_attempt).unwrap();
+            settle(&cm, job_id, JobState::Completing);
+
+            let job = cm.get_job(job_id).unwrap();
+            // Races force-finish (blocked on n2's slow cancel ack) against n2's own
+            // belated report, spawned so it lands mid-flight rather than after.
+            let finisher = tokio::spawn({
+                let cm = cm.clone();
+                async move { force_finish_completing_job(&cm, &job).await }
+            });
+            let racer = tokio::spawn({
+                let cm = cm.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let _ = cm.node_complete(job_id, "n2", 0, 0, run_attempt);
+                }
+            });
+            let _ = tokio::join!(finisher, racer);
+
+            settle(&cm, job_id, JobState::Failed);
         }
 
         // Mock agents echo an offset-keyed path; the stored path must be the
@@ -4136,13 +5343,20 @@ mod tests {
             let cm = test_cluster(&dir).await;
 
             let (good_addr, cancel_calls, release_pmix_good, _) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, false)
-                    .await;
+                spawn_mock_agent_capturing_fanout(
+                    None,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    false,
+                    Duration::ZERO,
+                )
+                .await;
             let (bad_addr, _, release_pmix_bad, _) = spawn_mock_agent_capturing_fanout(
                 Some(spur_proto::proto::LaunchFailureKind::LaunchFailureUnspecified),
                 Duration::ZERO,
                 Duration::ZERO,
                 false,
+                Duration::ZERO,
             )
             .await;
             register_node_at(&cm, "n1", good_addr);
@@ -4395,6 +5609,82 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_srun_allocation_prolog_failure_drains_the_node_and_cancels_the_job() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            // A node whose prolog rejects the standalone-srun RegisterJobAllocation
+            // (not LaunchJob). Before the fix this came back as a generic error, so
+            // the node was only cooled and srun could be re-dispatched onto it.
+            // Driven through process_assignment (not register_allocation_on_nodes
+            // directly) so the whole dispatch arm — the wide cancel and the failure
+            // detail alongside settle_prolog_failures — is exercised.
+            let (addr, cancel_calls) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-prolog-fail", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
+            assert!(!started, "a prolog failure must not start the job");
+
+            assert!(
+                cm.get_node("n1").unwrap().state.is_admin_hold(),
+                "the node that ran the failing prolog must stop taking srun work too"
+            );
+            // A standalone srun has a blocking client: holding it would hang srun
+            // forever with nothing to release it, so it is cancelled, not held.
+            settle(&cm, job_id, JobState::Cancelled);
+            // The dispatch arm also cancels wide across every assigned node, so a
+            // node that registered before another failed is not left holding one.
+            wait_for("allocation rolled back with a wide cancel", || {
+                cancel_calls.load(Ordering::SeqCst) >= 1
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_srun_allocation_prolog_failure_backs_off_when_hold_is_disabled() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.controller.hold_on_prolog_fail = false;
+            let cm = test_cluster_with_config(&dir, config).await;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureProlog,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-prolog-nohold", 1);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
+            assert!(!started);
+
+            // nohold_on_prolog_fail: the node still drains (the prolog gates access
+            // regardless), but the job is backed off for a retry rather than held —
+            // the srun-allocation twin of hold_on_prolog_fail_off_retries_the_job_instead.
+            assert!(cm.get_node("n1").unwrap().state.is_admin_hold());
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+            assert_eq!(job.requeue_count, 1);
+            assert!(
+                job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
+                "nohold retries with a backoff, not an unconditional immediate retry"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn an_operator_can_release_a_job_held_for_a_prolog_failure() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
@@ -4404,6 +5694,9 @@ mod tests {
             ))
             .await;
             register_node_at(&cm, "n1", addr);
+            // The prolog failure drains n1, so a second healthy node is needed for the
+            // released job to be genuinely placeable rather than just no-longer-held.
+            register_node_without_comm_addr(&cm, "n2");
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-release", 1));
             confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
@@ -4914,7 +6207,7 @@ mod tests {
             let mut spec = batch_spec("plain-batch", 1);
             spec.tasks_per_node = Some(2);
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(started, "a clean single-node batch dispatch must start");
             let job = cm.get_job(job_id).unwrap();
@@ -4931,7 +6224,7 @@ mod tests {
             // for an assignment computed against a snapshot that's since gone
             // stale (e.g. the job was deleted/expired between scheduling and
             // this call).
-            let started = process_assignment(cm.clone(), assignment(999, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(999, &["n1"]), false).await;
 
             assert!(!started);
         }
@@ -4946,7 +6239,7 @@ mod tests {
             register_node_at(&cm, "n1", bad_addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("plain-batch-unreachable", 1));
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -4972,7 +6265,7 @@ mod tests {
             assert!(spec.script.is_none());
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 !started,
@@ -4998,7 +6291,7 @@ mod tests {
             spec.script = Some("#!/bin/bash\necho hi\n".into());
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 started,
@@ -5022,14 +6315,20 @@ mod tests {
         async fn process_assignment_dispatches_a_plain_batch_job_with_task_fanout_false() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, _, _, fanout_calls) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, true).await;
+            let (addr, _, _, fanout_calls) = spawn_mock_agent_capturing_fanout(
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                true,
+                Duration::ZERO,
+            )
+            .await;
             register_node_at(&cm, "n1", addr);
 
             let mut spec = batch_spec("plain-batch-fanout", 1);
             spec.tasks_per_node = Some(4);
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(started, "a clean single-node batch dispatch must start");
             assert_eq!(
@@ -5043,8 +6342,14 @@ mod tests {
         async fn process_assignment_dispatches_srun_batch_fallback_with_task_fanout_true() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
-            let (addr, _, _, fanout_calls) =
-                spawn_mock_agent_capturing_fanout(None, Duration::ZERO, Duration::ZERO, true).await;
+            let (addr, _, _, fanout_calls) = spawn_mock_agent_capturing_fanout(
+                None,
+                Duration::ZERO,
+                Duration::ZERO,
+                true,
+                Duration::ZERO,
+            )
+            .await;
             register_k8s_node_at(&cm, "k1", addr);
 
             let mut spec = batch_spec("srun-fanout-with-script", 1);
@@ -5052,7 +6357,7 @@ mod tests {
             spec.tasks_per_node = Some(4);
             spec.script = Some("#!/bin/bash\necho hi\n".into());
             let job_id = submit_and_wait(&cm, spec);
-            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["k1"]), false).await;
 
             assert!(
                 started,
@@ -5082,7 +6387,7 @@ mod tests {
             spec.interactive = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 started,
@@ -5110,7 +6415,7 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(!started);
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
@@ -5137,7 +6442,8 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"])).await;
+            let started =
+                process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await;
 
             assert!(!started);
             assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
@@ -5170,7 +6476,8 @@ mod tests {
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"])).await;
+            let started =
+                process_assignment(cm.clone(), assignment(job_id, &["n1", "n2"]), false).await;
 
             assert!(!started);
             let job = cm.get_job(job_id).unwrap();
@@ -5216,7 +6523,7 @@ mod tests {
             let mut bad_assignment = assignment(job_id, &["n1", "n2"]);
             bad_assignment.per_node_alloc.remove("n2");
 
-            let started = process_assignment(cm.clone(), bad_assignment).await;
+            let started = process_assignment(cm.clone(), bad_assignment, false).await;
 
             assert!(
                 !started,
@@ -5235,6 +6542,11 @@ mod tests {
                 "n2 cancelled after start_job rejected the assignment",
                 || cancel2.load(Ordering::SeqCst) >= 1,
             );
+            // The cancelled epoch must be persisted too, or a retry re-presents
+            // the same now-poisoned run_attempt and reproduces the wedge.
+            wait_for("run_attempt backed off after start_job failure", || {
+                cm.get_job(job_id).is_some_and(|j| j.run_attempt == 1)
+            });
         }
 
         // The release runs after the job is committed Running, so a node that
@@ -5249,7 +6561,7 @@ mod tests {
             register_node_at(&cm, "n1", addr);
 
             let job_id = submit_and_wait(&cm, batch_spec("unreleasable", 1));
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(!started, "a job no node released must not count as started");
             wait_for("n1 cancelled after refusing the release", || {
@@ -5290,7 +6602,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("superseded", 1));
             assert!(
-                process_assignment(cm.clone(), assignment(job_id, &["n1"])).await,
+                process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await,
                 "the job must reach Running first"
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
@@ -5341,7 +6653,7 @@ mod tests {
             spec.interactive = true;
             let job_id = submit_and_wait(&cm, spec);
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -5372,7 +6684,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-slurmctld-batch", 1));
 
-            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"]), false).await;
 
             assert!(
                 !started,
@@ -5410,7 +6722,7 @@ mod tests {
 
             let cm_task = cm.clone();
             let handle = tokio::spawn(async move {
-                process_assignment(cm_task, assignment(job_id, &["n1"])).await
+                process_assignment(cm_task, assignment(job_id, &["n1"]), false).await
             });
 
             // Simulate a concurrent scancel landing while the (delayed)
@@ -5492,6 +6804,57 @@ mod tests {
                  1 gpu/resource allocation mismatch)",
                 "operators need the specific failure category, not a generic count"
             );
+        }
+
+        /// An agent that answers NOT_FOUND or FAILED_PRECONDITION was reached and
+        /// refused the launch. The job fails as rejected, and the node keeps
+        /// taking work: a cooldown here would hide a healthy node for a fault
+        /// that belongs to the job.
+        async fn assert_status_is_agent_rejected_without_cooldown(
+            status: tonic::Status,
+            job_name: &str,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let addr = spawn_mock_agent_rejecting_with_status(status).await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec(job_name, 1));
+
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(
+                cm.nodes_on_dispatch_cooldown().is_empty(),
+                "a rejected launch must not put the node on cooldown"
+            );
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.state_reason(),
+                "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
+                 1 agent rejected launch)",
+                "a refused launch must not read as an unreachable agent"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn not_found_reject_is_agent_rejected_and_does_not_cool_down_the_node() {
+            assert_status_is_agent_rejected_without_cooldown(
+                tonic::Status::not_found("no SpurJob carries the label spur.amd.com/job-id=1"),
+                "not-found-reject",
+            )
+            .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn failed_precondition_reject_is_agent_rejected_and_does_not_cool_down_the_node() {
+            assert_status_is_agent_rejected_without_cooldown(
+                tonic::Status::failed_precondition(
+                    "multiple SpurJobs carry spur.amd.com/job-id=1; refusing to guess",
+                ),
+                "failed-precondition-reject",
+            )
+            .await;
         }
     }
 

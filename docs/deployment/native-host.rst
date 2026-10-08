@@ -22,9 +22,10 @@ to ``~/.local/bin`` (no sudo required):
    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash
    export PATH="$HOME/.local/bin:$PATH"
 
-This installs the four binaries — ``spur``, ``spurctld``, ``spurd``, and the per-job
-supervisor ``spurstepd`` — and makes the
-CLI reachable under its Slurm-compatible names (``sbatch``, ``squeue``, ``sinfo``, …).
+This installs ``spur``, ``spurctld``, ``spurd``, the per-job supervisor ``spurstepd``,
+and the credential mint ``spurauthd`` (needed only for
+:ref:`native credentials <native-auth-plugin>`), and makes the CLI reachable under its
+Slurm-compatible names (``sbatch``, ``squeue``, ``sinfo``, …).
 
 For ``--mpi=pmix``, use a **nightly** tarball (includes ``spur_mpi_pmix.so``);
 see :ref:`mpi-pmix-install`.
@@ -37,7 +38,7 @@ build the binaries:
    git clone https://github.com/ROCm/spur.git && cd spur
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
    sudo apt install -y protobuf-compiler build-essential
-   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd -p spurauthd
 
 The binaries land in ``target/release/``. For a fuller build walkthrough see
 :doc:`/developer/building`.
@@ -159,7 +160,8 @@ The two daemons are configured with command-line flags. The most common are belo
    ``[hooks]``, ``[devices]`` (GRES and CDI), ``rlimits.memlock``, ``[cgroup]``,
    ``[cluster]``, and ``[mpi]``. If the file is absent, the agent logs a warning and
    falls back to defaults for those sections, which is fine when none of them are
-   in use.
+   in use. ``[devices]`` inventory is also re-discovered periodically after
+   startup; see :doc:`../admin-guide/configuration`.
 
 Quick Start: Two-Node Cluster
 -----------------------------
@@ -527,8 +529,9 @@ Inspect what a running job actually got:
 
 The job directory normally holds the limits and no processes — those live in the
 leaves; a step whose leaf could not be created falls back into the job directory
-itself. ``srun`` steps are numbered from ``step_0``; the batch payload uses the
-reserved step id it was launched under, so its leaf is a large number, not ``0``.
+itself. ``srun`` steps are numbered from ``step_0``, while a job's own lifetime
+runs in Slurm-named reserved leaves — ``step_batch`` for the batch payload and
+``step_extern`` for an allocation's holder.
 
 Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
 and runs jobs unconstrained. Every knob — including turning enforcement off
@@ -567,12 +570,13 @@ a granularity gap *inside* the job rather than a hole between jobs:
        step process that leaves that tree (``setsid``) is missed even though the
        step now has a cgroup that would catch it. Cancelling the whole *job* is
        exact, because that is a cgroup operation.
-   * - ``task_prolog`` / ``task_epilog``
-     - Run by ``spurd`` around each step, as root and in ``spurd``'s own cgroup.
-       They are site-supplied rather than user code, but they are neither
-       resource-bounded nor device-filtered.
+   * - ``task_prolog`` / ``task_epilog`` for a containerized step
+     - A supervised step runs its task hooks as the job user inside its own
+       ``step_<n>`` cgroup. A containerized ``srun`` step still takes the legacy
+       launch path, where the hooks — like the container workload — run in the
+       parent job's leaf rather than a per-step ``step_<n>`` leaf.
 
-Node-level ``prolog`` and ``epilog`` also run uncontained, and that is by design:
+Node-level ``prolog`` and ``epilog`` run uncontained, and that is by design:
 they run before the job's cgroup exists and after it is gone, and their purpose is
 node-wide setup and teardown.
 
@@ -646,6 +650,12 @@ below).
    spur --version
    ls "$HOME/spur/lib/spur/spur_mpi_pmix.so"
 
+``spurstepd`` and ``spurauthd`` also answer ``-V``/``--version`` directly
+(``spurstepd --version``, ``spurauthd --version``), without needing the
+positional/``--cluster`` arguments they otherwise require to run — useful for
+confirming a deployed binary's version without standing up a job or a
+credential-mint socket.
+
 ``install.sh`` layout (when ``INSTALL_DIR=$HOME/spur/bin``):
 
 .. list-table::
@@ -654,7 +664,8 @@ below).
    * - Path
      - Contents
    * - ``~/spur/bin/``
-     - ``spur``, ``spurctld``, ``spurd``, Slurm-compat symlinks
+     - ``spur``, ``spurctld``, ``spurd``, ``spurstepd``, ``spurauthd``, Slurm-compat
+       symlinks
    * - ``~/spur/lib/spur/``
      - ``spur_mpi_pmix.so`` (when shipped in the tarball)
 
@@ -733,6 +744,12 @@ agents (``ip -br addr``). Unpinned ``btl=tcp`` may pick docker, overlay, or
 IPv6-only NICs; **several tasks per node across two nodes** then hangs in
 ``MPI_Init`` even though a single-node or 1-task-per-node run may succeed.
 
+GPU collectives need the same treatment one layer up. RCCL chooses its transport
+independently of Open MPI, so ``OMPI_MCA_btl_tcp_if_include`` does not constrain
+it, and ``NCCL_SOCKET_IFNAME`` must name the same NIC. Left unpinned, the symptom
+matches the Open MPI one: one rank per host works and several ranks per host
+across two hosts hangs.
+
 .. code-block:: bash
 
    mkdir -p "$HOME/spur/mpi"
@@ -742,6 +759,7 @@ IPv6-only NICs; **several tasks per node across two nodes** then hangs in
    export LD_LIBRARY_PATH="${OPAL_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
    export OMPI_MCA_btl_tcp_if_include=eth0           # fabric NIC that reaches peer agents
    export OMPI_MCA_oob_tcp_if_include=eth0
+   export NCCL_SOCKET_IFNAME=eth0                    # RCCL sockets; the same NIC
    EOF
 
 Build the application **on each agent** with that prefix's ``mpicc`` (the
@@ -757,6 +775,7 @@ the MPI binary are in place:
    sinfo                                    # all agents idle/ready
    srun --mpi=list                          # expect: none, pmix
    srun --mpi=pmix -n4 /path/to/hello_mpi   # single-node smoke test
+   srun --mpi=pmix -N2 -n2 /path/to/hello_mpi   # one rank per node: the layout most sensitive to a broken env.sh
    srun --mpi=pmix -N2 -n4 /path/to/hello_mpi   # 4 ranks total (2 per node)
    # Stronger multi-node check (same layout as a typical sbatch):
    # srun --mpi=pmix -N2 -n8 /path/to/hello_mpi
@@ -798,13 +817,16 @@ Architecture
    topology metadata (``PMIX_NODE_MAP``, ``PMIX_PROC_MAP``, job/local size
    keys, ``PMIX_LOCAL_PEERS``, ``PMIX_LOCALLDR``, ``PMIX_TMPDIR``), then serves
    PMIx to application processes.
-3. For ``-n > 1``, ``spurd`` wraps the user command in a bash script that
-   **forks one process per rank**. Each child receives a full
+3. ``spurd`` runs every rank through a bash wrapper, including a node's only
+   rank, because the wrapper is the one place ``env.sh`` and the aliases below
+   are applied. A batch script that calls ``srun`` itself is a driver, not a
+   rank, and runs unwrapped. With several ranks on a node the wrapper **forks
+   one process per rank**, and each child receives a full
    ``PMIx_server_setup_fork`` environment (Slurm ``mpi_p_slurmstepd_task``
    parity) via ``spur_mpi_pmix_setup_fork_env`` in the plugin.
-4. The wrapper exports ``PMIX_SERVER_URI4`` / ``PMIX_SERVER_URI3`` aliases.
-   Slurm-compatible ``SLURM_*`` twins remain set (same as Slurm under
-   ``--mpi=pmix``).
+4. The wrapper sources ``env.sh`` and exports ``PMIX_SERVER_URI4`` /
+   ``PMIX_SERVER_URI3`` aliases. Slurm-compatible ``SLURM_*`` twins remain set
+   (same as Slurm under ``--mpi=pmix``).
 
 The embedded PMIx server registers ``fence_nb`` once at ``PMIx_server_init``.
 Single-node jobs never call it (OpenPMIx GDS handles modex locally). Multi-node

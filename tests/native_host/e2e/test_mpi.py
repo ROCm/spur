@@ -6,6 +6,7 @@
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 
 import pytest
 
@@ -38,6 +39,31 @@ def assert_mpi_ranks(out: str, expected_ranks: set[int], expected_size: int) -> 
     ranks, size = parse_mpi_ranks(out)
     assert size == expected_size, f"expected size={expected_size}, got {size}:\n{out}"
     assert ranks == expected_ranks, f"expected ranks {expected_ranks}, got {ranks}:\n{out}"
+
+
+ENV_SH = "$HOME/spur/mpi/env.sh"
+ENV_SH_SENTINEL = "SPUR_E2E_ENV_SH_SENTINEL"
+
+
+@contextmanager
+def env_sh_sentinel(cluster):
+    """Export ``ENV_SH_SENTINEL=applied`` from every node's ``env.sh``, and undo it,
+    removing the file on nodes where it did not exist before."""
+    created, touched = [], []
+    try:
+        for node in cluster.nodes:
+            if node.exec_allow_fail(f'test -e "{ENV_SH}" || echo absent').strip() == "absent":
+                created.append(node)
+            node.exec('mkdir -p "$HOME/spur/mpi"')
+            node.exec(f'printf "export {ENV_SH_SENTINEL}=applied\\n" >> "{ENV_SH}"')
+            touched.append(node)
+        yield
+    finally:
+        for node in touched:
+            if node in created:
+                node.exec_allow_fail(f'rm -f "{ENV_SH}"')
+            else:
+                node.exec_allow_fail(f"sed -i '/{ENV_SH_SENTINEL}/d' \"{ENV_SH}\"")
 
 
 @pytest.mark.mpi
@@ -182,6 +208,50 @@ class TestMpiSingleNode:
                 assert int(match.group(2)) == 4
         assert ranks == {0, 1, 2, 3}, f"expected ranks 0-3, got {ranks}:\n{content}"
 
+    def test_a_lone_batch_rank_gets_the_rank_environment(self, mpi_cluster):
+        cluster = mpi_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        out_path = f"{cluster.remote_dir}/lone-batch-rank.out"
+        script = cluster.write_file(
+            "lone-batch-rank.sh",
+            "#!/bin/bash\n#SBATCH --mpi=pmix\n"
+            f'echo "seen=${ENV_SH_SENTINEL} procid=$SLURM_PROCID"\n'
+            f'exec "{hello_mpi}"\n',
+        )
+        with env_sh_sentinel(cluster):
+            job_id = parse_job_id(cluster.sbatch(["-n1", "-o", out_path, script]))
+            assert job_id is not None
+            wait_job(cluster, job_id, timeout=120)
+        content = cluster.read_output_on_any_node(out_path)
+        assert "seen=applied procid=0" in content, content
+        assert_mpi_ranks(content, {0}, 1)
+
+    def test_a_pmix_batch_driver_is_not_given_a_rank_environment(self, mpi_cluster):
+        """A batch script that launches its own step is a driver; only the step's
+        ranks get ``env.sh``."""
+        cluster = mpi_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        out_path = f"{cluster.remote_dir}/batch-driver.out"
+        rank = cluster.write_file(
+            "batch-driver-rank.sh",
+            f'#!/bin/bash\necho "rank seen=${ENV_SH_SENTINEL}"\nexec "{hello_mpi}"\n',
+            all_nodes=True,
+        )
+        script = cluster.write_file(
+            "batch-driver.sh",
+            "#!/bin/bash\n#SBATCH --mpi=pmix\n"
+            f'echo "driver seen=${ENV_SH_SENTINEL}."\n'
+            f"srun --mpi=pmix -n1 {rank}\n",
+        )
+        with env_sh_sentinel(cluster):
+            job_id = parse_job_id(cluster.sbatch(["-n1", "-o", out_path, script]))
+            assert job_id is not None
+            wait_job(cluster, job_id, timeout=120)
+        content = cluster.read_output_on_any_node(out_path)
+        assert "driver seen=." in content, content
+        assert "rank seen=applied" in content, content
+        assert_mpi_ranks(content, {0}, 1)
+
 
 @pytest.mark.mpi
 class TestMpiMultiNode:
@@ -198,6 +268,49 @@ class TestMpiMultiNode:
                 ranks.add(int(match.group(1)))
                 assert int(match.group(2)) == 2
         assert ranks == {0, 1}, f"expected ranks 0-1, got {ranks}:\n{out}"
+
+    def test_a_lone_rank_sources_the_agent_mpi_environment(self, mpi_multi_node_cluster):
+        """Nothing else applies ``$HOME/spur/mpi/env.sh``, and a rank that misses it
+        cannot find the MPI it was linked against."""
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        # Reported by the payload rather than by a bare `echo`, so the step is a real
+        # MPI step and its exit status still means something.
+        payload = cluster.write_file(
+            "lone-rank-env.sh",
+            f'#!/bin/bash\necho "seen=${ENV_SH_SENTINEL} procid=$SLURM_PROCID"\n'
+            f'exec "{hello_mpi}"\n',
+            all_nodes=True,
+        )
+        with env_sh_sentinel(cluster):
+            code, out = cluster.srun_with_exit(
+                ["--mpi=pmix", "-N", "2", "-n", "2", payload]
+            )
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+        assert out.count("seen=applied") == 2, f"both ranks must see env.sh, got:\n{out}"
+        assert sorted(re.findall(r"procid=(\d+)", out)) == ["0", "1"], (
+            f"each rank must keep its SLURM_PROCID, got:\n{out}"
+        )
+        assert_mpi_ranks(out, {0, 1}, 2)
+
+    def test_a_lone_rank_is_pinned_by_map_cpu(self, mpi_multi_node_cluster):
+        cluster = mpi_multi_node_cluster
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        payload = cluster.write_file(
+            "lone-rank-map-cpu.sh",
+            "#!/bin/bash\n"
+            "echo \"pinned procid=$SLURM_PROCID "
+            "cpus=$(awk '/^Cpus_allowed_list/{print $2}' /proc/$$/status)\"\n"
+            f'exec "{hello_mpi}"\n',
+            all_nodes=True,
+        )
+        code, out = cluster.srun_with_exit(
+            ["--mpi=pmix", "-N", "2", "-n", "2", "--cpu-bind=map_cpu:0,1", payload]
+        )
+        assert code == 0, f"srun failed (exit {code}):\n{out}"
+        pinned = dict(re.findall(r"pinned procid=(\d+) cpus=(\S+)", out))
+        assert pinned == {"0": "0", "1": "1"}, f"each rank must sit on its map entry:\n{out}"
+        assert_mpi_ranks(out, {0, 1}, 2)
 
     def test_hello_mpi_two_nodes_multi_rank(self, mpi_multi_node_cluster):
         cluster = mpi_multi_node_cluster

@@ -41,9 +41,21 @@ Apply manifests in order:
 .. code-block:: bash
 
    kubectl apply -f examples/k8s/namespace.yaml
-   kubectl apply -f examples/k8s/configmap.yaml
    kubectl apply -f examples/k8s/rbac.yaml
    kubectl apply -f examples/k8s/spurjob-crd.yaml
+
+``spurctld`` reads ``spur.conf`` from a Secret, because the file carries the
+accounting database password. Fill in ``database_url`` in
+``examples/k8s/spur.conf`` and build the Secret from it before you apply the
+controller:
+
+.. code-block:: bash
+
+   kubectl create secret generic spur-config \
+     --from-file=spur.conf=examples/k8s/spur.conf -n spur
+
+.. code-block:: bash
+
    kubectl apply -f examples/k8s/spurctld.yaml
    kubectl apply -f examples/k8s/spurd.yaml
    kubectl apply -f examples/k8s/operator.yaml
@@ -52,7 +64,13 @@ Apply manifests in order:
 Configuration
 -------------
 
-The ConfigMap (``examples/k8s/configmap.yaml``) embeds ``spur.conf``:
+``examples/k8s/spur.conf`` is the controller configuration. The controllers
+run with the Secret ``spur-config`` that you build from it. The whole file goes
+into the Secret, not only the password: the configuration loader reads one TOML
+file and has no separate source for ``accounting.database_url`` or
+``auth.jwt_key``. A cluster with no accounting and no ``auth.jwt_key`` can hold
+the same file in a ConfigMap instead, built with
+``kubectl create configmap --from-file``. The file sets:
 
 .. code-block:: toml
 
@@ -89,8 +107,8 @@ is running, ``scontrol reconfigure`` applies many sections live, while others
 need a controller or agent restart — see
 :ref:`the configuration reference <reload-scope>` for the per-field breakdown.
 ``reconfigure`` runs on the Raft leader only — followers keep their startup
-config until restarted, at which point they re-read this same ConfigMap and
-converge. To roll all controllers onto an updated ConfigMap, restart the
+config until restarted, at which point they re-read this same Secret and
+converge. To roll all controllers onto an updated Secret, restart the
 StatefulSet pods.
 
 Submitting Jobs
@@ -119,6 +137,27 @@ Apply with ``kubectl``:
    kubectl apply -f job.yaml
 
 The operator watches SpurJob resources, submits them to the controller, and updates status fields as the job progresses.
+
+Operator connection to the controller
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The operator opens each channel to ``spurctld`` with these bounds:
+
+- A connect timeout of 10 s. A Service with no ready endpoint drops the connection attempt, and
+  the kernel retries it for more than two minutes. The operator stops earlier and connects again
+  when the controller is ready.
+- HTTP/2 keepalive pings every 10 s. A ping with no answer in 5 s closes the channel.
+- A bound of 30 s on each request.
+
+The job controller and the node watcher each keep one channel open. After a transport error they
+drop the channel and open a new one on the next call. A refusal from the controller, for example
+``NOT_FOUND``, is an answer and keeps the channel. A request that reaches the 30 s bound is a
+transport error and is retried.
+
+The node watcher registers each Kubernetes node with the controller. A transport error during a
+registration restarts the node watcher, which lists every node again. A refusal that is not a
+transport error, for example a missing admission token, is written to the log. The node watcher
+tries the registration again at the next event of that node.
 
 Authenticating the operator agent surface
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

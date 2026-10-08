@@ -73,6 +73,19 @@ def _get_ssh_key() -> str | None:
     return key if key else None
 
 
+def _parse_node_entry(entry: str, default_user: str) -> tuple[str, str]:
+    """Split an optional ``user@host`` node entry; falls back to default_user.
+
+    Lets a bed mix SSH identities per node (e.g. a login/controller host
+    reachable as one user and a lab GPU worker reachable as another) without
+    requiring uniform credentials across SPUR_TEST_NODES.
+    """
+    if "@" in entry:
+        user, host = entry.split("@", 1)
+        return host, user
+    return entry, default_user
+
+
 def _get_binaries_dir() -> str:
     return os.environ.get(
         "SPUR_TEST_BINARIES_DIR",
@@ -87,13 +100,14 @@ def ssh_nodes():
     Stays open for the entire test run.
     """
     nodes_config = _get_nodes_config()
-    ssh_user = _get_ssh_user()
+    default_user = _get_ssh_user()
     ssh_password = _get_ssh_password()
     ssh_key = _get_ssh_key()
 
     nodes = []
-    for host in nodes_config:
-        node = SshNode(host, ssh_user, password=ssh_password, key_path=ssh_key)
+    for entry in nodes_config:
+        host, user = _parse_node_entry(entry, default_user)
+        node = SshNode(host, user, password=ssh_password, key_path=ssh_key)
         nodes.append(node)
 
     yield nodes
@@ -356,6 +370,30 @@ def gpu_cluster(request, ssh_nodes, remote_bin_dir):
 
     as_root = request.node.get_closest_marker("rootful") is not None
     c = _deploy_cluster(ssh_nodes, remote_bin_dir, agent_as_root=as_root)
+    yield c
+    c.teardown()
+
+
+@pytest.fixture
+def gpu_pmix_cluster(request, ssh_nodes, remote_bin_dir):
+    """Like gpu_cluster, but also deploys and wires up the pmix plugin."""
+    if len(ssh_nodes) < 1:
+        pytest.skip("GPU tests require at least one node in SPUR_TEST_NODES")
+    if not _any_node_has_gpu(ssh_nodes):
+        pytest.skip("no GPU device nodes (/dev/kfd, /dev/dri/card*, /dev/dri/renderD*) on any node")
+    try:
+        ensure_bins(ssh_nodes, _get_binaries_dir(), remote_bin_dir, with_mpi_plugin=True)
+    except FileNotFoundError as exc:
+        pytest.skip(str(exc))
+
+    plugin_dir = str(Path(remote_bin_dir).parent / "lib" / "spur")
+    as_root = request.node.get_closest_marker("rootful") is not None
+    c = _deploy_cluster(
+        ssh_nodes,
+        remote_bin_dir,
+        agent_as_root=as_root,
+        config_overrides={"mpi": {"plugin_dir": plugin_dir, "pmix_tmpdir": "/tmp/spur-pmix"}},
+    )
     yield c
     c.teardown()
 

@@ -197,6 +197,24 @@ impl<'a> NodePlacement<'a> {
         !node.is_k0s_reserved() && self.eligible(node, reservations, now) && node.state.is_up()
     }
 
+    /// True when a listed node can't satisfy the request in an additive
+    /// nodelist — real placement rejects the whole job regardless of other idle capacity.
+    pub fn additive_listed_node_unavailable<'n>(
+        &self,
+        nodes: impl IntoIterator<Item = &'n Node>,
+        reservations: &[Reservation],
+        now: DateTime<Utc>,
+        required: &spur_core::resource::ResourceSet,
+    ) -> bool {
+        self.nodelist_is_additive()
+            && nodes.into_iter().any(|n| {
+                self.is_listed(&n.name)
+                    && self.eligible(n, reservations, now)
+                    && n.total_resources.can_satisfy(required)
+                    && !self.matches_for_reservation(n, reservations, now)
+            })
+    }
+
     fn reservation_ok(
         &self,
         node: &Node,

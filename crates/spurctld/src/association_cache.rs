@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use sqlx::PgPool;
+use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use spur_core::accounting::AccountLimits;
@@ -34,6 +35,7 @@ pub enum AccountMembership {
 /// refresh can never be observed half-applied.
 pub struct AssociationCache {
     snapshot: RwLock<Snapshot>,
+    kick: Notify,
 }
 
 /// Whether `qos` is usable given an association's allow-list and pinned
@@ -55,6 +57,7 @@ impl AssociationCache {
                 admin_level: HashMap::new(),
                 loaded: false,
             }),
+            kick: Notify::new(),
         }
     }
 
@@ -63,8 +66,6 @@ impl AssociationCache {
         self.snapshot.read().loaded
     }
 
-    /// Whether `user` holds the admin accounting level, in any spelling Slurm accepts. Fails closed:
-    /// an unloaded cache (accounting off or not yet fetched) reports no admins.
     pub fn is_admin(&self, user: &str) -> bool {
         let snapshot = self.snapshot.read();
         snapshot.loaded
@@ -72,6 +73,23 @@ impl AssociationCache {
                 .admin_level
                 .get(user)
                 .is_some_and(|lvl| crate::accounting::admin_level_is_admin(lvl))
+    }
+
+    /// Whether `user` holds Operator or Administrator accounting level. Fails closed
+    /// when the cache has not loaded.
+    pub fn is_operator(&self, user: &str) -> bool {
+        matches!(
+            self.admin_level(user).as_deref(),
+            Some("Operator") | Some("Administrator")
+        )
+    }
+
+    pub fn admin_level(&self, user: &str) -> Option<String> {
+        let snapshot = self.snapshot.read();
+        if !snapshot.loaded {
+            return None;
+        }
+        snapshot.admin_level.get(user).cloned()
     }
 
     /// Whether `user` is associated with `account`. An unloaded cache reports `CacheUnavailable`
@@ -287,6 +305,11 @@ impl AssociationCache {
         self.snapshot.write().loaded = true;
     }
 
+    /// Wake the refresh loop so role bindings apply without waiting for the interval.
+    pub fn kick_refresh(&self) {
+        self.kick.notify_waiters();
+    }
+
     pub fn spawn_refresh_loop(self: &Arc<Self>, pool: PgPool, refresh_interval_secs: u64) {
         let cache = Arc::clone(self);
         let interval = Duration::from_secs(refresh_interval_secs.max(10));
@@ -319,7 +342,10 @@ impl AssociationCache {
             }
 
             loop {
-                tokio::time::sleep(interval).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = cache.kick.notified() => {}
+                }
 
                 match tokio::time::timeout(
                     Duration::from_secs(10),
@@ -357,6 +383,7 @@ mod tests {
     fn is_admin_false_on_cold_cache() {
         let cache = AssociationCache::new();
         assert!(!cache.is_admin("carol"));
+        assert!(!cache.is_operator("carol"));
     }
 
     /// Every spelling Slurm's parser maps to super-user must resolve here, or a row stored as

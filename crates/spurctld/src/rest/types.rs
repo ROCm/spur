@@ -81,6 +81,14 @@ pub fn not_found_response(msg: &str) -> RestError {
     api_error_response(StatusCode::NOT_FOUND, msg)
 }
 
+pub fn forbidden_response(msg: &str) -> RestError {
+    api_error_response(StatusCode::FORBIDDEN, msg)
+}
+
+pub fn unauthorized_response(msg: &str) -> RestError {
+    api_error_response(StatusCode::UNAUTHORIZED, msg)
+}
+
 pub fn unavailable_response(msg: &str) -> RestError {
     api_error_response(StatusCode::SERVICE_UNAVAILABLE, msg)
 }
@@ -122,6 +130,8 @@ pub struct JobsQuery {
     pub state: Option<String>,
     pub account: Option<String>,
     pub name: Option<String>,
+    pub qos: Option<String>,
+    pub reservation: Option<String>,
 }
 
 #[derive(Serialize)]

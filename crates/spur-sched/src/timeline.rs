@@ -249,6 +249,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: spur_core::resource::GpuLinkType::PCIe,
+                stable_id: i as u64,
             })
             .collect();
         NodeTimeline::new(
@@ -328,7 +329,7 @@ mod tests {
         let mut alloc = ResourceAllocations::with_scalar(8, 0);
         alloc.devices.insert(
             "gpu".into(),
-            (0u32..8).map(AllocatedDevice::injectable).collect(),
+            (0u64..8).map(AllocatedDevice::injectable).collect(),
         );
         tl.reserve(now, now + Duration::hours(4), alloc);
 
@@ -342,6 +343,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    stable_id: i as u64,
                 })
                 .collect(),
             ..Default::default()
@@ -357,7 +359,7 @@ mod tests {
         let mut alloc = ResourceAllocations::with_scalar(4, 0);
         alloc.devices.insert(
             "gpu".into(),
-            (0u32..4).map(AllocatedDevice::injectable).collect(),
+            (0u64..4).map(AllocatedDevice::injectable).collect(),
         );
         tl.reserve(now, now + Duration::hours(4), alloc);
 
@@ -371,6 +373,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    stable_id: i as u64,
                 })
                 .collect(),
             ..Default::default()
@@ -623,14 +626,14 @@ mod tests {
         let mut alloc_a = ResourceAllocations::with_scalar(4, 0);
         alloc_a.devices.insert(
             "gpu".into(),
-            (0u32..4).map(AllocatedDevice::injectable).collect(),
+            (0u64..4).map(AllocatedDevice::injectable).collect(),
         );
         tl.reserve(base, base + Duration::hours(3), alloc_a);
 
         let mut alloc_b = ResourceAllocations::with_scalar(4, 0);
         alloc_b.devices.insert(
             "gpu".into(),
-            (4u32..6).map(AllocatedDevice::injectable).collect(),
+            (4u64..6).map(AllocatedDevice::injectable).collect(),
         );
         tl.reserve(
             base + Duration::hours(1),
@@ -648,6 +651,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    stable_id: i as u64,
                 })
                 .collect(),
             ..Default::default()

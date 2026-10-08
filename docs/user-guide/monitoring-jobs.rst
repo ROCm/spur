@@ -18,7 +18,8 @@ View the Queue — ``squeue``
 ---------------------------
 
 ``spur queue`` (Slurm ``squeue``) lists jobs currently in the system. With no
-arguments it shows every active job.
+arguments it shows every active job, or only your own if your site sets
+``private_data = ["jobs"]`` (see :ref:`private-data`).
 
 .. code-block:: bash
 
@@ -58,6 +59,12 @@ Common flags:
    * - ``--name``
      - ``-n``
      - Filter by job name.
+   * - ``--qos``
+     - ``-q``
+     - Filter by QOS (comma-separated list).
+   * - ``--reservation``
+     - ``-R``
+     - Filter by reservation (comma-separated list).
    * - ``--format``
      - ``-o``
      - Custom column format (see below).
@@ -131,14 +138,58 @@ SUSPENDED, COMPLETING**.
      - TIME_LEFT
    * - ``%b``
      - GRES
+     - ``%Q``
+     - PRIORITY
+   * - ``%W``
+     - BORROWED
      -
      -
+
+``%p`` and ``%Q`` both render the integer priority. Slurm splits these (``%p``
+is a normalized float, ``%Q`` the integer); Spur exposes the integer under both.
 
 .. code-block:: bash
 
    spur queue -u alice -t R
    squeue -p gpu -o "%.18i %.9P %.8T %.10M %R"
    squeue --states=PD,R --noheader
+
+Verbose field names — ``squeue -O``/``--Format``
+------------------------------------------------
+
+``-O``/``--Format`` selects columns by field name instead of ``%``-letter.
+Fields are comma-separated, each ``type[:[.][size][suffix]]``:
+
+- ``size`` is a minimum width (default ``20``); unlike ``-o``'s ``.``, it never
+  truncates.
+- A leading ``.`` right-justifies the column. The default is left-justified,
+  the opposite of ``-o``.
+- ``suffix`` is arbitrary text appended after the field, e.g. a separator.
+
+Field names are case-insensitive and render the same data as their ``%``-letter
+equivalents. ``-O`` and ``-o``/``--format`` are mutually exclusive; passing both
+is an error, matching Slurm.
+
+.. code-block:: bash
+
+   squeue -O "JobID:10,Partition,State,QOS"
+   squeue -O "JobID:.18,Priority,Reason"
+
+Supported field names: ``Account``, ``ArrayJobID``, ``Command``, ``Comment``,
+``EndTime``, ``GRES``, ``JobID``, ``Name``, ``NodeList``, ``NumCPUs``,
+``NumNodes``, ``Partition``, ``Priority``, ``PriorityLong``, ``QOS``,
+``Reason``, ``ReasonList``, ``Reservation``, ``SchedNodes``, ``StartTime``,
+``State``, ``StateCompact``, ``SubmitTime``, ``TimeLeft``, ``TimeLimit``,
+``TimeUsed``, ``UserName``, ``WorkDir``.
+
+Slurm exposes many more ``-O`` fields that Spur has no backing data for
+(``Licenses``, ``Dependency``, ``Nice``, ``Reboot``, most of the ``tres-*``
+family, federation fields, job-step fields, and others). Requesting an
+unsupported name is an error listing the supported fields, rather than the
+blank column Slurm prints. This is a deliberate divergence: fail fast on a
+typo instead of silently emitting an empty column. ``Priority`` renders Spur's
+integer priority (same as ``PriorityLong``); Spur does not compute Slurm's
+normalized 0.0-1.0 float.
 
 Projected Start Times — ``squeue --start``
 -------------------------------------------
@@ -237,6 +288,11 @@ Flags:
    * - ``--partition``
      - ``-p``
      - Filter by partition.
+   * - ``--states``
+     - ``-t``
+     - Filter by node state (comma-separated). Accepts the base states and the
+       display-only labels ``resv`` (or ``reserved``), ``maint``, and ``plnd``
+       (or ``planned``). ``all`` disables the filter.
    * - ``--nodes``
      - ``-n``
      - Filter by node.
@@ -295,6 +351,13 @@ reservation, else ``plnd`` for a node currently held by the scheduler for a
 specific pending job's upcoming start. The idle gate is checked live, but the
 job and start time shown for ``plnd`` reflect the most recent scheduling
 cycle (``scheduler.interval_secs``), not the current instant.
+
+Every abbreviation above, including the overlay labels ``resv``, ``maint``, and
+``plnd``, can be passed to ``-t`` / ``--states``. The long forms ``reserved``
+and ``planned`` are accepted as aliases for ``resv`` and ``plnd``. ``-t resv``
+also matches ``maint`` nodes (a maintenance reservation is still a reservation),
+while ``-t maint`` matches only maintenance nodes. ``-t idle`` returns all idle
+nodes, including those shown as ``resv``, ``maint``, or ``plnd``.
 
 Accounting History — ``sacct``
 -------------------------------
@@ -356,14 +419,25 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``%`` letters. Available fields include ``JobID``, ``JobName``, ``User``,
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
-``NCPUS``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, and ``PreemptQOS``. Set a
-per-field width with ``Field%N``, e.g. ``JobName%20``.
+``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
+and ``Borrowed``. Set a per-field width with ``Field%N``, e.g. ``JobName%20``.
 
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
 preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
 ``Requeue``, ``Cancel``, or ``Suspend``. ``PreemptQOS`` is the QOS name that
 authorized the preemption under ``preempt_type = qos_priority``; ``N/A`` for
 plain priority-based preemption. All three appear in the long format (``-l``).
+
+``Borrowed`` is ``yes`` when the run took borrowed capacity under
+:doc:`/admin-guide/idle-fill-scheduling`, and ``no`` otherwise. It is the same
+question ``squeue``'s ``%W`` answers for a running job:
+
+.. code-block:: console
+
+   $ sacct --format=JobID,User,State,Borrowed
+   JobID  User     State      Borrowed
+   19     ifbob    PREEMPTED  yes
+   21     ifalice  COMPLETED  no
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode``.
@@ -421,12 +495,46 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, ``step``, or
    spur show node node01
    scontrol show partition gpu
 
+Expanding node lists — ``scontrol show hostnames`` / ``hostlist``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``scontrol show hostnames`` expands a hostlist expression to one host per line;
+``scontrol show hostlist`` (and ``hostlistsorted``) does the reverse, compressing
+a list back into the bracketed form. Both are pure local transforms: they never
+contact the controller, so they work inside a batch script on any compute node.
+
+With no argument, ``hostnames`` reads ``SLURM_JOB_NODELIST`` (Spur also honors
+``SPUR_JOB_NODELIST``), which makes it the standard way to derive a rendezvous
+address or an MPI hostfile from an allocation:
+
+.. code-block:: bash
+
+   scontrol show hostnames 'gpu[01-03]'      # -> gpu01 / gpu02 / gpu03, one per line
+   scontrol show hostlist gpu03,gpu01,gpu02  # -> gpu[01-03]
+
+   # Inside a job: first allocated node as the rendezvous host, all nodes to a hostfile.
+   export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"
+   scontrol show hostnames > "$HOME/hostfile.$SLURM_JOB_ID"
+
+``hostlist`` and ``hostlistsorted`` produce identical output in Spur: both remove
+duplicates and sort before compressing.
+
 Diagnosing a job that will not start
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A job pending on ``Reason=Resources`` looks the same whether the cluster is full
 or the job is pinned to a busy subset of it. ``scontrol show job`` reports the
 request as submitted, which distinguishes the two:
+
+A job that no node could host even when completely idle reports
+``Reason=ReqNodeNotAvail, Requested node configuration is not available``
+instead. Waiting will not help it: either the request exceeds every node's
+capacity, or it names a resource no node declares — a typo such as
+``--gres 1`` asks for one unit of a resource literally named ``1``, which is
+easy to miss because it never appears in ``ReqTRES``. Compare ``ReqTRES`` and
+``MinCPUsNode`` / ``MinMemoryNode`` below against ``spur show node``, and
+check ``--gres`` spelling. The reason is recomputed every scheduling cycle, so
+the job starts on its own once matching nodes join.
 
 .. list-table::
    :header-rows: 1
@@ -531,6 +639,31 @@ fields:
 * ``PreemptQOS=<name>`` — the QOS that authorized the preemption under
   ``preempt_type = qos_priority``; ``N/A`` for plain priority-based preemption.
 
+Borrowed runs and reclaim
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When :doc:`/admin-guide/idle-fill-scheduling` is enabled, a job that exceeded its
+QOS group node quota may still run, on capacity no job with a quota claim wanted.
+Such a run is *borrowed*, and ``squeue``'s ``%W`` field reports it:
+
+.. code-block:: console
+
+   $ squeue -o "%i %j %u %t %N %W"
+   JOBID NAME         USER     ST NODELIST BORROWED
+   18    alice-legit  ifalice  R  node-3   no
+   19    bob-borrow   ifbob    R  node-4   yes
+
+A borrowed job can be reclaimed when a job that does hold a quota claim needs its
+nodes. Reclaim **requeues**: the job returns to the queue with its spec intact and
+starts again once capacity allows, so the partial run is lost but the work is not.
+It appears as an ordinary preemption, with ``PreemptMode=Requeue`` and
+``PreemptedBy`` naming the job that reclaimed it, and ``sacct`` records that the run
+was borrowed.
+
+Note that ``--no-requeue`` does not prevent reclaim, and that an over-quota job
+which has *not* been lent capacity keeps reporting ``QOSGrpNodeLimit`` rather than a
+placement reason — being over quota is the true reason it is waiting.
+
 **Quick reference — one command for any preempted job:**
 
 .. code-block:: bash
@@ -547,8 +680,11 @@ memory, fall back to:
    sacct -j <id> --format=JobID,State,PreemptedBy,PreemptMode,PreemptQOS
 
 The accounting database keeps the record permanently. In practice
-``scontrol show job`` is the right first instinct; use ``sacct`` only if
-``scontrol`` returns ``Invalid job id``.
+``scontrol show job`` is the right first instinct; fall back to ``sacct`` when
+it reports ``Job <id> not found`` (a non-zero exit status), which means the
+controller no longer holds the job. A malformed id is different:
+``scontrol show job abc`` fails with ``Invalid job id specified: abc``, so a
+script can tell a typo from a job that has left the controller.
 
 .. note::
 
@@ -559,9 +695,11 @@ The accounting database keeps the record permanently. In practice
    suspended, but are cleared when the job resumes so that a subsequent normal
    completion is not miscounted as a preemption. As a result, ``sacct`` has
    no record of the preemption for suspend-mode jobs: the accounting row for
-   that run will show the final completion state only. Requeue and cancel modes
-   are unaffected — both write an accounting end-record (``PREEMPTED``) at the
-   time of preemption.
+   that run will show the final completion state only. Requeue mode is
+   unaffected — it writes an accounting end-record (``PREEMPTED``) at the time
+   of preemption. Cancel mode writes the same record, but only once the run has
+   actually ended: the victim holds its allocation in ``COMPLETING`` until every
+   node reports the release, or until ``CompleteWait`` elapses.
 
 Limits Against Usage — ``scontrol show assoc_mgr``
 --------------------------------------------------
@@ -646,10 +784,12 @@ cache has not loaded yet, so some caps below may be missing; the usage figures
 are still current. A cluster with accounting disabled has no caps to read and so
 never prints this line.
 
-An unprivileged caller sees only their own usage: ``scontrol show assoc_mgr``
-scopes the view to the caller and lists only the QOS and accounts they take part
-in. Administrators see every scope, and may pass ``users=<name>`` to inspect one
-user.
+By default every caller sees every scope and may pass ``users=<name>`` to
+inspect one user. When an administrator sets ``private_data = ["usage"]`` under
+``[auth]`` (see :ref:`private-data`), an unprivileged caller sees only the QOS
+and accounts they take part in, and only their own ``User=`` lines; a ``users=``
+selector is replaced with their own name. ``Grp*`` totals on the scope line
+still include every user's jobs. Operators and Administrators are exempt.
 
 Cluster Metrics — ``/metrics``
 ------------------------------
@@ -866,12 +1006,17 @@ Controlling Jobs
    spur cancel -u alice -p gpu --state PENDING
    scancel --signal SIGTERM 2048
 
-Filter flags include ``--user``/``-u`` (defaults to the current user in filter
-mode), ``--partition``/``-p``, ``--state``/``-t`` (only ``PD`` or ``R``),
-``--name``/``-n``, ``--account``/``-A``, and ``--signal``/``-s`` (``KILL``/9,
-``TERM``/15, ``INT``/2, and others). You must supply at least job IDs,
-``--user``, or ``--name``. In filter mode, jobs already in a terminal state are
-silently skipped.
+Filter flags include ``--user``/``-u``, ``--partition``/``-p``, ``--state``/``-t``
+(only ``PD`` or ``R``), ``--name``/``-n``, ``--account``/``-A``, and
+``--signal``/``-s`` (``KILL``/9, ``TERM``/15, ``INT``/2, and others). You must
+supply job IDs or at least one of ``--user``, ``--name``, ``--partition``, or
+``--account``; ``--state`` alone only narrows a selection. Without ``--user``, a
+filter matches every user's jobs you can see, as in Slurm, and each one you do not
+own is refused. In filter mode, jobs already in a terminal state are silently
+skipped. ``scancel`` exits ``1`` and reports on ``stderr`` if any cancel or signal is
+refused. A job that is already finished or unknown does not fail a plain cancel
+(or ``-s KILL``) and is not reported. With another signal it fails, and
+``--quiet``/``-Q`` hides the report but not the exit status.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 

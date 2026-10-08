@@ -8,6 +8,7 @@ Handles SSH connections, binary deployment, cluster startup/teardown,
 and CLI wrappers for interacting with the running cluster.
 """
 
+import contextlib
 import os
 import re
 import shlex
@@ -23,7 +24,7 @@ import tomli_w
 
 logger = logging.getLogger(__name__)
 
-BINARIES = ["spurctld", "spurd", "spur", "spurstepd"]
+BINARIES = ["spurctld", "spurd", "spur", "spurstepd", "spurauthd"]
 CLI_SYMLINKS = ["sbatch", "srun", "squeue", "scancel", "sinfo", "scontrol"]
 ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
@@ -72,6 +73,26 @@ def deep_merge(base: dict, overrides: dict) -> dict:
     return base
 
 
+@contextlib.contextmanager
+def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_PORT):
+    """Drop the controller's outbound traffic to one node's agent port.
+
+    Blocks on the controller's own OUTPUT chain rather than stopping the
+    target's spurd or dropping its inbound traffic, so the node keeps
+    heartbeating and stays schedulable — every dispatch to it genuinely
+    fails at the RPC layer instead of the node going administratively DOWN.
+    Always removes the rule on exit, including when the body raises.
+    """
+    controller = cluster.nodes[0]
+    target = cluster.nodes[node_index].host
+    rule_args = f"-d {target} -p tcp --dport {port} -j DROP"
+    controller.exec(f"sudo iptables -A OUTPUT {rule_args}")
+    try:
+        yield
+    finally:
+        controller.exec_allow_fail(f"sudo iptables -D OUTPUT {rule_args}")
+
+
 class SshNode:
     """SSH connection to a single test node."""
 
@@ -98,13 +119,16 @@ class SshNode:
             self._sftp = self.client.open_sftp()
         return self._sftp
 
-    def exec(self, cmd: str, check: bool = True) -> str:
-        """Run a command via SSH. Returns stdout. Raises on non-zero exit if check=True."""
+    def _run(self, cmd: str) -> tuple[int, str, str]:
+        """Run a command via SSH. Returns (exit_code, stdout, stderr). The one
+        place that drives the channel; higher-level helpers shape the result."""
         _, stdout, stderr = self.client.exec_command(cmd)
         exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode()
-        err = stderr.read().decode()
+        return exit_code, stdout.read().decode(), stderr.read().decode()
 
+    def exec(self, cmd: str, check: bool = True) -> str:
+        """Run a command via SSH. Returns stdout. Raises on non-zero exit if check=True."""
+        exit_code, out, err = self._run(cmd)
         if check and exit_code != 0:
             raise RuntimeError(
                 f"Command failed on {self.host} (exit {exit_code}): {cmd}\n"
@@ -114,11 +138,13 @@ class SshNode:
 
     def exec_allow_fail(self, cmd: str) -> str:
         """Run a command, returning stdout+stderr regardless of exit code."""
-        _, stdout, stderr = self.client.exec_command(cmd)
-        stdout.channel.recv_exit_status()
-        out = stdout.read().decode()
-        err = stderr.read().decode()
+        _, out, err = self._run(cmd)
         return out + err
+
+    def exec_with_exit(self, cmd: str) -> tuple[int, str]:
+        """Run a command, returning (exit_code, combined stdout+stderr)."""
+        exit_code, out, err = self._run(cmd)
+        return exit_code, out + err
 
     def upload(self, local_path: str, remote_path: str):
         """Upload a local file to the remote node."""
@@ -139,6 +165,21 @@ class SshNode:
         if self._sftp:
             self._sftp.close()
         self.client.close()
+
+
+def _upload_binary(nodes: list[SshNode], local_path: Path, bin_dir: str, name: str):
+    local_size = local_path.stat().st_size
+    for node in nodes:
+        remote_path = f"{bin_dir}/{name}"
+        remote_size = node.exec_allow_fail(
+            f"stat -c%s '{remote_path}' 2>/dev/null || echo 0"
+        ).strip()
+        if remote_size == str(local_size):
+            logger.debug("Binary %s already present on %s", name, node.host)
+            continue
+        logger.info("Uploading %s to %s", name, node.host)
+        node.upload(str(local_path), remote_path)
+        node.exec(f"chmod +x '{remote_path}'")
 
 
 def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
@@ -162,21 +203,7 @@ def ensure_bins(nodes: list[SshNode], binaries_dir: str, bin_dir: str,
                 f"Missing binary: {local_path}\n"
                 f"Set SPUR_TEST_BINARIES_DIR or run: cargo build --release"
             )
-        local_size = local_path.stat().st_size
-
-        for node in nodes:
-            remote_path = f"{bin_dir}/{name}"
-            remote_size = node.exec_allow_fail(
-                f"stat -c%s '{remote_path}' 2>/dev/null || echo 0"
-            ).strip()
-
-            if remote_size == str(local_size):
-                logger.debug("Binary %s already present on %s", name, node.host)
-                continue
-
-            logger.info("Uploading %s to %s", name, node.host)
-            node.upload(str(local_path), remote_path)
-            node.exec(f"chmod +x '{remote_path}'")
+        _upload_binary(nodes, local_path, bin_dir, name)
 
     # Create CLI symlinks
     symlink_cmd = (
@@ -242,10 +269,17 @@ class SpurCluster:
         self.config_overrides: dict = {}
         self.agent_as_root: bool = False
         self.agent_labels: dict[int, dict[str, str]] = {}
+        # Extra environment variables injected into spurd's own launch env (e.g.
+        # SPUR_INVENTORY_REFRESH_SECS to drive the inventory-refresh loop fast in
+        # tests). Applied by _spurd_start_cmd for both fresh start and restart.
+        self.agent_env: dict[str, str] = {}
         self.agent_token: str | None = None
         self.accounting_enabled: bool = False
         self._pg_container = f"spur-e2e-pg-{os.getpid()}-{time.time_ns()}"
         self._pg_port: int | None = None
+        self.cli_env: dict[str, str] = {}
+        self.daemon_env: dict[str, str] = {}
+        self.controller_env: dict[str, str] = {}
 
     @property
     def _db_url(self) -> str:
@@ -313,6 +347,7 @@ class SpurCluster:
         """Kill all daemons but keep the working directory intact."""
         self.stop_agents()
         self.stop_controller()
+        self._kill_mint()
         if self.accounting_enabled:
             self._stop_postgres()
 
@@ -373,12 +408,45 @@ class SpurCluster:
     def teardown(self):
         """Kill all daemons and remove the working directory."""
         self.stop()
+        # Detached supervisors survive stop(), so reap them or they leak across
+        # tests — at teardown, not stop_agents(), so a test can still watch one survive.
         rm_prefix = self._sudo_prefix() if self.agent_as_root else ""
         for node in self.nodes:
+            self._pkill(node, f"{self.bin_dir}/spurstepd", use_sudo=self.agent_as_root)
             node.exec_allow_fail(f"{rm_prefix}rm -rf '{self.remote_dir}'")
         logger.info("Cluster torn down")
 
     # --- CLI wrappers ---
+
+    def _cli_env_assignments(self, controller_addr: str | None = None) -> list[str]:
+        parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(controller_addr or self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            f"SPUR_CONF={shlex.quote(self.etc_dir)}/spur.conf",
+        ]
+        for key, value in self.cli_env.items():
+            parts.append(f"{key}={shlex.quote(str(value))}")
+        return parts
+
+    def _cli_command(
+        self,
+        args: list[str],
+        controller_addr: str | None = None,
+        run_as: str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> str:
+        """Build the remote command line for a CLI invocation. With *run_as*
+        set, wrap it in ``sudo -u <user> env ...`` so the controller derives the
+        invoking account from that user."""
+        parts = self._cli_env_assignments(controller_addr)
+        for key, value in (extra_env or {}).items():
+            parts.append(f"{key}={shlex.quote(str(value))}")
+        parts.append(shlex.quote(f"{self.bin_dir}/{args[0]}"))
+        parts.extend(shlex.quote(a) for a in args[1:])
+        cmd = " ".join(parts)
+        if run_as is not None:
+            cmd = f"{self._sudo_prefix()}-u {shlex.quote(run_as)} env {cmd}"
+        return cmd
 
     def cli(self, args: list[str], controller_addr: str | None = None) -> str:
         """Run a spur CLI command on the controller node.
@@ -386,13 +454,7 @@ class SpurCluster:
         *controller_addr* overrides the endpoint(s) passed via
         ``SPUR_CONTROLLER_ADDR`` (e.g. a comma-separated failover list).
         """
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
-        ]
-        cmd_parts.extend(f"'{a}'" for a in args[1:])
-        return self.nodes[0].exec(" ".join(cmd_parts))
+        return self.nodes[0].exec(self._cli_command(args, controller_addr))
 
     def cli_allow_fail(self, args: list[str], controller_addr: str | None = None) -> str:
         """Run a spur CLI command, returning stdout+stderr regardless of exit
@@ -400,13 +462,7 @@ class SpurCluster:
 
         *controller_addr* overrides ``SPUR_CONTROLLER_ADDR`` as in :meth:`cli`.
         """
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
-        ]
-        cmd_parts.extend(f"'{a}'" for a in args[1:])
-        return self.nodes[0].exec_allow_fail(" ".join(cmd_parts))
+        return self.nodes[0].exec_allow_fail(self._cli_command(args, controller_addr))
 
     def cli_as_user(
         self,
@@ -414,9 +470,9 @@ class SpurCluster:
         args: list[str],
         controller_addr: str | None = None,
         extra_env: dict[str, str] | None = None,
+        check: bool = False,
     ) -> str:
-        """Run a spur CLI command as a specific UNIX user via sudo, returning
-        stdout+stderr regardless of exit code.
+        """Run a spur CLI command as a specific UNIX user via sudo.
 
         Commands that carry an identity (reservation create/update/delete,
         job cancel, ...) derive it from the invoking account (``whoami``), so
@@ -424,42 +480,52 @@ class SpurCluster:
 
         *extra_env* adds variables to the environment. Pass ``SPUR_AUTH_TOKEN`` to
         separate the identity the controller verifies from the invoking account.
+
+        With *check* set, a non-zero exit raises ``RuntimeError``; otherwise the
+        combined stdout+stderr is returned regardless of exit code.
         """
-        inner = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-        ]
-        for key, value in (extra_env or {}).items():
-            inner.append(f"{key}='{value}'")
-        inner.append(f"'{self.bin_dir}/{args[0]}'")
-        inner.extend(f"'{a}'" for a in args[1:])
-        cmd = f"{self._sudo_prefix()}-u '{run_as}' env {' '.join(inner)}"
-        return self.nodes[0].exec_allow_fail(cmd)
+        cmd = self._cli_command(
+            args, controller_addr, run_as=run_as, extra_env=extra_env
+        )
+        if not check:
+            return self.nodes[0].exec_allow_fail(cmd)
+        code, out = self.nodes[0].exec_with_exit(cmd)
+        if code != 0:
+            raise RuntimeError(
+                f"Command failed as {run_as} (exit {code}): {cmd}\n{out}"
+            )
+        return out
 
     def cli_with_exit(
         self, args: list[str], controller_addr: str | None = None
     ) -> tuple[int, str]:
         """Run a spur CLI command and return (exit_code, combined stdout+stderr)."""
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR='{controller_addr or self.controller_addr}'",
-            f"PATH='{self.bin_dir}':$PATH",
-            f"'{self.bin_dir}/{args[0]}'",
-        ]
-        cmd_parts.extend(f"'{a}'" for a in args[1:])
-        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
-        code = stdout.channel.recv_exit_status()
-        return code, stdout.read().decode() + stderr.read().decode()
+        return self.nodes[0].exec_with_exit(self._cli_command(args, controller_addr))
 
     def sbatch(self, args: list[str]) -> str:
         return self.cli(["sbatch"] + args)
 
-    def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
-        """Run srun and return (exit_code, combined stdout+stderr)."""
+    def sbatch_when_qos_ready(self, args: list[str], timeout: int = 15) -> str:
+        """``sbatch`` that retries while the controller's QoS cache has not yet
+        loaded a QoS created moments earlier via ``sacctmgr``."""
+        return retry_until_qos_ready(lambda: self.sbatch(args), timeout)
+
+    def sbatch_with_exit(self, args: list[str]) -> tuple[int, str]:
+        """Run sbatch and return (exit_code, combined stdout+stderr)."""
         cmd_parts = [
             f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
             f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-            shlex.quote(f"{self.bin_dir}/srun"),
+            shlex.quote(f"{self.bin_dir}/sbatch"),
         ]
+        cmd_parts.extend(shlex.quote(a) for a in args)
+        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
+    def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
+        """Run srun and return (exit_code, combined stdout+stderr)."""
+        cmd_parts = self._cli_env_assignments()
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
         cmd_parts.extend(shlex.quote(a) for a in args)
         _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
         code = stdout.channel.recv_exit_status()
@@ -479,11 +545,8 @@ class SpurCluster:
         removes variables (via ``env -u``) so an empty value does not fall through
         to ``~/.spur/token``.
         """
-        cmd_parts = [
-            f"SPUR_JOB_ID={job_id}",
-            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
-            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-        ]
+        cmd_parts = self._cli_env_assignments()
+        cmd_parts.append(f"SPUR_JOB_ID={job_id}")
         for key, value in (extra_env or {}).items():
             cmd_parts.append(f"{key}={shlex.quote(str(value))}")
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
@@ -513,11 +576,8 @@ class SpurCluster:
             f"#!/bin/bash\nset -euo pipefail\n{shell_body}\n",
         )
 
-        cmd_parts = [
-            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
-            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
-            f"SHELL={shlex.quote(script_path)}",
-        ]
+        cmd_parts = self._cli_env_assignments()
+        cmd_parts.append(f"SHELL={shlex.quote(script_path)}")
         for key, value in (extra_env or {}).items():
             cmd_parts.append(f"{key}={shlex.quote(str(value))}")
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/spur"))
@@ -586,8 +646,8 @@ class SpurCluster:
                 members.add(fields[0])
         return members
 
-    def scancel(self, job_id: str) -> str:
-        return self.cli(["scancel", job_id])
+    def scancel(self, job_id: int | str) -> str:
+        return self.cli(["scancel", str(job_id)])
 
     def scontrol(self, *args: str) -> str:
         return self.cli(["scontrol"] + list(args))
@@ -703,6 +763,12 @@ class SpurCluster:
     def sacctmgr(self, args: list[str]) -> str:
         return self.cli(["sacctmgr"] + args)
 
+    def sshare(self, args: list[str]) -> str:
+        return self.cli(["sshare"] + args)
+
+    def sreport(self, args: list[str]) -> str:
+        return self.cli(["sreport"] + args)
+
     def write_file(self, name: str, body: str, *,
                    all_nodes: bool = False, executable: bool = True) -> str:
         """Write a file under remote_dir. Returns the absolute remote path.
@@ -739,6 +805,68 @@ class SpurCluster:
             if content.strip():
                 combined.append(content)
         return "\n".join(combined)
+
+    def install_native_jwks(self) -> dict[str, str]:
+        """Generate native JWKS under ``remote_dir/jwks`` on every node."""
+        jwks_dir = f"{self.remote_dir}/jwks"
+        spur = f"{self.bin_dir}/spur"
+        n0 = self.nodes[0]
+        n0.exec(f"mkdir -p '{jwks_dir}'")
+        n0.exec(f"'{spur}' auth-keys hmac --kid auth-1 --out '{jwks_dir}/auth.jwks'")
+        n0.exec(
+            f"'{spur}' auth-keys ed25519 --kid cred-1 "
+            f"--signing '{jwks_dir}/cred-signing.jwks' "
+            f"--verify '{jwks_dir}/cred-verification.jwks'"
+        )
+        n0.exec(
+            f"'{spur}' auth-keys ed25519 --kid ctrl-1 "
+            f"--signing '{jwks_dir}/controller-signing.jwks' "
+            f"--verify '{jwks_dir}/controller-verification.jwks'"
+        )
+        n0.exec(
+            f"'{spur}' auth-keys ed25519 --kid node-1 "
+            f"--signing '{jwks_dir}/node-signing.jwks' "
+            f"--verify '{jwks_dir}/node-verification.jwks'"
+        )
+        names = [
+            "auth.jwks",
+            "cred-signing.jwks",
+            "cred-verification.jwks",
+            "controller-signing.jwks",
+            "controller-verification.jwks",
+            "node-signing.jwks",
+            "node-verification.jwks",
+        ]
+        for name in names:
+            path = f"{jwks_dir}/{name}"
+            n0.exec(f"chmod 600 '{path}'")
+        # Signing material stays on the controller host. Agents get verification
+        # JWKS plus the HMAC auth set (needed to run spurauthd locally).
+        agent_names = [
+            "auth.jwks",
+            "cred-verification.jwks",
+            "controller-verification.jwks",
+            "node-verification.jwks",
+        ]
+        for name in agent_names:
+            path = f"{jwks_dir}/{name}"
+            body = n0.read_file(path)
+            for node in self.nodes[1:]:
+                node.exec(f"mkdir -p '{jwks_dir}'")
+                node.write_file(path, body, mode=0o600)
+        return {name.rsplit(".", 1)[0]: f"{jwks_dir}/{name}" for name in names}
+
+    def start_native_mint(self, jwks: str, socket: str):
+        """Start ``spurauthd`` on every node so agents can mint controller RPCs."""
+        self._kill_mint()
+        for node, name in zip(self.nodes, self.node_names):
+            cmd = (
+                f"nohup '{self.bin_dir}/spurauthd' --cluster e2e-test "
+                f"--jwks {shlex.quote(jwks)} --socket {shlex.quote(socket)} "
+                f"> '{self.log_dir}/spurauthd.log' 2>&1 & echo $!"
+            )
+            pid = node.exec(cmd).strip()
+            logger.info("spurauthd started on %s (pid %s)", name, pid)
 
     def debug_job(self, job_id: int) -> str:
         """Collect diagnostic info for a failed job."""
@@ -836,6 +964,10 @@ class SpurCluster:
 
     def spurd_log(self, node_index: int = 0) -> str:
         raw = self.nodes[node_index].read_file(f"{self.log_dir}/spurd.log")
+        return re.sub(r"\x1b\[[0-9;]*m", "", raw)
+
+    def spurctld_log(self, node_index: int = 0) -> str:
+        raw = self.nodes[node_index].read_file(f"{self.log_dir}/spurctld.log")
         return re.sub(r"\x1b\[[0-9;]*m", "", raw)
 
     def spurd_registry_gpu_count(self, node_index: int = 0) -> int | None:
@@ -966,6 +1098,55 @@ class SpurCluster:
                 pytest.skip(f"{mpicc} could not build {source_name} on {node.host}")
         return remote_bin
 
+    def rccl_preflight(self, min_nodes: int = 1) -> tuple[str, str]:
+        """Skip unless the nodes already carry the ROCm toolchain RCCL needs.
+
+        Provisioning belongs to the host image; this only reports what is absent.
+        Returns node 0's hipcc and ROCm include root, which the build needs.
+        """
+        self.gpu_preflight(min_nodes)
+        self.mpi_preflight(min_nodes)
+
+        include_probe = (
+            'for d in "${ROCM_PATH:-/opt/rocm}/include" /opt/rocm/include; do '
+            '[ -f "$d/rccl/rccl.h" ] && { echo "$d"; break; }; done'
+        )
+        missing: list[str] = []
+        paths: list[tuple[str, str]] = []
+        for i in range(min(min_nodes, len(self.nodes))):
+            node, name = self.nodes[i], self.node_names[i]
+            hipcc = node.exec_allow_fail("command -v hipcc").strip()
+            include = node.exec_allow_fail(include_probe).strip()
+            paths.append((hipcc, include))
+            if not hipcc:
+                missing.append(f"hipcc on {name}")
+            if not include:
+                missing.append(f"rccl/rccl.h on {name}")
+            if not node.exec_allow_fail("ldconfig -p | grep -q librccl && echo y").strip():
+                missing.append(f"librccl on {name}")
+
+        if missing:
+            pytest.skip("RCCL toolchain missing: " + "; ".join(missing))
+        return paths[0]
+
+    def compile_rccl_fixture(self, source_name: str = "rccl_all_reduce.c") -> str:
+        """Build the MPI+RCCL fixture on every node, with that node's own toolchain."""
+        hipcc, rocm_include = self.rccl_preflight(len(self.nodes))
+        self.ship_fixture(source_name)
+        remote_src = f"{self.remote_dir}/{source_name}"
+        remote_bin = remote_src.rsplit(".", 1)[0]
+        mpicc = os.environ.get("SPUR_TEST_MPICC", "mpicc").strip() or "mpicc"
+        # OMPI_CC points the MPI wrapper at hipcc, so it contributes its own include
+        # and link flags. The macro is needed because this payload is plain C.
+        build = (
+            f"OMPI_CC={shlex.quote(hipcc)} {shlex.quote(mpicc)} "
+            f"-o {shlex.quote(remote_bin)} {shlex.quote(remote_src)} "
+            f"-I{shlex.quote(rocm_include)} -D__HIP_PLATFORM_AMD__ -lrccl"
+        )
+        for node in self.nodes:
+            node.exec(build)
+        return remote_bin
+
     def mpi_plugin_dir(self) -> str:
         return str(Path(self.bin_dir).parent / "lib" / "spur")
 
@@ -973,9 +1154,23 @@ class SpurCluster:
         """Restart spurd on one node without touching the controller."""
         node = self.nodes[node_index]
         self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=self.agent_as_root)
-        time.sleep(1)
+        self._wait_port_free(node, AGENT_PORT)
         node.exec(self._spurd_start_cmd(node_index))
         time.sleep(5)
+
+    def _wait_port_free(self, node: SshNode, port: int, timeout: int = 10):
+        """A killed spurd holding a live stepd across the restart still has to
+        tear down its listener; starting the replacement before the kernel
+        releases the port binds nothing and fails with EADDRINUSE.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            busy = node.exec_allow_fail(
+                f"ss -ltn 'sport = :{port}' 2>/dev/null | grep -q LISTEN && echo busy || true"
+            ).strip()
+            if busy != "busy":
+                return
+            time.sleep(0.2)
 
     def wait_agent_serving(self, node_index: int = 0, timeout: int = 60):
         """Block until a restarted spurd is answering RPCs again.
@@ -1242,10 +1437,19 @@ tar -C "$R" -czf '{local_tar}' .
         for node in self.nodes:
             node.write_file(f"{self.etc_dir}/spur.conf", config)
 
+    def _daemon_env_assignments(self, extra: dict[str, str] | None = None) -> str:
+        merged = {**self.daemon_env, **(extra or {})}
+        if not merged:
+            return ""
+        return " ".join(
+            f"{key}={shlex.quote(str(value))}" for key, value in merged.items()
+        ) + " "
+
     def _start_controller(self):
         listen = f"[::]:{CONTROLLER_PORT}"
+        extra = self._daemon_env_assignments(self.controller_env)
         cmd = (
-            f"nohup '{self.bin_dir}/spurctld' "
+            f"nohup env {extra}'{self.bin_dir}/spurctld' "
             f"-f '{self.etc_dir}/spur.conf' "
             f"--listen '{listen}' --state-dir '{self.state_dir}' --log-level info -D "
             f"> '{self.log_dir}/spurctld.log' 2>&1 & echo $!"
@@ -1321,6 +1525,10 @@ tar -C "$R" -czf '{local_tar}' .
     def _kill_controller(self):
         self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld")
 
+    def _kill_mint(self):
+        for node in self.nodes:
+            self._pkill(node, f"{self.bin_dir}/spurauthd")
+
     def _kill_agents(self, use_sudo: bool = False, broad: bool = False):
         for node in self.nodes:
             self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=use_sudo)
@@ -1338,8 +1546,11 @@ tar -C "$R" -czf '{local_tar}' .
         address = node.host
         agent_listen = f"0.0.0.0:{AGENT_PORT}"
         # `env VAR=val` runs under any sudo prefix, so the canary lands in spurd's
-        # own environment in both the rootless and rootful launch shapes.
-        daemon_env = f"env SPUR_DAEMON_ENV_CANARY={DAEMON_ENV_CANARY}"
+        # own environment in both the rootless and rootful launch shapes. Any
+        # test-supplied agent_env vars are appended to the same `env` invocation.
+        daemon_env = (
+            f"env SPUR_DAEMON_ENV_CANARY={DAEMON_ENV_CANARY} {self._daemon_env_assignments(self.agent_env)}"
+        )
         spurd_bin = (
             f"{self._sudo_prefix()}{daemon_env} '{self.bin_dir}/spurd'"
             if self.agent_as_root
@@ -1449,6 +1660,28 @@ def job_state(squeue_output: str, job_id: int) -> str | None:
         state = _TRUNCATED_STATE_CODES.get(fields[state_index], fields[state_index])
         return state if state in _JOB_STATE_CODES else None
     return None
+
+
+def retry_until_qos_ready(submit, timeout: int = 15) -> str:
+    """Retry *submit* while the controller's QoS cache has not yet loaded a QoS
+    created moments earlier via ``sacctmgr``. The cache refreshes on a fixed
+    interval (``fairshare_refresh_secs``), not on write.
+
+    Handles both a checked submit that raises ``RuntimeError`` (``cluster.sbatch``)
+    and an unchecked one that returns the error text (``cli_as_user``)."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            out = submit()
+        except RuntimeError as error:
+            if "does not exist" not in str(error) or time.time() >= deadline:
+                raise
+            time.sleep(1)
+            continue
+        if "does not exist" in out and time.time() < deadline:
+            time.sleep(1)
+            continue
+        return out
 
 
 def wait_job_state(

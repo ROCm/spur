@@ -64,6 +64,11 @@ mod local_path_tests {
 /// `mesh_native` picks Calico's mode — `bird` (native routing over the WireGuard mesh, `api_address`
 /// being the control-plane's mesh IP) when true, else `vxlan` (Calico's own overlay, no mesh needed,
 /// `api_address` being its real underlay address). `cni_mtu` is Calico-only.
+///
+/// kube-router runs with `overlay-type=full`: its default (`subnet`) routes pod packets unencapsulated
+/// between nodes of the same subnet, and a cloud VNIC (OCI, AWS, ...) drops packets whose source is a
+/// pod address unless source/destination checking is disabled on the interface. Full overlay puts every
+/// pod packet in the IPIP tunnel with the node address outside, which works on any underlay.
 #[allow(clippy::too_many_arguments)]
 pub fn k0s_controller_config_yaml(
     cni: &str,
@@ -108,6 +113,10 @@ pub fn k0s_controller_config_yaml(
             y.push_str("      enabled: true\n");
             y.push_str("      type: EnvoyProxy\n");
         }
+    } else {
+        y.push_str("    kuberouter:\n");
+        y.push_str("      extraArgs:\n");
+        y.push_str("        overlay-type: full\n");
     }
     y
 }
@@ -225,7 +234,7 @@ mod k0s_config_tests {
 
     /// kuberouter must carry the configured CIDRs, not k0s's own built-in default.
     #[test]
-    fn kuberouter_carries_configured_pod_and_service_cidr() {
+    fn kuberouter_carries_configured_cidrs_and_full_overlay() {
         let y = k0s_controller_config_yaml(
             "kuberouter",
             "192.0.2.0/24",
@@ -239,6 +248,8 @@ mod k0s_config_tests {
         assert!(y.contains("provider: kuberouter"));
         assert!(y.contains("podCIDR: 192.0.2.0/24"));
         assert!(y.contains("serviceCIDR: 198.51.100.0/24"));
+        // Unencapsulated same-subnet pod routing is dropped by cloud VNIC source checks.
+        assert!(y.contains("overlay-type: full"));
         assert!(!y.contains("api:"));
         assert!(!y.contains("calico:"));
     }

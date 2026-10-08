@@ -10,6 +10,9 @@ drive real steps through an allocation shell and assert their output reaches
 the client intact.
 """
 
+# Mirrors MAX_STEP_NAME_BYTES in crates/spur-core/src/step.rs.
+_MAX_STEP_NAME_BYTES = 256
+
 
 class TestSrunStepOutput:
     def test_step_stdout_reaches_client(self, cluster):
@@ -38,3 +41,25 @@ class TestSrunStepOutput:
         assert code == 0, out
         assert "before-fail" in out, out
         assert "step-exit=7" in out, out
+
+    def test_long_command_line_does_not_become_the_step_name(self, cluster):
+        # The controller stores the argv as the step name, so an unbounded one
+        # lands in the Raft entry and is re-serialized into every snapshot.
+        code, out = cluster.salloc_run(
+            'srun bash -c "echo LONG-ARGV-DONE; true $(head -c 20000 /dev/zero | tr \'\\0\' x)"\n'
+            'scontrol show step "$SPUR_JOB_ID"\n'
+        )
+        assert code == 0, out
+        assert "LONG-ARGV-DONE" in out, out
+
+        names = [
+            ln.split("StepName=", 1)[1].split(" State=", 1)[0]
+            for ln in out.splitlines()
+            if "StepName=" in ln
+        ]
+        assert names, out
+        for name in names:
+            assert len(name.encode()) <= _MAX_STEP_NAME_BYTES, f"{len(name.encode())}B: {name[:400]}"
+        capped = [n for n in names if n.endswith("...")]
+        assert len(capped) == 1, names
+        assert capped[0].startswith("bash -c echo LONG-ARGV-DONE"), capped[0]

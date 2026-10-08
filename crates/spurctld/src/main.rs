@@ -4,6 +4,7 @@
 mod accounting;
 mod agent_client;
 mod association_cache;
+mod audit;
 mod auth_middleware;
 mod cluster;
 mod cluster_k8s;
@@ -12,6 +13,7 @@ mod hooks;
 mod limits_cache;
 mod metrics_proto;
 mod metrics_server;
+mod native_keys;
 mod pmix_dispatch;
 mod raft;
 mod raft_server;
@@ -102,6 +104,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    config.auth.check_private_data()?;
+
     // Fail fast on a broken submit hook (missing, non-executable, or a Lua that
     // won't compile) instead of deferring the error to the first user submission.
     hooks::validate_submit_hooks(&config.hooks)?;
@@ -182,6 +186,12 @@ async fn main() -> anyhow::Result<()> {
 
     let raft_handle = Arc::new(handle);
     cluster.set_raft(raft_handle.raft.clone());
+    crate::native_keys::install(
+        &config.cluster_name,
+        raft_handle.clone(),
+        &config.auth.plugin,
+    )
+    .map_err(|e| anyhow::anyhow!("native signing keys: {e}"))?;
 
     let sched_stats = Arc::new(SchedStatsCollector::new(config.scheduler.plugin.clone()));
     cluster.set_sched_stats(sched_stats.clone());
@@ -285,20 +295,63 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // The controller presents this key as its credential to agents (spurd authenticates callers).
+    // Only the configured key: the admission fallback is a well-known constant, and presenting a
+    // token signed with it makes every agent that has no key reject the call.
+    let jwt_key = server::resolve_startup_jwt_key(&config)?;
+    crate::agent_client::set_signing_key(server::agent_signing_key(&config)?);
+    crate::agent_client::set_channel_tuning(&config.controller);
+    let bearer = spur_core::auth::BearerAuth::from_config(
+        &config,
+        jwt_key.as_bytes(),
+        spur_core::auth::VerifierKind::Controller,
+    )
+    .map_err(|e| anyhow::anyhow!("native auth key set: {e}"))?;
+
+    // One instance, shared with the REST server below.
+    let controller = server::build_service(
+        cluster.clone(),
+        raft_handle.clone(),
+        rpc_stats.clone(),
+        sched_stats.clone(),
+        config.cluster.control_plane_replicas,
+        jwt_key,
+        &bearer,
+    );
+
     if config.rest_api.enabled {
         let rest_addr: std::net::SocketAddr = config.controller.rest_addr.parse()?;
         if !rest_addr.ip().is_loopback() {
+            if config.auth.plugin == "spur"
+                && config.auth.mode == spur_core::config::AuthMode::Required
+                && !config.rest_api.allow_non_loopback
+            {
+                anyhow::bail!(
+                    "REST API is enabled on non-loopback {rest_addr} with [auth] plugin = \"spur\" \
+                     and mode = \"required\"; bind loopback or set rest_api.allow_non_loopback = true \
+                     behind a trusted gateway"
+                );
+            }
             tracing::warn!(
                 addr = %rest_addr,
-                "REST API is enabled on a non-loopback address and performs NO authentication: \
-                 any peer that can reach it can submit and cancel jobs. Restrict it to loopback or \
-                 front it with an authenticating proxy."
+                "REST API is enabled on a non-loopback address: credentials are verified, but \
+                 restrict the port at the network layer as well"
             );
         }
         let rest_cluster = cluster.clone();
         let rest_raft = raft_handle.clone();
+        let rest_auth = bearer.clone();
+        let rest_controller = controller.clone();
         tokio::spawn(async move {
-            if let Err(e) = rest::serve(rest_addr, rest_cluster, rest_raft).await {
+            if let Err(e) = rest::serve(
+                rest_addr,
+                rest_cluster,
+                rest_raft,
+                rest_auth,
+                rest_controller,
+            )
+            .await
+            {
                 tracing::error!(error = %e, "REST API server failed");
             }
         });
@@ -306,12 +359,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Start gRPC server
     let addr: std::net::SocketAddr = listen_addr.parse()?;
-    // The controller presents this key as its credential to agents (spurd authenticates callers).
-    // Only the configured key: the admission fallback is a well-known constant, and presenting a
-    // token signed with it makes every agent that has no key reject the call.
-    let jwt_key = server::resolve_startup_jwt_key(&config)?;
-    crate::agent_client::set_signing_key(server::agent_signing_key(&config)?);
-    crate::agent_client::set_channel_tuning(&config.controller);
 
     // State the authentication posture explicitly at startup: it determines whether the listening
     // port is the trust boundary or merely the transport.
@@ -334,6 +381,9 @@ async fn main() -> anyhow::Result<()> {
              the client. Treat this port as an administrative boundary."
         ),
     }
+    if let Some(warning) = config.auth.private_data_warning() {
+        tracing::warn!("{warning}");
+    }
     if !addr.ip().is_loopback() && config.auth.mode != spur_core::config::AuthMode::Required {
         tracing::warn!(
             %addr,
@@ -342,19 +392,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     info!(%addr, "gRPC server listening");
-    server::serve(
-        addr,
-        cluster,
-        raft_handle,
-        rpc_stats,
-        sched_stats,
-        accounting_service,
-        config.cluster.control_plane_replicas,
-        jwt_key,
-    )
-    .await?;
+    server::serve(addr, controller, accounting_service, bearer).await?;
 
     sched_handle.abort();
+    // Audit rows are written off the request path; the runtime would drop them.
+    if !cluster
+        .drain_accounting(std::time::Duration::from_secs(5))
+        .await
+    {
+        tracing::warn!("accounting writes still pending at shutdown; some rows were lost");
+    }
     Ok(())
 }
 
@@ -406,5 +453,6 @@ fn default_config() -> spur_core::config::SlurmConfig {
         cgroup: Default::default(),
         mpi: Default::default(),
         health: Default::default(),
+        spurd: Default::default(),
     }
 }

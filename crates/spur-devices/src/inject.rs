@@ -459,6 +459,7 @@ mod tests {
             device_edits: ContainerEdits::default(),
             shared_edits: ContainerEdits::default(),
             device_paths: Vec::new(),
+            stable_id: 0,
         }
     }
 

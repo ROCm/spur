@@ -70,7 +70,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let parsed = NodeArgs::try_parse_from(args)?;
+    let parsed = crate::clap_exit::parse_or_exit::<NodeArgs>(&args);
     let controller = parsed.controller;
     match parsed.command {
         NodeCommand::Label { node, labels } => cmd_label(&controller, node, labels).await,

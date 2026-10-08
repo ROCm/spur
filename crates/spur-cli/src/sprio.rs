@@ -49,7 +49,7 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = SprioArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<SprioArgs>(&args);
 
     let job_ids = args
         .jobs
@@ -72,6 +72,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             job_ids,
             name: String::new(),
             nodes: Vec::new(),
+            qos: String::new(),
+            reservation: String::new(),
         })
         .await
         .context("failed to get jobs")?;

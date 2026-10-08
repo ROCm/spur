@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
@@ -62,14 +63,88 @@ fn validate_target_node(
     }
 }
 
+fn verify_launch_credential(
+    keys: &spur_core::native_jwks::Ed25519VerifyKeySet,
+    cluster_id: &str,
+    hostname: &str,
+    req: &LaunchJobRequest,
+) -> Result<(), Status> {
+    if req.execution_credential.is_empty() {
+        spur_core::native_metrics::inc_exec_fail();
+        return Err(Status::unauthenticated("execution credential required"));
+    }
+    let spec = req
+        .spec
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+    let now = spur_core::native_mint::unix_now().unwrap_or(0);
+    let cred =
+        spur_core::native_exec::verify_execution(&req.execution_credential, keys, cluster_id, now)
+            .map_err(map_exec_err)?;
+    cred.require_kind(spur_core::native_cred::CredentialKind::Job)
+        .map_err(map_exec_err)?;
+    let node = if req.target_node.is_empty() {
+        hostname
+    } else {
+        req.target_node.as_str()
+    };
+    cred.require_node(node).map_err(map_exec_err)?;
+    cred.require_run_attempt(req.run_attempt)
+        .map_err(map_exec_err)?;
+    cred.require_unix(spec.uid, spec.gid)
+        .map_err(map_exec_err)?;
+    let digest =
+        spur_core::native_exec::command_digest(&spec.script, &spec.argv, &spec.container_image);
+    cred.require_command_digest(&digest).map_err(map_exec_err)?;
+    let (cpus, memory_mb, devices) = spur_core::native_exec::proto_slice_devices(&req.allocated);
+    cred.require_slice(node, cpus, memory_mb, &devices)
+        .map_err(map_exec_err)?;
+    spur_core::native_metrics::inc_exec_ok();
+    Ok(())
+}
+
+fn map_exec_err(err: spur_core::native_cred::CredentialError) -> Status {
+    spur_core::native_metrics::inc_exec_fail();
+    use spur_core::native_cred::CredentialStatusCode;
+    match err.status_code() {
+        CredentialStatusCode::FailedPrecondition => Status::failed_precondition(err.to_string()),
+        CredentialStatusCode::PermissionDenied => Status::permission_denied(err.to_string()),
+        CredentialStatusCode::Unauthenticated => Status::unauthenticated(err.to_string()),
+    }
+}
+
 /// Virtual SlurmAgent that creates K8s Pods instead of fork/exec.
 pub struct VirtualAgent {
     client: Client,
+    cluster_id: String,
+    cred_keys: Option<Arc<spur_core::native_jwks::Ed25519VerifyKeySet>>,
+    hostname: String,
+    auth_audience: String,
+    auth_epoch: u64,
 }
 
 impl VirtualAgent {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            cluster_id: String::new(),
+            cred_keys: None,
+            hostname: hostname::get()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            auth_audience: String::new(),
+            auth_epoch: 0,
+        }
+    }
+
+    pub fn apply_auth_handshake(&mut self, bearer: &spur_core::auth::BearerAuth) {
+        let (audience, epoch) = bearer.advertised_handshake();
+        self.auth_audience = audience;
+        self.auth_epoch = epoch;
+        if let Some(native) = &bearer.native {
+            self.cluster_id = native.cluster_id.clone();
+            self.cred_keys = native.cred_keys.clone();
+        }
     }
 
     /// Look up the SpurJob labeled `spur.amd.com/job-id=<id>` and return its placement facts.
@@ -91,7 +166,11 @@ impl VirtualAgent {
                 let mut items = list.items.into_iter();
                 match (items.next(), items.next()) {
                     (None, _) => Err(Status::not_found(format!(
-                        "spur.amd.com/job-id={job_id} label not yet visible"
+                        "no SpurJob carries the label spur.amd.com/job-id={job_id}. In Pod mode \
+                         the operator makes Pods only for a SpurJob custom resource, so a job \
+                         submitted with the CLI (sbatch, spur submit) has nothing to launch. \
+                         Submit it with `kubectl apply` of a SpurJob instead. If this job DID \
+                         come from a SpurJob, the label is not visible yet and this is retried."
                     ))),
                     (Some(job), None) => Ok(job),
                     (Some(_), Some(_)) => Err(Status::failed_precondition(format!(
@@ -115,9 +194,17 @@ impl VirtualAgent {
         let job = match result {
             Ok(Ok(job)) => job,
             Ok(Err(status)) => return Err(status),
+            // The retry above swallows NotFound while it waits for a label that
+            // may still be propagating. When the budget runs out the answer is
+            // that no SpurJob exists, which is an explicit rejection and not a
+            // transport failure: deadline_exceeded here made the controller
+            // report "agent unreachable" for a running, reachable operator.
             Err(_elapsed) => {
-                return Err(Status::deadline_exceeded(format!(
-                    "namespace lookup for spur.amd.com/job-id={job_id} timed out after {}s",
+                return Err(Status::not_found(format!(
+                    "no SpurJob carries the label spur.amd.com/job-id={job_id} after {}s. In Pod \
+                     mode the operator makes Pods only for a SpurJob custom resource, so a job \
+                     submitted with the CLI (sbatch, spur submit) has nothing to launch. Submit \
+                     it with `kubectl apply` of a SpurJob instead.",
                     NS_LOOKUP_BUDGET.as_secs()
                 )))
             }
@@ -148,6 +235,18 @@ impl SlurmAgent for VirtualAgent {
     type InteractiveSessionStream =
         tokio_stream::wrappers::ReceiverStream<Result<InteractiveOutput, Status>>;
 
+    async fn ping(&self, _request: Request<()>) -> Result<Response<PingResponse>, Status> {
+        Ok(Response::new(PingResponse {
+            hostname: self.hostname.clone(),
+            server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            version: env!("CARGO_PKG_VERSION").into(),
+            federation_peers: Vec::new(),
+            cluster_name: self.cluster_id.clone(),
+            auth_audience: self.auth_audience.clone(),
+            auth_epoch: self.auth_epoch,
+        }))
+    }
+
     /// Steps here run as pods the kubelet owns, so there is no supervisor
     /// session for a lost caller to re-park on.
     async fn await_step(
@@ -164,6 +263,9 @@ impl SlurmAgent for VirtualAgent {
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
         let req = request.into_inner();
+        if let Some(keys) = &self.cred_keys {
+            verify_launch_credential(keys, &self.cluster_id, &self.hostname, &req)?;
+        }
         let job_id = req.job_id;
         let job = self.resolve_job(job_id).await?;
         let ns = job.namespace;
@@ -178,6 +280,13 @@ impl SlurmAgent for VirtualAgent {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+
+        // Two nodes with one sanitized name would share a Pod name and a peer DNS
+        // name; the second Pod create returns 409 and the job hangs on a missing
+        // peer. Refuse the whole launch instead of creating a partial job.
+        if let Some(collision) = sanitized_collision(&split_nodelist(&spec.nodelist)) {
+            return Err(Status::invalid_argument(collision.to_string()));
+        }
 
         // Pod name includes target_node to avoid conflicts for multi-node jobs
         let pod_name = if target_node.is_empty() {
@@ -260,8 +369,14 @@ impl SlurmAgent for VirtualAgent {
 
         senv.set("SPUR_TASK_OFFSET", req.task_offset);
         senv.set("SPUR_NODE_RANK", node_rank);
-        if !peer_nodes.is_empty() {
-            senv.set("SPUR_PEER_NODES", peer_nodes.join(","));
+        // The controller sends agent addresses in `peer_nodes`. In Pod mode every
+        // node answers on the one operator address, so that list is the same
+        // address repeated and no workload can reach a peer with it. The Pods of a
+        // multi-node job are reachable under the headless Service instead, because
+        // each Pod takes its target node as its hostname.
+        let peer_dns = headless_peer_dns(&spec.nodelist, job_id, &ns);
+        if !peer_dns.is_empty() {
+            senv.set("SPUR_PEER_NODES", peer_dns.join(","));
         }
         if !target_node.is_empty() {
             senv.set("SPUR_TARGET_NODE", &target_node);
@@ -450,7 +565,7 @@ impl SlurmAgent for VirtualAgent {
         let (hostname, subdomain) = if num_peers > 1 && !target_node.is_empty() {
             (
                 Some(sanitize_k8s_name(&target_node)),
-                Some(format!("spur-job-{}", job_id)),
+                Some(job_service_name(job_id)),
             )
         } else {
             (None, None)
@@ -585,7 +700,7 @@ impl SlurmAgent for VirtualAgent {
 
         // Also clean up the headless service if it exists
         let services: Api<Service> = Api::namespaced(self.client.clone(), &ns);
-        let svc_name = format!("spur-job-{}", job_id);
+        let svc_name = job_service_name(job_id);
         match services.delete(&svc_name, &DeleteParams::default()).await {
             Ok(_) => debug!(job_id, "deleted headless Service"),
             Err(kube::Error::Api(e)) if e.code == 404 => {}
@@ -876,7 +991,7 @@ impl VirtualAgent {
         namespace: &str,
     ) -> Result<(), kube::Error> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let svc_name = format!("spur-job-{}", job_id);
+        let svc_name = job_service_name(job_id);
 
         let selector = BTreeMap::from([("spur.amd.com/job-id".to_string(), job_id.to_string())]);
 
@@ -982,6 +1097,85 @@ fn sanitize_k8s_name(s: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+/// The headless Service of a job. The Pod `subdomain` and the peer DNS names
+/// only resolve while they use this exact name.
+fn job_service_name(job_id: u32) -> String {
+    format!("spur-job-{job_id}")
+}
+
+/// The node names of a comma-separated nodelist, trimmed, empty segments dropped.
+/// `launch_job` and `headless_peer_dns` must read the list the same way.
+fn split_nodelist(nodelist: &str) -> Vec<&str> {
+    nodelist
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Two node names that `sanitize_k8s_name` maps to one Kubernetes name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeNameCollision {
+    first: String,
+    second: String,
+    sanitized: String,
+}
+
+impl std::fmt::Display for NodeNameCollision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "node names {:?} and {:?} both sanitize to {:?}",
+            self.first, self.second, self.sanitized
+        )
+    }
+}
+
+/// The first pair of nodes whose sanitized names are equal. Such a pair would
+/// share a Pod name and a peer DNS name, so the launch must be refused.
+fn sanitized_collision(nodes: &[&str]) -> Option<NodeNameCollision> {
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for node in nodes {
+        let sanitized = sanitize_k8s_name(node);
+        let Some(first) = seen.insert(sanitized.clone(), node) else {
+            continue;
+        };
+        return Some(NodeNameCollision {
+            first: first.to_string(),
+            second: node.to_string(),
+            sanitized,
+        });
+    }
+    None
+}
+
+/// The DNS names under which the Pods of a multi-node job reach each other.
+///
+/// `launch_job` gives each Pod `hostname = sanitize_k8s_name(target_node)` and
+/// `subdomain = job_service_name(id)`, and `ensure_headless_service` publishes
+/// that Service, so every peer answers at
+/// `<hostname>.<service>.<namespace>.svc.cluster.local`. The order follows
+/// the nodelist, so index N is the peer whose SPUR_NODE_RANK is N.
+///
+/// A single node job gets no headless Service and therefore no name to return.
+fn headless_peer_dns(nodelist: &str, job_id: u32, namespace: &str) -> Vec<String> {
+    let nodes = split_nodelist(nodelist);
+    if nodes.len() < 2 {
+        return Vec::new();
+    }
+    nodes
+        .iter()
+        .map(|n| {
+            format!(
+                "{}.{}.{}.svc.cluster.local",
+                sanitize_k8s_name(n),
+                job_service_name(job_id),
+                namespace
+            )
+        })
+        .collect()
 }
 
 /// Determine the K8s device plugin resource key based on GPU type.
@@ -1310,5 +1504,234 @@ mod tests {
         assert_eq!(gpu_request_to_gres(8, Some("mi300x")), "gpu:mi300x:8");
         assert_eq!(gpu_request_to_gres(4, Some("mi250x")), "gpu:mi250x:4");
         assert_eq!(gpu_request_to_gres(1, Some("gfx942")), "gpu:gfx942:1");
+    }
+
+    #[test]
+    fn map_exec_err_matches_native_agent_status_codes() {
+        let err = map_exec_err(spur_core::native_cred::CredentialError::WrongNode);
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let err = map_exec_err(spur_core::native_cred::CredentialError::IdentityMismatch);
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let err = map_exec_err(spur_core::native_cred::CredentialError::BadSignature);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+}
+
+#[cfg(test)]
+mod resolve_job_tests {
+    use super::*;
+    use crate::test_support::{list_response, FakeApiServer};
+    use http::StatusCode;
+
+    const JOB_ID: u32 = 7;
+    const LIST_PATH: &str = "/apis/spur.amd.com/v1alpha1/spurjobs";
+
+    fn spur_job(name: &str, namespace: Option<&str>, assigned_nodes: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "spur.amd.com/v1alpha1",
+            "kind": "SpurJob",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": { "spur.amd.com/job-id": JOB_ID.to_string() },
+            },
+            "spec": { "name": name, "image": "busybox" },
+            "status": { "assignedNodes": assigned_nodes },
+        })
+    }
+
+    fn server_listing(jobs: &[serde_json::Value]) -> FakeApiServer {
+        FakeApiServer::answering(StatusCode::OK, &list_response(jobs))
+    }
+
+    fn assert_lists_by_job_label(server: &FakeApiServer) {
+        let requests = server.requests();
+        assert!(!requests.is_empty(), "the agent must ask the API server");
+        for req in &requests {
+            assert_eq!(req.method, http::Method::GET);
+            assert_eq!(req.path, LIST_PATH);
+            assert!(
+                req.decoded_query()
+                    .contains(&format!("labelSelector=spur.amd.com/job-id={JOB_ID}")),
+                "the list must select on the job label, got query {:?}",
+                req.query
+            );
+        }
+    }
+
+    /// Paused time lets the retry loop burn the whole lookup budget at once, so
+    /// the test observes the real budget without waiting for it.
+    #[tokio::test(start_paused = true)]
+    async fn no_spurjob_within_the_budget_is_a_not_found_rejection() {
+        let server = server_listing(&[]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .resolve_job(JOB_ID)
+            .await
+            .err()
+            .expect("no SpurJob must fail");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let expected_message = format!(
+            "no SpurJob carries the label spur.amd.com/job-id={JOB_ID} after {}s",
+            NS_LOOKUP_BUDGET.as_secs()
+        );
+        assert!(
+            err.message().starts_with(&expected_message),
+            "the message must say what was missing and for how long, got {:?}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("kubectl apply"),
+            "the message must tell the operator how to submit a job the operator can launch"
+        );
+        assert!(
+            server.requests().len() > 1,
+            "an empty list is retried while the label may still be propagating"
+        );
+        assert_lists_by_job_label(&server);
+    }
+
+    #[tokio::test]
+    async fn the_one_matching_spurjob_gives_its_namespace_and_allocation() {
+        let server = server_listing(&[spur_job("train", Some("team-a"), &["n1", "n2"])]);
+        let agent = VirtualAgent::new(server.client());
+
+        let resolved = agent.resolve_job(JOB_ID).await.expect("one match resolves");
+
+        assert_eq!(resolved.namespace, "team-a");
+        assert_eq!(resolved.assigned_nodes, vec!["n1", "n2"]);
+        assert_eq!(server.requests().len(), 1, "a match needs no retry");
+        assert_lists_by_job_label(&server);
+    }
+
+    #[tokio::test]
+    async fn two_matching_spurjobs_are_refused_without_a_retry() {
+        let server = server_listing(&[
+            spur_job("train", Some("team-a"), &[]),
+            spur_job("train-copy", Some("team-b"), &[]),
+        ]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .resolve_job(JOB_ID)
+            .await
+            .err()
+            .expect("ambiguity must fail");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("refusing to guess"),
+            "got {:?}",
+            err.message()
+        );
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "a real conflict is not a propagation race, so it must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_match_without_a_namespace_is_not_found() {
+        let server = server_listing(&[spur_job("train", None, &[])]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .resolve_job(JOB_ID)
+            .await
+            .err()
+            .expect("no namespace must fail");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert!(
+            err.message().contains("has no namespace"),
+            "got {:?}",
+            err.message()
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_dns_tests {
+    use super::{headless_peer_dns, sanitized_collision, split_nodelist, NodeNameCollision};
+
+    #[test]
+    fn dotted_and_dashed_names_collide_after_sanitizing() {
+        let collision = sanitized_collision(&["node.a", "node-b", "node-a"]);
+        assert_eq!(
+            collision,
+            Some(NodeNameCollision {
+                first: "node.a".to_string(),
+                second: "node-a".to_string(),
+                sanitized: "node-a".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn distinct_names_do_not_collide() {
+        assert_eq!(sanitized_collision(&["node-a", "node-b", "node-c"]), None);
+    }
+
+    #[test]
+    fn a_single_name_cannot_collide() {
+        assert_eq!(sanitized_collision(&["node.a"]), None);
+        assert_eq!(sanitized_collision(&[]), None);
+    }
+
+    #[test]
+    fn collision_message_names_both_nodes_and_the_shared_name() {
+        let collision = sanitized_collision(&["node.a", "node-a"]).expect("collision");
+        assert_eq!(
+            collision.to_string(),
+            r#"node names "node.a" and "node-a" both sanitize to "node-a""#
+        );
+    }
+
+    #[test]
+    fn collision_check_reads_the_nodelist_like_peer_dns() {
+        let nodes = split_nodelist(" node.a , node-a, ");
+        assert_eq!(nodes, vec!["node.a", "node-a"]);
+        assert!(sanitized_collision(&nodes).is_some());
+        assert!(sanitized_collision(&split_nodelist(" node-a , ")).is_none());
+    }
+
+    #[test]
+    fn multi_node_job_gets_one_resolvable_name_per_node_in_nodelist_order() {
+        let out = headless_peer_dns("node-a,node-b,node-c", 7, "spur");
+        assert_eq!(
+            out,
+            vec![
+                "node-a.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-b.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-c.spur-job-7.spur.svc.cluster.local".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_node_job_gets_nothing_because_it_has_no_headless_service() {
+        assert!(headless_peer_dns("node-a", 7, "spur").is_empty());
+        assert!(headless_peer_dns("", 7, "spur").is_empty());
+    }
+
+    #[test]
+    fn node_names_are_sanitized_the_same_way_as_the_pod_hostname() {
+        let out = headless_peer_dns("Node_A.example,node-b", 3, "ns");
+        assert_eq!(out[0], "node-a-example.spur-job-3.ns.svc.cluster.local");
+    }
+
+    #[test]
+    fn segments_are_trimmed_and_empty_ones_dropped() {
+        let out = headless_peer_dns(" node-a , node-b, ", 7, "spur");
+        assert_eq!(
+            out,
+            vec![
+                "node-a.spur-job-7.spur.svc.cluster.local".to_string(),
+                "node-b.spur-job-7.spur.svc.cluster.local".to_string(),
+            ]
+        );
     }
 }

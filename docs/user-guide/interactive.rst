@@ -28,6 +28,11 @@ Inside an allocation, a bare ``srun`` inherits the allocation's size
 (``--ntasks``, ``--cpus-per-task``, nodes, partition, account, QOS), so it runs
 at the allocation's scale unless you override on the command line.
 
+A step is named after the command line that created it. That name is stored
+capped at 256 bytes, so a longer command line is truncated on a character
+boundary and ends in ``...`` where ``scontrol show step`` prints it. The step
+still runs the full command — only the displayed name is shortened.
+
 Common options:
 
 .. list-table::
@@ -58,6 +63,18 @@ Common options:
      -
      - Per-task GPU binding: ``closest``, ``map_gpu:...``, ``mask_gpu:...``, or
        ``none``.
+   * - ``--export``
+     -
+     - Which submission environment variables reach the step, using Slurm's
+       grammar (``ALL``, ``NONE``, ``VAR1,VAR2``, ``VAR=value``,
+       ``ALL,VAR=value``; ``ALL``/``NONE`` are case-insensitive). Under
+       ``NONE``/list forms, ``SLURM_*``/``SPUR_*`` are kept, except credentials
+       (``SPUR_AUTH_TOKEN``, ``SPUR_REGISTRY_PASSWORD``) unless named. Default
+       ``ALL``; env default ``SPUR_EXPORT_ENV``, then ``SRUN_EXPORT_ENV``, then
+       ``SLURM_EXPORT_ENV`` (set by ``sbatch --export``). Under ``NONE`` a step
+       has no ``PATH``, so give the command's absolute path. Ignored for a
+       ``--pty`` step inside an existing allocation, which runs in the job's
+       environment.
    * - ``--partition``
      - ``-p``
      - Partition to run in.
@@ -116,11 +133,13 @@ environment exported (``SPUR_JOB_ID``, ``SPUR_JOB_USER``, ``SPUR_NODELIST``,
 partition/account/QOS variables, and their ``SLURM_*`` twins). When you exit the
 shell, the allocation is released. Ctrl-C cancels it.
 
-When authentication is enabled, ``salloc`` also passes ``$SPUR_AUTH_TOKEN`` (or
-``~/.spur/token``) into the allocation shell so step commands can authenticate
-to the controller. ``SPUR_JOB_USER`` records the job owner bound at submit time
-(for example the JWT subject); ``srun`` inside the shell uses it when step RPCs
-run without a token.
+When JWT authentication is enabled, ``salloc`` also passes ``$SPUR_AUTH_TOKEN``
+(or ``~/.spur/token``) into the allocation shell so step commands can
+authenticate to the controller. With ``[auth] plugin = "spur"``, the shell does
+not inherit a bearer; each command mints a fresh credential from the local
+socket. ``SPUR_JOB_USER`` records the job owner bound at submit time (for
+example the JWT subject); ``srun`` inside the shell uses it when step RPCs run
+without a token.
 
 Inside that shell, ``srun`` runs as a job step. With no step-level ``-N`` or
 ``-w``, it uses the allocation's nodes and inherits the allocation's task count

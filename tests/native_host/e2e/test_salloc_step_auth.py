@@ -120,7 +120,12 @@ unset SPUR_AUTH_TOKEN
             assert not _denied(out), out
             assert out.strip(), f"expected hostname output, got:\n{out}"
         finally:
-            cluster.scancel(str(job_id))
+            cluster.cli_as_user(
+                ssh_user,
+                ["scancel", str(job_id)],
+                extra_env={"SPUR_AUTH_TOKEN": token},
+                check=True,
+            )
 
     def test_srun_step_wrong_job_user_denied(self, cluster):
         ssh_user = _ssh_user()
@@ -145,10 +150,19 @@ unset SPUR_AUTH_TOKEN
             assert code != 0, f"step with a spoofed job user must fail:\n{out}"
             assert _denied(out), f"expected ownership denial, got:\n{out}"
         finally:
-            cluster.scancel(str(job_id))
+            cluster.cli_as_user(
+                ssh_user,
+                ["scancel", str(job_id)],
+                extra_env={"SPUR_AUTH_TOKEN": token},
+                check=True,
+            )
 
     def test_srun_step_jwt_non_owner_denied(self, cluster):
-        """A JWT for a different subject cannot run a step in another user's job."""
+        """A JWT for a different subject cannot run a step in another user's job.
+
+        The controller checks the step caller against the job owner, so the
+        step never starts.
+        """
         ssh_user = _ssh_user()
         if ssh_user == JWT_OWNER:
             pytest.skip("SSH user is root; need a distinct non-owner account")
@@ -174,7 +188,12 @@ unset SPUR_AUTH_TOKEN
             assert code != 0, f"non-owner JWT must not run a step:\n{out}"
             assert _denied(out), f"expected ownership denial, got:\n{out}"
         finally:
-            cluster.scancel(str(job_id))
+            cluster.cli_as_user(
+                ssh_user,
+                ["scancel", str(job_id)],
+                extra_env={"SPUR_AUTH_TOKEN": owner_token},
+                check=True,
+            )
 
 
 class TestSallocStepAuthUidFallback:

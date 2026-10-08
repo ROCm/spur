@@ -16,11 +16,10 @@ use kube::runtime::finalizer::{self, finalizer, Event as FinalizerEvent};
 use kube::runtime::watcher::Config as WatcherConfig;
 use kube::Client;
 use tokio::sync::Mutex;
-use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
+use crate::controller::ControllerClient;
 use crate::crd::{to_core_job_spec, SpurJob, SpurJobStatus};
-use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     CancelJobRequest, GetJobRequest, ReportJobStatusRequest, SubmitJobRequest,
 };
@@ -51,7 +50,7 @@ pub enum ReconcileError {
 /// Shared state for the reconciler.
 pub struct JobControllerCtx {
     pub client: Client,
-    pub ctrl_client: Mutex<SlurmControllerClient<Channel>>,
+    pub ctrl_client: Mutex<ControllerClient>,
     /// Track multi-pod completion: job_id → (expected_count, completed_count, any_failed)
     pub(crate) pod_tracker: Mutex<HashMap<u32, PodTracker>>,
     /// Consecutive reconcile failures per SpurJob (keyed by [`failure_key`]),
@@ -211,8 +210,11 @@ async fn submit_to_controller(
 
     let mut ctrl = ctx.ctrl_client.lock().await;
     let job_id = match ctrl
-        .submit_job(SubmitJobRequest {
-            spec: Some(proto_spec),
+        .call(|mut c| async move {
+            c.submit_job(SubmitJobRequest {
+                spec: Some(proto_spec),
+            })
+            .await
         })
         .await
     {
@@ -296,7 +298,10 @@ async fn handle_job(
 
     let mut ctrl = ctx.ctrl_client.lock().await;
 
-    match ctrl.get_job(GetJobRequest { job_id }).await {
+    match ctrl
+        .call(|mut c| async move { c.get_job(GetJobRequest { job_id }).await })
+        .await
+    {
         Ok(resp) => {
             let info = resp.into_inner();
             let spur_state = proto_job_state_to_string(info.state);
@@ -343,17 +348,9 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
 
     info!(spurjob = %name, "handling SpurJob deletion");
 
-    // Cancel the Spur job if it has an ID and isn't terminal
     if let Some(job_id) = status.spur_job_id {
         if !is_terminal(&status.state) {
-            let mut ctrl = ctx.ctrl_client.lock().await;
-            let _ = ctrl
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 0,
-                    user: String::new(),
-                })
-                .await;
+            cancel_spur_job(ctx, &name, job_id).await?;
         }
 
         // Delete all Pods by label
@@ -361,8 +358,13 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
         let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
         if let Ok(pod_list) = pods.list(&lp).await {
             for pod in pod_list {
-                let pod_name = pod.metadata.name.unwrap_or_default();
-                let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
+                let pod_name = pod.metadata.name.clone().unwrap_or_default();
+                if let Err(e) = pods.delete(&pod_name, &DeleteParams::default()).await {
+                    warn!(spurjob = %name, pod = %pod_name, error = %e, "failed to delete Pod");
+                }
+                // A deleted Pod never reaches Succeeded/Failed, so the reconciler
+                // that normally reports it never runs; speak for it here instead.
+                report_pod_released(ctx, job_id, &pod).await;
             }
         }
 
@@ -373,6 +375,82 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
     }
 
     Ok(Action::await_change())
+}
+
+/// Tell spurctld the Pod has released its slice of the allocation, which the
+/// controller holds until every node reports. Best-effort: a duplicate is a no-op.
+async fn report_pod_released(ctx: &JobControllerCtx, job_id: u32, pod: &Pod) {
+    let Some(reporting_node) = resolve_reporting_node(pod) else {
+        warn!(job_id, "cannot resolve reporting_node for a deleted Pod");
+        return;
+    };
+    let req = ReportJobStatusRequest {
+        step_id: None,
+        job_id,
+        state: spur_core::job::JobState::Failed.to_proto_i32(),
+        exit_code: 1,
+        signal: 0,
+        message: "Pod deleted".into(),
+        drain_node: false,
+        drain_reason: String::new(),
+        reporting_node,
+        run_attempt: 0,
+    };
+    let result = ctx
+        .ctrl_client
+        .lock()
+        .await
+        .call(|mut c| async move { c.report_job_status(req).await })
+        .await;
+    if let Err(e) = result {
+        debug!(job_id, error = %e, "deleted-Pod release report not accepted");
+    }
+}
+
+/// A job with no Pod yet lives only in the controller queue, so a lost cancel
+/// would leave it there for ever once the SpurJob is gone. A failure therefore
+/// keeps the finalizer and retries instead of being swallowed.
+async fn cancel_spur_job(
+    ctx: &JobControllerCtx,
+    name: &str,
+    job_id: u32,
+) -> Result<(), ReconcileError> {
+    let result = ctx
+        .ctrl_client
+        .lock()
+        .await
+        .call(|mut c| async move {
+            c.cancel_job(CancelJobRequest {
+                job_id,
+                signal: 0,
+                user: String::new(),
+            })
+            .await
+        })
+        .await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) if cancel_is_settled(e.code()) => {
+            debug!(spurjob = %name, job_id, reason = e.message(), "Spur job needs no cancel");
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                spurjob = %name, job_id, error = %e,
+                "failed to cancel the Spur job; retrying before the SpurJob is removed"
+            );
+            Err(ReconcileError::Grpc(e))
+        }
+    }
+}
+
+/// `NotFound` means the controller already forgot the job and
+/// `FailedPrecondition` that it is already terminal: nothing is left to cancel.
+fn cancel_is_settled(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::NotFound | tonic::Code::FailedPrecondition
+    )
 }
 
 fn error_policy(job: Arc<SpurJob>, error: &ReconcileError, ctx: Arc<JobControllerCtx>) -> Action {
@@ -392,19 +470,9 @@ pub async fn run(
     controller_addr: String,
     operator_namespace: String,
 ) -> anyhow::Result<()> {
-    let url = if controller_addr.starts_with("http") {
-        controller_addr
-    } else {
-        format!("http://{}", controller_addr)
-    };
-    let ctrl_client = SlurmControllerClient::connect(url)
-        .await?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE);
-
     let ctx = Arc::new(JobControllerCtx {
         client: client.clone(),
-        ctrl_client: Mutex::new(ctrl_client),
+        ctrl_client: Mutex::new(ControllerClient::new(&controller_addr)),
         pod_tracker: Mutex::new(HashMap::new()),
         failures: StdMutex::new(HashMap::new()),
     });
@@ -631,7 +699,10 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     // controller-side staleness check for this report.
                     run_attempt: 0,
                 };
-                if let Err(e) = ctrl.report_job_status(req).await {
+                if let Err(e) = ctrl
+                    .call(|mut c| async move { c.report_job_status(req).await })
+                    .await
+                {
                     error!(job_id, error = %e, "failed to report job status");
                 } else if report_state.is_terminal() {
                     ctx.pod_tracker.lock().await.remove(&job_id);
@@ -1631,5 +1702,202 @@ mod tests {
             ..Default::default()
         };
         assert!(!should_submit(&status));
+    }
+
+    // --- cancel on deletion ---
+
+    #[test]
+    fn cancel_is_settled_only_when_nothing_is_left_to_cancel() {
+        assert!(cancel_is_settled(tonic::Code::NotFound));
+        assert!(cancel_is_settled(tonic::Code::FailedPrecondition));
+        for code in [
+            tonic::Code::Ok,
+            tonic::Code::Internal,
+            tonic::Code::Unavailable,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+        ] {
+            assert!(!cancel_is_settled(code), "{code:?}");
+        }
+    }
+
+    use spur_proto::proto as pb;
+    use spur_proto::proto::slurm_controller_server::SlurmController;
+    use tonic::{Request, Response, Status};
+
+    /// Answers `cancel_job` with `reply` and records the job IDs it saw.
+    struct CancelStub {
+        reply: Option<tonic::Code>,
+        cancelled: Arc<StdMutex<Vec<u32>>>,
+    }
+
+    /// Generates the impl so `async_trait` runs after expansion. Only
+    /// `cancel_job` has behavior; the rest just have to exist.
+    macro_rules! stub_controller {
+        ($($name:ident($req:ty) -> $resp:ty;)*) => {
+            #[tonic::async_trait]
+            impl SlurmController for CancelStub {
+                async fn cancel_job(
+                    &self,
+                    request: Request<pb::CancelJobRequest>,
+                ) -> Result<Response<()>, Status> {
+                    self.cancelled.lock().unwrap().push(request.into_inner().job_id);
+                    match self.reply {
+                        None => Ok(Response::new(())),
+                        Some(code) => Err(Status::new(code, "stub")),
+                    }
+                }
+
+                $(
+                    async fn $name(&self, _: Request<$req>) -> Result<Response<$resp>, Status> {
+                        Err(Status::unimplemented(stringify!($name)))
+                    }
+                )*
+            }
+        };
+    }
+
+    stub_controller! {
+        submit_job(pb::SubmitJobRequest) -> pb::SubmitJobResponse;
+        get_jobs(pb::GetJobsRequest) -> pb::GetJobsResponse;
+        get_job(pb::GetJobRequest) -> pb::JobInfo;
+        complete_job(pb::CompleteJobRequest) -> ();
+        job_keepalive(pb::JobKeepaliveRequest) -> pb::JobKeepaliveResponse;
+        suspend_job(pb::SuspendJobRequest) -> ();
+        resume_job(pb::ResumeJobRequest) -> ();
+        update_job(pb::UpdateJobRequest) -> ();
+        requeue_job(pb::RequeueJobRequest) -> pb::RequeueJobResponse;
+        get_nodes(pb::GetNodesRequest) -> pb::GetNodesResponse;
+        get_node(pb::GetNodeRequest) -> pb::NodeInfo;
+        update_node(pb::UpdateNodeRequest) -> ();
+        drain_node(pb::DrainNodeRequest) -> pb::DrainNodeResponse;
+        deregister_node(pb::DeregisterNodeRequest) -> pb::DeregisterNodeResponse;
+        deregister_agent(pb::DeregisterAgentRequest) -> ();
+        get_partitions(pb::GetPartitionsRequest) -> pb::GetPartitionsResponse;
+        get_job_steps(pb::GetJobStepsRequest) -> pb::GetJobStepsResponse;
+        create_job_step(pb::CreateJobStepRequest) -> pb::CreateJobStepResponse;
+        complete_job_step(pb::CompleteJobStepRequest) -> ();
+        create_partition(pb::CreatePartitionRequest) -> ();
+        update_partition(pb::UpdatePartitionRequest) -> ();
+        delete_partition(pb::DeletePartitionRequest) -> ();
+        reconfigure(()) -> ();
+        ping(()) -> pb::PingResponse;
+        get_job_metrics(()) -> pb::JobMetrics;
+        get_node_metrics(()) -> pb::NodeMetrics;
+        get_rpc_stats(()) -> pb::RpcStats;
+        reset_diag_stats(()) -> ();
+        get_sched_stats(()) -> pb::SchedStats;
+        get_assoc_mgr_info(pb::GetAssocMgrInfoRequest) -> pb::GetAssocMgrInfoResponse;
+        register_agent(pb::RegisterAgentRequest) -> pb::RegisterAgentResponse;
+        heartbeat(pb::HeartbeatRequest) -> pb::HeartbeatResponse;
+        create_token(pb::CreateTokenRequest) -> pb::CreateTokenResponse;
+        list_tokens(pb::ListTokensRequest) -> pb::ListTokensResponse;
+        revoke_token(pb::RevokeTokenRequest) -> pb::RevokeTokenResponse;
+        report_job_status(pb::ReportJobStatusRequest) -> ();
+        report_stepd_recovery(pb::StepdRecoveryRequest) -> pb::StepdRecoveryResponse;
+        create_reservation(pb::CreateReservationRequest) -> ();
+        update_reservation(pb::UpdateReservationRequest) -> ();
+        delete_reservation(pb::DeleteReservationRequest) -> ();
+        list_reservations(pb::ListReservationsRequest) -> pb::ListReservationsResponse;
+        exec_in_job(pb::ExecInJobRequest) -> pb::ExecInJobResponse;
+        run_step(pb::RunStepRequest) -> pb::RunStepResponse;
+        cluster_up(pb::ClusterUpRequest) -> pb::ClusterUpResponse;
+        cluster_down(pb::ClusterDownRequest) -> pb::ClusterDownResponse;
+        cluster_status(pb::ClusterStatusRequest) -> pb::ClusterStatusResponse;
+        cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
+        cluster_add_nodes(pb::ClusterAddNodesRequest) -> pb::ClusterAddNodesResponse;
+        cluster_remove_nodes(pb::ClusterRemoveNodesRequest) -> pb::ClusterRemoveNodesResponse;
+    }
+
+    /// A kube client whose every request fails. The deletion path tolerates
+    /// Pod and Service cleanup errors, so no API server is needed.
+    fn offline_kube_client() -> Client {
+        let svc = tower::service_fn(|_: http::Request<kube::client::Body>| async {
+            Err::<http::Response<kube::client::Body>, _>(std::io::Error::other("offline"))
+        });
+        Client::new(svc, "default")
+    }
+
+    async fn deletion_ctx(
+        reply: Option<tonic::Code>,
+    ) -> (JobControllerCtx, Arc<StdMutex<Vec<u32>>>) {
+        let cancelled = Arc::new(StdMutex::new(Vec::new()));
+        let stub = CancelStub {
+            reply,
+            cancelled: cancelled.clone(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(spur_proto::controller_server(stub))
+                .serve_with_incoming(incoming),
+        );
+        let ctrl_client = ControllerClient::new(&addr.to_string());
+        let ctx = JobControllerCtx {
+            client: offline_kube_client(),
+            ctrl_client: Mutex::new(ctrl_client),
+            pod_tracker: Mutex::new(HashMap::new()),
+            failures: StdMutex::new(HashMap::new()),
+        };
+        (ctx, cancelled)
+    }
+
+    fn deleting_spurjob(state: &str) -> SpurJob {
+        let mut job = make_spurjob(None, Some("ns"));
+        job.status = Some(SpurJobStatus {
+            state: state.into(),
+            spur_job_id: Some(42),
+            ..Default::default()
+        });
+        job
+    }
+
+    #[tokio::test]
+    async fn deletion_cancels_a_live_job() {
+        let (ctx, cancelled) = deletion_ctx(None).await;
+        handle_deletion(&deleting_spurjob("Pending"), &ctx)
+            .await
+            .expect("deletion must succeed when the cancel succeeds");
+        assert_eq!(*cancelled.lock().unwrap(), vec![42]);
+    }
+
+    #[tokio::test]
+    async fn deletion_succeeds_when_nothing_is_left_to_cancel() {
+        for code in [tonic::Code::NotFound, tonic::Code::FailedPrecondition] {
+            let (ctx, cancelled) = deletion_ctx(Some(code)).await;
+            handle_deletion(&deleting_spurjob("Pending"), &ctx)
+                .await
+                .unwrap_or_else(|e| panic!("{code:?} must be settled, got {e}"));
+            assert_eq!(*cancelled.lock().unwrap(), vec![42]);
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_keeps_the_finalizer_when_the_cancel_fails() {
+        for code in [
+            tonic::Code::Internal,
+            tonic::Code::Unavailable,
+            tonic::Code::PermissionDenied,
+        ] {
+            let (ctx, _) = deletion_ctx(Some(code)).await;
+            let err = handle_deletion(&deleting_spurjob("Pending"), &ctx)
+                .await
+                .expect_err("a failed cancel must keep the finalizer");
+            assert!(
+                matches!(&err, ReconcileError::Grpc(status) if status.code() == code),
+                "{code:?}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_skips_the_cancel_of_a_terminal_job() {
+        let (ctx, cancelled) = deletion_ctx(Some(tonic::Code::Internal)).await;
+        handle_deletion(&deleting_spurjob("Completed"), &ctx)
+            .await
+            .expect("a terminal job needs no cancel");
+        assert!(cancelled.lock().unwrap().is_empty());
     }
 }

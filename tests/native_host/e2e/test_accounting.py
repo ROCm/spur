@@ -12,7 +12,80 @@ import time
 
 import pytest
 
-from cluster import deep_merge, parse_job_id, wait_job, wait_job_state, wait_sacct_row
+from cluster import (
+    deep_merge,
+    job_state,
+    parse_job_id,
+    wait_job,
+    wait_job_state,
+    wait_sacct_row,
+)
+
+
+def _wait_node_gone(cluster, node_name, timeout=60):
+    """Poll sinfo until a node disappears."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if node_name not in cluster.sinfo_nodes():
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    raise TimeoutError(f"Node {node_name} still visible after {timeout}s")
+
+
+class TestSacctNodeFailState:
+    """A job killed by a forced node eviction must be reported and filterable
+    as NODE_FAIL, not silently displayed/filtered as COMPLETED."""
+
+    def test_node_fail_state_and_filter(self, accounting_cluster):
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("node-fail accounting test requires at least 2 nodes")
+        node0 = c.node_names[0]
+
+        script = c.write_file("acct-nodefail.sh", "#!/bin/bash\nsleep 600\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "acct-nodefail", "-N", "1", f"--nodelist={node0}", script])
+        )
+        assert job_id is not None
+        wait_job_state(c, job_id, "R")
+        # The RUNNING accounting row is written asynchronously after the
+        # squeue state transition, so wait for it before filtering on it.
+        wait_sacct_row(c, job_id, "JobID,State")
+
+        # While still running, --state=RUNNING must match it and --state=PENDING
+        # must not (a dropped filter code silently matches every job instead).
+        running_out = c.sacct(["-j", str(job_id), "-n", "-o", "JobID,State", "--state=RUNNING"])
+        assert str(job_id) in running_out, (
+            f"sacct --state=RUNNING dropped job {job_id}: {running_out!r}"
+        )
+        pending_out = c.sacct(["-j", str(job_id), "-n", "-o", "JobID,State", "--state=PENDING"])
+        assert str(job_id) not in pending_out, (
+            f"sacct --state=PENDING must not match a running job: {pending_out!r}"
+        )
+
+        c.cli(["spur", "node", "remove", node0, "--force", "--reason", "node-fail accounting test"])
+
+        final_state = wait_job(c, job_id, timeout=60)
+        assert final_state == "NF", f"expected NODE_FAIL, got {final_state}"
+        _wait_node_gone(c, node0)
+
+        row = wait_sacct_row(c, job_id, "JobID,State")
+        assert row.split()[1] == "NODE_FAIL", f"sacct displayed {row!r}, not NODE_FAIL"
+
+        nf_out = c.sacct(["-j", str(job_id), "-n", "-o", "JobID,State", "--state=NODE_FAIL"])
+        assert str(job_id) in nf_out, (
+            f"sacct --state=NODE_FAIL dropped job {job_id}: {nf_out!r}"
+        )
+
+        completed_out = c.sacct(
+            ["-j", str(job_id), "-n", "-o", "JobID,State", "--state=COMPLETED"]
+        )
+        assert str(job_id) not in completed_out, (
+            f"sacct --state=COMPLETED must not match a NODE_FAIL job: {completed_out!r}"
+        )
 
 
 class TestSacctExitReporting:
@@ -395,6 +468,68 @@ class TestQosLimitReasons:
         assert _reason(c, blocked[0]) == "QOSGrpCpuLimit", (
             f"blocked job {blocked[0]} reason: {_reason(c, blocked[0])!r}"
         )
+
+    def test_a_job_the_partition_can_never_run_reserves_no_grp_node_quota(
+        self, accounting_cluster
+    ):
+        """A job blocked on PartitionTimeLimit must not hold grp node headroom.
+
+        Reported from a production pool sitting at 29 nodes running against a cap
+        of 32 while fresh jobs were refused with QOSGrpNodeLimit: a job whose
+        --time exceeds the partition MaxTime never starts, but was reserving its
+        nodes every scheduling pass.
+        """
+        c = accounting_cluster
+        if len(c.node_names) < 3:
+            pytest.skip("requires 3 nodes: 1 occupied, 1 phantom, 1 that must stay usable")
+
+        c.sacctmgr(["add", "qos", "name=phantomcap", "grptres=node=2"])
+        time.sleep(15)
+
+        # The holder outlives every wait below, so its node is never what frees a slot.
+        hold = c.write_file("phantom-hold.sh", "#!/bin/bash\nsleep 900\n")
+        submitted = []
+
+        def submit(name, minutes):
+            job_id = parse_job_id(
+                c.sbatch(["-J", name, "-N", "1", "--exclusive", "-t", str(minutes),
+                          "-q", "phantomcap", hold])
+            )
+            assert job_id is not None
+            submitted.append(job_id)
+            return job_id
+
+        try:
+            occupied = submit("ph-hold", 20)
+            wait_job_state(c, occupied, "R", timeout=60)
+
+            # Over the partition MaxTime of 24h, so it can never be placed.
+            never = submit("ph-never", 1500)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                if _reason(c, never) == "PartitionTimeLimit":
+                    break
+                time.sleep(2)
+            assert _reason(c, never) == "PartitionTimeLimit", (
+                f"fixture needs a partition-blocked job, got {_reason(c, never)!r}"
+            )
+
+            # One node running against a cap of two, so this must start. It cannot if
+            # the blocked job is still reserving the second slot.
+            legit = submit("ph-legit", 20)
+            try:
+                wait_job_state(c, legit, "R", timeout=90)
+            except (AssertionError, TimeoutError) as exc:
+                raise AssertionError(
+                    f"a job the partition can never run reserved grp node quota: "
+                    f"{_reason(c, legit)!r}\n{c.squeue(['-t', 'all', '-o', '%i %j %t %r'])}"
+                ) from exc
+            assert job_state(c.squeue_all(), occupied) == "R", (
+                "the holder ended before ph-legit started, so its start proves nothing"
+            )
+        finally:
+            for job_id in submitted:
+                c.scancel(job_id)
 
     def test_grp_node_cap_admits_job_packable_onto_already_used_nodes(self, accounting_cluster):
         # A QOS grp node=2 cap is fully occupied by two 1-cpu jobs pinned to
@@ -1012,7 +1147,10 @@ def _wait_txn_rows(c, res_name: str, predicate, timeout: int = 60) -> list[dict]
     deadline = time.time() + timeout
     last: list[dict] = []
     while time.time() < deadline:
-        rows = _parse_txn_rows(c.sacctmgr(["show", "txn", f"Name={res_name}", fmt]), where)
+        # Entity= as well as Name=, now that other entities share the log.
+        rows = _parse_txn_rows(
+            c.sacctmgr(["show", "txn", "Entity=reservation", f"Name={res_name}", fmt]), where
+        )
         if any(predicate(r) for r in rows):
             return rows
         last = rows
@@ -1128,3 +1266,264 @@ class TestReservationAudit:
             assert denied[0]["actor"] == submit_user, denied
         finally:
             c.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+
+
+class TestSshareAndSreportUnits:
+    """Verify sshare and sreport display cpu-seconds, not cpu-hours."""
+
+    def test_sshare_shows_cpu_seconds(self, accounting_cluster):
+        c = accounting_cluster
+        user = c.nodes[0].user
+        c.sacctmgr(["add", "account", "name=unitchk", "fairshare=10"])
+        c.sacctmgr(["add", "user", f"name={user}", "account=unitchk"])
+        time.sleep(15)
+
+        script = c.write_file("unit-check.sh", "#!/bin/bash\nsleep 10\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "unit-chk", "-N", "1", "-n", "1", "-c", "4",
+                      "--account=unitchk", script])
+        )
+        wait_job(c, job_id, timeout=60)
+        time.sleep(15)
+
+        out = c.sshare(["-l"])
+        assert "CPURawUsage" in out, f"expected CPURawUsage header: {out}"
+        for line in out.splitlines():
+            if "unitchk" not in line:
+                continue
+            # Account row has empty User column; split() collapses it,
+            # giving 7 tokens: [name, shares, norm, raw, norm, fair, cpuraw].
+            fields = line.split()
+            raw_usage = float(fields[3])
+            assert raw_usage >= 40, (
+                f"RawUsage {raw_usage} too small for a 4-CPU 10s job "
+                f"(expected >=40 cpu-seconds): {line}"
+            )
+            assert raw_usage < 40 * 3600, (
+                f"RawUsage {raw_usage} looks like cpu-hours, not "
+                f"cpu-seconds: {line}"
+            )
+            break
+        else:
+            pytest.fail(f"unitchk account not found in sshare output: {out}")
+
+    def test_sreport_shows_cpu_seconds(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.sreport(["cluster", "AccountUtilizationByUser"])
+        assert "CPU Seconds" in out, f"expected 'CPU Seconds' header: {out}"
+
+
+def _wait_entity_rows(c, entity: str, name: str, fields: str, predicate,
+                      timeout: int = 60) -> list[list[str]]:
+    """Poll the audit log for `entity:name` until some row satisfies `predicate`.
+
+    Pipe-delimited because Info is JSON containing spaces, which column
+    splitting would tear apart. `fields` must start with Action.
+    """
+    width = len(fields.split(","))
+    deadline = time.time() + timeout
+    last: list[list[str]] = []
+    while time.time() < deadline:
+        out = c.sacctmgr(
+            ["-P", "show", "txn", f"Entity={entity}", f"Name={name}", f"format={fields}"]
+        )
+        rows = [
+            parts
+            for line in out.splitlines()
+            if len(parts := line.split("|")) == width
+            and parts[0] in ("create", "update", "delete")
+        ]
+        if any(predicate(r) for r in rows):
+            return rows
+        last = rows
+        time.sleep(2)
+    raise TimeoutError(f"no {entity}:{name} row matched within {timeout}s (last: {last!r})")
+
+
+def _delimited_txn_rows(c, node: str, fields: str) -> list[list[str]]:
+    """Rows for a node. Delimited rather than column-aligned because an
+    unauthenticated `UpdateNode` leaves Actor empty, which splitting would lose."""
+    out = c.sacctmgr(["-P", "show", "txn", "Entity=node", f"Name={node}", f"format={fields}"])
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) == len(fields.split(",")) and parts[0] in ("create", "update", "delete"):
+            rows.append(parts)
+    return rows
+
+
+class TestNodeAudit:
+    """Node state changes are audited, which is the question the audit log was
+    built to answer: who drained this node, and when."""
+
+    def test_drain_recorded_in_txn_log(self, accounting_cluster):
+        c = accounting_cluster
+        node = c.node_names[0]
+        reason = f"e2e-drain-{int(time.time())}"
+
+        try:
+            c.cli_as_user(
+                "root",
+                ["scontrol", "update", f"NodeName={node}", "State=DRAIN", f"Reason={reason}"],
+            )
+
+            # Audit writes are async, so poll for the row rather than racing it.
+            deadline = time.time() + 60
+            rows: list[list[str]] = []
+            while time.time() < deadline:
+                rows = _delimited_txn_rows(c, node, "Action,Where,Outcome,Peer,Info")
+                if any(r[0] == "update" and r[2] == "success" for r in rows):
+                    break
+                time.sleep(2)
+
+            drained = [r for r in rows if r[0] == "update" and r[2] == "success"]
+            assert drained, f"no successful node update recorded: {rows}"
+            _action, where, _outcome, peer, info = drained[0]
+            assert where == f"node:{node}", drained
+            assert reason in info, f"the requested reason must be captured: {info}"
+            # No jwt_key here and no user field on UpdateNode, so the peer
+            # address is the only attribution left — which is why it exists.
+            assert peer, f"an unauthenticated action must still record a peer: {drained[0]}"
+
+            # The node record's own attribution and the audit log must agree.
+            assert reason in c.cli(["sinfo", "-R"]), "sinfo -R should show the drain reason"
+        finally:
+            # Leaving a node drained would starve every later test.
+            c.cli_as_user("root", ["scontrol", "update", f"NodeName={node}", "State=RESUME"])
+
+
+class TestAccountingEntityAudit:
+    """`sacctmgr add` and `modify` reach one upsert RPC, so only the write knows
+    which verb happened. Before this was fixed a modify logged as a create with
+    no target, which reads as a different action against an unknown object."""
+
+    def test_qos_add_modify_delete_are_named_and_distinguished(self, accounting_cluster):
+        c = accounting_cluster
+        qos = f"auditqos{int(time.time())}"
+
+        try:
+            c.sacctmgr(["-i", "add", "qos", f"name={qos}", "maxwall=60"])
+            c.sacctmgr(["-i", "modify", "qos", f"name={qos}", "set", "maxwall=120"])
+            c.sacctmgr(["-i", "delete", "qos", f"name={qos}"])
+
+            # Delete is the last write, so its row implies the earlier two landed.
+            rows = _wait_entity_rows(
+                c, "qos", qos, "Action,Where,Outcome,Info",
+                lambda r: r[0] == "delete" and r[2] == "success",
+            )
+            by_action = {r[0]: r for r in rows if r[2] == "success"}
+
+            assert set(by_action) == {"create", "update", "delete"}, rows
+            for action, row in by_action.items():
+                assert row[1] == f"qos:{qos}", f"{action} must name the qos: {row}"
+
+            # The modify is a real SQL UPDATE, so the row carries both sides —
+            # this is what answers "what was the wall time before?".
+            info = by_action["update"][3]
+            assert '"max_wall_min":{"from":60,"to":120}' in info.replace(" ", ""), (
+                f"the update must record old and new: {info}"
+            )
+            # An insert has no prior value, so it carries no diff.
+            assert "changed" not in by_action["create"][3], by_action["create"]
+        finally:
+            c.cli_allow_fail(["sacctmgr", "-i", "delete", "qos", f"name={qos}"])
+
+    def test_account_modify_is_not_recorded_as_a_creation(self, accounting_cluster):
+        c = accounting_cluster
+        account = f"auditacct{int(time.time())}"
+
+        try:
+            c.sacctmgr(["-i", "add", "account", f"name={account}", "description=first"])
+            # Same verb as the add, against a row that now exists.
+            c.sacctmgr(["-i", "add", "account", f"name={account}", "description=second"])
+
+            rows = _wait_entity_rows(
+                c, "account", account, "Action,Where,Outcome,Info",
+                lambda r: r[0] == "update" and r[2] == "success",
+            )
+            creates = [r for r in rows if r[0] == "create" and r[2] == "success"]
+            updates = [r for r in rows if r[0] == "update" and r[2] == "success"]
+
+            assert len(creates) == 1, f"only the first add created the account: {rows}"
+            assert updates, f"the second add modified it and must say so: {rows}"
+            assert "second" in updates[0][3], updates
+            assert updates[0][1] == f"account:{account}", updates
+        finally:
+            c.cli_allow_fail(["sacctmgr", "-i", "delete", "account", f"name={account}"])
+
+
+class TestJobAudit:
+    """A job's id is its only name, and it is assigned by the submission being
+    audited — so the row has to be annotated after the job is created."""
+
+    def test_submit_and_cancel_name_the_job_id(self, accounting_cluster):
+        c = accounting_cluster
+        script = c.write_file("audit-job.sh", "#!/bin/bash\nsleep 120\n")
+        job_id = parse_job_id(c.sbatch(["-J", "audit-job", "-N", "1", script]))
+        assert job_id, "sbatch must return a job id"
+
+        c.cli(["scancel", str(job_id)])
+
+        rows = _wait_entity_rows(
+            c, "job", str(job_id), "Action,Where,Outcome,Info",
+            lambda r: r[0] == "delete" and r[2] == "success",
+        )
+        by_action = {r[0]: r for r in rows if r[2] == "success"}
+
+        assert "create" in by_action, f"the submission must be audited: {rows}"
+        for action, row in by_action.items():
+            assert row[1] == f"job:{job_id}", f"{action} must name the job id: {row}"
+        assert "audit-job" in by_action["create"][3], (
+            f"the submission should record what was asked for: {by_action['create']}"
+        )
+
+
+# Groups stay unset so role resolution never needs NSS on the test nodes.
+AUDIT_READ_AUTH = {
+    "auth": {
+        "plugin": "jwt",
+        "jwt_key": "e2e-audit-read-key",
+        "cluster_admins": ["root"],
+    },
+}
+
+
+def _audit_token(c, user: str) -> str:
+    out = c.cli(
+        ["spur", "token", "user", f"--user={user}", f"--config={c.etc_dir}/spur.conf"]
+    )
+    token = out.strip().split("\n")[0]
+    assert token.count(".") == 2, f"unexpected token format: {out}"
+    return token
+
+
+class TestAuditReadAuthorization:
+    """The log carries every user's actions and the addresses they came from,
+    so reading it is Operator-or-above, as Slurm restricts `show transaction`."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return AUDIT_READ_AUTH
+
+    def test_identified_non_admin_cannot_read_the_log(self, accounting_cluster):
+        c = accounting_cluster
+        login = c.nodes[0].user
+
+        admin = c.cli_as_user(
+            login,
+            ["sacctmgr", "show", "txn", "limit=1"],
+            extra_env={"SPUR_AUTH_TOKEN": _audit_token(c, "root")},
+        )
+        assert "requires cluster operator" not in admin.lower(), (
+            f"a cluster admin must still be able to read the log: {admin}"
+        )
+
+        # Same command, a token for a user bound to no role.
+        denied = c.cli_as_user(
+            login,
+            ["sacctmgr", "show", "txn", "limit=1"],
+            extra_env={"SPUR_AUTH_TOKEN": _audit_token(c, login)},
+        )
+        assert "requires cluster operator or administrator" in denied.lower(), (
+            f"an identified non-admin must be refused: {denied}"
+        )

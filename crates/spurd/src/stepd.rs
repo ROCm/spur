@@ -42,13 +42,15 @@ pub struct StepdLaunchSpec {
     pub memory_mb: u64,
     pub cpu_ids: Vec<u32>,
     #[serde(default)]
-    pub gpu_devices: Vec<u32>,
+    pub gpu_devices: Vec<u64>,
     pub open_mode: Option<String>,
     pub uid: u32,
     pub gid: u32,
     pub partition: String,
     pub nodelist: String,
     pub memlock: StepdMemlock,
+    #[serde(default)]
+    pub io_mode: crate::executor::LaunchIo,
     #[serde(default)]
     pub container: Option<crate::executor::ContainerLaunchConfig>,
     #[serde(default)]
@@ -90,6 +92,12 @@ pub struct StepdLaunchSpec {
     /// Absent unless this launch hosts a PMIx server; see [`StepdPmix`].
     #[serde(default)]
     pub pmix: Option<StepdPmix>,
+    #[serde(default)]
+    pub cred_id: String,
+    #[serde(default)]
+    pub cred_kid: String,
+    #[serde(default)]
+    pub cred_digest: String,
 }
 
 /// Everything the supervisor needs to host its own PMIx server. The agent builds
@@ -149,7 +157,7 @@ pub struct StepdJobResources {
     #[serde(default)]
     pub memory_mb: u64,
     #[serde(default)]
-    pub gpu_devices: Vec<u32>,
+    pub gpu_devices: Vec<u64>,
     /// The exact cores, so a restart replays the binding the job is pinned to
     /// instead of re-deriving one that overlaps it.
     #[serde(default)]
@@ -192,6 +200,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             partition: config.partition.clone(),
             nodelist: config.nodelist.clone(),
             memlock: config.memlock.into(),
+            io_mode: config.io_mode,
             container: config.container.clone(),
             host_device_plan: config.host_device_plan.clone(),
             container_rootfs_mode: None,
@@ -219,6 +228,9 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 mpi: config.mpi.clone(),
             },
             pmix: None,
+            cred_id: String::new(),
+            cred_kid: String::new(),
+            cred_digest: String::new(),
         })
     }
 }
@@ -251,11 +263,13 @@ impl StepdLaunchSpec {
             gid: self.gid,
             container: self.container,
             prolog_script: None,
+            task_prolog_script: self.hooks.task_prolog.clone(),
+            task_epilog_script: self.hooks.task_epilog.clone(),
             partition: self.partition,
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
             memlock: self.memlock.into(),
-            io_mode: crate::executor::LaunchIo::File,
+            io_mode: self.io_mode,
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
             allocation_holder: self.allocation_holder,
@@ -335,6 +349,61 @@ fn recv_custody(sock: std::os::fd::RawFd) -> nix::Result<(Vec<u8>, Vec<std::os::
     Ok((buf[..read].to_vec(), fds))
 }
 
+/// A reply's `sendmsg` is as blocking as the request's `recvmsg`, so it gets
+/// the same blocking-pool-plus-timeout treatment (the caller drops its
+/// custody-map lock first, so this can't stall other terminals either).
+async fn bounded_custody_reply(
+    raw: std::os::fd::RawFd,
+    payload: [u8; 5],
+    fds: Vec<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
+    let send = tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        let raw_fds: Vec<_> = fds.iter().map(std::os::fd::OwnedFd::as_raw_fd).collect();
+        send_custody(raw, &payload, &raw_fds)
+    });
+    let joined = match request_timeout() {
+        Some(bound) => tokio::time::timeout(bound, send)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "custody peer did not read"))?,
+        None => send.await,
+    };
+    joined
+        .map_err(|error| io::Error::other(format!("custody reply task failed: {error}")))?
+        .map_err(|error| io::Error::other(format!("send custody reply: {error}")))
+}
+
+/// Runs one custody request/reply on the blocking pool, bounded like a stepd
+/// control request, so an unresponsive peer can't strand a worker thread.
+async fn custody_exchange(
+    session_dir: &std::path::Path,
+    payload: [u8; 5],
+    fds: Vec<std::os::fd::RawFd>,
+    expect_reply: bool,
+) -> io::Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
+    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    let exchange = tokio::task::spawn_blocking(move || -> io::Result<_> {
+        use std::os::fd::AsRawFd;
+        let raw = stream.as_raw_fd();
+        send_custody(raw, &payload, &fds)
+            .map_err(|error| io::Error::other(format!("send custody request: {error}")))?;
+        if !expect_reply {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        recv_custody(raw)
+            .map_err(|error| io::Error::other(format!("recv custody response: {error}")))
+    });
+    let joined = match request_timeout() {
+        Some(bound) => tokio::time::timeout(bound, exchange)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "custody peer did not answer"))?,
+        None => exchange.await,
+    };
+    joined.map_err(|error| io::Error::other(format!("custody exchange task failed: {error}")))?
+}
+
 /// Ask the supervisor to hold a dup of one shell's pty master, so that terminal
 /// does not hang up when the agent that created it goes away. Keyed per shell:
 /// one job can have several terminals open at once.
@@ -344,15 +413,14 @@ pub async fn deposit_pty_master(
     master: std::os::fd::BorrowedFd<'_>,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    send_custody(
-        stream.as_raw_fd(),
-        &custody_payload(CUSTODY_DEPOSIT, session_id),
-        &[master.as_raw_fd()],
+    custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_DEPOSIT, session_id),
+        vec![master.as_raw_fd()],
+        false,
     )
-    .map_err(|error| io::Error::other(format!("deposit pty master: {error}")))
+    .await?;
+    Ok(())
 }
 
 /// Claim a terminal the job has left orphaned, returning its shell id with the
@@ -361,33 +429,29 @@ pub async fn deposit_pty_master(
 pub async fn reclaim_orphaned_pty(
     session_dir: &std::path::Path,
 ) -> io::Result<Option<(u32, std::os::fd::OwnedFd)>> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    let raw = stream.as_raw_fd();
-    send_custody(raw, &custody_payload(CUSTODY_RECLAIM_ANY, 0), &[])
-        .map_err(|error| io::Error::other(format!("request orphaned pty: {error}")))?;
-    let (payload, fds) = recv_custody(raw)
-        .map_err(|error| io::Error::other(format!("reclaim orphaned pty: {error}")))?;
-    match parse_custody_payload(&payload) {
-        Some((CUSTODY_FOUND, session_id)) => Ok(fds.into_iter().next().map(|fd| (session_id, fd))),
-        _ => Ok(None),
-    }
+    let (payload, fds) = custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RECLAIM_ANY, 0),
+        Vec::new(),
+        true,
+    )
+    .await?;
+    Ok(match parse_custody_payload(&payload) {
+        Some((CUSTODY_FOUND, session_id)) => fds.into_iter().next().map(|fd| (session_id, fd)),
+        _ => None,
+    })
 }
 
 /// Stop holding a terminal that has closed.
 pub async fn release_pty_master(session_dir: &std::path::Path, session_id: u32) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    send_custody(
-        stream.as_raw_fd(),
-        &custody_payload(CUSTODY_RELEASE, session_id),
-        &[],
+    custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RELEASE, session_id),
+        Vec::new(),
+        false,
     )
-    .map_err(|error| io::Error::other(format!("release pty master: {error}")))
+    .await?;
+    Ok(())
 }
 
 /// Reclaim one shell's master, so a replacement agent resumes that terminal
@@ -396,19 +460,17 @@ pub async fn reclaim_pty_master(
     session_dir: &std::path::Path,
     session_id: u32,
 ) -> io::Result<Option<std::os::fd::OwnedFd>> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    let raw = stream.as_raw_fd();
-    send_custody(raw, &custody_payload(CUSTODY_RECLAIM, session_id), &[])
-        .map_err(|error| io::Error::other(format!("request pty master: {error}")))?;
-    let (payload, fds) = recv_custody(raw)
-        .map_err(|error| io::Error::other(format!("reclaim pty master: {error}")))?;
-    match parse_custody_payload(&payload) {
-        Some((CUSTODY_FOUND, _)) => Ok(fds.into_iter().next()),
-        _ => Ok(None),
-    }
+    let (payload, fds) = custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RECLAIM, session_id),
+        Vec::new(),
+        true,
+    )
+    .await?;
+    Ok(match parse_custody_payload(&payload) {
+        Some((CUSTODY_FOUND, _)) => fds.into_iter().next(),
+        _ => None,
+    })
 }
 
 const OBLIGATION_FILE: &str = "obligations.jsonl";
@@ -608,6 +670,10 @@ const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// Bounds the pre-launch wait so an agent that dies mid-launch cannot strand
 /// the supervisor holding the job's resources.
 const START_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Once a connection decides the gate, how long to keep accepting siblings
+/// before finalizing — so a Start and Shutdown dispatched near-simultaneously
+/// both get seen instead of losing on pure delivery order.
+const GATE_DECISION_SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
 
 // A Stepd supervises exactly one step's process tree; PTY/srun steps get
 // their own separate Stepd in follow-up work, not a slot in this one.
@@ -830,6 +896,12 @@ pub struct StepdDescriptor {
     /// before removing it, so guessing the mode leaks the mounts.
     #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
+    #[serde(default)]
+    pub cred_id: String,
+    #[serde(default)]
+    pub cred_kid: String,
+    #[serde(default)]
+    pub cred_digest: String,
 }
 
 impl StepdDescriptor {
@@ -866,6 +938,9 @@ impl StepdDescriptor {
             stdout_path: String::new(),
             stderr_path: String::new(),
             container_rootfs_mode: None,
+            cred_id: String::new(),
+            cred_kid: String::new(),
+            cred_digest: String::new(),
         }
     }
 }
@@ -1419,8 +1494,22 @@ async fn serve_pty_custody(listener: UnixListener) {
             if stream.set_nonblocking(false).is_err() {
                 return;
             }
+            // Raw blocking recvmsg (fd-passing needs it), so a silent client
+            // strands a blocking-pool thread, not a worker this process needs.
             let raw = stream.as_raw_fd();
-            let Ok((payload, fds)) = recv_custody(raw) else {
+            let received = match request_timeout() {
+                Some(bound) => tokio::time::timeout(
+                    bound,
+                    tokio::task::spawn_blocking(move || recv_custody(raw)),
+                )
+                .await
+                .ok()
+                .and_then(|joined| joined.ok()),
+                None => tokio::task::spawn_blocking(move || recv_custody(raw))
+                    .await
+                    .ok(),
+            };
+            let Some(Ok((payload, fds))) = received else {
                 return;
             };
             let Some((opcode, session_id)) = parse_custody_payload(&payload) else {
@@ -1438,12 +1527,22 @@ async fn serve_pty_custody(listener: UnixListener) {
                 },
                 CUSTODY_RECLAIM_ANY => {
                     tracing::debug!(held = custody.len(), "pty custody: reclaim-any");
-                    let claimed = custody.iter().next().map(|(id, fd)| (*id, fd.as_raw_fd()));
+                    let claimed = custody.iter().next().map(|(id, fd)| (*id, fd.try_clone()));
+                    // A duplicate, not the map's own fd: the deferred reply below
+                    // outlives this lock, and the map entry can be removed or
+                    // replaced (a concurrent release/deposit) before it runs.
                     let (reply, id, fds) = match claimed {
-                        Some((id, raw_fd)) => (CUSTODY_FOUND, id, vec![raw_fd]),
+                        Some((id, Ok(dup))) => (CUSTODY_FOUND, id, vec![dup]),
+                        Some((_, Err(error))) => {
+                            tracing::warn!(%error, "failed to duplicate an orphaned pty's fd");
+                            (CUSTODY_ABSENT, 0, Vec::new())
+                        }
                         None => (CUSTODY_ABSENT, 0, Vec::new()),
                     };
-                    if let Err(error) = send_custody(raw, &custody_payload(reply, id), &fds) {
+                    drop(custody);
+                    if let Err(error) =
+                        bounded_custody_reply(raw, custody_payload(reply, id), fds).await
+                    {
                         tracing::warn!(%error, "failed to hand back an orphaned pty");
                     }
                 }
@@ -1451,11 +1550,20 @@ async fn serve_pty_custody(listener: UnixListener) {
                     custody.remove(&session_id);
                 }
                 CUSTODY_RECLAIM => {
-                    let (reply, fds) = match custody.get(&session_id) {
-                        Some(master) => (CUSTODY_FOUND, vec![master.as_raw_fd()]),
+                    let (reply, fds) = match custody
+                        .get(&session_id)
+                        .map(std::os::fd::OwnedFd::try_clone)
+                    {
+                        Some(Ok(dup)) => (CUSTODY_FOUND, vec![dup]),
+                        Some(Err(error)) => {
+                            tracing::warn!(session_id, %error, "failed to duplicate a pty master's fd");
+                            (CUSTODY_ABSENT, Vec::new())
+                        }
                         None => (CUSTODY_ABSENT, Vec::new()),
                     };
-                    if let Err(error) = send_custody(raw, &custody_payload(reply, session_id), &fds)
+                    drop(custody);
+                    if let Err(error) =
+                        bounded_custody_reply(raw, custody_payload(reply, session_id), fds).await
                     {
                         tracing::warn!(session_id, %error, "failed to hand back a pty master");
                     }
@@ -1535,20 +1643,56 @@ pub async fn serve_control(stream: UnixStream, session: &Stepd) -> io::Result<()
     }
 }
 
+/// How the pre-launch gate ended: released to run, or cancelled before
+/// running — the only way out besides the 120s `START_GATE_TIMEOUT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    Released,
+    Cancelled,
+}
+
 /// Serves the control socket before the job exists, so spurd's handshake
-/// completes without waiting on the launch. Returns once Start arrives.
-async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> io::Result<()> {
+/// completes without waiting on the launch. Returns once Start arrives, or
+/// once a cancel arrives telling this session to give up before starting.
+async fn await_start(
+    listener: &UnixListener,
+    descriptor: &StepdDescriptor,
+) -> io::Result<GateOutcome> {
+    // Single authority for the gate's outcome, so a racing Start and
+    // Shutdown can't both be told they won. `Cancelled` always wins once
+    // seen (via `claim_decision`); `Released` only holds if nothing decided.
+    let decision: Arc<Mutex<Option<GateOutcome>>> = Arc::new(Mutex::new(None));
     // Connections are served concurrently: the agent's readiness probe and its
-    // later Start arrive on separate connections, and the first must not block
-    // the second.
-    let (released, mut is_released) = tokio::sync::mpsc::channel::<()>(1);
+    // later Start (or cancel) arrive on separate connections, and the first
+    // must not block the second.
+    let (decided, mut is_decided) = tokio::sync::mpsc::channel::<()>(1);
+    // Set once the first decisive connection notifies. Accepting keeps
+    // running until this elapses, so a near-simultaneous sibling still gets
+    // served (and can still flip `decision`) instead of going unaccepted.
+    let mut settle_deadline: Option<tokio::time::Instant> = None;
     loop {
+        let settle = async {
+            match settle_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
-            _ = is_released.recv() => return Ok(()),
+            Some(()) = is_decided.recv() => {
+                settle_deadline.get_or_insert_with(|| tokio::time::Instant::now() + GATE_DECISION_SETTLE);
+            }
+            () = settle => {
+                let outcome = decision
+                    .lock()
+                    .await
+                    .expect("decision is Some before this channel is ever signalled");
+                return Ok(outcome);
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 let descriptor = descriptor.clone();
-                let released = released.clone();
+                let decided = decided.clone();
+                let decision = decision.clone();
                 tokio::spawn(async move {
                     let hello = tokio::time::timeout(
                         STEPD_HANDSHAKE_TIMEOUT,
@@ -1566,9 +1710,9 @@ async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> i
                             return;
                         }
                     };
-                    match serve_until_start(stream, &descriptor).await {
+                    match serve_until_start(stream, &descriptor, &decision).await {
                         Ok(true) => {
-                            let _ = released.send(()).await;
+                            let _ = decided.send(()).await;
                         }
                         Ok(false) => {}
                         Err(error) => {
@@ -1581,9 +1725,30 @@ async fn await_start(listener: &UnixListener, descriptor: &StepdDescriptor) -> i
     }
 }
 
-/// Answers requests on one connection until Start. `Ok(true)` means the job
-/// was released; `Ok(false)` means the peer hung up without releasing it.
-async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> io::Result<bool> {
+/// Resolves one request against the gate's shared decision, returning the
+/// outcome to ack — which may not be what this connection asked for.
+/// `Cancelled` always overwrites; `Released` only holds from nothing decided.
+async fn claim_decision(
+    decision: &Mutex<Option<GateOutcome>>,
+    requested: GateOutcome,
+) -> GateOutcome {
+    let mut decided = decision.lock().await;
+    match (*decided, requested) {
+        (_, GateOutcome::Cancelled) => *decided = Some(GateOutcome::Cancelled),
+        (None, GateOutcome::Released) => *decided = Some(GateOutcome::Released),
+        _ => {}
+    }
+    decided.expect("one of the two arms above always sets this on first decision")
+}
+
+/// Answers requests on one connection until Start or a cancel decides the
+/// gate. Returns `true` once this connection has observed a decision (so
+/// `await_start` knows to stop waiting), `false` if the peer hung up first.
+async fn serve_until_start(
+    stream: UnixStream,
+    descriptor: &StepdDescriptor,
+    decision: &Mutex<Option<GateOutcome>>,
+) -> io::Result<bool> {
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
@@ -1604,12 +1769,40 @@ async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> 
                 format!("invalid runtime request: {error}"),
             )
         })?;
-        let started = matches!(request, StepdRequest::Start);
-        let response = match request {
-            StepdRequest::Start => StepdResponse::Acknowledged,
+        // A cancel arriving before Start has nothing to signal or tear down yet,
+        // so it decides the gate directly rather than waiting out the full timeout.
+        let requested = match request {
+            StepdRequest::Start => Some(GateOutcome::Released),
+            // A signal has no live workload to reach yet, so it's rejected like any
+            // other pre-launch request; only teardown/shutdown decides the gate here.
+            StepdRequest::BeginTeardown | StepdRequest::Shutdown => Some(GateOutcome::Cancelled),
+            _ => None,
+        };
+        let final_outcome = match requested {
+            Some(requested) => Some(claim_decision(decision, requested).await),
+            None => None,
+        };
+        let response = match (request, final_outcome) {
+            // This connection's own request is the one that stuck.
+            (StepdRequest::Start, Some(GateOutcome::Released)) => StepdResponse::Acknowledged,
+            (
+                StepdRequest::BeginTeardown | StepdRequest::Shutdown,
+                Some(GateOutcome::Cancelled),
+            ) => StepdResponse::Acknowledged,
+            // Start lost to a Shutdown/BeginTeardown decided on another
+            // connection: never claim success, or the caller launches a
+            // workload it was just told was cancelled.
+            (StepdRequest::Start, Some(GateOutcome::Cancelled)) => StepdResponse::Rejected {
+                message: "cancelled before start".into(),
+            },
+            // Unreachable given `claim_decision`'s rules (Shutdown/BeginTeardown
+            // always sets Cancelled), kept exhaustive rather than panicking.
+            (StepdRequest::BeginTeardown | StepdRequest::Shutdown, Some(GateOutcome::Released)) => {
+                StepdResponse::Acknowledged
+            }
             // The agent probes readiness with QueryState before releasing the
             // job, so refusing it here would deadlock the launch.
-            StepdRequest::QueryState => StepdResponse::State {
+            (StepdRequest::QueryState, _) => StepdResponse::State {
                 job_id: descriptor.job_id,
                 run_attempt: descriptor.run_attempt,
                 step_id: descriptor.step_id,
@@ -1631,7 +1824,7 @@ async fn serve_until_start(stream: UnixStream, descriptor: &StepdDescriptor) -> 
         })?;
         reader.get_mut().write_all(&encoded).await?;
         reader.get_mut().write_all(b"\n").await?;
-        if started {
+        if final_outcome.is_some() {
             return Ok(true);
         }
     }
@@ -1699,10 +1892,10 @@ async fn serve_supervisor_connection(
 /// A step's rootfs is kept out of the job's namespace so it can never resolve to
 /// (and later delete) a batch job's live rootfs.
 fn rootfs_base(job_id: u32, step_id: spur_core::step::StepId) -> String {
-    if spur_core::step::is_user_step(step_id) {
-        crate::container::step_rootfs_base(job_id, step_id)
-    } else {
+    if spur_core::step::owns_job_lifetime(step_id) {
         crate::container::job_rootfs_base(job_id)
+    } else {
+        crate::container::step_rootfs_base(job_id, step_id)
     }
 }
 
@@ -1872,6 +2065,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     descriptor.resources = launch_spec.resources.clone();
     descriptor.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
+    descriptor.cred_id = launch_spec.cred_id.clone();
+    descriptor.cred_kid = launch_spec.cred_kid.clone();
+    descriptor.cred_digest = launch_spec.cred_digest.clone();
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
     // Custody of an interactive session's pty master outlives the agent that
@@ -1901,6 +2097,21 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         cpus: launch_spec.cpus,
         memory_mb: launch_spec.memory_mb,
     };
+    // TaskEpilog runs as the job user inside the step cgroup on teardown; captured
+    // now because `launch_spec` is consumed by the launch below.
+    let task_epilog_script = hooks.task_epilog.clone();
+    let task_epilog_context = spur_core::hooks::HookContext {
+        job_id,
+        work_dir: launch_spec.work_dir.clone(),
+        uid: launch_spec.uid,
+        gid: launch_spec.gid,
+        partition: launch_spec.partition.clone(),
+        nodelist: launch_spec.nodelist.clone(),
+        script_context: "epilog_task".into(),
+        gpu_devices: launch_spec.gpu_devices.clone(),
+        cpus: launch_spec.cpus,
+        memory_mb: launch_spec.memory_mb,
+    };
     // Hold the workload until spurd has finished its own launch bookkeeping, so
     // an srun on the script's first line cannot outrun the job's start. Only the
     // launch path releases the gate; an allocation has no workload to hold.
@@ -1909,15 +2120,22 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for spurd to start the job"))
             .and_then(|result| result.map_err(anyhow::Error::from));
-        if let Err(error) = gate {
+        // A cancel arriving before Start (BeginTeardown/Shutdown) decides the gate
+        // directly, instead of sitting out the full START_GATE_TIMEOUT.
+        let error = match gate {
+            Ok(GateOutcome::Released) => None,
+            Ok(GateOutcome::Cancelled) => Some(anyhow::anyhow!("cancelled before start")),
+            Err(error) => Some(error),
+        };
+        if let Some(error) = error {
             // Nothing launched, so only the session's own artifacts need clearing
             // — but they must be, or the session is never prunable.
             let _ = std::fs::remove_file(&socket_path);
             record_launch_failure(&session_dir, &stderr_path, &error);
-            if spur_core::step::is_user_step(step_id) {
-                crate::executor::cleanup_step_spool(job_id, step_id);
-            } else {
+            if spur_core::step::owns_job_lifetime(step_id) {
                 crate::executor::cleanup_job_spool(job_id);
+            } else {
+                crate::executor::cleanup_step_spool(job_id, step_id);
             }
             return Err(error);
         }
@@ -1929,10 +2147,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
-        if spur_core::step::is_user_step(step_id) {
-            crate::executor::cleanup_step_spool(job_id, step_id);
-        } else {
+        if spur_core::step::owns_job_lifetime(step_id) {
             crate::executor::cleanup_job_spool(job_id);
+        } else {
+            crate::executor::cleanup_step_spool(job_id, step_id);
         }
     };
     // Before the workload execs: the ranks look the server up through the
@@ -1945,14 +2163,18 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup, launched_output) = if launch_spec.allocation_only {
-        (RunningJob::AllocationOnly, None, None)
+    let (job, launched_cgroup, launched_output, task_environment, pty_master) = if launch_spec
+        .allocation_only
+    {
+        (RunningJob::AllocationOnly, None, None, HashMap::new(), None)
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
             Ok(result) => (
                 result.job,
                 result.cgroup_path,
                 Some((result.stdout_path, result.stderr_path)),
+                result.task_environment,
+                result.pty_master,
             ),
             Err(error) => {
                 if let Some(pmix) = pmix.as_ref() {
@@ -1967,6 +2189,16 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if workload_pid > 0 {
         descriptor.workload_pid = workload_pid;
         descriptor.workload_start_ticks = process_start_ticks(workload_pid).unwrap_or(0);
+    }
+    // Self-deposit: the agent's interactive-session handler reclaims this by
+    // pid over the same custody protocol an agent restart already uses, so a
+    // fresh attach and a post-restart reattach both just reclaim a master.
+    if let Some(master) = pty_master.as_ref() {
+        if let Err(error) =
+            deposit_pty_master(&session_dir, workload_pid, std::os::fd::AsFd::as_fd(master)).await
+        {
+            tracing::warn!(job_id, %error, "failed to deposit this step's own pty master");
+        }
     }
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
@@ -1998,6 +2230,22 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let _ = std::fs::remove_file(socket_path);
     let cgroup = session.take_cgroup().await.or(recorded_cgroup);
     let teardown = |cgroup: Option<PathBuf>| async move {
+        // TaskEpilog runs as the job user inside the step cgroup before it is
+        // reaped; the extern/allocation step runs no task hooks.
+        if step_id != spur_core::step::STEP_EXTERN {
+            if let Some(ref task_epilog) = task_epilog_script {
+                if let Err(error) = crate::task_hook::run_task_epilog(
+                    task_epilog,
+                    &task_epilog_context,
+                    &task_environment,
+                    cgroup.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!(job_id, %error, "TaskEpilog failed");
+                }
+            }
+        }
         if let Some(pmix) = pmix.as_ref() {
             pmix.stop();
         }
@@ -2006,7 +2254,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             // The agent reaps the job node once its last step releases; this
             // covers the case where teardown here runs and that never does.
             // Removing an absent directory is a no-op, so both trying is safe.
-            if !spur_core::step::is_user_step(step_id) {
+            if spur_core::step::owns_job_lifetime(step_id) {
                 if let Some(job_cgroup) = cgroup.parent() {
                     crate::executor::cleanup_cgroup(job_cgroup);
                 }
@@ -2015,9 +2263,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
-        // A user step's spool outlives teardown: this runs before the agent is
-        // notified, and the agent still has to read the step's output back.
-        if !spur_core::step::is_user_step(step_id) {
+        // A non-owning step's spool outlives teardown, since the agent still
+        // has to read its output back after this runs.
+        if spur_core::step::owns_job_lifetime(step_id) {
             crate::executor::cleanup_job_spool(job_id);
         }
     };
@@ -2043,9 +2291,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // unbounded operator code, and a crash in them must not read as "never ran".
     obligations.append(&StepdObligation::ExitObserved { exit_code, signal })?;
     teardown(cgroup).await;
-    // The node epilog and SPANK exit hooks are per-job-per-node, so only the step
-    // that owns the job's lifetime runs them — a numbered step would re-run them.
-    let owns_job_lifetime = !spur_core::step::is_user_step(step_id);
+    // Per-job-per-node hooks: only the step owning the job's lifetime runs them.
+    let owns_job_lifetime = spur_core::step::owns_job_lifetime(step_id);
     let epilog_failed = match hooks.epilog.as_deref().filter(|_| owns_job_lifetime) {
         Some(epilog) => match spur_core::hooks::run_hook(epilog, &hook_context).await {
             Err(error) => {
@@ -2197,9 +2444,8 @@ impl StepdStore {
         if !matches!(stepd_liveness(descriptor), Ok(StepdLiveness::Stale)) {
             return Ok(false);
         }
-        // A numbered step's loss is that step's failure; only a job-level
-        // session speaks for the allocation the controller is holding.
-        if spur_core::step::is_user_step(descriptor.step_id) {
+        // Only the step owning the job's lifetime speaks for the allocation.
+        if !spur_core::step::owns_job_lifetime(descriptor.step_id) {
             return Ok(false);
         }
         if self
@@ -2700,7 +2946,15 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
 
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
     match process_start_ticks(descriptor.pid) {
-        Ok(start_ticks) if start_ticks == descriptor.process_start_ticks => Ok(StepdLiveness::Live),
+        // A zombie's start ticks still match (the kernel keeps them until
+        // reaped), but it has already exited and released everything —
+        // `process_is_live` is the one check here that knows to exclude it.
+        Ok(start_ticks)
+            if start_ticks == descriptor.process_start_ticks
+                && process_is_live(descriptor.pid, descriptor.process_start_ticks) =>
+        {
+            Ok(StepdLiveness::Live)
+        }
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
@@ -2995,6 +3249,7 @@ mod tests {
             partition: "default".into(),
             nodelist: "node-a".into(),
             memlock: StepdMemlock::Inherit,
+            io_mode: crate::executor::LaunchIo::File,
             container: None,
             host_device_plan: None,
             container_rootfs_mode: None,
@@ -3007,6 +3262,9 @@ mod tests {
             allocation_only: false,
             pmix_multi_task: false,
             pmix: None,
+            cred_id: String::new(),
+            cred_kid: String::new(),
+            cred_digest: String::new(),
         }
     }
 
@@ -3015,6 +3273,26 @@ mod tests {
         let mut spec = launch_spec();
         spec.pmix_multi_task = true;
         assert!(spec.into_launch_config().pmix_multi_task);
+    }
+
+    // A stepd relaunched from a persisted spec must honor Pty just as the
+    // original launch did, or a restart silently drops back to File.
+    #[test]
+    fn launch_spec_preserves_pty_io_mode() {
+        let mut spec = launch_spec();
+        spec.io_mode = crate::executor::LaunchIo::Pty;
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::Pty
+        );
+    }
+
+    #[test]
+    fn job_launch_config_round_trip_preserves_pty_io_mode() {
+        let mut config = launch_spec().into_launch_config();
+        config.io_mode = crate::executor::LaunchIo::Pty;
+        let spec = StepdLaunchSpec::try_from(&config).expect("valid config");
+        assert_eq!(spec.io_mode, crate::executor::LaunchIo::Pty);
     }
 
     fn pmix_spec(step_id: spur_core::step::StepId, ranks: u32, plugin: &str) -> StepdPmix {
@@ -3187,7 +3465,7 @@ mod tests {
         let pmix = restored
             .pmix
             .expect("the PMIx plan must survive launch.json");
-        assert_eq!(pmix.plan.namespace, "spur.42.4294967294");
+        assert_eq!(pmix.plan.namespace, "spur.42.4294967291");
         assert_eq!(pmix.plan.local_procs.len(), 2);
         assert_eq!(pmix.config.plugin_dir, "/opt/spur/lib");
         assert_eq!(pmix.user_script_path, "/tmp/.spur_user_42.sh");
@@ -4709,6 +4987,18 @@ mod tests {
         );
     }
 
+    // A terminal supervisor is reserved like the batch/extern steps but owns no
+    // workload; retiring it must not re-run a job-ending hook.
+    #[tokio::test]
+    async fn a_terminal_placeholder_does_not_run_the_node_epilog() {
+        let AgentNotification::StepdCompleted { epilog_failed, .. } =
+            supervised_completion_notice(spur_core::step::STEP_INTERACTIVE).await;
+        assert!(
+            !epilog_failed,
+            "a terminal placeholder must leave the node epilog to the step owning the job"
+        );
+    }
+
     fn gate_descriptor() -> StepdDescriptor {
         StepdDescriptor::new(
             7,
@@ -4732,8 +5022,11 @@ mod tests {
     async fn the_gate_releases_the_job_on_start() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let descriptor = gate_descriptor();
-        let server =
-            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+        let decision = Arc::new(Mutex::new(None));
+        let server_decision = decision.clone();
+        let server = tokio::spawn(async move {
+            serve_until_start(server_stream, &descriptor, &server_decision).await
+        });
         let (reader, mut writer) = client_stream.into_split();
         send(&mut writer, StepdRequest::Start).await;
         let mut line = String::new();
@@ -4746,14 +5039,18 @@ mod tests {
             StepdResponse::Acknowledged
         ));
         assert!(server.await.expect("join").expect("serve"));
+        assert_eq!(*decision.lock().await, Some(GateOutcome::Released));
     }
 
     #[tokio::test]
     async fn the_gate_refuses_work_until_the_job_is_released() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let descriptor = gate_descriptor();
-        let server =
-            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+        let decision = Arc::new(Mutex::new(None));
+        let server_decision = decision.clone();
+        let server = tokio::spawn(async move {
+            serve_until_start(server_stream, &descriptor, &server_decision).await
+        });
         let (reader, mut writer) = client_stream.into_split();
         send(&mut writer, StepdRequest::SignalAllocation { signal: 15 }).await;
         send(&mut writer, StepdRequest::Start).await;
@@ -4771,6 +5068,7 @@ mod tests {
             StepdResponse::Acknowledged
         ));
         assert!(server.await.expect("join").expect("serve"));
+        assert_eq!(*decision.lock().await, Some(GateOutcome::Released));
     }
 
     // Start and the readiness probe arrive on separate connections, so the
@@ -4799,13 +5097,125 @@ mod tests {
         gate.await.expect("join").expect("gate released");
     }
 
+    // Start and Shutdown dispatched back-to-back, as spurd's launch and
+    // cancel paths racing each other would. Start's own connection may still
+    // ack, but the gate's authoritative outcome must still go to Shutdown.
+    #[tokio::test]
+    async fn a_shutdown_shortly_after_start_still_cancels_the_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move { await_start(&listener, &gate_descriptor).await });
+
+        start_job(&descriptor, "launcher".into())
+            .await
+            .expect("start accepted on its own connection");
+        shutdown_allocation(&descriptor, "canceller".into())
+            .await
+            .expect("shutdown accepted");
+
+        assert_eq!(
+            gate.await.expect("join").expect("gate decided"),
+            GateOutcome::Cancelled,
+            "a Shutdown racing shortly behind Start must still cancel the gate, \
+             so the workload this Start acked never actually launches"
+        );
+    }
+
+    // The mirror ordering: Shutdown first, then Start racing shortly behind it.
+    // Cancelled must win regardless of which connection's request the gate
+    // happened to see first.
+    #[tokio::test]
+    async fn a_start_shortly_after_shutdown_does_not_undo_the_cancel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move { await_start(&listener, &gate_descriptor).await });
+
+        shutdown_allocation(&descriptor, "canceller".into())
+            .await
+            .expect("shutdown accepted");
+        let start_result = start_job(&descriptor, "launcher".into()).await;
+
+        assert!(
+            start_result.is_err(),
+            "Start must be rejected once Shutdown has already decided the gate"
+        );
+        assert_eq!(
+            gate.await.expect("join").expect("gate decided"),
+            GateOutcome::Cancelled,
+        );
+    }
+
+    // A cancel arriving before Start must decide the gate itself, not leave
+    // the session waiting out the full START_GATE_TIMEOUT.
+    #[tokio::test]
+    async fn the_gate_is_cancelled_by_a_shutdown_before_start() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let descriptor = gate_descriptor();
+        let decision = Arc::new(Mutex::new(None));
+        let server_decision = decision.clone();
+        let server = tokio::spawn(async move {
+            serve_until_start(server_stream, &descriptor, &server_decision).await
+        });
+        let (reader, mut writer) = client_stream.into_split();
+        send(&mut writer, StepdRequest::Shutdown).await;
+        let mut line = String::new();
+        BufReader::new(reader)
+            .read_line(&mut line)
+            .await
+            .expect("read ack");
+        assert!(matches!(
+            serde_json::from_str::<StepdResponse>(&line).expect("decode"),
+            StepdResponse::Acknowledged
+        ));
+        assert!(server.await.expect("join").expect("serve"));
+        assert_eq!(*decision.lock().await, Some(GateOutcome::Cancelled));
+    }
+
+    // Real time deliberately: paused time can race the client/server handshake
+    // in ways unrelated to what this test is actually checking.
+    #[tokio::test]
+    async fn await_start_resolves_promptly_on_shutdown_before_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let mut descriptor = gate_descriptor();
+        descriptor.socket_path = socket_path.clone();
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+
+        let gate_descriptor = descriptor.clone();
+        let gate = tokio::spawn(async move { await_start(&listener, &gate_descriptor).await });
+
+        shutdown_allocation(&descriptor, "cancel".into())
+            .await
+            .expect("shutdown accepted");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), gate)
+            .await
+            .expect("await_start must resolve well within the 120s gate timeout")
+            .expect("join")
+            .expect("gate decided");
+        assert_eq!(outcome, GateOutcome::Cancelled);
+    }
+
     // An agent that dies mid-launch must not leave the job released.
     #[tokio::test]
     async fn the_gate_reports_a_peer_that_hung_up_without_starting() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let descriptor = gate_descriptor();
+        let decision: Arc<Mutex<Option<GateOutcome>>> = Arc::new(Mutex::new(None));
         let server =
-            tokio::spawn(async move { serve_until_start(server_stream, &descriptor).await });
+            tokio::spawn(
+                async move { serve_until_start(server_stream, &descriptor, &decision).await },
+            );
         drop(client_stream);
         assert!(!server.await.expect("join").expect("serve"));
     }
@@ -4872,5 +5282,44 @@ mod tests {
             greeted.load(Ordering::Acquire),
             "the bound must cover the request, not just the handshake"
         );
+    }
+
+    // On a single-threaded runtime, a custody exchange blocking that one
+    // thread directly (instead of on the blocking pool) starves unrelated work.
+    #[tokio::test]
+    async fn a_wedged_custody_peer_does_not_starve_unrelated_work() {
+        REQUEST_TIMEOUT.with(|timeout| timeout.set(Some(std::time::Duration::from_millis(200))));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = UnixListener::bind(dir.path().join(PTY_CUSTODY_SOCKET_NAME)).expect("bind");
+
+        // Accepts the connection, same as a live stepd, but never answers —
+        // the state an orphaned `<defunct>` child can leave its supervisor in.
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(stream);
+        });
+
+        let session_dir = dir.path().to_path_buf();
+        let reclaim = tokio::spawn(async move { reclaim_orphaned_pty(&session_dir).await });
+
+        let unrelated = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            42
+        });
+        let unrelated_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), unrelated)
+                .await
+                .expect("unrelated work must not be starved by a stuck custody peer")
+                .expect("join");
+        assert_eq!(unrelated_result, 42);
+
+        let error = reclaim
+            .await
+            .expect("join")
+            .expect_err("a wedged custody peer must time out, not hang forever");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }

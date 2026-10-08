@@ -18,10 +18,11 @@ message ResourceSet {
   uint64 memory_mb = 2;
   repeated GpuResource gpus = 3;
   map<string, uint64> generic = 4;  // licenses, etc.
+  uint64 generation = 5;  // bumped by the agent on each topology rebuild
 }
 
 message AllocatedDevice {
-  uint32 device_id = 1;
+  uint64 device_id = 1;
   uint64 count = 2;
 }
 
@@ -33,6 +34,7 @@ message ResourceAllocations {
   uint32 cpus = 1;
   uint64 memory_mb = 2;
   map<string, DeviceAllocations> devices = 3;
+  uint64 generation = 4;  // node inventory generation this allocation was made under
 }
 
 message GpuResource {
@@ -41,6 +43,7 @@ message GpuResource {
   uint64 memory_mb = 3;
   repeated uint32 peer_gpus = 4;
   GpuLinkType link_type = 5;
+  uint64 stable_id = 6;   // BDF(domain:bus:dev.func) + partition rank; stable per-logical-device identity
 }
 
 enum GpuLinkType {
@@ -295,6 +298,11 @@ message JobInfo {
   string sched_nodelist = 78;
 
   bool min_memory_is_per_cpu = 79;
+
+  // True when this run took borrowed capacity: the job exceeded its QOS group
+  // node quota and was placed on nodes nobody with a quota claim wanted, so it
+  // is reclaimable if such a job needs them.
+  bool idle_fill = 80;
 }
 
 message NodeInfo {
@@ -473,6 +481,8 @@ service SlurmController {
 // -- Agent service (slurmd) --
 
 service SlurmAgent {
+  // Health plus native auth handshake (`auth_audience` / `auth_epoch`).
+  rpc Ping(google.protobuf.Empty) returns (PingResponse);
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
   // Start PMIx server and verify multi-node peers before rank exec (multi-node pmix only).
   rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
@@ -579,6 +589,10 @@ message GetJobsRequest {
   string name = 6;
   // Filter: only jobs allocated on any of these nodes (expanded hostlist).
   repeated string nodes = 7;
+  // Filter: only jobs with one of these QOS names (comma-separated).
+  string qos = 8;
+  // Filter: only jobs in one of these reservations (comma-separated).
+  string reservation = 9;
 }
 
 message GetJobsResponse {
@@ -705,6 +719,10 @@ message PingResponse {
   string version = 3;
   repeated string federation_peers = 4;
   string cluster_name = 5;
+  // Native plugin handshake: the audience and boot epoch the caller must mint
+  // into user-RPC credentials. Empty when `[auth] plugin` is not `spur`.
+  string auth_audience = 6;
+  uint64 auth_epoch = 7;
 }
 
 message JobStateCount {
@@ -902,6 +920,11 @@ message RunningJobStatus {
   uint32 job_id = 1;
   JobState state = 2;
   int32 exit_code = 3;
+  // The stable_ids this job currently holds on this node, after any legacy
+  // positional->stable_id translation the agent applied at restore. Lets the
+  // controller converge its per-node used-view to the ids the job actually
+  // occupies. Empty from an old agent or a job with no GPUs.
+  repeated uint64 gpu_stable_ids = 4;
 }
 
 message HeartbeatResponse {}
@@ -913,7 +936,7 @@ message StepdRecoveryRequest {
   string node_token = 4;
   bool stale_descriptor = 5;
   // Supervisors are per (job, attempt, step). 0 from an older controller is
-  // the numbered step 0, not "unset"; the batch step is 0xFFFFFFFE.
+  // the numbered step 0, not "unset"; the batch step is 0xFFFFFFFB.
   uint32 step_id = 6;
 }
 
@@ -978,6 +1001,8 @@ message LaunchJobRequest {
   bool task_fanout = 11;
   // When true, PMIx was prepared via PreparePmix; LaunchJob must not re-init the server.
   bool pmix_prepared = 12;
+  // Controller-signed job execution credential. Required when [auth] plugin = "spur".
+  string execution_credential = 13;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -1044,7 +1069,7 @@ message StepdProbeRequest {
   uint32 job_id = 1;
   uint32 run_attempt = 2;
   // Supervisors are per (job, attempt, step). 0 from an older controller is
-  // the numbered step 0, not "unset"; the batch step is 0xFFFFFFFE.
+  // the numbered step 0, not "unset"; the batch step is 0xFFFFFFFB.
   uint32 step_id = 3;
 }
 
@@ -1082,6 +1107,8 @@ message RunStepRequest {
   // Step-level container override. Absent = inherit from the parent job's
   // container config (empty image = run on the host / enter the parent).
   ContainerSpec container = 11;
+  // Controller-signed step credential from CreateJobStep. Empty when plugin is jwt.
+  string execution_credential = 12;
 }
 
 // Container settings carried on a step RPC, mirroring the JobSpec container
@@ -1325,6 +1352,8 @@ message RunCommandRequest {
   // Step node subset (comma-separated names). Empty = use the job allocation
   // nodelist. Drives SPUR_NODELIST / SPUR_NNODES / SPUR_NODEID for the step.
   string nodelist = 16;
+  // Controller-signed step credential. Required when [auth] plugin = "spur".
+  string execution_credential = 17;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.
@@ -1344,7 +1373,14 @@ message RegisterJobAllocationRequest {
   uint32 run_attempt = 13;
 }
 
-message RegisterJobAllocationResponse {}
+message RegisterJobAllocationResponse {
+  // Set when the node ran the job's prolog and it failed, so the controller
+  // drains the node and holds the job exactly as the LaunchJob path does
+  // instead of re-dispatching srun onto a node whose prolog fails every time.
+  // UNSPECIFIED (the default, and what a pre-field agent sends) on success.
+  LaunchFailureKind failure_kind = 1;
+  string error = 2;
+}
 
 message RunCommandResponse {
   int32 exit_code = 1;
@@ -1400,6 +1436,7 @@ message InitSession {
   string user = 8;           // Requesting user; verified identity must own the job; the controller/admin credential overrides
   ContainerSpec container = 9;  // Effective container the step runs in (empty image = host); resolved by the controller
   bool non_interactive = 10;    // Client stdin is not a TTY: input-stream close is stdin-EOF (drain output), not a hangup (SIGHUP)
+  string execution_credential = 11; // Controller-signed step credential for a PTY launch; empty for attach
 }
 
 message InteractiveInput {
@@ -1467,20 +1504,24 @@ message GetTransactionsRequest {
   google.protobuf.Timestamp start_after = 6;
   google.protobuf.Timestamp start_before = 7;
   uint32 limit = 8;
+  string peer_addr = 9;         // prefix match, so a bare IP matches any port
 }
 
 message TransactionRecord {
   int64 id = 1;
   google.protobuf.Timestamp timestamp = 2;
   string actor = 3;
-  uint32 actor_uid = 4;         // 0 when unknown (e.g. unauthenticated caller)
+  // Absent unless the kernel vouched for it; a JWT's uid is caller-asserted,
+  // and flattening that to 0 would read as root.
+  optional uint32 actor_uid = 4;
   bool verified = 5;            // true only when a JWT identity was verified
   string source = 6;            // "api" | "system"
   string action = 7;            // "create" | "update" | "delete"
-  string entity_type = 8;       // "reservation"
+  string entity_type = 8;       // "node" | "job" | "reservation" | ...
   string entity_name = 9;
   string outcome = 10;          // "success" | "denied" | "error"
   string details = 11;          // JSON: requested parameters (+ error on failure)
+  string peer_addr = 12;        // caller's address, empty when unavailable
 }
 
 message GetTransactionsResponse {
@@ -1496,8 +1537,8 @@ message GetUsageRequest {
 message UsageEntry {
   string user = 1;
   string account = 2;
-  double cpu_hours = 3;
-  double gpu_hours = 4;
+  double cpu_seconds = 3;
+  double gpu_seconds = 4;
   uint64 job_count = 5;
 }
 
@@ -1684,6 +1725,9 @@ message CreateQosRequest {
   optional uint32 max_submit_jobs_per_account = 16;
   // Max submitted (pending + running) jobs across all users in this QOS.
   optional uint32 grp_submit_jobs = 17;
+  // Mark this QOS reclaimable by idle-fill even while inside quota. Absent = no
+  // change on update.
+  optional bool idle_fill_preemptable = 19;
   // Comma-separated QOS flags. Recognized: DenyOnLimit. Unset preserves the
   // stored flags; explicit empty clears them.
   optional string flags = 18;
@@ -1718,6 +1762,10 @@ message QosInfo {
   uint32 max_submit_jobs_per_account = 16;
   uint32 grp_submit_jobs = 17;
   string flags = 18;
+  // Jobs in this QOS are reclaimable by idle-fill even while inside their quota.
+  // Exists so an existing burst QOS, which carries no group cap to exceed and so is
+  // never stamped, can still be called back for a job holding a quota claim.
+  bool idle_fill_preemptable = 19;
 }
 
 // ============================================================
@@ -1760,6 +1808,7 @@ message CreateJobStepResponse {
   uint32 step_id = 1;
   string node_addr = 2;        // Address of the first resolved step node; host:port for agent
   ContainerSpec container = 3; // Effective container for the step (step's own, else inherited from the job); empty image = host
+  string execution_credential = 4; // Controller-signed step credential; empty when plugin is jwt
 }
 
 message CompleteJobStepRequest {

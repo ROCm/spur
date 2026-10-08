@@ -31,26 +31,30 @@ use http::{Request, Response};
 use tower::{Layer, Service};
 use tracing::warn;
 
-use spur_core::auth::BearerOutcome;
+use spur_core::auth::{BearerAuth, BearerOutcome};
 use spur_core::config::AuthMode;
+
+/// Caller address for a request, `None` when the transport did not record one.
+fn peer_addr(extensions: &http::Extensions) -> Option<String> {
+    extensions
+        .get::<tonic::transport::server::TcpConnectInfo>()
+        .and_then(|info| info.remote_addr())
+        .map(spur_core::peer::canonical_peer)
+}
 
 #[derive(Clone)]
 pub struct AgentAuthLayer {
-    inner: Arc<AgentAuthConfig>,
-}
-
-struct AgentAuthConfig {
-    mode: AuthMode,
-    jwt_key: Vec<u8>,
+    inner: Arc<BearerAuth>,
 }
 
 impl AgentAuthLayer {
     pub fn new(mode: AuthMode, jwt_key: &str) -> Self {
+        Self::from_bearer(BearerAuth::jwt(mode, jwt_key.as_bytes()))
+    }
+
+    pub fn from_bearer(auth: BearerAuth) -> Self {
         Self {
-            inner: Arc::new(AgentAuthConfig {
-                mode,
-                jwt_key: jwt_key.as_bytes().to_vec(),
-            }),
+            inner: Arc::new(auth),
         }
     }
 }
@@ -69,13 +73,11 @@ impl<S> Layer<S> for AgentAuthLayer {
 #[derive(Clone)]
 pub struct AgentAuthMiddleware<S> {
     inner: S,
-    config: Arc<AgentAuthConfig>,
+    config: Arc<BearerAuth>,
 }
 
-fn decide(config: &AgentAuthConfig, header: Option<&str>) -> BearerOutcome {
-    spur_core::auth::authenticate_bearer(
-        config.mode,
-        &config.jwt_key,
+fn decide(config: &BearerAuth, header: Option<&str>) -> BearerOutcome {
+    config.authenticate(
         header,
         "this agent only accepts calls carrying the cluster credential",
     )
@@ -98,6 +100,10 @@ where
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        if spur_core::auth::is_unauthenticated_auth_handshake(req.uri().path()) {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
+        }
         let header = req
             .headers()
             .get(http::header::AUTHORIZATION)
@@ -122,6 +128,14 @@ where
                 }
             }
             BearerOutcome::Reject(msg) => {
+                // A forged credential aimed at a node agent is worth recording on
+                // every cluster, so this is not gated behind any debug setting.
+                warn!(
+                    path = %req.uri().path(),
+                    peer = peer_addr(req.extensions()).as_deref().unwrap_or("-"),
+                    reason = %msg,
+                    "rejected an agent RPC with an invalid credential"
+                );
                 let resp = tonic::Status::unauthenticated(msg).into_http();
                 return Box::pin(async move { Ok(resp) });
             }
@@ -137,15 +151,27 @@ mod tests {
     use super::*;
     use spur_core::auth::generate_token;
 
-    fn cfg(mode: AuthMode, key: &str) -> AgentAuthConfig {
-        AgentAuthConfig {
-            mode,
-            jwt_key: key.as_bytes().to_vec(),
-        }
+    fn cfg(mode: AuthMode, key: &str) -> BearerAuth {
+        BearerAuth::jwt(mode, key.as_bytes())
     }
 
     fn controller_token(key: &str) -> String {
         generate_token("spurctld", 0, true, key.as_bytes(), 300).unwrap()
+    }
+
+    /// Guards this copy of `peer_addr`: a dual-stack listener hands us the
+    /// IPv4-mapped form, and every daemon must log the plain IPv4 form.
+    #[test]
+    fn peer_addr_unwraps_an_ipv4_mapped_client() {
+        let mut ext = http::Extensions::new();
+        ext.insert(tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some("[::ffff:10.0.0.4]:51234".parse().unwrap()),
+        });
+        assert_eq!(peer_addr(&ext).as_deref(), Some("10.0.0.4:51234"));
+
+        // No connection info at all (a non-TCP or test transport) is not an error.
+        assert_eq!(peer_addr(&http::Extensions::new()), None);
     }
 
     #[test]
@@ -172,6 +198,72 @@ mod tests {
             decide(&cfg(AuthMode::Required, "cluster-key"), Some(&header)),
             BearerOutcome::Authenticated(_)
         ));
+    }
+
+    /// Counts calls so a test can assert the inner service was never reached.
+    #[derive(Clone, Default)]
+    struct CountingInner(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Service<Request<()>> for CountingInner {
+        type Response = Response<tonic::body::Body>;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(Ok(Response::new(tonic::body::Body::default())))
+        }
+    }
+
+    /// Exercises the real `Layer`/`Service` wiring, not just `decide()`: a
+    /// forged credential must never reach the code that runs work on this node.
+    #[tokio::test]
+    async fn a_forged_credential_never_reaches_the_inner_service() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut svc = AgentAuthLayer::new(AuthMode::Required, "cluster-key")
+            .layer(CountingInner(calls.clone()));
+        let req = Request::builder()
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", controller_token("attacker-key")),
+            )
+            .body(())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a forged credential must not reach this node's agent surface"
+        );
+        let status = tonic::Status::from_header_map(resp.headers()).expect("grpc-status");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// A valid credential is forwarded, so the rejection test above cannot pass
+    /// by the layer simply refusing everything.
+    #[tokio::test]
+    async fn a_valid_credential_reaches_the_inner_service() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut svc = AgentAuthLayer::new(AuthMode::Required, "cluster-key")
+            .layer(CountingInner(calls.clone()));
+        let req = Request::builder()
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", controller_token("cluster-key")),
+            )
+            .body(())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(resp.headers().get("grpc-status").is_none());
     }
 
     #[test]

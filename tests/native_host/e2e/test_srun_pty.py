@@ -7,6 +7,87 @@ The command must run through an interactive PTY session rather than the
 buffered RunStep path, and the step it creates must reach a terminal state.
 """
 
+import re
+import threading
+import time
+
+# Below this, a step id names a reserved (batch/extern/interactive) session
+# that every allocation already gets a supervisor for; a bare `pgrep
+# spurstepd` can't tell that apart from the one this test is actually about.
+_RESERVED_STEP_FLOOR = 0xFFFFFFF0
+
+
+def _user_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> set[str]:
+    node = cluster.nodes[node_index]
+    listing = node.exec_allow_fail(
+        f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
+    )
+    prefix = f"{job_id}."
+    sessions = set()
+    for name in listing.split():
+        if not name.startswith(prefix):
+            continue
+        try:
+            step_id = int(name.rsplit(".", 1)[-1])
+        except ValueError:
+            continue
+        if step_id < _RESERVED_STEP_FLOOR:
+            sessions.add(name)
+    return sessions
+
+
+def _reserved_step_sessions_for_job(cluster, job_id: int, node_index: int = 0) -> set[str]:
+    node = cluster.nodes[node_index]
+    listing = node.exec_allow_fail(
+        f"ls '{cluster.state_dir}/runtime' 2>/dev/null || true"
+    )
+    prefix = f"{job_id}."
+    sessions = set()
+    for name in listing.split():
+        if not name.startswith(prefix):
+            continue
+        try:
+            step_id = int(name.rsplit(".", 1)[-1])
+        except ValueError:
+            continue
+        if step_id >= _RESERVED_STEP_FLOOR:
+            sessions.add(name)
+    return sessions
+
+
+# The reserved-range floor above also matches the allocation's own
+# batch/extern placeholder, which exists well before a nested `srun --pty`.
+_STEP_INTERACTIVE = 0xFFFFFFFA
+
+
+def _interactive_step_session_for_job(cluster, job_id: int, node_index: int = 0) -> set[str]:
+    return {
+        name
+        for name in _reserved_step_sessions_for_job(cluster, job_id, node_index)
+        if name.rsplit(".", 1)[-1] == str(_STEP_INTERACTIVE)
+    }
+
+
+def _wait_for_interactive_step_session(cluster, job_id: int, timeout: int = 30) -> set[str]:
+    deadline = time.time() + timeout
+    sessions: set[str] = set()
+    while time.time() < deadline:
+        sessions = _interactive_step_session_for_job(cluster, job_id)
+        if sessions:
+            break
+        time.sleep(1)
+    return sessions
+
+
+def _assert_ticks_not_replayed(out: str, ticks: int = 20) -> None:
+    """A shell relaunched from scratch after a restart repeats its early
+    ticks; a reconnect racing the restart only drops a line or two of a
+    terminal it can't buffer while disconnected. Duplicates, not gaps,
+    are what distinguish a restart from a clean reconnect.
+    """
+    duplicated = [i for i in range(1, ticks + 1) if out.count(f"tick {i}\r\n") > 1]
+    assert not duplicated, f"tick(s) {duplicated} repeated — the shell was restarted:\n{out}"
+
 
 class TestSrunPtyStep:
     def test_pty_step_runs_on_a_tty(self, cluster):
@@ -79,7 +160,7 @@ class TestSrunPtyStep:
         assert code == 0, out
         assert "--output/--error are not applied" in out, out
         assert "--chdir does not move a --pty step" in out, out
-        assert "--cpu-bind/--gpu-bind/--label/--mpi are ignored" in out, out
+        assert "--cpu-bind/--gpu-bind/--label/--mpi/--export are ignored" in out, out
 
     def test_step_warnings_are_emitted_exactly_once(self, cluster):
         # The pty path chains both helpers and returns before dispatch_step, so
@@ -122,3 +203,235 @@ class TestSrunPtyStepMultiNode:
         assert code == 0, out
         hosts = {ln.split("=", 1)[1].strip() for ln in out.splitlines() if ln.startswith("NODE=")}
         assert hosts == {target}, out
+
+
+class TestSrunPtyStepSupervision:
+    """A `--pty` step used to run as a bare child of spurd, with no supervisor
+    to outlive an agent restart. It now gets one, like any other step."""
+
+    def test_pty_step_survives_an_agent_restart(self, cluster):
+        result: dict[str, object] = {}
+        job_name = f"pty-restart-survival-{time.time_ns()}"
+        # Pinned: the session check and the restart both target node 0, so an
+        # unpinned allocation could land elsewhere and make both a no-op.
+        node = cluster.node_names[0]
+
+        def run():
+            result["code"], result["out"] = cluster.salloc_run(
+                "srun --pty bash -c '"
+                "for i in $(seq 1 180); do echo tick $i; sleep 1; done; "
+                "echo SURVIVED'\n",
+                # `-t` rounds up to whole minutes (Slurm's MM:SS form, div_ceil) —
+                # 6:00 covers the workload plus worst-case restart/poll overhead.
+                salloc_args=["-N", "1", "-w", node, "-t", "6:00", "-J", job_name],
+            )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            deadline = time.time() + 30
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id, "expected the allocation to appear before the restart"
+
+            before = _wait_for_interactive_step_session(cluster, job_id)
+            assert before, (
+                f"expected a session for the pty step (step id {_STEP_INTERACTIVE:#x}) "
+                "before the restart"
+            )
+
+            cluster.restart_agent(0)
+            cluster.wait_agent_serving(0)
+
+            # Identity, not count: a supervisor killed with the agent and
+            # respawned afterwards would satisfy any "still one running" check.
+            after = _interactive_step_session_for_job(cluster, job_id)
+            assert before <= after, (
+                "the pty step's supervisor must outlive the agent that spawned it: "
+                f"{sorted(before)} before the restart, {sorted(after)} after"
+            )
+        finally:
+            thread.join(timeout=200)
+
+        assert result.get("code") == 0, result.get("out")
+        out = str(result.get("out"))
+        assert "SURVIVED" in out, out
+        _assert_ticks_not_replayed(out, ticks=180)
+
+    def test_interactive_session_ending_does_not_end_the_allocation(self, cluster):
+        # salloc's own $SHELL runs on the client and keeps going regardless,
+        # so check the job's own state from inside it, not just shell output.
+        code, out = cluster.salloc_run(
+            "srun --pty bash -c 'echo hi-from-pty; sleep 2'\n"
+            "echo AFTER_PTY\n"
+            'scontrol show job "$SPUR_JOB_ID" | grep -o "JobState=[A-Z]*"\n'
+            "sleep 5\n"
+            "echo END_OF_SHELL\n"
+        )
+        assert code == 0, out
+        assert "AFTER_PTY" in out, (
+            f"the allocation ended when the interactive session did:\n{out}"
+        )
+        assert "JobState=RUNNING" in out, (
+            f"the allocation's own workload was killed off by the terminal session:\n{out}"
+        )
+        assert "END_OF_SHELL" in out, (
+            f"the allocation's own shell did not survive to its own natural end:\n{out}"
+        )
+
+    def test_standalone_pty_srun_does_not_run_the_command_twice(self, cluster):
+        # The interactive session runs the real command; the job's own
+        # placeholder used to run it a second, unwatched time in its own
+        # redundant container/environment.
+        marker = f"{cluster.remote_dir}/pty-once-marker.txt"
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02", "--pty",
+            "bash", "-c", f"echo ran >> '{marker}'",
+        ])
+        assert code == 0, out
+        content = cluster.read_output_on_any_node(marker)
+        assert content.count("ran") == 1, (
+            f"the command must run exactly once, not once per placeholder:\n{content}"
+        )
+        job_id = re.search(r"Pending job allocation (\d+)", out)
+        assert job_id, out
+        job_info = cluster.scontrol("show", "job", job_id.group(1))
+        assert "Command=sleep infinity" in job_info, (
+            f"the job's own placeholder must not carry the real command:\n{job_info}"
+        )
+
+    def test_standalone_pty_srun_job_completes_cleanly(self, cluster):
+        # A standalone --pty session used to always leave the job CANCELLED in
+        # sacct/scontrol, even on a clean exit — assert the real outcome lands.
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02", "--pty", "bash", "-c", "exit 0",
+        ])
+        assert code == 0, out
+        job_id = re.search(r"Pending job allocation (\d+)", out)
+        assert job_id, out
+        job_info = cluster.scontrol("show", "job", job_id.group(1))
+        assert "JobState=COMPLETED" in job_info, job_info
+        assert "JobState=CANCELLED" not in job_info, job_info
+
+    def test_standalone_pty_srun_job_records_a_nonzero_exit_code(self, cluster):
+        # A nonzero exit is still a real answer from the remote session, not
+        # grounds to record the job as cancelled.
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02", "--pty", "bash", "-c", "exit 7",
+        ])
+        assert code == 7, out
+        job_id = re.search(r"Pending job allocation (\d+)", out)
+        assert job_id, out
+        job_info = cluster.scontrol("show", "job", job_id.group(1))
+        assert "JobState=FAILED" in job_info, job_info
+        assert "ExitCode=7:0" in job_info, job_info
+
+    def test_standalone_pty_srun_job_survives_an_agent_restart(self, cluster):
+        # Standalone `srun --pty` (no salloc) submits its own job through the
+        # same LaunchJob path as sbatch; that job's own supervisor must be
+        # just as durable, not skipped because the job happens to be --pty.
+        result: dict[str, object] = {}
+        job_name = f"standalone-pty-restart-{time.time_ns()}"
+        node = cluster.node_names[0]
+
+        def run():
+            result["code"], result["out"] = cluster.srun_with_exit([
+                # "0:05" rounds up to a 60s limit (MM:SS, div_ceil to whole
+                # minutes) — 6:00 covers the workload plus restart overhead.
+                "-N", "1", "-w", node, "-t", "6:00", "-J", job_name, "--pty",
+                "bash", "-c",
+                "for i in $(seq 1 180); do echo tick $i; sleep 1; done; echo SURVIVED",
+            ])
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            deadline = time.time() + 30
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id, "expected the standalone job to appear before the restart"
+
+            before = _wait_for_interactive_step_session(cluster, job_id)
+            assert before, (
+                f"expected the job's own supervisor (step id {_STEP_INTERACTIVE:#x}) "
+                "before the restart"
+            )
+
+            cluster.restart_agent(0)
+            cluster.wait_agent_serving(0)
+
+            after = _interactive_step_session_for_job(cluster, job_id)
+            assert before <= after, (
+                "a standalone --pty job's own supervisor must outlive the agent "
+                f"that spawned it: {sorted(before)} before, {sorted(after)} after"
+            )
+        finally:
+            thread.join(timeout=200)
+
+        assert result.get("code") == 0, result.get("out")
+        out = str(result.get("out"))
+        assert "SURVIVED" in out, out
+        _assert_ticks_not_replayed(out, ticks=180)
+
+        # The clean exit must land as COMPLETED, not the unconditional
+        # CANCELLED a standalone --pty job used to get after any session end.
+        job_info = cluster.scontrol("show", "job", str(job_id))
+        assert "JobState=COMPLETED" in job_info, job_info
+        assert "JobState=CANCELLED" not in job_info, job_info
+
+    def test_srun_pty_reconnects_after_the_agent_restarts(self, cluster):
+        # A dropped mid-session stream (the agent restarting) must be
+        # retried by the CLI, not reported as if the workload itself failed.
+        result: dict[str, object] = {}
+        job_name = f"pty-reconnect-{time.time_ns()}"
+        node = cluster.node_names[0]
+
+        def run():
+            result["code"], result["out"] = cluster.salloc_run(
+                "srun --pty bash -c '"
+                "for i in $(seq 1 180); do echo tick $i; sleep 1; done; "
+                "echo SURVIVED'\n",
+                # "0:05" rounds up to a 60s limit (MM:SS, div_ceil to whole
+                # minutes) — 6:00 covers the workload plus restart overhead.
+                salloc_args=["-N", "1", "-w", node, "-t", "6:00", "-J", job_name],
+            )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        try:
+            deadline = time.time() + 30
+            job_id = None
+            while time.time() < deadline:
+                ids = cluster.running_job_ids_by_name(job_name)
+                if ids:
+                    job_id = ids[0]
+                    break
+                time.sleep(1)
+            assert job_id, "expected the allocation to appear before the restart"
+
+            before = _wait_for_interactive_step_session(cluster, job_id)
+            assert before, (
+                f"expected a session for the pty step (step id {_STEP_INTERACTIVE:#x}) "
+                "before the restart"
+            )
+
+            cluster.restart_agent(0)
+            cluster.wait_agent_serving(0)
+        finally:
+            thread.join(timeout=200)
+
+        assert result.get("code") == 0, result.get("out")
+        out = str(result.get("out"))
+        assert "reconnecting" in out, f"the client must report the dropped stream:\n{out}"
+        assert "SURVIVED" in out, out
+        _assert_ticks_not_replayed(out, ticks=180)

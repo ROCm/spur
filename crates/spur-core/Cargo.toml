@@ -19,6 +19,8 @@ regex = { workspace = true }
 tracing = { workspace = true }
 prost-types = { workspace = true }
 jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+aws-lc-rs = "1.18"
 sha2 = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }

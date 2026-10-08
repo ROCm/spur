@@ -18,7 +18,9 @@ subtrees:
         subtrees:
           - entries:
               - file: admin-guide/configuration
+              - file: admin-guide/rbac
               - file: admin-guide/accounting
+              - file: admin-guide/idle-fill-scheduling
               - file: admin-guide/dme-integration
       - file: deployment/index
         subtrees:
@@ -38,3 +40,4 @@ subtrees:
               - file: developer/building
               - file: developer/documentation
               - file: developer/contributing
+              - file: developer/native-credential-mint

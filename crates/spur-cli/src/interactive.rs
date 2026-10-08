@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    interactive_input, interactive_output, GetJobRequest, InitSession, InteractiveInput,
-    JobKeepaliveRequest,
+    interactive_input, interactive_output, CancelJobRequest, GetJobRequest, InitSession,
+    InteractiveInput, JobKeepaliveRequest,
 };
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -80,15 +80,18 @@ pub(crate) fn agent_port_or_default(port: u32) -> u32 {
 
 /// Connect to a spurd agent, presenting the caller's credential if one is available.
 ///
-/// The agent authenticates callers with the same JWT mechanism as the controller. A user token
-/// from `$SPUR_AUTH_TOKEN` / `~/.spur/token` is signed with the cluster key and will be accepted.
-/// Without a token the connection still succeeds against agents in `permissive` mode, but will be
-/// refused in `required` mode.
+/// Native `plugin = "spur"` Pings the agent for audience/epoch, then mints a
+/// matching credential. JWT plugins attach `$SPUR_AUTH_TOKEN` / `~/.spur/token`.
 pub async fn connect_agent(addr: &str) -> Result<SlurmAgentClient<crate::authclient::AuthChannel>> {
     let channel = spur_client::connect_channel(addr)
         .await
         .context("cannot connect to agent")?;
-    Ok(SlurmAgentClient::new(crate::authclient::wrap(channel))
+    let wrapped = if crate::authclient::plugin_is_spur() {
+        crate::authclient::wrap_after_agent_ping(channel).await?
+    } else {
+        crate::authclient::wrap_with_audience(channel, addr)
+    };
+    Ok(SlurmAgentClient::new(wrapped)
         .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
         .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE))
 }
@@ -164,8 +167,39 @@ pub async fn resolve_job_owner_for_cancel(
     }
 }
 
+/// Spawn a Ctrl-C handler that cancels `job_id` and exits 130.
+pub fn install_ctrl_c_cancel(
+    client: SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    submit_user: String,
+    tool: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut client = client;
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\n{tool}: cancelling job {job_id}...");
+            let cancel_user = resolve_job_owner_for_cancel(&mut client, job_id, &submit_user).await;
+            let _ = client
+                .cancel_job(CancelJobRequest {
+                    job_id,
+                    signal: 2,
+                    user: cancel_user,
+                })
+                .await;
+            std::process::exit(130);
+        }
+    })
+}
+
 /// Propagate the caller's auth token into a child process (allocation shell).
+///
+/// Native plugin callers mint from the local socket in the child; copying a
+/// JWT would paper over that and reuse a long-lived bearer.
 pub fn inherit_auth_token(cmd: &mut tokio::process::Command) {
+    if crate::authclient::plugin_is_spur() {
+        cmd.env_remove("SPUR_AUTH_TOKEN");
+        return;
+    }
     if let Ok(token) = std::env::var("SPUR_AUTH_TOKEN") {
         if !token.trim().is_empty() {
             cmd.env("SPUR_AUTH_TOKEN", token);
@@ -206,6 +240,7 @@ pub async fn open_interactive_session(
     overlap: bool,
     user: &str,
     container: Option<spur_proto::proto::ContainerSpec>,
+    execution_credential: String,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
     // Non-TTY stdin (script, pipe, redirect) closes the input stream on EOF, not
     // on hangup. Flag it so the agent drains output instead of SIGHUP-ing the
@@ -223,6 +258,7 @@ pub async fn open_interactive_session(
             user: user.to_string(),
             container,
             non_interactive,
+            execution_credential,
         })),
     };
 
@@ -284,11 +320,12 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
                             None => {}
                         }
                     }
-                    Ok(None) => break 1,
-                    Err(e) => {
-                        eprintln!("\r\nstream error: {e}");
-                        break 1;
+                    // No real exit status here, so faking one would look like
+                    // the workload itself failed — let the caller retry instead.
+                    Ok(None) => {
+                        anyhow::bail!("interactive session stream closed without an exit status")
                     }
+                    Err(e) => anyhow::bail!("interactive session stream error: {e}"),
                 }
             }
 
@@ -342,12 +379,19 @@ pub async fn run_interactive_session(
     overlap: bool,
     user: &str,
 ) -> Result<i32> {
-    let handle =
-        open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, user, None)
-            .await
-            .map_err(|status| {
-                anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message())
-            })?;
+    let handle = open_interactive_session(
+        agent,
+        job_id,
+        step_id,
+        argv,
+        winsize,
+        overlap,
+        user,
+        None,
+        String::new(),
+    )
+    .await
+    .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
     drive_interactive_session(handle).await
 }
 
@@ -484,6 +528,35 @@ mod tests {
         let mut client = mock_controller::client(addr).await;
         let user = resolve_job_owner_for_cancel(&mut client, 3, "submit-wire-name").await;
         assert_eq!(user, "submit-wire-name");
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn inherit_auth_token_skips_bearer_when_plugin_is_spur() {
+        let _env = EnvGuard::new();
+        std::env::set_var("SPUR_AUTH_PLUGIN", "spur");
+        std::env::set_var("SPUR_AUTH_TOKEN", "test-jwt-token");
+        let mut cmd = tokio::process::Command::new("/bin/true");
+        cmd.env("SPUR_AUTH_TOKEN", "test-jwt-token");
+        inherit_auth_token(&mut cmd);
+        let envs: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|s| s.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            !envs.contains_key("SPUR_AUTH_TOKEN")
+                || envs
+                    .get("SPUR_AUTH_TOKEN")
+                    .and_then(|v| v.as_deref())
+                    .is_none(),
+            "native plugin must not export a JWT into the allocation shell"
+        );
     }
 
     #[test]

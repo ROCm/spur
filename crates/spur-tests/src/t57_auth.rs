@@ -69,6 +69,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin: false,
+            trusted_unix: false,
         };
         assert!(id.can_cancel_job("alice").is_ok());
     }
@@ -80,6 +81,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin: false,
+            trusted_unix: false,
         };
         let result = id.can_cancel_job("bob");
         assert!(result.is_err());
@@ -100,6 +102,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin: false,
+            trusted_unix: false,
         };
         assert!(id.can_modify_job("alice").is_ok());
         assert!(id.can_modify_job("bob").is_err());
@@ -112,6 +115,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin: false,
+            trusted_unix: false,
         };
         assert!(user.require_admin().is_err());
         assert!(Identity::admin().require_admin().is_ok());

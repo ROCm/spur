@@ -31,7 +31,8 @@ pub struct ScontrolArgs {
 pub enum ScontrolCommand {
     /// Show detailed information
     Show {
-        /// Entity type: job, node, partition, reservation, assoc_mgr, federation, config
+        /// Entity type: job, node, partition, reservation, assoc_mgr, federation,
+        /// config, hostnames, hostlist, hostlistsorted
         entity: String,
         /// Entity name or ID
         name: Option<String>,
@@ -316,10 +317,15 @@ pub async fn main() -> Result<()> {
 }
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
-    let args = ScontrolArgs::try_parse_from(&args)?;
+    let args = crate::clap_exit::parse_or_exit::<ScontrolArgs>(&args);
 
     match args.command {
         ScontrolCommand::Show { entity, name } => {
+            let env = job_nodelist_env(|v| std::env::var(v).ok());
+            if let Some(out) = show_hostlist(&entity, name.as_deref(), env.as_deref()) {
+                print!("{}", out?);
+                return Ok(());
+            }
             show(&args.controller, &entity, name.as_deref()).await
         }
         ScontrolCommand::Ping => ping(&args.controller).await,
@@ -566,18 +572,77 @@ fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> St
     )
 }
 
+/// The job's nodelist from the environment: `SLURM_JOB_NODELIST`, else
+/// `SPUR_JOB_NODELIST`. A blank value counts as absent. `lookup` is injected
+/// so precedence is testable without touching the process environment.
+fn job_nodelist_env(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["SLURM_JOB_NODELIST", "SPUR_JOB_NODELIST"]
+        .into_iter()
+        .filter_map(lookup)
+        .find(|v| !v.trim().is_empty())
+}
+
+/// `scontrol show hostnames|hostlist|hostlistsorted`: local hostlist transforms
+/// that never contact the controller. `None` if `entity` is not one of them.
+fn show_hostlist(
+    entity: &str,
+    arg: Option<&str>,
+    env_nodelist: Option<&str>,
+) -> Option<Result<String>> {
+    let arg = normalize_show_name(arg);
+    match entity.to_lowercase().as_str() {
+        "hostnames" => {
+            let Some(list) = arg.or(normalize_show_name(env_nodelist)) else {
+                return Some(Err(anyhow::anyhow!(
+                    "scontrol show hostnames: no hostlist given and neither \
+                     SLURM_JOB_NODELIST nor SPUR_JOB_NODELIST is set"
+                )));
+            };
+            Some(
+                spur_core::hostlist::expand(list)
+                    .context("invalid hostlist")
+                    .map(|hosts| hosts.iter().map(|h| format!("{h}\n")).collect()),
+            )
+        }
+        "hostlist" | "hostlistsorted" => {
+            let Some(list) = arg else {
+                return Some(Err(anyhow::anyhow!(
+                    "scontrol show {entity}: a hostlist argument is required"
+                )));
+            };
+            Some(
+                spur_core::hostlist::expand(list)
+                    .context("invalid hostlist")
+                    .map(|hosts| {
+                        let compressed = spur_core::hostlist::compress(&hosts);
+                        if compressed.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{compressed}\n")
+                        }
+                    }),
+            )
+        }
+        _ => None,
+    }
+}
+
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
+    let entity = entity.to_lowercase();
+    // Parsed before connecting so a malformed id surfaces its own error, not a connect failure.
+    let job_ids = match entity.as_str() {
+        "job" | "jobs" => parse_show_job_ids(name)?,
+        _ => Vec::new(),
+    };
+
     let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
 
-    match entity.to_lowercase().as_str() {
+    match entity.as_str() {
         "job" | "jobs" => {
-            let job_ids = name
-                .map(|n| vec![n.parse::<u32>().unwrap_or(0)])
-                .unwrap_or_default();
-
+            let requested_job_id = job_ids.first().copied();
             let resp = client
                 .get_jobs(spur_proto::proto::GetJobsRequest {
                     job_ids,
@@ -586,7 +651,17 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .await
                 .context("failed to get jobs")?;
 
-            for job in resp.into_inner().jobs {
+            let jobs = resp.into_inner().jobs;
+            // A specific id that matches nothing exits non-zero, matching Slurm,
+            // so a script can tell a gone job from one still in the queue. With
+            // no id filter, an empty cluster just prints nothing.
+            if jobs.is_empty() {
+                if let Some(id) = requested_job_id {
+                    bail!("Job {id} not found");
+                }
+            }
+
+            for job in jobs {
                 print!("{}", format_job_detail(&job));
             }
         }
@@ -791,13 +866,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!("No steps found for job {}", job_id);
             } else {
                 for step in steps {
-                    let step_name = if step.step_id == 0xFFFF_FFFE {
-                        "batch".to_string()
-                    } else if step.step_id == 0xFFFF_FFFD {
-                        "extern".to_string()
-                    } else {
-                        step.step_id.to_string()
-                    };
+                    let step_name = spur_core::step::step_display_name(step.step_id);
                     println!(
                         "StepId={}.{} StepName={} State={} NumTasks={}",
                         step.job_id, step_name, step.name, step.state, step.num_tasks
@@ -849,7 +918,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
         }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, hostnames, hostlist, hostlistsorted",
                 other
             );
         }
@@ -1685,6 +1754,17 @@ async fn update_node(
 /// so the CLI and the server (which also trims) never disagree.
 fn normalize_show_name(name: Option<&str>) -> Option<&str> {
     name.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Job-id filter for `scontrol show job [id]`; an empty list requests every job.
+fn parse_show_job_ids(name: Option<&str>) -> Result<Vec<u32>> {
+    let Some(n) = normalize_show_name(name) else {
+        return Ok(Vec::new());
+    };
+    let id = n
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid job id specified: {n}"))?;
+    Ok(vec![id])
 }
 
 /// Split a comma-separated list into trimmed, non-empty entries.
@@ -2660,6 +2740,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn show_hostnames_does_not_contact_controller() {
+        // Point at an address nothing listens on. The command must still succeed,
+        // which proves it returns before ever attempting to connect.
+        main_with_args(vec![
+            "scontrol".into(),
+            "--controller".into(),
+            "http://127.0.0.1:1".into(),
+            "show".into(),
+            "hostnames".into(),
+            "n[1-3]".into(),
+        ])
+        .await
+        .expect("hostnames must not contact the controller");
+    }
+
+    #[test]
+    fn show_hostlist_missing_arg_echoes_original_casing() {
+        let err = show_hostlist("HostList", None, None)
+            .expect("hostlist is a hostlist entity")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("scontrol show HostList:"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn scontrol_update_expands_hostlist() {
         let (addr, capture) = crate::mock_controller::spawn().await;
         main_with_args(vec![
@@ -2715,6 +2822,49 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(capture.update_node_names().is_empty());
+    }
+
+    #[test]
+    fn parse_show_job_ids_rejects_a_malformed_id() {
+        for bad in ["abc", "12abc", "4294967296"] {
+            let err = parse_show_job_ids(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("Invalid job id specified: {bad}")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_show_job_ids_accepts_an_id_or_none() {
+        assert_eq!(parse_show_job_ids(Some(" 42 ")).unwrap(), vec![42]);
+        assert!(parse_show_job_ids(None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn show_job_rejects_a_malformed_id_before_contacting_the_controller() {
+        // Nothing listens on port 1, so any network I/O would fail with a connect error first.
+        let err = show("http://127.0.0.1:1", "job", Some("abc"))
+            .await
+            .expect_err("a malformed job id must fail");
+        assert!(
+            err.to_string().contains("Invalid job id specified: abc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_job_reports_not_found_for_an_unknown_id() {
+        // The mock returns no jobs, so a well-formed id that matches nothing must
+        // fail (exit non-zero), not print nothing and succeed.
+        let (addr, _capture) = crate::mock_controller::spawn().await;
+        let err = show(&format!("http://{addr}"), "job", Some("999999"))
+            .await
+            .expect_err("an unknown job id must fail");
+        assert!(
+            err.to_string().contains("Job 999999 not found"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2783,5 +2933,125 @@ mod tests {
         let parsed = parse_reservation_create_params(&params).unwrap();
         assert_eq!(parsed.name, "r1");
         assert_eq!(parsed.duration_minutes, 30 * 24 * 60);
+    }
+
+    #[test]
+    fn show_hostnames_expands_in_order_one_per_line() {
+        let out = show_hostlist("hostnames", Some("n[1-3],gpu01"), None)
+            .expect("hostnames is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "n1\nn2\nn3\ngpu01\n");
+    }
+
+    #[test]
+    fn show_hostnames_is_case_insensitive() {
+        let out = show_hostlist("HostNames", Some("n[1-2]"), None)
+            .expect("entity match ignores case")
+            .expect("valid pattern");
+        assert_eq!(out, "n1\nn2\n");
+    }
+
+    #[test]
+    fn show_hostnames_falls_back_to_env_nodelist() {
+        let out = show_hostlist("hostnames", None, Some("a[1-2]"))
+            .expect("hostnames is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "a1\na2\n");
+    }
+
+    #[test]
+    fn show_hostnames_argument_overrides_env() {
+        let out = show_hostlist("hostnames", Some("b1"), Some("a[1-2]"))
+            .expect("hostnames is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "b1\n");
+    }
+
+    #[test]
+    fn show_hostnames_errors_when_no_arg_and_no_env() {
+        let err = show_hostlist("hostnames", None, None)
+            .expect("hostnames is a hostlist entity")
+            .unwrap_err();
+        assert!(err.to_string().contains("SLURM_JOB_NODELIST"), "got: {err}");
+    }
+
+    #[test]
+    fn show_hostnames_blank_arg_counts_as_missing() {
+        let err = show_hostlist("hostnames", Some("   "), None)
+            .expect("hostnames is a hostlist entity")
+            .unwrap_err();
+        assert!(err.to_string().contains("SLURM_JOB_NODELIST"), "got: {err}");
+    }
+
+    #[test]
+    fn show_hostlist_compresses_and_sorts() {
+        let out = show_hostlist("hostlist", Some("n3,n1,n2,n2"), None)
+            .expect("hostlist is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "n[1-3]\n");
+    }
+
+    #[test]
+    fn show_hostlistsorted_matches_hostlist() {
+        let out = show_hostlist("hostlistsorted", Some("n3,n1,n2"), None)
+            .expect("hostlistsorted is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "n[1-3]\n");
+    }
+
+    #[test]
+    fn show_hostlist_requires_arg_even_with_env() {
+        let err = show_hostlist("hostlist", None, Some("a[1-2]"))
+            .expect("hostlist is a hostlist entity")
+            .unwrap_err();
+        assert!(err.to_string().contains("required"), "got: {err}");
+    }
+
+    #[test]
+    fn show_hostlist_rejects_invalid_pattern() {
+        let err = show_hostlist("hostnames", Some("n[3-1"), None)
+            .expect("hostnames is a hostlist entity")
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid hostlist"), "got: {err}");
+    }
+
+    #[test]
+    fn show_hostlist_passes_through_other_entities() {
+        assert!(show_hostlist("job", Some("1024"), None).is_none());
+        assert!(show_hostlist("node", Some("n1"), None).is_none());
+    }
+
+    #[test]
+    fn show_hostlist_empty_expansion_prints_nothing() {
+        let out = show_hostlist("hostlist", Some(","), None)
+            .expect("hostlist is a hostlist entity")
+            .expect("valid pattern");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn job_nodelist_env_prefers_slurm() {
+        let env = |v: &str| match v {
+            "SLURM_JOB_NODELIST" => Some("s[1-2]".to_string()),
+            "SPUR_JOB_NODELIST" => Some("p1".to_string()),
+            _ => None,
+        };
+        assert_eq!(job_nodelist_env(env).as_deref(), Some("s[1-2]"));
+    }
+
+    #[test]
+    fn job_nodelist_env_empty_slurm_falls_back_to_spur() {
+        let env = |v: &str| match v {
+            "SLURM_JOB_NODELIST" => Some("   ".to_string()),
+            "SPUR_JOB_NODELIST" => Some("p1".to_string()),
+            _ => None,
+        };
+        assert_eq!(job_nodelist_env(env).as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn job_nodelist_env_none_when_all_unset_or_blank() {
+        assert_eq!(job_nodelist_env(|_| None), None);
+        assert_eq!(job_nodelist_env(|_| Some(String::new())), None);
     }
 }

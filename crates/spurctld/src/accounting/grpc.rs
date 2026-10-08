@@ -9,7 +9,25 @@ use spur_core::accounting::{limit_to_wire, TresRecord};
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
 
-use super::{db, fairshare};
+use super::{db, fairshare, txn};
+use crate::audit::Annotation;
+
+fn internal(e: impl std::fmt::Display) -> Status {
+    Status::internal(e.to_string())
+}
+
+/// On the caller's transaction, so the row commits with the change or not at
+/// all. A failure fails the mutation, rather than applying it unaudited.
+async fn write_txn_in_band(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    audit: &crate::audit::InBand,
+    annotation: Annotation,
+) -> Result<(), Status> {
+    let Some(record) = audit.row(annotation) else {
+        return Ok(());
+    };
+    db::record_txn(tx, &record).await.map_err(internal)
+}
 
 /// Reject a TRES string (e.g. `grptres=`/`maxtresperjob=`/`maxtresperuser=`)
 /// that doesn't parse, instead of letting it silently become a no-op limit.
@@ -87,13 +105,35 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
     Ok(v as i32)
 }
 
-/// Rejects an identified non-admin from an account/user/QOS mutation; anonymous is allowed, same as
-/// the controller's gate. Narrower than `caller_is_admin`: token `admin` claim only, no cache handle here.
-fn require_admin<T>(request: &Request<T>, op: &str) -> Result<(), Status> {
-    let denied = || Status::permission_denied(format!("{op} requires cluster admin"));
-    match request.extensions().get::<spur_core::auth::Identity>() {
-        Some(id) => id.require_admin().map_err(|_| denied()),
-        None => Ok(()),
+/// Rejects an identified caller below Operator from an account/user/QOS mutation.
+/// Anonymous is allowed, matching the controller's gate.
+fn require_admin_identity(
+    identity: Option<&spur_core::auth::Identity>,
+    auth: &spur_core::config::AuthConfig,
+    cache: Option<&crate::association_cache::AssociationCache>,
+    op: &str,
+) -> Result<(), Status> {
+    let denied = || {
+        spur_core::native_metrics::inc_role_deny();
+        Status::permission_denied(format!("{op} requires cluster operator or administrator"))
+    };
+    let Some(id) = identity else {
+        return Ok(());
+    };
+    let (level, loaded) = match cache {
+        Some(cache) => (cache.admin_level(&id.user), cache.is_loaded()),
+        None => (None, false),
+    };
+    let groups = if auth.admin_groups.is_empty() && auth.operator_groups.is_empty() {
+        Vec::new()
+    } else {
+        spur_core::privilege::named_user_groups(&id.user).unwrap_or_default()
+    };
+    let role = spur_core::rbac::resolve_role(id, auth, level.as_deref(), loaded, &groups, false);
+    if role.operates_jobs() {
+        Ok(())
+    } else {
+        Err(denied())
     }
 }
 
@@ -110,6 +150,8 @@ pub(crate) struct AccountingService {
 struct AccountingInner {
     pool: parking_lot::RwLock<Option<PgPool>>,
     reason: parking_lot::RwLock<&'static str>,
+    assoc: parking_lot::RwLock<Option<std::sync::Arc<crate::association_cache::AssociationCache>>>,
+    auth: parking_lot::RwLock<spur_core::config::AuthConfig>,
 }
 
 impl Clone for AccountingService {
@@ -126,6 +168,8 @@ impl AccountingService {
             inner: std::sync::Arc::new(AccountingInner {
                 pool: parking_lot::RwLock::new(None),
                 reason: parking_lot::RwLock::new(reason),
+                assoc: parking_lot::RwLock::new(None),
+                auth: parking_lot::RwLock::new(spur_core::config::AuthConfig::default()),
             }),
         }
     }
@@ -141,6 +185,34 @@ impl AccountingService {
     /// stale one.
     pub(crate) fn mark_unavailable(&self, reason: &'static str) {
         *self.inner.reason.write() = reason;
+    }
+
+    pub(crate) fn attach_association_cache(
+        &self,
+        cache: std::sync::Arc<crate::association_cache::AssociationCache>,
+    ) {
+        *self.inner.assoc.write() = Some(cache);
+    }
+
+    pub(crate) fn attach_auth(&self, auth: spur_core::config::AuthConfig) {
+        *self.inner.auth.write() = auth;
+    }
+
+    fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
+        let auth = self.inner.auth.read();
+        let assoc = self.inner.assoc.read();
+        require_admin_identity(
+            request.extensions().get::<spur_core::auth::Identity>(),
+            &auth,
+            assoc.as_ref().map(std::sync::Arc::as_ref),
+            op,
+        )
+    }
+
+    fn kick_assoc(&self) {
+        if let Some(cache) = self.inner.assoc.read().as_ref() {
+            cache.kick_refresh();
+        }
     }
 
     fn pool(&self) -> Result<PgPool, Status> {
@@ -207,6 +279,9 @@ impl SlurmAccounting for AccountingService {
                 submit_time,
                 start_time,
                 reservation: Some(req.reservation),
+                // The external accounting RPC carries no idle-fill notion; a run
+                // recorded through it is treated as an ordinary one.
+                idle_fill: false,
             },
         )
         .await
@@ -273,15 +348,7 @@ impl SlurmAccounting for AccountingService {
         let states: Vec<String> = req
             .states
             .iter()
-            .filter_map(|s| match *s {
-                3 => Some("COMPLETED".into()),
-                4 => Some("FAILED".into()),
-                5 => Some("CANCELLED".into()),
-                6 => Some("TIMEOUT".into()),
-                8 => Some("PREEMPTED".into()),
-                10 => Some("DEADLINE".into()),
-                _ => None,
-            })
+            .filter_map(|s| proto_job_state_to_db_str(*s).map(String::from))
             .collect();
 
         let user = if req.user.is_empty() {
@@ -319,17 +386,7 @@ impl SlurmAccounting for AccountingService {
                 uid: 0,
                 partition: r.partition.clone(),
                 account: r.account.clone(),
-                state: match r.state.as_str() {
-                    "COMPLETED" => JobState::JobCompleted as i32,
-                    "FAILED" => JobState::JobFailed as i32,
-                    "CANCELLED" => JobState::JobCancelled as i32,
-                    "TIMEOUT" => JobState::JobTimeout as i32,
-                    "PREEMPTED" => JobState::JobPreempted as i32,
-                    "DEADLINE" => JobState::JobDeadline as i32,
-                    "RUNNING" => JobState::JobRunning as i32,
-                    "PENDING" => JobState::JobPending as i32,
-                    _ => JobState::JobCompleted as i32,
-                },
+                state: db_job_state_str_to_proto(&r.state),
                 state_reason: String::new(),
                 submit_time: Some(datetime_to_proto(r.submit_time)),
                 start_time: r.start_time.map(datetime_to_proto),
@@ -367,6 +424,7 @@ impl SlurmAccounting for AccountingService {
                 preempted_by: r.preempted_by.unwrap_or(0),
                 preempt_mode: r.preempt_mode.clone(),
                 preempt_qos: r.preempt_qos.clone(),
+                idle_fill: r.idle_fill,
                 // Kept exhaustive so a new JobInfo field forces a decision here;
                 // the accounting store has no requested-placement columns.
                 req_nodelist: String::new(),
@@ -429,8 +487,8 @@ impl SlurmAccounting for AccountingService {
             let e = agg
                 .entry((r.user_name.clone(), r.account.clone()))
                 .or_default();
-            e.0 += r.cpu_seconds as f64 / 3600.0;
-            e.1 += r.gpu_seconds as f64 / 3600.0;
+            e.0 += r.cpu_seconds as f64;
+            e.1 += r.gpu_seconds as f64;
             e.2 += r.job_count;
         }
 
@@ -439,8 +497,8 @@ impl SlurmAccounting for AccountingService {
             .map(|((user, account), (cpu, gpu, jobs))| UsageEntry {
                 user,
                 account,
-                cpu_hours: cpu,
-                gpu_hours: gpu,
+                cpu_seconds: cpu,
+                gpu_seconds: gpu,
                 job_count: jobs,
             })
             .collect();
@@ -456,7 +514,8 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<CreateAccountRequest>,
     ) -> Result<Response<()>, Status> {
-        require_admin(&request, "create account")?;
+        self.require_admin(&request, "create account")?;
+        let audit = crate::audit::InBand::capture(&request, "CreateAccount");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -471,9 +530,29 @@ impl SlurmAccounting for AccountingService {
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             grp_tres: nullable_str(&req.grp_tres),
         };
-        db::upsert_account(pool, &req.name, update)
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let result = db::upsert_account(&mut tx, &req.name, update)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal)?;
+        let details = txn::requested(&[
+            ("description", req.description.map(Into::into)),
+            ("organization", req.organization.map(Into::into)),
+            ("parent_account", req.parent_account.map(Into::into)),
+            ("fairshare_weight", req.fairshare_weight.map(Into::into)),
+            ("max_running_jobs", req.max_running_jobs.map(Into::into)),
+            ("grp_tres", req.grp_tres.map(Into::into)),
+        ]);
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(&req.name, txn::with_changes(details, result.changed))
+                .action(result.outcome.action()),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -481,13 +560,24 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<DeleteAccountRequest>,
     ) -> Result<Response<()>, Status> {
-        require_admin(&request, "delete account")?;
+        self.require_admin(&request, "delete account")?;
+        let audit = crate::audit::InBand::capture(&request, "DeleteAccount");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
-        db::delete_account(pool, &req.name)
+        let mut tx = pool.begin().await.map_err(internal)?;
+        db::delete_account(&mut tx, &req.name)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal)?;
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(&req.name, txn::delete_details(None)),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -518,7 +608,8 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
-        require_admin(&request, "add user")?;
+        self.require_admin(&request, "add user")?;
+        let audit = crate::audit::InBand::capture(&request, "AddUser");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -597,9 +688,31 @@ impl SlurmAccounting for AccountingService {
             grp_tres: nullable_str(&req.grp_tres),
             max_wall_min: nullable_limit(req.max_wall_minutes, "max_wall_minutes")?,
         };
-        db::add_user(pool, &req.user, &req.account, update)
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let outcome = db::add_user(&mut tx, &req.user, &req.account, update)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal)?;
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(
+                &req.user,
+                txn::requested(&[
+                    ("account", Some(req.account.clone().into())),
+                    ("admin_level", admin_level.map(Into::into)),
+                    ("is_default", req.is_default.map(Into::into)),
+                    ("default_qos", req.default_qos.map(Into::into)),
+                    ("allowed_qos", allowed_qos_normalized.map(Into::into)),
+                    ("max_running_jobs", req.max_running_jobs.map(Into::into)),
+                    ("max_wall_minutes", req.max_wall_minutes.map(Into::into)),
+                ]),
+            )
+            .action(outcome.action()),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -607,14 +720,18 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<RemoveUserRequest>,
     ) -> Result<Response<()>, Status> {
-        require_admin(&request, "remove user")?;
+        self.require_admin(&request, "remove user")?;
+        let audit = crate::audit::InBand::capture(&request, "RemoveUser");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
-        let deleted = db::remove_user(pool, &req.user, &req.account)
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let deleted = db::remove_user(&mut tx, &req.user, &req.account)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal)?;
         if deleted == 0 {
+            // Dropping the transaction rolls back; nothing happened, so the
+            // layer records the NOT_FOUND attempt rather than this path.
             let target = if req.account.is_empty() {
                 format!("user '{}'", req.user)
             } else {
@@ -622,6 +739,23 @@ impl SlurmAccounting for AccountingService {
             };
             return Err(Status::not_found(format!("{target} does not exist")));
         }
+        // An empty account removes the user from every one of them, so record
+        // the scope only when the request narrowed it.
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(
+                &req.user,
+                txn::requested(&[(
+                    "account",
+                    (!req.account.is_empty()).then(|| req.account.clone().into()),
+                )]),
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -668,7 +802,8 @@ impl SlurmAccounting for AccountingService {
     }
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
-        require_admin(&request, "create qos")?;
+        self.require_admin(&request, "create qos")?;
+        let audit = crate::audit::InBand::capture(&request, "CreateQos");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -710,6 +845,7 @@ impl SlurmAccounting for AccountingService {
             .map(canonicalize_qos_flags)
             .transpose()?;
         let update = db::QosUpdate {
+            idle_fill_preemptable: req.idle_fill_preemptable,
             description: req.description.as_deref(),
             priority: req.priority,
             preempt_mode: req.preempt_mode.as_deref(),
@@ -737,20 +873,53 @@ impl SlurmAccounting for AccountingService {
             },
             flags: flags.as_deref(),
         };
-        db::upsert_qos(pool, &req.name, update)
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let result = db::upsert_qos(&mut tx, &req.name, update)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(internal)?;
+        let details = txn::requested(&[
+            ("description", req.description.map(Into::into)),
+            ("priority", req.priority.map(Into::into)),
+            ("preempt_mode", req.preempt_mode.map(Into::into)),
+            ("preempt", preempt_normalized.map(Into::into)),
+            ("usage_factor", req.usage_factor.map(Into::into)),
+            ("max_jobs_per_user", req.max_jobs_per_user.map(Into::into)),
+            ("max_wall_minutes", req.max_wall_minutes.map(Into::into)),
+            ("grp_wall_minutes", req.grp_wall_minutes.map(Into::into)),
+            ("max_tres_per_job", req.max_tres_per_job.map(Into::into)),
+            ("grp_tres", req.grp_tres.map(Into::into)),
+            ("flags", flags.map(Into::into)),
+        ]);
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(&req.name, txn::with_changes(details, result.changed))
+                .action(result.outcome.action()),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
     async fn delete_qos(&self, request: Request<DeleteQosRequest>) -> Result<Response<()>, Status> {
-        require_admin(&request, "delete qos")?;
+        self.require_admin(&request, "delete qos")?;
+        let audit = crate::audit::InBand::capture(&request, "DeleteQos");
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
-        db::delete_qos(pool, &req.name)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut tx = pool.begin().await.map_err(internal)?;
+        db::delete_qos(&mut tx, &req.name).await.map_err(internal)?;
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(&req.name, txn::delete_details(None)),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        self.kick_assoc();
         Ok(Response::new(()))
     }
 
@@ -767,6 +936,7 @@ impl SlurmAccounting for AccountingService {
         let qos_list = records
             .into_iter()
             .map(|r| QosInfo {
+                idle_fill_preemptable: r.idle_fill_preemptable,
                 name: r.name,
                 description: r.description,
                 priority: r.priority,
@@ -838,8 +1008,9 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetTransactionsRequest>,
     ) -> Result<Response<GetTransactionsResponse>, Status> {
-        // Ungated, consistent with get_job_history and the rest of this service.
-        // Confidentiality of the audit log requires auth.mode = required.
+        // Gated above the rest of this service: the log carries every user's
+        // actions and peer addresses, so it is not ordinary accounting data.
+        self.require_admin(&request, "show transactions")?;
         let pool = self.pool()?;
         let pool = &pool;
         let req = request.into_inner();
@@ -853,6 +1024,7 @@ impl SlurmAccounting for AccountingService {
             entity_name: (!req.entity_name.is_empty()).then_some(req.entity_name.as_str()),
             action: (!req.action.is_empty()).then_some(req.action.as_str()),
             outcome: (!req.outcome.is_empty()).then_some(req.outcome.as_str()),
+            peer_addr: (!req.peer_addr.is_empty()).then_some(req.peer_addr.as_str()),
             start_after,
             start_before,
             limit: req.limit,
@@ -868,7 +1040,7 @@ impl SlurmAccounting for AccountingService {
                 id: r.id,
                 timestamp: Some(datetime_to_proto(r.ts)),
                 actor: r.actor,
-                actor_uid: r.actor_uid.and_then(|u| u32::try_from(u).ok()).unwrap_or(0),
+                actor_uid: r.actor_uid.and_then(|u| u32::try_from(u).ok()),
                 verified: r.verified,
                 source: r.source,
                 action: r.action,
@@ -876,10 +1048,45 @@ impl SlurmAccounting for AccountingService {
                 entity_name: r.entity_name,
                 outcome: r.outcome,
                 details: r.details,
+                peer_addr: r.peer_addr,
             })
             .collect();
 
         Ok(Response::new(GetTransactionsResponse { transactions }))
+    }
+}
+
+fn proto_job_state_to_db_str(code: i32) -> Option<&'static str> {
+    match code {
+        0 => Some("PENDING"),
+        1 => Some("RUNNING"),
+        3 => Some("COMPLETED"),
+        4 => Some("FAILED"),
+        5 => Some("CANCELLED"),
+        6 => Some("TIMEOUT"),
+        7 => Some("NODE_FAIL"),
+        8 => Some("PREEMPTED"),
+        10 => Some("DEADLINE"),
+        11 => Some("OUT_OF_MEMORY"),
+        12 => Some("REQUEUED"),
+        _ => None,
+    }
+}
+
+fn db_job_state_str_to_proto(state: &str) -> i32 {
+    match state {
+        "COMPLETED" => JobState::JobCompleted as i32,
+        "FAILED" => JobState::JobFailed as i32,
+        "CANCELLED" => JobState::JobCancelled as i32,
+        "TIMEOUT" => JobState::JobTimeout as i32,
+        "NODE_FAIL" => JobState::JobNodeFail as i32,
+        "PREEMPTED" => JobState::JobPreempted as i32,
+        "DEADLINE" => JobState::JobDeadline as i32,
+        "OUT_OF_MEMORY" => JobState::JobOutOfMemory as i32,
+        "REQUEUED" => JobState::JobRequeued as i32,
+        "RUNNING" => JobState::JobRunning as i32,
+        "PENDING" => JobState::JobPending as i32,
+        _ => JobState::JobCompleted as i32,
     }
 }
 
@@ -909,6 +1116,59 @@ fn datetime_to_proto(dt: DateTime<Utc>) -> prost_types::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_fail_round_trips_through_the_history_filter_and_display_mapping() {
+        assert_eq!(
+            proto_job_state_to_db_str(JobState::JobNodeFail as i32),
+            Some("NODE_FAIL")
+        );
+        assert_eq!(
+            db_job_state_str_to_proto("NODE_FAIL"),
+            JobState::JobNodeFail as i32
+        );
+    }
+
+    #[test]
+    fn running_and_pending_states_are_preserved_in_the_history_filter() {
+        // A dropped code empties the states filter, which the query then
+        // treats as "match everything" instead of narrowing it.
+        assert_eq!(
+            proto_job_state_to_db_str(JobState::JobRunning as i32),
+            Some("RUNNING")
+        );
+        assert_eq!(
+            proto_job_state_to_db_str(JobState::JobPending as i32),
+            Some("PENDING")
+        );
+    }
+
+    #[test]
+    fn every_finalized_proto_state_maps_to_its_own_db_string_and_back() {
+        let finalized_states = [
+            (JobState::JobCompleted, "COMPLETED"),
+            (JobState::JobFailed, "FAILED"),
+            (JobState::JobCancelled, "CANCELLED"),
+            (JobState::JobTimeout, "TIMEOUT"),
+            (JobState::JobNodeFail, "NODE_FAIL"),
+            (JobState::JobPreempted, "PREEMPTED"),
+            (JobState::JobDeadline, "DEADLINE"),
+            (JobState::JobOutOfMemory, "OUT_OF_MEMORY"),
+            (JobState::JobRequeued, "REQUEUED"),
+        ];
+        for (proto_state, db_str) in finalized_states {
+            assert_eq!(
+                proto_job_state_to_db_str(proto_state as i32),
+                Some(db_str),
+                "states filter dropped {db_str}"
+            );
+            assert_eq!(
+                db_job_state_str_to_proto(db_str),
+                proto_state as i32,
+                "display mapping mis-mapped {db_str}"
+            );
+        }
+    }
 
     fn assert_startup_unavailable<T>(result: Result<Response<T>, Status>) {
         let status = match result {
@@ -1043,6 +1303,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             is_admin,
+            trusted_unix: false,
         }
     }
 
@@ -1053,21 +1314,41 @@ mod tests {
     /// gate binds real users only in `required` mode.
     #[test]
     fn require_admin_gates_accounting_mutations() {
+        let service = AccountingService::unavailable("no DB needed for this test");
         let mut admin = Request::new(AddUserRequest::default());
         admin.extensions_mut().insert(identity("root", true));
-        assert!(require_admin(&admin, "add user").is_ok());
+        assert!(service.require_admin(&admin, "add user").is_ok());
 
         let mut non_admin = Request::new(AddUserRequest::default());
         non_admin
             .extensions_mut()
             .insert(identity("mallory", false));
-        let err = require_admin(&non_admin, "add user").expect_err("non-admin must be rejected");
+        let err = service
+            .require_admin(&non_admin, "add user")
+            .expect_err("non-admin must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-        // No verified identity (disabled, or permissive with no credential) is allowed — the gate
-        // enforces once callers are identified, not in the non-enforcing modes.
         let anon = Request::new(AddUserRequest::default());
-        assert!(require_admin(&anon, "add user").is_ok());
+        assert!(service.require_admin(&anon, "add user").is_ok());
+    }
+
+    #[test]
+    fn cluster_admins_and_accounting_operator_pass_without_jwt_admin_claim() {
+        let service = AccountingService::unavailable("no DB needed for this test");
+        service.attach_auth(spur_core::config::AuthConfig {
+            cluster_admins: vec!["erin".into()],
+            ..Default::default()
+        });
+        let mut named = Request::new(AddUserRequest::default());
+        named.extensions_mut().insert(identity("erin", false));
+        assert!(service.require_admin(&named, "add user").is_ok());
+
+        let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
+        cache.insert_admin_level("bob", "Operator");
+        service.attach_association_cache(cache);
+        let mut op = Request::new(AddUserRequest::default());
+        op.extensions_mut().insert(identity("bob", false));
+        assert!(service.require_admin(&op, "add user").is_ok());
     }
 
     /// Table test over every gated accounting RPC, enumerated so a handler that drops its
@@ -1099,6 +1380,35 @@ mod tests {
         assert_admin_gated!(remove_user, RemoveUserRequest::default());
         assert_admin_gated!(create_qos, CreateQosRequest::default());
         assert_admin_gated!(delete_qos, DeleteQosRequest::default());
+        // A read, but gated with the mutations: it exposes every user's actions.
+        assert_admin_gated!(get_transactions, GetTransactionsRequest::default());
+    }
+
+    /// The audit read must not over-block. Reaching the query is what proves the
+    /// caller passed the gate: with no pool it can only fail `Unavailable`.
+    #[tokio::test]
+    async fn transactions_read_admits_operator_and_anonymous() {
+        let service = AccountingService::unavailable("no DB needed for this test");
+        let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
+        cache.insert_admin_level("bob", "Operator");
+        service.attach_association_cache(cache);
+
+        let mut operator = Request::new(GetTransactionsRequest::default());
+        operator.extensions_mut().insert(identity("bob", false));
+
+        let anonymous = Request::new(GetTransactionsRequest::default());
+
+        for (who, request) in [("operator", operator), ("anonymous", anonymous)] {
+            let err = service
+                .get_transactions(request)
+                .await
+                .expect_err("no pool is installed");
+            assert_eq!(
+                err.code(),
+                tonic::Code::Unavailable,
+                "{who} must reach the query rather than be denied"
+            );
+        }
     }
 
     /// Every spelling Slurm accepts must survive, and the admin ones must converge: `sacctmgr show
@@ -1259,5 +1569,123 @@ mod tests {
             timestamp_to_utc(Some(ts)).unwrap_err().code(),
             tonic::Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn usage_entry_returns_cpu_seconds_not_hours() {
+        let now = chrono::Utc::now();
+        let records = vec![
+            db::UsageRecord {
+                user_name: "alice".into(),
+                account: "research".into(),
+                cpu_seconds: 240,
+                gpu_seconds: 0,
+                job_count: 1,
+                period_start: now,
+            },
+            db::UsageRecord {
+                user_name: "alice".into(),
+                account: "research".into(),
+                cpu_seconds: 480,
+                gpu_seconds: 100,
+                job_count: 2,
+                period_start: now,
+            },
+        ];
+
+        let mut agg: std::collections::HashMap<(String, String), (f64, f64, u64)> =
+            std::collections::HashMap::new();
+        for r in &records {
+            let e = agg
+                .entry((r.user_name.clone(), r.account.clone()))
+                .or_default();
+            e.0 += r.cpu_seconds as f64;
+            e.1 += r.gpu_seconds as f64;
+            e.2 += r.job_count;
+        }
+
+        let entries: Vec<UsageEntry> = agg
+            .into_iter()
+            .map(|((user, account), (cpu, gpu, jobs))| UsageEntry {
+                user,
+                account,
+                cpu_seconds: cpu,
+                gpu_seconds: gpu,
+                job_count: jobs,
+            })
+            .collect();
+
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(
+            e.cpu_seconds, 720.0,
+            "must be raw seconds (240+480), not hours"
+        );
+        assert_eq!(e.gpu_seconds, 100.0);
+        assert_eq!(e.job_count, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn get_usage_handler_returns_cpu_seconds_not_hours() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await
+            .expect("DB connect");
+        db::migrate(&pool).await.expect("migrate");
+
+        let pid = std::process::id();
+        let user = format!("spur_unit_{pid}");
+        let acct = format!("spur_unitacct_{pid}");
+
+        let now = chrono::Utc::now();
+        let num_tasks: i32 = 1;
+        let cpus_per_task: i32 = 8;
+        let wall_secs: i64 = 30;
+
+        sqlx::query(
+            "INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count) \
+             VALUES ($1, $2, $3, $4, $5, 0, 1) \
+             ON CONFLICT (user_name, account, period_start) DO UPDATE SET \
+               cpu_seconds = usage.cpu_seconds + $5, job_count = usage.job_count + 1",
+        )
+        .bind(&user)
+        .bind(&acct)
+        .bind(now)
+        .bind(now + chrono::Duration::hours(1))
+        .bind(wall_secs * num_tasks as i64 * cpus_per_task as i64)
+        .execute(&pool)
+        .await
+        .expect("insert usage");
+
+        let service = AccountingService::unavailable("test");
+        service.install_pool(pool.clone());
+
+        let resp = service
+            .get_usage(tonic::Request::new(GetUsageRequest {
+                user: user.clone(),
+                account: acct.clone(),
+                since: None,
+            }))
+            .await
+            .expect("get_usage");
+
+        let entries = &resp.into_inner().entries;
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(
+            e.cpu_seconds,
+            (wall_secs * num_tasks as i64 * cpus_per_task as i64) as f64,
+            "handler must return raw cpu_seconds (240), not cpu_hours (0.067)"
+        );
+
+        sqlx::query("DELETE FROM usage WHERE user_name = $1 AND account = $2")
+            .bind(&user)
+            .bind(&acct)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }

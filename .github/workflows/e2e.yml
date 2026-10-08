@@ -278,6 +278,38 @@ jobs:
             ssh $SSH_OPTS -i "$KEY" ci@"$node" "echo '${PROF}' | sudo apparmor_parser -r 2>/dev/null || true"
           done
 
+      - name: Download baseline release binaries for upgrade tests
+        run: |
+          BASELINE_DIR="${{ env.RUN_DIR }}/baseline-binaries"
+          mkdir -p "$BASELINE_DIR"
+          # Download v0.14.0 tarball for version-to-version upgrade tests.
+          # Best-effort: if the download fails, the upgrade test skips
+          # gracefully via SPUR_TEST_BASELINE_BINARIES_DIR.
+          TMPDIR=$(mktemp -d /tmp/spur-baseline-XXXXXX)
+          gh release download v0.14.0 \
+            --repo "${{ github.repository }}" \
+            --dir "$TMPDIR" \
+            --pattern 'spur-v0.14.0-linux-amd64.tar.gz' \
+            --clobber 2>/dev/null && \
+          tar -xzf "$TMPDIR"/spur-v0.14.0-linux-amd64.tar.gz -C "$TMPDIR" && \
+          cp "$TMPDIR"/spur-v0.14.0-linux-amd64/bin/{spurctld,spurd,spur,spurstepd,spurauthd} "$BASELINE_DIR/" && \
+          chmod +x "$BASELINE_DIR"/* && \
+          rm -rf "$TMPDIR" || {
+            echo "::warning::Could not download v0.14.0 binaries; upgrade test will skip"
+            rm -rf "$BASELINE_DIR" "$TMPDIR"
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push baseline binaries to driver VM
+        run: |
+          BASELINE_DIR="${{ env.RUN_DIR }}/baseline-binaries"
+          if [ -d "$BASELINE_DIR" ] && ls "$BASELINE_DIR"/spur* >/dev/null 2>&1; then
+            DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
+            KEY="${{ steps.ssh.outputs.privkey }}"
+            scp $SSH_OPTS -i "$KEY" -r "$BASELINE_DIR" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/"
+          fi
+
       - name: Run tests inside driver VM
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
@@ -290,8 +322,13 @@ jobs:
           export SPUR_TEST_SSH_USER=ci
           export SPUR_TEST_SSH_KEY=${{ env.RUN_DIR }}/ci-ssh-key
           export SPUR_TEST_BINARIES_DIR=${{ env.RUN_DIR }}/release-binaries
+          export SPUR_TEST_MPI_PLUGIN=${{ env.RUN_DIR }}/release-binaries/libspur_mpi_pmix.so
           export SPUR_TEST_REMOTE_BIN_DIR=/tmp/spur-ci-bin-${{ github.run_id }}
           export SPUR_TEST_GPU_VENV=/opt/spur-ci/gpu-venv
+          # Baseline binaries for version upgrade tests (skips if absent)
+          if [ -d ${{ env.RUN_DIR }}/baseline-binaries ]; then
+            export SPUR_TEST_BASELINE_BINARIES_DIR=${{ env.RUN_DIR }}/baseline-binaries
+          fi
           chmod +x ${{ env.RUN_DIR }}/release-binaries/*
           source /opt/spur-ci/test-venv/bin/activate
           rc=0

@@ -57,6 +57,11 @@ pub enum WalOperation {
         /// Run epoch for this dispatch (0 for pre-upgrade entries).
         #[serde(default)]
         run_attempt: u32,
+        /// This run started on spare capacity outside the QOS group node quota
+        /// (idle-fill). Travels in the WAL so the stamp lands on followers; the
+        /// `Job` field is what survives snapshot and failover.
+        #[serde(default)]
+        idle_fill: bool,
     },
     JobComplete {
         job_id: JobId,
@@ -75,6 +80,12 @@ pub enum WalOperation {
     /// terminating signal as an ordinary failure. `at` is stamped on the leader
     /// so replicas share one instant instead of consulting their own clocks.
     JobTimeLimitSignaled {
+        job_id: JobId,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    /// A live run was signalled for cancellation. Records the verdict and moves
+    /// the run to Completing, holding its allocation until the nodes report.
+    JobCancelSignaled {
         job_id: JobId,
         at: chrono::DateTime<chrono::Utc>,
     },
@@ -107,6 +118,11 @@ pub enum WalOperation {
         /// When true, clears `spec.reservation` (admin release after reservation delete hold).
         #[serde(default)]
         clear_reservation: bool,
+        /// Dispatch epoch being held/backed-off, so a held or backed-off job's
+        /// `run_attempt` still advances past the poisoned attempt. `None`
+        /// where no new epoch was presented this cycle.
+        #[serde(default)]
+        run_attempt: Option<u32>,
     },
     /// Back off a job that failed dispatch before ever leaving Pending, where
     /// `JobStateChange`'s transition-gated backoff can't apply. NoOp on replay
@@ -114,6 +130,10 @@ pub enum WalOperation {
     JobDispatchBackoff {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
+        /// Dispatch epoch that failed, so the next attempt never re-presents
+        /// the same (now-poisoned) run_attempt. 0 for pre-upgrade entries.
+        #[serde(default)]
+        run_attempt: u32,
     },
     /// Preempt a running job and requeue it in one atomic step: free its node
     /// allocation, end the prior run for accounting (as PREEMPTED), return it to
@@ -148,6 +168,10 @@ pub enum WalOperation {
         /// QOS of the preempting job (`None` for plain priority-based preemption).
         #[serde(default)]
         preempt_qos: Option<String>,
+        /// Leader-stamped instant, so every replica measures the completing
+        /// deadline from one value. Absent pre-upgrade; falls back to apply time.
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Admin requeue (`scontrol requeue` / `requeuehold`): return a job to
     /// Pending with the same spec in one atomic step. A running/suspended job is
@@ -430,6 +454,7 @@ impl WalOperation {
             per_node_alloc,
             srun_step_dispatch: false,
             run_attempt: 0,
+            idle_fill: false,
         }
     }
 }
@@ -599,13 +624,19 @@ mod job_state_change_wal_tests {
         let op = WalOperation::JobDispatchBackoff {
             job_id: 8,
             begin_time: hold,
+            run_attempt: 3,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                begin_time,
+                run_attempt,
+            } => {
                 assert_eq!(job_id, 8);
                 assert_eq!(begin_time, hold);
+                assert_eq!(run_attempt, 3);
             }
             _ => panic!("wrong variant"),
         }
@@ -622,6 +653,25 @@ mod job_state_change_wal_tests {
             } => {
                 assert_eq!(job_id, 3);
                 assert_eq!(begin_time, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pre_upgrade_job_dispatch_backoff_without_run_attempt_deserializes() {
+        // A WAL written before run_attempt existed on this variant must still
+        // replay, defaulting to 0 rather than crashing the controller.
+        let json = r#"{"JobDispatchBackoff":{"job_id":8,"begin_time":"2026-01-01T00:00:00Z"}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                run_attempt,
+                ..
+            } => {
+                assert_eq!(job_id, 8);
+                assert_eq!(run_attempt, 0);
             }
             _ => panic!("wrong variant"),
         }
@@ -646,6 +696,7 @@ mod job_priority_change_wal_tests {
             pending_reason_desc: Some("launch failed requeued held".into()),
             reset_requeue_count: false,
             clear_reservation: false,
+            run_attempt: Some(2),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -655,6 +706,7 @@ mod job_priority_change_wal_tests {
                 new_priority,
                 pending_reason,
                 pending_reason_desc,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(job_id, 4);
@@ -664,16 +716,17 @@ mod job_priority_change_wal_tests {
                     pending_reason_desc.as_deref(),
                     Some("launch failed requeued held")
                 );
+                assert_eq!(run_attempt, Some(2));
             }
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn pre_upgrade_job_priority_change_without_description_deserializes() {
-        // A WAL written before pending_reason_desc existed on this variant
-        // must still replay (e.g. hold_job / release_job entries from before
-        // this fix).
+    fn pre_upgrade_job_priority_change_without_description_or_run_attempt_deserializes() {
+        // A WAL written before pending_reason_desc/run_attempt existed on
+        // this variant must still replay (e.g. hold_job entries from before
+        // either field).
         let json = r#"{"JobPriorityChange":{"job_id":4,"old_priority":500,"new_priority":0,"pending_reason":"Held"}}"#;
         let back: WalOperation = serde_json::from_str(json).unwrap();
         match back {
@@ -683,6 +736,7 @@ mod job_priority_change_wal_tests {
                 pending_reason_desc,
                 reset_requeue_count,
                 clear_reservation,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(job_id, 4);
@@ -690,6 +744,10 @@ mod job_priority_change_wal_tests {
                 assert_eq!(pending_reason_desc, None);
                 assert!(!reset_requeue_count);
                 assert!(!clear_reservation);
+                assert_eq!(
+                    run_attempt, None,
+                    "an entry without the field must stay inert, not advance run_attempt"
+                );
             }
             _ => panic!("wrong variant"),
         }
@@ -765,6 +823,56 @@ mod tests {
                 assert!(!spec.pty);
                 assert!(!spec.srun_job);
                 assert!(spec.gpus.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen pre-idle-fill JobStart entry (no idle_fill field); must still
+    // deserialize or spurctld crashes on upgrade replay, with idle_fill
+    // defaulting to false. Never regenerate — a failure means a new field needs
+    // #[serde(default)].
+    #[test]
+    fn job_start_pre_idle_fill_payload_still_deserializes() {
+        const JOB_START_PRE_IDLE_FILL: &str = r#"{"JobStart":{"job_id":5,"nodes":["n1"],"resources":{"cpus":4,"memory_mb":1024,"devices":{}},"per_node_alloc":{"n1":{"cpus":4,"memory_mb":1024,"devices":{}}},"srun_step_dispatch":false,"run_attempt":1}}"#;
+        let op: WalOperation = serde_json::from_str(JOB_START_PRE_IDLE_FILL)
+            .expect("pre-idle-fill JobStart must deserialize; idle_fill needs #[serde(default)]");
+        match op {
+            WalOperation::JobStart {
+                job_id,
+                srun_step_dispatch,
+                run_attempt,
+                idle_fill,
+                ..
+            } => {
+                assert_eq!(job_id, 5);
+                assert!(!srun_step_dispatch);
+                assert_eq!(run_attempt, 1);
+                assert!(!idle_fill, "an entry without the field defaults to false");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_start_idle_fill_stamp_round_trips() {
+        let op = WalOperation::JobStart {
+            job_id: 8,
+            nodes: vec!["n1".into()],
+            resources: ResourceAllocations::default(),
+            per_node_alloc: HashMap::new(),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+            idle_fill: true,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobStart {
+                job_id, idle_fill, ..
+            } => {
+                assert_eq!(job_id, 8);
+                assert!(idle_fill, "the stamp must survive the WAL round-trip");
             }
             _ => panic!("wrong variant"),
         }
@@ -1035,10 +1143,12 @@ mod suspend_wal_tests {
 
     #[test]
     fn preempt_cancel_op_round_trips() {
+        let stamped = chrono::Utc::now();
         let op = WalOperation::JobPreemptCancel {
             job_id: 7,
             preempted_by: Some(3),
             preempt_qos: Some("burst".into()),
+            at: Some(stamped),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1047,10 +1157,12 @@ mod suspend_wal_tests {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                at,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, Some(3));
                 assert_eq!(preempt_qos.as_deref(), Some("burst"));
+                assert_eq!(at, Some(stamped));
             }
             _ => panic!("wrong variant"),
         }
@@ -1063,10 +1175,12 @@ mod suspend_wal_tests {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                at,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
+                assert_eq!(at, None, "legacy entry falls back to apply time");
             }
             _ => panic!("wrong variant"),
         }
@@ -1220,6 +1334,24 @@ mod suspend_wal_tests {
                 at: at_back,
             } => {
                 assert_eq!(job_id, 13);
+                assert_eq!(at_back, at);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_cancel_signaled_op_round_trips() {
+        let at = chrono::Utc::now();
+        let op = WalOperation::JobCancelSignaled { job_id: 21, at };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobCancelSignaled {
+                job_id,
+                at: at_back,
+            } => {
+                assert_eq!(job_id, 21);
                 assert_eq!(at_back, at);
             }
             _ => panic!("wrong variant"),

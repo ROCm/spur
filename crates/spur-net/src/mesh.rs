@@ -18,8 +18,9 @@
 //!    mesh address), and a matching kernel route must exist over the interface.
 //!
 //! This module computes the per-node peer set (pure, tested) and applies it to
-//! a running interface via `wg set`. `AllowedIPs` is all WireGuard needs to
-//! forward pod traffic; the kernel FIB routes are owned by the CNI in
+//! a running interface via `wg set` (`apply_mesh`) or `wg set` plus a persisted
+//! config-file write (`apply_mesh_durable`). `AllowedIPs` is all WireGuard needs
+//! to forward pod traffic; the kernel FIB routes are owned by the CNI in
 //! native-routing mode, so spur only programs them on request (`program_routes`,
 //! for the no-CNI case). Applying is **additive** — it does not prune peers for
 //! nodes removed from the membership.
@@ -93,6 +94,7 @@ pub fn mesh_peers_for(self_mesh_ip: &str, members: &[MeshNode]) -> Vec<WgPeer> {
             // the underlay tunnel `spur net join` established. Only override when one is supplied.
             endpoint: Some(n.endpoint.clone()).filter(|e| !e.trim().is_empty()),
             persistent_keepalive: Some(25),
+            ..Default::default()
         })
         .collect()
 }
@@ -140,12 +142,63 @@ pub fn apply_mesh(
     Ok(peers.len())
 }
 
+/// The persist half of [`apply_mesh_durable`], split out so it is testable without the `wg` binary
+/// the live half shells out to. Caller holds the config lock.
+fn persist_mesh_peers(
+    config_path: &std::path::Path,
+    peers: &[wireguard::WgPeer],
+) -> anyhow::Result<()> {
+    // No config to persist into means an interface Spur did not create; keep the live apply
+    // working as it did before peers were persisted at all, rather than refusing outright.
+    if !config_path.exists() {
+        tracing::warn!(
+            path = %config_path.display(),
+            "no WireGuard config to persist into; mesh peers will not survive an interface reload"
+        );
+        return Ok(());
+    }
+    let mut config = wireguard::WgConfig::read_from(config_path)?;
+    for peer in peers {
+        config.upsert_peer(peer.clone());
+    }
+    config.write_to(config_path)
+}
+
+/// Like [`apply_mesh`], but also persists every applied peer into the config at `config_path` (one
+/// read-modify-write covering all peers), so a manual `spur net mesh` pass survives an interface
+/// reload — unlike the k0s reconcile loop, there is no daemon re-pushing it every tick.
+pub fn apply_mesh_durable(
+    interface: &str,
+    self_mesh_ip: &str,
+    members: &[MeshNode],
+    program_routes: bool,
+    config_path: &std::path::Path,
+) -> anyhow::Result<usize> {
+    let peers = mesh_peers_for(self_mesh_ip, members);
+    wireguard::with_config_lock(config_path, || {
+        persist_mesh_peers(config_path, &peers)?;
+        for peer in &peers {
+            wireguard::add_peer(interface, peer)?;
+        }
+        if program_routes {
+            for cidr in mesh_pod_routes(self_mesh_ip, members) {
+                wireguard::add_route(interface, cidr)?;
+            }
+        }
+        Ok(peers.len())
+    })
+}
+
 /// Of the interface's `current` peer public keys, those NOT in the desired member set (self
-/// excluded) — i.e. peers for nodes that have left the mesh and should be removed. Pure + tested.
+/// excluded) and NOT in `protected` — i.e. peers for nodes that have left the mesh and should be
+/// removed. `protected` is a peer's exemption from this reconcile entirely: any key present in the
+/// node's own persisted config is never this reconcile's to remove, no matter the membership it was
+/// pushed — including keys a prior `spur net mesh` wrote there. Pure + tested.
 pub fn peers_to_prune<'a>(
     current: &'a [String],
     self_mesh_ip: &str,
     members: &[MeshNode],
+    protected: &std::collections::HashSet<String>,
 ) -> Vec<&'a str> {
     let desired: std::collections::HashSet<String> = mesh_peers_for(self_mesh_ip, members)
         .into_iter()
@@ -153,7 +206,7 @@ pub fn peers_to_prune<'a>(
         .collect();
     current
         .iter()
-        .filter(|k| !desired.contains(k.as_str()))
+        .filter(|k| !desired.contains(k.as_str()) && !protected.contains(k.as_str()))
         .map(String::as_str)
         .collect()
 }
@@ -161,16 +214,18 @@ pub fn peers_to_prune<'a>(
 /// Reconcile the full mesh: prune peers no longer in `members`, then add/update the desired peers.
 /// Unlike [`apply_mesh`] (additive only), this converges — a node dropped from `members` has its
 /// WireGuard peer removed. `current_peers` is the interface's live peer keys (from
-/// [`wireguard::list_peers`]). Returns `(added, pruned)`. `program_routes` as in [`apply_mesh`].
+/// [`wireguard::list_peers`]); `protected` peers are exempt (see [`peers_to_prune`]). Returns
+/// `(added, pruned)`. `program_routes` as in [`apply_mesh`].
 pub fn reconcile_mesh(
     interface: &str,
     self_mesh_ip: &str,
     members: &[MeshNode],
     current_peers: &[String],
+    protected: &std::collections::HashSet<String>,
     program_routes: bool,
 ) -> anyhow::Result<(usize, usize)> {
     let mut pruned = 0;
-    for key in peers_to_prune(current_peers, self_mesh_ip, members) {
+    for key in peers_to_prune(current_peers, self_mesh_ip, members, protected) {
         wireguard::remove_peer(interface, key)?;
         pruned += 1;
     }
@@ -291,11 +346,83 @@ mod tests {
             "pk-10.44.0.4".to_string(), // departed -> prune
             "pk-10.44.0.2".to_string(), // self (never a desired peer) -> prune
         ];
-        let prune = peers_to_prune(&current, "10.44.0.2", &members);
+        let prune = peers_to_prune(&current, "10.44.0.2", &members, &Default::default());
         assert_eq!(prune.len(), 2);
         assert!(prune.contains(&"pk-10.44.0.4"));
         assert!(prune.contains(&"pk-10.44.0.2"));
         assert!(!prune.contains(&"pk-10.44.0.1"));
         assert!(!prune.contains(&"pk-10.44.0.3"));
+    }
+
+    /// A peer absent from `members` is normally pruned (previous test) — but not if it's in
+    /// `protected`: it is in the node's persisted config, for something outside this membership
+    /// (e.g. a non-k0s node), so this reconcile pass was never responsible for it.
+    #[test]
+    fn peers_to_prune_exempts_protected_peers() {
+        let members = vec![node("10.44.0.1", None), node("10.44.0.2", None)];
+        let current = vec![
+            "pk-10.44.0.1".to_string(),
+            "pk-persisted".to_string(), // not in members, but protected -> must survive
+            "pk-truly-departed".to_string(), // not in members, not protected -> pruned
+        ];
+        let protected: std::collections::HashSet<String> =
+            ["pk-persisted".to_string()].into_iter().collect();
+        let prune = peers_to_prune(&current, "10.44.0.2", &members, &protected);
+        assert_eq!(prune, vec!["pk-truly-departed"]);
+    }
+
+    /// The persist half of `apply_mesh_durable` writes every computed peer to the config, and is
+    /// additive: an unrelated pre-existing peer in the file survives.
+    #[test]
+    fn persist_mesh_peers_skips_a_missing_config_so_the_live_apply_still_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("spur0.conf"); // never written
+        let members = vec![node("10.44.0.1", None), node("10.44.0.2", None)];
+        persist_mesh_peers(&config_path, &mesh_peers_for("10.44.0.2", &members)).unwrap();
+        assert!(!config_path.exists(), "must not fabricate a config file");
+    }
+
+    #[test]
+    fn persist_mesh_peers_writes_every_peer_and_keeps_unrelated_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("spur0.conf");
+        wireguard::WgConfig {
+            private_key: "key=".into(),
+            address: "10.44.0.2/16".into(),
+            listen_port: Some(51820),
+            peers: vec![wireguard::WgPeer {
+                public_key: "pk-departed".into(),
+                allowed_ips: "10.44.0.9/32".into(),
+                endpoint: None,
+                persistent_keepalive: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .write_to(&config_path)
+        .unwrap();
+
+        let members = vec![
+            node("10.44.0.1", None),
+            node("10.44.0.2", None), // self
+            node("10.44.0.3", Some("10.42.2.0/24")),
+        ];
+        persist_mesh_peers(&config_path, &mesh_peers_for("10.44.0.2", &members)).unwrap();
+
+        let persisted = wireguard::WgConfig::read_from(&config_path).unwrap();
+        assert!(
+            persisted
+                .peers
+                .iter()
+                .any(|p| p.public_key == "pk-10.44.0.3"),
+            "mesh peer must be persisted"
+        );
+        assert!(
+            persisted
+                .peers
+                .iter()
+                .any(|p| p.public_key == "pk-departed"),
+            "apply_mesh_durable is additive; a pre-existing unrelated peer must survive"
+        );
     }
 }

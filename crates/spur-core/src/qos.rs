@@ -250,6 +250,55 @@ pub fn check_qos_limits_with_grp_node_charge(
     }
 }
 
+/// Whether the QOS group *node* cap is the only thing blocking this job: with
+/// that one dimension lifted, the job clears every remaining QOS limit. This is
+/// the idle-fill eligibility test — a job that qualifies is over its group node
+/// quota and nothing else, so it may run on genuinely spare capacity.
+///
+/// A pending-reason check would be wrong: `qos_resource_breach` reports only its
+/// first breach in cpu/node/mem/gpu order, so a job over both its node cap and,
+/// say, its GPU cap reports the node one and would be mistaken for eligible. The
+/// reverse also bites — a job over its node cap and its group CPU cap reports
+/// CPU and would be refused forever. Re-running the full check with the node cap
+/// zeroed is exact rather than heuristic.
+///
+/// Only `grp_tres[Node]` is zeroed. The per-job and per-user node caps, every
+/// other TRES dimension, and the non-TRES limits (max jobs, max submit, group
+/// wall) are all still enforced. Zeroing is sound only because 0 means "ignore"
+/// for a TRES cap; it must never be generalized to wall time, where 0 means
+/// block everything.
+#[allow(clippy::too_many_arguments)]
+pub fn grp_node_is_sole_blocker(
+    job: &Job,
+    qos: &Qos,
+    user_running_count: u32,
+    user_submitted_count: u32,
+    user_running_tres: &TresRecord,
+    qos_running_tres: &TresRecord,
+    consumed_wall_minutes: Option<u64>,
+    grp_node_charge: u64,
+) -> bool {
+    // `grp_node_charge` (demand) is a separate parameter from the cap, so zeroing
+    // the cap here cannot disturb what the job is asking for.
+    let mut probe = qos.clone();
+    if let Some(ref mut grp) = probe.limits.grp_tres {
+        grp.set(TresType::Node, 0);
+    }
+    matches!(
+        check_qos_limits_with_grp_node_charge(
+            job,
+            &probe,
+            user_running_count,
+            user_submitted_count,
+            user_running_tres,
+            qos_running_tres,
+            consumed_wall_minutes,
+            grp_node_charge,
+        ),
+        QosCheckResult::Allowed
+    )
+}
+
 /// QOS submit-count limits (`MaxSubmitJobsPerUser`, `MaxSubmitJobsPerAccount`,
 /// `GrpSubmitJobs`). These always deny at submission (Slurm's
 /// `acct_policy_validate`), independent of `DenyOnLimit`, because admitting the
@@ -1138,5 +1187,142 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(qos_preempt_override(&suspend), Some(PreemptMode::Suspend));
+    }
+
+    fn grp_node_qos(node_cap: u64) -> Qos {
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, node_cap);
+        Qos {
+            name: "team".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn sole_blocker(
+        job: &Job,
+        qos: &Qos,
+        user_running_count: u32,
+        user_submitted_count: u32,
+        qos_running_tres: &TresRecord,
+        grp_node_charge: u64,
+    ) -> bool {
+        grp_node_is_sole_blocker(
+            job,
+            qos,
+            user_running_count,
+            user_submitted_count,
+            &TresRecord::new(),
+            qos_running_tres,
+            None,
+            grp_node_charge,
+        )
+    }
+
+    #[test]
+    fn eligible_when_grp_node_is_the_sole_blocker() {
+        // Over the group node cap (2 running + 3 charged > 4) and nothing else.
+        let qos = grp_node_qos(4);
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Node, 2);
+        assert!(sole_blocker(&job, &qos, 0, 0, &qos_running, 3));
+    }
+
+    #[test]
+    fn eligible_when_job_already_fits() {
+        // A job inside every limit passes the zeroed check trivially.
+        let qos = grp_node_qos(4);
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        assert!(sole_blocker(&job, &qos, 0, 0, &TresRecord::new(), 1));
+    }
+
+    #[test]
+    fn ineligible_when_a_second_tres_dimension_is_also_breached() {
+        // Precondition: with both the group node and group GPU caps breached,
+        // the plain check reports the node one first (cpu/node/mem/gpu order),
+        // which is exactly why a reason-based test would mislabel this job.
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        grp.set(TresType::Gpu, 8);
+        let qos = Qos {
+            name: "team".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        job.spec.gres = vec!["gpu:4".into()];
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Node, 2); // 2 + 3 > 4
+        qos_running.set(TresType::Gpu, 6); // 6 + 4 > 8
+        assert_eq!(
+            check_qos_limits(&job, &qos, 0, 0, &TresRecord::new(), &qos_running, None),
+            QosCheckResult::Blocked(PendingReason::QosGrpNodeLimit),
+            "the misleading first-breach reason is the whole point of this test"
+        );
+
+        // Lifting the node cap still leaves the GPU breach, so it is not eligible.
+        assert!(!sole_blocker(&job, &qos, 0, 0, &qos_running, 3));
+    }
+
+    #[test]
+    fn ineligible_when_a_non_tres_limit_also_blocks() {
+        // Over the group node cap and at the max-jobs-per-user cap. The latter
+        // is checked before the TRES breach, so zeroing the node dimension does
+        // not rescue the job.
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 4);
+        let qos = Qos {
+            name: "team".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                max_jobs_per_user: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 3;
+        let mut qos_running = TresRecord::new();
+        qos_running.set(TresType::Node, 2);
+        assert!(!sole_blocker(&job, &qos, 2, 2, &qos_running, 3));
+    }
+
+    #[test]
+    fn eligible_when_the_qos_has_no_group_cap() {
+        let qos = Qos {
+            name: "team".into(),
+            limits: QosLimits::default(),
+            ..Default::default()
+        };
+        let job = make_test_job();
+        assert!(sole_blocker(&job, &qos, 0, 0, &TresRecord::new(), 1));
+    }
+
+    #[test]
+    fn eligible_when_the_node_dimension_is_unset() {
+        // A group cap on other dimensions but no node cap: the node cap cannot
+        // be a blocker, and nothing else breaches, so the job is eligible.
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Cpu, 64);
+        let qos = Qos {
+            name: "team".into(),
+            limits: QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let job = make_test_job();
+        assert!(sole_blocker(&job, &qos, 0, 0, &TresRecord::new(), 1));
     }
 }
