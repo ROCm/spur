@@ -61,9 +61,23 @@ _SINGLE_PARTITION_CONFIG = {
     ],
     # Explicit zero so a victim is preemptable the moment it starts and the
     # exempt window can never be mistaken for the reason nothing was evicted.
-    "scheduler": {"preempt_exempt_time": 0},
+    # qos_priority is required: without it try_preempt never runs at all.
+    "scheduler": {"preempt_exempt_time": 0, "preempt_type": "qos_priority"},
     **_AUTH_ROOT,
 }
+
+# Self-listing QOS shared by victim and aggressor: qos_priority requires an
+# explicit allow-list, and same-name eligibility falls back to submit order,
+# which every test here already satisfies (victim submitted first).
+_QOS = "satisfiability"
+
+
+def _ensure_satisfiability_qos(cluster) -> None:
+    # A QOS can't list itself at creation time (the name doesn't exist yet),
+    # so add it bare first, then modify it to self-list.
+    cluster.sacctmgr(["add", "qos", f"name={_QOS}"])
+    cluster.sacctmgr(["modify", "qos", f"name={_QOS}", "set", f"preempt={_QOS}"])
+    time.sleep(15)  # past the QoS cache refresh floor
 
 
 def _assert_scontrol_state(cluster, job_id: int, expected: str, label: str = "") -> None:
@@ -109,20 +123,21 @@ class TestUnplaceableAggressorEvictsNothing:
     def cluster_config_overrides(self):
         return _SINGLE_PARTITION_CONFIG
 
-    def test_unsatisfiable_gres_aggressor_preempts_nobody(self, cluster):
+    def test_unsatisfiable_gres_aggressor_preempts_nobody(self, accounting_cluster):
         """End-to-end outcome for the production shape. The structural gate is
         what keeps this job out of try_preempt; the victim-set proof is the
         backstop, covered on its own by the multi-node cases below."""
-        c = cluster
+        c = accounting_cluster
+        _ensure_satisfiability_qos(c)
         node = c.node_names[0]
         victim_id = aggressor_id = None
         try:
-            victim_id = _run_victim(c, node, "unsat-victim")
+            victim_id = _run_victim(c, node, "unsat-victim", extra=["-q", _QOS])
             preempted_before = c.sdiag_jobs_preempted()
             aggressor_id = _queue_aggressor(
                 c,
                 "unsat-aggressor",
-                ["-N1", "--exclusive", f"--nodelist={node}", _BOGUS_GRES],
+                ["-N1", "--exclusive", f"--nodelist={node}", "-q", _QOS, _BOGUS_GRES],
             )
 
             time.sleep(_GUARD_SECS)
@@ -164,15 +179,16 @@ class TestUnplaceableAggressorEvictsNothing:
         finally:
             _scancel_all(c, [job_id])
 
-    def test_placeable_aggressor_still_preempts(self, cluster):
+    def test_placeable_aggressor_still_preempts(self, accounting_cluster):
         """Control: the same submission minus the unsatisfiable gres does evict."""
-        c = cluster
+        c = accounting_cluster
+        _ensure_satisfiability_qos(c)
         node = c.node_names[0]
         victim_id = aggressor_id = None
         try:
-            victim_id = _run_victim(c, node, "ctrl-victim")
+            victim_id = _run_victim(c, node, "ctrl-victim", extra=["-q", _QOS])
             aggressor_id = _queue_aggressor(
-                c, "ctrl-aggressor", ["-N1", "--exclusive", f"--nodelist={node}"]
+                c, "ctrl-aggressor", ["-N1", "--exclusive", f"--nodelist={node}", "-q", _QOS]
             )
 
             terminal = wait_job(c, victim_id, timeout=_WAIT_PREEMPT)
@@ -191,10 +207,13 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
     def cluster_config_overrides(self):
         return _SINGLE_PARTITION_CONFIG
 
-    def test_partial_victim_set_evicts_nobody(self, multi_node_cluster):
+    def test_partial_victim_set_evicts_nobody(self, accounting_cluster):
         """Covers the PreemptMode=Off eligibility gate, excluded before the
         satisfiability proof runs; see _via_satisfiability_proof for that proof."""
-        c = multi_node_cluster
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("requires 2 nodes")
+        _ensure_satisfiability_qos(c)
         first, second = c.node_names[0], c.node_names[1]
         # Overlays the second node. PreemptMode defaults to OFF on create, so a
         # job submitted here is ineligible for eviction but the node is not.
@@ -207,9 +226,9 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
         )
         evictable_id = shielded_id = aggressor_id = None
         try:
-            evictable_id = _run_victim(c, first, "partial-evictable")
+            evictable_id = _run_victim(c, first, "partial-evictable", extra=["-q", _QOS])
             shielded_id = _run_victim(
-                c, second, "partial-shielded", extra=["-p", "shielded"]
+                c, second, "partial-shielded", extra=["-p", "shielded", "-q", _QOS]
             )
             preempted_before = c.sdiag_jobs_preempted()
             # Pinned to exactly these two nodes so a bed with spare capacity
@@ -217,7 +236,7 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
             aggressor_id = _queue_aggressor(
                 c,
                 "partial-aggressor",
-                ["-N2", "--exclusive", "-p", "default", f"--nodelist={first},{second}"],
+                ["-N2", "--exclusive", "-p", "default", "-q", _QOS, f"--nodelist={first},{second}"],
             )
 
             time.sleep(_GUARD_SECS)
@@ -240,19 +259,22 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
             _scancel_all(c, [evictable_id, shielded_id, aggressor_id])
             c.cli_allow_fail(["scontrol", "delete-partition", "--name=shielded"])
 
-    def test_complete_victim_set_is_evicted_together(self, multi_node_cluster):
+    def test_complete_victim_set_is_evicted_together(self, accounting_cluster):
         """Control: with both victims evictable, both go and the aggressor runs."""
-        c = multi_node_cluster
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("requires 2 nodes")
+        _ensure_satisfiability_qos(c)
         first, second = c.node_names[0], c.node_names[1]
         victim_ids = []
         aggressor_id = None
         try:
             for i, node in enumerate((first, second)):
-                victim_ids.append(_run_victim(c, node, f"full-victim-{i}"))
+                victim_ids.append(_run_victim(c, node, f"full-victim-{i}", extra=["-q", _QOS]))
             aggressor_id = _queue_aggressor(
                 c,
                 "full-aggressor",
-                ["-N2", "--exclusive", "-p", "default", f"--nodelist={first},{second}"],
+                ["-N2", "--exclusive", "-p", "default", "-q", _QOS, f"--nodelist={first},{second}"],
             )
 
             for victim_id in victim_ids:
@@ -276,12 +298,16 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
             pytest.skip("requires 2 nodes")
         first, second = c.node_names[0], c.node_names[1]
 
+        # exempt-shield outranked by _QOS so only its exempt-time guard, not the
+        # allow-list/rank gate, is what the aggressor has left to fail against.
         c.sacctmgr(["add", "qos", "name=exempt-shield", "preemptexempttime=3600"])
+        c.sacctmgr(["add", "qos", f"name={_QOS}", "priority=10"])
+        c.sacctmgr(["modify", "qos", f"name={_QOS}", "set", f"preempt={_QOS},exempt-shield"])
         time.sleep(15)  # past the QoS cache refresh floor
 
         evictable_id = shielded_id = aggressor_id = None
         try:
-            evictable_id = _run_victim(c, first, "proof-evictable")
+            evictable_id = _run_victim(c, first, "proof-evictable", extra=["-q", _QOS])
             shielded_id = _run_victim(
                 c, second, "proof-shielded", extra=["-q", "exempt-shield"]
             )
@@ -289,7 +315,7 @@ class TestMultiNodeAggressorEvictsAllOrNothing:
             aggressor_id = _queue_aggressor(
                 c,
                 "proof-aggressor",
-                ["-N2", "--exclusive", "-p", "default", f"--nodelist={first},{second}"],
+                ["-N2", "--exclusive", "-p", "default", "-q", _QOS, f"--nodelist={first},{second}"],
             )
 
             time.sleep(_GUARD_SECS)

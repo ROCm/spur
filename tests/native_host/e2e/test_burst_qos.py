@@ -68,7 +68,7 @@ class TestBurstQosPreemptedByNormal:
     """A burst job running on the only node must be cancelled when a normal job
     arrives, because:
       [1] normal QoS has burst in its preempt allow-list → preemption authorised
-      [2] burst has a deeply negative priority delta → gap exceeds the 2× threshold
+      [2] normal's QoS priority strictly exceeds burst's deeply negative one
     Both conditions must hold simultaneously for preemption to fire."""
 
     @pytest.fixture
@@ -103,7 +103,7 @@ class TestBurstQosPreemptedByNormal:
             wait_job_state(c, normal_id, "PD", timeout=30)
             _assert_scontrol_state(c, normal_id, "PENDING", "normal before preemption")
 
-            # Burst job must be cancelled — allow-list permits it, priority gap qualifies.
+            # Burst job must be cancelled — allow-list permits it, QoS rank qualifies.
             terminal = wait_job(c, burst_id, timeout=_WAIT_PREEMPT)
             assert terminal in ("CA", "GONE"), (
                 f"burst job must be preempted by normal job; got {terminal!r}"
@@ -125,9 +125,13 @@ class TestBurstQosPreemptedByNormal:
 
 
 class TestBurstQosNotPreemptedByAnotherBurst:
-    """Two burst jobs competing for the same node: neither must preempt the other.
-    Both have the same low priority, so the running burst job is not above the 2×
-    threshold that would qualify the pending one for preemption."""
+    """Two burst tiers competing for the same node: neither must preempt the other.
+
+    The allow-list is deliberately satisfied — burst-b names burst-a — so the only
+    thing standing between the pending job and the running one is that their QoS
+    priorities are equal, and the rank comparison is strict. Leaving the allow-list
+    empty as well would let this test pass without ever reaching the rank check.
+    """
 
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -137,10 +141,11 @@ class TestBurstQosNotPreemptedByAnotherBurst:
         c = accounting_cluster
         node = c.node_names[0]
 
-        # Two burst QoSes with identical low priority; neither has the other
-        # in its allow-list, so even a modest priority gap would be blocked.
+        # Two burst QoSes with identical priority. burst-b is authorised to
+        # preempt burst-a, so only the equal rank can block it.
         c.sacctmgr(["add", "qos", "name=burst-a", "priority=-5000"])
-        c.sacctmgr(["add", "qos", "name=burst-b", "priority=-5000"])
+        c.sacctmgr(["add", "qos", "name=burst-b", "priority=-5000",
+                    "preempt=burst-a"])
         time.sleep(15)
 
         burst_a_id = None
@@ -162,12 +167,13 @@ class TestBurstQosNotPreemptedByAnotherBurst:
             wait_job_state(c, burst_b_id, "PD", timeout=30)
             _assert_scontrol_state(c, burst_b_id, "PENDING", "burst-b before guard")
 
-            # Neither condition for preemption is met: no allow-list entry AND
-            # equal priority. After several scheduler cycles nothing must change.
+            # The allow-list permits it; equal QoS rank does not. After several
+            # scheduler cycles nothing must change.
             time.sleep(_GUARD_SECS)
             sq = c.squeue_all()
             assert job_state(sq, burst_a_id) == "R", (
-                "running burst job must not be evicted by another burst job"
+                "running burst job must not be evicted by an equal-priority burst "
+                "QoS, even one that allow-lists it"
             )
             _assert_scontrol_state(c, burst_a_id, "RUNNING", "burst-a after guard")
             assert job_state(sq, burst_b_id) == "PD", (
@@ -183,8 +189,7 @@ class TestBurstQosNotPreemptedByAnotherBurst:
 
 class TestBurstQosNotPreemptedByQosWithoutAllowList:
     """A QoS that does NOT list burst in its preempt allow-list must not evict a
-    burst job, even when its priority gap would otherwise qualify it under a plain
-    priority-based preemption scheme."""
+    burst job, even when its QoS rank would otherwise qualify it."""
 
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -220,8 +225,8 @@ class TestBurstQosNotPreemptedByQosWithoutAllowList:
             wait_job_state(c, stranger_id, "PD", timeout=30)
             _assert_scontrol_state(c, stranger_id, "PENDING", "stranger before guard")
 
-            # Under qos_priority mode the allow-list is the gate — priority gap
-            # alone is not sufficient. burst must stay running.
+            # Under qos_priority mode the allow-list is a gate in its own right —
+            # a QoS rank advantage alone is not sufficient. burst must stay running.
             time.sleep(_GUARD_SECS)
             sq = c.squeue_all()
             assert job_state(sq, burst_id) == "R", (
@@ -421,8 +426,10 @@ class TestBurstQosRequeueMode:
 
 
 class TestBurstQosPartitionOffBlocksPreemption:
-    """Even when the normal QoS has burst in its allow-list and the priority gap
-    qualifies, a partition with preempt_mode=off must block eviction entirely."""
+    """A partition preempt_mode=off blocks eviction when the victim's QoS
+    supplies no action of its own — the allow-list and QoS rank alone are not
+    enough. A victim QoS preemptmode would override it; see the decision table
+    in docs/admin-guide/accounting.rst."""
 
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -475,13 +482,13 @@ class TestBurstQosPartitionOffBlocksPreemption:
             wait_job_state(c, normal_id, "PD", timeout=30)
             _assert_scontrol_state(c, normal_id, "PENDING", "normal before guard")
 
-            # Allow-list and priority gap both say "preempt", but partition says "off".
-            # Partition gate wins — burst must stay running.
+            # Allow-list and rank both qualify, but no action is configured at
+            # either scope (burst-noevict sets no preemptmode), so nothing fires.
             time.sleep(_GUARD_SECS)
             sq = c.squeue_all()
             assert job_state(sq, burst_id) == "R", (
-                "burst job must not be evicted when partition preempt_mode=off, "
-                "even when QoS allow-list and priority gap both qualify preemption"
+                "burst job must not be evicted when partition preempt_mode=off "
+                "and its QoS supplies no preemptmode of its own"
             )
             _assert_scontrol_state(c, burst_id, "RUNNING", "burst after guard")
             assert job_state(sq, normal_id) == "PD", (

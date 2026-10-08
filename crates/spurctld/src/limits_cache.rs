@@ -15,7 +15,7 @@ use parking_lot::RwLock;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-use spur_core::accounting::{Qos, QosLimits, QosPreemptMode, TresRecord};
+use spur_core::accounting::{Qos, QosLimits, TresRecord};
 
 struct Snapshot {
     qos: HashMap<String, Qos>,
@@ -238,7 +238,8 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
         name: r.name,
         description: r.description,
         priority: r.priority,
-        preempt_mode: r.preempt_mode.parse::<QosPreemptMode>().unwrap_or_default(),
+        preempt_mode: spur_core::accounting::parse_qos_preempt_mode(&r.preempt_mode)
+            .unwrap_or(None),
         preempt: r
             .preempt
             .split(',')
@@ -277,6 +278,7 @@ fn parse_deny_on_limit(flags: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_core::accounting::QosPreemptMode;
     use spur_core::accounting::TresType;
     use spur_core::job::{Job, JobSpec, PendingReason};
     use spur_core::qos::{check_qos_limits, QosCheckResult};
@@ -362,6 +364,55 @@ mod tests {
         );
     }
 
+    fn qos_record_with_preempt_mode(mode: &str) -> crate::accounting::db::QosRecord {
+        crate::accounting::db::QosRecord {
+            name: "q".into(),
+            description: String::new(),
+            priority: 0,
+            preempt_mode: mode.into(),
+            preempt: String::new(),
+            usage_factor: 1.0,
+            max_jobs_per_user: None,
+            max_wall_min: None,
+            max_tres_per_job: None,
+            max_submit_per_user: None,
+            max_submit_per_account: None,
+            grp_submit_jobs: None,
+            max_tres_per_user: None,
+            grp_tres: None,
+            grp_wall_min: None,
+            preempt_exempt_time: None,
+            idle_fill_preemptable: false,
+            flags: String::new(),
+        }
+    }
+
+    // A stored 'off' now resolves as a hard stop (see qos_preempt_override); the
+    // one-time migration in accounting/db.rs is what keeps rows written by the
+    // old CLI default (before preempt_mode was optional) from inheriting that
+    // meaning — this only covers rows that reach here still holding 'off'.
+    #[test]
+    fn off_qos_row_is_hard_stop_unset_row_falls_back() {
+        use spur_core::qos::qos_preempt_override;
+
+        let explicit_off = qos_from_record(qos_record_with_preempt_mode("off"));
+        assert_eq!(explicit_off.preempt_mode, Some(QosPreemptMode::Off));
+        assert_eq!(
+            qos_preempt_override(&explicit_off),
+            Some(spur_core::partition::PreemptMode::Off)
+        );
+
+        let unset = qos_from_record(qos_record_with_preempt_mode(""));
+        assert_eq!(unset.preempt_mode, None);
+        assert_eq!(qos_preempt_override(&unset), None);
+
+        let configured = qos_from_record(qos_record_with_preempt_mode("requeue"));
+        assert_eq!(
+            qos_preempt_override(&configured),
+            Some(spur_core::partition::PreemptMode::Requeue)
+        );
+    }
+
     #[test]
     fn test_qos_from_record_parses_limits() {
         let record = crate::accounting::db::QosRecord {
@@ -392,7 +443,7 @@ mod tests {
         assert_eq!(qos.limits.max_submit_jobs_per_account, Some(40));
         assert_eq!(qos.limits.grp_submit_jobs, Some(30));
         assert_eq!(qos.priority, 100);
-        assert_eq!(qos.preempt_mode, QosPreemptMode::Cancel);
+        assert_eq!(qos.preempt_mode, Some(QosPreemptMode::Cancel));
         assert_eq!(qos.usage_factor, 2.0);
         assert_eq!(qos.limits.max_jobs_per_user, Some(10));
         assert_eq!(qos.limits.max_wall_minutes, Some(60));

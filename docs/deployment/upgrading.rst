@@ -496,6 +496,72 @@ This release makes ``scancel`` exit ``1`` when the controller refuses a cancel o
 printed to ``stderr``. Scripts that call ``scancel`` and branch on its exit code now see the
 failure. A job that is already finished or unknown still does not fail a plain cancel (or
 ``-s KILL``), and ``--quiet``/``-Q`` hides the report but not the exit status.
+Job preemption policy (``preempt_type``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The release introducing ``scheduler.preempt_type`` makes preemption **opt-in**
+and narrows what makes a running job eligible. Both changes apply to a
+``spur.conf`` that is not edited.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Behavior
+     - Before
+     - After
+     - Effect
+   * - Whether preemption runs
+     - On whenever the pending job's partition set a non-``off``
+       ``preempt_mode``
+     - Off unless ``scheduler.preempt_type = "qos_priority"``
+     - **A cluster that preempted before stops preempting entirely** until the
+       new field is set.
+   * - What makes a job eligible
+     - An effective-priority gap of more than 2×
+     - The pending job's QOS lists the victim's QOS in ``preempt`` **and** has
+       a strictly higher QOS ``priority``
+     - **Preemption no longer fires without a QOS allow-list.** Fair-share, job
+       age, and ``--priority`` no longer affect eligibility at all;
+       ``priority_tier`` matters only for the active-reservation guard.
+
+To restore preemption, enable the engine in ``spur.conf`` on the controller:
+
+.. code-block:: toml
+
+   [scheduler]
+   preempt_type = "qos_priority"
+
+then give each preempting QOS an allow-list and a higher priority than the QOS
+it should displace:
+
+.. code-block:: bash
+
+   sacctmgr modify qos name=burst set priority=100
+   sacctmgr modify qos name=normal set priority=10000 preempt=burst
+
+Both are live: ``preempt_type`` applies on ``scontrol reconfigure``, and QOS
+changes take effect without a restart. A victim still needs a resolved action
+that is not ``off``: its QOS ``preemptmode`` if set, else the most aggressive
+of its partitions' ``preempt_mode``. See :doc:`/admin-guide/accounting` for
+the full decision table.
+
+A pending job's own partition ``preempt_mode`` no longer gates whether it may
+preempt. Previously a job sitting in an ``off`` partition could never trigger
+preemption; now only the victim's scope decides. Partitions used to hold
+pending work away from preemption need their *victims* protected instead.
+
+**QOS ``preemptmode=off`` is now a real protection, not a no-op.** It used to
+mean "no QOS override, defer to the partition"; it now always wins over the
+partition, including to protect a job the partition would otherwise let
+through. Every pre-upgrade row holding the literal ``off`` behaved as unset
+under the old resolution rule, so a one-time migration resets those rows back
+to unset — they keep deferring to their partition exactly as before. Only a
+QOS an admin sets to ``off`` *after* upgrading gains the new protection.
+
+Leaving ``preempt_type`` at its ``"none"`` default is safe but silent: nothing
+logs that preemption was skipped, so verify with a test job rather than
+assuming the old behavior carried over.
 
 See Also
 --------

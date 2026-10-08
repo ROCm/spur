@@ -860,8 +860,9 @@ fn busy_until_from_running_jobs(
     busy_until
 }
 
-/// Resolve the effective PreemptMode for a job: QoS override wins if set
-/// (see `qos_preempt_override`), else the most aggressive matched partition.
+/// Resolve the effective PreemptMode for a job: an explicit QOS mode (including
+/// `Off`) wins outright; unset falls back to the most aggressive matched
+/// partition. See `qos_preempt_override`.
 fn job_preempt_mode(
     job: &spur_core::job::Job,
     partitions: &[spur_core::partition::Partition],
@@ -875,9 +876,30 @@ fn job_preempt_mode(
 
     spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
         .into_iter()
-        .map(|p| p.preempt_mode)
+        .filter_map(|p| p.preempt_mode)
         .max_by_key(|m| m.aggressiveness())
         .unwrap_or(PreemptMode::Off)
+}
+
+/// Within one self-listing QOS rank can never separate two jobs, so submit order
+/// decides; being immutable across a requeue, it cannot cycle.
+fn qos_preempt_allowed(
+    pending: &spur_core::job::Job,
+    pending_qos: &spur_core::accounting::Qos,
+    victim: &spur_core::job::Job,
+    victim_qos: &spur_core::accounting::Qos,
+) -> bool {
+    if !pending_qos.preempt.contains(&victim_qos.name) {
+        return false;
+    }
+    if pending_qos.name != victim_qos.name {
+        return pending_qos.priority > victim_qos.priority;
+    }
+    pending.submit_time > victim.submit_time
+}
+
+fn qos_priority_preemption_enabled(sched: &spur_core::config::SchedulerConfig) -> bool {
+    sched.preempt_type == spur_core::partition::PreemptType::QosPriority
 }
 
 /// Effective preempt-exempt seconds for a running job: QOS > partition > global.
@@ -900,9 +922,11 @@ fn effective_exempt_secs(
         .unwrap_or(sched.preempt_exempt_time)
 }
 
-/// Preempt lower-priority running jobs per their partition PreemptMode
-/// (Off jobs are never preempted). A non-`gone` failure mid-set leaves the
-/// already-evicted victims evicted with the pending job still unplaced.
+/// Preempt running jobs to make room for pending ones. Only runs under
+/// `preempt_type = qos_priority`; eligibility and mode resolution follow the
+/// decision table in the admin guide. Victim selection proves the eviction
+/// would actually place the pending job; a non-`gone` failure mid-set leaves
+/// the already-evicted victims evicted with the pending job still unplaced.
 pub(crate) async fn try_preempt(
     cluster: &Arc<ClusterManager>,
     partitions: &[spur_core::partition::Partition],
@@ -917,13 +941,18 @@ pub(crate) async fn try_preempt(
     use spur_core::partition::{Partition, PreemptMode, PreemptType};
     use spur_core::reservation::job_runs_in_active_reservation;
 
+    if !qos_priority_preemption_enabled(sched) {
+        return;
+    }
+
     let now = chrono::Utc::now();
     let reservations = cluster.get_reservations();
 
+    // Only the reservation tier check reads this, so pick the highest tier.
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
         spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
             .into_iter()
-            .max_by_key(|p| p.preempt_mode.aggressiveness())
+            .max_by_key(|partition| partition.priority_tier)
     };
 
     // Suspended and completing jobs still hold their allocation, so a node one of
@@ -946,24 +975,22 @@ pub(crate) async fn try_preempt(
             occupants.entry(node.as_str()).or_default().push(job.job_id);
         }
     }
-    // Resolve once, reuse for both the priority recompute and the
-    // preempt-mode decision below.
+    // Resolve once, reused for the occupant map, the policy checks, and the
+    // action decision below.
     let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
         running
             .iter()
             .map(|j| (j.job_id, cluster.resolve_qos(j)))
             .collect();
-    // Running jobs' stored `priority` is the raw base value, unlike
-    // `pending`'s fully adjusted one; recompute a comparable value.
-    let running_priority: std::collections::HashMap<spur_core::job::JobId, u32> = running
+    // `get_jobs` iterates a HashMap, so without this the victim picked among
+    // equally eligible candidates varies run to run. Least important first.
+    running.sort_by_key(|j| (running_qos[&j.job_id].priority, j.job_id));
+    // Lets the satisfiability search spend the lowest-QOS-priority victims
+    // first; eligibility already proved each candidate a legal victim, so
+    // only QOS rank (not fair-share-inflated job priority) should break ties.
+    let victim_cost: HashMap<spur_core::job::JobId, i32> = running_qos
         .iter()
-        .map(|j| (j.job_id, cluster.current_effective_priority(j, partitions)))
-        .collect();
-    running.sort_by_key(|j| running_priority[&j.job_id]);
-    // Lets the satisfiability search spend the cheapest victims first.
-    let victim_cost: HashMap<spur_core::job::JobId, i32> = running_priority
-        .iter()
-        .map(|(id, p)| (*id, i32::try_from(*p).unwrap_or(i32::MAX)))
+        .map(|(id, qos)| (*id, qos.priority))
         .collect();
 
     // Pending job's QOS is resolved once per pending job; used for the
@@ -1000,9 +1027,6 @@ pub(crate) async fn try_preempt(
         let Some(pending_part) = partition_for(pending) else {
             continue;
         };
-        if pending_part.preempt_mode == PreemptMode::Off {
-            continue;
-        }
         let pending_tier = pending_part.priority_tier;
         let pending_qos = &pending_qos_map[&pending.job_id];
 
@@ -1010,11 +1034,6 @@ pub(crate) async fn try_preempt(
         // below, by whether their removal would place the job.
         let mut eligible: Vec<(&spur_core::job::Job, PreemptMode)> = Vec::new();
         for candidate in &running {
-            let candidate_priority = running_priority[&candidate.job_id];
-            if candidate_priority >= pending.priority / 2 {
-                continue;
-            }
-
             if !preempt_overlaps_pending_nodes(pending, candidate, cluster_nodes) {
                 continue;
             }
@@ -1031,9 +1050,7 @@ pub(crate) async fn try_preempt(
             // QOS hierarchy: pending job may only preempt candidate when the
             // pending QOS explicitly lists the candidate's QOS in its allow-list.
             let candidate_qos = &running_qos[&candidate.job_id];
-            if sched.preempt_type == PreemptType::QosPriority
-                && !pending_qos.preempt.contains(&candidate_qos.name)
-            {
+            if !qos_preempt_allowed(pending, pending_qos, candidate, candidate_qos) {
                 continue;
             }
 
@@ -1104,13 +1121,16 @@ pub(crate) async fn try_preempt(
         let mut preempted = false;
         let mut evicted_so_far = Vec::new();
         for (candidate, mode) in eligible.iter().filter(|(j, _)| victims.contains(&j.job_id)) {
+            let candidate_qos = &running_qos[&candidate.job_id];
             info!(
                 preempted_job = candidate.job_id,
-                preempted_priority = running_priority[&candidate.job_id],
+                preempted_qos = %candidate_qos.name,
+                preempted_qos_priority = candidate_qos.priority,
                 pending_job = pending.job_id,
-                pending_priority = pending.priority,
+                pending_qos = %pending_qos.name,
+                pending_qos_priority = pending_qos.priority,
                 mode = ?mode,
-                "preempting lower-priority job"
+                "preempting job"
             );
             match cluster.preempt_job_with_provenance(
                 candidate.job_id,
@@ -3713,7 +3733,7 @@ mod tests {
     ) -> spur_core::partition::Partition {
         spur_core::partition::Partition {
             name: name.into(),
-            preempt_mode: mode,
+            preempt_mode: Some(mode),
             ..Default::default()
         }
     }
@@ -3727,13 +3747,13 @@ mod tests {
 
     fn qos_with_mode(mode: spur_core::accounting::QosPreemptMode) -> spur_core::accounting::Qos {
         spur_core::accounting::Qos {
-            preempt_mode: mode,
+            preempt_mode: Some(mode),
             ..Default::default()
         }
     }
 
     fn no_qos_override() -> spur_core::accounting::Qos {
-        qos_with_mode(spur_core::accounting::QosPreemptMode::Off)
+        spur_core::accounting::Qos::default()
     }
 
     fn sched_config_default() -> spur_core::config::SchedulerConfig {
@@ -3848,6 +3868,96 @@ mod tests {
         assert!(!permitted);
     }
 
+    fn job_submitted_at(secs: i64) -> spur_core::job::Job {
+        let mut job = job_with_spec(JobSpec::default());
+        job.submit_time = chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        job
+    }
+
+    #[test]
+    fn qos_preempt_requires_a_strictly_higher_stable_qos_priority() {
+        let (older, newer) = (job_submitted_at(100), job_submitted_at(200));
+        let victim = spur_core::accounting::Qos {
+            name: "victim".into(),
+            priority: 100,
+            ..Default::default()
+        };
+        let listed = |priority| spur_core::accounting::Qos {
+            name: "hunter".into(),
+            priority,
+            preempt: vec!["victim".into()],
+            ..Default::default()
+        };
+
+        assert!(qos_preempt_allowed(&newer, &listed(101), &older, &victim));
+        assert!(!qos_preempt_allowed(&newer, &listed(100), &older, &victim));
+        assert!(!qos_preempt_allowed(&newer, &listed(99), &older, &victim));
+
+        let not_listed = spur_core::accounting::Qos {
+            name: "hunter".into(),
+            priority: 500,
+            ..Default::default()
+        };
+        assert!(!qos_preempt_allowed(&newer, &not_listed, &older, &victim));
+
+        // Rank alone decides across different QOS; submit order is irrelevant.
+        assert!(qos_preempt_allowed(&older, &listed(101), &newer, &victim));
+    }
+
+    #[test]
+    fn qos_that_lists_itself_preempts_only_older_jobs() {
+        let self_listed = spur_core::accounting::Qos {
+            name: "burst".into(),
+            priority: 100,
+            preempt: vec!["burst".into()],
+            ..Default::default()
+        };
+        let (older, newer) = (job_submitted_at(100), job_submitted_at(200));
+
+        assert!(qos_preempt_allowed(
+            &newer,
+            &self_listed,
+            &older,
+            &self_listed
+        ));
+        // The reverse must never hold, or a requeued victim would preempt its
+        // own preemptor back and neither job would ever finish.
+        assert!(!qos_preempt_allowed(
+            &older,
+            &self_listed,
+            &newer,
+            &self_listed
+        ));
+        assert!(!qos_preempt_allowed(
+            &older,
+            &self_listed,
+            &older,
+            &self_listed
+        ));
+
+        let not_self_listed = spur_core::accounting::Qos {
+            preempt: vec!["other".into()],
+            ..self_listed.clone()
+        };
+        assert!(!qos_preempt_allowed(
+            &newer,
+            &not_self_listed,
+            &older,
+            &not_self_listed
+        ));
+    }
+
+    #[test]
+    fn only_qos_priority_enables_preemption() {
+        use spur_core::partition::PreemptType;
+        assert!(!qos_priority_preemption_enabled(&sched_config_default()));
+        let enabled = spur_core::config::SchedulerConfig {
+            preempt_type: PreemptType::QosPriority,
+            ..Default::default()
+        };
+        assert!(qos_priority_preemption_enabled(&enabled));
+    }
+
     #[test]
     fn job_preempt_mode_single_partition() {
         use spur_core::partition::PreemptMode;
@@ -3901,6 +4011,44 @@ mod tests {
         assert_eq!(
             job_preempt_mode(&job_in_partitions("gpu,cpu"), &parts, &no_qos_override()),
             PreemptMode::Off
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_unset_partition_matches_explicit_off() {
+        use spur_core::partition::PreemptMode;
+        let unset = vec![spur_core::partition::Partition {
+            name: "gpu".into(),
+            ..Default::default()
+        }];
+        let explicit = vec![partition_with_mode("gpu", PreemptMode::Off)];
+        let job = job_in_partitions("gpu");
+        assert_eq!(unset[0].preempt_mode, None);
+        assert_eq!(
+            job_preempt_mode(&job, &unset, &no_qos_override()),
+            job_preempt_mode(&job, &explicit, &no_qos_override()),
+        );
+        assert_eq!(
+            job_preempt_mode(&job, &unset, &no_qos_override()),
+            PreemptMode::Off
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_qos_action_works_without_partition_action() {
+        use spur_core::accounting::QosPreemptMode;
+        use spur_core::partition::PreemptMode;
+        let parts = vec![spur_core::partition::Partition {
+            name: "gpu".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            job_preempt_mode(
+                &job_in_partitions("gpu"),
+                &parts,
+                &qos_with_mode(QosPreemptMode::Requeue),
+            ),
+            PreemptMode::Requeue
         );
     }
 
@@ -6871,12 +7019,24 @@ mod tests {
     }
 
     #[test]
-    fn job_preempt_mode_qos_off_falls_back_to_partition() {
+    fn job_preempt_mode_qos_unset_falls_back_to_partition() {
         use spur_core::partition::PreemptMode;
         let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
         assert_eq!(
             job_preempt_mode(&job_in_partitions("gpu"), &parts, &no_qos_override()),
             PreemptMode::Cancel
+        );
+    }
+
+    #[test]
+    fn job_preempt_mode_qos_explicit_off_is_hard_stop() {
+        use spur_core::accounting::QosPreemptMode;
+        use spur_core::partition::PreemptMode;
+        let parts = vec![partition_with_mode("gpu", PreemptMode::Cancel)];
+        let qos = qos_with_mode(QosPreemptMode::Off);
+        assert_eq!(
+            job_preempt_mode(&job_in_partitions("gpu"), &parts, &qos),
+            PreemptMode::Off
         );
     }
 }
