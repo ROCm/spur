@@ -5177,6 +5177,7 @@ impl AssocMgrScope {
             (Self::Association, Cap::MaxTres) => "MaxTRES",
             (_, Cap::GrpTres) => "GrpTRES",
             (_, Cap::GrpSubmitJobs) => "GrpSubmitJobs",
+            (_, Cap::GrpWall) => "GrpWall",
         }
     }
 }
@@ -5201,6 +5202,10 @@ fn assoc_mgr_to_proto(
         grp_tres: opt_tres(&usage.grp_tres),
         grp_submit_jobs: opt_cap(usage.grp_submit_jobs),
         max_wall_minutes: opt_cap(usage.max_wall_minutes),
+        max_tres_per_job: opt_tres(&usage.max_tres_per_job),
+        max_submit_jobs_per_account: opt_cap(usage.max_submit_jobs_per_account),
+        grp_wall_minutes: opt_cap(usage.grp_wall_minutes),
+        grp_wall_consumed_minutes: opt_consumed(usage.grp_wall_consumed_minutes),
         scope_caps: usage.user_caps.as_ref().map(|caps| AssocMgrCaps {
             max_jobs: opt_cap(caps.max_jobs),
             max_submit_jobs: opt_cap(caps.max_submit_jobs),
@@ -5217,6 +5222,7 @@ fn assoc_mgr_to_proto(
                 max_jobs: opt_cap(user.caps.max_jobs),
                 max_submit_jobs: opt_cap(user.caps.max_submit_jobs),
                 max_tres: opt_tres(&user.caps.max_tres),
+                max_tres_per_job: opt_tres(&user.caps.max_tres_per_job),
                 over_limit: cap_names(user.exceeded_caps(), scope),
             })
             .collect(),
@@ -5230,6 +5236,15 @@ fn opt_cap(v: Option<u32>) -> u32 {
 
 fn opt_tres(t: &Option<spur_core::accounting::TresRecord>) -> String {
     t.as_ref().map(|t| t.format()).unwrap_or_default()
+}
+
+/// Unread spend goes out as `INFINITE` so a client can tell it from a real zero; a
+/// real value is clamped below the sentinel so the two never collide.
+fn opt_consumed(v: Option<u64>) -> u32 {
+    match v {
+        None => spur_core::accounting::INFINITE,
+        Some(m) => m.min(u64::from(spur_core::accounting::INFINITE - 1)) as u32,
+    }
 }
 
 fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec<String> {
@@ -12162,6 +12177,34 @@ mod tests {
             .metadata_mut()
             .insert(FORWARDED_HEADER, "true".parse().unwrap());
         assert!(ControllerService::is_already_forwarded(&header_only));
+    }
+
+    #[test]
+    fn assoc_mgr_wire_record_puts_an_association_per_job_cap_on_its_user() {
+        use spur_core::accounting::{PerUserCaps, ScopeLimitUsage, TresRecord, UserLimitUsage};
+        let usage = ScopeLimitUsage {
+            scope: "tenant-a".into(),
+            users: vec![UserLimitUsage {
+                user: "alice".into(),
+                caps: PerUserCaps {
+                    max_tres_per_job: Some(TresRecord::parse("node=2").unwrap()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let record = assoc_mgr_to_proto(&usage, AssocMgrScope::Association);
+        assert_eq!(record.users[0].max_tres_per_job, "node=2");
+        assert_eq!(record.max_tres_per_job, "");
+    }
+
+    #[test]
+    fn assoc_mgr_wire_record_keeps_unread_grp_wall_spend_apart_from_any_real_value() {
+        use spur_core::accounting::INFINITE;
+        assert_eq!(opt_consumed(None), INFINITE);
+        assert_eq!(opt_consumed(Some(0)), 0);
+        assert_eq!(opt_consumed(Some(u64::MAX)), INFINITE - 1);
     }
 
     /// A verified identity is always signed into an envelope, never quietly

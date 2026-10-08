@@ -155,6 +155,7 @@ pub enum Cap {
     MaxTres,
     GrpTres,
     GrpSubmitJobs,
+    GrpWall,
 }
 
 /// Caps that apply to a single user. A QOS sets one set of these for every user
@@ -165,6 +166,9 @@ pub struct PerUserCaps {
     pub max_jobs: Option<u32>,
     pub max_submit_jobs: Option<u32>,
     pub max_tres: Option<TresRecord>,
+    /// Set only by an association, which keys its per-job cap per user; a QOS's
+    /// is scope-wide and lives on [`ScopeLimitUsage`].
+    pub max_tres_per_job: Option<TresRecord>,
 }
 
 /// One user's holdings under a scope, beside the caps that govern that user.
@@ -189,6 +193,13 @@ pub struct ScopeLimitUsage {
     pub grp_tres: Option<TresRecord>,
     pub grp_submit_jobs: Option<u32>,
     pub max_wall_minutes: Option<u32>,
+    /// This and the three below are QOS-only, `None` in an association record; an
+    /// association's per-job cap is on each [`PerUserCaps`].
+    pub max_tres_per_job: Option<TresRecord>,
+    pub max_submit_jobs_per_account: Option<u32>,
+    pub grp_wall_minutes: Option<u32>,
+    /// `None` until the GrpWall cache loads, which is not zero spend.
+    pub grp_wall_consumed_minutes: Option<u64>,
     /// The caps every user of this scope is held to, where the scope defines them
     /// once — a QOS does, an association does not, so it stays `None` there and
     /// each user record carries its own instead. Without this a QOS nobody is
@@ -240,7 +251,19 @@ impl ScopeLimitUsage {
         if count_exceeds(self.grp_submitted_jobs, self.grp_submit_jobs) {
             exceeded.push(Cap::GrpSubmitJobs);
         }
+        if self.grp_wall_exceeded() {
+            exceeded.push(Cap::GrpWall);
+        }
         exceeded
+    }
+
+    /// `>=`, not `>` like the other caps: `check_qos_limits` blocks once spend
+    /// reaches the budget. Unread spend is never a breach.
+    fn grp_wall_exceeded(&self) -> bool {
+        match (self.grp_wall_minutes, self.grp_wall_consumed_minutes) {
+            (Some(cap), Some(consumed)) => consumed >= cap as u64,
+            _ => false,
+        }
     }
 }
 
@@ -531,6 +554,33 @@ mod tests {
             vec![Cap::GrpTres, Cap::GrpSubmitJobs]
         );
         assert!(usage.users[0].exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn scope_exceeded_caps_reports_grp_wall_at_the_gate_boundary() {
+        let at_cap = ScopeLimitUsage {
+            grp_wall_minutes: Some(600),
+            grp_wall_consumed_minutes: Some(600),
+            ..Default::default()
+        };
+        assert_eq!(at_cap.exceeded_caps(), vec![Cap::GrpWall]);
+
+        let under_cap = ScopeLimitUsage {
+            grp_wall_minutes: Some(600),
+            grp_wall_consumed_minutes: Some(599),
+            ..Default::default()
+        };
+        assert!(under_cap.exceeded_caps().is_empty());
+    }
+
+    #[test]
+    fn scope_exceeded_caps_never_flags_grp_wall_without_a_reading() {
+        let usage = ScopeLimitUsage {
+            grp_wall_minutes: Some(1),
+            grp_wall_consumed_minutes: None,
+            ..Default::default()
+        };
+        assert!(usage.exceeded_caps().is_empty());
     }
 
     #[test]
