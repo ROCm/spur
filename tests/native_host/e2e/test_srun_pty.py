@@ -305,6 +305,32 @@ class TestSrunPtyStepSupervision:
             f"the job's own placeholder must not carry the real command:\n{job_info}"
         )
 
+    def test_standalone_pty_srun_job_completes_cleanly(self, cluster):
+        # A standalone --pty session used to always leave the job CANCELLED in
+        # sacct/scontrol, even on a clean exit — assert the real outcome lands.
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02", "--pty", "bash", "-c", "exit 0",
+        ])
+        assert code == 0, out
+        job_id = re.search(r"Pending job allocation (\d+)", out)
+        assert job_id, out
+        job_info = cluster.scontrol("show", "job", job_id.group(1))
+        assert "JobState=COMPLETED" in job_info, job_info
+        assert "JobState=CANCELLED" not in job_info, job_info
+
+    def test_standalone_pty_srun_job_records_a_nonzero_exit_code(self, cluster):
+        # A nonzero exit is still a real answer from the remote session, not
+        # grounds to record the job as cancelled.
+        code, out = cluster.srun_with_exit([
+            "-N", "1", "-t", "0:02", "--pty", "bash", "-c", "exit 7",
+        ])
+        assert code == 7, out
+        job_id = re.search(r"Pending job allocation (\d+)", out)
+        assert job_id, out
+        job_info = cluster.scontrol("show", "job", job_id.group(1))
+        assert "JobState=FAILED" in job_info, job_info
+        assert "ExitCode=7:0" in job_info, job_info
+
     def test_standalone_pty_srun_job_survives_an_agent_restart(self, cluster):
         # Standalone `srun --pty` (no salloc) submits its own job through the
         # same LaunchJob path as sbatch; that job's own supervisor must be
@@ -356,6 +382,12 @@ class TestSrunPtyStepSupervision:
         out = str(result.get("out"))
         assert "SURVIVED" in out, out
         _assert_ticks_not_replayed(out, ticks=180)
+
+        # The clean exit must land as COMPLETED, not the unconditional
+        # CANCELLED a standalone --pty job used to get after any session end.
+        job_info = cluster.scontrol("show", "job", str(job_id))
+        assert "JobState=COMPLETED" in job_info, job_info
+        assert "JobState=CANCELLED" not in job_info, job_info
 
     def test_srun_pty_reconnects_after_the_agent_restarts(self, cluster):
         # A dropped mid-session stream (the agent restarting) must be
