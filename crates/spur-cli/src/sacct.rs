@@ -287,6 +287,8 @@ fn parse_acct_state(s: &str) -> Option<i32> {
         "NF" | "NODE_FAIL" => Some(7),
         "PR" | "PREEMPTED" => Some(8),
         "DL" | "DEADLINE" => Some(10),
+        "OOM" | "OUT_OF_MEMORY" => Some(11),
+        "RQ" | "REQUEUED" => Some(12),
         "R" | "RUNNING" => Some(1),
         "PD" | "PENDING" => Some(0),
         _ => None,
@@ -381,10 +383,22 @@ mod tests {
             ("NODE_FAIL", JobState::JobNodeFail),
             ("PREEMPTED", JobState::JobPreempted),
             ("DEADLINE", JobState::JobDeadline),
+            ("OUT_OF_MEMORY", JobState::JobOutOfMemory),
+            ("REQUEUED", JobState::JobRequeued),
         ];
         for (s, expected) in cases {
             assert_eq!(parse_acct_state(s), Some(expected as i32), "state {s}");
         }
+    }
+
+    #[test]
+    fn parse_acct_state_accepts_oom_and_rq_short_codes() {
+        // --state=OOM/RQ must filter, not silently drop into an unconstrained query.
+        assert_eq!(
+            parse_acct_state("OOM"),
+            Some(JobState::JobOutOfMemory as i32)
+        );
+        assert_eq!(parse_acct_state("RQ"), Some(JobState::JobRequeued as i32));
     }
 
     #[test]

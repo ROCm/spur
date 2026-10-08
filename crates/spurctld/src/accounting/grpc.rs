@@ -348,15 +348,7 @@ impl SlurmAccounting for AccountingService {
         let states: Vec<String> = req
             .states
             .iter()
-            .filter_map(|s| match *s {
-                3 => Some("COMPLETED".into()),
-                4 => Some("FAILED".into()),
-                5 => Some("CANCELLED".into()),
-                6 => Some("TIMEOUT".into()),
-                8 => Some("PREEMPTED".into()),
-                10 => Some("DEADLINE".into()),
-                _ => None,
-            })
+            .filter_map(|s| proto_job_state_to_db_str(*s).map(String::from))
             .collect();
 
         let user = if req.user.is_empty() {
@@ -394,17 +386,7 @@ impl SlurmAccounting for AccountingService {
                 uid: 0,
                 partition: r.partition.clone(),
                 account: r.account.clone(),
-                state: match r.state.as_str() {
-                    "COMPLETED" => JobState::JobCompleted as i32,
-                    "FAILED" => JobState::JobFailed as i32,
-                    "CANCELLED" => JobState::JobCancelled as i32,
-                    "TIMEOUT" => JobState::JobTimeout as i32,
-                    "PREEMPTED" => JobState::JobPreempted as i32,
-                    "DEADLINE" => JobState::JobDeadline as i32,
-                    "RUNNING" => JobState::JobRunning as i32,
-                    "PENDING" => JobState::JobPending as i32,
-                    _ => JobState::JobCompleted as i32,
-                },
+                state: db_job_state_str_to_proto(&r.state),
                 state_reason: String::new(),
                 submit_time: Some(datetime_to_proto(r.submit_time)),
                 start_time: r.start_time.map(datetime_to_proto),
@@ -1074,6 +1056,40 @@ impl SlurmAccounting for AccountingService {
     }
 }
 
+fn proto_job_state_to_db_str(code: i32) -> Option<&'static str> {
+    match code {
+        0 => Some("PENDING"),
+        1 => Some("RUNNING"),
+        3 => Some("COMPLETED"),
+        4 => Some("FAILED"),
+        5 => Some("CANCELLED"),
+        6 => Some("TIMEOUT"),
+        7 => Some("NODE_FAIL"),
+        8 => Some("PREEMPTED"),
+        10 => Some("DEADLINE"),
+        11 => Some("OUT_OF_MEMORY"),
+        12 => Some("REQUEUED"),
+        _ => None,
+    }
+}
+
+fn db_job_state_str_to_proto(state: &str) -> i32 {
+    match state {
+        "COMPLETED" => JobState::JobCompleted as i32,
+        "FAILED" => JobState::JobFailed as i32,
+        "CANCELLED" => JobState::JobCancelled as i32,
+        "TIMEOUT" => JobState::JobTimeout as i32,
+        "NODE_FAIL" => JobState::JobNodeFail as i32,
+        "PREEMPTED" => JobState::JobPreempted as i32,
+        "DEADLINE" => JobState::JobDeadline as i32,
+        "OUT_OF_MEMORY" => JobState::JobOutOfMemory as i32,
+        "REQUEUED" => JobState::JobRequeued as i32,
+        "RUNNING" => JobState::JobRunning as i32,
+        "PENDING" => JobState::JobPending as i32,
+        _ => JobState::JobCompleted as i32,
+    }
+}
+
 /// Convert an optional proto timestamp to UTC, rejecting a present-but-invalid
 /// value with `invalid_argument` instead of silently coercing it to the epoch
 /// (which would widen a query window). Guards the nanos cast against negatives.
@@ -1100,6 +1116,59 @@ fn datetime_to_proto(dt: DateTime<Utc>) -> prost_types::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_fail_round_trips_through_the_history_filter_and_display_mapping() {
+        assert_eq!(
+            proto_job_state_to_db_str(JobState::JobNodeFail as i32),
+            Some("NODE_FAIL")
+        );
+        assert_eq!(
+            db_job_state_str_to_proto("NODE_FAIL"),
+            JobState::JobNodeFail as i32
+        );
+    }
+
+    #[test]
+    fn running_and_pending_states_are_preserved_in_the_history_filter() {
+        // A dropped code empties the states filter, which the query then
+        // treats as "match everything" instead of narrowing it.
+        assert_eq!(
+            proto_job_state_to_db_str(JobState::JobRunning as i32),
+            Some("RUNNING")
+        );
+        assert_eq!(
+            proto_job_state_to_db_str(JobState::JobPending as i32),
+            Some("PENDING")
+        );
+    }
+
+    #[test]
+    fn every_finalized_proto_state_maps_to_its_own_db_string_and_back() {
+        let finalized_states = [
+            (JobState::JobCompleted, "COMPLETED"),
+            (JobState::JobFailed, "FAILED"),
+            (JobState::JobCancelled, "CANCELLED"),
+            (JobState::JobTimeout, "TIMEOUT"),
+            (JobState::JobNodeFail, "NODE_FAIL"),
+            (JobState::JobPreempted, "PREEMPTED"),
+            (JobState::JobDeadline, "DEADLINE"),
+            (JobState::JobOutOfMemory, "OUT_OF_MEMORY"),
+            (JobState::JobRequeued, "REQUEUED"),
+        ];
+        for (proto_state, db_str) in finalized_states {
+            assert_eq!(
+                proto_job_state_to_db_str(proto_state as i32),
+                Some(db_str),
+                "states filter dropped {db_str}"
+            );
+            assert_eq!(
+                db_job_state_str_to_proto(db_str),
+                proto_state as i32,
+                "display mapping mis-mapped {db_str}"
+            );
+        }
+    }
 
     fn assert_startup_unavailable<T>(result: Result<Response<T>, Status>) {
         let status = match result {
