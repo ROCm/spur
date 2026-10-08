@@ -596,14 +596,14 @@ it:
 
 Reading it:
 
-* On the ``Grp*`` line and the ``User=`` lines every cap is printed as
+* On the ``Grp*`` line and the ``User=`` lines every cap except ``MaxTRESPJ`` is printed as
   **``Limit(Consumed)``**, as in Slurm: ``node=4(6)`` is a cap of four nodes with
   six in use, and ``N`` marks no cap. ``GrpWall`` follows the same shape as a
   wall-clock time, ``budget(spent)``; an ``N`` in its consumed slot means the
   controller has not read spend yet (its usage cache holds no snapshot), which is
   not the same as none spent. The per-job and per-account caps
-  (``MaxWall``, ``MaxTRESPJ``, ``MaxSubmitJobsPA``) and the per-user caps print
-  bare, with no consumption beside them, because they bound each job, account, or
+  (``MaxWall``, ``MaxTRESPJ``, ``MaxSubmitJobsPA``), and a QOS's per-user caps on
+  its scope line, print bare, with no consumption beside them, because they bound each job, account, or
   user rather than a total the scope accrues.
 * For the count caps a literal ``0`` is a real cap that blocks every job it
   governs. A TRES dimension is the exception: ``0`` there is treated as *unset* —
