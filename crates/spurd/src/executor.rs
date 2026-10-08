@@ -2182,15 +2182,17 @@ fn spool_dir_error(
     // often not the one that blocked: a stray file at the temp fallback reads as a
     // permission failure on the node-owned root, which sends the reader to the wrong
     // path entirely.
+    let (dir, err) = failures.remove(chosen);
+    // The chosen candidate goes last and without its errno: its error is the source,
+    // which a `{:#}` render appends right after it.
     let attempts = failures
         .iter()
-        .map(|(dir, err)| format!("{}: {err}", dir.display()))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let (dir, err) = failures.swap_remove(chosen);
+        .map(|(dir, err)| format!("{}: {err}; ", dir.display()))
+        .collect::<String>();
     let err = anyhow::Error::new(err).context(format!(
-        "create job spool dir, tried {} candidates: {attempts}",
-        failures.len() + 1
+        "create job spool dir, tried {} candidates: {attempts}{}",
+        failures.len() + 1,
+        dir.display()
     ));
     classify_spool_error(&dir, owned_root.unwrap_or(&dir), err)
 }
@@ -3189,6 +3191,14 @@ mod tests {
         assert!(
             text.contains(&fallback_spool().display().to_string()),
             "the fallback that actually blocked must be named too, got: {text}"
+        );
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+        let enotdir = std::io::Error::from_raw_os_error(libc::ENOTDIR).to_string();
+        assert!(
+            text.contains(&format!("{}: {enotdir}", fallback_spool().display()))
+                && text.ends_with(&format!("{}: {eacces}", owned_spool().display()))
+                && text.matches(&eacces).count() == 1,
+            "each candidate must carry its own errno once, got: {text}"
         );
     }
 
