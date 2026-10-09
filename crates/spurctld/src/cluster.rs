@@ -1959,6 +1959,7 @@ impl ClusterManager {
                 num_nodes: spec_for_notify.num_nodes,
                 num_tasks: spec_for_notify.num_tasks,
                 cpus_per_task: spec_for_notify.cpus_per_task,
+                total_gpus: effective_gpus(&spec_for_notify, spec_for_notify.num_nodes) as u32,
                 memory_mb: resources.memory_mb,
                 submit_time: submit_time_for_notify,
                 start_time: Utc::now(),

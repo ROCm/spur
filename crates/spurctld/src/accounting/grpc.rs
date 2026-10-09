@@ -253,11 +253,18 @@ impl SlurmAccounting for AccountingService {
             .map(|t| DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default())
             .unwrap_or(start_time);
 
-        let (memory_mb, cpus) = req
+        let (memory_mb, cpus, total_gpus) = req
             .resources
             .as_ref()
-            .map(|r| (r.memory_mb, r.cpus))
-            .unwrap_or((0, 1));
+            .map(|r| {
+                let gpus: u32 = r
+                    .devices
+                    .values()
+                    .map(|d| d.devices.iter().map(|a| a.count as u32).sum::<u32>())
+                    .sum();
+                (r.memory_mb, r.cpus, gpus)
+            })
+            .unwrap_or((0, 1, 0));
 
         let mut conn = pool
             .acquire()
@@ -275,6 +282,7 @@ impl SlurmAccounting for AccountingService {
                 num_nodes: 1, // simplified
                 num_tasks: cpus,
                 cpus_per_task: 1,
+                total_gpus,
                 memory_mb,
                 submit_time,
                 start_time,
@@ -995,13 +1003,17 @@ impl SlurmAccounting for AccountingService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let account_weights: std::collections::HashMap<String, f64> = accounts
+        let associations = db::list_associations(pool)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let user_weights: std::collections::HashMap<(String, String), i32> = associations
             .into_iter()
-            .map(|a| (a.name, a.fairshare_weight as f64))
+            .map(|a| ((a.user_name, a.account), a.fairshare_weight))
             .collect();
 
         let raw_factors =
-            fairshare::compute_fairshare(&usage, &account_weights, halflife_days, now);
+            fairshare::compute_fairshare(&usage, &accounts, &user_weights, halflife_days, now);
 
         let entries = raw_factors
             .into_iter()

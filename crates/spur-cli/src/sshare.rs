@@ -1,9 +1,13 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::{GetUsageRequest, ListAccountsRequest, ListUsersRequest};
+use spur_proto::proto::{
+    GetFairshareFactorsRequest, GetUsageRequest, ListAccountsRequest, ListUsersRequest,
+};
 
 /// Display fair-share information by account and user.
 #[derive(Parser, Debug)]
@@ -88,6 +92,39 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("failed to get usage")?;
     let usage = usage_resp.into_inner();
 
+    let fairshare_map: HashMap<(String, String), f64> = match client
+        .get_fairshare_factors(GetFairshareFactorsRequest { halflife_days: 0 })
+        .await
+    {
+        Ok(resp) => resp
+            .into_inner()
+            .entries
+            .into_iter()
+            .map(|e| ((e.user, e.account), e.factor))
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
+                 Values shown are local approximations and may differ from the scheduler."
+            );
+            HashMap::new()
+        }
+    };
+
+    let account_fairshare: HashMap<&str, f64> = {
+        let mut sums: HashMap<&str, (f64, usize)> = HashMap::new();
+        for ((_, acct), factor) in &fairshare_map {
+            if let Some(a) = accounts.iter().find(|a| a.name == *acct) {
+                let e = sums.entry(a.name.as_str()).or_default();
+                e.0 += factor;
+                e.1 += 1;
+            }
+        }
+        sums.into_iter()
+            .map(|(acct, (sum, count))| (acct, sum / count as f64))
+            .collect()
+    };
+
     // Compute total shares for normalization
     let total_shares: f64 = accounts.iter().map(|a| a.fairshare_weight).sum();
     let total_shares = if total_shares <= 0.0 {
@@ -97,13 +134,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     };
 
     // Build lookup maps from entries (server guarantees one entry per user+account)
-    let mut account_cpu_secs: std::collections::HashMap<&str, f64> =
-        std::collections::HashMap::new();
-    let mut user_account_cpu_secs: std::collections::HashMap<(&str, &str), f64> =
-        std::collections::HashMap::new();
+    let mut account_cpu_secs: HashMap<&str, f64> = HashMap::new();
+    let mut account_gpu_secs: HashMap<&str, f64> = HashMap::new();
+    let mut user_account_cpu_secs: HashMap<(&str, &str), f64> = HashMap::new();
+    let mut user_account_gpu_secs: HashMap<(&str, &str), f64> = HashMap::new();
     for entry in &usage.entries {
         *account_cpu_secs.entry(&entry.account).or_default() += entry.cpu_seconds;
+        *account_gpu_secs.entry(&entry.account).or_default() += entry.gpu_seconds;
         user_account_cpu_secs.insert((&entry.user, &entry.account), entry.cpu_seconds);
+        user_account_gpu_secs.insert((&entry.user, &entry.account), entry.gpu_seconds);
     }
 
     // Compute total usage for normalization
@@ -117,7 +156,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if args.long {
         if !args.noheader {
             println!(
-                "{:<15} {:<15} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+                "{:<15} {:<15} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
                 "Account",
                 "User",
                 "RawShares",
@@ -125,9 +164,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 "RawUsage",
                 "NormUsage",
                 "FairShare",
-                "CPURawUsage"
+                "CPURawUsage",
+                "GPURawUsage"
             );
-            println!("{}", "-".repeat(101));
+            println!("{}", "-".repeat(117));
         }
     } else if !args.noheader {
         println!(
@@ -152,18 +192,30 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             .copied()
             .unwrap_or(0.0);
         let norm_usage = raw_usage / total_cpu_usage;
-        let fair_share = if norm_usage > 0.001 {
-            norm_shares / norm_usage
-        } else {
-            // No usage = maximum fair share (capped)
-            norm_shares / 0.001
-        };
-        let fair_share = fair_share.min(10.0);
+        let fair_share = account_fairshare
+            .get(account.name.as_str())
+            .copied()
+            .unwrap_or_else(|| {
+                if norm_usage > 0.001 {
+                    (norm_shares / norm_usage).min(100.0)
+                } else {
+                    (norm_shares / 0.001).min(100.0)
+                }
+            });
+
+        let cpu_raw = account_cpu_secs
+            .get(account.name.as_str())
+            .copied()
+            .unwrap_or(0.0);
+        let gpu_raw = account_gpu_secs
+            .get(account.name.as_str())
+            .copied()
+            .unwrap_or(0.0);
 
         // Account-level row
         if args.long {
             println!(
-                "{:<15} {:<15} {:>12} {:>12.6} {:>12.0} {:>12.6} {:>12.6} {:>12.0}",
+                "{:<15} {:<15} {:>12} {:>12.6} {:>12.1} {:>12.6} {:>12.6} {:>12.1} {:>12.1}",
                 account.name,
                 "",
                 raw_shares as u32,
@@ -171,7 +223,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 raw_usage,
                 norm_usage,
                 fair_share,
-                raw_usage,
+                cpu_raw,
+                gpu_raw,
             );
         } else {
             println!(
@@ -198,16 +251,29 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             // Each user within an account gets an equal sub-share
             let user_count = account_users.len().max(1) as f64;
             let user_norm_shares = norm_shares / user_count;
-            let user_fair_share = if user_norm_usage > 0.001 {
-                user_norm_shares / user_norm_usage
-            } else {
-                user_norm_shares / 0.001
-            };
-            let user_fair_share = user_fair_share.min(10.0);
+            let user_fair_share = fairshare_map
+                .get(&(user.name.clone(), account.name.clone()))
+                .copied()
+                .unwrap_or_else(|| {
+                    if user_norm_usage > 0.001 {
+                        (user_norm_shares / user_norm_usage).min(100.0)
+                    } else {
+                        (user_norm_shares / 0.001).min(100.0)
+                    }
+                });
+
+            let user_cpu = user_account_cpu_secs
+                .get(&(user.name.as_str(), account.name.as_str()))
+                .copied()
+                .unwrap_or(0.0);
+            let user_gpu = user_account_gpu_secs
+                .get(&(user.name.as_str(), account.name.as_str()))
+                .copied()
+                .unwrap_or(0.0);
 
             if args.long {
                 println!(
-                    " {:<14} {:<15} {:>12} {:>12.6} {:>12.0} {:>12.6} {:>12.6} {:>12.0}",
+                    " {:<14} {:<15} {:>12} {:>12.6} {:>12.1} {:>12.6} {:>12.6} {:>12.1} {:>12.1}",
                     "",
                     user.name,
                     raw_shares as u32,
@@ -215,7 +281,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     user_usage,
                     user_norm_usage,
                     user_fair_share,
-                    user_usage,
+                    user_cpu,
+                    user_gpu,
                 );
             } else {
                 println!(

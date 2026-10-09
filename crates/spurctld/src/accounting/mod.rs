@@ -208,14 +208,16 @@ pub async fn fairshare_factors(
     let usage = db::get_usage(pool, None, None, since).await?;
     let accounts = db::list_accounts(pool).await?;
 
-    let account_weights: HashMap<String, f64> = accounts
+    let associations = db::list_associations(pool).await?;
+    let user_weights: HashMap<(String, String), i32> = associations
         .into_iter()
-        .map(|a| (a.name, a.fairshare_weight as f64))
+        .map(|a| ((a.user_name, a.account), a.fairshare_weight))
         .collect();
 
     Ok(fairshare::compute_fairshare(
         &usage,
-        &account_weights,
+        &accounts,
+        &user_weights,
         halflife_days,
         now,
     ))
@@ -391,6 +393,7 @@ mod tests {
         super::db::AssociationRecord {
             user_name: "alice".into(),
             account: "research".into(),
+            fairshare_weight: 1,
             max_running_jobs: None,
             max_submit_jobs: None,
             grp_submit_jobs,
