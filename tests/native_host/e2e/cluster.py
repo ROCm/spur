@@ -30,6 +30,11 @@ ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
+# HA chaos-test timings. The blip repro needs heartbeat_timeout < blip < tick,
+# and heartbeat_timeout must clear spurd's fixed 30s send interval so ordinary
+# cadence jitter can never be mistaken for the grace-window bug.
+HA_HEARTBEAT_TIMEOUT_SECS = 35
+HA_HEALTH_TICK_SECS = 60
 
 # Injected into spurd's own environment (only) at launch so a test can prove the
 # daemon's environment does not leak into jobs or into sessions that enter a
@@ -282,9 +287,13 @@ class SpurCluster:
         self.controller_env: dict[str, str] = {}
         # Node indices running spurctld. Only index 0 outside start_ha().
         self._controller_node_indices: list[int] = [0]
+        self._raft_port = 6821
         # Wall-clock (this process's clock) when start_ha()'s first leader was
         # observed — lets a test wait out the grace window from a known origin.
         self.ha_leader_elected_at: float | None = None
+        # When the HA controllers were launched. Health ticks run from process
+        # start, so this is the phase origin for aligning a chaos window.
+        self.ha_controllers_started_at: float | None = None
 
     @property
     def ha_controller_count(self) -> int:
@@ -1202,6 +1211,10 @@ class SpurCluster:
         from the Raft log on the existing state-dir. Waits for the controller
         to answer queries again (does not require nodes to be idle, since a
         suspended job keeps its allocation)."""
+        if self.ha_controller_count > 1:
+            # Node 0 is hardcoded below, and sinfo would be answered by any
+            # peer, so the readiness poll proves nothing under HA.
+            raise RuntimeError("restart_controller() does not support HA clusters")
         self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld", use_sudo=False)
         time.sleep(1)
         self._start_controller()
@@ -1511,9 +1524,11 @@ tar -C "$R" -czf '{local_tar}' .
                 "start_ha() does not support SPUR_TEST_CONTROLLER_PORT overrides"
             )
         self._controller_node_indices = list(range(n_controllers))
+        self._raft_port = raft_port
         if kill_stale:
-            self._kill_controller()
+            self._kill_controller(broad=True)
             self._kill_agents(use_sudo=False, broad=True)
+            self._kill_agents(use_sudo=True, broad=True)  # best-effort for rootful
         self.config_overrides = config_overrides or {}
         # Agent-only hosts (beyond n_controllers) never get the HA rewrite
         # below, so write the shared config everywhere first.
@@ -1521,6 +1536,7 @@ tar -C "$R" -czf '{local_tar}' .
         peers = [f"{self.nodes[i].host}:{raft_port}" for i in range(n_controllers)]
         for i in range(n_controllers):
             self._write_ha_controller_config(i, peers, i + 1, raft_port)
+        self.ha_controllers_started_at = time.time()
         for i in range(n_controllers):
             self._start_controller_on(i)
         self.controller_addr = ",".join(
@@ -1533,17 +1549,40 @@ tar -C "$R" -czf '{local_tar}' .
         self.start_agents(kill_stale=False)
         self.wait_ready()
 
-    def _wait_leader_elected(self, timeout: int = 30):
+    def _current_raft_leader(self) -> int | None:
+        """Index of the single controller whose log ends in "become leader",
+        or None when zero or several claim it (a split vote mid-election)."""
+        leaders = [
+            i
+            for i in self._controller_node_indices
+            if self.spurctld_log(i).rfind("become leader")
+            > self.spurctld_log(i).rfind("quit leader")
+        ]
+        return leaders[0] if len(leaders) == 1 else None
+
+    def _wait_leader_elected(self, timeout: int = 60, settle: float = 5.0):
         """A read like ``sinfo`` isn't proof of a leader (reads fall back to
-        local state); poll each controller's own log for "become leader"."""
+        local state); poll each controller's own log for "become leader".
+
+        Controllers start together and can split the first vote, so the first
+        "become leader" is often superseded a few seconds later. Requires the
+        same leader to hold for *settle* (> openraft's 3s leader lease), or
+        writes submitted in the re-election gap fail with "not the Raft leader".
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for i in self._controller_node_indices:
-                log = self.spurctld_log(i)
-                if log.rfind("become leader") > log.rfind("quit leader"):
+            leader = self._current_raft_leader()
+            if leader is not None:
+                stable_until = time.time() + settle
+                while time.time() < stable_until:
+                    time.sleep(0.5)
+                    if self._current_raft_leader() != leader:
+                        leader = None
+                        break
+                if leader is not None:
                     return
             time.sleep(1)
-        raise TimeoutError(f"no controller became leader within {timeout}s")
+        raise TimeoutError(f"no stable controller leader within {timeout}s")
 
     def _start_postgres(self):
         """Bring up Postgres (Docker) on node 0. Accounting runs inside spurctld."""
@@ -1612,16 +1651,25 @@ tar -C "$R" -czf '{local_tar}' .
         # invocation that embeds it literally (classic pkill -f self-match: a
         # STOP would then freeze that shell forever, since it never sees CONT).
         safe_pattern = f"[{pattern[0]}]{pattern[1:]}" if pattern else pattern
-        if sig is None:
-            # A prior STOP (e.g. a chaos test's signal_controller) leaves TERM
-            # queued but undelivered; CONT first so a frozen process actually dies.
-            node.exec_allow_fail(f"{prefix}pkill -CONT -f '{safe_pattern}' 2>/dev/null || true")
-        flag = f"-{sig} " if sig else ""
-        node.exec_allow_fail(f"{prefix}pkill {flag}-f '{safe_pattern}' 2>/dev/null || true")
+        if sig:
+            node.exec_allow_fail(f"{prefix}pkill -{sig} -f '{safe_pattern}' 2>/dev/null || true")
+            return
+        # A prior STOP (e.g. a chaos test's signal_controller) leaves TERM queued
+        # but undelivered; CONT first so a frozen process actually dies.
+        node.exec_allow_fail(
+            f"{prefix}pkill -CONT -f '{safe_pattern}' 2>/dev/null; "
+            f"{prefix}pkill -f '{safe_pattern}' 2>/dev/null; true"
+        )
 
-    def _kill_controller(self):
+    def _kill_controller(self, broad: bool = False):
         for i in self._controller_node_indices:
             self._pkill(self.nodes[i], f"{self.bin_dir}/spurctld")
+            # A spurctld from a previous session lives under a different bin_dir,
+            # so the pattern misses it while it still holds the ports.
+            if broad:
+                self.nodes[i].exec_allow_fail(
+                    f"fuser -k {CONTROLLER_PORT}/tcp {self._raft_port}/tcp 2>/dev/null || true"
+                )
 
     def signal_controller(self, index: int, sig: str):
         """Send *sig* (e.g. ``STOP``/``CONT``) to the spurctld on nodes[index]."""

@@ -324,6 +324,11 @@ pub struct ControllerConfig {
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
+    /// Seconds between node-health passes. Configured in TOML as
+    /// `[controller] health_tick_secs` (default: 30).
+    #[serde(default = "default_health_tick_secs")]
+    pub health_tick_secs: u64,
+
     /// Maximum automatic requeues (excluding preemption) before a job is held
     /// with `JobHoldMaxRequeue`. Configured in TOML as `[controller] max_batch_requeue` (default: 5).
     #[serde(default = "default_max_batch_requeue")]
@@ -380,6 +385,10 @@ pub struct ControllerConfig {
 
 fn default_max_batch_requeue() -> u32 {
     5
+}
+
+fn default_health_tick_secs() -> u64 {
+    30
 }
 
 fn default_terminal_job_retention_secs() -> u64 {
@@ -469,6 +478,7 @@ impl Default for ControllerConfig {
             node_id: None,
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
+            health_tick_secs: default_health_tick_secs(),
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
@@ -2085,6 +2095,13 @@ impl SlurmConfig {
         if self.controller.max_batch_requeue == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "controller.max_batch_requeue".into(),
+                value: "0 (must be at least 1)".into(),
+            });
+        }
+        // A zero period panics `tokio::time::interval` at controller startup.
+        if self.controller.health_tick_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.health_tick_secs".into(),
                 value: "0 (must be at least 1)".into(),
             });
         }
@@ -4798,6 +4815,30 @@ heartbeat_timeout_secs = 120
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.heartbeat_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn controller_config_health_tick_defaults_and_parses() {
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(config.controller.health_tick_secs, 30);
+
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nhealth_tick_secs = 5\n",
+        )
+        .unwrap();
+        assert_eq!(config.controller.health_tick_secs, 5);
+    }
+
+    #[test]
+    fn controller_config_rejects_a_zero_health_tick() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nhealth_tick_secs = 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("controller.health_tick_secs"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

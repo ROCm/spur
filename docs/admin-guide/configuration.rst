@@ -242,6 +242,13 @@ and Raft high-availability topology.
      - Restart
      - Seconds without a heartbeat before a node is marked Down. Unset by
        default; the controller applies a 90-second fallback when absent.
+   * - ``health_tick_secs``
+     - integer
+     - ``30``
+     - Restart
+     - Seconds between node-health passes. After winning a Raft election the
+       controller withholds DOWN marking for ``max(heartbeat_timeout_secs,
+       health_tick_secs)`` so heartbeats can refresh. Must be ``>= 1``.
    * - ``max_batch_requeue``
      - integer
      - ``5``

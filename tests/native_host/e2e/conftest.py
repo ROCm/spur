@@ -13,7 +13,15 @@ from pathlib import Path
 
 import pytest
 
-from cluster import SshNode, SpurCluster, deep_merge, ensure_bins, make_remote_dir
+from cluster import (
+    HA_HEALTH_TICK_SECS,
+    HA_HEARTBEAT_TIMEOUT_SECS,
+    SshNode,
+    SpurCluster,
+    deep_merge,
+    ensure_bins,
+    make_remote_dir,
+)
 from wg_cluster import MESH_CIDR, WG_IFACE, WgMesh, wg_available
 
 logger = logging.getLogger(__name__)
@@ -325,10 +333,15 @@ def ha_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     c.provision()
     try:
-        # Above spurd's fixed 30s heartbeat-send interval (reporter.rs), so a
-        # false mark-down can only be attributed to the grace-window bug, not
-        # to ordinary heartbeat-cadence jitter racing a too-strict timeout.
-        c.start_ha(3, config_overrides={"controller": {"heartbeat_timeout_secs": 60}})
+        c.start_ha(
+            3,
+            config_overrides={
+                "controller": {
+                    "heartbeat_timeout_secs": HA_HEARTBEAT_TIMEOUT_SECS,
+                    "health_tick_secs": HA_HEALTH_TICK_SECS,
+                }
+            },
+        )
     except Exception:
         c.teardown()
         raise
