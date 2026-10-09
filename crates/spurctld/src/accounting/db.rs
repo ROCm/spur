@@ -168,6 +168,14 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS idle_fill BOOLEAN NOT NULL DEFAULT FALSE;
+-- Rename legacy column first (before ADD COLUMN to avoid duplicate-column error).
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='jobs' AND column_name='gpus_per_task') THEN
+    ALTER TABLE jobs RENAME COLUMN gpus_per_task TO total_gpus;
+  END IF;
+END $$;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS total_gpus INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS usage_recorded BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -283,6 +291,7 @@ pub struct JobStartRecord {
     pub num_nodes: u32,
     pub num_tasks: u32,
     pub cpus_per_task: u32,
+    pub total_gpus: u32,
     pub memory_mb: u64,
     pub submit_time: DateTime<Utc>,
     pub start_time: DateTime<Utc>,
@@ -305,8 +314,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation, idle_fill)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13, $14)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -316,6 +325,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             num_nodes = EXCLUDED.num_nodes,
             num_tasks = EXCLUDED.num_tasks,
             cpus_per_task = EXCLUDED.cpus_per_task,
+            total_gpus = EXCLUDED.total_gpus,
             memory_mb = EXCLUDED.memory_mb,
             submit_time = EXCLUDED.submit_time,
             start_time = EXCLUDED.start_time,
@@ -331,7 +341,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             -- Reclaim makes this routine rather than rare (D12).
             preempted_by = NULL,
             preempt_mode = '',
-            preempt_qos = ''
+            preempt_qos = '',
+            usage_recorded = FALSE
         "#,
     )
     .bind(rec.job_id as i64)
@@ -343,6 +354,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.num_nodes as i32)
     .bind(rec.num_tasks as i32)
     .bind(rec.cpus_per_task as i32)
+    .bind(rec.total_gpus as i32)
     .bind(rec.memory_mb as i64)
     .bind(rec.submit_time)
     .bind(rec.start_time)
@@ -354,7 +366,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
     let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
     )
     .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
@@ -362,7 +374,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
 
     let end_time: Option<DateTime<Utc>> = row.get("end_time");
     if let Some(end_time) = end_time {
-        update_usage(conn, row, end_time).await?;
+        update_usage(conn, row, end_time, rec.job_id as i64).await?;
     }
 
     Ok(())
@@ -398,7 +410,7 @@ pub async fn record_job_end(
             preempted_by = $7,
             preempt_mode = $8,
             preempt_qos = $9
-        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, state, idle_fill
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
         "#,
     )
     .bind(job_id as i64)
@@ -413,7 +425,7 @@ pub async fn record_job_end(
     .fetch_one(&mut *conn)
     .await?;
 
-    update_usage(conn, row, end_time).await?;
+    update_usage(conn, row, end_time, job_id as i64).await?;
 
     Ok(())
 }
@@ -460,40 +472,62 @@ pub async fn job_accounting_states(
         .collect())
 }
 
-/// Update usage accounting for a completed job, from the row `record_job_end` just wrote.
+/// Update usage accounting for a completed job. Idempotent: the charge is
+/// applied at most once per job via a `usage_recorded` flag on the job row,
+/// so a reconcile pass that re-finalizes a job cannot double-bill it.
 async fn update_usage(
     conn: &mut PgConnection,
     row: PgRow,
     end_time: DateTime<Utc>,
+    job_id: i64,
 ) -> anyhow::Result<()> {
     let user: String = row.get("user_name");
     let account: String = row.get("account");
     let start_time: Option<DateTime<Utc>> = row.get("start_time");
     let Some(start_time) = start_time else {
-        // End arrived before start; usage will be computed when start lands.
         return Ok(());
     };
-    // A borrowed run that was reclaimed is not charged to fairshare. Charging it
-    // creates a self-reinforcing loop: the borrower is billed for a run it did not
-    // get to finish, its priority drops, and a lower priority makes it the preferred
-    // next victim — so the more capacity it loses, the more it loses (D9).
-    //
-    // Keyed on the stamp, so a burst-pattern victim (reclaimable only because its
-    // QOS is marked preemptable, while running inside its own quota) keeps today's
-    // treatment and is charged as before.
     let state: String = row.get("state");
     let idle_fill: bool = row.get("idle_fill");
     if idle_fill && state == "PREEMPTED" {
         return Ok(());
     }
 
+    // Atomically claim the charge: only the first caller to flip the flag
+    // proceeds; a concurrent or later attempt gets rows_affected == 0.
+    let claimed = sqlx::query(
+        "UPDATE jobs SET usage_recorded = TRUE WHERE job_id = $1 AND NOT usage_recorded",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Ok(());
+    }
+
     let num_tasks: i32 = row.get("num_tasks");
     let cpus_per_task: i32 = row.get("cpus_per_task");
+    let total_gpus: i32 = row.get("total_gpus");
+    let qos_name: String = row.get("qos");
 
     let duration_secs = (end_time - start_time).num_seconds().max(0);
     let cpu_seconds = duration_secs * (num_tasks as i64) * (cpus_per_task as i64);
+    let gpu_seconds = duration_secs * (total_gpus as i64);
 
-    // Truncate to hourly period for aggregation
+    let usage_factor: f64 = if !qos_name.is_empty() {
+        sqlx::query_scalar("SELECT usage_factor FROM qos WHERE name = $1")
+            .bind(&qos_name)
+            .fetch_optional(&mut *conn)
+            .await?
+            .map(|v: f32| (v as f64).clamp(0.0, 1000.0))
+            .unwrap_or(1.0)
+    } else {
+        1.0
+    };
+
+    let cpu_seconds = (cpu_seconds as f64 * usage_factor) as i64;
+    let gpu_seconds = (gpu_seconds as f64 * usage_factor) as i64;
+
     let period_start = start_time
         .date_naive()
         .and_hms_opt(start_time.hour(), 0, 0)
@@ -503,10 +537,11 @@ async fn update_usage(
 
     sqlx::query(
         r#"
-        INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, job_count)
-        VALUES ($1, $2, $3, $4, $5, 1)
+        INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count)
+        VALUES ($1, $2, $3, $4, $5, $6, 1)
         ON CONFLICT (user_name, account, period_start) DO UPDATE SET
             cpu_seconds = usage.cpu_seconds + $5,
+            gpu_seconds = usage.gpu_seconds + $6,
             job_count = usage.job_count + 1
         "#,
     )
@@ -515,6 +550,7 @@ async fn update_usage(
     .bind(period_start)
     .bind(period_end)
     .bind(cpu_seconds)
+    .bind(gpu_seconds)
     .execute(&mut *conn)
     .await?;
 
@@ -1435,7 +1471,7 @@ pub async fn list_associations(pool: &PgPool) -> anyhow::Result<Vec<AssociationR
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT ON (user_name, account)
-            user_name, account, max_running_jobs, max_submit_jobs, grp_submit_jobs,
+            user_name, account, fairshare_weight, max_running_jobs, max_submit_jobs, grp_submit_jobs,
             max_tres_per_job, grp_tres, max_wall_min
         FROM associations
         WHERE partition_name IS NULL OR partition_name = ''
@@ -1450,6 +1486,7 @@ pub async fn list_associations(pool: &PgPool) -> anyhow::Result<Vec<AssociationR
         .map(|r| AssociationRecord {
             user_name: r.get("user_name"),
             account: r.get("account"),
+            fairshare_weight: r.get("fairshare_weight"),
             max_running_jobs: r.get("max_running_jobs"),
             max_submit_jobs: r.get("max_submit_jobs"),
             grp_submit_jobs: r.get("grp_submit_jobs"),
@@ -1464,6 +1501,7 @@ pub async fn list_associations(pool: &PgPool) -> anyhow::Result<Vec<AssociationR
 pub struct AssociationRecord {
     pub user_name: String,
     pub account: String,
+    pub fairshare_weight: i32,
     pub max_running_jobs: Option<i32>,
     pub max_submit_jobs: Option<i32>,
     pub grp_submit_jobs: Option<i32>,
@@ -1753,6 +1791,7 @@ mod job_history_tests {
                 num_nodes: num_nodes as u32,
                 num_tasks: num_tasks as u32,
                 cpus_per_task: cpus_per_task as u32,
+                total_gpus: 0,
                 memory_mb: memory_mb as u64,
                 submit_time,
                 start_time,
@@ -1810,6 +1849,7 @@ mod job_history_tests {
                 num_nodes: 1,
                 num_tasks: 1,
                 cpus_per_task: 1,
+                total_gpus: 0,
                 memory_mb: 0,
                 submit_time: start_time,
                 start_time,

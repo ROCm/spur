@@ -502,7 +502,10 @@ QOS keys
        ``sacctmgr modify qos name=<name> set clearpreemptexempttime=1``.
    * - ``usagefactor``
      - ``1.0``
-     - Multiplier applied to usage charged under this QOS.
+     - Multiplier applied to both CPU and GPU usage charged under this QOS.
+       A factor of ``2.0`` doubles the usage billed for fair-share; ``0.5``
+       halves it. Negative values are clamped to ``0.0`` and values above
+       ``1000.0`` are clamped to ``1000.0`` to guard against misconfiguration.
    * - ``maxjobsperuser`` (alias ``maxjobspu``)
      - unset (no limit)
      - Maximum running jobs per user under this QOS. See :ref:`limit-values`.
@@ -1051,6 +1054,36 @@ At submit, Spur resolves the job's QOS in this order, matching Slurm:
 
    A configured ``accounting.default_qos`` that does **not** name an existing QOS
    is a hard error, not a silent fallback. Create the QOS before referencing it.
+
+Fair-share scheduling
+---------------------
+
+Fair-share scores determine how the scheduler prioritizes pending jobs. A user
+who has consumed less than their entitled share receives a boost; one who has
+consumed more gets deprioritised. The score is computed from three inputs:
+
+- **Account hierarchy** — accounts form a tree, and each account's effective
+  share is its weight divided by the sum of its sibling weights, scaled by its
+  parent's share. ``sshare`` displays the resulting per-user factors.
+- **Usage decay** — older usage fades exponentially with a half-life set by
+  ``scheduler.fairshare_halflife_days`` (default 14).
+- **CPU + GPU billing** — a job's billable usage is the sum of its CPU-seconds
+  and GPU-seconds. GPU time is billed 1:1 with CPU time; there is no
+  per-resource billing weight. This is a deliberate simplification — add a
+  configurable weight if your cluster's GPU-hours are significantly more
+  valuable than CPU-hours.
+
+The ``usagefactor`` on a job's QOS multiplies both CPU and GPU billable usage.
+
+**Differences from Slurm's fair-share:**
+
+- Spur's fair-share factor ranges from 0 to 100 (capped), where 1.0 means "you
+  have used exactly your share." Slurm's ranges from 0 to 1, with 0.5 as the
+  midpoint. The **ranking** of users is the same — both agree on who is over-
+  and under-using — but the raw numbers are on different scales.
+- ``sshare -l`` includes a ``GPURawUsage`` column showing GPU-seconds alongside
+  ``CPURawUsage``. The ``RawUsage`` column is CPU-seconds only (not the combined
+  billable total).
 
 Associations
 ------------
