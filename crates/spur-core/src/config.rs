@@ -324,6 +324,11 @@ pub struct ControllerConfig {
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
+    /// Seconds between node-health passes. Configured in TOML as
+    /// `[controller] health_tick_secs` (default: 30).
+    #[serde(default = "default_health_tick_secs")]
+    pub health_tick_secs: u64,
+
     /// Maximum automatic requeues (excluding preemption) before a job is held
     /// with `JobHoldMaxRequeue`. Configured in TOML as `[controller] max_batch_requeue` (default: 5).
     #[serde(default = "default_max_batch_requeue")]
@@ -380,6 +385,10 @@ pub struct ControllerConfig {
 
 fn default_max_batch_requeue() -> u32 {
     5
+}
+
+fn default_health_tick_secs() -> u64 {
+    30
 }
 
 fn default_terminal_job_retention_secs() -> u64 {
@@ -469,6 +478,7 @@ impl Default for ControllerConfig {
             node_id: None,
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
+            health_tick_secs: default_health_tick_secs(),
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
@@ -2083,6 +2093,21 @@ impl SlurmConfig {
         if self.controller.max_batch_requeue == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "controller.max_batch_requeue".into(),
+                value: "0 (must be at least 1)".into(),
+            });
+        }
+        // A zero period panics `tokio::time::interval` at controller startup.
+        if self.controller.health_tick_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.health_tick_secs".into(),
+                value: "0 (must be at least 1)".into(),
+            });
+        }
+        // Zero makes every heartbeat instantly stale, so the first health pass
+        // past the grace window marks every registered node Down.
+        if self.controller.heartbeat_timeout_secs == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.heartbeat_timeout_secs".into(),
                 value: "0 (must be at least 1)".into(),
             });
         }
@@ -4850,6 +4875,68 @@ heartbeat_timeout_secs = 120
 "#;
         let config = SlurmConfig::load_from_str(toml).unwrap();
         assert_eq!(config.controller.heartbeat_timeout_secs, Some(120));
+    }
+
+    #[test]
+    fn controller_config_health_tick_defaults_and_parses() {
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(config.controller.health_tick_secs, 30);
+
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nhealth_tick_secs = 5\n",
+        )
+        .unwrap();
+        assert_eq!(config.controller.health_tick_secs, 5);
+    }
+
+    #[test]
+    fn controller_config_rejects_a_zero_health_tick() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nhealth_tick_secs = 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("controller.health_tick_secs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_a_zero_heartbeat_timeout() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nheartbeat_timeout_secs = 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("controller.heartbeat_timeout_secs"),
+            "unexpected error: {err}"
+        );
+
+        // Absent stays absent: only an explicit 0 is rejected.
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(config.controller.heartbeat_timeout_secs, None);
+    }
+
+    #[test]
+    fn a_config_predating_the_health_tick_field_still_loads() {
+        // Upgrade contract: neither zero-guard may fire on a deployed config
+        // written before these fields existed, or the controller won't restart.
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "legacy"
+
+[controller]
+listen_addr = "0.0.0.0:6817"
+raft_listen_addr = "0.0.0.0:6821"
+node_id = 1
+peers = ["10.0.0.2:6821", "10.0.0.3:6821"]
+max_batch_requeue = 5
+"#,
+        )
+        .expect("a pre-upgrade config must still validate");
+        assert_eq!(config.controller.health_tick_secs, 30);
+        assert_eq!(config.controller.heartbeat_timeout_secs, None);
     }
 
     #[test]

@@ -771,6 +771,93 @@ impl RaftHandle {
     pub fn current_leader(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
     }
+
+    /// Publishes when leadership has been held since, tagged with its term.
+    /// Watch-driven, so a blip between two health ticks is still observed.
+    pub fn spawn_leadership_watcher(&self) -> tokio::sync::watch::Receiver<Option<LeaderSince>> {
+        let metrics_rx = self.raft.metrics();
+        let node_id = self.node_id;
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(run_leadership_watcher(metrics_rx, tx, node_id));
+        rx
+    }
+
+    /// The Raft term this node currently holds a vote at, for confirming a
+    /// published [`LeaderSince`] still describes the live term.
+    pub fn current_term(&self) -> u64 {
+        self.raft.metrics().borrow().current_term
+    }
+}
+
+/// When this node won leadership, and the term it won it in. The term lets a
+/// reader reject a value the watcher has not yet refreshed past a transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaderSince {
+    pub at: std::time::Instant,
+    pub term: u64,
+}
+
+/// Drives the leadership watch channel. Losing the raft metrics sender publishes
+/// `None` first, so a reader fails closed rather than acting on a value that can
+/// no longer change; the receiver-gone exits have nobody left to tell.
+async fn run_leadership_watcher(
+    mut metrics_rx: tokio::sync::watch::Receiver<
+        openraft::RaftMetrics<NodeId, openraft::BasicNode>,
+    >,
+    tx: tokio::sync::watch::Sender<Option<LeaderSince>>,
+    node_id: NodeId,
+) {
+    let mut published = None;
+    loop {
+        let (current_leader, current_term) = {
+            let m = metrics_rx.borrow_and_update();
+            (m.current_leader, m.current_term)
+        };
+        let next = observe_leadership(
+            current_leader,
+            current_term,
+            node_id,
+            published,
+            std::time::Instant::now(),
+        );
+        if next != published {
+            published = next;
+            if tx.send(published).is_err() {
+                return;
+            }
+        }
+        tokio::select! {
+            _ = tx.closed() => return,
+            changed = metrics_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    tracing::error!("raft leadership watcher stopped; suppressing node health checks");
+    let _ = tx.send(None);
+}
+
+/// Restamps whenever this node leads under a term it was not already credited
+/// with, so a coalesced lose-then-regain is still caught by its term bump.
+fn observe_leadership(
+    current_leader: Option<NodeId>,
+    current_term: u64,
+    node_id: NodeId,
+    prior: Option<LeaderSince>,
+    now: std::time::Instant,
+) -> Option<LeaderSince> {
+    if current_leader != Some(node_id) {
+        return None;
+    }
+    match prior {
+        Some(p) if p.term == current_term => Some(p),
+        _ => Some(LeaderSince {
+            at: now,
+            term: current_term,
+        }),
+    }
 }
 
 /// The system hostname as a UTF-8 string.
@@ -1405,6 +1492,122 @@ mod tests {
         let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
         let inner = store.inner.read();
         assert!(inner.last_purged.is_none());
+    }
+
+    #[test]
+    fn observe_leadership_sets_since_on_election_win() {
+        let now = std::time::Instant::now();
+        let got = super::observe_leadership(Some(1), 3, 1, None, now);
+        assert_eq!(got, Some(super::LeaderSince { at: now, term: 3 }));
+    }
+
+    #[test]
+    fn observe_leadership_keeps_since_steady_while_leader_and_term_unchanged() {
+        let t0 = std::time::Instant::now();
+        let prior = super::LeaderSince { at: t0, term: 3 };
+        let t1 = t0 + std::time::Duration::from_secs(5);
+        let got = super::observe_leadership(Some(1), 3, 1, Some(prior), t1);
+        assert_eq!(
+            got,
+            Some(prior),
+            "unchanged term must not restart the window"
+        );
+    }
+
+    #[test]
+    fn observe_leadership_resets_on_term_bump_while_still_leader() {
+        // A watch channel coalescing a lose-then-regain: the leader value reads
+        // unchanged, but the term proves an election happened in between.
+        let t0 = std::time::Instant::now();
+        let prior = super::LeaderSince { at: t0, term: 3 };
+        let t1 = t0 + std::time::Duration::from_secs(20);
+        let got = super::observe_leadership(Some(1), 4, 1, Some(prior), t1);
+        assert_eq!(got, Some(super::LeaderSince { at: t1, term: 4 }));
+    }
+
+    #[test]
+    fn observe_leadership_clears_since_when_not_leader() {
+        let t0 = std::time::Instant::now();
+        let prior = super::LeaderSince { at: t0, term: 3 };
+        assert_eq!(
+            super::observe_leadership(Some(2), 3, 1, Some(prior), t0),
+            None
+        );
+    }
+
+    fn metrics_at(leader: Option<NodeId>, term: u64) -> openraft::RaftMetrics<NodeId, BasicNode> {
+        let mut m = openraft::RaftMetrics::new_initial(1);
+        m.current_leader = leader;
+        m.current_term = term;
+        m
+    }
+
+    /// Drives the real watcher loop, not just its pure decision fn: this is the
+    /// wiring that previously sampled on a timer and missed sub-tick blips.
+    #[tokio::test]
+    async fn leadership_watcher_restamps_on_a_coalesced_lose_then_regain() {
+        let (metrics_tx, metrics_rx) = tokio::sync::watch::channel(metrics_at(Some(1), 3));
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let task = tokio::spawn(super::run_leadership_watcher(metrics_rx, tx, 1));
+
+        rx.changed().await.unwrap();
+        let first = rx.borrow_and_update().expect("leader at term 3");
+        assert_eq!(first.term, 3);
+
+        // One send collapsing a lost-and-regained leadership: `current_leader`
+        // reads the same on both sides, so only the term exposes the blip.
+        metrics_tx.send(metrics_at(Some(1), 4)).unwrap();
+        rx.changed().await.unwrap();
+        let second = rx.borrow_and_update().expect("leader again at term 4");
+        assert_eq!(second.term, 4);
+        assert!(second.at > first.at, "the grace window must be re-armed");
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn leadership_watcher_publishes_none_on_losing_leadership() {
+        let (metrics_tx, metrics_rx) = tokio::sync::watch::channel(metrics_at(Some(1), 3));
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let task = tokio::spawn(super::run_leadership_watcher(metrics_rx, tx, 1));
+
+        rx.changed().await.unwrap();
+        assert!(rx.borrow_and_update().is_some());
+
+        metrics_tx.send(metrics_at(Some(2), 4)).unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow_and_update(), None);
+
+        task.abort();
+    }
+
+    /// A watcher that stops must leave the health path suppressed, not acting on
+    /// a stale `leader_since` that can no longer be refreshed.
+    #[tokio::test]
+    async fn leadership_watcher_publishes_none_when_the_metrics_channel_closes() {
+        let (metrics_tx, metrics_rx) = tokio::sync::watch::channel(metrics_at(Some(1), 3));
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        tokio::spawn(super::run_leadership_watcher(metrics_rx, tx, 1));
+
+        rx.changed().await.unwrap();
+        assert!(rx.borrow_and_update().is_some());
+
+        drop(metrics_tx);
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow_and_update(), None);
+    }
+
+    /// Dropping the receiver must stop the task even though leadership never
+    /// changes again, which is the only thing that would otherwise wake it.
+    #[tokio::test]
+    async fn leadership_watcher_exits_when_its_receiver_is_dropped() {
+        let (_metrics_tx, metrics_rx) = tokio::sync::watch::channel(metrics_at(Some(1), 3));
+        let (tx, mut rx) = tokio::sync::watch::channel(None);
+        let task = tokio::spawn(super::run_leadership_watcher(metrics_rx, tx, 1));
+
+        rx.changed().await.unwrap();
+        drop(rx);
+        task.await.unwrap();
     }
 
     #[test]

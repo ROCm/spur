@@ -13,7 +13,15 @@ from pathlib import Path
 
 import pytest
 
-from cluster import SshNode, SpurCluster, deep_merge, ensure_bins, make_remote_dir
+from cluster import (
+    HA_HEALTH_TICK_SECS,
+    HA_HEARTBEAT_TIMEOUT_SECS,
+    SshNode,
+    SpurCluster,
+    deep_merge,
+    ensure_bins,
+    make_remote_dir,
+)
 from wg_cluster import MESH_CIDR, WG_IFACE, WgMesh, wg_available
 
 logger = logging.getLogger(__name__)
@@ -314,6 +322,31 @@ def k8s_calico_direct_cluster(ssh_nodes, remote_bin_dir):
         pass
     c.teardown()
     _reset_k0s_all_nodes(c)
+
+
+@pytest.fixture
+def ha_cluster(ssh_nodes, remote_bin_dir):
+    """3-controller Raft HA cluster: spurctld on every node (real election,
+    real peers), spurd on every node. Skips unless >= 3 nodes are configured."""
+    if len(ssh_nodes) < 3:
+        pytest.skip(f"HA controller tests require >= 3 nodes (got {len(ssh_nodes)})")
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    c.provision()
+    try:
+        c.start_ha(
+            3,
+            config_overrides={
+                "controller": {
+                    "heartbeat_timeout_secs": HA_HEARTBEAT_TIMEOUT_SECS,
+                    "health_tick_secs": HA_HEALTH_TICK_SECS,
+                }
+            },
+        )
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    c.teardown()
 
 
 @pytest.fixture

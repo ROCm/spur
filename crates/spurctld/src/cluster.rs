@@ -8787,32 +8787,31 @@ pub enum MarkDownPolicy {
     Suppressed,
 }
 
-/// Withholds DOWN marking for `grace` after leadership is first observed: a
-/// non-leader records no heartbeats, so every `last_heartbeat` is outage-stale.
+/// Withholds DOWN marking for `grace` after leadership is won: a non-leader
+/// records no heartbeats, so every `last_heartbeat` is outage-stale.
 pub struct LeadershipGrace {
     grace: std::time::Duration,
-    leader_since: Option<std::time::Instant>,
 }
 
 impl LeadershipGrace {
     pub fn new(grace: std::time::Duration) -> Self {
-        Self {
-            grace,
-            leader_since: None,
-        }
+        Self { grace }
     }
 
-    pub fn observe(&mut self, is_leader: bool, now: std::time::Instant) -> MarkDownPolicy {
-        if !is_leader {
-            self.leader_since = None;
-            return MarkDownPolicy::Suppressed;
-        }
-        let since = *self.leader_since.get_or_insert(now);
-        if now.saturating_duration_since(since) >= self.grace {
+    /// `None` means skip the health pass: either not leader, or `leader_since`
+    /// is from an older term and has not caught up with a just-won election.
+    pub fn policy(
+        &self,
+        leader_since: Option<crate::raft::LeaderSince>,
+        live_term: u64,
+        now: std::time::Instant,
+    ) -> Option<MarkDownPolicy> {
+        let since = leader_since.filter(|s| s.term == live_term)?;
+        Some(if now.saturating_duration_since(since.at) >= self.grace {
             MarkDownPolicy::Allowed
         } else {
             MarkDownPolicy::Suppressed
-        }
+        })
     }
 }
 
@@ -24998,48 +24997,60 @@ mod tests {
         assert_eq!(super::recovered_node_state(Some(&node)), NodeState::Idle);
     }
 
+    fn leader_since(at: std::time::Instant, term: u64) -> crate::raft::LeaderSince {
+        crate::raft::LeaderSince { at, term }
+    }
+
     #[test]
     fn leadership_grace_suppresses_until_the_window_elapses() {
         let grace = std::time::Duration::from_secs(90);
-        let mut gate = super::LeadershipGrace::new(grace);
+        let gate = super::LeadershipGrace::new(grace);
         let t0 = std::time::Instant::now();
 
         assert_eq!(
-            gate.observe(true, t0),
-            super::MarkDownPolicy::Suppressed,
+            gate.policy(Some(leader_since(t0, 7)), 7, t0),
+            Some(super::MarkDownPolicy::Suppressed),
             "leadership just acquired"
         );
         assert_eq!(
-            gate.observe(true, t0 + std::time::Duration::from_secs(89)),
-            super::MarkDownPolicy::Suppressed
+            gate.policy(
+                Some(leader_since(t0, 7)),
+                7,
+                t0 + std::time::Duration::from_secs(89)
+            ),
+            Some(super::MarkDownPolicy::Suppressed)
         );
         assert_eq!(
-            gate.observe(true, t0 + grace),
-            super::MarkDownPolicy::Allowed
+            gate.policy(Some(leader_since(t0, 7)), 7, t0 + grace),
+            Some(super::MarkDownPolicy::Allowed)
         );
     }
 
     #[test]
-    fn leadership_grace_restarts_after_losing_leadership() {
-        let grace = std::time::Duration::from_secs(90);
-        let mut gate = super::LeadershipGrace::new(grace);
+    fn leadership_grace_skips_the_pass_when_not_leader() {
+        let gate = super::LeadershipGrace::new(std::time::Duration::from_secs(90));
         let t0 = std::time::Instant::now();
-        assert_eq!(gate.observe(true, t0), super::MarkDownPolicy::Suppressed);
-        assert_eq!(
-            gate.observe(true, t0 + grace),
-            super::MarkDownPolicy::Allowed
-        );
+        assert_eq!(gate.policy(None, 7, t0), None);
+    }
 
-        let lost = t0 + std::time::Duration::from_secs(200);
-        assert_eq!(gate.observe(false, lost), super::MarkDownPolicy::Suppressed);
+    /// The window a published `leader_since` lags a just-won election: the
+    /// elapsed old-term value must not be mistaken for an elapsed new-term one.
+    #[test]
+    fn leadership_grace_skips_a_leader_since_from_a_stale_term() {
+        let grace = std::time::Duration::from_secs(90);
+        let gate = super::LeadershipGrace::new(grace);
+        let t0 = std::time::Instant::now();
+        let elapsed = t0 + grace;
+
         assert_eq!(
-            gate.observe(true, lost + std::time::Duration::from_secs(1)),
-            super::MarkDownPolicy::Suppressed,
-            "re-acquiring leadership restarts the grace window"
+            gate.policy(Some(leader_since(t0, 7)), 7, elapsed),
+            Some(super::MarkDownPolicy::Allowed),
+            "same term: the window genuinely elapsed"
         );
         assert_eq!(
-            gate.observe(true, lost + std::time::Duration::from_secs(1) + grace),
-            super::MarkDownPolicy::Allowed
+            gate.policy(Some(leader_since(t0, 7)), 8, elapsed),
+            None,
+            "term moved on: the watcher has not republished yet"
         );
     }
 
