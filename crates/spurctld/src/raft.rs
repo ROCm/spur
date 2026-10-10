@@ -797,8 +797,9 @@ pub struct LeaderSince {
     pub term: u64,
 }
 
-/// Drives the leadership watch channel. Every exit publishes `None` so a
-/// reader fails closed rather than acting on a value that can no longer change.
+/// Drives the leadership watch channel. Losing the raft metrics sender publishes
+/// `None` first, so a reader fails closed rather than acting on a value that can
+/// no longer change; the receiver-gone exits have nobody left to tell.
 async fn run_leadership_watcher(
     mut metrics_rx: tokio::sync::watch::Receiver<
         openraft::RaftMetrics<NodeId, openraft::BasicNode>,

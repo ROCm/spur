@@ -2105,6 +2105,14 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
+        // Zero makes every heartbeat instantly stale, so the first health pass
+        // past the grace window marks every registered node Down.
+        if self.controller.heartbeat_timeout_secs == Some(0) {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.heartbeat_timeout_secs".into(),
+                value: "0 (must be at least 1)".into(),
+            });
+        }
         // Zero would clamp every launch-failure hold to zero, restoring the tight
         // re-dispatch loop the backoff exists to prevent. The upper bound keeps
         // the hold instant representable.
@@ -4839,6 +4847,44 @@ heartbeat_timeout_secs = 120
             err.to_string().contains("controller.health_tick_secs"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn controller_config_rejects_a_zero_heartbeat_timeout() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nheartbeat_timeout_secs = 0\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("controller.heartbeat_timeout_secs"),
+            "unexpected error: {err}"
+        );
+
+        // Absent stays absent: only an explicit 0 is rejected.
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(config.controller.heartbeat_timeout_secs, None);
+    }
+
+    #[test]
+    fn a_config_predating_the_health_tick_field_still_loads() {
+        // Upgrade contract: neither zero-guard may fire on a deployed config
+        // written before these fields existed, or the controller won't restart.
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "legacy"
+
+[controller]
+listen_addr = "0.0.0.0:6817"
+raft_listen_addr = "0.0.0.0:6821"
+node_id = 1
+peers = ["10.0.0.2:6821", "10.0.0.3:6821"]
+max_batch_requeue = 5
+"#,
+        )
+        .expect("a pre-upgrade config must still validate");
+        assert_eq!(config.controller.health_tick_secs, 30);
+        assert_eq!(config.controller.heartbeat_timeout_secs, None);
     }
 
     #[test]

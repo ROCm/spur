@@ -51,6 +51,13 @@ DOCKER_PORT_INSPECT_FMT = (
 )
 
 
+def log_tail_is_leader(log: str) -> bool:
+    """Whether *log* ends in a "become leader" not yet followed by "quit leader".
+    Takes text, not a node index: offsets from two reads aren't comparable."""
+    become = log.rfind("become leader")
+    return become != -1 and become > log.rfind("quit leader")
+
+
 def parse_published_port(inspect_output: str) -> int:
     """Host port from ``docker inspect --format DOCKER_PORT_INSPECT_FMT`` output."""
     port = inspect_output.strip()
@@ -1555,8 +1562,7 @@ tar -C "$R" -czf '{local_tar}' .
         leaders = [
             i
             for i in self._controller_node_indices
-            if self.spurctld_log(i).rfind("become leader")
-            > self.spurctld_log(i).rfind("quit leader")
+            if log_tail_is_leader(self.spurctld_log(i))
         ]
         return leaders[0] if len(leaders) == 1 else None
 

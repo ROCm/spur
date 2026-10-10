@@ -249,6 +249,8 @@ async fn main() -> anyhow::Result<()> {
         ));
         loop {
             interval.tick().await;
+            // Two snapshots: the watcher can lag a just-won election, so the
+            // term equality inside `policy` skips the pass rather than trust it.
             let leader_since = *leader_since_rx.borrow();
             let live_term = health_raft.current_term();
             let Some(mark_down) = grace.policy(leader_since, live_term, std::time::Instant::now())

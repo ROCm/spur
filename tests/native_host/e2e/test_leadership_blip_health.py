@@ -17,6 +17,7 @@ import pytest
 from cluster import (
     HA_HEALTH_TICK_SECS,
     HA_HEARTBEAT_TIMEOUT_SECS,
+    log_tail_is_leader,
     parse_job_id,
     wait_job_state,
     job_state,
@@ -31,7 +32,9 @@ BLIP_HOLD_SECS = 42
 # seen, so this is a timeout, not an enforced freeze duration.
 INTERIM_ELECTION_TIMEOUT_SECS = 10
 RACE_SETTLE_TIMEOUT_SECS = 30
-MAX_RECLAIM_ATTEMPTS = 3
+# Staging the blip is timing-sensitive and exhausting the attempts now fails the
+# test, so budget more of them than the repro typically needs.
+MAX_RECLAIM_ATTEMPTS = 5
 GRACE_SECS = max(HA_HEARTBEAT_TIMEOUT_SECS, HA_HEALTH_TICK_SECS)
 # Wait past grace plus one full health tick before judging node/job state.
 HEALTH_SETTLE_SECS = GRACE_SECS + 2 * HA_HEALTH_TICK_SECS + 10
@@ -40,13 +43,7 @@ HEALTH_SETTLE_SECS = GRACE_SECS + 2 * HA_HEALTH_TICK_SECS + 10
 SURVIVOR_JOB_SECS = 1800
 
 
-def _log_tail_is_leader(log: str) -> bool:
-    become = log.rfind("become leader")
-    quit_ = log.rfind("quit leader")
-    return become != -1 and become > quit_
-
-
-def _wait_initial_leader(cluster, n: int, timeout: float = 60.0) -> int:
+def _wait_initial_leader(cluster, timeout: float = 60.0) -> int:
     """A split first vote is common, so require the leader to actually settle
     before a blip is staged against it."""
     cluster._wait_leader_elected(timeout=int(timeout))
@@ -64,7 +61,7 @@ def _wait_became_leader_since(cluster, indices, since_lens, timeout, want=None):
     seen = None
     while time.time() < deadline:
         for i in indices:
-            if _log_tail_is_leader(cluster.spurctld_log(i)[since_lens[i]:]):
+            if log_tail_is_leader(cluster.spurctld_log(i)[since_lens[i]:]):
                 if want is None or i == want:
                     return i
                 seen = i
@@ -137,7 +134,7 @@ class TestLeadershipBlipHealth:
         reclaimed = False
         attempts = []
         for _ in range(MAX_RECLAIM_ATTEMPTS):
-            leader_idx = _wait_initial_leader(cluster, n)
+            leader_idx = _wait_initial_leader(cluster)
             # Start just after a tick boundary so the whole blip fits between
             # two ticks (otherwise a mid-blip tick re-arms even the old code)
             # and the next tick lands while the map is still stale.
@@ -146,7 +143,7 @@ class TestLeadershipBlipHealth:
 
             winner, blip = _attempt_reclaim(cluster, n, leader_idx)
             # Let the cluster fully restabilize before the next attempt/assert.
-            _wait_initial_leader(cluster, n, timeout=60)
+            _wait_initial_leader(cluster, timeout=60)
             attempts.append(f"winner={winner} want={leader_idx} blip={blip:.1f}s")
             # Outside this band the run proves nothing: a blip under the
             # heartbeat timeout leaves no node stale enough to be a mark-down
@@ -159,7 +156,9 @@ class TestLeadershipBlipHealth:
                 break
 
         if not reclaimed:
-            pytest.skip(
+            # Not a skip: the harness ran, so this is the regression scenario
+            # failing to stage rather than a missing prerequisite.
+            pytest.fail(
                 "no same-controller reclaim with a blip inside "
                 f"({HA_HEARTBEAT_TIMEOUT_SECS}s, {HA_HEALTH_TICK_SECS}s) in "
                 f"{MAX_RECLAIM_ATTEMPTS} attempts: " + "; ".join(attempts)
