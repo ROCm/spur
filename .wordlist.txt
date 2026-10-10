@@ -75,6 +75,7 @@ rootfs
 rlimit
 rlimits
 ROCm
+ROCr
 runnable
 sacct
 sacctmgr
