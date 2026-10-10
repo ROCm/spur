@@ -433,6 +433,9 @@ pub struct ClusterManager {
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
+    /// Per-job high-water mark for user step ids. Advanced when an id is handed
+    /// out, before `JobStepCreate` commits, so a lost create cannot reissue it.
+    next_step_id: RwLock<HashMap<JobId, u32>>,
     /// Configured cluster-wide license totals (immutable; from config). Current
     /// availability is derived as total minus the licenses held by active jobs
     /// (see `available_licenses`), so it cannot drift or diverge from config.
@@ -695,6 +698,7 @@ impl ClusterManager {
             config_seeded_partitions: RwLock::new(config_seeded_partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
+            next_step_id: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(first_job_id),
             license_pool: RwLock::new(license_pool),
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
@@ -3937,6 +3941,27 @@ impl ClusterManager {
         Ok(resp.jobs_finalized)
     }
 
+    /// Reserve the next user step id for `job_id`. Reserving and proposing are
+    /// separate, so this is the only point that can keep the ids distinct.
+    pub fn allocate_step_id(&self, job_id: JobId) -> u32 {
+        let mut next = self.next_step_id.write();
+        let slot = next
+            .entry(job_id)
+            .or_insert_with(|| self.highest_user_step_id(job_id).map_or(0, |id| id + 1));
+        let step_id = *slot;
+        *slot = slot.saturating_add(1);
+        step_id
+    }
+
+    fn highest_user_step_id(&self, job_id: JobId) -> Option<u32> {
+        self.steps
+            .read()
+            .keys()
+            .filter(|(jid, step_id)| *jid == job_id && spur_core::step::is_user_step(*step_id))
+            .map(|(_, step_id)| *step_id)
+            .max()
+    }
+
     /// Create a job step durably via Raft. Caps the step name before proposing:
     /// doing it later (apply or snapshot restore) would let a mixed-version
     /// quorum compute divergent state from the same WAL entry.
@@ -6908,10 +6933,21 @@ impl ClusterManager {
                     );
                 }
                 Some(_) => {
-                    let mut steps = self.steps.write();
-                    steps
-                        .entry((step.job_id, step.step_id))
-                        .or_insert_with(|| (**step).clone());
+                    // Scoped so the `steps` guard is gone before `next_step_id`
+                    // is taken: `allocate_step_id` acquires the two the other way.
+                    {
+                        let mut steps = self.steps.write();
+                        steps
+                            .entry((step.job_id, step.step_id))
+                            .or_insert_with(|| (**step).clone());
+                    }
+                    // Floored on every replica, not just the proposer: a follower
+                    // that later wins an election would otherwise reissue this id.
+                    if spur_core::step::is_user_step(step.step_id) {
+                        let mut next = self.next_step_id.write();
+                        let slot = next.entry(step.job_id).or_insert(0);
+                        *slot = (*slot).max(step.step_id.saturating_add(1));
+                    }
                 }
             },
             WalOperation::JobPriorityChange {
@@ -7428,6 +7464,9 @@ impl ClusterManager {
                     self.steps
                         .write()
                         .retain(|_, s| !evicted.contains(&s.job_id));
+                    self.next_step_id
+                        .write()
+                        .retain(|id, _| !evicted.contains(id));
                 }
             }
         }
@@ -7471,6 +7510,10 @@ struct ClusterSnapshot {
     /// from survivors alone would reissue used ids; restore takes max(rebuilt, this).
     #[serde(default)]
     next_job_id: JobId,
+    /// Per-job user step-id high-water marks, same rationale as `next_job_id`:
+    /// an id handed out before its create landed leaves no trace in `steps`.
+    #[serde(default)]
+    next_step_id: HashMap<JobId, u32>,
 }
 
 impl ClusterManager {
@@ -7553,6 +7596,7 @@ impl StateMachineApply for ClusterManager {
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
             k0s: self.k0s.read().clone(),
             next_job_id: self.next_job_id.load(Ordering::Relaxed),
+            next_step_id: self.next_step_id.read().clone(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -7611,6 +7655,25 @@ impl StateMachineApply for ClusterManager {
         for step in snap.steps {
             steps.insert((step.job_id, step.step_id), step);
         }
+        // Built while `steps` is held but installed only after it is dropped:
+        // `allocate_step_id` acquires the two locks the other way round.
+        let mut marks: HashMap<JobId, u32> = HashMap::new();
+        for (job_id, step_id) in steps.keys() {
+            if spur_core::step::is_user_step(*step_id) {
+                let slot = marks.entry(*job_id).or_insert(0);
+                *slot = (*slot).max(step_id.saturating_add(1));
+            }
+        }
+        drop(steps);
+        // Folded over those floors, never under them, so neither a stale mark
+        // from this replica's pre-restore life nor a lower persisted one wins.
+        for (job_id, mark) in snap.next_step_id {
+            if jobs.contains_key(&job_id) {
+                let slot = marks.entry(job_id).or_insert(0);
+                *slot = (*slot).max(mark);
+            }
+        }
+        *self.next_step_id.write() = marks;
 
         // license_pool is the configured total (immutable); it is intentionally
         // NOT restored from the snapshot so config stays authoritative and any
@@ -23549,6 +23612,223 @@ mod tests {
         );
     }
 
+    fn user_step(job_id: JobId, step_id: u32) -> JobStep {
+        JobStep {
+            job_id,
+            step_id,
+            name: "s".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: ResourceAllocations::default(),
+            nodes: vec!["n1".into()],
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocated_step_ids_are_never_reused() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Nothing is created from these: an id whose JobStepCreate is dropped is
+        // still held by the client that was handed it, so it must not come back.
+        let first = cm.allocate_step_id(7);
+        let second = cm.allocate_step_id(7);
+        let third = cm.allocate_step_id(7);
+
+        assert_eq!((first, second, third), (0, 1, 2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocated_step_ids_are_per_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        assert_eq!(cm.allocate_step_id(7), 0);
+        assert_eq!(cm.allocate_step_id(8), 0);
+        assert_eq!(cm.allocate_step_id(7), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocated_step_ids_skip_reserved_steps_and_existing_ids() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        {
+            let mut steps = cm.steps.write();
+            steps.insert((7, 0), user_step(7, 0));
+            steps.insert((7, 1), user_step(7, 1));
+            steps.insert((7, STEP_BATCH), user_step(7, STEP_BATCH));
+        }
+
+        assert_eq!(cm.allocate_step_id(7), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_create_floors_the_mark_a_returning_leader_allocates_from() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(basic_spec("j")),
+        });
+        // Seeded while this replica led; it then steps down and only replays.
+        assert_eq!(cm.allocate_step_id(7), 0);
+
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(user_step(7, 4)),
+        });
+
+        assert_eq!(
+            cm.allocate_step_id(7),
+            5,
+            "a committed id must not be reissued once leadership comes back"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_create_leaves_no_mark_for_a_reserved_step() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(basic_spec("j")),
+        });
+
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(user_step(7, STEP_BATCH)),
+        });
+
+        assert_eq!(cm.allocate_step_id(7), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicting_a_job_releases_its_step_id_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Cancelled,
+        });
+        assert_eq!(cm.allocate_step_id(1), 0);
+
+        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![1] });
+
+        assert_eq!(
+            cm.allocate_step_id(1),
+            0,
+            "an evicted job must not keep a step-id high-water mark"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_from_snapshot_reseeds_step_ids_above_the_restored_steps() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        cm.steps.write().insert((7, 4), user_step(7, 4));
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        // A mark from the target's own pre-restore life must not survive and
+        // hand back an id the restored snapshot already uses.
+        assert_eq!(cm2.allocate_step_id(7), 0);
+
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(cm2.allocate_step_id(7), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_carries_a_step_id_mark_whose_create_never_committed() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(basic_spec("j")),
+        });
+        // Handed out, then the create is lost: nothing in `steps` records id 0.
+        assert_eq!(cm.allocate_step_id(7), 0);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(
+            cm2.allocate_step_id(7),
+            1,
+            "an id handed out before its create committed must not be reissued"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_lifts_the_step_floor_to_a_higher_persisted_mark() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(basic_spec("j")),
+        });
+        cm.steps.write().insert((7, 4), user_step(7, 4));
+        // 5..8 were handed out and their creates never landed.
+        cm.next_step_id.write().insert(7, 9);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(cm2.allocate_step_id(7), 9);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_never_lowers_the_step_floor_to_a_stale_mark() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(basic_spec("j")),
+        });
+        cm.steps.write().insert((7, 4), user_step(7, 4));
+        cm.next_step_id.write().insert(7, 2);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(
+            cm2.allocate_step_id(7),
+            5,
+            "a mark below the restored steps must not hand back a used id"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_drops_a_step_id_mark_whose_job_is_gone() {
+        let src = TempDir::new().unwrap();
+        let cm = test_cluster(&src).await;
+        // No job 99 and no steps behind it — the mark must not outlive its job,
+        // or the map grows for the cluster's whole life.
+        cm.next_step_id.write().insert(99, 5);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        assert_eq!(cm2.allocate_step_id(99), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_snapshot_drops_stale_live_partition() {
         // A partition present in the target's live memory but absent from the
@@ -27434,6 +27714,7 @@ mod tests {
             burst_buffer_total_gb: 0,
             k0s: spur_core::k0s::K0sClusterState::default(),
             next_job_id: 0,
+            next_step_id: HashMap::new(),
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         cm.restore_from_snapshot(&bytes).unwrap();

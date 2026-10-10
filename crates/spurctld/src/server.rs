@@ -2841,11 +2841,7 @@ impl SlurmController for ControllerService {
         })?;
         let node_addr = node_comm_socket(&node, &target_node)?;
 
-        let existing_steps = self.cluster.get_steps(job_id);
-        let step_id = existing_steps
-            .iter()
-            .filter(|s| s.step_id < 0xFFFF_FFF0)
-            .count() as u32;
+        let step_id = self.cluster.allocate_step_id(job_id);
 
         let step = spur_core::step::JobStep {
             job_id,
@@ -8766,6 +8762,43 @@ mod tests {
             .await
             .expect_err("a still-Pending job must not accept a new step");
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_create_job_step_never_hands_out_a_duplicate_step_id() {
+        // Two clients handed the same id land on one supervisor session and
+        // destroy each other's state.
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let calls = (0..8).map(|_| {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                svc.create_job_step(Request::new(CreateJobStepRequest {
+                    job_id,
+                    command: vec!["hostname".into()],
+                    user: "ubuntu".into(),
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    overlap: true,
+                    ..Default::default()
+                }))
+                .await
+                .map(|resp| resp.into_inner().step_id)
+            })
+        });
+
+        let mut ids = Vec::new();
+        for call in calls.collect::<Vec<_>>() {
+            ids.push(call.await.expect("task").expect("step creation"));
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..8).collect::<Vec<u32>>(),
+            "ids must be distinct and contiguous, not reused or skipped"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
