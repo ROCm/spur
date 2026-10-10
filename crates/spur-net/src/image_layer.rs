@@ -33,10 +33,20 @@ fn is_zstd(data: &[u8]) -> bool {
 }
 
 pub fn decode<'a>(data: &'a [u8], media_type: Option<&str>) -> anyhow::Result<Box<dyn Read + 'a>> {
-    match detect_compression(media_type, data) {
-        LayerCompression::Gzip => Ok(Box::new(MultiGzDecoder::new(data))),
-        LayerCompression::Uncompressed => Ok(Box::new(data)),
-        LayerCompression::Zstd => Ok(Box::new(zstd::stream::read::Decoder::new(data)?)),
+    decode_reader(data, data, media_type)
+}
+
+/// Like [`decode`], but streams from `reader`; `head` must be the first bytes of
+/// the layer (at least 4 when available) for magic-number detection.
+pub fn decode_reader<'a, R: Read + 'a>(
+    reader: R,
+    head: &[u8],
+    media_type: Option<&str>,
+) -> anyhow::Result<Box<dyn Read + 'a>> {
+    match detect_compression(media_type, head) {
+        LayerCompression::Gzip => Ok(Box::new(MultiGzDecoder::new(reader))),
+        LayerCompression::Uncompressed => Ok(Box::new(reader)),
+        LayerCompression::Zstd => Ok(Box::new(zstd::stream::read::Decoder::new(reader)?)),
     }
 }
 
