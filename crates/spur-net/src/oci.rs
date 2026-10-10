@@ -24,6 +24,7 @@ use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
 /// A parsed container image reference.
@@ -168,7 +169,7 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
     let cache_override = std::env::var_os("SPUR_IMAGE_CACHE");
     let cache = LayerCache::open(&layer_cache_dir(output_dir, cache_override.as_deref()));
 
-    let result = pull_and_extract(&image_ref, &rootfs_dir, &cache).await;
+    let result = pull_and_extract(&image_ref, &rootfs_dir, &tmp_dir, &cache).await;
     if let Err(e) = &result {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(anyhow::anyhow!("{}", e));
@@ -225,6 +226,7 @@ pub async fn pull_image(image: &str, output_dir: &Path) -> anyhow::Result<PathBu
 async fn pull_and_extract(
     image_ref: &ImageRef,
     rootfs_dir: &Path,
+    staging_dir: &Path,
     cache: &LayerCache,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().user_agent("spur/0.1").build()?;
@@ -294,23 +296,23 @@ async fn pull_and_extract(
 
     info!(layers = manifest.layers.len(), "downloading layers");
 
-    // Download layers in parallel, then extract sequentially (order matters)
-    let mut layer_data: Vec<(usize, bytes::Bytes)> = Vec::new();
+    // Download layers in parallel to disk, then extract sequentially (order
+    // matters). Layers are streamed so multi-GB blobs never sit in memory.
+    let mut layer_files: Vec<(usize, PathBuf)> = Vec::new();
 
-    // Parallel download
     let mut handles = Vec::new();
     for (i, layer) in manifest.layers.iter().enumerate() {
         let digest = layer.digest.clone();
         let size = layer.size;
 
-        if let Some(cached) = cache.read_layer(&digest) {
+        if let Some(cached) = cache.cached_layer(&digest) {
             info!(
                 layer = i + 1,
                 total = manifest.layers.len(),
                 digest = %digest,
                 "layer cached, skipping download"
             );
-            layer_data.push((i, bytes::Bytes::from(cached)));
+            layer_files.push((i, cached));
             continue;
         }
 
@@ -321,6 +323,7 @@ async fn pull_and_extract(
         let client = client.clone();
         let token = token.clone();
         let cache = cache.clone();
+        let staged = staging_dir.join(format!("layer-{i:03}.download"));
 
         let handle = tokio::spawn(async move {
             info!(
@@ -335,33 +338,39 @@ async fn pull_and_extract(
                 req = req.header(AUTHORIZATION, format!("Bearer {}", token));
             }
 
-            let resp = req.send().await.context("failed to download layer")?;
+            let mut resp = req.send().await.context("failed to download layer")?;
             if !resp.status().is_success() {
                 bail!("registry returned {} for layer {}", resp.status(), digest);
             }
 
-            let data = resp.bytes().await.context("failed to read layer body")?;
+            let mut file = tokio::fs::File::create(&staged)
+                .await
+                .with_context(|| format!("failed to create {}", staged.display()))?;
+            while let Some(chunk) = resp.chunk().await.context("failed to read layer body")? {
+                file.write_all(&chunk)
+                    .await
+                    .with_context(|| format!("failed to write {}", staged.display()))?;
+            }
+            file.flush().await?;
+            drop(file);
 
-            cache.write_layer(&digest, &data);
-
-            Ok::<(usize, bytes::Bytes), anyhow::Error>((i, data))
+            Ok::<(usize, PathBuf), anyhow::Error>((i, cache.store_layer(&digest, staged)))
         });
         handles.push(handle);
     }
 
-    // Collect parallel downloads
     for handle in handles {
-        let (idx, data) = handle.await.context("layer download task panicked")??;
-        layer_data.push((idx, data));
+        let (idx, path) = handle.await.context("layer download task panicked")??;
+        layer_files.push((idx, path));
     }
 
     // Sort by layer index (parallel downloads may complete out of order)
-    layer_data.sort_by_key(|(idx, _)| *idx);
+    layer_files.sort_by_key(|(idx, _)| *idx);
 
     // Extract layers sequentially (order matters for whiteout files)
-    for (i, (_, data)) in layer_data.iter().enumerate() {
+    for (i, (_, path)) in layer_files.iter().enumerate() {
         let media_type = &manifest.layers[i].media_type;
-        extract_layer(data, Some(media_type), rootfs_dir)
+        extract_layer_file(path, Some(media_type), rootfs_dir)
             .with_context(|| format!("failed to extract layer {}", i + 1))?;
     }
 
@@ -431,21 +440,27 @@ impl LayerCache {
             .map(|dir| dir.join(digest.replace(':', "_")))
     }
 
-    fn read_layer(&self, digest: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.layer_path(digest)?).ok()
+    fn cached_layer(&self, digest: &str) -> Option<PathBuf> {
+        self.layer_path(digest).filter(|path| path.is_file())
     }
 
-    fn write_layer(&self, digest: &str, data: &[u8]) {
+    /// Move a fully downloaded layer into the cache, returning where it now
+    /// lives. On failure the layer stays at `staged` and is used from there.
+    fn store_layer(&self, digest: &str, staged: PathBuf) -> PathBuf {
         let Some(path) = self.layer_path(digest) else {
-            return;
+            return staged;
         };
 
-        if let Err(error) = std::fs::write(&path, data) {
-            warn!(
-                path = %path.display(),
-                %error,
-                "failed to cache image layer"
-            );
+        match std::fs::rename(&staged, &path) {
+            Ok(()) => path,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to cache image layer"
+                );
+                staged
+            }
         }
     }
 }
@@ -700,8 +715,15 @@ async fn resolve_manifest_list(
     Ok(manifest)
 }
 
+#[cfg(test)]
 fn extract_layer(data: &[u8], media_type: Option<&str>, dest: &Path) -> anyhow::Result<()> {
     extract_tar(crate::image_layer::decode(data, media_type)?, dest)
+}
+
+fn extract_layer_file(path: &Path, media_type: Option<&str>, dest: &Path) -> anyhow::Result<()> {
+    let reader = crate::image_layer::decode_file(path, media_type)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    extract_tar(reader, dest)
 }
 
 fn extract_tar(reader: impl Read, dest: &Path) -> anyhow::Result<()> {
@@ -1086,6 +1108,28 @@ mod tests {
     }
 
     #[test]
+    fn extract_layer_file_streams_from_disk() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let blobs = tempfile::tempdir().unwrap();
+        let cases = [
+            ("plain.txt", None, tar_layer("plain.txt", b"plain")),
+            ("gzip.txt", None, gzip(&tar_layer("gzip.txt", b"gzip"))),
+            (
+                "zstd.txt",
+                Some("application/vnd.oci.image.layer.v1.tar+zstd"),
+                zstd::stream::encode_all(tar_layer("zstd.txt", b"zstd").as_slice(), 0).unwrap(),
+            ),
+        ];
+
+        for (name, media_type, layer) in cases {
+            let blob = blobs.path().join(name);
+            std::fs::write(&blob, layer).unwrap();
+            extract_layer_file(&blob, media_type, rootfs.path()).unwrap();
+            assert!(rootfs.path().join(name).is_file(), "{name} not extracted");
+        }
+    }
+
+    #[test]
     fn extract_layer_applies_whiteout() {
         let rootfs = tempfile::tempdir().unwrap();
         let removed = rootfs.path().join("nested/removed.txt");
@@ -1340,15 +1384,16 @@ mod tests {
         let cache = LayerCache::open(&cache_dir);
 
         assert!(cache_dir.is_dir());
-        assert_eq!(cache.read_layer("sha256:abc"), None);
+        assert_eq!(cache.cached_layer("sha256:abc"), None);
 
-        cache.write_layer("sha256:abc", b"layer bytes");
+        let staged = output_dir.path().join("layer.download");
+        std::fs::write(&staged, b"layer bytes").expect("write staged layer");
+        let stored = cache.store_layer("sha256:abc", staged.clone());
 
-        assert_eq!(
-            cache.read_layer("sha256:abc").as_deref(),
-            Some(&b"layer bytes"[..])
-        );
-        assert!(cache_dir.join("sha256_abc").is_file());
+        assert_eq!(stored, cache_dir.join("sha256_abc"));
+        assert!(!staged.exists());
+        assert_eq!(cache.cached_layer("sha256:abc"), Some(stored.clone()));
+        assert_eq!(std::fs::read(stored).unwrap(), b"layer bytes");
     }
 
     #[test]
@@ -1362,8 +1407,10 @@ mod tests {
         let cache = LayerCache::open(&blocked.join(".layers"));
 
         assert_eq!(cache.layer_path("sha256:abc"), None);
-        cache.write_layer("sha256:abc", b"layer bytes");
-        assert_eq!(cache.read_layer("sha256:abc"), None);
+        let staged = output_dir.path().join("layer.download");
+        std::fs::write(&staged, b"layer bytes").expect("write staged layer");
+        assert_eq!(cache.store_layer("sha256:abc", staged.clone()), staged);
+        assert_eq!(cache.cached_layer("sha256:abc"), None);
     }
 
     #[test]
@@ -1375,8 +1422,11 @@ mod tests {
         let entry = cache.layer_path("sha256:abc").expect("cache enabled");
         std::fs::create_dir(&entry).expect("occupy entry path");
 
-        cache.write_layer("sha256:abc", b"layer bytes");
+        let staged = output_dir.path().join("layer.download");
+        std::fs::write(&staged, b"layer bytes").expect("write staged layer");
 
-        assert_eq!(cache.read_layer("sha256:abc"), None);
+        assert_eq!(cache.store_layer("sha256:abc", staged.clone()), staged);
+        assert_eq!(std::fs::read(&staged).unwrap(), b"layer bytes");
+        assert_eq!(cache.cached_layer("sha256:abc"), None);
     }
 }
