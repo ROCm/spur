@@ -195,6 +195,22 @@ pub struct SrunArgs {
     #[arg(long, default_value = "ALL", overrides_with = "export")]
     pub export: String,
 
+    /// Accepted for Slurm/PRRTE compatibility (optional value form: --kill-on-bad-exit[=0|1]).
+    #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "1")]
+    pub kill_on_bad_exit: Option<String>,
+
+    /// Accepted for PRRTE orted daemon placement (hidden no-op).
+    #[arg(long, hide = true)]
+    pub external_launcher: bool,
+
+    /// Accepted for PRRTE orted daemon placement (hidden no-op).
+    #[arg(long, hide = true)]
+    pub no_kill: bool,
+
+    /// Task distribution method (accepted for PRRTE compatibility; not enforced).
+    #[arg(short = 'm', long, hide = true)]
+    pub distribution: Option<String>,
+
     /// Allocate a pseudo-terminal for the job
     #[arg(long)]
     pub pty: bool,
@@ -203,7 +219,7 @@ pub struct SrunArgs {
     #[arg(long)]
     pub jobid: Option<u32>,
 
-    /// Share resources with the running job (requires --jobid)
+    /// Share resources with the running job
     #[arg(long)]
     pub overlap: bool,
 
@@ -229,8 +245,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let matches = crate::clap_exit::matches_or_exit(SrunArgs::command(), &args);
     let mut args = crate::clap_exit::from_matches_or_exit::<SrunArgs>(&matches);
 
-    if args.jobid.is_some() && !args.overlap {
-        anyhow::bail!("--jobid requires --overlap");
+    if args.jobid.is_some() {
+        args.overlap = true;
     }
 
     if args.container_readonly {
@@ -3566,7 +3582,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jobid_without_overlap_errors() {
+    async fn jobid_without_overlap_implies_overlap() {
+        // --jobid implies --overlap for PRRTE orted daemon placement compat.
+        // The call will fail at the connect stage (no controller), but it
+        // must not reject the flag combination at parse time.
         let result = main_with_args(vec![
             "srun".into(),
             "--jobid".into(),
@@ -3577,8 +3596,8 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(
-            msg.contains("--overlap"),
-            "expected --overlap error, got: {msg}"
+            !msg.contains("--overlap"),
+            "--jobid should imply --overlap, got: {msg}"
         );
     }
 

@@ -22,11 +22,12 @@ use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
-use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_NONE, MPI_PMIX};
+use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_MPIRUN, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
     batch_companion_hold_script, batch_launch, batch_script_uses_step_launch,
-    build_multi_task_pmix_wrapper, build_multi_task_wrapper, use_multi_task_launch, BatchLaunch,
+    build_mpi_mpirun_wrapper, build_multi_task_pmix_wrapper, build_multi_task_wrapper,
+    use_multi_task_launch, BatchLaunch,
 };
 use spur_devices::DeviceRegistry;
 
@@ -5240,6 +5241,37 @@ impl SlurmAgent for AgentService {
             SpurEnv::apply_step_scope(&mut senv, job_id, 0, spec.num_tasks, node_rank, num_nodes);
             senv.set_with_slurm_twin("SPUR_MPI_TYPE", MPI_PMIX);
             senv.set("SPUR_TASK_OFFSET", task_offset);
+        } else if spec.mpi == MPI_MPIRUN {
+            senv.set_with_slurm_twin("SPUR_MPI_TYPE", MPI_MPIRUN);
+            SpurEnv::apply_task_rank(&mut senv, task_offset, 0);
+            let num_nodes = peer_nodes.len().max(1) as u32;
+            let base = spec.num_tasks / num_nodes;
+            let remainder = spec.num_tasks % num_nodes;
+            let tpn = if remainder == 0 {
+                format!("{base}(x{num_nodes})")
+            } else {
+                let first = base + remainder;
+                if num_nodes > 1 {
+                    format!("{first},{base}(x{})", num_nodes - 1)
+                } else {
+                    format!("{first}(x1)")
+                }
+            };
+            senv.set("SLURM_TASKS_PER_NODE", &tpn);
+            senv.set("SPUR_TASKS_PER_NODE", &tpn);
+            if !peer_nodes.is_empty() {
+                let hosts: Vec<String> = peer_nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| {
+                        let host = n.rsplit_once(':').map_or(n.as_str(), |(h, _)| h);
+                        let host = host.trim_start_matches('[').trim_end_matches(']');
+                        let slots = if i == 0 { base + remainder } else { base };
+                        format!("{host}:{slots}")
+                    })
+                    .collect();
+                senv.set("SPUR_MPIRUN_HOSTS", hosts.join(","));
+            }
         } else if tasks_per_node == 1 {
             SpurEnv::apply_task_rank(&mut senv, task_offset, 0);
         } else {
@@ -5398,7 +5430,15 @@ impl SlurmAgent for AgentService {
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
         let shape = batch_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
-        let launch_script = if shape != BatchLaunch::Script {
+        let launch_script = if shape == BatchLaunch::Mpirun {
+            if node_rank == 0 {
+                let user_cmd = shlex::try_join(spec.argv.iter().map(String::as_str))
+                    .map_err(|e| Status::invalid_argument(format!("cannot quote command: {e}")))?;
+                build_mpi_mpirun_wrapper(&user_cmd, spec.num_tasks, true)
+            } else {
+                batch_companion_hold_script().to_string()
+            }
+        } else if shape != BatchLaunch::Script {
             let user_script_path = crate::executor::stage_user_script(
                 job_id,
                 launch_step,
@@ -6748,10 +6788,8 @@ impl SlurmAgent for AgentService {
         let agent_hostname = self.reporter.hostname.clone();
         let node_names: Vec<&str> = step_nodelist.split(',').filter(|s| !s.is_empty()).collect();
         let num_nodes = node_names.len().max(1) as u32;
-        let node_id = node_names
-            .iter()
-            .position(|n| *n == agent_hostname)
-            .unwrap_or(0) as u32;
+        let node_position = node_names.iter().position(|n| *n == agent_hostname);
+        let node_id = node_position.unwrap_or(0) as u32;
         let job_num_nodes = job_nodelist
             .split(',')
             .filter(|s| !s.is_empty())
@@ -6817,12 +6855,17 @@ impl SlurmAgent for AgentService {
         }
 
         let step_mpi_type = resolve_step_mpi(req.mpi.as_str(), job_mpi.as_str());
-        if !step_mpi_type.is_empty() && step_mpi_type != MPI_NONE && step_mpi_type != MPI_PMIX {
+        if !step_mpi_type.is_empty()
+            && step_mpi_type != MPI_NONE
+            && step_mpi_type != MPI_PMIX
+            && step_mpi_type != MPI_MPIRUN
+        {
             return Err(Status::invalid_argument(format!(
                 "invalid step mpi type '{step_mpi_type}'"
             )));
         }
         let step_mpi = step_mpi_type == MPI_PMIX;
+        let step_mpirun = step_mpi_type == MPI_MPIRUN;
         if req.pmix_plan.is_some() && !step_mpi {
             return Err(Status::invalid_argument("pmix_plan requires step mpi=pmix"));
         }
@@ -6879,7 +6922,10 @@ impl SlurmAgent for AgentService {
 
         // A lone PMIx rank needs the wrapper too: it carries `env.sh` and the
         // `PMIX_SERVER_URI` aliases, which no other part of the launch applies.
-        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label || step_mpi
+        let (program, program_args, step_script_cleanup) = if num_tasks > 1
+            || req.label
+            || step_mpi
+            || step_mpirun
         {
             let step_dir =
                 crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
@@ -6899,7 +6945,16 @@ impl SlurmAgent for AgentService {
             guard.paths.push(user_script_path.clone());
 
             let wrapper_path = step_dir.join(wrapper_name);
-            let wrapper = if num_tasks > 1 {
+            let wrapper = if step_mpirun {
+                let total_tasks = step_num_tasks.max(num_tasks);
+                let user_cmd = shlex::try_join(req.command.iter().map(String::as_str))
+                    .map_err(|e| Status::invalid_argument(format!("cannot quote command: {e}")))?;
+                Some(build_mpi_mpirun_wrapper(
+                    &user_cmd,
+                    total_tasks,
+                    node_position == Some(0),
+                ))
+            } else if num_tasks > 1 {
                 if step_mpi {
                     match supervised_pmix.as_mut() {
                         // Only the process hosting the server can hand out each
@@ -6967,6 +7022,34 @@ impl SlurmAgent for AgentService {
         let mut env = senv.into_map();
         if num_tasks > 1 && step_mpi {
             mpi_plugin::strip_launcher_mpi_env(&mut env);
+        }
+        if step_mpirun {
+            let num_step_nodes = node_names.len().max(1) as u32;
+            let base = step_num_tasks / num_step_nodes;
+            let remainder = step_num_tasks % num_step_nodes;
+            let tpn = if remainder == 0 {
+                format!("{base}(x{num_step_nodes})")
+            } else {
+                let first = base + remainder;
+                if num_step_nodes > 1 {
+                    format!("{first},{base}(x{})", num_step_nodes - 1)
+                } else {
+                    format!("{first}(x1)")
+                }
+            };
+            env.insert("SLURM_TASKS_PER_NODE".into(), tpn.clone());
+            env.insert("SPUR_TASKS_PER_NODE".into(), tpn);
+            if node_names.len() > 1 {
+                let hosts: Vec<String> = node_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| {
+                        let slots = if i == 0 { base + remainder } else { base };
+                        format!("{n}:{slots}")
+                    })
+                    .collect();
+                env.insert("SPUR_MPIRUN_HOSTS".into(), hosts.join(","));
+            }
         }
         if step_mpi && pmix_per_local_rank_env.is_none() && supervised_pmix.is_none() {
             let plan = pmix_plan
