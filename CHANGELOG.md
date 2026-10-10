@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.15.0](https://github.com/ROCm/spur/compare/v0.14.0...v0.15.0) (2026-10-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **spurctld:** a cluster that preempted before stops preempting until preempt_type is set explicitly, and eligibility now requires a QOS allow-list entry. See docs/deployment/upgrading.rst.
+* **spur-cli:** exit non-zero when scancel refuses a cancel ([#1014](https://github.com/ROCm/spur/issues/1014))
+* **spurctld:** add [auth] private_data for job and usage visibility ([#1013](https://github.com/ROCm/spur/issues/1013))
+
+### Features
+
+* **spur-cli:** add scontrol show hostnames and hostlist ([#939](https://github.com/ROCm/spur/issues/939)) ([8783791](https://github.com/ROCm/spur/commit/8783791475fd603b4affe6f5ec181bebae0146a7))
+* **spur-cli:** add squeue --me flag ([#930](https://github.com/ROCm/spur/issues/930)) ([fa3907a](https://github.com/ROCm/spur/commit/fa3907aa0de1a36e66c3ef8bf28ceaa13d58894d))
+* **spur-cli:** support --export in srun ([#941](https://github.com/ROCm/spur/issues/941)) ([82aa7ee](https://github.com/ROCm/spur/commit/82aa7eef96669a702a4362f91c7f65ba46d66f79))
+* **spurctld:** add [auth] private_data for job and usage visibility ([#1013](https://github.com/ROCm/spur/issues/1013)) ([c2b18e8](https://github.com/ROCm/spur/commit/c2b18e850e4bb68e0dfb85d2a94d5a3ae28d294c))
+* **spurctld:** detect k0s membership drift ([#1007](https://github.com/ROCm/spur/issues/1007)) ([9160545](https://github.com/ROCm/spur/commit/91605455fb24a15863c130ee8f3b98a78766fdb3))
+* **spurctld:** surface per-account submit, group wall, and per-job TRES caps in assoc_mgr ([#798](https://github.com/ROCm/spur/issues/798)) ([4944311](https://github.com/ROCm/spur/commit/4944311ee99c0623cfaf01adb41f2f53659016db))
+
+
+### Bug Fixes
+
+* **spur-cli:** accept plnd, resv and maint in sinfo -t ([#940](https://github.com/ROCm/spur/issues/940)) ([8e9442e](https://github.com/ROCm/spur/commit/8e9442e764bec580df387be17e96b64505b4ec2b))
+* **spur-cli:** exit non-zero when scancel refuses a cancel ([#1014](https://github.com/ROCm/spur/issues/1014)) ([3668642](https://github.com/ROCm/spur/commit/36686425ca4ddf5c5a12e27f5348181e0da2ae42))
+* **spur-cli:** reject malformed and unknown job ids in scontrol show job ([#907](https://github.com/ROCm/spur/issues/907)) ([3204c54](https://github.com/ROCm/spur/commit/3204c54ce70684c5542aeb6fcfa391715c3aec60))
+* **spur-cli:** stop misclassifying a clean srun --pty exit as cancelled ([#986](https://github.com/ROCm/spur/issues/986)) ([4b2c3bc](https://github.com/ROCm/spur/commit/4b2c3bce7d40e9f69f1e339db768e000ac9af402))
+* **spurctld:** advance run_attempt on every aborted/held dispatch ([#970](https://github.com/ROCm/spur/issues/970)) ([96464f9](https://github.com/ROCm/spur/commit/96464f944ad030c76f378fef0cad794656b51ae4))
+* **spurctld:** cap the stored srun step name ([#969](https://github.com/ROCm/spur/issues/969)) ([33ac656](https://github.com/ROCm/spur/commit/33ac656b6499ac8a23c782f9c875031fcb9967a6))
+* **spurctld:** let an idle-fill job reach reclaim, and document the priority rules ([#932](https://github.com/ROCm/spur/issues/932)) ([5904e4d](https://github.com/ROCm/spur/commit/5904e4d564ecaba25d6788764374e49d0f495af1))
+* **spurctld:** make qos preemption deterministic and reject unknown modes ([#855](https://github.com/ROCm/spur/issues/855)) ([0d13c7a](https://github.com/ROCm/spur/commit/0d13c7a6a79e2c675365c503495d9a0b58ff2501))
+* **spurctld:** only preempt when the eviction would place the pending job ([#1009](https://github.com/ROCm/spur/issues/1009)) ([0b4aa22](https://github.com/ROCm/spur/commit/0b4aa22cf0cd70ed20369b9372d51bfecb46b1de))
+* **spurctld:** re-arm the leadership grace window on every raft transition ([#1012](https://github.com/ROCm/spur/issues/1012)) ([646d32e](https://github.com/ROCm/spur/commit/646d32e153ee9d24153aa78000ade920a8a1e1a3))
+* **spurctld:** repair tests broken by the [#994](https://github.com/ROCm/spur/issues/994)/[#1009](https://github.com/ROCm/spur/issues/1009) preempt cross-merge ([#1023](https://github.com/ROCm/spur/issues/1023)) ([a8a3f11](https://github.com/ROCm/spur/commit/a8a3f119123ab07fa34b3cd617eb750f82f2cef0))
+* **spurctld:** report and filter node-failed jobs as NODE_FAIL in sacct ([#1011](https://github.com/ROCm/spur/issues/1011)) ([4a0da74](https://github.com/ROCm/spur/commit/4a0da7442e31650bdd2be57b545b195e61cc2d44))
+* **spurctld:** route cancel and preempt-cancel through COMPLETING ([#994](https://github.com/ROCm/spur/issues/994)) ([bf416cd](https://github.com/ROCm/spur/commit/bf416cdb1f07248b041e09a99a0b47f466dc1777))
+* **spurd:** give a lone MPI rank the same environment as a shared node ([#917](https://github.com/ROCm/spur/issues/917)) ([c16c601](https://github.com/ROCm/spur/commit/c16c601b79b10bbdde6f5d35780ea3e746e85810))
+* **spurd:** log version=&lt;pkg+sha&gt; on spurstepd/spurauthd startup ([#948](https://github.com/ROCm/spur/issues/948)) ([f25c553](https://github.com/ROCm/spur/commit/f25c5534e431a5062cc81e08fa11d937a3c15b81))
+* **spurd:** recover agent heartbeats from a controller that accepts TCP but never answers ([#982](https://github.com/ROCm/spur/issues/982)) ([c34bb59](https://github.com/ROCm/spur/commit/c34bb593e46fb7761af569a627304923cc4bd155))
+* **spurd:** run node prolog for standalone srun allocations ([#955](https://github.com/ROCm/spur/issues/955)) ([dcce7c7](https://github.com/ROCm/spur/commit/dcce7c787ab366204375a817e3c6506c0d8834a7))
+* **spurd:** wire the host device plan into srun steps and interactive sessions ([#954](https://github.com/ROCm/spur/issues/954)) ([1141866](https://github.com/ROCm/spur/commit/11418664fd13c2d0aabe117c814184d329e17496))
+
 ## [0.14.0](https://github.com/ROCm/spur/compare/v0.13.0...v0.14.0) (2026-09-30)
 
 
