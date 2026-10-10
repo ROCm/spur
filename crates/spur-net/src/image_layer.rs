@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::Read;
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use flate2::read::MultiGzDecoder;
 
@@ -48,6 +49,15 @@ pub fn decode_reader<'a, R: Read + 'a>(
         LayerCompression::Uncompressed => Ok(Box::new(reader)),
         LayerCompression::Zstd => Ok(Box::new(zstd::stream::read::Decoder::new(reader)?)),
     }
+}
+
+/// Open a layer file and stream-decode it without reading it into memory.
+pub fn decode_file(path: &Path, media_type: Option<&str>) -> anyhow::Result<Box<dyn Read>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut head = Vec::with_capacity(4);
+    (&mut file).take(4).read_to_end(&mut head)?;
+    file.seek(SeekFrom::Start(0))?;
+    decode_reader(BufReader::new(file), &head, media_type)
 }
 
 #[cfg(test)]

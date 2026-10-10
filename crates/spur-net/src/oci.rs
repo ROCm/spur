@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -721,15 +721,9 @@ fn extract_layer(data: &[u8], media_type: Option<&str>, dest: &Path) -> anyhow::
 }
 
 fn extract_layer_file(path: &Path, media_type: Option<&str>, dest: &Path) -> anyhow::Result<()> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut head = Vec::with_capacity(4);
-    (&mut file).take(4).read_to_end(&mut head)?;
-    file.seek(SeekFrom::Start(0))?;
-    extract_tar(
-        crate::image_layer::decode_reader(BufReader::new(file), &head, media_type)?,
-        dest,
-    )
+    let reader = crate::image_layer::decode_file(path, media_type)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    extract_tar(reader, dest)
 }
 
 fn extract_tar(reader: impl Read, dest: &Path) -> anyhow::Result<()> {
