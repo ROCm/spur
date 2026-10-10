@@ -880,8 +880,10 @@ async fn dispatch_step(
         })
     });
 
-    let resp = client
-        .run_step(RunStepRequest {
+    let resp = run_step_with_reattach(
+        client,
+        &args.controller,
+        RunStepRequest {
             job_id,
             command: args.command.clone(),
             uid: nix::unistd::geteuid().as_raw(),
@@ -894,10 +896,9 @@ async fn dispatch_step(
             user: params.user.to_string(),
             container: container_spec_from_srun_args(args),
             execution_credential,
-        })
-        .await
-        .context("RunStep dispatch failed")?
-        .into_inner();
+        },
+    )
+    .await?;
 
     if !resp.node.is_empty() {
         eprintln!("srun: dispatched to node {}", resp.node);
@@ -1768,6 +1769,50 @@ fn is_retryable_status(status: &tonic::Status) -> bool {
             // prior attempt's connection died; retrying lets that unwind.
             | tonic::Code::AlreadyExists
     )
+}
+
+const RUN_STEP_RECONNECT_ATTEMPTS: u32 = 30;
+const RUN_STEP_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// tonic surfaces a dropped connection as Unknown/"transport error" rather
+/// than Unavailable, so both count as losing spurctld, not losing the step.
+fn is_controller_connection_loss(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown
+    )
+}
+
+/// `RunStep` blocks for the step's entire runtime, so spurctld restarting
+/// mid-call drops the client's connection long before the step itself is
+/// done. Reconnect and resubmit the same request: the controller recognizes
+/// the step as already dispatched (`step.dispatched`) and reattaches to it
+/// instead of relaunching it, mirroring how it re-attaches to an agent it
+/// lost mid-run.
+async fn run_step_with_reattach(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    controller_addr: &str,
+    request: RunStepRequest,
+) -> Result<spur_proto::proto::RunStepResponse> {
+    for attempt in 0..RUN_STEP_RECONNECT_ATTEMPTS {
+        match client.run_step(request.clone()).await {
+            Ok(resp) => return Ok(resp.into_inner()),
+            Err(status) if is_controller_connection_loss(&status) => {
+                eprintln!(
+                    "srun: warning: lost contact with spurctld mid-step; reconnecting to \
+                     reattach ({}/{})",
+                    attempt + 1,
+                    RUN_STEP_RECONNECT_ATTEMPTS
+                );
+                tokio::time::sleep(RUN_STEP_RECONNECT_BACKOFF).await;
+                if let Ok(channel) = crate::authclient::connect(controller_addr).await {
+                    *client = SlurmControllerClient::new(channel);
+                }
+            }
+            Err(status) => return Err(status).context("RunStep dispatch failed"),
+        }
+    }
+    anyhow::bail!("lost contact with spurctld and could not reattach to the step")
 }
 
 /// Flags accepted on the command line that no job step can honor.
@@ -3562,6 +3607,34 @@ mod tests {
         assert!(
             msg.contains("failed to create job step"),
             "expected a CreateJobStep failure, got: {msg}"
+        );
+    }
+
+    /// spurctld restarting mid-`RunStep` drops the client's connection long
+    /// before the step itself finishes. A naive single-shot RunStep call
+    /// (no reattach) would surface that as a hard dispatch failure; the fix
+    /// must instead reconnect and resubmit, landing a second RunStep call.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn dispatch_step_reattaches_after_spurctld_restarts_mid_run_step() {
+        let _env = EnvGuard::new();
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let mut client = crate::mock_controller::client(addr).await;
+        capture.set_run_step_transient_failures(1);
+
+        let controller_addr = format!("http://{addr}");
+        let result = dispatch_with(
+            &mut client,
+            &["srun", "--controller", &controller_addr, "hostname"],
+        )
+        .await
+        .expect("a transient controller disconnect must be retried, not surfaced");
+
+        assert_eq!(result.exit_code, crate::mock_controller::MOCK_EXIT_CODE);
+        assert_eq!(
+            capture.run_step_calls(),
+            2,
+            "one failed dispatch attempt plus one successful reattach"
         );
     }
 

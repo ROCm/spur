@@ -43,6 +43,9 @@ pub(crate) struct StepCapture {
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
+    /// Remaining `RunStep` calls that should fail as `Unavailable` before
+    /// succeeding, standing in for spurctld restarting mid-step.
+    run_step_failures_remaining: Arc<AtomicU32>,
     get_node_names: Arc<Mutex<Vec<String>>>,
     get_node_requests: Arc<Mutex<Vec<String>>>,
     update_node_names: Arc<Mutex<Vec<String>>>,
@@ -104,6 +107,12 @@ impl StepCapture {
     /// Number of `RunStep` calls, so tests can assert dispatch stopped early.
     pub(crate) fn run_step_calls(&self) -> u32 {
         self.run_step_calls.load(Ordering::SeqCst)
+    }
+
+    /// Make the next `n` `RunStep` calls fail as `Unavailable` (as if
+    /// spurctld had restarted mid-step) before the mock starts succeeding.
+    pub(crate) fn set_run_step_transient_failures(&self, n: u32) {
+        self.run_step_failures_remaining.store(n, Ordering::SeqCst);
     }
 
     pub(crate) fn set_get_node_names(&self, names: Vec<String>) {
@@ -290,6 +299,15 @@ mock_controller_impl! {
                 .run_step_step_id
                 .store(request.into_inner().step_id, Ordering::SeqCst);
             self.capture.run_step_calls.fetch_add(1, Ordering::SeqCst);
+            let remaining = self.capture.run_step_failures_remaining.load(Ordering::SeqCst);
+            if remaining > 0 {
+                self.capture
+                    .run_step_failures_remaining
+                    .store(remaining - 1, Ordering::SeqCst);
+                return Err(tonic::Status::unavailable(
+                    "mock: simulated spurctld restart mid-step",
+                ));
+            }
             Ok(tonic::Response::new(proto::RunStepResponse {
                 exit_code: MOCK_EXIT_CODE,
                 stdout: String::new(),

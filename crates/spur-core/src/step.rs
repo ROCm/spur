@@ -104,6 +104,12 @@ pub struct JobStep {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
+
+    /// Set once `run_step` has actually contacted the step's agents. Lets a
+    /// retried `RunStep` (e.g. after a controller restart) tell "reattach to
+    /// what's already running" apart from "dispatch for the first time".
+    #[serde(default)]
+    pub dispatched: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,6 +536,7 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            dispatched: false,
         };
 
         assert!(!step.state.is_terminal());
