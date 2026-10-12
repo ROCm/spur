@@ -13,7 +13,6 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
-futures-util = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 zstd = { workspace = true }

@@ -11,13 +11,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
-prost-types = { workspace = true }
 jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 aws-lc-rs = "1.18"
