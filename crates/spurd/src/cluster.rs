@@ -348,9 +348,22 @@ impl ClusterSupervisor {
         if !self.systemd_available().await {
             anyhow::bail!("systemctl unavailable");
         }
-        self.disable_unit().await;
+        let stopped = self.disable_and_confirm().await;
         if reset {
             self.reset_and_purge().await?;
+        }
+        stopped
+    }
+
+    /// `disable_unit`, then check the unit really stopped. The disable error is ignored because
+    /// an absent unit is fine, but that also hides a real failure (no privilege, a stuck stop).
+    async fn disable_and_confirm(&self) -> anyhow::Result<()> {
+        self.disable_unit().await;
+        if self.unit_status_is(&["is-active"], "active").await {
+            anyhow::bail!(
+                "{} is still active after disable --now",
+                self.unit_file_name()
+            );
         }
         Ok(())
     }
@@ -851,11 +864,15 @@ impl K0sAgent {
 
     /// Stop/disable any spurd-owned k0s unit present on the host (a node runs at most one, but both
     /// names are disabled idempotently), then `k0s reset` once if requested. Used when `active` is
-    /// empty so a lost in-memory state can't leave a running k0s unit behind. A failed reset is
-    /// surfaced so `down --reset` reports the partial teardown rather than a false success.
+    /// empty so a lost in-memory state can't leave a running k0s unit behind. A failed reset, or a
+    /// unit still running after the stop, is surfaced so the caller sees a partial teardown rather
+    /// than a false success.
     async fn stop_untracked(&self, reset: bool) -> anyhow::Result<()> {
+        let mut stopped = Ok(());
         for role in [ClusterRole::Controller, ClusterRole::Worker] {
-            self.probe_supervisor(role).disable_unit().await;
+            if let Err(e) = self.probe_supervisor(role).disable_and_confirm().await {
+                stopped = Err(e);
+            }
         }
         if reset {
             // Purge UNCONDITIONALLY, even if `k0s reset` fails (broken/half-installed k0s binary):
@@ -872,7 +889,7 @@ impl K0sAgent {
             let _ = tokio::fs::remove_file(self.config_dir.join("token")).await;
             reset_result?;
         }
-        Ok(())
+        stopped
     }
 
     /// Mint a k0s join token on this (control-plane) node via `k0s token create`. Returns the

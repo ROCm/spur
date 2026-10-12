@@ -9,6 +9,7 @@ reconcile loop drives without k0s actually reaching `active`, exactly like
 test_k8s_scheduling). Full k0s convergence is covered on hardware, not in CI.
 """
 
+import re
 import time
 from contextlib import contextmanager
 
@@ -30,18 +31,51 @@ def k8s_enabled_cluster(unstarted_cluster):
         pass
 
 
+@contextmanager
+def _degraded(cluster, agent_as_root: bool):
+    cluster.start(
+        config_overrides={"cluster": {"enabled": True, "k8s_provisioning_timeout_secs": 5}},
+        agent_as_root=agent_as_root,
+    )
+    try:
+        yield cluster
+    finally:
+        try:
+            cluster.k8s_down(reset=True)
+            _wait_torn_down(cluster)
+        except Exception:
+            pass
+
+
+def _wait_torn_down(cluster, timeout: int = 180) -> None:
+    """`k8s down` only asks; the reconcile loop stops and resets each node over later ticks
+    and clears its role once k0s is gone. Killing spurd first would leave k0s running."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rows = [
+            line
+            for line in cluster.k8s_status().splitlines()
+            if line[:1].isspace() and any(n in line for n in cluster.node_names)
+        ]
+        if not rows:
+            return
+        time.sleep(5)
+
+
 @pytest.fixture
 def k8s_degraded_cluster(unstarted_cluster):
     """`k8s_enabled_cluster` with a 5 s provisioning timeout. k0s never reaches `active`
     here, and drift is only checked once the cluster has left `provisioning`."""
-    unstarted_cluster.start(
-        config_overrides={"cluster": {"enabled": True, "k8s_provisioning_timeout_secs": 5}}
-    )
-    yield unstarted_cluster
-    try:
-        unstarted_cluster.k8s_down(reset=True)
-    except Exception:
-        pass
+    with _degraded(unstarted_cluster, agent_as_root=False) as cluster:
+        yield cluster
+
+
+@pytest.fixture
+def k8s_degraded_root_cluster(unstarted_cluster):
+    """`k8s_degraded_cluster` with spurd running as root, as in production: stopping a
+    systemd unit needs it. k0s can then really start, so the cluster may come up `ready`."""
+    with _degraded(unstarted_cluster, agent_as_root=True) as cluster:
+        yield cluster
 
 
 @contextmanager
@@ -75,6 +109,24 @@ def stray_k0s_worker(cluster, node_index: int, spurd_owned: bool = False):
             f"{sudo}rmdir {STRAY_UNIT}.d; {sudo}systemctl daemon-reload; "
             f"{sudo}systemctl reset-failed k0sworker"
         )
+
+
+def _wait_up(cluster, timeout: int = 600) -> str:
+    """Wait for `ready` or `degraded`. With a root agent k0s may really start, so which one
+    the cluster settles in depends on the bed; drift is checked in both."""
+    deadline = time.time() + timeout
+    status = ""
+    while time.time() < deadline:
+        status = cluster.k8s_status()
+        if re.search(r"^phase: (ready|degraded)$", status, re.M):
+            return status
+        time.sleep(5)
+    raise TimeoutError(f"k0s never reached ready or degraded within {timeout}s:\n{status}")
+
+
+def _names(line: str, node: str) -> bool:
+    """Whether a log line's `node=` field is exactly `node`, wherever it sits in the line."""
+    return re.search(rf"\bnode={re.escape(node)}(\s|$)", line) is not None
 
 
 def _drift_lines(cluster) -> list[str]:
@@ -196,24 +248,23 @@ class TestK8sMembershipDrift:
         others = [line for line in _drift_lines(cluster) if f"node={stray} " not in line]
         assert not others, f"drift reported on nodes without any: {others}"
 
-    def test_a_spurd_stray_outside_a_scoped_cluster_is_stopped(self, k8s_degraded_cluster):
+    def test_a_spurd_stray_outside_a_scoped_cluster_is_stopped(self, k8s_degraded_root_cluster):
         """The stop is confirmed by later checks, and the member is never stopped."""
-        cluster = k8s_degraded_cluster
+        cluster = k8s_degraded_root_cluster
         if len(cluster.node_names) < 2:
             pytest.skip("drift test needs a node outside the scope")
         member, stray = cluster.node_names[0], cluster.node_names[1]
         cluster.k8s_up(["--nodes", member, "--control-plane-node", member])
-        cluster.wait_k8s_phase("degraded", timeout=180)
+        _wait_up(cluster)
 
-        # Two visits to confirm, then two more to call the stop corrected.
-        deadline = time.time() + 30 * (4 * len(cluster.node_names) + 2)
         corrected: list[str] = []
         with stray_k0s_worker(cluster, 1, spurd_owned=True):
+            # A tick visits one node, so each visit to the stray is a sweep of 30 s per node
+            # apart: up to one sweep to the first visit, two to confirm, two to call it stopped.
+            deadline = time.time() + 30 * (5 * len(cluster.node_names) + 4)
             while time.time() < deadline:
                 log = cluster.spurctld_log().splitlines()
-                corrected = [
-                    line for line in log if f"node={stray} " in line and "stayed stopped" in line
-                ]
+                corrected = [line for line in log if _names(line, stray) and "stayed stopped" in line]
                 if corrected:
                     break
                 time.sleep(10)
@@ -223,4 +274,4 @@ class TestK8sMembershipDrift:
         assert corrected, f"{stray} was never confirmed stopped:\n{log[-4000:]}"
         assert still_running.strip() != "active", still_running
         stops = [line for line in log.splitlines() if "stopping stray k0s worker" in line]
-        assert len(stops) == 1 and f"node={stray} " in stops[0], stops
+        assert len(stops) == 1 and _names(stops[0], stray), stops
