@@ -4651,10 +4651,11 @@ impl ClusterManager {
     fn licenses_in_use(jobs: &HashMap<JobId, Job>) -> HashMap<String, u64> {
         let mut used: HashMap<String, u64> = HashMap::new();
         for job in jobs.values() {
-            if matches!(
+            let holds = matches!(
                 job.state,
                 JobState::Running | JobState::Suspended | JobState::Completing
-            ) {
+            ) || job.occupies_resources();
+            if holds {
                 for (lic, n) in extract_license_requirements(&job.spec) {
                     *used.entry(lic).or_insert(0) += n;
                 }
@@ -22964,6 +22965,41 @@ mod tests {
         assert_eq!(
             cm.get_job(t2).unwrap().pending_reason,
             PendingReason::JobArrayTaskLimit
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn licenses_in_use_counts_a_reserved_but_still_pending_job() {
+        // reserve_placement charges a job's nodes while it's still Pending, so
+        // the license budget must see it too, not just Running/Suspended/Completing.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.license_pool.write().insert("fluent".into(), 1);
+
+        let mut spec_a = basic_spec("license-a");
+        spec_a.gres = vec!["license:fluent:1".into()];
+        let a = submit_and_wait(&cm, spec_a);
+        let res = scalar_alloc(1, 1000);
+        cm.reserve_placement(
+            a,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+
+        let mut spec_b = basic_spec("license-b");
+        spec_b.gres = vec!["license:fluent:1".into()];
+        let b = submit_and_wait(&cm, spec_b);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(b).unwrap().pending_reason,
+            PendingReason::Licenses,
+            "a's reserved-but-unconfirmed license claim must still count against b"
         );
     }
 
