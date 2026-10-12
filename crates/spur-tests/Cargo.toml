@@ -12,21 +12,8 @@ spur-sched = { path = "../spur-sched" }
 
 spur-spank = { path = "../spur-spank" }
 
-futures-util = { workspace = true }
-tracing = { workspace = true }
-tokio = { workspace = true }
-tonic = { workspace = true }
-prost-types = { workspace = true }
 chrono = { workspace = true }
-anyhow = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tempfile = "3"
-assert_cmd = "2"
-predicates = "3"
-reqwest = { workspace = true }
 jsonwebtoken.workspace = true
-openssh = { version = "0.11", default-features = false, features = ["process-mux"] }
 
 [lints]
 workspace = true

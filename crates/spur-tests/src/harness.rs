@@ -3,12 +3,11 @@
 
 //! Test harness utilities.
 //!
-//! Provides helpers for standing up test clusters, submitting jobs,
-//! and asserting state transitions.
+//! Fixture builders for jobs, nodes, partitions, and batch scripts, plus
+//! job state-transition assertions.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use spur_core::config::SlurmConfig;
 use spur_core::job::{Job, JobSpec, JobState};
 use spur_core::node::{Node, NodeState};
 use spur_core::partition::{Partition, PartitionState};
@@ -140,36 +139,4 @@ pub fn test_script(directives: &[&str], body: &str) -> String {
     script.push_str(body);
     script.push('\n');
     script
-}
-
-/// Minimal TOML config for testing.
-pub fn test_config() -> SlurmConfig {
-    SlurmConfig::load_from_str(
-        r#"
-cluster_name = "test-cluster"
-
-[[partitions]]
-name = "default"
-default = true
-nodes = "node[001-008]"
-max_time = "24:00:00"
-
-[[partitions]]
-name = "gpu"
-nodes = "gpu[001-004]"
-max_time = "72:00:00"
-
-[[nodes]]
-names = "node[001-008]"
-cpus = 64
-memory_mb = 256000
-
-[[nodes]]
-names = "gpu[001-004]"
-cpus = 128
-memory_mb = 512000
-gres = ["gpu:mi300x:8"]
-"#,
-    )
-    .expect("test config should parse")
 }
