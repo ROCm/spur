@@ -44,7 +44,7 @@ tonic-prost-build = "0.14"
 # REST API
 axum = { version = "0.8", features = ["json"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -56,7 +56,7 @@ serde_yaml = "0.9"
 toml = "1.1"
 
 # Database
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "chrono"] }
 # Consensus
 openraft = { version = "0.9", features = ["serde"] }
 
@@ -87,11 +87,11 @@ prometheus-client = "0.25"
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4"] }
 regex = "1"
 parking_lot = "0.12"
 bytes = "1"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 futures-util = "0.3"
 flate2 = "1"
 tar = "0.4"
