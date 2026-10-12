@@ -2123,7 +2123,7 @@ fn settle_prolog_failures(
         if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
             error!(job_id, error = %e, "failed to cancel client-attached job after prolog failure");
         }
-    } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(detail), run_attempt) {
+    } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, detail, run_attempt) {
         error!(job_id, error = %e, "failed to hold job after prolog failure");
     }
     true
@@ -2437,8 +2437,7 @@ async fn confirm_dispatch_on_nodes(
         ) {
             error!(job_id, "{detail}");
             let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
-            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail), run_attempt)
-            {
+            if let Err(e) = cluster.hold_job_for_launch_failure(job_id, &detail, run_attempt) {
                 error!(job_id, error = %e, "failed to hold job for unsupported multi-node PMIx");
             }
             return DispatchConfirmOutcome::Aborted;
@@ -5736,19 +5735,21 @@ mod tests {
             // never reached Running, so this hold is applied directly on the
             // still-Pending job (`hold_job_for_launch_failure`) rather than
             // via the old Running->Failed->Held detour — same end state
-            // (Pending, priority 0, Held) with the dispatch failure detail
-            // surfaced in state_reason_display.
+            // (Pending, priority 0, Held), reading as held with the dispatch
+            // failure detail after it.
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert_eq!(job.pending_reason, PendingReason::Held);
             assert_eq!(job.priority, 0);
             assert_eq!(
                 job.state_reason_display(),
-                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
+                "launch failed requeued held \
+                 (dispatch confirmation failed (0/1 confirmed): 1 prolog failure)"
             );
             assert_eq!(
                 job.state_reason(),
-                "dispatch confirmation failed (0/1 confirmed): 1 prolog failure"
+                "launch failed requeued held \
+                 (dispatch confirmation failed (0/1 confirmed): 1 prolog failure)"
             );
             assert!(
                 !cm.pending_jobs().iter().any(|j| j.job_id == job_id),

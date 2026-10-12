@@ -265,7 +265,11 @@ and Raft high-availability topology.
      - bool
      - ``true``
      - Live
-     - Hold a job whose ``prolog_slurmctld`` hook fails instead of requeuing it.
+     - Hold a batch job whose node ``prolog`` fails instead of retrying it on
+       another node; the node is drained either way. The job's reason reads
+       ``launch failed requeued held (<cause>)`` until someone runs
+       ``scontrol release``. A ``prolog_slurmctld`` failure requeues the job
+       regardless of this setting.
    * - ``terminal_job_retention_secs``
      - integer
      - ``3600``
