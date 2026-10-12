@@ -1228,6 +1228,10 @@ pub struct ClusterConfig {
     /// download plus multi-node join.
     #[serde(default = "default_k8s_provisioning_timeout_secs")]
     pub k8s_provisioning_timeout_secs: u64,
+    /// Stop a spurd-installed k0s worker left running on a node outside a scoped cluster that has
+    /// no role. Off leaves drift report-only.
+    #[serde(default = "default_true_fn")]
+    pub k8s_drift_correction: bool,
     /// Allow `spur k8s kubeconfig --admin` to serve the k0s CLUSTER-ADMIN kubeconfig over RPC.
     ///
     /// Default false. The admin check it sits behind compares a client-supplied caller string, so
@@ -1289,6 +1293,7 @@ impl Default for ClusterConfig {
             storage_provisioner: default_storage_provisioner(),
             local_path_dir: default_local_path_dir(),
             k8s_provisioning_timeout_secs: default_k8s_provisioning_timeout_secs(),
+            k8s_drift_correction: true,
             allow_admin_kubeconfig: false,
         }
     }
@@ -3299,6 +3304,21 @@ cni_mtu = 1400
         assert_eq!(cfg.cluster.service_cidr, "10.43.0.0/16"); // default
         assert_eq!(cfg.cluster.cni, "calico");
         assert_eq!(cfg.cluster.cni_mtu, 1400);
+    }
+
+    #[test]
+    fn drift_correction_is_on_unless_turned_off() {
+        let load = |extra: &str| {
+            SlurmConfig::load_from_str(&format!(
+                "cluster_name=\"t\"\n[cluster]\nenabled=true\n{extra}"
+            ))
+            .expect("valid config")
+            .cluster
+            .k8s_drift_correction
+        };
+        assert!(load(""));
+        assert!(!load("k8s_drift_correction=false\n"));
+        assert!(ClusterConfig::default().k8s_drift_correction);
     }
 
     #[test]

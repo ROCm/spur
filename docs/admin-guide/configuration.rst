@@ -2583,6 +2583,13 @@ own startup. Only ``allow_admin_kubeconfig`` is reloadable.
      - ``600``
      - Restart
      - How long a node may stay in provisioning before it is marked Degraded.
+   * - ``k8s_drift_correction``
+     - bool
+     - ``true``
+     - Restart
+     - Stop a spurd-installed k0s worker left running on a node outside a scoped
+       cluster with no role. ``false`` keeps drift report-only. See
+       :ref:`k0s-membership-drift`.
    * - ``allow_admin_kubeconfig``
      - bool
      - ``false``

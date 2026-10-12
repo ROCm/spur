@@ -1264,6 +1264,9 @@ message GetClusterComponentStatusResponse {
   string role = 1;
   string component_state = 2;  // "active" | "inactive" | "failed" | "unknown"
   bool enabled = 3;
+  // The running unit was written by spurd, not by `k0s install` or an operator. Agents that
+  // predate this field always report false.
+  bool spurd_owned = 4;
 }
 
 // -- Control-plane-only cluster admin messages --

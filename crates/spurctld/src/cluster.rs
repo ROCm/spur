@@ -654,7 +654,7 @@ impl Drop for K0sRemoval<'_> {
         let Some(count) = removals.get_mut(&self.node) else {
             return;
         };
-        *count -= 1;
+        *count = count.saturating_sub(1);
         if *count == 0 {
             removals.remove(&self.node);
         }
@@ -22660,6 +22660,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("both assigned", || {
@@ -22708,6 +22709,7 @@ mod tests {
             cni: "calico".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         }
     }
 
@@ -22969,8 +22971,9 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: Some("node-a".into()),
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         };
-        let mut tokens = std::collections::HashMap::new();
+        let mut tokens = crate::cluster_k8s::StartTracker::default();
         crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, false).await;
 
         wait_for("un-roled node assigned by a Ready-phase tick", || {
@@ -22990,6 +22993,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         }
     }
 
@@ -23013,7 +23017,7 @@ mod tests {
         });
 
         let net = k0s_test_net();
-        let mut tokens = std::collections::HashMap::new();
+        let mut tokens = crate::cluster_k8s::StartTracker::default();
         crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, true).await;
 
         wait_for("degraded", || cm.k0s_state().phase == K0sPhase::Degraded);
@@ -23043,7 +23047,7 @@ mod tests {
         });
 
         let net = k0s_test_net();
-        let mut tokens = std::collections::HashMap::new();
+        let mut tokens = crate::cluster_k8s::StartTracker::default();
         crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, false).await;
 
         assert_eq!(cm.k0s_state().phase, K0sPhase::Provisioning);
@@ -23072,6 +23076,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unchanged_k0s_reason_is_not_written_again() {
+        use crate::cluster_k8s::set_reason_if_changed;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        let reason = |cm: &ClusterManager| cm.get_node("node-a").and_then(|n| n.k0s_last_error);
+
+        assert!(set_reason_if_changed(&cm, "node-a", "start failed: boom"));
+        wait_for("reason recorded", || {
+            reason(&cm).as_deref() == Some("start failed: boom")
+        });
+        assert!(!set_reason_if_changed(&cm, "node-a", "start failed: boom"));
+        assert!(set_reason_if_changed(&cm, "node-a", "start timed out"));
+        wait_for("reason replaced", || {
+            reason(&cm).as_deref() == Some("start timed out")
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_phase_reports_no_error_for_down_and_degraded() {
         use spur_core::k0s::K0sPhase;
         let dir = TempDir::new().unwrap();
@@ -23086,11 +23110,14 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         };
-        let mut tokens = std::collections::HashMap::new();
+        let mut tokens = crate::cluster_k8s::StartTracker::default();
         // A token cached from the torn-down incarnation must not survive the Down tick: reusing it
         // on the next `up` would hand a worker a stale-CA token, failing its join.
-        tokens.insert("worker-1".to_string(), "stale-ca-token".to_string());
+        tokens
+            .join_tokens
+            .insert("worker-1".to_string(), "stale-ca-token".to_string());
 
         let down = spur_core::k0s::K0sClusterState {
             phase: K0sPhase::Down,
@@ -23098,7 +23125,7 @@ mod tests {
         };
         assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &down, &mut tokens, false).await);
         assert!(
-            tokens.is_empty(),
+            tokens.join_tokens.is_empty(),
             "Down reconcile must clear cached join tokens so a rebuild mints fresh ones"
         );
 
@@ -23266,6 +23293,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("both nodes assigned k0s roles", || {
@@ -23320,6 +23348,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: Some("node-a".into()),
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("scoped nodes assigned", || {
@@ -23464,6 +23493,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("all four assigned", || {
@@ -23531,6 +23561,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("all assigned", || {

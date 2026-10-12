@@ -8390,11 +8390,12 @@ impl SlurmAgent for AgentService {
         &self,
         _request: Request<GetClusterComponentStatusRequest>,
     ) -> Result<Response<GetClusterComponentStatusResponse>, Status> {
-        let (role, component_state, enabled) = self.k0s.status().await;
+        let status = self.k0s.status().await;
         Ok(Response::new(GetClusterComponentStatusResponse {
-            role,
-            component_state,
-            enabled,
+            role: status.role,
+            component_state: status.state,
+            enabled: status.enabled,
+            spurd_owned: status.spurd_owned,
         }))
     }
 

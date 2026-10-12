@@ -80,6 +80,19 @@ impl ClusterRole {
     }
 }
 
+/// Written into every unit spurd renders. `k0s install` uses the same unit names, so this is
+/// the only way to tell spurd's k0s from an operator's.
+const SPURD_UNIT_MARKER: &str = "(managed by spurd)";
+
+/// What `K0sAgent::status` reports about this node's k0s unit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComponentStatus {
+    pub role: String,
+    pub state: String,
+    pub enabled: bool,
+    pub spurd_owned: bool,
+}
+
 /// Inputs the supervisor needs to own a k0s unit.
 ///
 /// Increment-2 prototype: sourced from env (`from_env`). Later increments populate this from
@@ -149,7 +162,7 @@ impl ClusterSupervisor {
         }
         format!(
             "[Unit]\n\
-             Description=k0s {role} (managed by spurd)\n\
+             Description=k0s {role} {SPURD_UNIT_MARKER}\n\
              Documentation=https://docs.k0sproject.io\n\
              ConditionFileIsExecutable={bin}\n\
              After=network-online.target\n\
@@ -288,6 +301,26 @@ impl ClusterSupervisor {
             .ok()
             .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
             .unwrap_or(0)
+    }
+
+    /// Whether the unit systemd actually loaded is one spurd wrote. Reads `FragmentPath` rather
+    /// than `unit_path` so a same-named unit installed elsewhere is judged by its own file.
+    async fn unit_is_spurd_owned(&self) -> bool {
+        let unit = self.unit_file_name();
+        let Ok(out) = Command::new("systemctl")
+            .args(["show", &unit, "-p", "FragmentPath", "--value"])
+            .output()
+            .await
+        else {
+            return false;
+        };
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if path.is_empty() {
+            return false;
+        }
+        tokio::fs::read_to_string(&path)
+            .await
+            .is_ok_and(|body| body.contains(SPURD_UNIT_MARKER))
     }
 
     fn role(&self) -> ClusterRole {
@@ -1034,31 +1067,38 @@ impl K0sAgent {
         Ok(())
     }
 
-    /// (role, active_state, enabled) for the node's component. When there is no tracked component,
-    /// it probes the actual spurd-owned units so a restarted spurd (before/without adoption) still
-    /// reports the truth instead of a false `inactive`.
-    pub async fn status(&self) -> (String, String, bool) {
+    /// The node's k0s component. When there is no tracked component, it probes the k0s unit
+    /// names so a restarted spurd (before/without adoption) still reports the truth instead of a
+    /// false `inactive`; `spurd_owned` says whether that unit is one spurd wrote.
+    pub async fn status(&self) -> ComponentStatus {
         // Snapshot out of the lock, then query systemctl OUTSIDE it (avoids serializing RPCs).
         let tracked = self.active.lock().await.clone();
         if let Some(sup) = tracked {
-            let enabled = sup.unit_status_is(&["is-enabled"], "enabled").await;
-            return (
-                sup.role().as_str().to_string(),
-                sup.component_state().await,
-                enabled,
-            );
+            return ComponentStatus {
+                role: sup.role().as_str().to_string(),
+                state: sup.component_state().await,
+                enabled: sup.unit_status_is(&["is-enabled"], "enabled").await,
+                spurd_owned: sup.unit_is_spurd_owned().await,
+            };
         }
-        // Untracked: report a running spurd-owned unit if there is one (Controller/Single share a
-        // unit name — reported as "controller").
+        // Untracked: report a running k0s unit if there is one (Controller/Single share a unit
+        // name — reported as "controller").
         for role in [ClusterRole::Worker, ClusterRole::Controller] {
             let probe = self.probe_supervisor(role);
             let state = probe.component_state().await;
             if state != "inactive" && state != "unknown" {
-                let enabled = probe.unit_status_is(&["is-enabled"], "enabled").await;
-                return (role.as_str().to_string(), state, enabled);
+                return ComponentStatus {
+                    role: role.as_str().to_string(),
+                    state,
+                    enabled: probe.unit_status_is(&["is-enabled"], "enabled").await,
+                    spurd_owned: probe.unit_is_spurd_owned().await,
+                };
             }
         }
-        (String::new(), "inactive".to_string(), false)
+        ComponentStatus {
+            state: "inactive".to_string(),
+            ..Default::default()
+        }
     }
 
     /// Background heal loop: keep the active component's unit reconciled. Spawned from spurd
@@ -1163,6 +1203,8 @@ mod tests {
         assert!(unit.contains("KillMode=process"));
         assert!(unit.contains("Delegate=yes"));
         assert!(unit.contains("Restart=always"));
+        // Units already on disk carry this exact text; changing it would disown them.
+        assert!(unit.contains("Description=k0s k0scontroller (managed by spurd)\n"));
         // k0s does not sd_notify: the unit must NOT be Type=notify (default simple is correct).
         assert!(!unit.contains("Type=notify"));
         assert_eq!(sup.unit_file_name(), "k0scontroller.service");

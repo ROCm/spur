@@ -331,24 +331,77 @@ Membership drift
 ~~~~~~~~~~~~~~~~
 
 ``spurctld`` records which nodes belong to the cluster and the k0s role each one
-runs, and checks that record against what each node's agent reports. Two kinds
+runs, and checks that record against what each node's agent reports. Three kinds
 of disagreement are reported:
 
 - ``out_of_scope``: k0s is running on a node outside a scoped cluster's members.
+  On a whole-inventory cluster every node is a member, so this cannot occur.
 - ``role_mismatch``: a node runs a different role than the one recorded for it,
-  for example a worker where the controller expects a control plane.
+  for example a worker where the controller expects a control plane. A node
+  recorded as ``single`` that reports ``controller`` is not a mismatch, since
+  both run the same unit.
+- ``not_running``: in a ``degraded`` cluster, a node with a role that was
+  running when the cluster degraded and no longer is. Nothing restarts nodes in
+  ``degraded``, so this is reported rather than corrected; recovery is
+  ``spur k8s down`` then ``spur k8s up``.
 
 While the cluster is ``ready`` or ``degraded``, every node with a role, and every
-node outside a scoped cluster, is checked about once every ten minutes. Nodes
-that are down, drained, draining, in an unknown state, or being taken out by
+node outside a scoped cluster, is checked at least once every ten minutes; on a
+large scoped inventory, where at most 16 nodes are checked per 30-second tick,
+the sweep takes ``ceil(candidates / 16) × 30`` seconds instead. A node that
+joins behind the sweep may wait one extra sweep. Nodes that are down, drained,
+draining, in error, suspended, in an unknown state, or being taken out by
 ``k8s remove-nodes`` are skipped. A disagreement is reported only when two
 successive readings of the same node agree, and once per episode: as a warning
 in the ``spurctld`` log naming the node and the roles involved, and on
 ``spur_k8s_drift_detected_total`` (see :doc:`/user-guide/monitoring-jobs`). A
-node that stops being checked, or a cluster that leaves ``ready`` or
-``degraded``, starts its readings over.
+node that stops being checked, a cluster that leaves ``ready`` or
+``degraded``, or a controller restart or leader change starts its readings over.
+A leader change while ``k8s remove-nodes`` is draining a node can surface one
+``out_of_scope`` report for that node.
 
-Spur reports drift but does not correct it: nothing is stopped or restarted.
+Correcting a stray
+^^^^^^^^^^^^^^^^^^
+
+One kind of drift is corrected automatically: a k0s **worker that spurd
+installed**, still running on a node that is **outside a scoped cluster** and
+has **no role recorded**. This is what a node left behind looks like, for
+example one that was unreachable during ``spur k8s down`` and came back with
+its k0s still running. ``spurctld`` stops and disables that unit, without
+``k0s reset``. Everything else is reported and left alone:
+
+- a k0s controller outside the cluster, which may still hold etcd quorum for
+  the live cluster;
+- a k0s unit spurd did not write, such as one from ``k0s install``; agents
+  older than the controller never claim a unit, so mixed versions stop nothing;
+- a node outside the scope that still has a role recorded, such as a
+  half-finished ``remove-nodes``;
+- every ``role_mismatch`` and ``not_running``.
+
+Before each stop, the controller confirms it is still the leader with a quorum
+round and that no election happened since it decided, then re-reads the node
+and the cluster record and gives up if either changed. It stops at most one
+node per tick and at most five per ten minutes, and holds back entirely while
+more than a quarter of the nodes it checks look like strays (at least two),
+because then the record is more likely wrong than the fleet. A node stopped
+before waits ten minutes before another stop, doubling to an hour. A stop
+counts as done only when the next two checks find the unit stopped; if it
+comes back, that is counted separately and the wait keeps growing.
+
+Turn this off with ``k8s_drift_correction = false`` under ``[cluster]``; drift
+is then report-only. Upgrading to a release with this on stops strays that are
+already being reported within the first two checks of each.
+
+Starting nodes that should run
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+While the cluster is ``provisioning`` or ``ready``, the controller starts k0s on
+every node with a role that is not running it. A start that fails, a unit that
+systemd gives up on, or three starts in a row that get no answer within two
+minutes are recorded as the node's reason in ``spur k8s status`` and counted on
+``spur_k8s_start_failures_total``. While ``ready``, a node that keeps failing
+is retried after one minute, doubling to ten; the wait is dropped once the node
+runs, or when it comes back from ``down``.
 
 Tear down
 ~~~~~~~~~
@@ -519,6 +572,9 @@ Configuration reference (``[cluster]``)
    * - ``k8s_provisioning_timeout_secs``
      - ``600``
      - Seconds a node may stay non-``active`` during provisioning before the cluster is marked ``degraded``.
+   * - ``k8s_drift_correction``
+     - ``true``
+     - Stop a spurd-installed k0s worker left running on a node outside the cluster with no role (see :ref:`k0s-membership-drift`). ``false`` reports only.
    * - ``allow_admin_kubeconfig``
      - ``false``
      - Allow ``spur k8s kubeconfig --admin`` to serve the cluster-admin kubeconfig over RPC.
