@@ -268,7 +268,7 @@ Two further consequences of not draining:
   capacity; here nothing drains, so a batch of N instead puts N agents' ``spurd`` down
   simultaneously while all N stay schedulable, widening the dispatch window above N-fold
   rather than serialising it. Keep the default of ``1``.
-- An agent unreachable over SSH is left schedulable and un-upgraded. Every other mode still
+- An agent unreachable over SSH is left schedulable and not upgraded. Every other mode still
   drains it, because the drain is a controller-side call that works on a host Ansible cannot
   reach. That is usually desirable — a node whose ``spurd`` is healthy but whose SSH is down
   should keep taking work — but a genuinely dead node stays schedulable until it crosses its
