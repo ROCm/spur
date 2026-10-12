@@ -100,6 +100,12 @@ pub enum WalOperation {
     JobStepCreate {
         step: Box<crate::step::JobStep>,
     },
+    /// A step's agents have actually been contacted. A `RunStep` retry after
+    /// this point reattaches to the dispatch instead of relaunching it.
+    JobStepDispatchStarted {
+        job_id: JobId,
+        step_id: u32,
+    },
     JobPriorityChange {
         job_id: JobId,
         old_priority: u32,
@@ -1447,6 +1453,7 @@ mod evict_wal_tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            dispatched: false,
         };
         let op = WalOperation::JobStepCreate {
             step: Box::new(step.clone()),
@@ -1458,6 +1465,25 @@ mod evict_wal_tests {
                 assert_eq!(restored.job_id, 7);
                 assert_eq!(restored.step_id, 1);
                 assert_eq!(restored.name, "hostname");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen on-wire shape from before `JobStep.dispatched` existed; a step
+    // created by an older controller must still replay, defaulting to false.
+    #[test]
+    fn job_step_create_frozen_payload_predating_dispatched_still_deserializes() {
+        const FROZEN: &str = r#"{"JobStepCreate":{"step":{"job_id":7,"step_id":1,"name":"hostname","state":"Running","num_tasks":2,"cpus_per_task":1,"resources":{"cpus":0,"memory_mb":0,"devices":{},"generation":0},"nodes":["n1","n2"],"distribution":"Block","start_time":null,"end_time":null,"exit_code":null}}}"#;
+        let op: WalOperation = serde_json::from_str(FROZEN).expect(
+            "frozen pre-`dispatched` JobStepCreate must deserialize; the field needs #[serde(default)]",
+        );
+        match op {
+            WalOperation::JobStepCreate { step } => {
+                assert!(
+                    !step.dispatched,
+                    "an old step must default to not-yet-dispatched"
+                );
             }
             _ => panic!("wrong variant"),
         }
