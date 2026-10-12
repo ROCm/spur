@@ -179,14 +179,19 @@ The playbook proceeds in order:
    ``spur_transport=wireguard`` (not yet supported by this playbook), or if the cluster is
    not already healthy (``spur nodes`` must return success).
 2. **Upgrade controllers one at a time** (``serial: 1``, no failures tolerated), preserving
-   Raft quorum. Each controller's binaries are force-reinstalled and the daemon restarted;
-   the "wait for Raft leader" step is the health gate before moving to the next controller.
-   The existing ``spur.conf`` is preserved unless you pass ``-e spur_overwrite_conf=true``.
+   Raft quorum. On a multi-controller cluster the playbook probes each controller first and
+   upgrades **the Raft leader last** (see :ref:`upgrading-leader-last`). Each controller's
+   binaries are force-reinstalled and the daemon restarted; the "wait for Raft leader" step
+   is the health gate before moving to the next controller. The existing ``spur.conf`` is
+   preserved unless you pass ``-e spur_overwrite_conf=true``.
 3. **Drain and upgrade agents in batches.** For each agent: drain it from the controller
    (``spur node drain <node> --reason "ansible rolling upgrade"``), wait until its state is
    ``DRAINED`` or ``DOWN`` (running jobs finish first — drain never force-kills), swap the
    binary, restart ``spurd``, wait for the node to re-register, then resume it
    (``scontrol update NodeName=<node> State=RESUME``).
+
+   ``spur_in_place_upgrade=true`` changes this step: the node is **never drained and never
+   resumed**, so it stays schedulable for the whole swap. See :ref:`upgrading-in-place`.
 4. **Verify.** Submit a real test job to confirm the upgraded cluster schedules work.
 
 The rolling upgrade is controlled with these ``-e`` flags:
@@ -214,6 +219,12 @@ The rolling upgrade is controlled with these ``-e`` flags:
      - ``false``
      - Kill running jobs and containers on a busy node and upgrade it anyway. Affected jobs
        are marked ``NODE_FAIL``.
+   * - ``spur_in_place_upgrade=true``
+     - ``false``
+     - Non-disruptive mode: never drain any agent, and upgrade a busy node's ``spurd``
+       without killing its running job, trusting ``spurstepd`` to carry it across. Also
+       orders controllers leader-last. Mutually exclusive with the two flags above.
+       See :ref:`upgrading-in-place`.
    * - ``spur_overwrite_conf=true``
      - ``false``
      - Re-render ``spur.conf`` from the Ansible template. Needed only when inventory
@@ -225,6 +236,73 @@ The rolling upgrade is controlled with these ``-e`` flags:
    single-controller cluster still has a short outage while its own controller restarts —
    true zero-downtime requires an HA quorum of 3 or more controllers.
 
+.. _upgrading-in-place:
+
+Non-disruptive in-place upgrade
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   ansible-playbook playbooks/rolling_upgrade.yml -i inventory/hosts.ini \
+     -e spur_binary_src=/path/to/target/release -e spur_in_place_upgrade=true
+
+Every other busy-node strategy drains the node first and resumes it afterwards, which makes
+it unschedulable for the length of the swap. ``spur_in_place_upgrade=true`` issues neither,
+so the controller's view of the node never changes and an operator's own pre-existing drain
+is never cleared.
+
+A running job is carried across by ``spurstepd``, the per-job supervisor that lives outside
+``spurd``'s process lifetime: ``spurd`` restarts, the new binary rediscovers the live
+session and re-adopts it, and the payload is never signalled. The mode still refuses a busy
+node that has no ``spurstepd`` installed yet — trusting a supervisor that is not there would
+be unsafe — and is mutually exclusive with ``spur_skip_busy_agents`` and
+``spur_force_upgrade_busy_agents``.
+
+The trade-off runs the opposite way from the drained modes. Because nothing stops the
+scheduler, a **new** job can be dispatched onto the node during the few seconds ``spurd`` is
+down and may fail to launch. Already-running supervised work is unaffected.
+
+.. note::
+
+   What survives is the *job*, not necessarily an attached client. ``sbatch`` work — plain,
+   containerised and multi-node — rides the swap untouched. A client-driven ``srun`` step
+   keeps running on the node, but the ``srun`` **client** can lose its connection when the
+   controller it is attached to restarts; the job then sits ``RUNNING`` with a live but
+   unattached payload, which ``scancel`` reaps cleanly. This is much likelier on a
+   single-controller cluster, where the restart is a full API outage with no peer to fail
+   over to, and it is not specific to this mode.
+
+.. _upgrading-leader-last:
+
+Controller order: the leader goes last
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On a multi-controller cluster ``rolling_upgrade.yml`` probes each controller before touching
+any of them and upgrades the Raft leader **last**.
+
+This matters because of how a mixed-version cluster replicates. ``WalOperation`` is an
+externally tagged enum with no tolerant unknown-variant path, and the Raft transport
+deserializes an entire ``AppendEntries`` payload in one call. If a release adds a WAL
+variant and the new build reaches the leader first, every still-old follower rejects the
+appends carrying that variant and **stops replicating** until it is itself upgraded. On a
+three-controller cluster that costs quorum. While the leader is still on the old build it
+cannot emit a new variant at all, which is what closes the window.
+
+Detection is a read-only ``GET`` to each controller's own loopback metrics listener
+(``http://127.0.0.1:6822/metrics/nodes``), which answers ``200`` on the leader and ``503``
+on a follower. It never blocks the upgrade: if no controller answers as leader, or more than
+one does, the playbook warns and falls back to inventory order. Pass
+``-e spur_controller_upgrade_order=ctl-2,ctl-0,ctl-1`` to override it entirely.
+
+.. warning::
+
+   Leader-last shrinks the mixed-version window but cannot remove it. If leadership moves
+   onto an already-upgraded controller mid-run and something then writes a new WAL variant —
+   ``scancel`` and preemption are the usual triggers — a not-yet-upgraded follower stalls.
+   Quorum survives, and the stalled follower catches up as soon as it is upgraded, so this
+   is degraded-but-self-healing rather than an outage. The stalled follower logs nothing
+   itself; the rejection is only visible on the leader.
+
 Safe Upgrade Order
 ~~~~~~~~~~~~~~~~~~~
 
@@ -235,7 +313,9 @@ Follow this order for any cluster upgrade:
 2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
    controller at a time to preserve quorum.
 3. **Drain agents before swapping binaries.** The rolling playbook drains automatically; a
-   running job blocks the swap unless you force it.
+   running job blocks the swap unless you force it. The exception is
+   ``spur_in_place_upgrade=true``, which deliberately never drains and relies on
+   ``spurstepd`` to carry running jobs across instead (see :ref:`upgrading-in-place`).
 4. **Never wipe state during an upgrade.** Keep the default ``spur_wipe_state=false``.
    Wiping resets the Raft job-id counter and destroys accounting history.
 5. **HA membership is fixed at init** in Spur 0.3.0. You can roll new binaries onto the
