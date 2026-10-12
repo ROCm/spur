@@ -222,9 +222,9 @@ The rolling upgrade is controlled with these ``-e`` flags:
    * - ``spur_in_place_upgrade=true``
      - ``false``
      - Non-disruptive mode: never drain any agent, and upgrade a busy node's ``spurd``
-       without killing its running job, trusting ``spurstepd`` to carry it across. Also
-       orders controllers leader-last. Mutually exclusive with the two flags above.
-       See :ref:`upgrading-in-place`.
+       without killing its running job, trusting ``spurstepd`` to carry it across.
+       Ignores ``spur_drain_wait_secs`` — nothing drains, so there is no wait.
+       Mutually exclusive with the two flags above. See :ref:`upgrading-in-place`.
    * - ``spur_overwrite_conf=true``
      - ``false``
      - Re-render ``spur.conf`` from the Ansible template. Needed only when inventory
@@ -262,6 +262,18 @@ The trade-off runs the opposite way from the drained modes. Because nothing stop
 scheduler, a **new** job can be dispatched onto the node during the few seconds ``spurd`` is
 down and may fail to launch. Already-running supervised work is unaffected.
 
+Two further consequences of not draining:
+
+- ``spur_rolling_batch_size`` behaves differently. Elsewhere it trades speed for drained
+  capacity; here nothing drains, so a batch of N instead puts N agents' ``spurd`` down
+  simultaneously while all N stay schedulable, widening the dispatch window above N-fold
+  rather than serialising it. Keep the default of ``1``.
+- An agent unreachable over SSH is left schedulable and un-upgraded. Every other mode still
+  drains it, because the drain is a controller-side call that works on a host Ansible cannot
+  reach. That is usually desirable — a node whose ``spurd`` is healthy but whose SSH is down
+  should keep taking work — but a genuinely dead node stays schedulable until it crosses its
+  own heartbeat timeout and is marked ``DOWN``.
+
 .. note::
 
    What survives is the *job*, not necessarily an attached client. ``sbatch`` work — plain,
@@ -278,7 +290,9 @@ Controller order: the leader goes last
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 On a multi-controller cluster ``rolling_upgrade.yml`` probes each controller before touching
-any of them and upgrades the Raft leader **last**.
+any of them and upgrades the Raft leader **last**. This applies to every busy-node mode, not
+only ``spur_in_place_upgrade``: it is gated solely on there being more than one controller
+and no explicit ``spur_controller_upgrade_order``.
 
 This matters because of how a mixed-version cluster replicates. ``WalOperation`` is an
 externally tagged enum with no tolerant unknown-variant path, and the Raft transport
