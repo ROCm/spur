@@ -42,29 +42,33 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
-/// True on the tick a leadership term begins, so per-term setup runs once rather
-/// than on every tick or on a follower. Advances `was_leader` to the new value.
-fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
-    let entering = is_leader && !*was_leader;
-    *was_leader = is_leader;
-    entering
-}
-
-/// Whether enough time has passed since this leader took over that it can
-/// trust its own (empty-at-first) view of what's in flight. `None` means no
-/// term has been recorded yet (never leader, or just relinquished).
-fn past_dispatch_grace(entered_leadership_at: Option<Instant>, grace: Duration) -> bool {
-    entered_leadership_at.is_none_or(|entered| entered.elapsed() >= grace)
+/// Whether enough time has passed under the live term that this leader can
+/// trust its own (empty-at-first) view of what's in flight. Filtering by
+/// `live_term` is what makes a coalesced lose-then-regain (A -> B -> A, all
+/// within one tick's await) safe: a published term the live term has since
+/// moved past is rejected rather than read as still-current grace.
+fn past_dispatch_grace(
+    leader_since: Option<crate::raft::LeaderSince>,
+    live_term: u64,
+    grace: Duration,
+) -> bool {
+    leader_since
+        .filter(|since| since.term == live_term)
+        .is_some_and(|since| since.at.elapsed() >= grace)
 }
 
 /// A disabled dispatch timeout (`deadline = None`) has no bound to wait out,
 /// so the sweep must stay off rather than fall back to a guessed grace.
 fn should_sweep_orphaned_placements(
     deadline: Option<Duration>,
-    entered_leadership_at: Option<Instant>,
+    leader_since: Option<crate::raft::LeaderSince>,
+    live_term: u64,
 ) -> bool {
     match deadline {
-        Some(grace) => past_dispatch_grace(entered_leadership_at, grace),
+        // Doubled: a multi-node PMIx dispatch is prepare then launch, each
+        // phase getting its own full deadline, so the grace must outlast
+        // the whole sequence, not one RPC's slice of it.
+        Some(grace) => past_dispatch_grace(leader_since, live_term, grace * 2),
         None => false,
     }
 }
@@ -81,6 +85,10 @@ pub(crate) fn relinquish_leadership(
 
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
+    // Watch-driven, not polled off a plain leader/follower bool: a term flip
+    // coalesced entirely within one tick's dispatch await (A -> B -> A) is
+    // still observed, so the grace below can't anchor off a stale term.
+    let leader_since_rx = raft.spawn_leadership_watcher();
     let enforcer_cluster = cluster.clone();
     let enforcer_raft = raft.clone();
     tokio::spawn(async move {
@@ -155,8 +163,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     // victim goes first and the dearer one follows a second later anyway. Remember
     // which reclaimer has capacity in flight and leave it alone until it lands.
     let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
-    let mut was_leader = false;
-    let mut leadership_entered_at: Option<Instant> = None;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -168,18 +174,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         let is_leader = raft.is_leader();
-        let entering_term = entering_leadership(&mut was_leader, is_leader);
 
         if !is_leader {
             // A former leader must not keep serving planned-reservation info
             // from before it lost leadership.
             relinquish_leadership(&cluster, &mut scheduler);
-            leadership_entered_at = None;
             continue;
-        }
-
-        if entering_term {
-            leadership_entered_at = Some(Instant::now());
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
@@ -192,7 +192,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.drive_bb_stage_in();
         // Held back for a full dispatch_timeout_secs after a leadership change:
         // an RPC the old leader had in flight needs time to land or time out first.
-        if should_sweep_orphaned_placements(dispatch_deadline(&cluster), leadership_entered_at) {
+        let leader_since = *leader_since_rx.borrow();
+        if should_sweep_orphaned_placements(
+            dispatch_deadline(&cluster),
+            leader_since,
+            raft.current_term(),
+        ) {
             cluster.abort_orphaned_placements();
         }
         cluster.purge_expired_reservations();
@@ -3475,32 +3480,6 @@ mod tests {
                 .abs()
                 < 2,
             "expected the completing timeout to bound it, got {got}"
-        );
-    }
-
-    #[test]
-    fn entering_leadership_fires_once_on_the_follower_to_leader_edge() {
-        let mut was_leader = false;
-
-        assert!(
-            !entering_leadership(&mut was_leader, false),
-            "a follower never enters a term"
-        );
-        assert!(
-            entering_leadership(&mut was_leader, true),
-            "the follower-to-leader edge is the entering tick"
-        );
-        assert!(
-            !entering_leadership(&mut was_leader, true),
-            "the next tick under the same term is not entering"
-        );
-        assert!(
-            !entering_leadership(&mut was_leader, false),
-            "losing leadership is not an entering edge"
-        );
-        assert!(
-            entering_leadership(&mut was_leader, true),
-            "regaining leadership is a fresh entering edge"
         );
     }
 
@@ -6804,41 +6783,75 @@ mod tests {
             );
         }
 
+        fn leader_since(at: Instant, term: u64) -> crate::raft::LeaderSince {
+            crate::raft::LeaderSince { at, term }
+        }
+
         #[test]
         fn past_dispatch_grace_holds_off_until_the_grace_elapses() {
             let grace = Duration::from_secs(300);
             assert!(
-                !past_dispatch_grace(Some(Instant::now()), grace),
+                !past_dispatch_grace(Some(leader_since(Instant::now(), 1)), 1, grace),
                 "just entered leadership: nothing has had time to land or time out yet"
             );
             let long_ago = Instant::now() - Duration::from_secs(301);
             assert!(
-                past_dispatch_grace(Some(long_ago), grace),
+                past_dispatch_grace(Some(leader_since(long_ago, 1)), 1, grace),
                 "grace window has elapsed"
             );
             assert!(
-                past_dispatch_grace(None, grace),
-                "no recorded term (never leader, or just relinquished) has nothing to wait out"
+                !past_dispatch_grace(None, 1, grace),
+                "no recorded term (never leader, or just relinquished) has nothing to trust"
+            );
+            assert!(
+                !past_dispatch_grace(Some(leader_since(long_ago, 1)), 2, grace),
+                "a coalesced A -> B -> A flip moves the live term past the published one; \
+                 that stale term's old timestamp must not read as elapsed grace"
             );
         }
 
         #[test]
         fn should_sweep_orphaned_placements_never_fires_with_a_disabled_dispatch_timeout() {
-            let long_ago = Some(Instant::now() - Duration::from_secs(10_000));
+            let long_ago = Some(leader_since(
+                Instant::now() - Duration::from_secs(10_000),
+                1,
+            ));
             assert!(
-                !should_sweep_orphaned_placements(None, long_ago),
+                !should_sweep_orphaned_placements(None, long_ago, 1),
                 "dispatch_timeout_secs = 0 means no RPC timeout, so there is no bound to wait out"
             );
             assert!(
-                should_sweep_orphaned_placements(Some(Duration::from_secs(300)), long_ago),
+                should_sweep_orphaned_placements(Some(Duration::from_secs(300)), long_ago, 1),
                 "a finite deadline that has elapsed must still sweep"
+            );
+            assert!(
+                !should_sweep_orphaned_placements(Some(Duration::from_secs(300)), long_ago, 2),
+                "a live term past the published one must not sweep off its stale timestamp"
             );
         }
 
-        // Proves the entering-leadership fix through the real gate `run`'s tick
-        // body uses: `entering_leadership` and `past_dispatch_grace` together,
-        // not a hand-rolled bool standing in for them. Uses a short real grace
-        // window so the boundary is crossed with a bounded sleep, not a mock.
+        #[test]
+        fn should_sweep_orphaned_placements_waits_out_a_two_phase_pmix_dispatch() {
+            // A multi-node PMIx dispatch is prepare-then-launch, each phase
+            // getting a full dispatch_timeout_secs budget — one elapsed
+            // budget is not proof the whole sequence is done.
+            let deadline = Duration::from_secs(100);
+            let one_budget_elapsed =
+                Some(leader_since(Instant::now() - Duration::from_secs(150), 1));
+            assert!(
+                !should_sweep_orphaned_placements(Some(deadline), one_budget_elapsed, 1),
+                "only one of the two legitimate phases has had time to run"
+            );
+            let both_budgets_elapsed =
+                Some(leader_since(Instant::now() - Duration::from_secs(250), 1));
+            assert!(
+                should_sweep_orphaned_placements(Some(deadline), both_budgets_elapsed, 1),
+                "both phases have now had their full budget"
+            );
+        }
+
+        // Proves the grace mechanism `run`'s tick body uses, with a short real
+        // grace window so the boundary is crossed with a bounded sleep.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn abort_orphaned_placements_is_skipped_until_the_dispatch_grace_elapses() {
             let dir = TempDir::new().unwrap();
@@ -6863,12 +6876,9 @@ mod tests {
             });
 
             let grace = Duration::from_millis(200);
-            let mut was_leader = false;
-            let entering_term = entering_leadership(&mut was_leader, true);
-            assert!(entering_term, "the first observed leader tick must enter");
-            let leadership_entered_at = Some(Instant::now());
+            let since = Some(leader_since(Instant::now(), 1));
 
-            if past_dispatch_grace(leadership_entered_at, grace) {
+            if past_dispatch_grace(since, 1, grace) {
                 cm.abort_orphaned_placements();
             }
             assert!(
@@ -6878,9 +6888,7 @@ mod tests {
             );
 
             tokio::time::sleep(grace + Duration::from_millis(50)).await;
-            let entering_term = entering_leadership(&mut was_leader, true);
-            assert!(!entering_term, "still the same term");
-            if past_dispatch_grace(leadership_entered_at, grace) {
+            if past_dispatch_grace(since, 1, grace) {
                 cm.abort_orphaned_placements();
             }
             assert!(

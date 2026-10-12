@@ -7311,11 +7311,19 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.priority = *new_priority;
                     if let Some(reason) = pending_reason {
-                        // A scheduling hold parks the job indefinitely; a reservation
-                        // `reserve_placement` already charged for an in-flight dispatch
-                        // must be freed here, or the charge survives forever with
-                        // nothing left to advance it to Running or back it off.
-                        if reason.is_scheduling_hold() && job.holds_a_placement() {
+                        // A concurrently-applied activate_job can beat this hold's
+                        // propose-time Pending check; recheck Pending (and the attempt,
+                        // if one was named) here, under the apply lock, before freeing
+                        // a reservation — or a hold can release a job's live nodes.
+                        let attempt_is_current = match run_attempt {
+                            Some(ra) if *ra != 0 && job.run_attempt != 0 => *ra >= job.run_attempt,
+                            _ => true,
+                        };
+                        if reason.is_scheduling_hold()
+                            && job.state == JobState::Pending
+                            && attempt_is_current
+                            && job.holds_a_placement()
+                        {
                             let freed_nodes = job.allocated_nodes.clone();
                             let allocated_resources = job.allocated_resources.clone();
                             let per_node_map = job.per_node_alloc.clone();
@@ -10816,6 +10824,113 @@ mod tests {
             cm.get_node("n1").unwrap().alloc_resources.cpus,
             0,
             "the final hold must not leave the last reservation's charge stranded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_priority_change_apply_does_not_free_a_running_jobs_allocation() {
+        // The apply-level race the public hold methods can't fully guard against:
+        // a hold's own Pending precheck passed before activate_job's entry landed
+        // first. Exercised directly against apply_operation, same as the sibling
+        // JobDispatchBackoff apply-race tests above.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("hold-race"));
+        let res = scalar_alloc(4, 8000);
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve");
+        cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("activate");
+        settle(&cm, id, JobState::Running);
+
+        cm.apply_operation(&WalOperation::JobPriorityChange {
+            job_id: id,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: Some(attempt),
+        });
+
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Running,
+            "a late hold must not touch a job that already activated"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "a Running job's charge must survive a hold whose precheck raced activation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_priority_change_apply_ignores_a_hold_for_a_superseded_attempt() {
+        // Same race, one step earlier: the hold still finds the job Pending, but
+        // a newer reservation has already replaced the attempt it was issued for.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("hold-stale-attempt"));
+        let res = scalar_alloc(4, 8000);
+        let attempt_a = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve A");
+        cm.abort_placement(id, attempt_a, false).expect("abort A");
+        wait_for("A's charge freed", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 0
+        });
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve B");
+
+        cm.apply_operation(&WalOperation::JobPriorityChange {
+            job_id: id,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: Some(attempt_a),
+        });
+
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "a stale hold for attempt A must not free attempt B's charge"
         );
     }
 
