@@ -4425,6 +4425,11 @@ impl ClusterManager {
             *count += 1;
         }
 
+        // Already reserved: it already counts in every gate's existing-usage
+        // baseline below (via `occupies_resources`), so admitting it again as a
+        // candidate would charge its own slot twice against its own cap.
+        candidates.retain(|candidate| !candidate.job.holds_a_placement());
+
         // Eligible-only: an unreadable cap is transient, not structural, so it must
         // not claim a begin-deferred job and report itself in place of BeginTime.
         // Nothing is admitted past the gate either way — ineligible candidates leave
@@ -4620,11 +4625,6 @@ impl ClusterManager {
         // ineligible candidates through without claiming them. Running after them
         // preserves their precedence, so a structural blocker still outranks the hold.
         candidates.retain(|candidate| {
-            // Already reserved: a second assignment would idle a node for this
-            // pass before reserve_placement's own duplicate guard rejects it.
-            if candidate.job.holds_a_placement() {
-                return false;
-            }
             if candidate.scheduling_eligible {
                 return true;
             }
@@ -15519,6 +15519,50 @@ mod tests {
         assert!(
             !cm.pending_jobs().iter().any(|j| j.job_id == id),
             "a job already holding a placement must not be offered again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_max_jobs_does_not_double_count_a_reserved_jobs_own_slot() {
+        // A reserved job already counts via `occupies_resources` in the gate's
+        // existing-usage scan; admitting it again as a same-pass candidate
+        // charged its own slot a second time, wrongly blocking a sibling that
+        // fit within the real (not doubled) cap.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut reserved_spec = basic_spec("reserved");
+        reserved_spec.qos = Some("cnt".into());
+        let reserved_id = submit_and_wait(&cm, reserved_spec);
+        let res = scalar_alloc(1, 1000);
+        cm.reserve_placement(
+            reserved_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+
+        let mut sibling_spec = basic_spec("waiting-sibling");
+        sibling_spec.qos = Some("cnt".into());
+        let sibling_id = submit_and_wait(&cm, sibling_spec);
+
+        cm.refresh_pending_reasons();
+        assert_ne!(
+            cm.get_job(sibling_id).unwrap().pending_reason,
+            PendingReason::QoSMaxJobsPerUser,
+            "one reserved job must not consume both of a cap of two slots"
         );
     }
 
