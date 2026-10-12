@@ -2041,6 +2041,12 @@ impl ClusterManager {
         if !job.holds_a_placement() {
             return Ok(());
         }
+        // A spared abort isn't the job's fault, so it never counts toward the
+        // cap; a charged one can, same as every other backoff call site.
+        if !spare_requeue_budget && job.requeue_count >= self.config().controller.max_batch_requeue
+        {
+            return self.hold_job_at_max_requeue(job_id, Some(run_attempt));
+        }
         let begin_time = self.launch_backoff_until(&job);
         self.propose(WalOperation::JobDispatchBackoff {
             job_id,
@@ -7305,6 +7311,26 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.priority = *new_priority;
                     if let Some(reason) = pending_reason {
+                        // A scheduling hold parks the job indefinitely; a reservation
+                        // `reserve_placement` already charged for an in-flight dispatch
+                        // must be freed here, or the charge survives forever with
+                        // nothing left to advance it to Running or back it off.
+                        if reason.is_scheduling_hold() && job.holds_a_placement() {
+                            let freed_nodes = job.allocated_nodes.clone();
+                            let allocated_resources = job.allocated_resources.clone();
+                            let per_node_map = job.per_node_alloc.clone();
+                            job.allocated_nodes.clear();
+                            job.allocated_resources = None;
+                            job.per_node_alloc.clear();
+                            Self::deallocate_job_slices(
+                                &mut nodes,
+                                &freed_nodes,
+                                allocated_resources.as_ref(),
+                                &per_node_map,
+                                &[],
+                                *job_id,
+                            );
+                        }
                         match pending_reason_desc {
                             Some(desc) => job.set_pending_reason_desc(reason.clone(), desc.clone()),
                             None => job.set_pending_reason(reason.clone()),
@@ -8365,7 +8391,7 @@ fn qos_block_with(
     let mut running_count = jobs
         .values()
         .filter(|j| {
-            j.state == JobState::Running
+            j.occupies_resources()
                 && !j.idle_fill
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
@@ -8484,7 +8510,7 @@ fn account_block_with(
     let mut running_count = jobs
         .values()
         .filter(|j| {
-            j.state == JobState::Running
+            j.occupies_resources()
                 && !j.idle_fill
                 && j.spec.user == *user
                 && j.spec.account.as_deref() == Some(account)
@@ -8740,7 +8766,7 @@ fn running_array_counts(jobs: &HashMap<JobId, Job>) -> HashMap<JobId, u32> {
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut acc = RunningTresAccumulator::default();
     for j in jobs.values() {
-        if j.state == JobState::Running && pred(j) {
+        if j.occupies_resources() && pred(j) {
             acc.add(j);
         }
     }
@@ -8835,7 +8861,7 @@ fn scope_usage(
         if !(is_submitted(job) && in_scope(job)) {
             continue;
         }
-        let running = job.state == JobState::Running;
+        let running = job.occupies_resources();
         // Group figures are the scope's own and are never narrowed by `only_user`.
         grp_submitted_jobs += 1;
         if running {
@@ -8887,7 +8913,7 @@ fn scope_usage(
 /// instead of always requiring brand-new distinct nodes.
 fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> HashSet<String> {
     jobs.values()
-        .filter(|j| j.state == JobState::Running && pred(j))
+        .filter(|j| j.occupies_resources() && pred(j))
         .flat_map(|j| j.allocated_nodes.iter().cloned())
         .collect()
 }
@@ -10749,6 +10775,47 @@ mod tests {
             cm.get_job(id).unwrap().state,
             JobState::Pending,
             "B is still an unconfirmed reservation, not yet running"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_placement_holds_instead_of_requeuing_past_max_batch_requeue() {
+        // Every other backoff call site caps at max_batch_requeue and holds the
+        // job instead of requeuing forever; abort_placement must too.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let max = cm.config().controller.max_batch_requeue;
+        let id = submit_and_wait(&cm, basic_spec("abort-at-cap"));
+        let res = scalar_alloc(4, 8000);
+
+        for _ in 0..=max {
+            let attempt = cm
+                .reserve_placement(
+                    id,
+                    vec!["n1".into()],
+                    res.clone(),
+                    per_node_for(&["n1"], res.clone()),
+                    false,
+                    false,
+                )
+                .expect("reserve");
+            cm.abort_placement(id, attempt, false).expect("abort");
+        }
+
+        wait_for("job held at max requeue", || {
+            cm.get_job(id)
+                .is_some_and(|j| j.pending_reason == PendingReason::JobHoldMaxRequeue)
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().requeue_count,
+            max,
+            "the hold must not keep bumping requeue_count past the cap"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            0,
+            "the final hold must not leave the last reservation's charge stranded"
         );
     }
 
@@ -20695,6 +20762,56 @@ mod tests {
             cm.get_job(j2).unwrap().pending_reason,
             PendingReason::QoSMaxJobsPerUser
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_counts_a_reserved_but_still_pending_job_as_running() {
+        // reserve_placement charges a job's nodes while it's still Pending
+        // (before dispatch confirms), so usage reporting must see it too — a
+        // raw `state == Running` filter under-counts a reserving job's charge.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("reserved-not-running");
+        spec.qos = Some("cnt".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.reserve_placement(
+            job_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+        assert_eq!(
+            cm.get_job(job_id).unwrap().state,
+            JobState::Pending,
+            "the reservation must not itself advance the job to Running"
+        );
+
+        let info = cm.assoc_mgr_info(None);
+        let record = info
+            .qos_records
+            .iter()
+            .find(|r| r.scope == "cnt")
+            .expect("cnt record");
+        assert_eq!(
+            record.grp_running_jobs, 1,
+            "a reserved-but-Pending job already occupies its node and must count"
+        );
+        let user = record
+            .users
+            .iter()
+            .find(|u| u.user == "testuser")
+            .expect("testuser row");
+        assert_eq!(user.running_jobs, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

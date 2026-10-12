@@ -1115,6 +1115,15 @@ impl Job {
             .any(|node| self.is_held_on(node))
     }
 
+    /// Whether this job currently occupies node/TRES capacity: either Running,
+    /// or Pending with a reservation `reserve_placement` already charged.
+    /// Quota/occupancy aggregates must use this, not a bare `== Running` check,
+    /// or a reserved-but-dispatching job's charge goes uncounted.
+    pub fn occupies_resources(&self) -> bool {
+        self.state == JobState::Running
+            || (self.state == JobState::Pending && self.holds_a_placement())
+    }
+
     /// Earliest time the job may start: `--begin` when it falls after submit.
     pub fn eligible_time(&self) -> DateTime<Utc> {
         match self.spec.begin_time {
@@ -1512,6 +1521,36 @@ mod tests {
     fn effective_memory_mb_defaults_to_zero_when_unset() {
         let spec = JobSpec::default();
         assert_eq!(effective_memory_mb(&spec, 1), 0);
+    }
+
+    #[test]
+    fn occupies_resources_counts_a_reserved_but_pending_job() {
+        let mut job = make_job();
+        job.state = JobState::Pending;
+        assert!(
+            !job.occupies_resources(),
+            "a Pending job with nothing charged occupies nothing"
+        );
+
+        job.allocated_nodes = vec!["n1".into()];
+        assert!(
+            job.occupies_resources(),
+            "reserve_placement charges a Pending job before it ever reaches Running"
+        );
+
+        job.node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 0 });
+        assert!(
+            !job.occupies_resources(),
+            "a node that already reported completion is no longer charged"
+        );
+    }
+
+    #[test]
+    fn occupies_resources_is_true_for_running_regardless_of_placement() {
+        let mut job = make_job();
+        job.state = JobState::Running;
+        assert!(job.occupies_resources());
     }
 
     // Pre-`pty` JobSpec must still deserialize, or spurctld crashes on replay.
