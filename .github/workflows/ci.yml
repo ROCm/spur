@@ -37,6 +37,19 @@ jobs:
       - name: Check dependencies
         run: cargo deny check
 
+  unused-packages-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install cargo-shear
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-shear@1.14.0
+      - name: Check for unused dependencies
+        run: cargo shear --locked --deny-warnings
+
   fmt:
     runs-on: ubuntu-latest
     steps:

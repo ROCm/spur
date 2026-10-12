@@ -70,6 +70,15 @@ Running Tests
 
 All tests are self-contained. No external services needed (no database, no network, no GPU). The E2E suite below is the only one that requires actual hardware (nodes with SSH access, optionally GPUs), and it is ignored by default.
 
+Unused dependencies are detected with `cargo-shear <https://github.com/Boshen/cargo-shear>`_, enforced in CI. Run it locally before opening a PR:
+
+.. code-block:: bash
+
+   cargo binstall cargo-shear@1.14.0
+   cargo shear --locked --deny-warnings
+
+If it flags a crate that is only used by generated code, add it to ``ignored`` under ``[package.metadata.cargo-shear]`` in that crate's ``Cargo.toml`` (see ``crates/spur-proto/Cargo.toml``).
+
 .. important::
 
    The E2E suites do not support parallel test execution. Do not use ``pytest-xdist``.

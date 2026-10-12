@@ -60,6 +60,7 @@ Validate your changes before submitting:
 ```bash
 cargo clippy --workspace --exclude spur-ffi --all-targets --locked  # no warnings
 cargo test --locked                                                 # all tests pass, no external services needed
+cargo shear --locked --deny-warnings                                # no unused dependencies (cargo binstall cargo-shear@1.14.0)
 ```
 
 ## Do Not
