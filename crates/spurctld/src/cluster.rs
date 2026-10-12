@@ -2041,18 +2041,17 @@ impl ClusterManager {
         if !job.holds_a_placement() {
             return Ok(());
         }
-        // A spared abort isn't the job's fault, so it never counts toward the
-        // cap; a charged one can, same as every other backoff call site.
-        if !spare_requeue_budget && job.requeue_count >= self.config().controller.max_batch_requeue
-        {
-            return self.hold_job_at_max_requeue(job_id, Some(run_attempt));
-        }
+        // Folded into this same propose (not a separate hold_job_at_max_requeue
+        // call) so it shares this op's Pending/run_attempt gate at apply time.
+        let at_max_requeue = !spare_requeue_budget
+            && job.requeue_count >= self.config().controller.max_batch_requeue;
         let begin_time = self.launch_backoff_until(&job);
         self.propose(WalOperation::JobDispatchBackoff {
             job_id,
             begin_time,
             spare_requeue_budget,
             run_attempt,
+            at_max_requeue,
         })?;
         Ok(())
     }
@@ -2949,7 +2948,7 @@ impl ClusterManager {
         job_id: JobId,
         run_attempt: u32,
     ) -> anyhow::Result<()> {
-        let begin_time = {
+        let (begin_time, at_max_requeue) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
@@ -2959,11 +2958,8 @@ impl ClusterManager {
                 // failed confirmation and this call — nothing to back off.
                 return Ok(());
             }
-            if job.requeue_count >= self.config().controller.max_batch_requeue {
-                drop(jobs);
-                return self.hold_job_at_max_requeue(job_id, Some(run_attempt));
-            }
-            self.launch_backoff_until(job)
+            let at_max_requeue = job.requeue_count >= self.config().controller.max_batch_requeue;
+            (self.launch_backoff_until(job), at_max_requeue)
         };
 
         self.propose(WalOperation::JobDispatchBackoff {
@@ -2971,6 +2967,7 @@ impl ClusterManager {
             begin_time,
             spare_requeue_budget: false,
             run_attempt,
+            at_max_requeue,
         })?;
         info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
         Ok(())
@@ -6600,9 +6597,10 @@ impl ClusterManager {
                 begin_time,
                 spare_requeue_budget,
                 run_attempt,
+                at_max_requeue,
             } => {
                 // NoOp if the job left Pending since the leader proposed this
-                // (e.g. a concurrent cancel).
+                // (e.g. a concurrent cancel or a concurrently-applied activation).
                 let Some(job) = jobs.get_mut(job_id) else {
                     return ClientResponse::default();
                 };
@@ -6623,15 +6621,23 @@ impl ClusterManager {
                 let freed_nodes = job.allocated_nodes.clone();
                 let allocated_resources = job.allocated_resources.clone();
                 let per_node_map = job.per_node_alloc.clone();
-                if *spare_requeue_budget {
+                if *at_max_requeue {
+                    // Already at the cap: park it instead of charging another
+                    // retry, same as hold_job_at_max_requeue's Pending branch.
+                    Self::clear_run_state_for_requeue(job);
+                    job.priority = 0;
+                    job.set_pending_reason(PendingReason::JobHoldMaxRequeue);
+                } else if *spare_requeue_budget {
                     // Not the job's fault: hold it without spending its
                     // max_batch_requeue budget.
                     Self::clear_run_state_for_requeue(job);
+                    job.spec.begin_time = Some(*begin_time);
+                    job.set_pending_reason(PendingReason::JobLaunchFailure);
                 } else {
                     Self::reset_job_for_requeue(job);
+                    job.spec.begin_time = Some(*begin_time);
+                    job.set_pending_reason(PendingReason::JobLaunchFailure);
                 }
-                job.spec.begin_time = Some(*begin_time);
-                job.set_pending_reason(PendingReason::JobLaunchFailure);
                 // Monotonic: never regress on an out-of-order/duplicate replay.
                 job.run_attempt = (*run_attempt).max(job.run_attempt);
                 Self::deallocate_job_slices(
@@ -10835,6 +10841,71 @@ mod tests {
             cm.get_node("n1").unwrap().alloc_resources.cpus,
             0,
             "the final hold must not leave the last reservation's charge stranded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_placement_at_cap_ignores_a_stale_attempt_once_a_newer_one_is_running() {
+        // A delayed abort for a superseded attempt must not force-hold a job
+        // that has since activated under a newer one, even once the cap trips.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let max = cm.config().controller.max_batch_requeue;
+        let id = submit_and_wait(&cm, basic_spec("stale-abort-at-cap"));
+        let res = scalar_alloc(4, 8000);
+
+        let mut stale_attempt = 0;
+        for _ in 0..max {
+            stale_attempt = cm
+                .reserve_placement(
+                    id,
+                    vec!["n1".into()],
+                    res.clone(),
+                    per_node_for(&["n1"], res.clone()),
+                    false,
+                    false,
+                )
+                .expect("reserve");
+            cm.abort_placement(id, stale_attempt, false).expect("abort");
+        }
+        assert_eq!(cm.get_job(id).unwrap().requeue_count, max);
+
+        let running_attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve newer attempt");
+        cm.activate_job(
+            id,
+            running_attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("activate newer attempt");
+        settle(&cm, id, JobState::Running);
+
+        // Next abort for `stale_attempt` would hit the cap if it weren't stale.
+        cm.abort_placement(id, stale_attempt, false)
+            .expect("stale abort at cap");
+
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Running,
+            "a stale abort must not force-fail the job running under a newer attempt"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "the running attempt's charge must survive the stale abort"
         );
     }
 
@@ -25809,6 +25880,7 @@ mod tests {
             begin_time: Utc::now(),
             spare_requeue_budget: false,
             run_attempt: 2,
+            at_max_requeue: false,
         });
         assert_eq!(cm.get_job(id).unwrap().run_attempt, 5);
     }
@@ -25963,6 +26035,7 @@ mod tests {
             begin_time: Utc::now(),
             spare_requeue_budget: false,
             run_attempt: 1,
+            at_max_requeue: false,
         });
         assert!(cm.get_job(999).is_none());
     }
@@ -25981,6 +26054,7 @@ mod tests {
             begin_time: Utc::now(),
             spare_requeue_budget: false,
             run_attempt: 1,
+            at_max_requeue: false,
         });
 
         let job = cm.get_job(id).unwrap();

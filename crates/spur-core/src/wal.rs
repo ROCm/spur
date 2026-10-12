@@ -169,6 +169,10 @@ pub enum WalOperation {
         /// 0 for pre-upgrade entries (disables both the gate and the advance).
         #[serde(default)]
         run_attempt: u32,
+        /// Park at `JobHoldMaxRequeue` instead of an ordinary backoff, sharing
+        /// this op's own Pending/`run_attempt` gate rather than a separate propose.
+        #[serde(default)]
+        at_max_requeue: bool,
     },
     /// Preempt a running job and requeue it in one atomic step: free its node
     /// allocation, end the prior run for accounting (as PREEMPTED), return it to
@@ -822,6 +826,7 @@ mod job_state_change_wal_tests {
             begin_time: hold,
             spare_requeue_budget: true,
             run_attempt: 3,
+            at_max_requeue: false,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -831,6 +836,7 @@ mod job_state_change_wal_tests {
                 begin_time,
                 spare_requeue_budget,
                 run_attempt,
+                ..
             } => {
                 assert_eq!(job_id, 8);
                 assert_eq!(begin_time, hold);
@@ -899,6 +905,26 @@ mod job_state_change_wal_tests {
             } => {
                 assert_eq!(job_id, 8);
                 assert_eq!(run_attempt, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pre_upgrade_job_dispatch_backoff_without_at_max_requeue_deserializes() {
+        let json = r#"{"JobDispatchBackoff":{"job_id":8,"begin_time":"2026-01-01T00:00:00Z"}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                at_max_requeue,
+                ..
+            } => {
+                assert_eq!(job_id, 8);
+                assert!(
+                    !at_max_requeue,
+                    "an entry with no field must replay as an ordinary backoff"
+                );
             }
             _ => panic!("wrong variant"),
         }
