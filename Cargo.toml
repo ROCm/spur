@@ -89,7 +89,6 @@ prometheus-client = "0.25"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
-dashmap = "6"
 parking_lot = "0.12"
 bytes = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
