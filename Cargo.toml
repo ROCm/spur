@@ -103,9 +103,6 @@ rand = "0.10"
 subtle = "2"
 serial_test = "4"
 
-# Internal
-spur-update = { path = "crates/spur-update" }
-
 [workspace.lints.clippy]
 unnecessary_unwrap = "warn"
 clone_on_copy = "warn"
