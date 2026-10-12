@@ -2172,24 +2172,30 @@ impl ClusterManager {
         Ok(run_attempt)
     }
 
-    /// Give up every reservation this controller cannot finish dispatching: a
-    /// leader that died between charging and dispatch left it unanswered.
-    pub fn abort_orphaned_placements(&self) {
+    /// Reservations this controller cannot finish dispatching: a leader that
+    /// died between charging and dispatch left them unanswered. Named nodes
+    /// let the caller cancel on the agent (a `RegisterJobAllocation` it already
+    /// accepted is otherwise never told to let go) before the charge is freed.
+    pub fn orphaned_placements(&self) -> Vec<(JobId, u32, Vec<String>)> {
         // Read after the job records, never before: a reservation taken between the two
         // reads would then be absent from one and present in the other, and taken back.
         let jobs = self.jobs.read();
         let in_flight = self.dispatch_tracker.jobs_in_flight();
-        let orphaned: Vec<(JobId, u32)> = jobs
-            .values()
+        jobs.values()
             .filter(|job| job.state == JobState::Pending && job.holds_a_placement())
             // A set exit_code means a finished run's own gate deferred the clear,
             // not an unconfirmed reservation; that debt is real, not abandoned.
             .filter(|job| job.exit_code.is_none())
-            .map(|job| (job.job_id, job.run_attempt))
-            .filter(|(job_id, _)| !in_flight.contains(job_id))
-            .collect();
-        drop(jobs);
-        for (job_id, run_attempt) in orphaned {
+            .map(|job| (job.job_id, job.run_attempt, job.allocated_nodes.clone()))
+            .filter(|(job_id, ..)| !in_flight.contains(job_id))
+            .collect()
+    }
+
+    /// Give up every reservation `orphaned_placements` names. Does not touch
+    /// the agent side — see `orphaned_placements`'s own doc for why a caller
+    /// with RPC access should cancel on those nodes first.
+    pub fn abort_orphaned_placements(&self) {
+        for (job_id, run_attempt, _) in self.orphaned_placements() {
             warn!(
                 job_id,
                 "giving up a reservation no dispatch is answering for"
@@ -4614,6 +4620,11 @@ impl ClusterManager {
         // ineligible candidates through without claiming them. Running after them
         // preserves their precedence, so a structural blocker still outranks the hold.
         candidates.retain(|candidate| {
+            // Already reserved: a second assignment would idle a node for this
+            // pass before reserve_placement's own duplicate guard rejects it.
+            if candidate.job.holds_a_placement() {
+                return false;
+            }
             if candidate.scheduling_eligible {
                 return true;
             }
@@ -15482,6 +15493,32 @@ mod tests {
         assert!(
             !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "held-by-begin-time job must not be eligible yet"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_excludes_a_job_already_holding_a_placement() {
+        // A reserved-but-undispatched job offered to the scheduler again could
+        // win a second node this pass before reserve_placement's own duplicate
+        // guard rejects it, idling that node until the next cycle.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("already-reserved"));
+        let res = scalar_alloc(4, 8000);
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == id),
+            "a job already holding a placement must not be offered again"
         );
     }
 

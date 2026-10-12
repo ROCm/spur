@@ -198,7 +198,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             leader_since,
             raft.current_term(),
         ) {
-            cluster.abort_orphaned_placements();
+            sweep_orphaned_placements(&cluster).await;
         }
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
@@ -3166,6 +3166,16 @@ pub async fn cancel_job_on_nodes(
         set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
     }
     while set.join_next().await.is_some() {}
+}
+
+/// Cancel every orphaned reservation's old attempt on its nodes before freeing
+/// the charge, so a `RegisterJobAllocation` an agent already accepted is told
+/// to let go instead of surviving a redispatch under a new attempt.
+pub async fn sweep_orphaned_placements(cluster: &Arc<ClusterManager>) {
+    for (job_id, run_attempt, nodes) in cluster.orphaned_placements() {
+        cancel_job_on_nodes(cluster, job_id, run_attempt, &nodes, 9).await;
+    }
+    cluster.abort_orphaned_placements();
 }
 
 /// Give up a reservation whose dispatch never confirmed, or the slice stays
@@ -6901,6 +6911,42 @@ mod tests {
             wait_for("run_attempt backed off after start_job failure", || {
                 cm.get_job(job_id).is_some_and(|j| j.run_attempt == 1)
             });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn sweep_orphaned_placements_cancels_on_the_node_before_freeing_the_charge() {
+            // An agent that already accepted a RegisterJobAllocation for the
+            // orphaned attempt must be told to let go, or it rejects the retry's
+            // new attempt as a duplicate and never releases the old one.
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancel_calls) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(&cm, batch_spec("orphaned-srun", 1));
+
+            let res = ResourceAllocations::with_scalar(1, 0);
+            cm.reserve_placement(
+                job_id,
+                vec!["n1".into()],
+                res.clone(),
+                [("n1".to_string(), res)].into_iter().collect(),
+                true,
+                false,
+            )
+            .expect("reserve");
+
+            sweep_orphaned_placements(&cm).await;
+
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "the agent must be told to drop the attempt it may have accepted"
+            );
+            assert!(
+                cm.get_job(job_id)
+                    .is_some_and(|j| j.allocated_nodes.is_empty()),
+                "the charge must still be freed"
+            );
         }
 
         // The release runs after the job is committed Running, so a node that
