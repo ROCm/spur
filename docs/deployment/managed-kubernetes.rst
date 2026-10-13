@@ -361,7 +361,7 @@ A leader change while ``k8s remove-nodes`` is draining a node can surface one
 ``out_of_scope`` report for that node.
 
 Correcting a stray
-^^^^^^^^^^^^^^^^^^
+''''''''''''''''''
 
 One kind of drift is corrected automatically: a k0s **worker that spurd
 installed**, still running on a node that is **outside a scoped cluster** and
@@ -394,7 +394,7 @@ is then report-only. Upgrading to a release with this on stops strays that are
 already being reported within the first two checks of each.
 
 Starting nodes that should run
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+''''''''''''''''''''''''''''''
 
 While the cluster is ``provisioning`` or ``ready``, the controller starts k0s on
 every node with a role that is not running it, and does not send another start
