@@ -340,15 +340,19 @@ impl SlurmAccounting for AccountingService {
             .map_err(|e| Status::internal(e.to_string()))?;
         db::record_job_end(
             &mut tx,
-            req.job_id,
-            state_str,
-            req.exit_code,
-            end_time,
-            req.exit_signal,
-            req.derived_exit_code,
-            None,
-            "",
-            "",
+            &db::JobEndRecord {
+                job_id: req.job_id,
+                state: state_str.to_string(),
+                exit_code: req.exit_code,
+                end_time,
+                exit_signal: req.exit_signal,
+                derived_exit_code: req.derived_exit_code,
+                preempted_by: None,
+                preempt_mode: String::new(),
+                preempt_qos: String::new(),
+                reason: None,
+                reason_detail: String::new(),
+            },
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;

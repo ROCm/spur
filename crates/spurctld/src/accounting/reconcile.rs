@@ -270,18 +270,23 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
 }
 
 async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<()> {
-    let end_time = job.end_time.unwrap_or_else(Utc::now);
+    let state = accounting_state(job);
+    let (reason, reason_detail) = job.end_reason(state);
     db::record_job_end(
         conn,
-        job.job_id,
-        accounting_state(job).display(),
-        job.exit_code.unwrap_or(0),
-        end_time,
-        job.exit_signal,
-        job.derived_exit_code,
-        job.preempted_by,
-        job.preempt_mode.as_deref().unwrap_or(""),
-        job.preempt_qos.as_deref().unwrap_or(""),
+        &db::JobEndRecord {
+            job_id: job.job_id,
+            state: state.display().to_owned(),
+            exit_code: job.exit_code.unwrap_or(0),
+            end_time: job.end_time.unwrap_or_else(Utc::now),
+            exit_signal: job.exit_signal,
+            derived_exit_code: job.derived_exit_code,
+            preempted_by: job.preempted_by,
+            preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
+            preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
+            reason: Some(reason),
+            reason_detail: reason_detail.unwrap_or_default(),
+        },
     )
     .await
 }
@@ -535,6 +540,22 @@ mod tests {
         Ok(pool)
     }
 
+    fn bare_end(job_id: JobId, state: &str, end_time: chrono::DateTime<Utc>) -> db::JobEndRecord {
+        db::JobEndRecord {
+            job_id,
+            state: state.to_string(),
+            exit_code: 0,
+            end_time,
+            exit_signal: 0,
+            derived_exit_code: 0,
+            preempted_by: None,
+            preempt_mode: String::new(),
+            preempt_qos: String::new(),
+            reason: None,
+            reason_detail: String::new(),
+        }
+    }
+
     async fn delete_job(pool: &PgPool, job_id: JobId) {
         let _ = sqlx::query("DELETE FROM jobs WHERE job_id = $1")
             .bind(job_id as i64)
@@ -559,15 +580,7 @@ mod tests {
         let mut conn = pool.acquire().await?;
         db::record_job_end(
             &mut conn,
-            job_id,
-            job.state.display(),
-            0,
-            job.end_time.unwrap(),
-            0,
-            0,
-            None,
-            "",
-            "",
+            &bare_end(job_id, job.state.display(), job.end_time.unwrap()),
         )
         .await?;
         drop(conn);
@@ -732,15 +745,7 @@ mod tests {
             .await?;
             db::record_job_end(
                 &mut conn,
-                job_id,
-                "COMPLETED",
-                0,
-                job.end_time.unwrap(),
-                0,
-                0,
-                None,
-                "",
-                "",
+                &bare_end(job_id, "COMPLETED", job.end_time.unwrap()),
             )
             .await?;
         }

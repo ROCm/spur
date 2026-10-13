@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, QueryBuilder, Row};
 
+use spur_core::end_reason::EndReason;
 use spur_core::job::JobId;
 
 /// Apply the database schema, serialized across controllers by a fixed advisory
@@ -176,6 +177,8 @@ DO $$ BEGIN
 END $$;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS total_gpus INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS usage_recorded BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason_detail TEXT NOT NULL DEFAULT '';
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -342,7 +345,9 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             preempted_by = NULL,
             preempt_mode = '',
             preempt_qos = '',
-            usage_recorded = FALSE
+            usage_recorded = FALSE,
+            reason = '',
+            reason_detail = ''
         "#,
     )
     .bind(rec.job_id as i64)
@@ -380,27 +385,36 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     Ok(())
 }
 
+/// One finished run, as `record_job_end` writes it. Named fields for the same
+/// reason as `JobStartRecord`.
+#[derive(Debug, Clone)]
+pub struct JobEndRecord {
+    pub job_id: JobId,
+    /// Accounting state string; the legacy `RecordJobEnd` RPC maps its own
+    /// proto values (including `UNKNOWN`), so this is not a `JobState`.
+    pub state: String,
+    pub exit_code: i32,
+    pub end_time: DateTime<Utc>,
+    pub exit_signal: i32,
+    pub derived_exit_code: i32,
+    pub preempted_by: Option<JobId>,
+    pub preempt_mode: String,
+    pub preempt_qos: String,
+    /// `None` only for the external `RecordJobEnd` RPC, which knows no reason;
+    /// stored as `''`, the same as a row written before the column existed.
+    pub reason: Option<EndReason>,
+    pub reason_detail: String,
+}
+
 /// Record a job completion in the database. See `record_job_start` for why
 /// this takes a `&mut PgConnection` rather than a `&PgPool`.
-#[allow(clippy::too_many_arguments)]
-pub async fn record_job_end(
-    conn: &mut PgConnection,
-    job_id: JobId,
-    state: &str,
-    exit_code: i32,
-    end_time: DateTime<Utc>,
-    exit_signal: i32,
-    derived_exit_code: i32,
-    preempted_by: Option<JobId>,
-    preempt_mode: &str,
-    preempt_qos: &str,
-) -> anyhow::Result<()> {
+pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyhow::Result<()> {
     // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
     let row = sqlx::query(
         r#"
         INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code,
-                          preempted_by, preempt_mode, preempt_qos)
-        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9)
+                          preempted_by, preempt_mode, preempt_qos, reason, reason_detail)
+        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
@@ -409,23 +423,27 @@ pub async fn record_job_end(
             derived_exit_code = $6,
             preempted_by = $7,
             preempt_mode = $8,
-            preempt_qos = $9
+            preempt_qos = $9,
+            reason = $10,
+            reason_detail = $11
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
         "#,
     )
-    .bind(job_id as i64)
-    .bind(state)
-    .bind(exit_code)
-    .bind(end_time)
-    .bind(exit_signal)
-    .bind(derived_exit_code)
-    .bind(preempted_by.map(|id| id as i64))
-    .bind(preempt_mode)
-    .bind(preempt_qos)
+    .bind(rec.job_id as i64)
+    .bind(&rec.state)
+    .bind(rec.exit_code)
+    .bind(rec.end_time)
+    .bind(rec.exit_signal)
+    .bind(rec.derived_exit_code)
+    .bind(rec.preempted_by.map(|id| id as i64))
+    .bind(&rec.preempt_mode)
+    .bind(&rec.preempt_qos)
+    .bind(rec.reason.map(EndReason::as_str).unwrap_or(""))
+    .bind(&rec.reason_detail)
     .fetch_one(&mut *conn)
     .await?;
 
-    update_usage(conn, row, end_time, job_id as i64).await?;
+    update_usage(conn, row, rec.end_time, rec.job_id as i64).await?;
 
     Ok(())
 }
@@ -1819,17 +1837,30 @@ mod job_history_tests {
         let mut conn = pool.acquire().await?;
         record_job_end(
             &mut conn,
-            job_id,
-            state,
-            exit_code,
-            end_time,
-            exit_signal,
-            derived_exit_code,
-            None,
-            "",
-            "",
+            &JobEndRecord {
+                exit_code,
+                exit_signal,
+                derived_exit_code,
+                ..end_record(job_id, state, end_time)
+            },
         )
         .await
+    }
+
+    fn end_record(job_id: JobId, state: &str, end_time: DateTime<Utc>) -> JobEndRecord {
+        JobEndRecord {
+            job_id,
+            state: state.to_string(),
+            exit_code: 0,
+            end_time,
+            exit_signal: 0,
+            derived_exit_code: 0,
+            preempted_by: None,
+            preempt_mode: String::new(),
+            preempt_qos: String::new(),
+            reason: None,
+            reason_detail: String::new(),
+        }
     }
 
     /// Seeds one job through the real start/end path on `conn`, so the EXPLAIN test
@@ -1864,7 +1895,7 @@ mod job_history_tests {
         )
         .await?;
         if let Some(end_time) = end {
-            record_job_end(conn, job_id, "COMPLETED", 0, end_time, 0, 0, None, "", "").await?;
+            record_job_end(conn, &end_record(job_id, "COMPLETED", end_time)).await?;
         }
         Ok(())
     }
@@ -2084,6 +2115,51 @@ mod job_history_tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn end_reason_is_stored_and_cleared_when_the_job_restarts() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let id = u32::MAX - 10;
+        let user = format!("spur_end_reason_{}", std::process::id());
+        delete_jobs(&pool, &[id]).await.ok();
+        let t0 = Utc::now() - Duration::hours(1);
+        start(&pool, id, "reason", &user, "", "", 1, 1, 1, 0, t0, t0, "").await?;
+
+        let mut conn = pool.acquire().await?;
+        record_job_end(
+            &mut conn,
+            &JobEndRecord {
+                exit_code: 127,
+                reason: Some(EndReason::NonZeroExitCode),
+                reason_detail: "exit 127: command not found (shell convention)".into(),
+                ..end_record(id, "FAILED", t0 + Duration::minutes(1))
+            },
+        )
+        .await?;
+        let row = sqlx::query("SELECT reason, reason_detail FROM jobs WHERE job_id = $1")
+            .bind(id as i64)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.get::<String, _>("reason"), "NonZeroExitCode");
+        assert!(row
+            .get::<String, _>("reason_detail")
+            .contains("command not found"));
+
+        start(&pool, id, "reason", &user, "", "", 1, 1, 1, 0, t0, t0, "").await?;
+        let row = sqlx::query("SELECT reason, reason_detail FROM jobs WHERE job_id = $1")
+            .bind(id as i64)
+            .fetch_one(&pool)
+            .await?;
+        delete_jobs(&pool, &[id]).await.ok();
+        sqlx::query("DELETE FROM usage WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        assert_eq!(row.get::<String, _>("reason"), "");
+        assert_eq!(row.get::<String, _>("reason_detail"), "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
     async fn record_job_start_overwrites_reused_job_id() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let id = test_job_id(3);
@@ -2160,15 +2236,12 @@ mod job_history_tests {
         let mut conn = pool.acquire().await?;
         record_job_end(
             &mut conn,
-            id,
-            "PREEMPTED",
-            0,
-            Utc::now(),
-            0,
-            0,
-            Some(preempter),
-            "requeue",
-            "high",
+            &JobEndRecord {
+                preempted_by: Some(preempter),
+                preempt_mode: "requeue".into(),
+                preempt_qos: "high".into(),
+                ..end_record(id, "PREEMPTED", Utc::now())
+            },
         )
         .await?;
         drop(conn);

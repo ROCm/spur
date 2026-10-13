@@ -40,7 +40,8 @@ use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::{
-    txn, AccountingNotifier, JobStartRecord, TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource,
+    txn, AccountingNotifier, JobEndRecord, JobStartRecord, TxnAction, TxnEntity, TxnOutcome,
+    TxnRecord, TxnSource,
 };
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
@@ -2214,7 +2215,7 @@ impl ClusterManager {
             }
         }
         self.run_epilog_slurmctld(finalized.job_id);
-        self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
+        self.notify_job_finished(finalized);
         self.react_to_health_job_finalized(finalized.job_id, finalized.state, finalized.exit_code);
     }
 
@@ -2508,7 +2509,8 @@ impl ClusterManager {
         });
     }
 
-    fn notify_job_finished(&self, job_id: JobId, state: JobState, exit_code: i32) {
+    fn notify_job_finished(&self, finalized: &JobFinalized) {
+        let (job_id, state) = (finalized.job_id, finalized.state);
         let spec_for_notify = self.jobs.read().get(&job_id).map(|j| j.spec.clone());
         if let Some(spec) = spec_for_notify {
             let is_success = state == JobState::Completed;
@@ -2539,17 +2541,19 @@ impl ClusterManager {
                     )
                 })
                 .unwrap_or((0, 0, None, None, None));
-            notifier.notify_job_end(
+            notifier.notify_job_end(JobEndRecord {
                 job_id,
-                state,
-                exit_code,
-                Utc::now(),
+                state: state.display().to_owned(),
+                exit_code: finalized.exit_code,
+                end_time: Utc::now(),
                 exit_signal,
                 derived_exit_code,
                 preempted_by,
-                preempt_mode,
-                preempt_qos,
-            );
+                preempt_mode: preempt_mode.unwrap_or_default(),
+                preempt_qos: preempt_qos.unwrap_or_default(),
+                reason: Some(finalized.reason),
+                reason_detail: finalized.reason_detail.clone().unwrap_or_default(),
+            });
         }
 
         // Preempted excluded: preempt_job owns its requeue (with hold).
