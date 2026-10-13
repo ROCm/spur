@@ -9,7 +9,7 @@
 name: Set E2E Pending
 
 on:
-  pull_request_target:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] never runs PR code, see header
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
