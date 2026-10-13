@@ -16,6 +16,15 @@ use spur_proto::raft_proto::{RaftRequest, RaftResponse};
 
 use crate::raft::{SpurRaft, SpurTypeConfig, RAFT_MAX_MESSAGE_SIZE};
 
+const _: () = assert!(
+    spur_proto::MAX_GRPC_REQUEST_SIZE < RAFT_MAX_MESSAGE_SIZE,
+    "client-facing request cap must be below raft-internal cap"
+);
+const _: () = assert!(
+    spur_proto::MAX_GRPC_REQUEST_SIZE <= spur_proto::MAX_GRPC_MESSAGE_SIZE / 4,
+    "request cap should be at most 1/4 of the response cap"
+);
+
 pub struct RaftInternalService {
     raft: SpurRaft,
 }
@@ -230,20 +239,5 @@ mod tests {
 
         let echoed = u64::from_le_bytes(resp.into_inner().payload.try_into().unwrap());
         assert_eq!(echoed as usize, payload.len());
-    }
-
-    /// Verify the constant relationship: client-facing request cap is
-    /// significantly tighter than the raft-internal cap.
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn request_size_tighter_than_raft_size() {
-        assert!(
-            spur_proto::MAX_GRPC_REQUEST_SIZE < RAFT_MAX_MESSAGE_SIZE,
-            "client-facing request cap must be below raft-internal cap"
-        );
-        assert!(
-            spur_proto::MAX_GRPC_REQUEST_SIZE <= spur_proto::MAX_GRPC_MESSAGE_SIZE / 4,
-            "request cap should be at most 1/4 of the response cap"
-        );
     }
 }
