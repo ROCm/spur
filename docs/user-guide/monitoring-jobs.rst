@@ -460,7 +460,7 @@ Why a job ended
 
 ``Reason`` is a short code saying why the job's run ended, and ``ReasonDetail``
 adds what Spur knew beyond the code. Use ``Reason`` to group failures, for
-example ``sacct -s FAILED,NODE_FAIL --format=JobID,State,Reason`` piped through
+example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
 ``sort | uniq -c``.
 
 .. code-block:: console
@@ -512,7 +512,7 @@ example ``sacct -s FAILED,NODE_FAIL --format=JobID,State,Reason`` piped through
      - The job was cancelled.
    * - ``Requeued``
      - REQUEUED
-     - An operator requeued the running job.
+     - The job's owner or an operator requeued it while it was running.
    * - ``NodeDown``
      - NODE_FAIL
      - A node the job ran on went down.
@@ -520,11 +520,13 @@ example ``sacct -s FAILED,NODE_FAIL --format=JobID,State,Reason`` piped through
      - NODE_FAIL
      - The job could not be started on every node; the detail says why.
 
-``Reason`` reads ``N/A`` for rows written before this field existed or through
-the external ``RecordJobEnd`` accounting RPC. Accounting keeps one row per job,
+``Reason`` reads ``N/A`` for a job that is still running, for rows written
+before this field existed, and for rows written through the external
+``RecordJobEnd`` accounting RPC. Accounting keeps one row per job,
 so a requeued job's next run replaces the reason with its own. During a
 rolling upgrade, a job that restarts and then ends while an older controller
-is leader keeps the reason of its previous run.
+is leader keeps the reason of its previous run, and a run the older controller
+force-finished reads ``NonZeroExitCode`` rather than ``CompletingTimeout``.
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode``.

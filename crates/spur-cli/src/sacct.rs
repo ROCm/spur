@@ -73,7 +73,7 @@ pub struct SacctArgs {
 
 const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
 const SACCT_LONG_FORMAT: &str =
-    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q %16r";
+    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q %18r";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
 
 pub fn sacct_header(spec: char) -> &'static str {
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn long_format_ends_with_reason() {
-        assert!(SACCT_LONG_FORMAT.ends_with("%16r"));
+        assert!(SACCT_LONG_FORMAT.ends_with("%18r"));
     }
 
     #[test]
