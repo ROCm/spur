@@ -36,11 +36,22 @@ spec:
         app: spurctld
     spec:
       securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
         fsGroup: 1001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: spurctld
           image: spur:latest
           command: [spurctld]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
           args:
             - --listen=[::]:6817
             - --config=/etc/spur/spur.conf
@@ -56,6 +67,8 @@ spec:
               mountPath: /etc/spur
             - name: spool
               mountPath: /var/spool/spur
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             tcpSocket:
               port: 6817
@@ -75,6 +88,9 @@ spec:
           #     --from-file=spur.conf=examples/k8s/spur.conf -n spur
           secret:
             secretName: spur-config
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
   volumeClaimTemplates:
     - metadata:
         name: spool
