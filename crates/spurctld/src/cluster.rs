@@ -615,6 +615,13 @@ struct PendingJobCandidate {
     tag_reason: bool,
 }
 
+/// Facts about how a run ended that only the caller of
+/// [`ClusterManager::complete_job_with`] knows.
+#[derive(Debug, Default)]
+pub struct JobEndFacts {
+    pub unreported_nodes: Vec<String>,
+}
+
 /// Filters for [`ClusterManager::get_jobs`]. Every field is optional: an empty
 /// slice or `None` disables that dimension, so `JobFilter::default()` returns
 /// all jobs.
@@ -2039,6 +2046,17 @@ impl ClusterManager {
         exit_code: i32,
         state: JobState,
     ) -> anyhow::Result<()> {
+        self.complete_job_with(job_id, exit_code, state, JobEndFacts::default())
+    }
+
+    /// `complete_job` for a caller that knows more about how the run ended.
+    pub fn complete_job_with(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        state: JobState,
+        facts: JobEndFacts,
+    ) -> anyhow::Result<()> {
         // A time-limit expiry has to win over the caller's outcome here, not
         // just in the per-node completion path. The marker is only ever set on
         // a run the watchdog signalled, so any completion routed through this
@@ -2070,7 +2088,12 @@ impl ClusterManager {
 
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
-        let resp = self.propose(WalOperation::job_complete(job_id, exit_code, state))?;
+        let resp = self.propose(WalOperation::JobComplete {
+            job_id,
+            exit_code,
+            state,
+            unreported_nodes: facts.unreported_nodes,
+        })?;
         self.run_all_finalized_side_effects(&resp);
 
         debug!(job_id, exit_code, "job completed");
@@ -9245,6 +9268,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use spur_core::end_reason::EndReason;
     use spur_core::job::JobSpec;
     use spur_core::resource::{ResourceAllocations, ResourceSet};
     use spur_metrics::job::JobMetricsSnapshot;
@@ -13248,6 +13272,48 @@ mod tests {
         .unwrap();
         settle(cm, job_id, JobState::Running);
         job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_force_finish_records_which_nodes_never_reported() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "force-finish", "worker1");
+
+        cm.complete_job_with(
+            job_id,
+            1,
+            JobState::Failed,
+            JobEndFacts {
+                unreported_nodes: vec!["worker1".into()],
+            },
+        )
+        .unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.unreported_nodes, vec!["worker1".to_string()]);
+        assert_eq!(
+            job.end_reason(JobState::Failed).0,
+            EndReason::CompletingTimeout
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_srun_failure_is_not_mistaken_for_a_force_finish() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "srun-fail", "worker1");
+
+        cm.complete_job(job_id, 3, JobState::Failed).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.unreported_nodes.is_empty());
+        assert_eq!(
+            job.end_reason(JobState::Failed).0,
+            EndReason::NonZeroExitCode
+        );
     }
 
     /// Drive an already-submitted job to RUNNING on `node`.

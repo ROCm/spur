@@ -19,7 +19,7 @@ use spur_proto::proto::{
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
-use crate::cluster::{ClusterManager, JobFilter};
+use crate::cluster::{ClusterManager, JobEndFacts, JobFilter};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 
@@ -2947,6 +2947,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         }
     }
 
+    let unreported_nodes = missing.clone();
     if !missing.is_empty() {
         let cluster = cluster.clone();
         let job_id = job.job_id;
@@ -2963,7 +2964,12 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         "completing timeout expired — force-finishing job"
     );
 
-    if let Err(e) = cluster.complete_job(job.job_id, exit_code, state) {
+    if let Err(e) = cluster.complete_job_with(
+        job.job_id,
+        exit_code,
+        state,
+        JobEndFacts { unreported_nodes },
+    ) {
         warn!(
             job_id = job.job_id,
             error = %e,
