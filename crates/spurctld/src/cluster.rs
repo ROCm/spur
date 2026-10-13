@@ -13296,6 +13296,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_requeue_clears_the_previous_runs_unreported_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "force-then-requeue", "worker1");
+        cm.complete_job_with(
+            job_id,
+            1,
+            JobState::Failed,
+            JobEndFacts {
+                unreported_nodes: vec!["worker1".into()],
+            },
+        )
+        .unwrap();
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+        });
+
+        assert!(cm.get_job(job_id).unwrap().unreported_nodes.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_srun_failure_is_not_mistaken_for_a_force_finish() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;

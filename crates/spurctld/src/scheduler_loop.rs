@@ -5195,6 +5195,10 @@ mod tests {
 
             let job = cm.get_job(job_id).unwrap();
             force_finish_completing_job(&cm, &job).await;
+            assert_eq!(
+                cm.get_job(job_id).unwrap().unreported_nodes,
+                vec!["n2".to_string()]
+            );
 
             wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
             assert_eq!(
