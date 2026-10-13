@@ -534,7 +534,8 @@ example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
        after lost heartbeats), plus the uid that set it when an operator did.
    * - ``NodeRemoved``
      - NODE_FAIL
-     - A node the job ran on was removed from the cluster.
+     - A node the job ran on was removed from the cluster; the detail names
+       the node and the removal reason.
    * - ``JobLaunchFailure``
      - NODE_FAIL
      - The job could not be started on every node; the detail says why.
