@@ -1083,7 +1083,16 @@ impl ControllerService {
         }
         let mut info = job_to_proto(job);
         annotate_jobs_with_planned_reservations(std::slice::from_mut(&mut info), &self.cluster);
+        if !self.caller_may_see_actors(identity) {
+            hide_actors(&mut info);
+        }
         Some(info)
+    }
+
+    /// The audience that may see who acted on a job: the same one the audit
+    /// log's read gate admits, anonymous included.
+    fn caller_may_see_actors(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
+        identity.is_none() || self.caller_is_operator(identity)
     }
 
     /// Forwarding metadata that carries the caller's credential through to the leader.
@@ -1502,6 +1511,9 @@ impl SlurmController for ControllerService {
 
         let mut proto_jobs: Vec<JobInfo> = jobs.iter().map(job_to_proto).collect();
         annotate_jobs_with_planned_reservations(&mut proto_jobs, &self.cluster);
+        if !self.caller_may_see_actors(__identity.as_ref()) {
+            proto_jobs.iter_mut().for_each(hide_actors);
+        }
 
         Ok(Response::new(GetJobsResponse { jobs: proto_jobs }))
     }
@@ -1701,12 +1713,12 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
+        let actor = spur_core::end_reason::Actor {
+            user: req.user.clone(),
+            uid: trusted_uid(__identity.as_ref()),
+        };
         self.cluster
-            .suspend_job_for(
-                job_id,
-                &req.user,
-                self.caller_is_operator(__identity.as_ref()),
-            )
+            .suspend_job_by(job_id, actor, self.caller_is_operator(__identity.as_ref()))
             .map_err(cluster_err_to_precondition_status)?;
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
@@ -1856,7 +1868,15 @@ impl SlurmController for ControllerService {
         );
         let outcome = self
             .cluster
-            .requeue_job_by_user(req.job_id, &req.user, caller_is_admin, req.hold)
+            .requeue_job_by(
+                req.job_id,
+                &spur_core::end_reason::Actor {
+                    user: req.user.clone(),
+                    uid: trusted_uid(__identity.as_ref()),
+                },
+                caller_is_admin,
+                req.hold,
+            )
             .map_err(cluster_err_to_precondition_status)?;
 
         // Kill the old processes for jobs that were Running/Suspended; the
@@ -4402,6 +4422,11 @@ fn is_daemon_caller(identity: Option<&spur_core::auth::Identity>, user: &str) ->
     identity.is_none() && user.is_empty()
 }
 
+fn hide_actors(info: &mut JobInfo) {
+    info.suspended_by.clear();
+    info.last_requeue_by.clear();
+}
+
 /// A uid only when the kernel vouched for it. A JWT claims its own, possibly 0,
 /// so recording it would attribute an action to an unproven uid. Cf. `bind_job_spec`.
 pub(crate) fn trusted_uid(identity: Option<&spur_core::auth::Identity>) -> Option<u32> {
@@ -5002,6 +5027,22 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         end_reason_detail: String::new(),
         ended_by: String::new(),
         ended_by_uid: None,
+        suspended_by: job
+            .suspended_by
+            .as_ref()
+            .map(|a| a.user.clone())
+            .unwrap_or_default(),
+        last_requeue: job
+            .last_requeue
+            .as_ref()
+            .map(|r| r.kind.clone())
+            .unwrap_or_default(),
+        last_requeue_by: job
+            .last_requeue
+            .as_ref()
+            .and_then(|r| r.by.as_ref())
+            .map(|a| a.user.clone())
+            .unwrap_or_default(),
         eligible_time: Some(datetime_to_proto(job.eligible_time())),
         accrue_time: Some(datetime_to_proto(job.accrue_time())),
         last_sched_eval: job.last_sched_eval.map(datetime_to_proto),
@@ -12078,6 +12119,20 @@ mod tests {
     }
 
     // --- authoritative_user ---
+
+    #[test]
+    fn hiding_actors_keeps_the_requeue_kind_but_drops_the_names() {
+        let mut info = JobInfo {
+            suspended_by: "alice".into(),
+            last_requeue: "Admin".into(),
+            last_requeue_by: "ops".into(),
+            ..Default::default()
+        };
+        hide_actors(&mut info);
+        assert_eq!(info.suspended_by, "");
+        assert_eq!(info.last_requeue, "Admin");
+        assert_eq!(info.last_requeue_by, "");
+    }
 
     #[test]
     fn authoritative_user_leaves_field_alone_when_no_identity() {

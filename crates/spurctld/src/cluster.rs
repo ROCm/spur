@@ -20,7 +20,7 @@ use spur_core::accounting::{
 };
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
-use spur_core::end_reason::{CancelProvenance, NodeFailure};
+use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
     PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
@@ -1579,10 +1579,26 @@ impl ClusterManager {
 
     /// Admin requeue (`scontrol requeue` / `requeuehold`), keeping the `job_id`.
     /// A bare array-parent id (no job record of its own) fans out to every task.
+    #[cfg(test)]
     pub fn requeue_job_by_user(
         &self,
         job_id: JobId,
         user: &str,
+        caller_is_admin: bool,
+        hold: bool,
+    ) -> anyhow::Result<RequeueOutcome> {
+        let actor = Actor {
+            user: user.to_string(),
+            uid: None,
+        };
+        self.requeue_job_by(job_id, &actor, caller_is_admin, hold)
+    }
+
+    /// [`Self::requeue_job_by_user`], recording who requeued each job.
+    pub fn requeue_job_by(
+        &self,
+        job_id: JobId,
+        actor: &Actor,
         caller_is_admin: bool,
         hold: bool,
     ) -> anyhow::Result<RequeueOutcome> {
@@ -1608,7 +1624,7 @@ impl ClusterManager {
         // user sees exactly why (not owner, interactive, already pending, ...).
         if !is_array {
             let id = targets[0];
-            let (requeued, killed) = self.requeue_one_job(id, user, caller_is_admin, hold)?;
+            let (requeued, killed) = self.requeue_one_job(id, actor, caller_is_admin, hold)?;
             return Ok(if requeued {
                 RequeueOutcome {
                     requeued: 1,
@@ -1631,7 +1647,7 @@ impl ClusterManager {
         let total = targets.len();
         let mut outcome = RequeueOutcome::default();
         for id in targets {
-            match self.requeue_one_job(id, user, caller_is_admin, hold) {
+            match self.requeue_one_job(id, actor, caller_is_admin, hold) {
                 Ok((true, killed)) => {
                     outcome.requeued += 1;
                     outcome.killed.extend(killed);
@@ -1659,10 +1675,11 @@ impl ClusterManager {
     fn requeue_one_job(
         &self,
         job_id: JobId,
-        user: &str,
+        actor: &Actor,
         caller_is_admin: bool,
         hold: bool,
     ) -> anyhow::Result<(bool, Option<Job>)> {
+        let user = actor.user.as_str();
         let snapshot = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1708,6 +1725,7 @@ impl ClusterManager {
             job_id,
             hold,
             begin_time,
+            by: (!actor.user.is_empty()).then(|| actor.clone()),
         })?;
         // Fires accounting-end + epilog for the finalized run (live path only;
         // an already-terminal job emits no finalized entry here).
@@ -1798,12 +1816,28 @@ impl ClusterManager {
     }
 
     /// Like [`Self::suspend_job`], plus Operators/Administrators (`operates_jobs`).
+    #[cfg(test)]
     pub fn suspend_job_for(
         &self,
         job_id: JobId,
         user: &str,
         operates_jobs: bool,
     ) -> anyhow::Result<()> {
+        let actor = Actor {
+            user: user.to_string(),
+            uid: None,
+        };
+        self.suspend_job_by(job_id, actor, operates_jobs)
+    }
+
+    /// [`Self::suspend_job_for`], recording who suspended the job.
+    pub fn suspend_job_by(
+        &self,
+        job_id: JobId,
+        actor: Actor,
+        operates_jobs: bool,
+    ) -> anyhow::Result<()> {
+        let user = actor.user.as_str();
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1819,6 +1853,7 @@ impl ClusterManager {
             at: chrono::Utc::now(),
             preempted_by: None,
             preempt_qos: None,
+            by: (!actor.user.is_empty()).then(|| actor.clone()),
         })?;
         info!(job_id, "job suspended");
         Ok(())
@@ -2210,6 +2245,7 @@ impl ClusterManager {
                     at: chrono::Utc::now(),
                     preempted_by,
                     preempt_qos: preempt_qos.clone(),
+                    by: None,
                 })?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (suspend)");
@@ -6132,6 +6168,7 @@ impl ClusterManager {
         job.cancel_signaled_at = None;
         job.cancelled_by = None;
         job.node_failure = None;
+        job.suspended_by = None;
         job.pending_reason = PendingReason::None;
         job.pending_reason_desc = None;
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
@@ -6153,6 +6190,10 @@ impl ClusterManager {
     fn reset_job_for_requeue(job: &mut Job) {
         job.requeue_count += 1;
         Self::clear_run_state_for_requeue(job);
+        job.last_requeue = Some(LastRequeue {
+            kind: "Failure".into(),
+            by: None,
+        });
     }
 
     /// Requeue after preemption: tracked separately since it isn't a failure
@@ -6160,14 +6201,22 @@ impl ClusterManager {
     fn reset_job_for_preempt_requeue(job: &mut Job) {
         job.preempt_requeue_count += 1;
         Self::clear_run_state_for_requeue(job);
+        job.last_requeue = Some(LastRequeue {
+            kind: "Preempt".into(),
+            by: None,
+        });
     }
 
-    /// Requeue by admin action (`scontrol requeue`): tracked separately since it
-    /// is an operator decision, never a failure, and must never contribute to
-    /// the `max_batch_requeue` hold.
-    fn reset_job_for_user_requeue(job: &mut Job) {
+    /// Requeue by `scontrol requeue`, from the job's owner or an operator:
+    /// tracked separately since it is a deliberate decision, never a failure, and
+    /// must never contribute to the `max_batch_requeue` hold.
+    fn reset_job_for_user_requeue(job: &mut Job, by: Option<Actor>) {
         job.user_requeue_count += 1;
         Self::clear_run_state_for_requeue(job);
+        job.last_requeue = Some(LastRequeue {
+            kind: "Admin".into(),
+            by,
+        });
     }
 
     /// Evict a single job by ID: transition to NodeFail, then free its
@@ -6186,9 +6235,7 @@ impl ClusterManager {
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
 
-        if let Some(since) = job.suspended_at.take() {
-            job.suspended_secs += (timestamp - since).num_seconds().max(0);
-        }
+        job.end_suspension(timestamp);
         // A run already signalled for cancellation keeps that verdict: reporting
         // it as NodeFail would requeue a job the user or the scheduler killed.
         let evicted_state = if job.cancel_signaled_at.is_some() {
@@ -6376,9 +6423,7 @@ impl ClusterManager {
                     }
                     job.exit_code = Some(-1);
                     job.end_time = Some(timestamp);
-                    if let Some(since) = job.suspended_at.take() {
-                        job.suspended_secs += (timestamp - since).num_seconds().max(0);
-                    }
+                    job.end_suspension(timestamp);
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
@@ -6425,6 +6470,7 @@ impl ClusterManager {
                 job_id,
                 hold,
                 begin_time,
+                by,
             } => {
                 // A live job is finalized once (routed through Requeued so
                 // accounting/steps see a finished run) then re-pended; an
@@ -6441,9 +6487,7 @@ impl ClusterManager {
                     match job.state {
                         JobState::Running | JobState::Suspended => {
                             finalized = Some(JobFinalized::for_job(job, JobState::Requeued, -1));
-                            if let Some(since) = job.suspended_at.take() {
-                                job.suspended_secs += (timestamp - since).num_seconds().max(0);
-                            }
+                            job.end_suspension(timestamp);
                             // The live run still holds its allocation; capture it
                             // to free below (reset clears node_completions).
                             freed_nodes = job.allocated_nodes.clone();
@@ -6471,7 +6515,7 @@ impl ClusterManager {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
                         return ClientResponse::default();
                     }
-                    Self::reset_job_for_user_requeue(job);
+                    Self::reset_job_for_user_requeue(job, by.clone());
                     if *hold {
                         job.priority = 0;
                         job.set_pending_reason(PendingReason::Held);
@@ -6532,9 +6576,7 @@ impl ClusterManager {
                     }
                     job.exit_code = Some(-1);
                     job.end_time = Some(at);
-                    if let Some(since) = job.suspended_at.take() {
-                        job.suspended_secs += (at - since).num_seconds().max(0);
-                    }
+                    job.end_suspension(at);
                     job.preempted_by = *preempted_by;
                     job.preempt_mode = Some("Cancel".to_string());
                     job.preempt_qos = preempt_qos.clone();
@@ -6602,6 +6644,7 @@ impl ClusterManager {
                 at,
                 preempted_by,
                 preempt_qos,
+                by,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     match job.apply_transition(JobState::Suspended) {
@@ -6611,6 +6654,8 @@ impl ClusterManager {
                                 job.preempted_by = *preempted_by;
                                 job.preempt_mode = Some("Suspend".to_string());
                                 job.preempt_qos = preempt_qos.clone();
+                            } else {
+                                job.suspended_by = by.clone();
                             }
                         }
                         Ok(TransitionOutcome::NoOp) => {}
@@ -6624,9 +6669,7 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     match job.apply_transition(JobState::Running) {
                         Ok(TransitionOutcome::Applied) => {
-                            if let Some(since) = job.suspended_at.take() {
-                                job.suspended_secs += (*at - since).num_seconds().max(0);
-                            }
+                            job.end_suspension(*at);
                             // Resuming clears preemption provenance: the job is
                             // running again and a subsequent normal completion
                             // must not report it as preempted in accounting.
@@ -6764,6 +6807,7 @@ impl ClusterManager {
                         if let Err(e) = job.transition(JobState::Completing) {
                             warn!(job_id = *job_id, error = %e, "invalid transition to Completing");
                         }
+                        job.end_suspension(timestamp);
                         job.end_time = Some(timestamp);
                     }
 
@@ -6861,9 +6905,7 @@ impl ClusterManager {
                     // Completing is not terminal, so nothing stamps this for us.
                     // It is what gives the job its full complete_wait_secs grace.
                     job.end_time = Some(*at);
-                    if let Some(since) = job.suspended_at.take() {
-                        job.suspended_secs += (*at - since).num_seconds().max(0);
-                    }
+                    job.end_suspension(*at);
                 }
             }
             WalOperation::JobComplete {
@@ -6913,9 +6955,7 @@ impl ClusterManager {
                     }
                     // Suspended -> terminal: fold the final suspended interval in
                     // and clear suspended_at so it never lingers on a terminal job.
-                    if let Some(since) = job.suspended_at.take() {
-                        job.suspended_secs += (timestamp - since).num_seconds().max(0);
-                    }
+                    job.end_suspension(timestamp);
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
@@ -11493,6 +11533,7 @@ mod tests {
             at: t0,
             preempted_by: None,
             preempt_qos: None,
+            by: None,
         });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Suspended);
         cm.apply_operation(&WalOperation::JobResume {
@@ -11663,6 +11704,7 @@ mod tests {
             at: t0,
             preempted_by: None,
             preempt_qos: None,
+            by: None,
         });
         cm.apply_operation(&WalOperation::JobResume {
             job_id: 1,
@@ -11675,6 +11717,7 @@ mod tests {
             at: t1,
             preempted_by: None,
             preempt_qos: None,
+            by: None,
         });
         cm.apply_operation(&WalOperation::JobResume {
             job_id: 1,
@@ -11710,6 +11753,7 @@ mod tests {
             at: since,
             preempted_by: None,
             preempt_qos: None,
+            by: None,
         });
         cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Cancelled));
         let job = cm.get_job(1).unwrap();
@@ -12498,6 +12542,7 @@ mod tests {
             job_id: 1,
             hold: false,
             begin_time: None,
+            by: None,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Pending);
@@ -13488,9 +13533,149 @@ mod tests {
             job_id,
             hold: false,
             begin_time: None,
+            by: None,
         });
 
         assert!(cm.get_job(job_id).unwrap().cancelled_by.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspend_records_who_paused_the_job_until_it_resumes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "suspend-actor", "worker1");
+        let ops = Actor {
+            user: "ops".into(),
+            uid: Some(0),
+        };
+
+        cm.suspend_job_by(job_id, ops.clone(), true).unwrap();
+        assert_eq!(cm.get_job(job_id).unwrap().suspended_by, Some(ops));
+
+        cm.resume_job_for(job_id, "ops", true).unwrap();
+        assert_eq!(cm.get_job(job_id).unwrap().suspended_by, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeueing_a_suspended_job_forgets_who_suspended_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "suspend-then-requeue", "worker1");
+        let ops = Actor {
+            user: "ops".into(),
+            uid: None,
+        };
+        cm.suspend_job_by(job_id, ops.clone(), true).unwrap();
+        assert!(cm.get_job(job_id).unwrap().suspended_by.is_some());
+
+        cm.requeue_job_by(job_id, &ops, true, false).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.suspended_by, None);
+        assert_eq!(job.last_requeue.unwrap().kind, "Admin");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspended_job_whose_task_dies_ends_its_suspension() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "suspended-death", "worker1");
+        let ops = Actor {
+            user: "ops".into(),
+            uid: None,
+        };
+        cm.suspend_job_by(job_id, ops, true).unwrap();
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "worker1".into(),
+            exit_code: 1,
+            signal: 0,
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.state.is_finalized(), "state {:?}", job.state);
+        assert_eq!(job.suspended_by, None);
+        assert_eq!(job.suspended_at, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemption_suspend_names_no_person() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "preempt-suspend", "worker1");
+
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id,
+            at: Utc::now(),
+            preempted_by: Some(job_id + 1),
+            preempt_qos: None,
+            by: Some(Actor {
+                user: "ops".into(),
+                uid: None,
+            }),
+        });
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Suspended);
+        assert_eq!(job.suspended_by, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launch_failure_requeue_is_recorded_as_a_failure() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "failure-kind", "worker1");
+
+        cm.requeue_job(job_id).unwrap();
+
+        let last = cm.get_job(job_id).unwrap().last_requeue.unwrap();
+        assert_eq!((last.kind.as_str(), last.by), ("Failure", None));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admin_requeue_records_its_kind_and_who_did_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "requeue-actor", "worker1");
+        let ops = Actor {
+            user: "ops".into(),
+            uid: None,
+        };
+
+        cm.requeue_job_by(job_id, &ops, true, false).unwrap();
+
+        assert_eq!(
+            cm.get_job(job_id).unwrap().last_requeue,
+            Some(LastRequeue {
+                kind: "Admin".into(),
+                by: Some(ops),
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preempt_requeue_is_recorded_as_one_with_no_person() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "preempt-kind", "worker1");
+
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id,
+            begin_time: Utc::now(),
+            preempted_by: Some(job_id + 1),
+            preempt_qos: None,
+        });
+
+        let last = cm.get_job(job_id).unwrap().last_requeue.unwrap();
+        assert_eq!((last.kind.as_str(), last.by), ("Preempt", None));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13514,6 +13699,7 @@ mod tests {
             job_id,
             hold: false,
             begin_time: None,
+            by: None,
         });
 
         assert!(cm.get_job(job_id).unwrap().unreported_nodes.is_empty());
@@ -13721,6 +13907,7 @@ mod tests {
             job_id,
             hold: false,
             begin_time: None,
+            by: None,
         });
 
         assert_eq!(resp.jobs_finalized[0].reason, EndReason::Requeued);
@@ -13809,6 +13996,7 @@ mod tests {
             job_id,
             hold: false,
             begin_time: None,
+            by: None,
         });
 
         let requeued = cm.get_job(job_id).unwrap();
@@ -14420,6 +14608,7 @@ mod tests {
             job_id: live,
             hold: false,
             begin_time: None,
+            by: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::Requeued);
@@ -14431,6 +14620,7 @@ mod tests {
             job_id: done,
             hold: false,
             begin_time: None,
+            by: None,
         });
         assert!(
             resp.jobs_finalized.is_empty(),
@@ -14765,6 +14955,7 @@ mod tests {
             job_id,
             hold: false,
             begin_time: None,
+            by: None,
         });
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
         assert_eq!(cm.get_job(job_id).unwrap().user_requeue_count, 1);
@@ -14775,6 +14966,7 @@ mod tests {
             job_id,
             hold: false,
             begin_time: None,
+            by: None,
         });
         assert_eq!(
             cm.get_job(job_id).unwrap().user_requeue_count,

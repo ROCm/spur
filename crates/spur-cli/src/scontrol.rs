@@ -2013,6 +2013,23 @@ fn format_limit(d: Option<&prost_types::Duration>) -> String {
     }
 }
 
+/// `SuspendedBy=` and `LastRequeue=` for a job someone acted on, else nothing.
+fn actor_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
+    let mut parts = Vec::new();
+    if !job.suspended_by.is_empty() {
+        parts.push(format!("SuspendedBy={}", job.suspended_by));
+    }
+    if !job.last_requeue.is_empty() {
+        let by = if job.last_requeue_by.is_empty() {
+            String::new()
+        } else {
+            format!("({})", job.last_requeue_by)
+        };
+        parts.push(format!("LastRequeue={}{by}", job.last_requeue));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
 fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -2035,6 +2052,9 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         "   Requeue={} Restarts={} BatchFlag={} Exclusive={}",
         job.requeue as u8, job.restarts, job.batch_flag as u8, job.exclusive as u8,
     );
+    if let Some(line) = actor_line(job) {
+        let _ = writeln!(out, "   {line}");
+    }
     let _ = writeln!(
         out,
         "   RunTime={} TimeLimit={} TimeMin={}",
@@ -2179,6 +2199,26 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_job_names_who_suspended_or_requeued_it() {
+        let job = spur_proto::proto::JobInfo {
+            suspended_by: "alice".into(),
+            last_requeue: "Admin".into(),
+            last_requeue_by: "ops".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            actor_line(&job).as_deref(),
+            Some("SuspendedBy=alice LastRequeue=Admin(ops)")
+        );
+        let failure = spur_proto::proto::JobInfo {
+            last_requeue: "Failure".into(),
+            ..Default::default()
+        };
+        assert_eq!(actor_line(&failure).as_deref(), Some("LastRequeue=Failure"));
+        assert_eq!(actor_line(&spur_proto::proto::JobInfo::default()), None);
+    }
 
     fn pending_pinned_job() -> spur_proto::proto::JobInfo {
         spur_proto::proto::JobInfo {

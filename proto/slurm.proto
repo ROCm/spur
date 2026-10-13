@@ -312,6 +312,13 @@ message JobInfo {
   // may read the audit log.
   string ended_by = 83;
   optional uint32 ended_by_uid = 84;
+
+  // Live view of who acted on the job. `last_requeue` is "Failure", "Preempt"
+  // or "Admin"; the user names are blank unless the caller may read the audit
+  // log.
+  string suspended_by = 85;
+  string last_requeue = 86;
+  string last_requeue_by = 87;
 }
 
 message NodeInfo {

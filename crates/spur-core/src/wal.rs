@@ -193,6 +193,8 @@ pub enum WalOperation {
         hold: bool,
         #[serde(default)]
         begin_time: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<crate::end_reason::Actor>,
     },
     JobSuspend {
         job_id: JobId,
@@ -205,6 +207,8 @@ pub enum WalOperation {
         preempted_by: Option<JobId>,
         #[serde(default)]
         preempt_qos: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<crate::end_reason::Actor>,
     },
     JobResume {
         job_id: JobId,
@@ -1301,6 +1305,7 @@ mod suspend_wal_tests {
                 job_id: 42,
                 hold,
                 begin_time,
+                by: None,
             };
             let json = serde_json::to_string(&op).unwrap();
             let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1309,6 +1314,7 @@ mod suspend_wal_tests {
                     job_id,
                     hold: got_hold,
                     begin_time: got_begin,
+                    ..
                 } => {
                     assert_eq!(job_id, 42);
                     assert_eq!(got_hold, hold);
@@ -1330,10 +1336,12 @@ mod suspend_wal_tests {
                 job_id,
                 hold,
                 begin_time,
+                by,
             } => {
                 assert_eq!(job_id, 7);
                 assert!(!hold);
                 assert_eq!(begin_time, None);
+                assert_eq!(by, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1348,6 +1356,7 @@ mod suspend_wal_tests {
                 at,
                 preempted_by: None,
                 preempt_qos: None,
+                by: None,
             },
             WalOperation::JobResume { job_id: 7, at },
         ] {
@@ -1448,6 +1457,20 @@ mod suspend_wal_tests {
             WalOperation::JobCancelSignaled {
                 job_id: 5,
                 cancel: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_suspend_written_before_the_actor_existed_still_replays() {
+        let old = r#"{"JobSuspend":{"job_id":5,"at":"2026-10-13T00:00:00Z"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobSuspend {
+                job_id: 5,
+                by: None,
                 ..
             }
         ));

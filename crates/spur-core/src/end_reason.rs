@@ -28,6 +28,25 @@ impl CancelProvenance {
     }
 }
 
+/// A person who acted on a job: the authoritative user and, when the kernel
+/// vouched for it, their uid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Actor {
+    pub user: String,
+    #[serde(default)]
+    pub uid: Option<u32>,
+}
+
+/// Why the job last went back to the queue, shown while it is live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastRequeue {
+    /// `"Failure"`, `"Preempt"` or `"Admin"`, as a string for the same reason
+    /// as `CancelProvenance::origin`.
+    pub kind: String,
+    #[serde(default)]
+    pub by: Option<Actor>,
+}
+
 /// The node failure that ended a run, copied from the node record when the
 /// run was evicted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

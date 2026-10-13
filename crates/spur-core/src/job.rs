@@ -888,6 +888,15 @@ pub struct Job {
     #[serde(default)]
     pub node_failure: Option<crate::end_reason::NodeFailure>,
 
+    /// Who suspended the job, while it is suspended. Preemption suspends leave
+    /// it empty; `preempted_by` says who preempted.
+    #[serde(default)]
+    pub suspended_by: Option<crate::end_reason::Actor>,
+
+    /// Why the job last went back to the queue, and who sent it there.
+    #[serde(default)]
+    pub last_requeue: Option<crate::end_reason::LastRequeue>,
+
     /// Job ID of the higher-priority job that caused this preemption. Set on
     /// both cancel and requeue preemption; `None` for jobs never preempted.
     #[serde(default)]
@@ -975,6 +984,8 @@ impl Job {
             unreported_nodes: Vec::new(),
             cancelled_by: None,
             node_failure: None,
+            suspended_by: None,
+            last_requeue: None,
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,
@@ -1323,6 +1334,15 @@ impl Job {
     /// during the wait, and only the hold-explaining reasons are worth keeping.
     pub fn reason_explains_begin_hold(&self, now: DateTime<Utc>) -> bool {
         self.is_begin_held(now) && self.pending_reason.explains_begin_hold()
+    }
+
+    /// Close the current suspension, if any: fold its time into
+    /// `suspended_secs` and forget who suspended the job.
+    pub fn end_suspension(&mut self, at: DateTime<Utc>) {
+        if let Some(since) = self.suspended_at.take() {
+            self.suspended_secs += (at - since).num_seconds().max(0);
+        }
+        self.suspended_by = None;
     }
 
     /// Set the scheduling reason, dropping any description the previous reason

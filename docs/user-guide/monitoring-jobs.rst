@@ -602,8 +602,25 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, ``step``, or
    unset string, so a parser must key on the field name rather than on a line
    being absent. Some fields still appear only when set (``Comment``,
    ``Reservation``, ``ArrayJobId``, ``SchedNodeList``, ``StdIn``, the GPU line,
-   and the preemption line), and ``MinMemoryNode`` is spelled ``MinMemoryCPU``
-   for a ``--mem-per-cpu`` job.
+   the preemption line, and the ``SuspendedBy``/``LastRequeue`` line), and
+   ``MinMemoryNode`` is spelled ``MinMemoryCPU`` for a ``--mem-per-cpu`` job.
+
+For a live job someone acted on, ``scontrol show job`` adds a line naming who.
+``SuspendedBy`` is the user who suspended the job, only while it stays
+suspended; a job paused by preemption shows the preemption line instead.
+``LastRequeue`` says why the job last went back to the queue: ``Failure`` (a
+launch failure, time limit or node failure with ``--requeue``), ``Preempt``, or
+``Admin`` (an ``scontrol requeue`` by the owner or an operator), with whoever
+requeued it in parentheses for ``Admin``:
+
+.. code-block:: console
+
+   SuspendedBy=alice LastRequeue=Admin(ops)
+
+The user names are shown to the same audience as ``EndedBy`` in ``sacct``
+(operators, administrators, and unauthenticated callers when ``[auth]`` is
+``disabled`` or ``permissive``); for anyone else they are blank and
+``LastRequeue`` shows the kind alone.
 
 .. code-block:: bash
 

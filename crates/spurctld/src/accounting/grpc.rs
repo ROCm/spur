@@ -485,6 +485,10 @@ impl SlurmAccounting for AccountingService {
                     String::new()
                 },
                 ended_by_uid: r.ended_by_uid.filter(|_| show_actors),
+                // Live-only: a finished row has no current suspend or requeue.
+                suspended_by: String::new(),
+                last_requeue: String::new(),
+                last_requeue_by: String::new(),
                 // Kept exhaustive so a new JobInfo field forces a decision here;
                 // the accounting store has no requested-placement columns.
                 req_nodelist: String::new(),
