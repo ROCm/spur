@@ -454,6 +454,8 @@ impl SlurmAccounting for AccountingService {
                 preempt_mode: r.preempt_mode.clone(),
                 preempt_qos: r.preempt_qos.clone(),
                 idle_fill: r.idle_fill,
+                end_reason: r.reason.clone(),
+                end_reason_detail: r.reason_detail.clone(),
                 // Kept exhaustive so a new JobInfo field forces a decision here;
                 // the accounting store has no requested-placement columns.
                 req_nodelist: String::new(),

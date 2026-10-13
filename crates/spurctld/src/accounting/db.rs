@@ -604,6 +604,8 @@ pub struct JobRecord {
     pub preempt_qos: String,
     /// True when the run took borrowed capacity rather than the job's own quota.
     pub idle_fill: bool,
+    pub reason: String,
+    pub reason_detail: String,
 }
 
 /// Filters for [`get_job_history`]. A `None` or empty-slice field is an
@@ -628,7 +630,7 @@ pub async fn get_job_history(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
          submit_time, start_time, end_time, reservation, \
-         preempted_by, preempt_mode, preempt_qos, idle_fill \
+         preempted_by, preempt_mode, preempt_qos, idle_fill, reason, reason_detail \
          FROM jobs WHERE 1=1",
     );
 
@@ -691,6 +693,8 @@ pub async fn get_job_history(
             preempt_mode: row.get("preempt_mode"),
             preempt_qos: row.get("preempt_qos"),
             idle_fill: row.get("idle_fill"),
+            reason: row.get("reason"),
+            reason_detail: row.get("reason_detail"),
         })
         .collect();
 

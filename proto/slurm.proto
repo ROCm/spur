@@ -303,6 +303,11 @@ message JobInfo {
   // node quota and was placed on nodes nobody with a quota claim wanted, so it
   // is reclaimable if such a job needs them.
   bool idle_fill = 80;
+
+  // Why the run ended, from accounting history only; empty on live job
+  // queries and on rows written before this field existed.
+  string end_reason = 81;
+  string end_reason_detail = 82;
 }
 
 message NodeInfo {
