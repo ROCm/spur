@@ -159,9 +159,9 @@ impl AccountingNotifier {
         tokio::spawn(async move {
             let _guard = InFlightGuard(inflight);
             let write = || async {
-                let mut conn = pool.acquire().await?;
+                let mut tx = pool.begin().await?;
                 super::db::record_job_end(
-                    &mut conn,
+                    &mut tx,
                     job_id,
                     &state_str,
                     exit_code,
@@ -172,7 +172,9 @@ impl AccountingNotifier {
                     preempt_mode.as_deref().unwrap_or(""),
                     preempt_qos.as_deref().unwrap_or(""),
                 )
-                .await
+                .await?;
+                tx.commit().await?;
+                Ok(())
             };
             if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
                 error!(job_id, error = %e, "failed to record job end in accounting after retries");
