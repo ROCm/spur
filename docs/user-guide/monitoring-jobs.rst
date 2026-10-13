@@ -416,7 +416,8 @@ Flags:
      - Comma-separated field names (see below).
    * - ``--long``
      - ``-l``
-     - Long form; adds DerivedExitCode, Start, End, TimeLimit.
+     - Long form; adds DerivedExitCode, Start, End, TimeLimit, the three
+       preemption fields, and Reason.
    * - ``--brief``
      - ``-b``
      - Brief form: JobID, State, ExitCode.
@@ -432,7 +433,8 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
 ``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
-and ``Borrowed``. Set a per-field width with ``Field%N``, e.g. ``JobName%20``.
+``Borrowed``, ``Reason``, and ``ReasonDetail``. Set a per-field width with
+``Field%N``, e.g. ``JobName%20``.
 
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
 preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
@@ -452,6 +454,77 @@ question ``squeue``'s ``%W`` answers for a running job:
    JobID  User     State      Borrowed
    19     ifbob    PREEMPTED  yes
    21     ifalice  COMPLETED  no
+
+Why a job ended
+~~~~~~~~~~~~~~~
+
+``Reason`` is a short code saying why the job's run ended, and ``ReasonDetail``
+adds what Spur knew beyond the code. Use ``Reason`` to group failures, for
+example ``sacct -s FAILED,NODE_FAIL --format=JobID,State,Reason`` piped through
+``sort | uniq -c``.
+
+.. code-block:: console
+
+   $ sacct --format=JobID,State,ExitCode,Reason,ReasonDetail
+   JobID  State      ExitCode  Reason             ReasonDetail
+   41     FAILED     127:0     NonZeroExitCode    exit 127: command not found (shell convention)
+   42     FAILED     0:11      RaisedSignal       signal 11 (Segmentation_fault)
+   43     FAILED     1:0       CompletingTimeout  no completion reported by node3
+   44     TIMEOUT    0:15      TimeLimit
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 60
+
+   * - Reason
+     - State
+     - When
+   * - ``None``
+     - COMPLETED
+     - The job ended normally.
+   * - ``NonZeroExitCode``
+     - FAILED
+     - The job exited with a non-zero code. For 126 and 127 the detail notes
+       the shell convention ("not executable", "command not found"); that is a
+       hint, since a script may also exit 127 itself.
+   * - ``RaisedSignal``
+     - FAILED
+     - A signal ended the job; the detail names it.
+   * - ``CompletingTimeout``
+     - FAILED
+     - The controller stopped waiting for the job's nodes to report; the
+       detail lists the nodes that never did.
+   * - ``TimeLimit``
+     - TIMEOUT
+     - The job reached its time limit, however the process then died.
+   * - ``DeadLine``
+     - DEADLINE
+     - The job's ``--deadline`` passed before it could run.
+   * - ``OutOfMemory``
+     - OUT_OF_MEMORY
+     - The kernel killed the job for exceeding its memory limit.
+   * - ``Preempted``
+     - PREEMPTED
+     - A higher-priority job preempted it; the detail names that job and its
+       QOS.
+   * - ``Cancelled``
+     - CANCELLED
+     - The job was cancelled.
+   * - ``Requeued``
+     - REQUEUED
+     - An operator requeued the running job.
+   * - ``NodeDown``
+     - NODE_FAIL
+     - A node the job ran on went down.
+   * - ``JobLaunchFailure``
+     - NODE_FAIL
+     - The job could not be started on every node; the detail says why.
+
+``Reason`` reads ``N/A`` for rows written before this field existed or through
+the external ``RecordJobEnd`` accounting RPC. Accounting keeps one row per job,
+so a requeued job's next run replaces the reason with its own. During a
+rolling upgrade, a job that restarts and then ends while an older controller
+is leader keeps the reason of its previous run.
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode``.
