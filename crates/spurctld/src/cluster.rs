@@ -20,7 +20,7 @@ use spur_core::accounting::{
 };
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
-use spur_core::end_reason::CancelProvenance;
+use spur_core::end_reason::{CancelProvenance, NodeFailure};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
     PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
@@ -6131,6 +6131,7 @@ impl ClusterManager {
         job.time_limit_signaled_at = None;
         job.cancel_signaled_at = None;
         job.cancelled_by = None;
+        job.node_failure = None;
         job.pending_reason = PendingReason::None;
         job.pending_reason_desc = None;
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
@@ -6181,6 +6182,7 @@ impl ClusterManager {
         nodes: &mut HashMap<String, Node>,
         timestamp: chrono::DateTime<Utc>,
         reason: PendingReason,
+        failure: Option<NodeFailure>,
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
 
@@ -6202,6 +6204,7 @@ impl ClusterManager {
         job.end_time = Some(timestamp);
         if evicted_state == JobState::NodeFail {
             job.set_pending_reason(reason);
+            job.node_failure = failure;
         }
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
@@ -6226,6 +6229,7 @@ impl ClusterManager {
     /// allocations on **every** node each job spans.
     fn evict_jobs_on_node(
         node_name: &str,
+        failure: NodeFailure,
         jobs: &mut HashMap<JobId, Job>,
         nodes: &mut HashMap<String, Node>,
         timestamp: chrono::DateTime<Utc>,
@@ -6243,9 +6247,14 @@ impl ClusterManager {
             .collect();
 
         for jid in affected {
-            if let Some(fin) =
-                Self::evict_job_locked(jid, jobs, nodes, timestamp, PendingReason::NodeDown)
-            {
+            if let Some(fin) = Self::evict_job_locked(
+                jid,
+                jobs,
+                nodes,
+                timestamp,
+                PendingReason::NodeDown,
+                Some(failure.clone()),
+            ) {
                 response.jobs_finalized.push(fin);
             }
         }
@@ -6642,6 +6651,7 @@ impl ClusterManager {
                     &mut nodes,
                     timestamp,
                     PendingReason::JobLaunchFailure,
+                    None,
                 ) {
                     response.jobs_finalized.push(fin);
                 }
@@ -6680,6 +6690,7 @@ impl ClusterManager {
                     job.derived_exit_code = 0;
                     job.exit_signal = 0;
                     job.unreported_nodes.clear();
+                    job.node_failure = None;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -7134,7 +7145,20 @@ impl ClusterManager {
                     }
                 }
                 if *new_state == NodeState::Down {
-                    Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
+                    let failure = NodeFailure {
+                        node: name.clone(),
+                        reason: reason.clone().unwrap_or_default(),
+                        reason_uid: *reason_uid,
+                        removed: false,
+                    };
+                    Self::evict_jobs_on_node(
+                        name,
+                        failure,
+                        &mut jobs,
+                        &mut nodes,
+                        timestamp,
+                        &mut response,
+                    );
                 }
             }
             WalOperation::NodeLabelsUpdate { name, set, remove } => {
@@ -7166,7 +7190,20 @@ impl ClusterManager {
                 }
             }
             WalOperation::NodeRemove { name, reason } => {
-                Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
+                let failure = NodeFailure {
+                    node: name.clone(),
+                    reason: reason.clone().unwrap_or_default(),
+                    reason_uid: None,
+                    removed: true,
+                };
+                Self::evict_jobs_on_node(
+                    name,
+                    failure,
+                    &mut jobs,
+                    &mut nodes,
+                    timestamp,
+                    &mut response,
+                );
                 if let Some(node) = nodes.get(name) {
                     if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
                         warn!(
@@ -13576,7 +13613,79 @@ mod tests {
             reason_time: None,
         });
 
-        assert_eq!(resp.jobs_finalized[0].reason, EndReason::NodeDown);
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::NodeDown);
+        assert_eq!(
+            fin.reason_detail.as_deref(),
+            Some("node worker1: Not responding")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admin_node_down_records_who_set_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        run_job_on(&cm, "admin-down", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "worker1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("maintenance".into()),
+            admin_locked: true,
+            reason_uid: Some(0),
+            reason_time: Some(Utc::now()),
+        });
+
+        assert_eq!(
+            resp.jobs_finalized[0].reason_detail.as_deref(),
+            Some("node worker1: maintenance (set by uid 0)")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_a_node_under_a_job_is_node_removed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        run_job_on(&cm, "node-removed", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::NodeRemove {
+            name: "worker1".into(),
+            reason: Some("decommissioned".into()),
+        });
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::NodeRemoved);
+        assert_eq!(
+            fin.reason_detail.as_deref(),
+            Some("node worker1: decommissioned")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_job_on_a_failed_node_keeps_its_cancel_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "cancel-then-down", "worker1");
+        let owner = cm.get_job(job_id).unwrap().spec.user;
+        cm.cancel_job(job_id, &owner).unwrap();
+
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "worker1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("Not responding".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::UserCancel);
+        assert_eq!(fin.reason_detail, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -28364,6 +28473,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
         assert!(result.is_none());
     }
@@ -28381,6 +28491,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         )
         .unwrap();
         assert_eq!(fin.job_id, 1);
@@ -28408,6 +28519,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
 
         assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
@@ -28429,6 +28541,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
         assert!(result.is_none());
     }
@@ -28451,6 +28564,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
 
         let job = &jobs[&1];
@@ -28473,6 +28587,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         )
         .unwrap();
         assert_eq!(fin.state, JobState::NodeFail);
@@ -28495,6 +28610,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);

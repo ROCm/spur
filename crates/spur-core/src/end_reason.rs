@@ -28,6 +28,33 @@ impl CancelProvenance {
     }
 }
 
+/// The node failure that ended a run, copied from the node record when the
+/// run was evicted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeFailure {
+    pub node: String,
+    pub reason: String,
+    #[serde(default)]
+    pub reason_uid: Option<u32>,
+    /// The node was removed from the cluster rather than marked down.
+    #[serde(default)]
+    pub removed: bool,
+}
+
+impl NodeFailure {
+    fn detail(&self) -> String {
+        let mut detail = format!("node {}", self.node);
+        if !self.reason.is_empty() {
+            detail.push_str(": ");
+            detail.push_str(&self.reason);
+        }
+        if let Some(uid) = self.reason_uid {
+            detail.push_str(&format!(" (set by uid {uid})"));
+        }
+        detail
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndReason {
     #[default]
@@ -46,6 +73,7 @@ pub enum EndReason {
     UserCancel,
     AdminCancel,
     SystemCancel,
+    NodeRemoved,
 }
 
 impl EndReason {
@@ -68,6 +96,7 @@ impl EndReason {
             EndReason::UserCancel => "UserCancel",
             EndReason::AdminCancel => "AdminCancel",
             EndReason::SystemCancel => "SystemCancel",
+            EndReason::NodeRemoved => "NodeRemoved",
         }
     }
 
@@ -102,7 +131,13 @@ impl Job {
                 EndReason::JobLaunchFailure,
                 self.launch_failure_detail.clone(),
             ),
-            JobState::NodeFail => (EndReason::NodeDown, None),
+            JobState::NodeFail => match &self.node_failure {
+                Some(failure) if failure.removed => {
+                    (EndReason::NodeRemoved, Some(failure.detail()))
+                }
+                Some(failure) => (EndReason::NodeDown, Some(failure.detail())),
+                None => (EndReason::NodeDown, None),
+            },
             JobState::Pending | JobState::Running | JobState::Completing | JobState::Suspended => {
                 (EndReason::None, None)
             }
@@ -209,6 +244,7 @@ mod tests {
             (EndReason::UserCancel, "UserCancel"),
             (EndReason::AdminCancel, "AdminCancel"),
             (EndReason::SystemCancel, "SystemCancel"),
+            (EndReason::NodeRemoved, "NodeRemoved"),
         ];
         for (reason, spelling) in pinned {
             assert_eq!(reason.as_str(), spelling);
@@ -399,6 +435,53 @@ mod tests {
         assert_eq!(
             job.end_reason(JobState::NodeFail),
             (EndReason::NodeDown, None)
+        );
+    }
+
+    fn node_failed(reason: &str, reason_uid: Option<u32>, removed: bool) -> Job {
+        let mut job = job();
+        job.set_pending_reason(PendingReason::NodeDown);
+        job.node_failure = Some(NodeFailure {
+            node: "node7".into(),
+            reason: reason.into(),
+            reason_uid,
+            removed,
+        });
+        job
+    }
+
+    #[test]
+    fn a_node_down_names_the_node_and_why_it_went_down() {
+        assert_eq!(
+            node_failed("Not responding", None, false).end_reason(JobState::NodeFail),
+            (
+                EndReason::NodeDown,
+                Some("node node7: Not responding".into())
+            )
+        );
+        assert_eq!(
+            node_failed("maintenance", Some(0), false)
+                .end_reason(JobState::NodeFail)
+                .1
+                .as_deref(),
+            Some("node node7: maintenance (set by uid 0)")
+        );
+        assert_eq!(
+            node_failed("", None, false)
+                .end_reason(JobState::NodeFail)
+                .1
+                .as_deref(),
+            Some("node node7")
+        );
+    }
+
+    #[test]
+    fn a_removed_node_is_node_removed() {
+        assert_eq!(
+            node_failed("decommissioned", None, true)
+                .end_reason(JobState::NodeFail)
+                .0,
+            EndReason::NodeRemoved
         );
     }
 

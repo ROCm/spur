@@ -529,7 +529,12 @@ example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
      - The job's owner or an operator requeued it while it was running.
    * - ``NodeDown``
      - NODE_FAIL
-     - A node the job ran on went down.
+     - A node the job ran on went down. The detail names the node and its
+       down reason, as ``sinfo -R`` shows it (for example ``Not responding``
+       after lost heartbeats), plus the uid that set it when an operator did.
+   * - ``NodeRemoved``
+     - NODE_FAIL
+     - A node the job ran on was removed from the cluster.
    * - ``JobLaunchFailure``
      - NODE_FAIL
      - The job could not be started on every node; the detail says why.

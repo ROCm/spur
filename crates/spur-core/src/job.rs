@@ -884,6 +884,10 @@ pub struct Job {
     #[serde(default)]
     pub cancelled_by: Option<crate::end_reason::CancelProvenance>,
 
+    /// The node failure that evicted this run.
+    #[serde(default)]
+    pub node_failure: Option<crate::end_reason::NodeFailure>,
+
     /// Job ID of the higher-priority job that caused this preemption. Set on
     /// both cancel and requeue preemption; `None` for jobs never preempted.
     #[serde(default)]
@@ -970,6 +974,7 @@ impl Job {
             launch_failure_detail: None,
             unreported_nodes: Vec::new(),
             cancelled_by: None,
+            node_failure: None,
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,
