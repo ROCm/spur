@@ -18,7 +18,7 @@ jobs:
         package: [spur-ci, spur-build-cache]
     steps:
       - name: Delete old ${{ matrix.package }} images
-        uses: actions/delete-package-versions@v5
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
         with:
           package-name: ${{ matrix.package }}
           package-type: container
