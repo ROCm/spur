@@ -22,7 +22,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use spur_core::end_reason::EndReason;
+use spur_core::end_reason::{CancelProvenance, EndReason};
 use spur_core::job::{Job, JobState};
 use spur_core::wal::WalOperation;
 
@@ -75,6 +75,8 @@ pub struct JobFinalized {
     pub reason: EndReason,
     #[serde(skip)]
     pub reason_detail: Option<String>,
+    #[serde(skip)]
+    pub ended_by: Option<CancelProvenance>,
 }
 
 impl JobFinalized {
@@ -86,6 +88,7 @@ impl JobFinalized {
             exit_code,
             reason,
             reason_detail,
+            ended_by: job.ended_by(reason).cloned(),
         }
     }
 }

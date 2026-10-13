@@ -179,6 +179,8 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS total_gpus INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS usage_recorded BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason_detail TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ended_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ended_by_uid BIGINT;
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -347,7 +349,9 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             preempt_qos = '',
             usage_recorded = FALSE,
             reason = '',
-            reason_detail = ''
+            reason_detail = '',
+            ended_by = '',
+            ended_by_uid = NULL
         "#,
     )
     .bind(rec.job_id as i64)
@@ -404,6 +408,9 @@ pub struct JobEndRecord {
     /// stored as `''`, the same as a row written before the column existed.
     pub reason: Option<EndReason>,
     pub reason_detail: String,
+    /// Who cancelled the run; empty unless `reason` is a cancel code.
+    pub ended_by: String,
+    pub ended_by_uid: Option<u32>,
 }
 
 /// Record a job completion in the database. See `record_job_start` for why
@@ -413,8 +420,9 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     let row = sqlx::query(
         r#"
         INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code,
-                          preempted_by, preempt_mode, preempt_qos, reason, reason_detail)
-        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                          preempted_by, preempt_mode, preempt_qos, reason, reason_detail,
+                          ended_by, ended_by_uid)
+        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
@@ -425,7 +433,9 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
             preempt_mode = $8,
             preempt_qos = $9,
             reason = $10,
-            reason_detail = $11
+            reason_detail = $11,
+            ended_by = $12,
+            ended_by_uid = $13
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
         "#,
     )
@@ -440,6 +450,8 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     .bind(&rec.preempt_qos)
     .bind(rec.reason.map(EndReason::as_str).unwrap_or(""))
     .bind(&rec.reason_detail)
+    .bind(&rec.ended_by)
+    .bind(rec.ended_by_uid.map(i64::from))
     .fetch_one(&mut *conn)
     .await?;
 
@@ -606,6 +618,8 @@ pub struct JobRecord {
     pub idle_fill: bool,
     pub reason: String,
     pub reason_detail: String,
+    pub ended_by: String,
+    pub ended_by_uid: Option<u32>,
 }
 
 /// Filters for [`get_job_history`]. A `None` or empty-slice field is an
@@ -630,7 +644,8 @@ pub async fn get_job_history(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
          submit_time, start_time, end_time, reservation, \
-         preempted_by, preempt_mode, preempt_qos, idle_fill, reason, reason_detail \
+         preempted_by, preempt_mode, preempt_qos, idle_fill, reason, reason_detail, \
+         ended_by, ended_by_uid \
          FROM jobs WHERE 1=1",
     );
 
@@ -695,6 +710,10 @@ pub async fn get_job_history(
             idle_fill: row.get("idle_fill"),
             reason: row.get("reason"),
             reason_detail: row.get("reason_detail"),
+            ended_by: row.get("ended_by"),
+            ended_by_uid: row
+                .get::<Option<i64>, _>("ended_by_uid")
+                .and_then(|uid| u32::try_from(uid).ok()),
         })
         .collect();
 
@@ -1864,6 +1883,8 @@ mod job_history_tests {
             preempt_qos: String::new(),
             reason: None,
             reason_detail: String::new(),
+            ended_by: String::new(),
+            ended_by_uid: None,
         }
     }
 
@@ -2134,24 +2155,32 @@ mod job_history_tests {
                 exit_code: 127,
                 reason: Some(EndReason::NonZeroExitCode),
                 reason_detail: "exit 127: command not found (shell convention)".into(),
+                ended_by: "alice".into(),
+                ended_by_uid: Some(1001),
                 ..end_record(id, "FAILED", t0 + Duration::minutes(1))
             },
         )
         .await?;
-        let row = sqlx::query("SELECT reason, reason_detail FROM jobs WHERE job_id = $1")
-            .bind(id as i64)
-            .fetch_one(&pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT reason, reason_detail, ended_by, ended_by_uid FROM jobs WHERE job_id = $1",
+        )
+        .bind(id as i64)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.get::<String, _>("ended_by"), "alice");
+        assert_eq!(row.get::<Option<i64>, _>("ended_by_uid"), Some(1001));
         assert_eq!(row.get::<String, _>("reason"), "NonZeroExitCode");
         assert!(row
             .get::<String, _>("reason_detail")
             .contains("command not found"));
 
         start(&pool, id, "reason", &user, "", "", 1, 1, 1, 0, t0, t0, "").await?;
-        let row = sqlx::query("SELECT reason, reason_detail FROM jobs WHERE job_id = $1")
-            .bind(id as i64)
-            .fetch_one(&pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT reason, reason_detail, ended_by, ended_by_uid FROM jobs WHERE job_id = $1",
+        )
+        .bind(id as i64)
+        .fetch_one(&pool)
+        .await?;
         delete_jobs(&pool, &[id]).await.ok();
         sqlx::query("DELETE FROM usage WHERE user_name = $1")
             .bind(&user)
@@ -2159,6 +2188,8 @@ mod job_history_tests {
             .await?;
         assert_eq!(row.get::<String, _>("reason"), "");
         assert_eq!(row.get::<String, _>("reason_detail"), "");
+        assert_eq!(row.get::<String, _>("ended_by"), "");
+        assert_eq!(row.get::<Option<i64>, _>("ended_by_uid"), None);
         Ok(())
     }
 

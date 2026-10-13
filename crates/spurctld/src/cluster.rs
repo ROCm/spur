@@ -20,6 +20,7 @@ use spur_core::accounting::{
 };
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
+use spur_core::end_reason::CancelProvenance;
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
     PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
@@ -621,6 +622,49 @@ struct PendingJobCandidate {
 #[derive(Debug, Default)]
 pub struct JobEndFacts {
     pub unreported_nodes: Vec<String>,
+    pub cancel: Option<CancelProvenance>,
+}
+
+/// Who is asking to cancel a job, before the owner is known.
+#[derive(Debug, Clone)]
+pub struct Canceller {
+    pub user: String,
+    pub uid: Option<u32>,
+    /// The controller itself or an in-cluster daemon, not a person.
+    pub system: bool,
+}
+
+impl Canceller {
+    pub fn user(user: &str, uid: Option<u32>) -> Self {
+        Self {
+            user: user.to_string(),
+            uid,
+            system: false,
+        }
+    }
+
+    pub fn system() -> Self {
+        Self {
+            user: String::new(),
+            uid: None,
+            system: true,
+        }
+    }
+
+    fn provenance(&self, owner: &str) -> CancelProvenance {
+        let origin = if self.system {
+            "System"
+        } else if self.user == owner {
+            "User"
+        } else {
+            "Admin"
+        };
+        CancelProvenance {
+            origin: origin.to_string(),
+            user: self.user.clone(),
+            uid: self.uid,
+        }
+    }
 }
 
 /// Filters for [`ClusterManager::get_jobs`]. Every field is optional: an empty
@@ -1469,20 +1513,26 @@ impl ClusterManager {
         spur_core::auth::check_job_owner(user, operates_jobs, owner, action)
     }
 
-    /// Cancel a job. The requesting `user` must be the job owner, or the caller
-    /// must pass `operates_jobs` (verified operator / daemon-internal).
+    /// Cancel a job as its owner `user`.
+    #[cfg(test)]
     pub fn cancel_job(&self, job_id: JobId, user: &str) -> Result<(), CancelError> {
-        self.cancel_job_for(job_id, user, false)
+        self.cancel_job_for(job_id, Canceller::user(user, None), false)
     }
 
-    /// Like [`Self::cancel_job`], plus Operators/Administrators (`operates_jobs`).
+    /// A cancel the controller decides on itself, never on a user's behalf.
+    pub fn cancel_job_as_system(&self, job_id: JobId) -> Result<(), CancelError> {
+        self.cancel_job_for(job_id, Canceller::system(), true)
+    }
+
+    /// Cancel a job on behalf of `canceller`, who must own it unless
+    /// `operates_jobs` (verified operator or daemon-internal).
     pub fn cancel_job_for(
         &self,
         job_id: JobId,
-        user: &str,
+        canceller: Canceller,
         operates_jobs: bool,
     ) -> Result<(), CancelError> {
-        let holds_nodes = {
+        let (holds_nodes, cancel) = {
             let jobs = self.jobs.read();
             let job = jobs.get(&job_id).ok_or(CancelError::NotFound(job_id))?;
             if job.state.is_terminal() {
@@ -1491,9 +1541,12 @@ impl ClusterManager {
                     state: job.state,
                 });
             }
-            Self::check_job_owner_for(user, &job.spec.user, "cancel", operates_jobs)
+            Self::check_job_owner_for(&canceller.user, &job.spec.user, "cancel", operates_jobs)
                 .map_err(CancelError::NotOwner)?;
-            !job.allocated_nodes.is_empty()
+            (
+                !job.allocated_nodes.is_empty(),
+                canceller.provenance(&job.spec.user),
+            )
         };
 
         // A job holding nodes still has processes to tear down: record the
@@ -1502,6 +1555,7 @@ impl ClusterManager {
             self.propose(WalOperation::JobCancelSignaled {
                 job_id,
                 at: Utc::now(),
+                cancel: Some(cancel.clone()),
             })?;
             // Re-read rather than trust the pre-propose snapshot: the job may
             // have started, ended or re-pended, and then the signal was a no-op.
@@ -1516,7 +1570,7 @@ impl ClusterManager {
             }
         }
 
-        let resp = self.propose(WalOperation::job_complete(job_id, -1, JobState::Cancelled))?;
+        let resp = self.propose(WalOperation::job_cancelled(job_id, cancel))?;
         self.run_all_finalized_side_effects(&resp);
 
         info!(job_id, "job cancelled");
@@ -2094,6 +2148,7 @@ impl ClusterManager {
             exit_code,
             state,
             unreported_nodes: facts.unreported_nodes,
+            cancel: facts.cancel,
         })?;
         self.run_all_finalized_side_effects(&resp);
 
@@ -2553,6 +2608,12 @@ impl ClusterManager {
                 preempt_qos: preempt_qos.unwrap_or_default(),
                 reason: Some(finalized.reason),
                 reason_detail: finalized.reason_detail.clone().unwrap_or_default(),
+                ended_by: finalized
+                    .ended_by
+                    .as_ref()
+                    .map(|c| c.user.clone())
+                    .unwrap_or_default(),
+                ended_by_uid: finalized.ended_by.as_ref().and_then(|c| c.uid),
             });
         }
 
@@ -4619,7 +4680,7 @@ impl ClusterManager {
             if self.jobs.read().get(&id).map(|j| j.state) != Some(JobState::Pending) {
                 continue;
             }
-            match self.propose(WalOperation::job_complete(id, -1, JobState::Cancelled)) {
+            match self.propose(WalOperation::job_cancelled(id, CancelProvenance::system())) {
                 Ok(resp) => {
                     self.run_all_finalized_side_effects(&resp);
                     info!(job_id = id, "job cancelled: dependency never satisfied");
@@ -5213,7 +5274,11 @@ impl ClusterManager {
             })
             .collect();
         for job_id in to_cancel {
-            if let Err(e) = self.complete_job(job_id, -1, JobState::Cancelled) {
+            let facts = JobEndFacts {
+                cancel: Some(CancelProvenance::system()),
+                ..Default::default()
+            };
+            if let Err(e) = self.complete_job_with(job_id, -1, JobState::Cancelled, facts) {
                 warn!(job_id, error = %e, "failed to cancel job after reservation ended");
             }
         }
@@ -6065,6 +6130,7 @@ impl ClusterManager {
         job.unreported_nodes.clear();
         job.time_limit_signaled_at = None;
         job.cancel_signaled_at = None;
+        job.cancelled_by = None;
         job.pending_reason = PendingReason::None;
         job.pending_reason_desc = None;
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
@@ -6758,7 +6824,7 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobCancelSignaled { job_id, at } => {
+            WalOperation::JobCancelSignaled { job_id, at, cancel } => {
                 let Some(job) = jobs.get_mut(job_id) else {
                     return ClientResponse::default();
                 };
@@ -6768,6 +6834,9 @@ impl ClusterManager {
                 }
                 if job.cancel_signaled_at.is_none() {
                     job.cancel_signaled_at = Some(*at);
+                }
+                if job.cancelled_by.is_none() {
+                    job.cancelled_by = cancel.clone();
                 }
                 // Nothing will ever report for a run holding no nodes, so it must
                 // not wait in Completing; the caller finalizes it instead.
@@ -6791,6 +6860,7 @@ impl ClusterManager {
                 exit_code,
                 state,
                 unreported_nodes,
+                cancel,
             } => {
                 let freed_nodes;
                 let allocated_resources;
@@ -6813,6 +6883,9 @@ impl ClusterManager {
                         return ClientResponse::default();
                     }
                     job.unreported_nodes = unreported_nodes.clone();
+                    if *state == JobState::Cancelled && job.cancelled_by.is_none() {
+                        job.cancelled_by = cancel.clone();
+                    }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
                     // Derived from the replicated entry, so every replica reports
@@ -13283,6 +13356,7 @@ mod tests {
             JobState::Failed,
             JobEndFacts {
                 unreported_nodes: vec!["worker1".into()],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -13293,6 +13367,93 @@ mod tests {
             job.end_reason(JobState::Failed).0,
             EndReason::CompletingTimeout
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_cancelling_a_running_job_is_a_user_cancel_by_them() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "owner-cancel", "worker1");
+        let owner = cm.get_job(job_id).unwrap().spec.user;
+
+        cm.cancel_job(job_id, &owner).unwrap();
+        let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: 15,
+        });
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::UserCancel);
+        assert_eq!(
+            fin.ended_by.as_ref().map(|c| c.user.as_str()),
+            Some(owner.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_pending_job_records_the_same_canceller() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("pending-cancel"));
+        let owner = cm.get_job(job_id).unwrap().spec.user;
+
+        cm.cancel_job(job_id, &owner).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.end_reason(JobState::Cancelled).0, EndReason::UserCancel);
+        assert_eq!(job.cancelled_by.unwrap().user, owner);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_cancelling_someone_elses_job_is_an_admin_cancel() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("admin-cancel"));
+
+        cm.cancel_job_for(job_id, Canceller::user("ops", Some(0)), true)
+            .unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            job.end_reason(JobState::Cancelled).0,
+            EndReason::AdminCancel
+        );
+        let by = job.cancelled_by.unwrap();
+        assert_eq!((by.user.as_str(), by.uid), ("ops", Some(0)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_cancel_is_a_system_cancel() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("system-cancel"));
+
+        cm.cancel_job_as_system(job_id).unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(
+            job.end_reason(JobState::Cancelled).0,
+            EndReason::SystemCancel
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_requeue_forgets_who_cancelled_the_previous_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("cancel-then-requeue"));
+        cm.cancel_job_as_system(job_id).unwrap();
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+        });
+
+        assert!(cm.get_job(job_id).unwrap().cancelled_by.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13307,6 +13468,7 @@ mod tests {
             JobState::Failed,
             JobEndFacts {
                 unreported_nodes: vec!["worker1".into()],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -17305,6 +17467,46 @@ mod tests {
 
         cm.enforce_reservation_end_times();
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_ending_under_a_job_is_a_system_cancel() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::hours(1),
+            end_time: now - chrono::Duration::minutes(5),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        })
+        .unwrap();
+        let mut spec = basic_spec("resv-ended");
+        spec.reservation = Some("r1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.enforce_reservation_end_times();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(
+            job.end_reason(JobState::Cancelled).0,
+            EndReason::SystemCancel
+        );
     }
 
     /// Config with the preemption engine on and a cancel-mode partition.
@@ -22413,6 +22615,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobCancelSignaled {
             job_id,
             at: Utc::now(),
+            cancel: None,
         });
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Running);
@@ -22432,6 +22635,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobCancelSignaled {
             job_id,
             at: Utc::now(),
+            cancel: None,
         });
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Completed);
@@ -22558,7 +22762,8 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("internal-cancel"));
-        cm.cancel_job_for(job_id, "", true).unwrap();
+        cm.cancel_job_for(job_id, Canceller::system(), true)
+            .unwrap();
         settle(&cm, job_id, JobState::Cancelled);
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Cancelled);
     }
@@ -22569,7 +22774,8 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         let job_id = submit_and_wait(&cm, basic_spec("operator-cancel"));
-        cm.cancel_job_for(job_id, "ops", true).unwrap();
+        cm.cancel_job_for(job_id, Canceller::user("ops", None), true)
+            .unwrap();
         settle(&cm, job_id, JobState::Cancelled);
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Cancelled);
     }
@@ -26630,7 +26836,12 @@ mod tests {
 
         let cancelled = cm.cancel_unsatisfiable_dependency_jobs();
         assert_eq!(cancelled, vec![2]);
-        assert_eq!(cm.get_job(2).unwrap().state, JobState::Cancelled);
+        let child = cm.get_job(2).unwrap();
+        assert_eq!(child.state, JobState::Cancelled);
+        assert_eq!(
+            child.end_reason(JobState::Cancelled).0,
+            EndReason::SystemCancel
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

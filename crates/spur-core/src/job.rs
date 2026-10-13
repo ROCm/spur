@@ -880,6 +880,10 @@ pub struct Job {
     #[serde(default)]
     pub unreported_nodes: Vec<String>,
 
+    /// Who cancelled this run. First writer wins, like `cancel_signaled_at`.
+    #[serde(default)]
+    pub cancelled_by: Option<crate::end_reason::CancelProvenance>,
+
     /// Job ID of the higher-priority job that caused this preemption. Set on
     /// both cancel and requeue preemption; `None` for jobs never preempted.
     #[serde(default)]
@@ -965,6 +969,7 @@ impl Job {
             actual_stderr_path: None,
             launch_failure_detail: None,
             unreported_nodes: Vec::new(),
+            cancelled_by: None,
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,

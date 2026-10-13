@@ -272,6 +272,7 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
 async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<()> {
     let state = accounting_state(job);
     let (reason, reason_detail) = job.end_reason(state);
+    let ended_by = job.ended_by(reason);
     db::record_job_end(
         conn,
         &db::JobEndRecord {
@@ -286,6 +287,8 @@ async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<(
             preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
             reason: Some(reason),
             reason_detail: reason_detail.unwrap_or_default(),
+            ended_by: ended_by.map(|c| c.user.clone()).unwrap_or_default(),
+            ended_by_uid: ended_by.and_then(|c| c.uid),
         },
     )
     .await
@@ -553,6 +556,8 @@ mod tests {
             preempt_qos: String::new(),
             reason: None,
             reason_detail: String::new(),
+            ended_by: String::new(),
+            ended_by_uid: None,
         }
     }
 

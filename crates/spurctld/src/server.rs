@@ -950,7 +950,7 @@ impl ControllerService {
         identity: Option<&spur_core::auth::Identity>,
         user: &str,
     ) -> bool {
-        self.caller_is_operator(identity) || (identity.is_none() && user.is_empty())
+        self.caller_is_operator(identity) || is_daemon_caller(identity, user)
     }
 
     fn caller_role(
@@ -1552,10 +1552,15 @@ impl SlurmController for ControllerService {
             .asserted_actor(&req.user),
         );
 
+        let canceller = if is_daemon_caller(__identity.as_ref(), &req.user) {
+            crate::cluster::Canceller::system()
+        } else {
+            crate::cluster::Canceller::user(&req.user, trusted_uid(__identity.as_ref()))
+        };
         self.cluster
             .cancel_job_for(
                 job_id,
-                &req.user,
+                canceller,
                 self.caller_may_cancel_unowned(__identity.as_ref(), &req.user),
             )
             .map_err(cancel_err_to_status)?;
@@ -4392,6 +4397,11 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received, draining");
 }
 
+/// The in-cluster daemon: no bearer and an empty `user`, as the k8s operator sends.
+fn is_daemon_caller(identity: Option<&spur_core::auth::Identity>, user: &str) -> bool {
+    identity.is_none() && user.is_empty()
+}
+
 /// A uid only when the kernel vouched for it. A JWT claims its own, possibly 0,
 /// so recording it would attribute an action to an unproven uid. Cf. `bind_job_spec`.
 pub(crate) fn trusted_uid(identity: Option<&spur_core::auth::Identity>) -> Option<u32> {
@@ -4990,6 +5000,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         idle_fill: job.idle_fill,
         end_reason: String::new(),
         end_reason_detail: String::new(),
+        ended_by: String::new(),
+        ended_by_uid: None,
         eligible_time: Some(datetime_to_proto(job.eligible_time())),
         accrue_time: Some(datetime_to_proto(job.accrue_time())),
         last_sched_eval: job.last_sched_eval.map(datetime_to_proto),
@@ -6428,10 +6440,12 @@ mod tests {
         apply(&WalOperation::JobCancelSignaled {
             job_id: 20,
             at: Utc::now() - chrono::Duration::seconds(300),
+            cancel: None,
         });
         apply(&WalOperation::JobCancelSignaled {
             job_id: 21,
             at: Utc::now(),
+            cancel: None,
         });
         assert_eq!(job_state(&cluster, 20), Some(JobState::Completing));
         assert_eq!(job_state(&cluster, 21), Some(JobState::Completing));

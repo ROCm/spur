@@ -440,7 +440,7 @@ async fn process_assignment(
                 "PrologSlurmctld failed"
             );
             if job.spec.interactive {
-                if let Err(ce) = cluster.cancel_job(assignment.job_id, &job.spec.user) {
+                if let Err(ce) = cluster.cancel_job_as_system(assignment.job_id) {
                     error!(job_id = assignment.job_id, error = %ce, "failed to cancel job after PrologSlurmctld failure");
                 }
             } else if let Err(re) = cluster.requeue_job(assignment.job_id) {
@@ -2120,7 +2120,7 @@ fn settle_prolog_failures(
         return false;
     }
     if spec.interactive || spec.srun_job {
-        if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
+        if let Err(e) = cluster.cancel_job_as_system(job_id) {
             error!(job_id, error = %e, "failed to cancel client-attached job after prolog failure");
         }
     } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(detail), run_attempt) {
@@ -2968,7 +2968,10 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         job.job_id,
         exit_code,
         state,
-        JobEndFacts { unreported_nodes },
+        JobEndFacts {
+            unreported_nodes,
+            ..Default::default()
+        },
     ) {
         warn!(
             job_id = job.job_id,

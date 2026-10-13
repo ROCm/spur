@@ -71,6 +71,8 @@ pub enum WalOperation {
         /// force-finishes a completing run.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         unreported_nodes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::end_reason::CancelProvenance>,
     },
     JobNodeComplete {
         job_id: JobId,
@@ -92,6 +94,8 @@ pub enum WalOperation {
     JobCancelSignaled {
         job_id: JobId,
         at: chrono::DateTime<chrono::Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::end_reason::CancelProvenance>,
     },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
@@ -383,6 +387,17 @@ impl WalOperation {
             exit_code,
             state,
             unreported_nodes: Vec::new(),
+            cancel: None,
+        }
+    }
+
+    pub fn job_cancelled(job_id: JobId, cancel: crate::end_reason::CancelProvenance) -> Self {
+        Self::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Cancelled,
+            unreported_nodes: Vec::new(),
+            cancel: Some(cancel),
         }
     }
 
@@ -1393,13 +1408,18 @@ mod suspend_wal_tests {
     #[test]
     fn job_cancel_signaled_op_round_trips() {
         let at = chrono::Utc::now();
-        let op = WalOperation::JobCancelSignaled { job_id: 21, at };
+        let op = WalOperation::JobCancelSignaled {
+            job_id: 21,
+            at,
+            cancel: None,
+        };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobCancelSignaled {
                 job_id,
                 at: at_back,
+                ..
             } => {
                 assert_eq!(job_id, 21);
                 assert_eq!(at_back, at);
@@ -1416,6 +1436,20 @@ mod suspend_wal_tests {
             op,
             WalOperation::JobComplete { job_id: 5, ref unreported_nodes, .. }
                 if unreported_nodes.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_cancel_signal_written_before_provenance_existed_still_replays() {
+        let old = r#"{"JobCancelSignaled":{"job_id":5,"at":"2026-10-13T00:00:00Z"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobCancelSignaled {
+                job_id: 5,
+                cancel: None,
+                ..
+            }
         ));
     }
 

@@ -3,7 +3,30 @@
 
 //! Why a job's run ended, as recorded in accounting.
 
+use serde::{Deserialize, Serialize};
+
 use crate::job::{Job, JobId, JobState, PendingReason};
+
+/// Who cancelled a run, carried on the WAL entry that records the cancel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelProvenance {
+    /// `"User"`, `"Admin"` or `"System"`. A string so a later origin cannot make
+    /// an older replica fail to read the entry.
+    pub origin: String,
+    pub user: String,
+    #[serde(default)]
+    pub uid: Option<u32>,
+}
+
+impl CancelProvenance {
+    pub fn system() -> Self {
+        Self {
+            origin: "System".into(),
+            user: String::new(),
+            uid: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndReason {
@@ -20,6 +43,9 @@ pub enum EndReason {
     NodeDown,
     JobLaunchFailure,
     CompletingTimeout,
+    UserCancel,
+    AdminCancel,
+    SystemCancel,
 }
 
 impl EndReason {
@@ -39,7 +65,17 @@ impl EndReason {
             EndReason::NodeDown => "NodeDown",
             EndReason::JobLaunchFailure => "JobLaunchFailure",
             EndReason::CompletingTimeout => "CompletingTimeout",
+            EndReason::UserCancel => "UserCancel",
+            EndReason::AdminCancel => "AdminCancel",
+            EndReason::SystemCancel => "SystemCancel",
         }
+    }
+
+    fn is_cancel(self) -> bool {
+        matches!(
+            self,
+            EndReason::UserCancel | EndReason::AdminCancel | EndReason::SystemCancel
+        )
     }
 }
 
@@ -60,7 +96,7 @@ impl Job {
                     self.preempt_qos.as_deref(),
                 )),
             ),
-            JobState::Cancelled => (EndReason::Cancelled, None),
+            JobState::Cancelled => (self.cancel_reason(), None),
             JobState::Requeued => (EndReason::Requeued, None),
             JobState::NodeFail if self.pending_reason == PendingReason::JobLaunchFailure => (
                 EndReason::JobLaunchFailure,
@@ -70,6 +106,21 @@ impl Job {
             JobState::Pending | JobState::Running | JobState::Completing | JobState::Suspended => {
                 (EndReason::None, None)
             }
+        }
+    }
+
+    /// The canceller, only when the run ended as one of the cancel codes; a
+    /// cancel that lost to a time limit or an OOM names nobody.
+    pub fn ended_by(&self, reason: EndReason) -> Option<&CancelProvenance> {
+        self.cancelled_by.as_ref().filter(|_| reason.is_cancel())
+    }
+
+    fn cancel_reason(&self) -> EndReason {
+        match self.cancelled_by.as_ref().map(|c| c.origin.as_str()) {
+            Some("User") => EndReason::UserCancel,
+            Some("Admin") => EndReason::AdminCancel,
+            Some("System") => EndReason::SystemCancel,
+            _ => EndReason::Cancelled,
         }
     }
 
@@ -155,6 +206,9 @@ mod tests {
             (EndReason::NodeDown, "NodeDown"),
             (EndReason::JobLaunchFailure, "JobLaunchFailure"),
             (EndReason::CompletingTimeout, "CompletingTimeout"),
+            (EndReason::UserCancel, "UserCancel"),
+            (EndReason::AdminCancel, "AdminCancel"),
+            (EndReason::SystemCancel, "SystemCancel"),
         ];
         for (reason, spelling) in pinned {
             assert_eq!(reason.as_str(), spelling);
@@ -272,6 +326,50 @@ mod tests {
             killed.end_reason(JobState::Cancelled).0,
             EndReason::Cancelled
         );
+    }
+
+    fn cancelled_by(origin: &str) -> Job {
+        let mut job = job();
+        job.cancelled_by = Some(CancelProvenance {
+            origin: origin.into(),
+            user: "alice".into(),
+            uid: Some(1001),
+        });
+        job
+    }
+
+    #[test]
+    fn a_cancel_is_labelled_by_who_issued_it() {
+        for (origin, code) in [
+            ("User", EndReason::UserCancel),
+            ("Admin", EndReason::AdminCancel),
+            ("System", EndReason::SystemCancel),
+        ] {
+            assert_eq!(cancelled_by(origin).end_reason(JobState::Cancelled).0, code);
+        }
+    }
+
+    #[test]
+    fn a_cancel_with_no_or_unknown_origin_stays_cancelled() {
+        assert_eq!(
+            job().end_reason(JobState::Cancelled).0,
+            EndReason::Cancelled
+        );
+        assert_eq!(
+            cancelled_by("Robot").end_reason(JobState::Cancelled).0,
+            EndReason::Cancelled
+        );
+    }
+
+    #[test]
+    fn only_a_cancel_code_names_the_canceller() {
+        let job = cancelled_by("User");
+        assert_eq!(
+            job.ended_by(EndReason::UserCancel).map(|c| c.user.as_str()),
+            Some("alice")
+        );
+        assert!(job.ended_by(EndReason::TimeLimit).is_none());
+        assert!(job.ended_by(EndReason::Cancelled).is_none());
     }
 
     #[test]

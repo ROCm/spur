@@ -103,6 +103,7 @@ pub fn sacct_header(spec: char) -> &'static str {
         'W' => "Borrowed",
         'r' => "Reason",
         'z' => "ReasonDetail",
+        'e' => "EndedBy",
         _ => "?",
     }
 }
@@ -133,6 +134,7 @@ fn sacct_field_spec(name: &str) -> Option<char> {
         "borrowed" => Some('W'),
         "reason" => Some('r'),
         "reasondetail" => Some('z'),
+        "endedby" => Some('e'),
         _ => None,
     }
 }
@@ -280,6 +282,13 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
             }
         }
         'z' => job.end_reason_detail.clone(),
+        'e' => {
+            if job.ended_by.is_empty() {
+                "N/A".into()
+            } else {
+                job.ended_by.clone()
+            }
+        }
         _ => "?".into(),
     }
 }
@@ -357,6 +366,14 @@ mod tests {
             "exit 127: command not found (shell convention)"
         );
         assert_eq!(resolve_sacct_field(&job(0, 0, 0), 'z'), "");
+    }
+
+    #[test]
+    fn ended_by_names_the_canceller_or_na() {
+        let mut j = job(0, 0, 0);
+        j.ended_by = "alice".into();
+        assert_eq!(resolve_sacct_field(&j, 'e'), "alice");
+        assert_eq!(resolve_sacct_field(&job(0, 0, 0), 'e'), "N/A");
     }
 
     #[test]
@@ -491,6 +508,7 @@ mod tests {
             "borrowed",
             "reason",
             "reasondetail",
+            "endedby",
         ];
         let job = JobInfo::default();
         for name in names {

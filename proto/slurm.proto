@@ -308,6 +308,10 @@ message JobInfo {
   // queries and on rows written before this field existed.
   string end_reason = 81;
   string end_reason_detail = 82;
+  // Who cancelled the run, for a cancel reason only. Blank unless the caller
+  // may read the audit log.
+  string ended_by = 83;
+  optional uint32 ended_by_uid = 84;
 }
 
 message NodeInfo {

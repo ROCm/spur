@@ -433,7 +433,7 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
 ``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
-``Borrowed``, ``Reason``, and ``ReasonDetail``. Set a per-field width with
+``Borrowed``, ``Reason``, ``ReasonDetail``, and ``EndedBy``. Set a per-field width with
 ``Field%N``, e.g. ``JobName%20``.
 
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
@@ -507,9 +507,23 @@ example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
      - PREEMPTED
      - A higher-priority job preempted it; the detail names that job and its
        QOS.
+   * - ``UserCancel``
+     - CANCELLED
+     - The job's owner cancelled it.
+   * - ``AdminCancel``
+     - CANCELLED
+     - An operator or administrator cancelled someone else's job.
+   * - ``SystemCancel``
+     - CANCELLED
+     - Spur cancelled it: a dependency that can never be met, an ended
+       reservation, a failed prolog on an interactive or ``srun`` job, or an
+       in-cluster daemon (including an FFI ``slurm_kill_job`` call made
+       without credentials).
    * - ``Cancelled``
      - CANCELLED
-     - The job was cancelled.
+     - Cancelled, but who did it was not recorded: the job was cancelled
+       before this release, or by an older controller during a rolling
+       upgrade.
    * - ``Requeued``
      - REQUEUED
      - The job's owner or an operator requeued it while it was running.
@@ -519,6 +533,13 @@ example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
    * - ``JobLaunchFailure``
      - NODE_FAIL
      - The job could not be started on every node; the detail says why.
+
+``EndedBy`` is the user who cancelled the job, for ``UserCancel`` and
+``AdminCancel``; a ``SystemCancel`` has no user and, like every other reason,
+shows ``N/A``. It is shown to operators and administrators, the same audience as
+``sacctmgr show txn``; for anyone else it reads ``N/A``. When ``[auth]`` runs in
+``disabled`` or ``permissive`` mode an unauthenticated caller counts as that
+audience, as it does for the audit log.
 
 ``Reason`` reads ``N/A`` for a job that is still running, for rows written
 before this field existed, and for rows written through the external
