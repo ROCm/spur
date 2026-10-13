@@ -103,9 +103,9 @@ jobs:
               return;
             }
 
-            const sha = '${{ github.event.workflow_run.head_sha }}';
-            const conclusion = '${{ github.event.workflow_run.conclusion }}';
-            const draftSkip = '${{ steps.draft-check.outputs.skip }}' === 'true';
+            const sha = process.env.HEAD_SHA;
+            const conclusion = process.env.CONCLUSION;
+            const draftSkip = process.env.DRAFT_SKIP === 'true';
 
             let state, desc;
             if (draftSkip) {
@@ -126,9 +126,14 @@ jobs:
                 state,
                 context: ctx,
                 description: desc,
-                target_url: '${{ github.event.workflow_run.html_url }}'
+                target_url: process.env.CI_RUN_URL
               });
             }
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          DRAFT_SKIP: ${{ steps.draft-check.outputs.skip }}
+          CI_RUN_URL: ${{ github.event.workflow_run.html_url }}
 
   mark-running:
     name: Mark E2E running
@@ -152,13 +157,16 @@ jobs:
             for (const ctx of contexts) {
               await github.rest.repos.createCommitStatus({
                 owner: context.repo.owner, repo: context.repo.repo,
-                sha: '${{ github.event.workflow_run.head_sha }}',
+                sha: process.env.HEAD_SHA,
                 state: 'pending',
-                target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+                target_url: process.env.RUN_URL,
                 context: ctx,
                 description: 'Running E2E tests...'
               });
             }
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   native-host:
     name: native-host (${{ matrix.pool }} ${{ matrix.shard_id }}/${{ matrix.shard_count }})
@@ -581,18 +589,22 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const result = '${{ needs.native-host.result }}';
+            const result = process.env.RESULT;
             const state = result === 'success'
               ? 'success'
               : (result === 'cancelled' ? 'error' : 'failure');
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
+              sha: process.env.HEAD_SHA,
               state,
-              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: '${{ env.STATUS_CONTEXT }}',
+              target_url: process.env.RUN_URL,
+              context: process.env.STATUS_CONTEXT,
               description: result === 'success' ? 'passed' : result
             });
+        env:
+          RESULT: ${{ needs.native-host.result }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
   report-k8s:
     name: Report k8s status
@@ -606,15 +618,19 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
-            const result = '${{ needs.k8s.result }}';
+            const result = process.env.RESULT;
             const state = result === 'success'
               ? 'success'
               : (result === 'cancelled' ? 'error' : 'failure');
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner, repo: context.repo.repo,
-              sha: '${{ github.event.workflow_run.head_sha }}',
+              sha: process.env.HEAD_SHA,
               state,
-              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-              context: '${{ env.STATUS_CONTEXT }}',
+              target_url: process.env.RUN_URL,
+              context: process.env.STATUS_CONTEXT,
               description: result === 'success' ? 'passed' : result
             });
+        env:
+          RESULT: ${{ needs.k8s.result }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
