@@ -1,9 +1,13 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use clap::Parser;
-use spur_proto::proto::{GetJobsRequest, GetPartitionsRequest, JobState};
+use spur_proto::proto::{
+    GetFairshareFactorsRequest, GetJobsRequest, GetPartitionsRequest, JobState,
+};
 
 /// View job priority breakdown for pending jobs.
 #[derive(Parser, Debug)]
@@ -60,7 +64,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let channel = crate::authclient::connect(&args.controller)
         .await
         .context("failed to connect to spurctld")?;
-    let mut client = spur_proto::controller_client(channel);
+    let mut client = spur_proto::controller_client(channel.clone());
 
     // Get pending jobs only (priority is relevant for pending jobs)
     let response = client
@@ -90,6 +94,29 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     let partitions = partitions_resp.into_inner().partitions;
 
+    // Fetch fairshare factors from the accounting service (same endpoint)
+    let fairshare_map: HashMap<(String, String), f64> = {
+        let mut acct_client = spur_proto::accounting_client(channel);
+        match acct_client
+            .get_fairshare_factors(GetFairshareFactorsRequest { halflife_days: 0 })
+            .await
+        {
+            Ok(resp) => resp
+                .into_inner()
+                .entries
+                .into_iter()
+                .map(|e| ((e.user, e.account), e.factor))
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "sprio: warning: could not fetch fair-share factors: {e}\n\
+                     FAIRSHARE column will show 1.0 (neutral)."
+                );
+                HashMap::new()
+            }
+        }
+    };
+
     let now = chrono::Utc::now();
 
     if args.long {
@@ -116,8 +143,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .unwrap_or(1);
 
             let base = job.priority;
-            // Approximate fair_share as 1.0 since we don't have usage data here
-            let fair_share = 1.0_f64;
+            let fair_share = fairshare_map
+                .get(&(job.user.clone(), job.account.clone()))
+                .copied()
+                .unwrap_or(1.0);
             let effective =
                 (base as f64 * fair_share.min(10.0) * age_factor * partition_tier.max(1) as f64)
                     as u32;
@@ -161,9 +190,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .map(|p| p.priority_tier)
                 .unwrap_or(1);
 
+            let fair_share = fairshare_map
+                .get(&(job.user.clone(), job.account.clone()))
+                .copied()
+                .unwrap_or(1.0);
+
             println!(
                 "{:>10} {:>10} {:>10} {:>10.4} {:>10.4} {:>10}",
-                job.job_id, job.user, job.priority, age_factor, 1.0, partition_tier,
+                job.job_id, job.user, job.priority, age_factor, fair_share, partition_tier,
             );
         }
     }

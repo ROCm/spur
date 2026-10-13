@@ -1558,6 +1558,9 @@ message FairshareEntry {
 
 message GetFairshareFactorsResponse {
   repeated FairshareEntry entries = 1;
+  // The half-life the server actually used (may differ from the request
+  // when the request sent 0, meaning "use the configured default").
+  uint32 effective_halflife_days = 2;
 }
 
 // -- K8s Operator --

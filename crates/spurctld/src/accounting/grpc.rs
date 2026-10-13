@@ -9,7 +9,7 @@ use spur_core::accounting::{limit_to_wire, TresRecord};
 use spur_proto::proto::slurm_accounting_server::{SlurmAccounting, SlurmAccountingServer};
 use spur_proto::proto::*;
 
-use super::{db, fairshare, txn};
+use super::{db, txn};
 use crate::audit::Annotation;
 
 fn internal(e: impl std::fmt::Display) -> Status {
@@ -152,6 +152,7 @@ struct AccountingInner {
     reason: parking_lot::RwLock<&'static str>,
     assoc: parking_lot::RwLock<Option<std::sync::Arc<crate::association_cache::AssociationCache>>>,
     auth: parking_lot::RwLock<spur_core::config::AuthConfig>,
+    fairshare_halflife_days: std::sync::atomic::AtomicU32,
 }
 
 impl Clone for AccountingService {
@@ -170,8 +171,21 @@ impl AccountingService {
                 reason: parking_lot::RwLock::new(reason),
                 assoc: parking_lot::RwLock::new(None),
                 auth: parking_lot::RwLock::new(spur_core::config::AuthConfig::default()),
+                fairshare_halflife_days: std::sync::atomic::AtomicU32::new(0),
             }),
         }
+    }
+
+    pub(crate) fn attach_fairshare_halflife(&self, days: u32) {
+        self.inner
+            .fairshare_halflife_days
+            .store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn configured_halflife_days(&self) -> u32 {
+        self.inner
+            .fairshare_halflife_days
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Install the pool once the background bring-up connects, flipping every
@@ -253,11 +267,18 @@ impl SlurmAccounting for AccountingService {
             .map(|t| DateTime::from_timestamp(t.seconds, t.nanos as u32).unwrap_or_default())
             .unwrap_or(start_time);
 
-        let (memory_mb, cpus) = req
+        let (memory_mb, cpus, total_gpus) = req
             .resources
             .as_ref()
-            .map(|r| (r.memory_mb, r.cpus))
-            .unwrap_or((0, 1));
+            .map(|r| {
+                let gpus: u32 = r
+                    .devices
+                    .values()
+                    .map(|d| d.devices.iter().map(|a| a.count as u32).sum::<u32>())
+                    .sum();
+                (r.memory_mb, r.cpus, gpus)
+            })
+            .unwrap_or((0, 1, 0));
 
         let mut conn = pool
             .acquire()
@@ -275,6 +296,7 @@ impl SlurmAccounting for AccountingService {
                 num_nodes: 1, // simplified
                 num_tasks: cpus,
                 cpus_per_task: 1,
+                total_gpus,
                 memory_mb,
                 submit_time,
                 start_time,
@@ -312,12 +334,12 @@ impl SlurmAccounting for AccountingService {
             _ => "UNKNOWN",
         };
 
-        let mut conn = pool
-            .acquire()
+        let mut tx = pool
+            .begin()
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         db::record_job_end(
-            &mut conn,
+            &mut tx,
             req.job_id,
             state_str,
             req.exit_code,
@@ -330,6 +352,9 @@ impl SlurmAccounting for AccountingService {
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(()))
     }
@@ -976,32 +1001,27 @@ impl SlurmAccounting for AccountingService {
         request: Request<GetFairshareFactorsRequest>,
     ) -> Result<Response<GetFairshareFactorsResponse>, Status> {
         let pool = self.pool()?;
-        let pool = &pool;
         let req = request.into_inner();
-        let halflife_days = if req.halflife_days == 0 {
-            14
+
+        // When the client sends 0, use the cluster's configured half-life
+        // so sshare/sprio agree with the scheduler.
+        let halflife = if req.halflife_days == 0 {
+            self.configured_halflife_days()
         } else {
-            req.halflife_days.clamp(1, 365)
+            req.halflife_days
         };
 
-        let now = Utc::now();
-        let since = now - chrono::Duration::days(halflife_days as i64 * 4);
-
-        let usage = db::get_usage(pool, None, None, since)
+        let raw_factors = super::fairshare_factors(&pool, halflife)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let accounts = db::list_accounts(pool)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-
-        let account_weights: std::collections::HashMap<String, f64> = accounts
-            .into_iter()
-            .map(|a| (a.name, a.fairshare_weight as f64))
-            .collect();
-
-        let raw_factors =
-            fairshare::compute_fairshare(&usage, &account_weights, halflife_days, now);
+        // `fairshare_factors` normalises its input (0→14, clamp 1–365), so
+        // read back what it actually used.
+        let effective = if halflife == 0 {
+            14
+        } else {
+            halflife.clamp(1, 365)
+        };
 
         let entries = raw_factors
             .into_iter()
@@ -1012,7 +1032,10 @@ impl SlurmAccounting for AccountingService {
             })
             .collect();
 
-        Ok(Response::new(GetFairshareFactorsResponse { entries }))
+        Ok(Response::new(GetFairshareFactorsResponse {
+            entries,
+            effective_halflife_days: effective,
+        }))
     }
 
     async fn get_transactions(

@@ -111,7 +111,24 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
             }
         };
 
-    let stale = jobs_needing_resync(&expected, &accounting_states, &unknown);
+    let mut stale: Vec<JobId> = jobs_needing_resync(&expected, &accounting_states, &unknown);
+
+    // Also flag in-flight jobs whose DB row has total_gpus=0 but the
+    // in-memory spec has GPUs — covers the upgrade window where the row
+    // predates the total_gpus column.
+    for job in &candidates {
+        if stale.contains(&job.job_id) || unknown.contains(&job.job_id) {
+            continue;
+        }
+        if let Some(row) = accounting_states.get(&job.job_id) {
+            let expected_gpus =
+                spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32;
+            if expected_gpus > 0 && row.total_gpus == 0 {
+                stale.push(job.job_id);
+            }
+        }
+    }
+
     if stale.is_empty() {
         return;
     }
@@ -123,7 +140,10 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     for job in candidates.iter().filter(|j| stale.contains(&j.job_id)) {
         let row = accounting_states.get(&job.job_id);
         let row_missing = row.is_none();
-        let needs_start_backfill = row.map(|r| r.needs_start_backfill).unwrap_or(false);
+        let expected_gpus = spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32;
+        let needs_start_backfill = row
+            .map(|r| r.needs_start_backfill || (expected_gpus > 0 && r.total_gpus == 0))
+            .unwrap_or(false);
         resync_job(pool, job, row_missing, needs_start_backfill).await;
     }
 }
@@ -234,6 +254,9 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
             num_nodes: spec.num_nodes,
             num_tasks: spec.num_tasks,
             cpus_per_task: spec.cpus_per_task,
+            // spec.num_nodes is already normalised to effective_num_nodes() at
+            // submit time (cluster.rs:821), so it equals the allocated count.
+            total_gpus: spur_core::job::effective_gpus(spec, spec.num_nodes) as u32,
             memory_mb,
             submit_time: job.submit_time,
             start_time,
@@ -271,6 +294,7 @@ mod tests {
         AccountingRowState {
             state: state.to_string(),
             needs_start_backfill: false,
+            total_gpus: 0,
         }
     }
 
@@ -340,6 +364,7 @@ mod tests {
             AccountingRowState {
                 state: "COMPLETED".to_string(),
                 needs_start_backfill: true,
+                total_gpus: 0,
             },
         );
 
@@ -606,6 +631,7 @@ mod tests {
                     num_nodes: job.spec.num_nodes,
                     num_tasks: job.spec.num_tasks,
                     cpus_per_task: job.spec.cpus_per_task,
+                    total_gpus: 0,
                     memory_mb: 0,
                     submit_time: job.submit_time,
                     start_time: job.start_time.unwrap(),
