@@ -12,6 +12,8 @@ spec:
       labels:
         app: spurd
     spec:
+      # spurd reaches the cluster through the host's k0s, never a pod token.
+      automountServiceAccountToken: false
       nodeSelector:
         spur.amd.com/compute: "true"
       tolerations:

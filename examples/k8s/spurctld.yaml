@@ -35,6 +35,8 @@ spec:
       labels:
         app: spurctld
     spec:
+      # spurctld never calls the Kubernetes API, so it gets no token to leak.
+      automountServiceAccountToken: false
       securityContext:
         fsGroup: 1001
       containers:
