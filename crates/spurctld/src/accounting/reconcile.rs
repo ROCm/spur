@@ -561,6 +561,32 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn resync_job_writes_a_preempt_cancel_as_preempted() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let job_id = test_job_id(7);
+        delete_job(&pool, job_id).await;
+        let mut job = test_job(job_id, JobState::Cancelled);
+        job.cancel_signaled_at = Some(Utc::now());
+        job.preempt_mode = Some("Cancel".into());
+
+        resync_job(&pool, &job, true, false).await;
+
+        let state: String = sqlx::query("SELECT state FROM jobs WHERE job_id = $1")
+            .bind(job_id as i64)
+            .fetch_one(&pool)
+            .await?
+            .get("state");
+        delete_job(&pool, job_id).await;
+        sqlx::query("DELETE FROM usage WHERE user_name = $1")
+            .bind(&job.spec.user)
+            .execute(&pool)
+            .await?;
+        assert_eq!(state, "PREEMPTED");
+        Ok(())
+    }
+
     // End to end: a suspended job's accounting row correctly shows RUNNING
     // (accounting has no SUSPENDED state); a resync pass must not treat that
     // as stale and must not clobber the row.
