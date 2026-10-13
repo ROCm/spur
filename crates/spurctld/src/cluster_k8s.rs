@@ -926,7 +926,6 @@ impl Refusal {
     }
 }
 
-/// One outcome of a drift visit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
     Report(String, Drift),
@@ -936,13 +935,14 @@ enum Decision {
     Recurred(String),
 }
 
-/// Stops allowed fleet-wide per `STOP_BUDGET_WINDOW`.
+/// Caps what a wrong record can take down before an operator notices, however many nodes it
+/// misreports.
 const STOP_BUDGET: usize = 5;
 const STOP_BUDGET_WINDOW: Duration = Duration::from_secs(600);
 /// A node's wait between stops starts at one sweep and doubles up to an hour.
 const STOP_BACKOFF_FIRST: Duration = Duration::from_secs(600);
 const STOP_BACKOFF_MAX: Duration = Duration::from_secs(3600);
-/// Clean visits after a stop before it counts as corrected.
+/// Two, so a unit something restarts right after the stop is not counted as fixed.
 const CLEAN_VISITS_TO_CORRECT: u8 = 2;
 
 #[derive(Debug, Clone, Copy)]
@@ -996,8 +996,14 @@ impl Correction {
             .insert(node.to_string(), StopBackoff { last: now, step });
     }
 
-    /// Settle an earlier stop from this visit's reading. Success is never taken from the stop
-    /// reply, which can claim a stop that did not happen.
+    /// A node admitted back into the cluster runs k0s legitimately; an old stop must not make
+    /// that read as a stray coming back.
+    fn forget(&mut self, node: &str) {
+        self.pending.remove(node);
+        self.corrected.remove(node);
+    }
+
+    /// Success is never taken from the stop reply, which can claim a stop that did not happen.
     fn settle(&mut self, node: &str, live: Option<&ComponentStatus>) -> Option<Decision> {
         let live = live?;
         let active = live.state == "active";
@@ -1040,9 +1046,23 @@ fn decide(
 ) -> Vec<Decision> {
     let mut out = Vec::new();
     let mut stop_chosen = false;
+    // A member with no role yet is not a candidate, so it is never visited to be forgotten.
+    let members: Vec<String> = correction
+        .pending
+        .keys()
+        .chain(correction.corrected.iter())
+        .filter(|n| state.is_member(n))
+        .cloned()
+        .collect();
+    for name in members {
+        correction.forget(&name);
+    }
     for node in slice {
         let name = &node.name;
         let live = statuses.get(name);
+        if node.k0s_role.is_some() {
+            correction.forget(name);
+        }
         out.extend(correction.settle(name, live));
         let drift = classify(node, state, live);
         if drift == Drift::OutOfScope && is_stoppable(node, live) {
@@ -1982,17 +2002,16 @@ async fn stop_all_components(cluster: &ClusterManager, reset: bool) {
     }
 }
 
-/// How long a spawned start may run before its outcome counts as unknown. The agent keeps going,
-/// so a timeout is not a failure.
-const START_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bound on a spawned start. Dropping the call cancels the agent's handler, and a start may
+/// download k0s first, so this must outlast that download; anything slower has failed anyway.
+const START_TIMEOUT: Duration =
+    Duration::from_secs(spur_update::k0s::DOWNLOAD_TIMEOUT.as_secs() + 300);
 /// In `ready`, a node whose start failed waits two ticks before the next, doubling to ten minutes.
 const START_BACKOFF_FIRST: Duration = Duration::from_secs(60);
 const START_BACKOFF_MAX: Duration = Duration::from_secs(600);
-/// Consecutive unanswered starts before the node is recorded as timing out.
-const START_TIMEOUTS_TO_REPORT: u8 = 3;
 
 #[derive(Debug)]
-enum StartOutcome {
+pub(crate) enum StartOutcome {
     Started,
     Failed(String),
     TimedOut,
@@ -2015,41 +2034,32 @@ pub(crate) struct StartTracker {
     in_flight: HashMap<String, Instant>,
     outcomes: Arc<parking_lot::Mutex<Vec<(String, StartOutcome)>>>,
     backoff: HashMap<String, StartBackoff>,
-    timeouts: HashMap<String, u8>,
 }
 
 impl StartTracker {
-    /// Fold in the results of starts spawned on earlier ticks.
-    fn absorb_outcomes(&mut self, cluster: &ClusterManager, phase: K0sPhase, now: Instant) {
+    /// Fold in the results of starts spawned on earlier ticks. Results that land while the
+    /// cluster is `degraded` wait for the next `up`, since converge does not run there.
+    pub(crate) fn absorb_outcomes(
+        &mut self,
+        cluster: &ClusterManager,
+        phase: K0sPhase,
+        now: Instant,
+    ) {
         let outcomes = std::mem::take(&mut *self.outcomes.lock());
         for (node, outcome) in outcomes {
             self.in_flight.remove(&node);
-            match outcome {
-                StartOutcome::Started => {
-                    self.timeouts.remove(&node);
-                }
-                StartOutcome::Failed(detail) => self.record_failure(
-                    cluster,
-                    &node,
-                    &format!("start failed: {detail}"),
-                    phase,
-                    now,
-                ),
-                StartOutcome::TimedOut => {
-                    let count = self.timeouts.entry(node.clone()).or_default();
-                    *count += 1;
-                    if *count >= START_TIMEOUTS_TO_REPORT {
-                        self.timeouts.remove(&node);
-                        self.record_failure(cluster, &node, "start timed out", phase, now);
-                    }
-                }
-            }
+            let reason = match outcome {
+                StartOutcome::Started => continue,
+                StartOutcome::Failed(detail) => format!("start failed: {detail}"),
+                StartOutcome::TimedOut => "start timed out".to_string(),
+            };
+            self.record_failure(cluster, &node, &reason, phase, now);
         }
     }
 
-    /// A unit systemd gave up on counts as a failed start even though the agent answered
-    /// `started`. Only recorded when no other reason is, so two reasons never take turns
-    /// rewriting the record each tick.
+    /// A unit systemd gave up on is a failed start even though the agent answered `started`.
+    /// It only spaces out retries: `spur k8s status` already shows the live `failed` state, and
+    /// writing a reason here would churn the record each tick for a unit that flaps.
     fn note_failed_unit(
         &mut self,
         cluster: &ClusterManager,
@@ -2058,8 +2068,8 @@ impl StartTracker {
         phase: K0sPhase,
         now: Instant,
     ) {
-        if component == Some("failed") && node.k0s_last_error.is_none() {
-            self.record_failure(cluster, &node.name, "k0s unit failed", phase, now);
+        if component == Some("failed") && phase == K0sPhase::Ready {
+            self.arm_backoff(cluster, &node.name, now);
         }
     }
 
@@ -2078,9 +2088,12 @@ impl StartTracker {
                 .record_start_failure(&cluster.config().cluster_name);
         }
         // Provisioning keeps retrying every tick; its timeout already bounds the attempts.
-        if phase != K0sPhase::Ready {
-            return;
+        if phase == K0sPhase::Ready {
+            self.arm_backoff(cluster, node, now);
         }
+    }
+
+    fn arm_backoff(&mut self, cluster: &ClusterManager, node: &str, now: Instant) {
         let step = match self.backoff.get(node) {
             Some(b) if now < b.until => return,
             Some(b) => (b.step * 2).min(START_BACKOFF_MAX),
@@ -2101,12 +2114,20 @@ impl StartTracker {
 
     fn on_active(&mut self, node: &str) {
         self.backoff.remove(node);
-        self.timeouts.remove(node);
     }
 
-    /// Whether converge may send `node` a start now: none still running, and in `ready` no
-    /// backoff pending. A node coming back from `down`/`unknown` drops its backoff, since
-    /// whatever failed may have been fixed while it was away.
+    #[cfg(test)]
+    pub(crate) fn push_outcome(&self, node: &str, outcome: StartOutcome) {
+        self.outcomes.lock().push((node.to_string(), outcome));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_backoff(&self, node: &str) -> bool {
+        self.backoff.contains_key(node)
+    }
+
+    /// A node coming back from `down`/`unknown` drops its backoff, since whatever failed may
+    /// have been fixed while it was away.
     fn may_start(&mut self, node: &spur_core::node::Node, phase: K0sPhase, now: Instant) -> bool {
         use spur_core::node::NodeState;
         if let Some(since) = self.in_flight.get(&node.name) {
@@ -2133,8 +2154,8 @@ impl StartTracker {
     }
 }
 
-/// Record `reason` only when it differs from the node's current one, so a node that keeps failing
-/// the same way costs one Raft write rather than one per tick. Returns whether it wrote.
+/// Writes only on a change, so a node that keeps failing the same way costs one Raft write
+/// rather than one per tick.
 pub(crate) fn set_reason_if_changed(cluster: &ClusterManager, node: &str, reason: &str) -> bool {
     let current = cluster.get_node(node).and_then(|n| n.k0s_last_error);
     if current.as_deref() == Some(reason) {
@@ -2144,8 +2165,7 @@ pub(crate) fn set_reason_if_changed(cluster: &ClusterManager, node: &str, reason
     true
 }
 
-/// StartClusterComponent to a node's agent off the reconcile thread. The outcome comes back
-/// through `starts` on a later tick.
+/// Runs off the reconcile thread; the outcome is folded in on a later tick.
 fn spawn_start_component(
     cluster: &ClusterManager,
     starts: &mut StartTracker,
@@ -3343,13 +3363,36 @@ mod tests {
         enabled: bool,
         now: Instant,
     ) -> Vec<Decision> {
-        let candidates = drift_candidates(nodes, state, &HashSet::new());
-        t.roled = candidates
-            .iter()
-            .filter(|n| n.k0s_role.is_some())
-            .map(|n| n.name.clone())
-            .collect();
+        let none = HashSet::new();
+        let _ = t.next_probe(state, nodes, &none);
+        let candidates = drift_candidates(nodes, state, &none);
         decide(state, &candidates, live, t, c, enabled, now)
+    }
+
+    #[test]
+    fn a_node_admitted_back_is_not_mistaken_for_a_returning_stray() {
+        let (state, nodes, _) = stray_cluster();
+        let mut c = Correction::default();
+        c.corrected.insert("stray".into());
+        c.pending.insert("other".into(), 1);
+        let mut admitted = state.clone();
+        admitted.member_nodes.push("stray".into());
+        let live = statuses(&[
+            ("m1", live("worker", "active", true)),
+            ("stray", live("worker", "active", true)),
+        ]);
+        let mut t = DriftTracker::default();
+        let decisions = sweep(
+            &mut t,
+            &mut c,
+            &admitted,
+            &nodes,
+            &live,
+            true,
+            Instant::now(),
+        );
+        assert!(decisions.is_empty(), "{decisions:?}");
+        assert!(!c.corrected.contains("stray"));
     }
 
     fn stray_cluster() -> (

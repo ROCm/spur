@@ -965,16 +965,16 @@ cluster lifecycle and per-node health at ``/metrics/k8s``. Every series carries
      - Stopped strays whose k0s came back.
    * - ``spur_k8s_start_failures_total``
      - Nodes newly recorded as failing to start k0s.
-
-The drift counters are kept by the current leader in memory, so a controller
-restart or leader change starts them, and their episodes, over. Alert on
-``increase(...[1h]) > 0`` rather than ``rate``, which falls back to zero while
-the drift is still present. They carry no node label, to keep series bounded;
-the ``spurctld`` log line names the node.
    * - ``spur_k8s_node_up{node}``
      - Whether a node's k0s systemd unit reports active.
    * - ``spur_k8s_node_restart_total{node}`` / ``spur_k8s_install_duration_seconds{node}``
      - Per-node k0s unit restarts and install time (histogram).
+
+The drift and start-failure counters are kept by the current leader in memory,
+so a controller restart or leader change starts them, and their episodes, over.
+Alert on ``increase(...[1h]) > 0`` rather than ``rate``, which falls back to zero
+while the drift is still present. They carry no node label, to keep series
+bounded; the ``spurctld`` log line names the node.
 
 k0s component metrics *(incoming)*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

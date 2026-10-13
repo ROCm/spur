@@ -382,8 +382,9 @@ Before each stop, the controller confirms it is still the leader with a quorum
 round and that no election happened since it decided, then re-reads the node
 and the cluster record and gives up if either changed. It stops at most one
 node per tick and at most five per ten minutes, and holds back entirely while
-more than a quarter of the nodes it checks look like strays (at least two),
-because then the record is more likely wrong than the fleet. A node stopped
+the stoppable strays it sees outnumber a quarter of the nodes it compares them
+against (nodes with a role, plus nodes outside the cluster seen running k0s),
+with at least two, because then the record is more likely wrong than the fleet. A node stopped
 before waits ten minutes before another stop, doubling to an hour. A stop
 counts as done only when the next two checks find the unit stopped; if it
 comes back, that is counted separately and the wait keeps growing.
@@ -396,10 +397,13 @@ Starting nodes that should run
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 While the cluster is ``provisioning`` or ``ready``, the controller starts k0s on
-every node with a role that is not running it. A start that fails, a unit that
-systemd gives up on, or three starts in a row that get no answer within two
-minutes are recorded as the node's reason in ``spur k8s status`` and counted on
-``spur_k8s_start_failures_total``. While ``ready``, a node that keeps failing
+every node with a role that is not running it, and does not send another start
+while one is still running. A start that fails, or that gets no answer within
+fifteen minutes (long enough for the k0s download), is recorded as the node's
+reason in ``spur k8s status`` and counted on ``spur_k8s_start_failures_total``.
+During ``provisioning`` the provisioning timeout (ten minutes by default)
+usually applies first.
+While ``ready``, a node that keeps failing, or whose unit systemd gave up on,
 is retried after one minute, doubling to ten; the wait is dropped once the node
 runs, or when it comes back from ``down``.
 

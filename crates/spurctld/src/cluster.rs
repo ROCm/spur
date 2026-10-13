@@ -23076,6 +23076,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_start_is_recorded_and_backed_off_only_while_ready() {
+        use crate::cluster_k8s::{StartOutcome, StartTracker};
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("registered", || cm.get_node("node-b").is_some());
+        let reason = |n: &str| cm.get_node(n).and_then(|n| n.k0s_last_error);
+        let now = std::time::Instant::now();
+
+        let mut ready = StartTracker::default();
+        ready.join_tokens.insert("node-a".into(), "tok".into());
+        ready.push_outcome("node-a", StartOutcome::Failed("boom".into()));
+        ready.absorb_outcomes(&cm, K0sPhase::Ready, now);
+        wait_for("failure recorded", || {
+            reason("node-a").as_deref() == Some("start failed: boom")
+        });
+        assert!(!ready.join_tokens.contains_key("node-a"));
+        assert!(ready.has_backoff("node-a"));
+
+        let mut provisioning = StartTracker::default();
+        provisioning.push_outcome("node-b", StartOutcome::TimedOut);
+        provisioning.push_outcome("node-a", StartOutcome::Started);
+        provisioning.absorb_outcomes(&cm, K0sPhase::Provisioning, now);
+        wait_for("timeout recorded", || {
+            reason("node-b").as_deref() == Some("start timed out")
+        });
+        assert!(!provisioning.has_backoff("node-b"));
+        assert_eq!(reason("node-a").as_deref(), Some("start failed: boom"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unchanged_k0s_reason_is_not_written_again() {
         use crate::cluster_k8s::set_reason_if_changed;
         let dir = TempDir::new().unwrap();

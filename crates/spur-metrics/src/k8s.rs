@@ -396,7 +396,7 @@ impl K8sMetrics {
         self.drift_recurred.get_or_create(&self.base(cluster)).inc();
     }
 
-    /// Record a k0s start that failed or kept timing out.
+    /// Record a k0s start that failed or timed out.
     pub fn record_start_failure(&self, cluster: &str) {
         self.start_failures.get_or_create(&self.base(cluster)).inc();
     }
