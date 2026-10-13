@@ -6315,13 +6315,10 @@ impl ClusterManager {
                     job.preempted_by = *preempted_by;
                     job.preempt_mode = Some("Requeue".to_string());
                     job.preempt_qos = preempt_qos.clone();
-                    let desc = match preempted_by {
-                        Some(by) => match preempt_qos.as_deref() {
-                            Some(qos) => format!("preempted by job {by} (QOS: {qos})"),
-                            None => format!("preempted by job {by}"),
-                        },
-                        None => "preempted".to_string(),
-                    };
+                    let desc = spur_core::end_reason::preemption_summary(
+                        *preempted_by,
+                        preempt_qos.as_deref(),
+                    );
                     job.set_pending_reason_desc(PendingReason::Preempted, desc);
                 }
                 Self::deallocate_job_slices(

@@ -874,6 +874,12 @@ pub struct Job {
     #[serde(default)]
     pub launch_failure_detail: Option<String>,
 
+    /// Allocated nodes that never reported completion before the controller
+    /// force-finished the run. Set only by that path, so it is the one signal
+    /// that a failure was the controller giving up rather than the job's exit.
+    #[serde(default)]
+    pub unreported_nodes: Vec<String>,
+
     /// Job ID of the higher-priority job that caused this preemption. Set on
     /// both cancel and requeue preemption; `None` for jobs never preempted.
     #[serde(default)]
@@ -958,6 +964,7 @@ impl Job {
             actual_stdout_path: None,
             actual_stderr_path: None,
             launch_failure_detail: None,
+            unreported_nodes: Vec::new(),
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,
