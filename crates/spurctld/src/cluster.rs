@@ -1441,11 +1441,7 @@ impl ClusterManager {
             job.set_pending_reason(PendingReason::DeadLine);
         }
 
-        let resp = self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Deadline,
-        })?;
+        let resp = self.propose(WalOperation::job_complete(job_id, -1, JobState::Deadline))?;
         self.run_all_finalized_side_effects(&resp);
 
         info!(job_id, "job deadline passed — transitioned to DEADLINE");
@@ -1512,11 +1508,7 @@ impl ClusterManager {
             }
         }
 
-        let resp = self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Cancelled,
-        })?;
+        let resp = self.propose(WalOperation::job_complete(job_id, -1, JobState::Cancelled))?;
         self.run_all_finalized_side_effects(&resp);
 
         info!(job_id, "job cancelled");
@@ -2078,11 +2070,7 @@ impl ClusterManager {
 
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
-        let resp = self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code,
-            state,
-        })?;
+        let resp = self.propose(WalOperation::job_complete(job_id, exit_code, state))?;
         self.run_all_finalized_side_effects(&resp);
 
         debug!(job_id, exit_code, "job completed");
@@ -2645,11 +2633,7 @@ impl ClusterManager {
 
         // transition to Failed via JobComplete so node resources,
         // licenses, and steps are properly cleaned up.
-        self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Failed,
-        })?;
+        self.propose(WalOperation::job_complete(job_id, -1, JobState::Failed))?;
 
         if hold {
             self.propose(WalOperation::job_state_change_held_pending_desc(
@@ -3244,11 +3228,7 @@ impl ClusterManager {
         };
 
         if state == JobState::Running {
-            self.propose(WalOperation::JobComplete {
-                job_id,
-                exit_code: -1,
-                state: JobState::Failed,
-            })?;
+            self.propose(WalOperation::job_complete(job_id, -1, JobState::Failed))?;
             state = JobState::Failed;
         }
 
@@ -4612,11 +4592,7 @@ impl ClusterManager {
             if self.jobs.read().get(&id).map(|j| j.state) != Some(JobState::Pending) {
                 continue;
             }
-            match self.propose(WalOperation::JobComplete {
-                job_id: id,
-                exit_code: -1,
-                state: JobState::Cancelled,
-            }) {
+            match self.propose(WalOperation::job_complete(id, -1, JobState::Cancelled)) {
                 Ok(resp) => {
                     self.run_all_finalized_side_effects(&resp);
                     info!(job_id = id, "job cancelled: dependency never satisfied");
@@ -6059,6 +6035,7 @@ impl ClusterManager {
         job.allocated_resources = None;
         job.per_node_alloc.clear();
         job.node_completions.clear();
+        job.unreported_nodes.clear();
         job.time_limit_signaled_at = None;
         job.cancel_signaled_at = None;
         job.pending_reason = PendingReason::None;
@@ -6617,6 +6594,7 @@ impl ClusterManager {
                     // the finished run's record is written after that apply.
                     job.derived_exit_code = 0;
                     job.exit_signal = 0;
+                    job.unreported_nodes.clear();
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -6793,6 +6771,7 @@ impl ClusterManager {
                 job_id,
                 exit_code,
                 state,
+                unreported_nodes,
             } => {
                 let freed_nodes;
                 let allocated_resources;
@@ -6814,6 +6793,7 @@ impl ClusterManager {
                         );
                         return ClientResponse::default();
                     }
+                    job.unreported_nodes = unreported_nodes.clone();
                     if state.is_terminal() {
                         response.jobs_finalized.push(JobFinalized {
                             job_id: *job_id,
@@ -11061,11 +11041,7 @@ mod tests {
             idle_fill: false,
         });
 
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Completed,
-        });
+        cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Completed);
@@ -11086,11 +11062,7 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Cancelled));
         assert!(
             cm.get_job(1).unwrap().state.is_terminal(),
             "job 1 is terminal"
@@ -11181,11 +11153,7 @@ mod tests {
                 job_id: 1,
                 spec: Box::new(basic_spec("done")),
             });
-            cm.apply_operation(&WalOperation::JobComplete {
-                job_id: 1,
-                exit_code: 0,
-                state: JobState::Cancelled,
-            });
+            cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Cancelled));
         }
         // Divergent local end_times: skew must not change the outcome, since the
         // apply guard reads state, not end_time.
@@ -11235,11 +11203,7 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("fresh")),
         });
-        cm2.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm2.apply_operation(&WalOperation::job_complete(1, 0, JobState::Cancelled));
         cm2.evict_expired_terminal_jobs();
         assert!(
             cm2.get_job(1).is_some(),
@@ -11269,11 +11233,7 @@ mod tests {
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Cancelled));
 
         // Just completed: within the floored window, so retention 0 does not
         // evict on the next tick.
@@ -11314,11 +11274,7 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 100,
-            exit_code: 0,
-            state: JobState::Completed,
-        });
+        cm.apply_operation(&WalOperation::job_complete(100, 0, JobState::Completed));
         cm.jobs.write().get_mut(&100).unwrap().end_time =
             Some(chrono::Utc::now() - chrono::Duration::days(1));
 
@@ -11337,11 +11293,7 @@ mod tests {
         );
 
         // Once the child is gone, the target is evictable.
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 101,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&WalOperation::job_complete(101, 0, JobState::Cancelled));
         cm.jobs.write().get_mut(&101).unwrap().end_time =
             Some(chrono::Utc::now() - chrono::Duration::days(1));
         cm.evict_expired_terminal_jobs();
@@ -11370,11 +11322,7 @@ mod tests {
             job_id: id2,
             spec: Box::new(basic_spec("high")),
         });
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: id2,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&WalOperation::job_complete(id2, 0, JobState::Cancelled));
         let next_before = cm.next_job_id.load(Ordering::Relaxed);
         cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![id2] });
         assert!(cm.get_job(id2).is_none(), "high-id job evicted");
@@ -11633,11 +11581,7 @@ mod tests {
             preempted_by: None,
             preempt_qos: None,
         });
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Cancelled));
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
         assert!(
@@ -12554,11 +12498,7 @@ mod tests {
             idle_fill: false,
         });
 
-        let resp = cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Completed,
-        });
+        let resp = cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
         let f = resp
             .jobs_finalized
             .first()
@@ -12594,11 +12534,7 @@ mod tests {
             idle_fill: false,
         });
 
-        let first = cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Completed,
-        });
+        let first = cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
         assert!(
             !first.jobs_finalized.is_empty(),
             "first JobComplete should finalize"
@@ -12607,11 +12543,7 @@ mod tests {
         assert_eq!(node.alloc_resources.cpus, 0);
         assert_eq!(node.alloc_resources.memory_mb, 0);
 
-        let second = cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: -1,
-            state: JobState::Cancelled,
-        });
+        let second = cm.apply_operation(&WalOperation::job_complete(1, -1, JobState::Cancelled));
         assert!(second.jobs_finalized.is_empty());
 
         let job = cm.get_job(1).unwrap();
@@ -14818,11 +14750,7 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: -1,
-            state: JobState::Failed,
-        });
+        cm.apply_operation(&WalOperation::job_complete(1, -1, JobState::Failed));
 
         let hold = Utc::now() + chrono::Duration::seconds(40);
         let requeue = WalOperation::job_state_change_backoff_pending(
@@ -15218,18 +15146,10 @@ mod tests {
             run_attempt: 0,
             idle_fill: false,
         });
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Completed,
-        });
+        cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
 
         // Replaying the terminal complete: still Completed, resources still freed.
-        let replayed = cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Completed,
-        });
+        let replayed = cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
         assert!(replayed.jobs_finalized.is_empty());
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
@@ -15252,11 +15172,7 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+        cm.apply_operation(&WalOperation::job_complete(1, -1, JobState::Preempted));
         cm.apply_operation(&WalOperation::job_state_change(
             1,
             JobState::Preempted,
@@ -15416,11 +15332,7 @@ mod tests {
     /// jobs in PREEMPTED.
     fn preempted_job_on(cm: &ClusterManager, name: &str, node: &str) -> JobId {
         let job_id = run_job_on(cm, name, node);
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+        cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Preempted);
         job_id
     }
@@ -15459,11 +15371,7 @@ mod tests {
 
         let job_id = preempted_job_on(&cm, "replay-complete", "worker1");
 
-        let resp = cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: 0,
-            state: JobState::Completed,
-        });
+        let resp = cm.apply_operation(&WalOperation::job_complete(job_id, 0, JobState::Completed));
         assert!(
             resp.jobs_finalized.is_empty(),
             "replayed complete over PREEMPTED must not re-finalize"
@@ -18492,11 +18400,7 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+        cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         for _ in 0..5 {
             cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
@@ -18508,11 +18412,7 @@ mod tests {
                 JobState::Pending,
                 JobState::Running,
             ));
-            cm.apply_operation(&WalOperation::JobComplete {
-                job_id,
-                exit_code: -1,
-                state: JobState::Preempted,
-            });
+            cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         }
         assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
 
@@ -18542,11 +18442,7 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+        cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         for _ in 0..5 {
             cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
@@ -18558,11 +18454,7 @@ mod tests {
                 JobState::Pending,
                 JobState::Running,
             ));
-            cm.apply_operation(&WalOperation::JobComplete {
-                job_id,
-                exit_code: -1,
-                state: JobState::Preempted,
-            });
+            cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         }
         assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
 
@@ -18949,11 +18841,7 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+        cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         for _ in 0..5 {
             cm.apply_operation(&WalOperation::job_state_change(
                 job_id,
@@ -18965,11 +18853,7 @@ mod tests {
                 JobState::Pending,
                 JobState::Running,
             ));
-            cm.apply_operation(&WalOperation::JobComplete {
-                job_id,
-                exit_code: -1,
-                state: JobState::Preempted,
-            });
+            cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         }
         cm.hold_job_at_max_requeue(job_id, None).unwrap();
         wait_for("job held at max requeue", || {
@@ -18999,11 +18883,7 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+        cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Preempted);
 
         cm.cancel_job(job_id, "testuser").unwrap();
@@ -23855,11 +23735,7 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+        cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Preempted));
         let run_attempt_before = cm.get_job(job_id).unwrap().run_attempt;
 
         // Regression guard: a None call site (no new epoch presented this
@@ -24685,11 +24561,7 @@ mod tests {
         cm.set_job_output_paths(id, "/tmp/spur.out".into(), "/tmp/spur.out".into());
         assert!(cm.get_job(id).unwrap().actual_stdout_path.is_some());
 
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: id,
-            exit_code: -1,
-            state: JobState::Timeout,
-        });
+        cm.apply_operation(&WalOperation::job_complete(id, -1, JobState::Timeout));
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Timeout);
 
         // Requeue: Timeout → Pending should reset allocation fields
@@ -26400,11 +26272,7 @@ mod tests {
                 JobState::Running,
             ));
         }
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: id,
-            exit_code,
-            state,
-        });
+        cm.apply_operation(&WalOperation::job_complete(id, exit_code, state));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
