@@ -373,8 +373,6 @@ pub(crate) fn resolve_startup_jwt_key(
 }
 
 impl ControllerService {
-    // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
-    #[allow(clippy::result_large_err)]
     /// Decide whether to run this request here or forward it to the leader.
     ///
     /// The forwarded body digest is verified once, in `auth_middleware`, against the
@@ -921,7 +919,6 @@ impl ControllerService {
         )
     }
 
-    #[allow(clippy::result_large_err)]
     fn require_k0s_admin(
         &self,
         identity: Option<&spur_core::auth::Identity>,
@@ -995,7 +992,6 @@ impl ControllerService {
     /// Rejects an identified non-admin from a cluster-tenancy mutation (partitions, node placement,
     /// tokens); anonymous is allowed, matching `caller_is_privileged`. Call as a prologue, before
     /// `into_inner`. Reservations use the stricter [`Self::require_reservation_manager`].
-    #[allow(clippy::result_large_err)]
     fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
         if self.caller_is_privileged(Self::verified_identity(request)) {
             Ok(())
@@ -1106,7 +1102,6 @@ impl ControllerService {
         meta
     }
 
-    #[allow(clippy::result_large_err)]
     fn forwarded_metadata_for(
         orig: &tonic::metadata::MetadataMap,
         identity: Option<&spur_core::auth::Identity>,
@@ -1162,7 +1157,6 @@ impl ControllerService {
     /// the only registration path that makes a caller *prove* an identity
     /// rather than merely assert a hostname, and stepd recovery's fencing
     /// action must not trust an unproven claim.
-    #[allow(clippy::result_large_err)]
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
@@ -1200,7 +1194,6 @@ impl ControllerService {
             )
     }
 
-    #[allow(clippy::result_large_err)]
     fn mint_node_token(&self, hostname: &str) -> Result<String, Status> {
         if let Some(signer) = crate::native_keys::node_signer() {
             let now = spur_core::native_mint::unix_now().unwrap_or(0);
@@ -1214,7 +1207,6 @@ impl ControllerService {
 
     /// Gates on controller configuration, never on whether the request carried a
     /// token — keying it on the request would let any caller skip verification.
-    #[allow(clippy::result_large_err)]
     fn verify_node_identity(&self, hostname: &str, node_token: &str) -> Result<(), Status> {
         if !self.enforces_node_identity() {
             return Ok(());
@@ -1225,7 +1217,6 @@ impl ControllerService {
         self.verify_issued_node_token(hostname, node_token)
     }
 
-    #[allow(clippy::result_large_err)]
     fn verify_issued_node_token(&self, hostname: &str, node_token: &str) -> Result<(), Status> {
         if let Some(signer) = crate::native_keys::node_signer() {
             let now = spur_core::native_mint::unix_now().unwrap_or(0);
@@ -4291,7 +4282,6 @@ impl SlurmController for ControllerService {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Separate from [`serve`] so `main` can hand a clone to the REST server, which
 /// dispatches into these handlers instead of reaching past them into the cluster.
 pub fn build_service(
@@ -4595,8 +4585,6 @@ fn select_step_node<'a>(allocated: &'a [String], requested: &str) -> Result<&'a 
 
 // ---- Proto conversion helpers ----
 
-// tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
-#[allow(clippy::result_large_err)]
 fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     let mut gres = spec.gres;
     for lic in &spec.licenses {
@@ -5565,7 +5553,6 @@ fn reports_whole_job(step_id: Option<spur_core::step::StepId>) -> bool {
     }
 }
 
-#[allow(clippy::result_large_err)]
 fn validate_completion_report_state_for_rpc(
     state: spur_core::job::JobState,
     exit_code: i32,

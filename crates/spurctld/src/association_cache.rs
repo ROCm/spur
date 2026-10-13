@@ -214,7 +214,6 @@ impl AssociationCache {
         all
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn replace(
         &self,
         default_qos: HashMap<(String, String), String>,

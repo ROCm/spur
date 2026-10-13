@@ -151,7 +151,6 @@ pub fn create_details(
 }
 
 /// Details for a reservation update attempt (the requested deltas).
-#[allow(clippy::too_many_arguments)]
 pub fn update_details(
     duration_minutes: u32,
     add_nodes: &[String],

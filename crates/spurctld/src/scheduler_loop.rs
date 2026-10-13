@@ -2130,7 +2130,6 @@ fn settle_prolog_failures(
 }
 
 /// Register a srun-only allocation on every assigned node.
-#[allow(clippy::too_many_arguments)]
 async fn register_allocation_on_nodes(
     cluster: Arc<ClusterManager>,
     job_id: spur_core::job::JobId,

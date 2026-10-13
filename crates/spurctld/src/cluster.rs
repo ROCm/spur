@@ -3953,7 +3953,6 @@ impl ClusterManager {
 
     /// Record an srun step's completion via Raft so the step exit code and the
     /// job's running-max DerivedExitCode are durable and replay-consistent.
-    #[allow(clippy::result_large_err)]
     pub fn record_step_complete(
         &self,
         job_id: JobId,
