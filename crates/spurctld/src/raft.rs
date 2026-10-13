@@ -22,6 +22,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use spur_core::end_reason::EndReason;
+use spur_core::job::{Job, JobState};
 use spur_core::wal::WalOperation;
 
 pub type NodeId = u64;
@@ -62,11 +64,30 @@ pub(crate) fn raft_client(
 }
 
 /// Set when a committed WAL entry transitions a job to a terminal state.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobFinalized {
     pub job_id: u32,
-    pub state: spur_core::job::JobState,
+    pub state: JobState,
     pub exit_code: i32,
+    /// Computed in apply, so a later entry cannot change it before the
+    /// accounting write reads it.
+    #[serde(skip)]
+    pub reason: EndReason,
+    #[serde(skip)]
+    pub reason_detail: Option<String>,
+}
+
+impl JobFinalized {
+    pub fn for_job(job: &Job, state: JobState, exit_code: i32) -> Self {
+        let (reason, reason_detail) = job.end_reason(state);
+        Self {
+            job_id: job.job_id,
+            state,
+            exit_code,
+            reason,
+            reason_detail,
+        }
+    }
 }
 
 /// Response returned after a Raft write is committed.

@@ -2204,7 +2204,7 @@ impl ClusterManager {
         }
     }
 
-    fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
+    fn run_job_finalized_side_effects(&self, finalized: &JobFinalized) {
         if let Some(stats) = self.sched_stats.get() {
             stats.record_finalized();
             // Preempt-cancel and preempt-requeue are the only sources of a
@@ -2220,7 +2220,7 @@ impl ClusterManager {
 
     fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
         for f in &resp.jobs_finalized {
-            self.run_job_finalized_side_effects(*f);
+            self.run_job_finalized_side_effects(f);
         }
     }
 
@@ -6145,11 +6145,11 @@ impl ClusterManager {
             job_id,
         );
 
-        Some(JobFinalized {
-            job_id,
-            state: job.end_of_run_state(evicted_state),
-            exit_code: -1,
-        })
+        Some(JobFinalized::for_job(
+            job,
+            job.end_of_run_state(evicted_state),
+            -1,
+        ))
     }
 
     /// Fail all running/completing/suspended jobs on a node, releasing
@@ -6280,6 +6280,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let finalized;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -6315,6 +6316,7 @@ impl ClusterManager {
                     job.preempted_by = *preempted_by;
                     job.preempt_mode = Some("Requeue".to_string());
                     job.preempt_qos = preempt_qos.clone();
+                    finalized = JobFinalized::for_job(job, JobState::Preempted, -1);
                     let desc = spur_core::end_reason::preemption_summary(
                         *preempted_by,
                         preempt_qos.as_deref(),
@@ -6336,11 +6338,7 @@ impl ClusterManager {
                 self.complete_job_steps(job_id, -1, timestamp);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
-                    jobs_finalized: vec![JobFinalized {
-                        job_id: *job_id,
-                        state: JobState::Preempted,
-                        exit_code: -1,
-                    }],
+                    jobs_finalized: vec![finalized],
                     ..Default::default()
                 };
             }
@@ -6353,7 +6351,7 @@ impl ClusterManager {
                 // accounting/steps see a finished run) then re-pended; an
                 // already-terminal job re-pends with no second finalization to
                 // avoid double-counting. NoOp on replay / non-requeuable states.
-                let was_live;
+                let finalized;
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
@@ -6363,7 +6361,7 @@ impl ClusterManager {
                     };
                     match job.state {
                         JobState::Running | JobState::Suspended => {
-                            was_live = true;
+                            finalized = Some(JobFinalized::for_job(job, JobState::Requeued, -1));
                             if let Some(since) = job.suspended_at.take() {
                                 job.suspended_secs += (timestamp - since).num_seconds().max(0);
                             }
@@ -6376,7 +6374,7 @@ impl ClusterManager {
                         s if s.is_terminal() => {
                             // The slice was already freed at completion; freeing
                             // again would double-subtract on any shared node.
-                            was_live = false;
+                            finalized = None;
                             freed_nodes = Vec::new();
                             allocated_resources = None;
                             per_node_map = HashMap::new();
@@ -6419,17 +6417,13 @@ impl ClusterManager {
                 drop(jobs);
                 drop(nodes);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
-                if was_live {
+                if let Some(finalized) = finalized {
                     // Complete steps and fire accounting-end for the terminated
                     // run as REQUEUED; the terminal path already did this at its
                     // real completion, so it emits nothing here (no double-count).
                     self.complete_job_steps(job_id, -1, timestamp);
                     return ClientResponse {
-                        jobs_finalized: vec![JobFinalized {
-                            job_id: *job_id,
-                            state: JobState::Requeued,
-                            exit_code: -1,
-                        }],
+                        jobs_finalized: vec![finalized],
                         ..Default::default()
                     };
                 }
@@ -6445,6 +6439,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let finalized;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -6465,6 +6460,7 @@ impl ClusterManager {
                     job.preempt_mode = Some("Cancel".to_string());
                     job.preempt_qos = preempt_qos.clone();
                     job.cancel_signaled_at = Some(at);
+                    finalized = JobFinalized::for_job(job, JobState::Preempted, -1);
 
                     // The killed run still occupies its nodes; wait in Completing
                     // until each reports, then finalize as CANCELLED / PREEMPTED.
@@ -6518,11 +6514,7 @@ impl ClusterManager {
                 self.complete_job_steps(job_id, -1, timestamp);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
-                    jobs_finalized: vec![JobFinalized {
-                        job_id: *job_id,
-                        state: JobState::Preempted,
-                        exit_code: -1,
-                    }],
+                    jobs_finalized: vec![finalized],
                     ..Default::default()
                 };
             }
@@ -6722,7 +6714,11 @@ impl ClusterManager {
                                 job.set_pending_reason(final_reason);
                                 job.end_time = Some(timestamp);
                                 job.node_completions.clear();
-                                Some((job.end_of_run_state(final_state), final_exit))
+                                Some(JobFinalized::for_job(
+                                    job,
+                                    job.end_of_run_state(final_state),
+                                    final_exit,
+                                ))
                             }
                             Err(e) => {
                                 warn!(
@@ -6738,17 +6734,13 @@ impl ClusterManager {
                     }
                 };
 
-                if let Some((reported_state, final_exit)) = finalized {
+                if let Some(finalized) = finalized {
                     drop(jobs);
                     drop(nodes);
-                    self.complete_job_steps(job_id, final_exit, timestamp);
+                    self.complete_job_steps(job_id, finalized.exit_code, timestamp);
                     self.next_job_id.store(next_id, Ordering::Relaxed);
                     return ClientResponse {
-                        jobs_finalized: vec![JobFinalized {
-                            job_id: *job_id,
-                            state: reported_state,
-                            exit_code: final_exit,
-                        }],
+                        jobs_finalized: vec![finalized],
                         ..Default::default()
                     };
                 }
@@ -6817,19 +6809,19 @@ impl ClusterManager {
                         return ClientResponse::default();
                     }
                     job.unreported_nodes = unreported_nodes.clone();
-                    if state.is_terminal() {
-                        response.jobs_finalized.push(JobFinalized {
-                            job_id: *job_id,
-                            state: job.end_of_run_state(*state),
-                            exit_code: *exit_code,
-                        });
-                    }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
                     // Derived from the replicated entry, so every replica reports
                     // the same reason for a job the watchdog had to force-kill.
                     if *state == JobState::Timeout {
                         job.set_pending_reason(PendingReason::TimeLimit);
+                    }
+                    if state.is_terminal() {
+                        response.jobs_finalized.push(JobFinalized::for_job(
+                            job,
+                            job.end_of_run_state(*state),
+                            *exit_code,
+                        ));
                     }
                     // Suspended -> terminal: fold the final suspended interval in
                     // and clear suspended_at so it never lingers on a terminal job.
@@ -13314,6 +13306,252 @@ mod tests {
             job.end_reason(JobState::Failed).0,
             EndReason::NonZeroExitCode
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_completion_reports_this_runs_exit_code() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "exit-127", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::job_complete(job_id, 127, JobState::Failed));
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::NonZeroExitCode);
+        assert!(fin
+            .reason_detail
+            .as_deref()
+            .unwrap()
+            .contains("command not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_completion_reports_a_signal_as_raised_signal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "segv", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: 11,
+        });
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::RaisedSignal);
+        assert_eq!(
+            fin.reason_detail.as_deref(),
+            Some("signal 11 (Segmentation_fault)")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launch_eviction_reports_the_launch_detail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "launch-evict", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::JobEvict {
+            job_id,
+            detail: Some("pmix bootstrap timed out".into()),
+        });
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::JobLaunchFailure);
+        assert_eq!(
+            fin.reason_detail.as_deref(),
+            Some("pmix bootstrap timed out")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_going_down_reports_node_down() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        run_job_on(&cm, "node-down", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "worker1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("Not responding".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+
+        assert_eq!(resp.jobs_finalized[0].reason, EndReason::NodeDown);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preempt_requeue_reports_preempted_and_who_preempted_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "preempt-requeue", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id,
+            begin_time: Utc::now(),
+            preempted_by: Some(job_id + 1),
+            preempt_qos: None,
+        });
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::Preempted);
+        assert_eq!(
+            fin.reason_detail.as_deref(),
+            Some(format!("preempted by job {}", job_id + 1).as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_requeue_of_a_running_job_reports_requeued() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "user-requeue", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+        });
+
+        assert_eq!(resp.jobs_finalized[0].reason, EndReason::Requeued);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missed_deadline_reports_deadline() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("deadline"));
+
+        let resp = cm.apply_operation(&WalOperation::job_complete(job_id, -1, JobState::Deadline));
+
+        assert_eq!(resp.jobs_finalized[0].reason, EndReason::DeadLine);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_primary_node_decides_a_multi_node_outcome() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+        let mut spec = basic_spec("two-node");
+        spec.num_nodes = 2;
+        let job_id = submit_and_wait(&cm, spec);
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into(), "worker2".into()],
+            resources.clone(),
+            per_node_for(&["worker1", "worker2"], resources),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "worker2".into(),
+            exit_code: 1,
+            signal: 0,
+        });
+        let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: 0,
+        });
+
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.state, JobState::Completed);
+        assert_eq!(fin.reason, EndReason::None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_srun_step_under_a_clean_script_is_no_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "step-fail", "worker1");
+
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id,
+            step_id: 0,
+            exit_code: 3,
+        });
+        let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: 0,
+        });
+
+        assert_eq!(resp.jobs_finalized[0].reason, EndReason::None);
+        assert_eq!(cm.get_job(job_id).unwrap().derived_exit_code, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_requeue_after_finalize_does_not_change_the_reported_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "requeue-race", "worker1");
+
+        let resp = cm.apply_operation(&WalOperation::job_complete(job_id, 127, JobState::Failed));
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: false,
+            begin_time: None,
+        });
+
+        let requeued = cm.get_job(job_id).unwrap();
+        assert_eq!(requeued.exit_code, None);
+        assert_eq!(
+            requeued.end_reason(JobState::Failed).1,
+            None,
+            "a live read would lose the detail"
+        );
+        let fin = &resp.jobs_finalized[0];
+        assert_eq!(fin.reason, EndReason::NonZeroExitCode);
+        assert!(fin
+            .reason_detail
+            .as_deref()
+            .unwrap()
+            .contains("command not found"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_time_limit_outranks_the_kill_signal_and_oom_outranks_both() {
+        for (signal, expected) in [
+            (9, EndReason::TimeLimit),
+            (15, EndReason::TimeLimit),
+            (9 | spur_core::job::OOM_SIGNAL_FLAG, EndReason::OutOfMemory),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "worker1", 8, 16000);
+            let job_id = run_job_on(&cm, "time-limit", "worker1");
+            cm.apply_operation(&WalOperation::JobTimeLimitSignaled {
+                job_id,
+                at: Utc::now(),
+            });
+
+            let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+                job_id,
+                node_name: "worker1".into(),
+                exit_code: 0,
+                signal,
+            });
+
+            assert_eq!(resp.jobs_finalized[0].reason, expected, "signal {signal}");
+        }
     }
 
     /// Drive an already-submitted job to RUNNING on `node`.
