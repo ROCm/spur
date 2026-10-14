@@ -1,6 +1,8 @@
-# Trusted workflow: runs in the base repo context via workflow_run so self-hosted
-# runners and the workflow YAML are never exposed to untrusted fork code.
-# Untrusted code (binaries + pytest) runs ONLY inside disposable driver VMs.
+# Trusted workflow: workflow_run runs this file from the default branch, never
+# the PR's copy. Fork-built artifacts (binaries, e2e-assets, image tar) only
+# pass through the self-hosted runner and execute ONLY inside disposable VMs.
+# Never execute or source artifact content on the runner, and never check out
+# workflow_run.head_sha here. Fork CI runs need maintainer approval.
 #
 # Tests are routed to two runner pools by an auto-applied `gpu` marker
 # (see tests/native_host/e2e/conftest.py): GPU tests to `gpu` runners, the rest
@@ -24,7 +26,7 @@
 name: E2E
 
 on:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] fork artifacts run only in VMs, see header
     workflows: ["CI"]
     types: [completed]
 
