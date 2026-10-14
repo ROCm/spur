@@ -227,7 +227,6 @@ async fn main() -> anyhow::Result<()> {
             provisioning_timeout: std::time::Duration::from_secs(
                 config.cluster.k8s_provisioning_timeout_secs,
             ),
-            drift_correction: config.cluster.k8s_drift_correction,
         };
         tokio::spawn(async move {
             cluster_k8s::run(k8s_cluster, k8s_raft, k8s_net).await;

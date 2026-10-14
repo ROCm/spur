@@ -41,17 +41,16 @@ def k8s_drift_cluster(unstarted_cluster):
         agent_as_root=True,
     )
     yield unstarted_cluster
-    try:
-        unstarted_cluster.k8s_down(reset=True)
-        _wait_torn_down(unstarted_cluster)
-    except Exception:
-        pass
+    # A teardown that does not converge must fail loudly: it leaves k0s behind for the next run.
+    unstarted_cluster.k8s_down(reset=True)
+    _wait_torn_down(unstarted_cluster)
 
 
 def _wait_torn_down(cluster, timeout: int = 180) -> None:
     """`k8s down` only asks; the reconcile loop stops and resets each node over later ticks
     and clears its role once k0s is gone. Killing spurd first would leave k0s running."""
     deadline = time.time() + timeout
+    rows: list[str] = []
     while time.time() < deadline:
         rows = [
             line
@@ -61,6 +60,7 @@ def _wait_torn_down(cluster, timeout: int = 180) -> None:
         if not rows:
             return
         time.sleep(5)
+    raise TimeoutError(f"k0s teardown did not finish within {timeout}s: {rows}")
 
 
 @contextmanager
@@ -76,9 +76,14 @@ def stray_k0s_worker(cluster, node_index: int, spurd_owned: bool = False):
         pytest.skip(f"a stray k0s unit needs sudo on {cluster.node_names[node_index]}")
     if "active" in node.exec_allow_fail("systemctl is-active k0sworker k0scontroller").split():
         pytest.skip(f"{cluster.node_names[node_index]} already runs a k0s unit")
-    # A unit in /etc outranks the one written here, and its text decides spurd_owned.
-    if node.exec_allow_fail(f"test -e {INSTALLED_UNIT} && echo present").strip():
-        pytest.skip(f"{cluster.node_names[node_index]} has {INSTALLED_UNIT}")
+    # A unit in /etc outranks the one written here, and its text decides spurd_owned. One spurd
+    # left behind is cleared so a bad earlier teardown cannot quietly skip these tests; anyone
+    # else's is not ours to delete.
+    installed = node.exec_allow_fail(f"cat {INSTALLED_UNIT} 2>/dev/null")
+    if installed and "(managed by spurd)" in installed:
+        node.exec(f"{sudo}rm -f {INSTALLED_UNIT} && {sudo}systemctl daemon-reload")
+    elif installed:
+        pytest.skip(f"{cluster.node_names[node_index]} has a k0s unit spurd did not write")
 
     try:
         node.exec(

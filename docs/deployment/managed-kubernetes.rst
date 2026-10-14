@@ -382,16 +382,20 @@ Before each stop, the controller confirms it is still the leader with a quorum
 round and that no election happened since it decided, then re-reads the node
 and the cluster record and gives up if either changed. It stops at most one
 node per tick and at most five per ten minutes, and holds back entirely while
-the stoppable strays it sees outnumber a quarter of the nodes it compares them
-against (nodes with a role, plus nodes outside the cluster seen running k0s),
-with at least two, because then the record is more likely wrong than the fleet. A node stopped
+more than three stoppable strays are in view and they also outnumber a quarter
+of the nodes it compares them against (nodes with a role, plus nodes outside the
+cluster seen running k0s), because then the record is more likely wrong than the
+fleet. A few strays left behind on a small cluster are always let through, still
+one per tick. A node stopped
 before waits ten minutes before another stop, doubling to an hour. A stop
 counts as done only when the next two checks find the unit stopped; if it
 comes back, that is counted separately and the wait keeps growing.
 
 Turn this off with ``k8s_drift_correction = false`` under ``[cluster]``; drift
-is then report-only. Upgrading to a release with this on stops strays that are
-already being reported within the first two checks of each.
+is then report-only, and the change takes effect on a config reload. Once both
+the controller and the stray's agent run a release with this on, strays that
+are already being reported are stopped within their first two checks; an older
+agent never claims its unit, so its node is left alone until it is upgraded.
 
 Starting nodes that should run
 ''''''''''''''''''''''''''''''
@@ -578,7 +582,7 @@ Configuration reference (``[cluster]``)
      - Seconds a node may stay non-``active`` during provisioning before the cluster is marked ``degraded``.
    * - ``k8s_drift_correction``
      - ``true``
-     - Stop a spurd-installed k0s worker left running on a node outside the cluster with no role (see :ref:`k0s-membership-drift`). ``false`` reports only.
+     - Stop a spurd-installed k0s worker left running on a node outside a scoped cluster with no role (see :ref:`k0s-membership-drift`). ``false`` reports only.
    * - ``allow_admin_kubeconfig``
      - ``false``
      - Allow ``spur k8s kubeconfig --admin`` to serve the cluster-admin kubeconfig over RPC.

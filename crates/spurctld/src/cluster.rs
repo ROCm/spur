@@ -22660,7 +22660,6 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("both assigned", || {
@@ -22709,7 +22708,6 @@ mod tests {
             cni: "calico".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         }
     }
 
@@ -22971,7 +22969,6 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: Some("node-a".into()),
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         };
         let mut tokens = crate::cluster_k8s::StartTracker::default();
         crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, false).await;
@@ -22993,7 +22990,6 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         }
     }
 
@@ -23109,6 +23105,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_that_cannot_reach_its_agent_surfaces_as_the_nodes_reason() {
+        use crate::cluster_k8s::{spawn_start_component, StartTracker};
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        // Port 1 is privileged and unassigned, so the dial is refused rather than answered.
+        cm.register_node(
+            "node-a".into(),
+            "node-a".into(),
+            ResourceSet::default(),
+            "127.0.0.1".into(),
+            1,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
+        wait_for("registered", || cm.get_node("node-a").is_some());
+
+        let mut starts = StartTracker::default();
+        spawn_start_component(
+            &cm,
+            &mut starts,
+            "node-a",
+            K0sRole::Worker,
+            None,
+            None,
+            None,
+        );
+        assert!(starts.is_in_flight("node-a"));
+        wait_for("start reported back", || starts.has_outcome());
+        starts.absorb_outcomes(&cm, K0sPhase::Ready, std::time::Instant::now());
+        assert!(!starts.is_in_flight("node-a"));
+        assert!(starts.has_backoff("node-a"));
+        wait_for("reason recorded", || {
+            cm.get_node("node-a")
+                .and_then(|n| n.k0s_last_error)
+                .is_some_and(|r| r.starts_with("start failed: "))
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unchanged_k0s_reason_is_not_written_again() {
         use crate::cluster_k8s::set_reason_if_changed;
         let dir = TempDir::new().unwrap();
@@ -23143,7 +23183,6 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         };
         let mut tokens = crate::cluster_k8s::StartTracker::default();
         // A token cached from the torn-down incarnation must not survive the Down tick: reusing it
@@ -23326,7 +23365,6 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("both nodes assigned k0s roles", || {
@@ -23381,7 +23419,6 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: Some("node-a".into()),
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("scoped nodes assigned", || {
@@ -23526,7 +23563,6 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("all four assigned", || {
@@ -23594,7 +23630,6 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
-            drift_correction: true,
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("all assigned", || {

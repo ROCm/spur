@@ -155,7 +155,7 @@ struct DriftLabel {
 }
 
 /// Drift kinds the controller reports, pre-created at zero by `ensure_series`.
-const DRIFT_KINDS: [&str; 3] = ["out_of_scope", "role_mismatch", "not_running"];
+pub const DRIFT_KINDS: [&str; 3] = ["out_of_scope", "role_mismatch", "not_running"];
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct RefusalLabel {
@@ -165,11 +165,12 @@ struct RefusalLabel {
 }
 
 /// Why the controller declined to stop a stray, pre-created at zero by `ensure_series`.
-pub const DRIFT_REFUSAL_REASONS: [&str; 11] = [
+pub const DRIFT_REFUSAL_REASONS: [&str; 12] = [
     "disabled",
     "control_plane",
     "not_spurd_owned",
     "circuit_breaker",
+    "throttled",
     "budget",
     "backoff",
     "not_leader",
@@ -576,10 +577,12 @@ mod tests {
 
         metrics.record_drift_corrected("prod", "out_of_scope");
         metrics.record_drift_refused("prod", "budget");
+        metrics.record_drift_recurred("prod");
         metrics.record_start_failure("prod");
         let body = metrics.encode();
         assert!(body.contains(&format!("{corrected} 1\n")));
         assert!(body.contains(&format!("{} 1\n", refused("budget"))));
+        assert!(body.contains(&format!("spur_k8s_drift_recurred_total{{{base}}} 1\n")));
         assert!(body.contains(&format!("spur_k8s_start_failures_total{{{base}}} 1\n")));
     }
 }

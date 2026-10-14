@@ -60,8 +60,6 @@ pub struct ClusterNetworking {
     /// How long a k8s (k0s) node may stay non-`active` during provisioning before the loop
     /// marks the cluster `degraded` (cluster.k8s_provisioning_timeout_secs).
     pub provisioning_timeout: Duration,
-    /// Whether confirmed strays are stopped rather than only reported (cluster.k8s_drift_correction).
-    pub drift_correction: bool,
 }
 
 impl ClusterNetworking {
@@ -153,14 +151,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
             cluster.k8s_metrics().record_reconcile_error(&cluster_name);
         }
 
-        detect_drift(
-            &cluster,
-            &raft,
-            net.drift_correction,
-            &mut drift,
-            &mut correction,
-        )
-        .await;
+        detect_drift(&cluster, &raft, &mut drift, &mut correction).await;
     }
 }
 
@@ -700,6 +691,8 @@ fn classify(
         && node.k0s_role.is_some()
         && node.k0s_last_error.is_none();
     match live {
+        // "unknown" is an agent that could not read systemd, not an answer.
+        Some(s) if s.state == "unknown" && expected_active => Drift::Unknown,
         Some(s) if drift == Drift::None && expected_active && s.state != "active" => {
             Drift::NotRunning
         }
@@ -851,14 +844,14 @@ impl DriftTracker {
 
     /// Whether so many nodes look like stoppable strays that the record is more likely wrong
     /// than the fleet. Measured against roled candidates plus non-members seen running k0s, not
-    /// the whole inventory; one stray is never enough on its own.
+    /// the whole inventory.
     fn breaker_tripped(&self) -> bool {
         let strays = self
             .seen
             .iter()
             .filter(|(name, s)| s.drift() == Drift::OutOfScope && !self.roled.contains(*name))
             .count();
-        let limit = ((self.roled.len() + strays) / 4).max(1);
+        let limit = ((self.roled.len() + strays) / 4).max(BREAKER_FLOOR);
         self.stoppable.len() > limit
     }
 }
@@ -892,6 +885,13 @@ fn drift_candidates<'a>(
     out
 }
 
+// A reason missing from the metrics list would never get its zero series.
+const _: () = assert!(Refusal::ALL.len() == spur_metrics::k8s::DRIFT_REFUSAL_REASONS.len());
+
+/// Strays the breaker always lets through together, however small the cluster: the few left
+/// behind by one `k8s down` are what correction exists for, and the budget still paces them.
+const BREAKER_FLOOR: usize = 3;
+
 /// Why a stop of a confirmed stray did not happen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refusal {
@@ -899,6 +899,9 @@ enum Refusal {
     ControlPlane,
     NotSpurdOwned,
     CircuitBreaker,
+    /// Another stray was already stopped this tick.
+    Throttled,
+    /// The fleet-wide stop budget for the window is spent.
     Budget,
     Backoff,
     NotLeader,
@@ -909,12 +912,28 @@ enum Refusal {
 }
 
 impl Refusal {
+    const ALL: [Refusal; 12] = [
+        Refusal::Disabled,
+        Refusal::ControlPlane,
+        Refusal::NotSpurdOwned,
+        Refusal::CircuitBreaker,
+        Refusal::Throttled,
+        Refusal::Budget,
+        Refusal::Backoff,
+        Refusal::NotLeader,
+        Refusal::TermChange,
+        Refusal::RecordChanged,
+        Refusal::StopFailed,
+        Refusal::StopUnconfirmed,
+    ];
+
     fn label(self) -> &'static str {
         match self {
             Refusal::Disabled => "disabled",
             Refusal::ControlPlane => "control_plane",
             Refusal::NotSpurdOwned => "not_spurd_owned",
             Refusal::CircuitBreaker => "circuit_breaker",
+            Refusal::Throttled => "throttled",
             Refusal::Budget => "budget",
             Refusal::Backoff => "backoff",
             Refusal::NotLeader => "not_leader",
@@ -1003,6 +1022,13 @@ impl Correction {
         self.corrected.remove(node);
     }
 
+    fn retain_nodes(&mut self, nodes: &[spur_core::node::Node]) {
+        let names: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        self.pending.retain(|n, _| names.contains(n.as_str()));
+        self.corrected.retain(|n| names.contains(n.as_str()));
+        self.backoff.retain(|n, _| names.contains(n.as_str()));
+    }
+
     /// Success is never taken from the stop reply, which can claim a stop that did not happen.
     fn settle(&mut self, node: &str, live: Option<&ComponentStatus>) -> Option<Decision> {
         let live = live?;
@@ -1063,16 +1089,22 @@ fn decide(
         if node.k0s_role.is_some() {
             correction.forget(name);
         }
-        out.extend(correction.settle(name, live));
+        let settled = correction.settle(name, live);
+        let just_settled = settled.is_some();
+        out.extend(settled);
         let drift = classify(node, state, live);
+        // An unreachable node is no evidence of a stray, so it leaves the breaker's count too.
         if drift == Drift::OutOfScope && is_stoppable(node, live) {
             tracker.stoppable.insert(name.clone());
-        } else if drift != Drift::Unknown {
+        } else {
             tracker.stoppable.remove(name);
         }
         let newly = tracker.observe(name, drift);
         if let Some(kind) = newly {
             out.push(Decision::Report(name.clone(), kind));
+        }
+        if just_settled {
+            continue;
         }
         let confirmed_stray = drift == Drift::OutOfScope
             && tracker.confirmed(name) == Some(Drift::OutOfScope)
@@ -1082,12 +1114,12 @@ fn decide(
             continue;
         }
         let Some(live) = live else { continue };
-        let standing = if live.role != "worker" {
+        let standing = if !enabled {
+            Some(Refusal::Disabled)
+        } else if live.role != "worker" {
             Some(Refusal::ControlPlane)
         } else if !live.spurd_owned {
             Some(Refusal::NotSpurdOwned)
-        } else if !enabled {
-            Some(Refusal::Disabled)
         } else {
             None
         };
@@ -1099,7 +1131,9 @@ fn decide(
         }
         let refusal = if tracker.breaker_tripped() {
             Some(Refusal::CircuitBreaker)
-        } else if stop_chosen || !correction.budget_left(now) {
+        } else if stop_chosen {
+            Some(Refusal::Throttled)
+        } else if !correction.budget_left(now) {
             Some(Refusal::Budget)
         } else if correction.backing_off(name, now) {
             Some(Refusal::Backoff)
@@ -1133,40 +1167,88 @@ fn stop_still_warranted(
         && !held_out(node.state)
 }
 
-/// Stop a stray `decide` chose, after the checks that need consensus or a fresh record.
-async fn stop_stray(
-    cluster: &ClusterManager,
-    raft: &RaftHandle,
+/// The consensus checks a stop needs, behind a trait so the stop path is tested without Raft.
+trait Leadership {
+    async fn confirm(&self) -> bool;
+    fn term(&self) -> u64;
+}
+
+impl Leadership for RaftHandle {
+    async fn confirm(&self) -> bool {
+        // Drift handling runs inline on the reconcile loop; a stalled quorum round must not hold
+        // up mesh pushes, converge and teardown behind it.
+        tokio::time::timeout(AGENT_TIMEOUT, self.ensure_leader())
+            .await
+            .unwrap_or(false)
+    }
+
+    fn term(&self) -> u64 {
+        self.current_term()
+    }
+}
+
+/// The record a stop is re-checked against just before it is sent.
+struct StopRecord<'a> {
+    node: Option<&'a spur_core::node::Node>,
+    state: &'a K0sClusterState,
+    removing: &'a HashSet<String>,
+}
+
+/// Stop a stray `decide` chose. Free checks run before the quorum round, and budget is spent
+/// only on a stop that is actually sent.
+async fn stop_stray<L, F, Fut>(
+    leader: &L,
     term: u64,
-    node: &str,
+    record: StopRecord<'_>,
     correction: &mut Correction,
-) -> Result<(), Refusal> {
-    if !raft.ensure_leader().await {
+    now: Instant,
+    send: F,
+) -> Result<(), Refusal>
+where
+    L: Leadership,
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), StopError>>,
+{
+    let Some(node) = record
+        .node
+        .filter(|n| stop_still_warranted(Some(n), record.state, record.removing))
+    else {
+        return Err(Refusal::RecordChanged);
+    };
+    let Some(endpoint) = node_endpoint(node) else {
+        warn!(node = %node.name, "stray has no agent address; cannot stop it");
+        return Err(Refusal::StopFailed);
+    };
+    if !leader.confirm().await {
         return Err(Refusal::NotLeader);
     }
-    if raft.current_term() != term {
+    if leader.term() != term {
         return Err(Refusal::TermChange);
     }
-    let fresh = cluster.get_node(node);
-    if !stop_still_warranted(
-        fresh.as_ref(),
-        &cluster.k0s_state(),
-        &cluster.k0s_removals_in_flight(),
-    ) {
-        return Err(Refusal::RecordChanged);
-    }
-    correction.record_stop(node, Instant::now());
-    match request_stop(cluster, node, false).await {
+    correction.record_stop(&node.name, now);
+    match send(endpoint).await {
         // A slow `systemctl disable --now` can outlast the RPC bound; the next probe decides.
         Ok(()) | Err(StopError::TimedOut) => {
-            correction.pending.insert(node.to_string(), 0);
+            correction.pending.insert(node.name.clone(), 0);
             Ok(())
         }
         Err(StopError::Failed(detail)) => {
-            warn!(node = %node, detail = %detail, "stopping stray k0s failed");
+            warn!(node = %node.name, detail = %detail, "stopping stray k0s failed");
             Err(Refusal::StopFailed)
         }
     }
+}
+
+/// A new term means another leader may have acted, so sightings and stop bookkeeping start over.
+fn reset_on_new_term(term: u64, tracker: &mut DriftTracker, correction: &mut Correction) {
+    if correction.term == Some(term) {
+        return;
+    }
+    *tracker = DriftTracker::default();
+    *correction = Correction {
+        term: Some(term),
+        ..Default::default()
+    };
 }
 
 /// Probe one slice of the fleet, report drift two successive readings agree on, and stop a
@@ -1174,20 +1256,15 @@ async fn stop_stray(
 async fn detect_drift(
     cluster: &ClusterManager,
     raft: &RaftHandle,
-    enabled: bool,
     tracker: &mut DriftTracker,
     correction: &mut Correction,
 ) {
     let term = raft.current_term();
-    if correction.term != Some(term) {
-        *tracker = DriftTracker::default();
-        *correction = Correction {
-            term: Some(term),
-            ..Default::default()
-        };
-    }
+    reset_on_new_term(term, tracker, correction);
+    let enabled = cluster.config().cluster.k8s_drift_correction;
     let state = cluster.k0s_state();
     let nodes = cluster.get_nodes();
+    correction.retain_nodes(&nodes);
     let slice = tracker.next_probe(&state, &nodes, &cluster.k0s_removals_in_flight());
     let statuses = fetch_component_statuses(&slice).await;
     let decisions = decide(
@@ -1221,7 +1298,16 @@ async fn detect_drift(
                 metrics.record_drift_detected(&cluster_name, kind.label());
             }
             Decision::Stop(node) => {
-                match stop_stray(cluster, raft, term, &node, correction).await {
+                let fresh = cluster.get_node(&node);
+                let fresh_state = cluster.k0s_state();
+                let removing = cluster.k0s_removals_in_flight();
+                let record = StopRecord {
+                    node: fresh.as_ref(),
+                    state: &fresh_state,
+                    removing: &removing,
+                };
+                let send = |endpoint| send_stop(endpoint, node.clone(), false);
+                match stop_stray(raft, term, record, correction, Instant::now(), send).await {
                     Ok(()) => info!(node = %node, "stopping stray k0s worker outside the cluster"),
                     Err(reason) => {
                         warn!(node = %node, reason = reason.label(), "stray k0s left running");
@@ -1575,6 +1661,9 @@ async fn converge_provisioning(
         .into_iter()
         .filter(|n| n.k0s_role.is_some())
         .collect();
+    starts
+        .backoff
+        .retain(|name, _| assigned.iter().any(|n| &n.name == name));
     if assigned.is_empty() {
         starts.join_tokens.clear();
         return (errors, HashSet::new());
@@ -1911,10 +2000,14 @@ enum StopError {
     Failed(String),
 }
 
-/// One bounded StopClusterComponent, keeping a timeout distinct from a failure.
 async fn request_stop(cluster: &ClusterManager, node: &str, reset: bool) -> Result<(), StopError> {
     let endpoint = agent_endpoint(cluster, node)
         .ok_or_else(|| StopError::Failed(format!("{node} has no agent address")))?;
+    send_stop(endpoint, node.to_string(), reset).await
+}
+
+/// One bounded StopClusterComponent, keeping a timeout distinct from a failure.
+async fn send_stop(endpoint: String, node: String, reset: bool) -> Result<(), StopError> {
     let fut = async {
         let mut client = crate::agent_client::connect(endpoint)
             .await
@@ -2126,6 +2219,16 @@ impl StartTracker {
         self.backoff.contains_key(node)
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_in_flight(&self, node: &str) -> bool {
+        self.in_flight.contains_key(node)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_outcome(&self) -> bool {
+        !self.outcomes.lock().is_empty()
+    }
+
     /// A node coming back from `down`/`unknown` drops its backoff, since whatever failed may
     /// have been fixed while it was away.
     fn may_start(&mut self, node: &spur_core::node::Node, phase: K0sPhase, now: Instant) -> bool {
@@ -2165,8 +2268,20 @@ pub(crate) fn set_reason_if_changed(cluster: &ClusterManager, node: &str, reason
     true
 }
 
+/// `None` is a start that did not answer within `START_TIMEOUT`.
+fn start_outcome(
+    reply: Option<Result<spur_proto::proto::StartClusterComponentResponse, String>>,
+) -> StartOutcome {
+    match reply {
+        None => StartOutcome::TimedOut,
+        Some(Err(detail)) => StartOutcome::Failed(detail),
+        Some(Ok(r)) if r.started => StartOutcome::Started,
+        Some(Ok(r)) => StartOutcome::Failed(r.message),
+    }
+}
+
 /// Runs off the reconcile thread; the outcome is folded in on a later tick.
-fn spawn_start_component(
+pub(crate) fn spawn_start_component(
     cluster: &ClusterManager,
     starts: &mut StartTracker,
     node: &str,
@@ -2199,18 +2314,12 @@ fn spawn_start_component(
                 .await
                 .map_err(|e| format!("start_cluster_component failed: {}", e.message()))
         };
-        let outcome = match tokio::time::timeout(START_TIMEOUT, fut).await {
-            Err(_) => StartOutcome::TimedOut,
-            Ok(Err(detail)) => StartOutcome::Failed(detail),
-            Ok(Ok(resp)) => {
-                let r = resp.into_inner();
-                if r.started {
-                    StartOutcome::Started
-                } else {
-                    StartOutcome::Failed(r.message)
-                }
-            }
-        };
+        let outcome = start_outcome(
+            tokio::time::timeout(START_TIMEOUT, fut)
+                .await
+                .ok()
+                .map(|r| r.map(tonic::Response::into_inner)),
+        );
         if let StartOutcome::Failed(detail) = &outcome {
             warn!(node = %node, detail = %detail, "k0s component start failed");
         }
@@ -2870,7 +2979,6 @@ mod tests {
             cni: cni.into(),
             control_plane_node: None,
             provisioning_timeout: Duration::from_secs(600),
-            drift_correction: true,
         }
     }
 
@@ -3393,6 +3501,10 @@ mod tests {
         );
         assert!(decisions.is_empty(), "{decisions:?}");
         assert!(!c.corrected.contains("stray"));
+        assert!(
+            c.pending.contains_key("other"),
+            "a non-member's pending stop is kept"
+        );
     }
 
     fn stray_cluster() -> (
@@ -3466,6 +3578,7 @@ mod tests {
                 Refusal::NotSpurdOwned,
             ),
             (live("worker", "active", true), false, Refusal::Disabled),
+            (live("controller", "active", true), false, Refusal::Disabled),
         ] {
             let (state, nodes) = scoped(&["m1"], &["stray"]);
             let live = statuses(&[("m1", live("worker", "active", true)), ("stray", status)]);
@@ -3500,14 +3613,18 @@ mod tests {
         );
     }
 
+    fn all_workers_active(names: &[&str]) -> HashMap<String, ComponentStatus> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), live("worker", "active", true)))
+            .collect()
+    }
+
     #[test]
     fn mass_drift_trips_the_breaker() {
-        let (state, nodes) = scoped(&["m1"], &["s1", "s2"]);
-        let live = statuses(&[
-            ("m1", live("worker", "active", true)),
-            ("s1", live("worker", "active", true)),
-            ("s2", live("worker", "active", true)),
-        ]);
+        let strays = ["s1", "s2", "s3", "s4"];
+        let (state, nodes) = scoped(&["m1"], &strays);
+        let live = all_workers_active(&["m1", "s1", "s2", "s3", "s4"]);
         let (mut t, mut c) = (DriftTracker::default(), Correction::default());
         let now = Instant::now();
         sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
@@ -3515,7 +3632,87 @@ mod tests {
             .into_iter()
             .filter(|d| matches!(d, Decision::Refuse(_, Refusal::CircuitBreaker)))
             .collect();
-        assert_eq!(refusals.len(), 2);
+        assert_eq!(refusals.len(), strays.len());
+    }
+
+    #[test]
+    fn strays_left_by_a_small_cluster_are_stopped_one_per_tick() {
+        let (state, nodes) = scoped(&["a", "b"], &["c", "d"]);
+        let live = all_workers_active(&["a", "b", "c", "d"]);
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        let decisions = sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        assert!(
+            decisions.contains(&Decision::Stop("c".into())),
+            "{decisions:?}"
+        );
+        assert!(decisions.contains(&Decision::Refuse("d".into(), Refusal::Throttled)));
+    }
+
+    #[test]
+    fn an_unreachable_stray_leaves_the_breaker_count() {
+        let (state, nodes, live) = stray_cluster();
+        let mut t = DriftTracker::default();
+        let mut c = Correction::default();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, Instant::now());
+        assert!(t.stoppable.contains("stray"));
+        let unreachable = statuses(&[("m1", live["m1"].clone())]);
+        sweep(
+            &mut t,
+            &mut c,
+            &state,
+            &nodes,
+            &unreachable,
+            true,
+            Instant::now(),
+        );
+        assert!(!t.stoppable.contains("stray"));
+    }
+
+    #[test]
+    fn a_stop_that_did_not_take_is_refused_once_per_visit() {
+        let (state, nodes, live) = stray_cluster();
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        c.record_stop("stray", now);
+        c.pending.insert("stray".into(), 0);
+        assert_eq!(
+            sweep(&mut t, &mut c, &state, &nodes, &live, true, now),
+            [Decision::Refuse("stray".into(), Refusal::StopUnconfirmed)]
+        );
+    }
+
+    #[test]
+    fn every_reported_label_has_a_pre_created_series() {
+        for reason in Refusal::ALL {
+            assert!(
+                spur_metrics::k8s::DRIFT_REFUSAL_REASONS.contains(&reason.label()),
+                "{reason:?}"
+            );
+        }
+        for kind in [Drift::OutOfScope, Drift::RoleMismatch, Drift::NotRunning] {
+            assert!(
+                spur_metrics::k8s::DRIFT_KINDS.contains(&kind.label()),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_term_starts_drift_handling_over() {
+        let mut t = DriftTracker::default();
+        let mut c = Correction::default();
+        reset_on_new_term(4, &mut t, &mut c);
+        t.observe("n", Drift::OutOfScope);
+        c.pending.insert("n".into(), 0);
+        reset_on_new_term(4, &mut t, &mut c);
+        assert!(t.seen.contains_key("n") && c.pending.contains_key("n"));
+        reset_on_new_term(5, &mut t, &mut c);
+        assert!(t.seen.is_empty() && c.pending.is_empty());
+        assert_eq!(c.term, Some(5));
     }
 
     #[test]
@@ -3550,7 +3747,7 @@ mod tests {
         sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
         let decisions = sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
         assert!(decisions.contains(&Decision::Stop("s1".into())));
-        assert!(decisions.contains(&Decision::Refuse("s2".into(), Refusal::Budget)));
+        assert!(decisions.contains(&Decision::Refuse("s2".into(), Refusal::Throttled)));
     }
 
     #[test]
@@ -3682,6 +3879,11 @@ mod tests {
             Drift::None
         );
         assert_eq!(classify(&node, &ready(), Some(&inactive)), Drift::None);
+        assert_eq!(
+            classify(&node, &degraded, Some(&live("worker", "unknown", false))),
+            Drift::Unknown,
+            "an agent that could not read systemd is not a dead node"
+        );
     }
 
     #[test]
@@ -3757,5 +3959,136 @@ mod tests {
         node.state = NodeState::Idle;
         assert!(s.may_start(&node, K0sPhase::Ready, now));
         assert!(!s.backoff.contains_key("w1"));
+    }
+
+    #[test]
+    fn a_start_reply_is_classified_by_what_the_agent_said() {
+        use spur_proto::proto::StartClusterComponentResponse as Reply;
+        let reply = |started: bool, message: &str| Reply {
+            started,
+            message: message.into(),
+            ..Default::default()
+        };
+        assert!(matches!(start_outcome(None), StartOutcome::TimedOut));
+        assert!(matches!(
+            start_outcome(Some(Err("connect failed".into()))),
+            StartOutcome::Failed(d) if d == "connect failed"
+        ));
+        assert!(matches!(
+            start_outcome(Some(Ok(reply(false, "k0s missing")))),
+            StartOutcome::Failed(d) if d == "k0s missing"
+        ));
+        assert!(matches!(
+            start_outcome(Some(Ok(reply(true, "")))),
+            StartOutcome::Started
+        ));
+    }
+
+    struct FakeLeader {
+        leader: bool,
+        term: u64,
+    }
+
+    impl Leadership for FakeLeader {
+        async fn confirm(&self) -> bool {
+            self.leader
+        }
+
+        fn term(&self) -> u64 {
+            self.term
+        }
+    }
+
+    /// Runs `stop_stray` for the stray of `stray_cluster`, with an address unless `addressless`,
+    /// answering the stop with `reply`. Returns the result and whether a stop was sent.
+    async fn try_stop(
+        leader: FakeLeader,
+        mutate: impl FnOnce(&mut spur_core::node::Node),
+        reply: Result<(), StopError>,
+        c: &mut Correction,
+    ) -> (Result<(), Refusal>, bool) {
+        let (state, nodes, _) = stray_cluster();
+        let mut stray = nodes[1].clone();
+        stray.address = Some("127.0.0.1".into());
+        mutate(&mut stray);
+        let sent = std::cell::Cell::new(false);
+        let record = StopRecord {
+            node: Some(&stray),
+            state: &state,
+            removing: &HashSet::new(),
+        };
+        let send = |_endpoint: String| {
+            sent.set(true);
+            async move { reply }
+        };
+        let result = stop_stray(&leader, 7, record, c, Instant::now(), send).await;
+        (result, sent.get())
+    }
+
+    fn leader() -> FakeLeader {
+        FakeLeader {
+            leader: true,
+            term: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_sent_only_when_every_guard_passes() {
+        let mut c = Correction::default();
+        assert_eq!(
+            try_stop(leader(), |_| {}, Ok(()), &mut c).await,
+            (Ok(()), true)
+        );
+        assert_eq!(c.pending.get("stray"), Some(&0));
+        assert_eq!(c.recent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_guard_sends_nothing_and_spends_no_budget() {
+        type Mutate = fn(&mut spur_core::node::Node);
+        let cases: [(FakeLeader, Mutate, Refusal); 4] = [
+            (
+                leader(),
+                |n| n.k0s_role = Some(K0sRole::Worker),
+                Refusal::RecordChanged,
+            ),
+            (leader(), |n| n.address = None, Refusal::StopFailed),
+            (
+                FakeLeader {
+                    leader: false,
+                    term: 7,
+                },
+                |_| {},
+                Refusal::NotLeader,
+            ),
+            (
+                FakeLeader {
+                    leader: true,
+                    term: 8,
+                },
+                |_| {},
+                Refusal::TermChange,
+            ),
+        ];
+        for (leader, mutate, want) in cases {
+            let mut c = Correction::default();
+            let got = try_stop(leader, mutate, Ok(()), &mut c).await;
+            assert_eq!(got, (Err(want), false), "{want:?}");
+            assert!(c.recent.is_empty() && c.backoff.is_empty(), "{want:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_stop_waits_for_the_next_probe_and_a_failed_one_backs_off() {
+        let mut c = Correction::default();
+        let got = try_stop(leader(), |_| {}, Err(StopError::TimedOut), &mut c).await;
+        assert_eq!(got, (Ok(()), true));
+        assert!(c.pending.contains_key("stray"));
+
+        let mut c = Correction::default();
+        let failed = Err(StopError::Failed("refused".into()));
+        let got = try_stop(leader(), |_| {}, failed, &mut c).await;
+        assert_eq!(got, (Err(Refusal::StopFailed), true));
+        assert!(c.pending.is_empty() && c.backoff.contains_key("stray"));
     }
 }

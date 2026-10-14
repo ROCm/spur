@@ -2586,10 +2586,18 @@ own startup. Only ``allow_admin_kubeconfig`` is reloadable.
    * - ``k8s_drift_correction``
      - bool
      - ``true``
-     - Restart
+     - Live
      - Stop a spurd-installed k0s worker left running on a node outside a scoped
        cluster with no role. ``false`` keeps drift report-only. See
        :ref:`k0s-membership-drift`.
+
+       .. warning::
+
+          On by default, including for an existing cluster on upgrade. Once the
+          controller and agents are upgraded, the controller stops and disables
+          spurd-written k0s **worker** units on nodes outside a scoped cluster
+          with no role (no ``k0s reset``), within two checks of each. Set it to
+          ``false`` before upgrading to keep drift report-only.
    * - ``allow_admin_kubeconfig``
      - bool
      - ``false``

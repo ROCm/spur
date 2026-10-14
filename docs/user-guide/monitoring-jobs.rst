@@ -955,12 +955,14 @@ cluster lifecycle and per-node health at ``/metrics/k8s``. Every series carries
        episode. See :ref:`k0s-membership-drift`.
    * - ``spur_k8s_drift_corrected_total{kind}``
      - Strays the controller stopped, counted once the node stays stopped across
-       two checks.
+       two checks. Only ``out_of_scope`` is ever corrected, so it is the only kind.
    * - ``spur_k8s_drift_refused_total{reason}``
-     - Stops of a confirmed stray the controller declined: ``control_plane``,
-       ``not_spurd_owned`` and ``disabled`` once per episode; ``circuit_breaker``,
-       ``budget``, ``backoff``, ``not_leader``, ``term_change``,
-       ``record_changed``, ``stop_failed`` and ``stop_unconfirmed`` per attempt.
+     - Stops of a confirmed stray the controller declined: ``disabled``,
+       ``control_plane`` and ``not_spurd_owned`` once per episode;
+       ``circuit_breaker``, ``throttled`` (another stray was stopped this tick),
+       ``budget`` (the ten-minute stop budget is spent), ``backoff``,
+       ``not_leader``, ``term_change``, ``record_changed``, ``stop_failed`` and
+       ``stop_unconfirmed`` per attempt.
    * - ``spur_k8s_drift_recurred_total``
      - Stopped strays whose k0s came back.
    * - ``spur_k8s_start_failures_total``
@@ -970,10 +972,12 @@ cluster lifecycle and per-node health at ``/metrics/k8s``. Every series carries
    * - ``spur_k8s_node_restart_total{node}`` / ``spur_k8s_install_duration_seconds{node}``
      - Per-node k0s unit restarts and install time (histogram).
 
-The drift and start-failure counters are kept by the current leader in memory,
-so a controller restart or leader change starts them, and their episodes, over.
-Alert on ``increase(...[1h]) > 0`` rather than ``rate``, which falls back to zero
-while the drift is still present. They carry no node label, to keep series
+Each controller counts only what it saw while it was the leader, and its
+counters reset when that process restarts. A leader change also starts drift
+episodes over, so a drift that is still present is counted again by the new
+leader rather than staying flat. Alert on ``increase(...[1h]) > 0`` summed
+across controllers rather than on ``rate``, which falls back to zero while the
+drift is still present. The counters carry no node label, to keep series
 bounded; the ``spurctld`` log line names the node.
 
 k0s component metrics *(incoming)*
