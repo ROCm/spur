@@ -68,14 +68,17 @@ pub fn peer() -> Option<Arc<PeerVerifier>> {
     PEER.get().cloned().flatten()
 }
 
+/// The node id a forwarded-identity envelope should be bound to (the current
+/// Raft leader) and the term. Returns `0` for the leader when there is none, or
+/// when this node's Raft core has stopped: a dead node is not the leader, so the
+/// envelope must not be addressed to it. `current_leader()` fails closed via
+/// `live_leader`, matching the leader the forward channel resolves, so the
+/// envelope's destination and the channel's target stay consistent.
 pub fn leader_and_term() -> (u64, u64) {
     RAFT.get()
         .cloned()
         .flatten()
-        .map(|r| {
-            let m = r.raft.metrics().borrow().clone();
-            (m.current_leader.unwrap_or(r.node_id), m.current_term)
-        })
+        .map(|r| (r.current_leader().unwrap_or(0), r.current_term()))
         .unwrap_or((0, 0))
 }
 

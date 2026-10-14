@@ -393,7 +393,28 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     info!(%addr, "gRPC server listening");
-    server::serve(addr, controller, accounting_service, bearer).await?;
+    // A fatal Raft storage error stops the core but leaves the process running;
+    // without this, the node would keep serving as a stale leader (the 2h+
+    // write stall this fixes). Exit non-zero instead so the supervisor
+    // (systemd `Restart=on-failure`, or Kubernetes) restarts it to recover from
+    // disk. Fall through to the shared shutdown path either way.
+    let serve_result = tokio::select! {
+        res = server::serve(addr, controller, accounting_service, bearer) => res,
+        fatal = raft_handle.wait_fatal() => match fatal {
+            openraft::error::Fatal::Stopped => {
+                info!("Raft core stopped; shutting down controller");
+                Ok(())
+            }
+            other => {
+                tracing::error!(
+                    error = %other,
+                    "Raft core hit an unrecoverable error; exiting so the supervisor restarts \
+                     spurctld to recover from disk"
+                );
+                Err(anyhow::anyhow!("raft core fatal error: {other}"))
+            }
+        },
+    };
 
     sched_handle.abort();
     // Audit rows are written off the request path; the runtime would drop them.
@@ -403,7 +424,7 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("accounting writes still pending at shutdown; some rows were lost");
     }
-    Ok(())
+    serve_result
 }
 
 fn default_config() -> spur_core::config::SlurmConfig {

@@ -340,6 +340,16 @@ addresses, in the same order on every controller, to the ``peers`` list in the c
 Raft automatically elects a leader. Workers connect to any controller and are redirected
 to the current leader.
 
+.. important::
+
+   If ``spurctld`` hits an unrecoverable Raft storage error (for example the
+   state directory becomes unwritable), it exits non-zero rather than continuing
+   to run as a stale leader that accepts no writes. Rely on ``Restart=on-failure``
+   (as in the unit above) so the supervisor restarts it; on restart it recovers
+   its state from the Raft log and snapshot on disk, and the cluster re-elects a
+   leader. A persistent fault will restart-loop, which surfaces the problem in
+   ``systemctl status`` instead of silently wedging the cluster.
+
 Joining Worker Nodes
 --------------------
 
