@@ -130,6 +130,10 @@ pub struct SlurmConfig {
     /// direction of `[controller] agent_*`.
     #[serde(default)]
     pub spurd: SpurdConfig,
+    /// Auto-recovery hook: triggers a site-supplied script when a node enters
+    /// a system-initiated drain or down state.
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
 }
 
 /// Configuration for auto-update checking and self-update.
@@ -1849,7 +1853,7 @@ fn default_health_max_unavailable() -> String {
 /// count into an absolute cap, or `None` if it is malformed. `0`/`0%` = no cap
 /// (returns `Some(0)`). A positive percentage rounds up and is at least 1, so a
 /// check can always make progress on a small fleet.
-fn parse_health_cap(value: &str, eligible_nodes: usize) -> Option<usize> {
+pub(crate) fn parse_cap(value: &str, eligible_nodes: usize) -> Option<usize> {
     let value = value.trim();
     if let Some(pct) = value.strip_suffix('%') {
         let pct: usize = pct.trim().parse().ok()?;
@@ -1872,7 +1876,7 @@ impl HealthConfig {
     /// count. `0` = unlimited. Falls back to unlimited on a malformed value,
     /// which `validate()` rejects at config load, so this is never reached.
     pub fn concurrency_cap(&self, eligible_nodes: usize) -> usize {
-        parse_health_cap(&self.max_unavailable, eligible_nodes).unwrap_or(0)
+        parse_cap(&self.max_unavailable, eligible_nodes).unwrap_or(0)
     }
 }
 
@@ -1959,6 +1963,63 @@ impl Default for SpurdConfig {
     }
 }
 
+/// Auto-recovery hook configuration. Triggers a site-supplied recovery
+/// script when a node enters a system-initiated drain or down state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryConfig {
+    /// Path to the recovery script. Empty = feature disabled.
+    #[serde(default)]
+    pub program: String,
+
+    /// Which system-initiated hold states trigger recovery.
+    #[serde(default = "default_recovery_trigger_on")]
+    pub trigger_on: Vec<String>,
+
+    /// Max dispatch count per drain event before exhaustion.
+    #[serde(default = "default_recovery_max_attempts")]
+    pub max_attempts: u32,
+
+    /// Wall-time limit per recovery job invocation (seconds).
+    #[serde(default = "default_recovery_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// User to run the recovery script as (default: root).
+    #[serde(default = "default_recovery_user")]
+    pub user: String,
+
+    #[serde(default)]
+    pub uid: u32,
+
+    #[serde(default)]
+    pub gid: u32,
+
+    /// Seconds to wait after NodeFail for the node to re-register before
+    /// counting the dispatch as a failed attempt.
+    #[serde(default = "default_recovery_reboot_timeout_secs")]
+    pub reboot_timeout_secs: u64,
+
+    /// Max concurrent recovery jobs cluster-wide. Absolute count or percentage
+    /// (e.g. "10%").
+    #[serde(default = "default_recovery_concurrency_cap")]
+    pub concurrency_cap: String,
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self {
+            program: String::new(),
+            trigger_on: default_recovery_trigger_on(),
+            max_attempts: default_recovery_max_attempts(),
+            timeout_secs: default_recovery_timeout_secs(),
+            user: default_recovery_user(),
+            uid: 0,
+            gid: 0,
+            reboot_timeout_secs: default_recovery_reboot_timeout_secs(),
+            concurrency_cap: default_recovery_concurrency_cap(),
+        }
+    }
+}
+
 impl SpurdConfig {
     pub fn controller_connect_timeout(&self) -> Duration {
         Duration::from_secs(self.controller_connect_timeout_secs)
@@ -1983,6 +2044,43 @@ impl SpurdConfig {
     pub fn native_mint_timeout(&self) -> Duration {
         Duration::from_secs(self.native_mint_timeout_secs)
     }
+}
+
+impl RecoveryConfig {
+    pub fn is_enabled(&self) -> bool {
+        !self.program.is_empty()
+    }
+
+    pub fn concurrency_cap(&self, total_nodes: usize) -> usize {
+        parse_cap(&self.concurrency_cap, total_nodes).unwrap_or(0)
+    }
+
+    pub fn triggers_on_drain(&self) -> bool {
+        self.trigger_on.iter().any(|s| s == "drain")
+    }
+
+    pub fn triggers_on_down(&self) -> bool {
+        self.trigger_on.iter().any(|s| s == "down")
+    }
+}
+
+fn default_recovery_trigger_on() -> Vec<String> {
+    vec!["drain".into(), "down".into()]
+}
+fn default_recovery_max_attempts() -> u32 {
+    3
+}
+fn default_recovery_timeout_secs() -> u64 {
+    600
+}
+fn default_recovery_user() -> String {
+    "root".into()
+}
+fn default_recovery_reboot_timeout_secs() -> u64 {
+    900
+}
+fn default_recovery_concurrency_cap() -> String {
+    "10%".into()
 }
 
 /// Resolved cgroup-v2 control-file values for one job. `None`/empty means
@@ -2542,7 +2640,7 @@ impl SlurmConfig {
                 });
             }
         }
-        if parse_health_cap(&self.health.max_unavailable, 1).is_none() {
+        if parse_cap(&self.health.max_unavailable, 1).is_none() {
             return Err(ConfigError::InvalidValue {
                 field: "health.max_unavailable".into(),
                 value: format!(
@@ -3847,12 +3945,12 @@ gid = 0
     #[test]
     fn test_health_max_unavailable_parses_and_validates() {
         // Absolute and percentage forms both parse; a bad value is rejected.
-        assert_eq!(parse_health_cap("5", 40), Some(5));
-        assert_eq!(parse_health_cap("10%", 40), Some(4));
-        assert_eq!(parse_health_cap("10%", 3), Some(1)); // rounds up, at least 1
-        assert_eq!(parse_health_cap("0", 40), Some(0)); // unlimited
-        assert_eq!(parse_health_cap("0%", 40), Some(0));
-        assert_eq!(parse_health_cap("bogus", 40), None);
+        assert_eq!(parse_cap("5", 40), Some(5));
+        assert_eq!(parse_cap("10%", 40), Some(4));
+        assert_eq!(parse_cap("10%", 3), Some(1)); // rounds up, at least 1
+        assert_eq!(parse_cap("0", 40), Some(0)); // unlimited
+        assert_eq!(parse_cap("0%", 40), Some(0));
+        assert_eq!(parse_cap("bogus", 40), None);
 
         let err = SlurmConfig::load_from_str(
             "cluster_name = \"x\"\n[health]\nmax_unavailable = \"lots\"\n",

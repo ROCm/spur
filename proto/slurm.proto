@@ -344,6 +344,8 @@ message NodeInfo {
   // Port the node's agent listens on, so a client dialling it directly does not
   // have to assume the default.
   uint32 agent_port = 58;
+
+  DrainOrigin drain_origin = 59;
 }
 
 message PartitionInfo {
@@ -402,6 +404,13 @@ service SlurmController {
   rpc UpdateNode(UpdateNodeRequest) returns (google.protobuf.Empty);
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
   rpc DeregisterNode(DeregisterNodeRequest) returns (DeregisterNodeResponse);
+
+  // Auto-recovery: node self-management (WireGuard identity-authenticated)
+  rpc SelfLabelNode(SelfLabelNodeRequest) returns (google.protobuf.Empty);
+  rpc SelfUndrainNode(SelfUndrainNodeRequest) returns (google.protobuf.Empty);
+  // Auto-recovery: admin commands
+  rpc RecoverNode(RecoverNodeRequest) returns (google.protobuf.Empty);
+  rpc AbortRecovery(AbortRecoveryRequest) returns (google.protobuf.Empty);
 
   // Agent deregistration (called by spurd on SIGTERM)
   rpc DeregisterAgent(DeregisterAgentRequest) returns (google.protobuf.Empty);
@@ -687,6 +696,29 @@ message DrainNodeRequest {
 message DrainNodeResponse {
   string actual_state = 1;
   uint32 running_jobs = 2;
+}
+
+enum DrainOrigin {
+  DRAIN_ORIGIN_ADMIN = 0;
+  DRAIN_ORIGIN_SYSTEM = 1;
+}
+
+message SelfLabelNodeRequest {
+  string name = 1;
+  map<string, string> set_labels = 2;
+  repeated string remove_labels = 3;
+}
+
+message SelfUndrainNodeRequest {
+  string name = 1;
+}
+
+message RecoverNodeRequest {
+  string name = 1;
+}
+
+message AbortRecoveryRequest {
+  string name = 1;
 }
 
 message DeregisterNodeRequest {

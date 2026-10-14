@@ -174,11 +174,13 @@ impl<'a> NodePlacement<'a> {
         if !self.eligible(node, reservations, now) {
             return false;
         }
-        if !node.is_schedulable() {
+        if !node.is_schedulable() && !self.job.spec.system_override {
             return false;
         }
-        // Exclusive jobs need an idle node.
+        // Exclusive jobs need an idle node (system_override jobs on drained nodes
+        // are exempt — the node is empty by definition of Drain).
         if self.job.spec.exclusive
+            && !self.job.spec.system_override
             && (node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices())
         {
             return false;
@@ -194,7 +196,9 @@ impl<'a> NodePlacement<'a> {
         reservations: &[Reservation],
         now: DateTime<Utc>,
     ) -> bool {
-        !node.is_k0s_reserved() && self.eligible(node, reservations, now) && node.state.is_up()
+        !node.is_k0s_reserved()
+            && self.eligible(node, reservations, now)
+            && (node.state.is_up() || self.job.spec.system_override)
     }
 
     /// True when a listed node can't satisfy the request in an additive
@@ -206,6 +210,9 @@ impl<'a> NodePlacement<'a> {
         now: DateTime<Utc>,
         required: &spur_core::resource::ResourceSet,
     ) -> bool {
+        if self.job.spec.system_override {
+            return false;
+        }
         self.nodelist_is_additive()
             && nodes.into_iter().any(|n| {
                 self.is_listed(&n.name)

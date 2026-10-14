@@ -70,6 +70,10 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         "DrainNode" => targeted(Update, TxnEntity::Node, LeaderOnly),
         "DeregisterNode" => targeted(Delete, TxnEntity::Node, LeaderOnly),
         "DeregisterAgent" => targeted(Delete, TxnEntity::Node, LeaderOnly),
+        "SelfLabelNode" => targeted(Update, TxnEntity::Node, LeaderOnly),
+        "SelfUndrainNode" => targeted(Update, TxnEntity::Node, LeaderOnly),
+        "RecoverNode" => targeted(Update, TxnEntity::Node, LeaderOnly),
+        "AbortRecovery" => targeted(Update, TxnEntity::Node, LeaderOnly),
 
         // --- Reservations ---
         "CreateReservation" => targeted(Create, TxnEntity::Reservation, LeaderOnly),
