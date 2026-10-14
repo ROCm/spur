@@ -40,6 +40,23 @@ pub enum NodeEvent {
     PowerResume,
 }
 
+/// Distinguishes system-initiated drains (health-check, epilog, heartbeat)
+/// from admin-initiated drains (API, CLI). The recovery reconciler only
+/// acts on `System` drains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DrainOrigin {
+    #[default]
+    Admin,
+    System,
+}
+
+pub const RECOVERY_LABEL_PREFIX: &str = "spur.recovery/";
+pub const RECOVERY_PHASE_KEY: &str = "spur.recovery/phase";
+pub const RECOVERY_ATTEMPT_KEY: &str = "spur.recovery/attempt";
+pub const RECOVERY_DISPATCH_GEN_KEY: &str = "spur.recovery/dispatch-gen";
+pub const RECOVERY_DISPATCH_END_KEY: &str = "spur.recovery/dispatch-end";
+pub const RECOVERY_BOOT_ID_KEY: &str = "spur.recovery/boot-id";
+
 impl NodeState {
     /// Centralized transition table. Returns the new state if the transition
     /// is valid, `None` if the current state should be preserved.
@@ -324,6 +341,11 @@ pub struct Node {
     /// false so the node can self-heal when the agent reconnects.
     #[serde(default)]
     pub admin_locked: bool,
+    /// Whether this drain was initiated by the system (health-check, epilog,
+    /// heartbeat loss) or by an admin (API, CLI). The recovery reconciler only
+    /// acts on `System` drains.
+    #[serde(default)]
+    pub drain_origin: DrainOrigin,
     pub partitions: Vec<String>,
     /// Where this node comes from (native-host or K8s).
     #[serde(default)]
@@ -401,6 +423,7 @@ impl Node {
             reason_uid: None,
             reason_time: None,
             admin_locked: false,
+            drain_origin: DrainOrigin::default(),
             partitions: Vec::new(),
             source: NodeSource::default(),
             detected_resources: resources.clone(),
@@ -427,6 +450,19 @@ impl Node {
             k0s_pod_cidr: None,
             k0s_last_error: None,
         }
+    }
+
+    pub fn has_recovery_labels(&self) -> bool {
+        self.labels
+            .keys()
+            .any(|k| k.starts_with(RECOVERY_LABEL_PREFIX))
+    }
+
+    pub fn recovery_attempt(&self) -> u32 {
+        self.labels
+            .get(RECOVERY_ATTEMPT_KEY)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     }
 
     /// Reset config-derived scheduling policy (features, weight) to defaults.
@@ -839,5 +875,60 @@ mod tests {
             node_overlay(&node),
             Some(NodeOverlay::Reserved { maint: false })
         );
+    }
+
+    #[test]
+    fn drain_origin_defaults_to_admin() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.state = NodeState::Drain;
+        node.drain_origin = DrainOrigin::System;
+        let mut json: serde_json::Value = serde_json::to_value(&node).unwrap();
+        json.as_object_mut().unwrap().remove("drain_origin");
+        let deser: Node = serde_json::from_value(json).unwrap();
+        assert_eq!(deser.drain_origin, DrainOrigin::Admin);
+    }
+
+    #[test]
+    fn drain_origin_system_roundtrips() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.drain_origin = DrainOrigin::System;
+        let json = serde_json::to_string(&node).unwrap();
+        let deser: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.drain_origin, DrainOrigin::System);
+    }
+
+    #[test]
+    fn has_recovery_labels_true_when_present() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.labels
+            .insert("spur.recovery/phase".into(), "verify".into());
+        assert!(node.has_recovery_labels());
+    }
+
+    #[test]
+    fn has_recovery_labels_false_when_empty() {
+        let node = Node::new("n1".into(), ResourceSet::default());
+        assert!(!node.has_recovery_labels());
+    }
+
+    #[test]
+    fn has_recovery_labels_false_for_unrelated_labels() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.labels.insert("app".into(), "gpu".into());
+        assert!(!node.has_recovery_labels());
+    }
+
+    #[test]
+    fn recovery_attempt_parses_label() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.labels
+            .insert("spur.recovery/attempt".into(), "2".into());
+        assert_eq!(node.recovery_attempt(), 2);
+    }
+
+    #[test]
+    fn recovery_attempt_defaults_to_zero() {
+        let node = Node::new("n1".into(), ResourceSet::default());
+        assert_eq!(node.recovery_attempt(), 0);
     }
 }

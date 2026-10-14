@@ -1807,6 +1807,10 @@ mod tests {
         cluster_kubeconfig(pb::ClusterKubeconfigRequest) -> pb::ClusterKubeconfigResponse;
         cluster_add_nodes(pb::ClusterAddNodesRequest) -> pb::ClusterAddNodesResponse;
         cluster_remove_nodes(pb::ClusterRemoveNodesRequest) -> pb::ClusterRemoveNodesResponse;
+        self_label_node(pb::SelfLabelNodeRequest) -> ();
+        self_undrain_node(pb::SelfUndrainNodeRequest) -> ();
+        recover_node(pb::RecoverNodeRequest) -> ();
+        abort_recovery(pb::AbortRecoveryRequest) -> ();
     }
 
     /// A kube client whose every request fails. The deletion path tolerates

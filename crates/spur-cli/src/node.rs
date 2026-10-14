@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use spur_proto::proto::UpdateNodeRequest;
+use spur_proto::proto::{
+    AbortRecoveryRequest, RecoverNodeRequest, SelfLabelNodeRequest, SelfUndrainNodeRequest,
+    UpdateNodeRequest,
+};
 
 /// Node management commands.
 #[derive(Parser, Debug)]
@@ -40,6 +43,10 @@ pub enum NodeCommand {
         /// Labels to set (key=value) or remove (key-)
         #[arg(required = true)]
         labels: Vec<String>,
+        /// Use the node's own WireGuard identity (for recovery scripts).
+        /// Restricts labels to the spur.recovery/ namespace.
+        #[arg(long = "self")]
+        self_: bool,
     },
     /// Drain one or more nodes: stop scheduling new jobs while existing jobs finish.
     Drain {
@@ -48,6 +55,20 @@ pub enum NodeCommand {
         /// Reason for draining
         #[arg(long)]
         reason: Option<String>,
+    },
+    /// Return a node to idle (clear a drain hold).
+    Undrain {
+        /// Node name
+        node: String,
+        /// Use the node's own WireGuard identity (for recovery scripts).
+        /// Only works on system-initiated drains.
+        #[arg(long = "self")]
+        self_: bool,
+    },
+    /// Manage auto-recovery on nodes.
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
     },
     /// Remove one or more nodes from the cluster entirely.
     ///
@@ -65,6 +86,20 @@ pub enum NodeCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum RecoveryCommand {
+    /// Hand a drained node to the recovery script (admin-only).
+    Trigger {
+        /// Node name
+        node: String,
+    },
+    /// Abort auto-recovery and reclassify as admin drain.
+    Abort {
+        /// Node name
+        node: String,
+    },
+}
+
 pub async fn main() -> Result<()> {
     main_with_args(std::env::args().collect()).await
 }
@@ -73,8 +108,14 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let parsed = crate::clap_exit::parse_or_exit::<NodeArgs>(&args);
     let controller = parsed.controller;
     match parsed.command {
-        NodeCommand::Label { node, labels } => cmd_label(&controller, node, labels).await,
+        NodeCommand::Label {
+            node,
+            labels,
+            self_,
+        } => cmd_label(&controller, node, labels, self_).await,
         NodeCommand::Drain { node, reason } => cmd_drain(&controller, node, reason).await,
+        NodeCommand::Undrain { node, self_ } => cmd_undrain(&controller, &node, self_).await,
+        NodeCommand::Recovery { command } => cmd_recovery(&controller, command).await,
         NodeCommand::Remove {
             node,
             force,
@@ -106,8 +147,35 @@ fn parse_label_args(label_args: &[String]) -> Result<(HashMap<String, String>, V
     Ok((set_labels, remove_labels))
 }
 
-async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<String>) -> Result<()> {
+async fn cmd_label(
+    controller: &str,
+    node_pattern: String,
+    label_args: Vec<String>,
+    self_: bool,
+) -> Result<()> {
     let (set_labels, remove_labels) = parse_label_args(&label_args)?;
+
+    if self_ {
+        let mut client =
+            spur_proto::controller_client(crate::authclient::connect(controller).await?);
+        // --self: use SelfLabelNode RPC (node's own identity, spur.recovery/ namespace only)
+        client
+            .self_label_node(SelfLabelNodeRequest {
+                name: node_pattern.clone(),
+                set_labels: set_labels.clone(),
+                remove_labels: remove_labels.clone(),
+            })
+            .await
+            .context("SelfLabelNode RPC failed")?;
+        for (k, v) in &set_labels {
+            println!("  {node_pattern}: {k}={v}");
+        }
+        for k in &remove_labels {
+            println!("  {node_pattern}: {k} removed");
+        }
+        return Ok(());
+    }
+
     let nodes = expand_node_pattern(&node_pattern)?;
     let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
     let nodes = if let Some(nodes) = nodes {
@@ -200,6 +268,55 @@ async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String
             nodes.len(),
             failed.join(", ")
         );
+    }
+    Ok(())
+}
+
+async fn cmd_undrain(controller: &str, node: &str, self_: bool) -> Result<()> {
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+
+    if self_ {
+        client
+            .self_undrain_node(SelfUndrainNodeRequest {
+                name: node.to_string(),
+            })
+            .await
+            .context("SelfUndrainNode RPC failed")?;
+    } else {
+        client
+            .update_node(UpdateNodeRequest {
+                name: node.to_string(),
+                state: Some(spur_proto::proto::NodeState::NodeIdle.into()),
+                reason: None,
+                labels: HashMap::new(),
+                remove_labels: vec![],
+            })
+            .await
+            .context("UpdateNode RPC failed")?;
+    }
+
+    println!("Node {node} undrained");
+    Ok(())
+}
+
+async fn cmd_recovery(controller: &str, command: RecoveryCommand) -> Result<()> {
+    let mut client = spur_proto::controller_client(crate::authclient::connect(controller).await?);
+
+    match command {
+        RecoveryCommand::Trigger { node } => {
+            client
+                .recover_node(RecoverNodeRequest { name: node.clone() })
+                .await
+                .context("RecoverNode RPC failed")?;
+            println!("Recovery triggered for node {node}");
+        }
+        RecoveryCommand::Abort { node } => {
+            client
+                .abort_recovery(AbortRecoveryRequest { name: node.clone() })
+                .await
+                .context("AbortRecovery RPC failed")?;
+            println!("Recovery aborted for node {node}");
+        }
     }
     Ok(())
 }
