@@ -342,9 +342,9 @@ to the current leader.
 
 .. important::
 
-   If ``spurctld`` hits an unrecoverable Raft storage error (for example the
-   state directory becomes unwritable), it exits non-zero rather than continuing
-   to run as a stale leader that accepts no writes. Rely on ``Restart=on-failure``
+   If ``spurctld`` hits an unrecoverable Raft storage error (for example a write
+   to the state directory fails), it exits non-zero rather than continuing to run
+   as a stale leader that accepts no writes. Rely on ``Restart=on-failure``
    (as in the unit above) so the supervisor restarts it; on restart it recovers
    its state from the Raft log and snapshot on disk, and the cluster re-elects a
    leader. A persistent fault will restart-loop, which surfaces the problem in
