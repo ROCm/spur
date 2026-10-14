@@ -42,7 +42,7 @@ def pytest_configure(config):
 def _shard_of(nodeid: str, count: int) -> int:
     # md5, not hash(): the built-in is salted per interpreter (PYTHONHASHSEED),
     # so it would assign the same test to different shards across processes.
-    digest = hashlib.md5(nodeid.encode("utf-8")).hexdigest()
+    digest = hashlib.md5(nodeid.encode("utf-8"), usedforsecurity=False).hexdigest()
     return int(digest, 16) % count
 
 

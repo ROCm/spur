@@ -112,7 +112,8 @@ class SshNode:
         self.host = host
         self.user = user
         self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Test nodes are disposable VMs re-provisioned per run, so there is no stable host key to pin.
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec B507
 
         connect_kwargs = {"hostname": host, "username": user}
         if key_path:
