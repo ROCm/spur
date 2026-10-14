@@ -354,7 +354,7 @@ class SpurCluster:
         self.agent_as_root = agent_as_root
         self.agent_labels = agent_labels or {}
         if kill_stale:
-            self._kill_controller()
+            self._kill_controller(broad=True)
             self._kill_agents(use_sudo=False, broad=True)
             self._kill_agents(use_sudo=True, broad=True)  # best-effort for rootful
         if self.accounting_enabled:
@@ -547,12 +547,26 @@ class SpurCluster:
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
 
-    def srun_with_exit(self, args: list[str]) -> tuple[int, str]:
-        """Run srun and return (exit_code, combined stdout+stderr)."""
+    def srun_with_exit(
+        self, args: list[str], *, timeout: int | None = None
+    ) -> tuple[int, str]:
+        """Run srun and return (exit_code, combined stdout+stderr).
+
+        *timeout* (seconds) guards against GPU collectives that hang
+        indefinitely; the channel is closed after the deadline and the
+        method returns (-1, partial_output).
+        """
         cmd_parts = self._cli_env_assignments()
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
         cmd_parts.extend(shlex.quote(a) for a in args)
         _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        if timeout is not None:
+            deadline = time.time() + timeout
+            while not stdout.channel.exit_status_ready():
+                if time.time() > deadline:
+                    stdout.channel.close()
+                    return -1, stdout.read().decode() + stderr.read().decode()
+                time.sleep(1)
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
 
@@ -1478,6 +1492,7 @@ tar -C "$R" -czf '{local_tar}' .
         self._start_controller_on(0)
 
     def _start_controller_on(self, index: int):
+        self._wait_port_free(self.nodes[index], CONTROLLER_PORT)
         listen = f"[::]:{CONTROLLER_PORT}"
         extra = self._daemon_env_assignments(self.controller_env)
         cmd = (

@@ -101,6 +101,7 @@ impl PmixLaunchPlan {
 /// Supported `--mpi` values (excluding the special `list` keyword).
 pub const MPI_NONE: &str = "none";
 pub const MPI_PMIX: &str = "pmix";
+pub const MPI_MPIRUN: &str = "mpirun";
 
 /// Max bytes for PMIx namespace strings passed to the C plugin (NUL excluded).
 pub const PMIX_NAMESPACE_MAX: usize = 255;
@@ -359,9 +360,9 @@ pub fn parse_mpi_option(value: &str) -> Result<Option<String>, String> {
         return Ok(None);
     }
     match value {
-        MPI_NONE | MPI_PMIX => Ok(Some(value.to_string())),
+        MPI_NONE | MPI_PMIX | MPI_MPIRUN => Ok(Some(value.to_string())),
         other => Err(format!(
-            "invalid --mpi value '{other}' (supported: none, pmix)"
+            "invalid --mpi value '{other}' (supported: none, pmix, mpirun)"
         )),
     }
 }
@@ -370,6 +371,7 @@ pub fn mpi_list_lines(plugin_dir: &str) -> Vec<String> {
     vec![
         MPI_NONE.to_string(),
         MPI_PMIX.to_string(),
+        MPI_MPIRUN.to_string(),
         format!("plugin_dir={plugin_dir}"),
     ]
 }
@@ -468,6 +470,7 @@ mod tests {
     fn parse_mpi_option_values() {
         assert_eq!(parse_mpi_option("list").unwrap(), None);
         assert_eq!(parse_mpi_option("pmix").unwrap(), Some("pmix".into()));
+        assert_eq!(parse_mpi_option("mpirun").unwrap(), Some("mpirun".into()));
         assert!(parse_mpi_option("pmi2").is_err());
     }
 
@@ -608,6 +611,7 @@ mod tests {
         let lines = mpi_list_lines("/usr/lib/spur");
         assert!(lines.iter().any(|l| l == "none"));
         assert!(lines.iter().any(|l| l == "pmix"));
+        assert!(lines.iter().any(|l| l == "mpirun"));
         assert!(lines.iter().any(|l| l.contains("plugin_dir=")));
     }
 

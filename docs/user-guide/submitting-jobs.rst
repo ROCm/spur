@@ -414,6 +414,49 @@ not finish (often hash GDS, memlock, or Open MPI TCP using the wrong NIC) —
 ask an admin to check the native-host MPI section rather than retrying the
 same script.
 
+Open MPI via mpirun
+~~~~~~~~~~~~~~~~~~~
+
+Two launch paths avoid SSH between nodes:
+
+**Path 1: srun --mpi=mpirun** — Spur launches ``mpirun`` on node 0 only;
+PRRTE's ``plm:slurm`` places its daemons on remote nodes via ``srun``,
+no SSH required.  Other nodes hold the allocation until the driver
+completes.
+
+.. code-block:: bash
+
+   srun --mpi=mpirun -N 2 -n 8 --gres=gpu:8 ./hello_mpi
+
+When ``--mpi=mpirun`` is set, Spur additionally sources
+``$HOME/spur/mpi/env.sh`` for MPI library paths.
+
+**Path 2: sbatch + inline mpirun** — the batch script calls ``mpirun``
+directly without ``--mpi=mpirun``.  PRRTE detects the Slurm allocation
+from the environment (``SLURM_JOBID``, ``SLURM_NODELIST``) and uses
+``plm:slurm`` to place daemons.
+
+.. code-block:: bash
+
+   #!/bin/bash
+   #SBATCH -N 2
+   #SBATCH -n 8
+   #SBATCH --gres=gpu:8
+
+   mpirun -np 8 --bind-to none ./hello_mpi
+
+Both paths set ``SLURM_TASKS_PER_NODE`` in the ``N(xM)`` format that
+Open MPI expects.  The ``--mpi=mpirun`` value appears in
+``srun --mpi=list``.
+
+.. note::
+
+   Multi-node ``mpirun`` jobs survive a controller restart: the ``srun``
+   process that PRRTE uses for daemon placement retries the controller
+   connection for up to 60 seconds (30 attempts x 2 s backoff).  If the
+   controller is back within that window, the agent recognises the
+   already-running step and returns its result without relaunching.
+
 Distributed-training rendezvous variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

@@ -195,6 +195,27 @@ pub struct SrunArgs {
     #[arg(long, default_value = "ALL", overrides_with = "export")]
     pub export: String,
 
+    /// Accepted for Slurm/PRRTE compatibility (optional value form:
+    /// --kill-on-bad-exit[=0|1]). Spur's agent supervisor unconditionally
+    /// terminates all step processes when any task exits abnormally; the
+    /// per-task granularity this flag controls in Slurm is not implemented.
+    #[arg(long, hide = true, num_args = 0..=1, default_missing_value = "1")]
+    pub kill_on_bad_exit: Option<String>,
+
+    /// Accepted for PRRTE orted daemon placement (hidden no-op).
+    #[arg(long, hide = true)]
+    pub external_launcher: bool,
+
+    /// Accepted for PRRTE daemon placement. In Slurm, --no-kill keeps tasks
+    /// alive after one exits abnormally; Spur's step lifecycle is managed by
+    /// the agent supervisor, which always terminates step processes together.
+    #[arg(long, hide = true)]
+    pub no_kill: bool,
+
+    /// Task distribution method (accepted for PRRTE compatibility; not enforced).
+    #[arg(short = 'm', long, hide = true)]
+    pub distribution: Option<String>,
+
     /// Allocate a pseudo-terminal for the job
     #[arg(long)]
     pub pty: bool,
@@ -203,7 +224,7 @@ pub struct SrunArgs {
     #[arg(long)]
     pub jobid: Option<u32>,
 
-    /// Share resources with the running job (requires --jobid)
+    /// Share resources with the running job
     #[arg(long)]
     pub overlap: bool,
 
@@ -229,8 +250,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let matches = crate::clap_exit::matches_or_exit(SrunArgs::command(), &args);
     let mut args = crate::clap_exit::from_matches_or_exit::<SrunArgs>(&matches);
 
-    if args.jobid.is_some() && !args.overlap {
-        anyhow::bail!("--jobid requires --overlap");
+    if args.jobid.is_some() && !args.overlap && !args.external_launcher {
+        anyhow::bail!(
+            "--jobid requires --overlap (or --external-launcher for PRRTE daemon placement)"
+        );
     }
 
     if args.container_readonly {
@@ -243,36 +266,52 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     resolve_srun_env(&matches, &mut args)?;
     args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
-    // --jobid --overlap: exec into a running job (interactive PTY session)
+    // --jobid routing: two distinct use cases share --jobid.
+    //
+    // (a) Interactive attach: `srun --jobid=<id> [--overlap] [--pty] [cmd]`
+    //     A user attaching to a running job. Routes to the PTY path, which
+    //     creates a single-task, overlap step in the job's allocation.
+    //
+    // (b) Daemon placement: `srun --jobid=<id> --external-launcher -N<n> prted`
+    //     PRRTE's plm:slurm placing orted daemons across the allocation.
+    //     Routes to the step dispatch path, which creates a multi-task,
+    //     multi-node step honoring -N/--ntasks/--ntasks-per-node.
+    //
+    // --external-launcher is the distinguishing signal: PRRTE always passes
+    // it, regular users never do. Without it, --jobid stays on the PTY path
+    // to preserve the existing interactive-attach behavior (and its env
+    // isolation properties — the PTY path does not inherit daemon env).
     if let Some(job_id) = args.jobid {
-        let warnings = step_unsupported_warnings(&args)
-            .into_iter()
-            .chain(pty_step_unsupported_warnings(&args, &matches));
-        for warning in warnings {
-            eprintln!("{warning}");
+        if !args.external_launcher {
+            let warnings = step_unsupported_warnings(&args)
+                .into_iter()
+                .chain(pty_step_unsupported_warnings(&args, &matches));
+            for warning in warnings {
+                eprintln!("{warning}");
+            }
+            let node = first_node(args.nodelist.as_deref().unwrap_or_default());
+            let channel = crate::authclient::connect(&args.controller)
+                .await
+                .context("cannot connect to controller")?;
+            let mut ctrl = spur_proto::controller_client(channel);
+            let job = ctrl
+                .get_job(GetJobRequest { job_id })
+                .await
+                .context("failed to get job info")?
+                .into_inner();
+            let known_owner = (!job.user.is_empty()).then_some(job.user.as_str());
+            let user = crate::interactive::job_caller_user(&mut ctrl, job_id, known_owner).await?;
+            let exit_code = run_interactive_pty(
+                &mut ctrl,
+                job_id,
+                args.command.clone(),
+                node,
+                &user,
+                container_spec_from_srun_args(&args),
+            )
+            .await?;
+            std::process::exit(exit_code);
         }
-        let node = first_node(args.nodelist.as_deref().unwrap_or_default());
-        let channel = crate::authclient::connect(&args.controller)
-            .await
-            .context("cannot connect to controller")?;
-        let mut ctrl = spur_proto::controller_client(channel);
-        let job = ctrl
-            .get_job(GetJobRequest { job_id })
-            .await
-            .context("failed to get job info")?
-            .into_inner();
-        let known_owner = (!job.user.is_empty()).then_some(job.user.as_str());
-        let user = crate::interactive::job_caller_user(&mut ctrl, job_id, known_owner).await?;
-        let exit_code = run_interactive_pty(
-            &mut ctrl,
-            job_id,
-            args.command.clone(),
-            node,
-            &user,
-            container_spec_from_srun_args(&args),
-        )
-        .await?;
-        std::process::exit(exit_code);
     }
 
     if args.mpi.as_deref() == Some("list") {
@@ -283,10 +322,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         return Ok(());
     }
 
-    let step_mode = std::env::var("SPUR_JOB_ID")
-        .ok()
-        .and_then(|id| id.parse::<u32>().ok())
-        .is_some();
+    let step_mode = (args.jobid.is_some() && args.external_launcher)
+        || std::env::var("SPUR_JOB_ID")
+            .ok()
+            .and_then(|id| id.parse::<u32>().ok())
+            .is_some();
     let resolved_mpi = resolve_srun_mpi(&args, &matches, step_mode)?;
 
     if args.command.is_empty() {
@@ -314,6 +354,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         spur_core::hooks::run_hook(srun_prolog, &ctx)
             .await
             .context("SrunProlog failed — step not dispatched")?;
+    }
+
+    // --jobid + --external-launcher: daemon placement inside the referenced
+    // allocation. PRRTE's plm:slurm sends this to fan daemons across nodes.
+    if let Some(job_id) = args.jobid {
+        debug_assert!(
+            args.external_launcher,
+            "--jobid without --external-launcher should have taken the PTY path above"
+        );
+        return run_as_step(&args, &matches, job_id, &hooks, &work_dir, &resolved_mpi).await;
     }
 
     // Step mode: if running inside an allocation, create a step instead of a new job
@@ -880,24 +930,23 @@ async fn dispatch_step(
         })
     });
 
-    let resp = client
-        .run_step(RunStepRequest {
-            job_id,
-            command: args.command.clone(),
-            uid: nix::unistd::geteuid().as_raw(),
-            gid: nix::unistd::getegid().as_raw(),
-            work_dir: work_dir.to_string(),
-            environment,
-            step_id,
-            label: args.label,
-            mpi: step_mpi.to_string(),
-            user: params.user.to_string(),
-            container: container_spec_from_srun_args(args),
-            execution_credential,
-        })
+    let run_step_req = RunStepRequest {
+        job_id,
+        command: args.command.clone(),
+        uid: nix::unistd::geteuid().as_raw(),
+        gid: nix::unistd::getegid().as_raw(),
+        work_dir: work_dir.to_string(),
+        environment,
+        step_id,
+        label: args.label,
+        mpi: step_mpi.to_string(),
+        user: params.user.to_string(),
+        container: container_spec_from_srun_args(args),
+        execution_credential,
+    };
+    let resp = run_step_with_retry(client, run_step_req, &args.controller)
         .await
-        .context("RunStep dispatch failed")?
-        .into_inner();
+        .context("RunStep dispatch failed")?;
 
     if !resp.node.is_empty() {
         eprintln!("srun: dispatched to node {}", resp.node);
@@ -925,6 +974,61 @@ async fn dispatch_step(
     Ok(StepDispatchResult {
         exit_code: resp.exit_code,
     })
+}
+
+const RUN_STEP_RETRY_ATTEMPTS: u32 = 30;
+const RUN_STEP_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn is_transient_error(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown
+    )
+}
+
+async fn run_step_with_retry(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    req: RunStepRequest,
+    controller_addr: &str,
+) -> Result<spur_proto::proto::RunStepResponse> {
+    let mut last_error = None;
+    for attempt in 0..RUN_STEP_RETRY_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(RUN_STEP_RETRY_BACKOFF).await;
+            match crate::authclient::connect(controller_addr).await {
+                Ok(channel) => {
+                    *client = spur_proto::controller_client(channel);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "srun: reconnect to controller failed (attempt {}/{}): {e}",
+                        attempt + 1,
+                        RUN_STEP_RETRY_ATTEMPTS
+                    );
+                    continue;
+                }
+            }
+        }
+        match client.run_step(req.clone()).await {
+            Ok(response) => return Ok(response.into_inner()),
+            Err(status) if is_transient_error(&status) => {
+                eprintln!(
+                    "srun: lost controller connection (attempt {}/{}), reconnecting...",
+                    attempt + 1,
+                    RUN_STEP_RETRY_ATTEMPTS
+                );
+                last_error = Some(status);
+            }
+            Err(status) => {
+                anyhow::bail!("RunStep failed: {status}");
+            }
+        }
+    }
+    anyhow::bail!(
+        "RunStep failed after {} retries: {}",
+        RUN_STEP_RETRY_ATTEMPTS,
+        last_error.map_or_else(|| "unknown".to_string(), |e| e.to_string())
+    )
 }
 
 async fn release_srun_allocation(
@@ -3566,7 +3670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jobid_without_overlap_errors() {
+    async fn jobid_without_overlap_is_rejected() {
         let result = main_with_args(vec![
             "srun".into(),
             "--jobid".into(),
@@ -3578,7 +3682,25 @@ mod tests {
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains("--overlap"),
-            "expected --overlap error, got: {msg}"
+            "expected --overlap requirement, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jobid_with_external_launcher_skips_overlap_check() {
+        let result = main_with_args(vec![
+            "srun".into(),
+            "--jobid=42".into(),
+            "--external-launcher".into(),
+            "-N1".into(),
+            "prted".into(),
+        ])
+        .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            !msg.contains("--overlap"),
+            "--external-launcher should bypass the --overlap check, got: {msg}"
         );
     }
 
@@ -3649,5 +3771,70 @@ mod tests {
             vec![0, "numbered-step-start\n".len() as u64],
             "the reconnect must resume past what was already printed"
         );
+    }
+
+    #[test]
+    fn jobid_with_pty_parses_and_routes_to_interactive() {
+        let args = SrunArgs::try_parse_from(["srun", "--jobid=42", "--overlap", "--pty", "bash"])
+            .expect("parse");
+        assert_eq!(args.jobid, Some(42));
+        assert!(args.pty);
+        assert!(args.overlap);
+        assert!(!args.external_launcher);
+    }
+
+    #[test]
+    fn jobid_without_external_launcher_stays_on_pty_path() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "--jobid=42", "--overlap", "bash", "-c", "hostname"])
+                .expect("parse");
+        assert_eq!(args.jobid, Some(42));
+        assert!(!args.external_launcher);
+        // Without --external-launcher, --jobid routes to the PTY/interactive
+        // path regardless of whether a command is present.
+    }
+
+    #[test]
+    fn jobid_with_external_launcher_routes_to_step_dispatch() {
+        let args = SrunArgs::try_parse_from([
+            "srun",
+            "--jobid=42",
+            "--external-launcher",
+            "--no-kill",
+            "-N",
+            "2",
+            "prted",
+            "--arg",
+        ])
+        .expect("parse");
+        assert_eq!(args.jobid, Some(42));
+        assert!(args.external_launcher);
+        assert!(args.no_kill);
+        assert_eq!(args.nodes, 2);
+        assert_eq!(step_dispatch_kind(&args), StepDispatchKind::Buffered);
+    }
+
+    #[test]
+    fn kill_on_bad_exit_accepts_equals_form() {
+        let args =
+            SrunArgs::try_parse_from(["srun", "--kill-on-bad-exit=0", "hostname"]).expect("parse");
+        assert_eq!(args.kill_on_bad_exit.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn kill_on_bad_exit_accepts_bare_flag() {
+        let args = SrunArgs::try_parse_from(["srun", "--kill-on-bad-exit", "--", "hostname"])
+            .expect("parse");
+        assert_eq!(args.kill_on_bad_exit.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn distribution_short_and_long() {
+        let short =
+            SrunArgs::try_parse_from(["srun", "-m", "arbitrary", "hostname"]).expect("parse");
+        assert_eq!(short.distribution.as_deref(), Some("arbitrary"));
+        let long =
+            SrunArgs::try_parse_from(["srun", "--distribution=block", "hostname"]).expect("parse");
+        assert_eq!(long.distribution.as_deref(), Some("block"));
     }
 }
