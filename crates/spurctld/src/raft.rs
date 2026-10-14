@@ -18,7 +18,7 @@ use openraft::{
     BasicNode, Config, Entry, EntryPayload, LogId, Raft, RaftSnapshotBuilder, StorageError,
     StoredMembership, Vote,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -92,6 +92,14 @@ pub trait StateMachineApply: Send + Sync {
 /// Layout: `{state_dir}/raft/{vote.json, log/*.json, snapshot.json}`
 pub struct SpurStore {
     inner: RwLock<StoreInner>,
+    /// The current snapshot, served from memory so a reader never races a
+    /// concurrent on-disk rewrite (the torn-file bug that stalled the cluster).
+    current_snapshot: RwLock<Option<PersistedSnapshot>>,
+    /// Serializes snapshot persistence so a build task and a leader-driven
+    /// install cannot write `snapshot.json` at the same time, and an older
+    /// snapshot cannot overwrite a newer one. Separate from `current_snapshot`
+    /// so readers never wait behind a multi-second disk write.
+    persist_lock: Mutex<()>,
     raft_dir: PathBuf,
     applier: Arc<dyn StateMachineApply>,
 }
@@ -115,10 +123,19 @@ struct StoreInner {
     applied_count: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedSnapshot {
     meta: SnapshotMeta<NodeId, BasicNode>,
     data: Vec<u8>,
+}
+
+/// Borrowed mirror of [`PersistedSnapshot`] used only for serialization, so a
+/// ~750 MB snapshot is written without first cloning its bytes into an owned
+/// struct. Field names and order match, so the JSON is identical.
+#[derive(Serialize)]
+struct PersistedSnapshotRef<'a> {
+    meta: &'a SnapshotMeta<NodeId, BasicNode>,
+    data: &'a [u8],
 }
 
 impl SpurStore {
@@ -153,8 +170,14 @@ impl SpurStore {
         let log_dir = raft_dir.join("log");
         std::fs::create_dir_all(&log_dir)?;
 
+        // A crash mid-write leaves a partial `*.tmp` (a snapshot temp can be
+        // ~750 MB); the real files are only ever the renamed-into targets, so
+        // any leftover temp is stale and safe to drop.
+        remove_stale_temp_files(&raft_dir);
+
         let mut inner = StoreInner::default();
         let mut skipped_records = 0u64;
+        let mut recovered_snapshot: Option<PersistedSnapshot> = None;
 
         let vote_path = raft_dir.join("vote.json");
         if vote_path.exists() {
@@ -216,6 +239,7 @@ impl SpurStore {
                         Ok(()) => {
                             inner.last_applied = ps.meta.last_log_id;
                             inner.last_membership = ps.meta.last_membership.clone();
+                            recovered_snapshot = Some(ps);
                         }
                         Err(e) => {
                             if strict {
@@ -270,6 +294,8 @@ impl SpurStore {
 
         Ok(Self {
             inner: RwLock::new(inner),
+            current_snapshot: RwLock::new(recovered_snapshot),
+            persist_lock: Mutex::new(()),
             raft_dir,
             applier,
         })
@@ -277,22 +303,16 @@ impl SpurStore {
 
     fn persist_last_purged(&self, log_id: &LogId<NodeId>) -> Result<(), std::io::Error> {
         let path = self.raft_dir.join("purged.json");
-        let tmp = self.raft_dir.join("purged.json.tmp");
         let data = serde_json::to_vec(log_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Write-then-rename: a crash mid-write must never corrupt purged.json.
-        std::fs::write(&tmp, &data)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
-        std::fs::rename(&tmp, &path)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+        write_atomic(&path, &data)
     }
 
     fn persist_vote(&self, vote: &Vote<NodeId>) -> Result<(), std::io::Error> {
         let path = self.raft_dir.join("vote.json");
         let data = serde_json::to_vec(vote)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, &data)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
+        write_atomic(&path, &data)
     }
 
     fn persist_log_entry(&self, entry: &Entry<SpurTypeConfig>) -> Result<(), std::io::Error> {
@@ -314,30 +334,79 @@ impl SpurStore {
         let _ = std::fs::remove_file(&path);
     }
 
-    fn persist_snapshot(
+    /// Persist a snapshot atomically and update the in-memory cache, refusing to
+    /// replace a newer snapshot with an older one. Build runs in its own task
+    /// while a leader-driven install runs on the state-machine worker, so the
+    /// two can race; `persist_lock` serializes them and the monotonic
+    /// `last_log_id` check keeps a late-finishing older build from clobbering a
+    /// newer install on disk or in memory. Returns the snapshot now current
+    /// (the freshly written one, or the retained newer one if `meta` was stale).
+    fn persist_and_cache_snapshot(
         &self,
-        meta: &SnapshotMeta<NodeId, BasicNode>,
-        data: &[u8],
-    ) -> Result<(), std::io::Error> {
-        let ps = PersistedSnapshot {
-            meta: meta.clone(),
-            data: data.to_vec(),
-        };
-        let path = self.raft_dir.join("snapshot.json");
-        let json = serde_json::to_vec(&ps)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&path, &json)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))
-    }
+        meta: SnapshotMeta<NodeId, BasicNode>,
+        data: Vec<u8>,
+    ) -> Result<PersistedSnapshot, std::io::Error> {
+        let _guard = self.persist_lock.lock();
 
-    fn load_persisted_snapshot(&self) -> Option<PersistedSnapshot> {
-        let path = self.raft_dir.join("snapshot.json");
-        if !path.exists() {
-            return None;
+        if let Some(existing) = self.current_snapshot.read().as_ref() {
+            if existing.meta.last_log_id >= meta.last_log_id {
+                return Ok(existing.clone());
+            }
         }
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|data| serde_json::from_str(&data).ok())
+
+        let path = self.raft_dir.join("snapshot.json");
+        let json = serde_json::to_vec(&PersistedSnapshotRef {
+            meta: &meta,
+            data: &data,
+        })
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        write_atomic(&path, &json)?;
+
+        let ps = PersistedSnapshot { meta, data };
+        *self.current_snapshot.write() = Some(ps.clone());
+        Ok(ps)
+    }
+}
+
+/// Durable write: fill `<path>.tmp`, fsync it, rename over `path`, then fsync
+/// the directory so the rename itself survives a crash. A reader of `path`
+/// therefore only ever sees a complete file.
+fn write_atomic(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
+    f.write_all(data)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
+    f.sync_all()
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{tmp:?}: {e}")))?;
+    drop(f);
+
+    std::fs::rename(&tmp, path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))?;
+
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Drop any leftover `*.tmp` in the raft dir (an interrupted [`write_atomic`]).
+fn remove_stale_temp_files(raft_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(raft_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "tmp") {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -353,39 +422,48 @@ impl RaftLogReader<SpurTypeConfig> for Arc<SpurStore> {
 
 impl RaftSnapshotBuilder<SpurTypeConfig> for Arc<SpurStore> {
     async fn build_snapshot(&mut self) -> Result<Snapshot<SpurTypeConfig>, StorageError<NodeId>> {
-        let inner = self.inner.read();
+        // Capture the state bytes and meta together under `inner`, then release
+        // it before the multi-second disk write so applying entries is not
+        // blocked on I/O. `apply_to_state_machine` also takes `inner`, so the
+        // captured data and `last_applied` stay consistent.
+        let (snapshot_data, meta) = {
+            let inner = self.inner.read();
 
-        let snapshot_data = self.applier.snapshot_state().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
+            let snapshot_data = self.applier.snapshot_state().map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::other(e),
+                )
+            })?;
 
-        let snap_id = format!(
-            "{}-{}",
-            inner.last_applied.map(|l| l.index).unwrap_or(0),
-            inner.applied_count
-        );
+            let snap_id = format!(
+                "{}-{}",
+                inner.last_applied.map(|l| l.index).unwrap_or(0),
+                inner.applied_count
+            );
 
-        let meta = SnapshotMeta {
-            last_log_id: inner.last_applied,
-            last_membership: inner.last_membership.clone(),
-            snapshot_id: snap_id,
+            let meta = SnapshotMeta {
+                last_log_id: inner.last_applied,
+                last_membership: inner.last_membership.clone(),
+                snapshot_id: snap_id,
+            };
+            (snapshot_data, meta)
         };
 
-        self.persist_snapshot(&meta, &snapshot_data).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                e,
-            )
-        })?;
+        let ps = self
+            .persist_and_cache_snapshot(meta, snapshot_data)
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    e,
+                )
+            })?;
 
         Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(snapshot_data)),
+            meta: ps.meta,
+            snapshot: Box::new(Cursor::new(ps.data)),
         })
     }
 }
@@ -523,25 +601,34 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
         // actually missing whatever the leader just sent. Validate before
         // persisting: writing an unparseable snapshot to disk first would make
         // the next (strict-by-default) startup hard-fail permanently on it.
-        self.applier.restore_from_snapshot(&data).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
+        // Restore and advance `last_applied`/`last_membership` under one write
+        // guard: a concurrent `build_snapshot` reads `inner` then serializes
+        // cluster state, so it must not observe restored state still paired with
+        // the pre-install `last_applied` (which would persist a snapshot whose
+        // replay double-applies entries). Persist to disk after the guard drops,
+        // so the ~750 MB write does not block applying.
+        {
+            let mut inner = self.inner.write();
+            self.applier.restore_from_snapshot(&data).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::other(e),
+                )
+            })?;
+            inner.last_applied = meta.last_log_id;
+            inner.last_membership = meta.last_membership.clone();
+        }
 
-        self.persist_snapshot(meta, &data).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                e,
-            )
-        })?;
+        self.persist_and_cache_snapshot(meta.clone(), data)
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    e,
+                )
+            })?;
 
-        let mut inner = self.inner.write();
-        inner.last_applied = meta.last_log_id;
-        inner.last_membership = meta.last_membership.clone();
         info!(last_applied = ?meta.last_log_id, "installed snapshot from leader");
         Ok(())
     }
@@ -549,14 +636,10 @@ impl openraft::RaftStorage<SpurTypeConfig> for Arc<SpurStore> {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<SpurTypeConfig>>, StorageError<NodeId>> {
-        if let Some(ps) = self.load_persisted_snapshot() {
-            Ok(Some(Snapshot {
-                meta: ps.meta,
-                snapshot: Box::new(Cursor::new(ps.data)),
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(self.current_snapshot.read().as_ref().map(|ps| Snapshot {
+            meta: ps.meta.clone(),
+            snapshot: Box::new(Cursor::new(ps.data.clone())),
+        }))
     }
 }
 
@@ -1443,12 +1526,137 @@ mod tests {
             last_membership: StoredMembership::default(),
             snapshot_id: "snap-100".into(),
         };
-        let data = b"test snapshot data";
-        store.persist_snapshot(&meta, data).unwrap();
+        let data = b"test snapshot data".to_vec();
+        store
+            .persist_and_cache_snapshot(meta, data.clone())
+            .unwrap();
 
-        let loaded = store.load_persisted_snapshot().unwrap();
-        assert_eq!(loaded.meta.snapshot_id, "snap-100");
-        assert_eq!(loaded.data, data);
+        // Served from the in-memory cache, never re-read from disk.
+        let cached = store.current_snapshot.read().clone().unwrap();
+        assert_eq!(cached.meta.snapshot_id, "snap-100");
+        assert_eq!(cached.data, data);
+
+        // And it survives a restart: a fresh store recovers it from disk.
+        let reopened = SpurStore::new(dir.path(), noop_applier()).unwrap();
+        let recovered = reopened.current_snapshot.read().clone().unwrap();
+        assert_eq!(recovered.meta.snapshot_id, "snap-100");
+        assert_eq!(recovered.data, data);
+    }
+
+    #[tokio::test]
+    async fn get_current_snapshot_unaffected_by_torn_file_on_disk() {
+        use openraft::RaftStorage;
+        let dir = TempDir::new().unwrap();
+        let mut store = Arc::new(SpurStore::new(dir.path(), noop_applier()).unwrap());
+
+        let meta = SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: openraft::LeaderId {
+                    term: 3,
+                    node_id: 1,
+                },
+                index: 100,
+            }),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-100".into(),
+        };
+        let data = b"intact snapshot".to_vec();
+        store
+            .persist_and_cache_snapshot(meta, data.clone())
+            .unwrap();
+
+        // Simulate the incident: a concurrent rewrite leaves snapshot.json
+        // half-written. Reads come from memory, so this must not matter.
+        std::fs::write(dir.path().join("raft").join("snapshot.json"), b"{tor").unwrap();
+
+        let snap = store
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot served from memory");
+        assert_eq!(snap.meta.snapshot_id, "snap-100");
+        assert_eq!(snap.snapshot.into_inner(), data);
+    }
+
+    #[test]
+    fn persist_refuses_to_replace_newer_snapshot_with_older() {
+        let dir = TempDir::new().unwrap();
+        let store = SpurStore::new(dir.path(), noop_applier()).unwrap();
+
+        let mk = |index: u64, id: &str| SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: openraft::LeaderId {
+                    term: 1,
+                    node_id: 1,
+                },
+                index,
+            }),
+            last_membership: StoredMembership::default(),
+            snapshot_id: id.into(),
+        };
+
+        store
+            .persist_and_cache_snapshot(mk(200, "new"), b"new".to_vec())
+            .unwrap();
+        // An older build finishing late must not clobber the newer snapshot.
+        let kept = store
+            .persist_and_cache_snapshot(mk(100, "old"), b"old".to_vec())
+            .unwrap();
+        assert_eq!(kept.meta.snapshot_id, "new");
+
+        let cached = store.current_snapshot.read().clone().unwrap();
+        assert_eq!(cached.meta.snapshot_id, "new");
+        assert_eq!(cached.data, b"new");
+    }
+
+    #[test]
+    fn write_atomic_replaces_target_and_leaves_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f.json");
+        write_atomic(&path, b"first").unwrap();
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        assert!(!std::path::Path::new(&tmp).exists());
+    }
+
+    // The borrowed serializer must produce byte-identical JSON to the owned
+    // struct, so a snapshot.json written by either path (and by an old binary)
+    // round-trips. A field reorder or rename would break cross-version recovery.
+    #[test]
+    fn persisted_snapshot_ref_json_matches_owned() {
+        let meta = SnapshotMeta {
+            last_log_id: Some(LogId {
+                leader_id: openraft::LeaderId {
+                    term: 4,
+                    node_id: 2,
+                },
+                index: 42,
+            }),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "snap-42".into(),
+        };
+        let data = vec![0u8, 1, 2, 250, 255];
+
+        let owned = PersistedSnapshot {
+            meta: meta.clone(),
+            data: data.clone(),
+        };
+        let borrowed = PersistedSnapshotRef {
+            meta: &meta,
+            data: &data,
+        };
+
+        let owned_json = serde_json::to_vec(&owned).unwrap();
+        let borrowed_json = serde_json::to_vec(&borrowed).unwrap();
+        assert_eq!(owned_json, borrowed_json);
+
+        // And the owned struct deserializes back from the borrowed output.
+        let round: PersistedSnapshot = serde_json::from_slice(&borrowed_json).unwrap();
+        assert_eq!(round.meta.snapshot_id, "snap-42");
+        assert_eq!(round.data, data);
     }
 
     #[test]
@@ -1731,7 +1939,9 @@ mod tests {
             last_membership: StoredMembership::default(),
             snapshot_id: "snap-5".into(),
         };
-        store.persist_snapshot(&meta, b"opaque state").unwrap();
+        store
+            .persist_and_cache_snapshot(meta, b"opaque state".to_vec())
+            .unwrap();
 
         assert!(SpurStore::new(dir.path(), Arc::new(FailingRestoreApplier)).is_err());
     }
@@ -1751,7 +1961,9 @@ mod tests {
             last_membership: StoredMembership::default(),
             snapshot_id: "snap-5".into(),
         };
-        store.persist_snapshot(&meta, b"opaque state").unwrap();
+        store
+            .persist_and_cache_snapshot(meta, b"opaque state".to_vec())
+            .unwrap();
 
         let store =
             SpurStore::new_with_recovery_mode(dir.path(), Arc::new(FailingRestoreApplier), false)
