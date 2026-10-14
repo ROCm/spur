@@ -208,6 +208,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // the starvation drain/resume. Runs leader-only, alongside the other
         // per-tick maintenance.
         cluster.run_node_health_pass();
+        cluster.run_node_recovery_pass();
 
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
@@ -2139,7 +2140,12 @@ fn settle_prolog_failures(
     }
     for (node_name, reason) in prolog_failed {
         warn!(job_id, node = %node_name, reason = %reason, "draining node after prolog failure");
-        if let Err(e) = cluster.drain_node(node_name, Some(reason.clone()), Some(0)) {
+        if let Err(e) = cluster.drain_node(
+            node_name,
+            Some(reason.clone()),
+            Some(0),
+            spur_core::node::DrainOrigin::System,
+        ) {
             error!(job_id, node = %node_name, error = %e, "failed to drain node after prolog failure");
         }
     }
@@ -5040,6 +5046,7 @@ mod tests {
                 mpi: Default::default(),
                 health: Default::default(),
                 spurd: Default::default(),
+                recovery: Default::default(),
             }
         }
 

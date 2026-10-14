@@ -2056,12 +2056,151 @@ impl SlurmController for ControllerService {
         }
         let (actual_state, running_jobs) = self
             .cluster
-            .drain_node(&req.name, reason, reason_uid)
+            .drain_node(
+                &req.name,
+                reason,
+                reason_uid,
+                spur_core::node::DrainOrigin::Admin,
+            )
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(spur_proto::proto::DrainNodeResponse {
             actual_state: actual_state.to_string(),
             running_jobs,
         }))
+    }
+
+    async fn self_label_node(
+        &self,
+        request: Request<spur_proto::proto::SelfLabelNodeRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+        let audit = crate::audit::slot(&request);
+        annotate(
+            &audit,
+            Annotation::new(
+                &request.get_ref().name,
+                serde_json::json!({"action": "self-label"}),
+            ),
+        );
+        let req = request.into_inner();
+
+        if self.cluster.get_node(&req.name).is_none() {
+            return Err(Status::not_found(format!("node '{}' not found", req.name)));
+        }
+
+        for key in req.set_labels.keys().chain(req.remove_labels.iter()) {
+            if !key.starts_with(spur_core::node::RECOVERY_LABEL_PREFIX) {
+                return Err(Status::invalid_argument(format!(
+                    "key '{}' not in spur.recovery/ namespace",
+                    key
+                )));
+            }
+            if key.len() > 256 {
+                return Err(Status::invalid_argument("key exceeds 256 bytes"));
+            }
+            if !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b))
+            {
+                return Err(Status::invalid_argument(format!(
+                    "key '{}' contains invalid characters",
+                    key
+                )));
+            }
+        }
+        for value in req.set_labels.values() {
+            if value.len() > 1024 {
+                return Err(Status::invalid_argument("value exceeds 1024 bytes"));
+            }
+        }
+
+        self.cluster
+            .update_node_labels(&req.name, req.set_labels, &req.remove_labels)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn self_undrain_node(
+        &self,
+        request: Request<spur_proto::proto::SelfUndrainNodeRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+        let audit = crate::audit::slot(&request);
+        annotate(
+            &audit,
+            Annotation::new(
+                &request.get_ref().name,
+                serde_json::json!({"action": "self-undrain"}),
+            ),
+        );
+        let req = request.into_inner();
+
+        let node = self
+            .cluster
+            .get_node(&req.name)
+            .ok_or_else(|| Status::not_found(format!("node '{}' not found", req.name)))?;
+        if node.drain_origin != spur_core::node::DrainOrigin::System {
+            return Err(Status::permission_denied(
+                "cannot self-undrain an admin drain",
+            ));
+        }
+
+        self.cluster
+            .update_node_state(&req.name, spur_core::node::NodeState::Idle, None, None)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn recover_node(
+        &self,
+        request: Request<spur_proto::proto::RecoverNodeRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+        let audit = crate::audit::slot(&request);
+        annotate(
+            &audit,
+            Annotation::new(
+                &request.get_ref().name,
+                serde_json::json!({"action": "recover-node"}),
+            ),
+        );
+        self.require_admin(&request, "recover node")?;
+        let req = request.into_inner();
+
+        self.cluster
+            .trigger_recovery(&req.name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
+    }
+
+    async fn abort_recovery(
+        &self,
+        request: Request<spur_proto::proto::AbortRecoveryRequest>,
+    ) -> Result<Response<()>, Status> {
+        if let Route::Forward = self.route(&request) {
+            return self.forward_to_leader(request).await;
+        }
+        let audit = crate::audit::slot(&request);
+        annotate(
+            &audit,
+            Annotation::new(
+                &request.get_ref().name,
+                serde_json::json!({"action": "abort-recovery"}),
+            ),
+        );
+        self.require_admin(&request, "abort recovery")?;
+        let req = request.into_inner();
+
+        self.cluster
+            .abort_recovery(&req.name)
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(()))
     }
 
     async fn deregister_node(
@@ -4776,6 +4915,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         array_max_concurrent: None,
         requeue: spec.requeue,
         exclusive: spec.exclusive,
+        system_override: false,
         hold: spec.hold,
         interactive: spec.interactive,
         srun_job: spec.srun_job,
@@ -5325,6 +5465,10 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         reason_uid: node.reason_uid,
         reason_time: node.reason_time.map(datetime_to_proto),
         agent_port: u32::from(node.port),
+        drain_origin: match node.drain_origin {
+            spur_core::node::DrainOrigin::Admin => 0,
+            spur_core::node::DrainOrigin::System => 1,
+        },
     }
 }
 

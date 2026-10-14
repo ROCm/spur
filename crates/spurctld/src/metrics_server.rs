@@ -216,6 +216,7 @@ mod tests {
             mpi: Default::default(),
             health: Default::default(),
             spurd: Default::default(),
+            recovery: Default::default(),
         }
     }
 

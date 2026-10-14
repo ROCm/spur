@@ -14,6 +14,8 @@ Configuring and operating a Spur cluster.
 - :doc:`dme-integration` — attaching per-job labels (``job_id``, ``job_user``,
   ``job_partition``) to AMD Device Metrics Exporter GPU metrics via prolog/epilog
   hooks.
+- :doc:`node-health-checks` — automatic node health checking and auto-recovery.
+  Health checks detect unhealthy nodes; the recovery hook remediates them.
 
 Partitions are defined statically in ``spur.conf`` (see
 :doc:`/deployment/partitioning`), not created at runtime.

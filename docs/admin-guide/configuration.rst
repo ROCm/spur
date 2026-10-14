@@ -2413,6 +2413,109 @@ submitting host on each invocation.
    the config, so a broken submit hook is rejected rather than applied — the
    previous configuration stays in place and the command reports an error.
 
+``[health]``
+------------
+
+Node health checks. See :doc:`node-health-checks` for the full guide.
+
+**Reload: Live** — the check list is re-read each tick.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 12 16 50
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``max_unavailable``
+     - ``string``
+     - ``"10%"``
+     - Concurrent cap on nodes with health activity. ``"5"`` or ``"10%"``; ``"0"`` = unlimited.
+
+``[[health.checks]]`` — each entry is a check program:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 12 16 50
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``program``
+     - ``string``
+     - *(required)*
+     - Absolute path to check program.
+   * - ``interval_secs``
+     - ``u64``
+     - ``300``
+     - Re-run interval per node.
+   * - ``timeout_secs``
+     - ``u64``
+     - ``60``
+     - Kill + fail after this many seconds.
+   * - ``max_wait_secs``
+     - ``u64``
+     - ``600``
+     - Force-drain if the check cannot run within this window (``0`` = wait indefinitely).
+   * - ``user``
+     - ``string``
+     - ``"nobody"``
+     - Identity the check runs as.
+   * - ``uid`` / ``gid``
+     - ``u32``
+     - ``65534``
+     - Numeric uid/gid.
+
+``[recovery]``
+--------------
+
+Auto-recovery hook. See :doc:`node-health-checks` for the full guide.
+
+**Reload: Live** — the reconciler re-reads config each tick.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 12 16 50
+
+   * - Key
+     - Type
+     - Default
+     - Description
+   * - ``program``
+     - ``string``
+     - ``""``
+     - Path to recovery script. Empty = feature disabled.
+   * - ``trigger_on``
+     - ``[string]``
+     - ``["drain", "down"]``
+     - Which system-initiated hold states trigger recovery.
+   * - ``max_attempts``
+     - ``u32``
+     - ``3``
+     - Dispatch cap per drain event.
+   * - ``timeout_secs``
+     - ``u64``
+     - ``600``
+     - Wall-time limit per invocation.
+   * - ``user``
+     - ``string``
+     - ``"root"``
+     - Identity the script runs as.
+   * - ``uid`` / ``gid``
+     - ``u32``
+     - ``0``
+     - Numeric uid/gid.
+   * - ``reboot_timeout_secs``
+     - ``u64``
+     - ``900``
+     - Seconds to wait after NodeFail for re-registration.
+   * - ``concurrency_cap``
+     - ``string``
+     - ``"10%"``
+     - Max concurrent recovery jobs cluster-wide. ``"5"`` or ``"10%"``.
+
 ``[notifications]``
 -------------------
 
