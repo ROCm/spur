@@ -217,6 +217,9 @@ pub struct ControllerService {
     /// Default HA control-plane count (`[cluster] control_plane_replicas`) when `spur k8s up`
     /// requests neither `--replicas` nor an explicit node set.
     control_plane_replicas: u32,
+    /// Whether `main` started the k0s reconcile loop. Captured at startup, not read from the live
+    /// config: the loop is spawned once, and `scontrol reconfigure` can neither start nor stop it.
+    k0s_reconcile_running: bool,
     /// JWT signing key for node tokens, captured at startup. Deliberately NOT
     /// re-read on `scontrol reconfigure`: swapping it live would instantly fail
     /// verification of every outstanding node token (7-day TTL), silently
@@ -932,6 +935,17 @@ impl ControllerService {
                 "{op} requires cluster admin"
             )))
         }
+    }
+
+    /// `up`, `down` and `add-nodes` only record intent; the reconcile loop is what acts on it.
+    fn require_k0s_reconcile(&self, op: &str) -> Result<(), Status> {
+        if self.k0s_reconcile_running {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "{op}: k0s management is not running on this controller ([cluster] enabled was false \
+             when spurctld started); set it in spur.conf on every controller and restart spurctld"
+        )))
     }
 
     fn caller_is_operator(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
@@ -3823,6 +3837,7 @@ impl SlurmController for ControllerService {
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
         self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster up")?;
+        self.require_k0s_reconcile("k0s cluster up")?;
         let state = self.cluster.k0s_state();
         let nodes = self.cluster.get_nodes();
         let assigned = nodes.iter().any(|n| n.k0s_role.is_some());
@@ -3959,6 +3974,7 @@ impl SlurmController for ControllerService {
             .asserted_actor(&req.caller),
         );
         self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster add-nodes")?;
+        self.require_k0s_reconcile("k0s cluster add-nodes")?;
 
         let state = self.cluster.k0s_state();
         // Online add only makes sense on a running cluster.
@@ -4163,6 +4179,7 @@ impl SlurmController for ControllerService {
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
         self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster down")?;
+        self.require_k0s_reconcile("k0s cluster down")?;
         self.cluster
             .set_k0s_phase(
                 spur_core::k0s::K0sPhase::Down,
@@ -4289,7 +4306,7 @@ pub fn build_service(
     raft_handle: Arc<RaftHandle>,
     rpc_stats: Arc<RpcStatsCollector>,
     sched_stats: Arc<SchedStatsCollector>,
-    control_plane_replicas: u32,
+    startup_cluster: &spur_core::config::ClusterConfig,
     jwt_key: String,
     bearer: &spur_core::auth::BearerAuth,
 ) -> ControllerService {
@@ -4319,7 +4336,8 @@ pub fn build_service(
         leader_proxy,
         rpc_stats,
         sched_stats,
-        control_plane_replicas,
+        control_plane_replicas: startup_cluster.control_plane_replicas,
+        k0s_reconcile_running: startup_cluster.enabled,
         jwt_key,
         node_identity_key_configured,
         incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
@@ -5629,6 +5647,7 @@ pub(crate) mod test_support {
             rpc_stats: Arc::new(RpcStatsCollector::new()),
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
             control_plane_replicas: 1,
+            k0s_reconcile_running: false,
             jwt_key: String::new(),
             node_identity_key_configured: false,
             incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
@@ -6948,6 +6967,17 @@ mod tests {
         test_service_with(dir, step_test_config()).await
     }
 
+    fn k0s_test_config() -> spur_core::config::SlurmConfig {
+        let mut config = step_test_config();
+        config.cluster.enabled = true;
+        config
+    }
+
+    /// A controller started with `[cluster] enabled`, so its k0s reconcile loop runs.
+    async fn k0s_test_service(dir: &tempfile::TempDir) -> ControllerService {
+        test_service_with(dir, k0s_test_config()).await
+    }
+
     /// `test_service` with an explicit config, so a test can exercise a config-gated code path
     /// (e.g. `[cluster] allow_admin_kubeconfig`).
     async fn test_service_with(
@@ -6956,6 +6986,15 @@ mod tests {
     ) -> ControllerService {
         use crate::cluster::ClusterManager;
         let cluster = std::sync::Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        test_service_over(dir, cluster).await
+    }
+
+    /// `test_service_with` over a caller-built `ClusterManager`, e.g. one given a config path so
+    /// the test can `reconfigure` it.
+    async fn test_service_over(
+        dir: &tempfile::TempDir,
+        cluster: std::sync::Arc<crate::cluster::ClusterManager>,
+    ) -> ControllerService {
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
             .await
             .unwrap();
@@ -6971,6 +7010,7 @@ mod tests {
         // key/mode pairing that the config it was built from would never produce.
         let jwt_key = resolve_startup_jwt_key(&cluster.config()).expect("resolve signing key");
         let node_identity_key_configured = cluster.config().auth.has_jwt_key();
+        let k0s_reconcile_running = cluster.config().cluster.enabled;
         ControllerService {
             cluster,
             raft: raft.clone(),
@@ -6979,6 +7019,7 @@ mod tests {
             rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
             control_plane_replicas: 1,
+            k0s_reconcile_running,
             jwt_key,
             node_identity_key_configured,
             incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
@@ -9874,7 +9915,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_bare_reup_on_ha_cluster_is_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         assign_ha_control_plane(&svc).await;
 
         let resp = svc
@@ -9893,7 +9934,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_mismatched_replicas_on_ha_cluster_is_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         assign_ha_control_plane(&svc).await;
 
         let err = svc
@@ -9911,7 +9952,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_denied_for_non_admin_caller() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         svc.cluster
             .association_cache()
             .insert_association("alice", "physics");
@@ -9930,7 +9971,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_denied_for_non_root_caller_on_cold_cache_with_accounting_enabled() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut config = step_test_config();
+        let mut config = k0s_test_config();
         config.accounting.database_url = "postgresql://unused-in-test".into();
         let svc = test_service_with(&dir, config).await;
         assert!(!svc.cluster.association_cache().is_loaded());
@@ -9948,7 +9989,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_down_denied_for_non_admin_caller() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         svc.cluster
             .association_cache()
             .insert_association("alice", "physics");
@@ -9965,7 +10006,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_allowed_for_admin_level_caller() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         svc.cluster
             .register_node(
                 "cp-a".into(),
@@ -10002,7 +10043,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_allowed_for_cluster_admins_identity() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut config = step_test_config();
+        let mut config = k0s_test_config();
         config.auth.cluster_admins = vec!["erin".into()];
         let svc = test_service_with(&dir, config).await;
         register_plain_node(&svc, "cp-a", 6818).await;
@@ -10070,9 +10111,137 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cluster_up_scopes_membership_to_selected_nodes() {
+    async fn cluster_up_is_refused_and_records_nothing_without_the_reconcile_loop() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
+        register_plain_node(&svc, "node-a", 6818).await;
+        let err = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "root".into(),
+                nodes: "node-a".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("nothing would ever act on the request");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("k0s management is not running"),
+            "got: {}",
+            err.message()
+        );
+        let state = svc.cluster.k0s_state();
+        assert_eq!(state.phase, spur_core::k0s::K0sPhase::Down);
+        assert!(
+            state.member_nodes.is_empty(),
+            "got: {:?}",
+            state.member_nodes
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_down_is_refused_without_the_reconcile_loop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "node-a", 6818).await;
+        svc.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Ready,
+                Some("node-a".into()),
+                vec!["node-a".into()],
+                vec!["node-a".into()],
+                false,
+            )
+            .unwrap();
+        let err = svc
+            .cluster_down(Request::new(ClusterDownRequest {
+                caller: "root".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("nothing would stop the running components");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(
+            svc.cluster.k0s_state().phase,
+            spur_core::k0s::K0sPhase::Ready
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_add_nodes_is_refused_without_the_reconcile_loop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "node-a", 6818).await;
+        register_plain_node(&svc, "node-b", 6819).await;
+        svc.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Provisioning,
+                Some("node-a".into()),
+                vec!["node-a".into()],
+                vec!["node-a".into()],
+                false,
+            )
+            .unwrap();
+        let err = svc
+            .cluster_add_nodes(Request::new(ClusterAddNodesRequest {
+                caller: "root".into(),
+                nodes: "node-b".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("nothing would enroll the node");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(svc.cluster.k0s_state().member_nodes, vec!["node-a"]);
+    }
+
+    /// `reconfigure` swaps the live config but cannot stop a loop started at boot, so a
+    /// controller that booted with `[cluster] enabled` must keep accepting `up`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_still_accepted_after_reconfigure_drops_the_cluster_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conf_path = dir.path().join("spur.conf");
+        let with_cluster = "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\n\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n\
+             [cluster]\nenabled = true\n";
+        std::fs::write(&conf_path, with_cluster).unwrap();
+        let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
+        let cluster = std::sync::Arc::new(
+            crate::cluster::ClusterManager::new_with_config_path(
+                config,
+                dir.path(),
+                Some(conf_path.clone()),
+            )
+            .unwrap(),
+        );
+        let svc = test_service_over(&dir, cluster).await;
+        register_plain_node(&svc, "node-a", 6818).await;
+
+        std::fs::write(
+            &conf_path,
+            with_cluster.replace("[cluster]\nenabled = true\n", ""),
+        )
+        .unwrap();
+        svc.cluster.reconfigure().unwrap();
+        assert!(
+            !svc.cluster.config().cluster.enabled,
+            "reconfigure must swap the live config"
+        );
+
+        let resp = svc
+            .cluster_up(Request::new(ClusterUpRequest {
+                caller: "root".into(),
+                nodes: "node-a".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("the loop started at boot is still running");
+        assert!(resp.into_inner().accepted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_up_scopes_membership_to_selected_nodes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = k0s_test_service(&dir).await;
         for (i, n) in ["node-a", "node-b", "node-c"].iter().enumerate() {
             register_plain_node(&svc, n, 6818 + i as u16).await;
         }
@@ -10096,7 +10265,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_rejects_control_plane_outside_scope() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         for (i, n) in ["node-a", "node-b", "node-c"].iter().enumerate() {
             register_plain_node(&svc, n, 6818 + i as u16).await;
         }
@@ -10139,7 +10308,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_add_nodes_unions_into_scoped_member_set() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         // Scoped to {node-a, node-b}; node-c is registered but out of scope.
         scoped_assigned_cluster(&svc).await;
         let resp = svc
@@ -10161,7 +10330,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_add_nodes_rejected_on_whole_inventory_cluster() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         for (i, n) in ["node-a", "node-b"].iter().enumerate() {
             register_plain_node(&svc, n, 6818 + i as u16).await;
         }
@@ -10189,7 +10358,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_add_nodes_rejects_control_plane_node() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         scoped_assigned_cluster(&svc).await; // control plane = node-a
         let err = svc
             .cluster_add_nodes(Request::new(ClusterAddNodesRequest {
@@ -10323,7 +10492,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_bare_reup_preserves_recorded_scope() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         scoped_assigned_cluster(&svc).await;
         let resp = svc
             .cluster_up(Request::new(ClusterUpRequest {
@@ -10344,7 +10513,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_with_identical_scope_is_a_noop() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         scoped_assigned_cluster(&svc).await;
         // Same scope expressed again (not a bare re-up) must not rewrite the recorded state.
         let resp = svc
@@ -10368,7 +10537,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_rejects_scope_change_on_assigned_cluster() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         scoped_assigned_cluster(&svc).await;
         let err = svc
             .cluster_up(Request::new(ClusterUpRequest {
@@ -10385,7 +10554,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_up_rejected_while_teardown_drains_roles() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         scoped_assigned_cluster(&svc).await;
         // down clears the recorded scope/CP immediately; node-a's role drains on a later tick. A
         // re-up in that window must be rejected, not silently widen to the whole inventory.
@@ -10547,7 +10716,7 @@ mod tests {
     async fn cluster_up_denied_for_named_caller_when_accounting_off() {
         // Cold cache = accounting disabled: a named caller is not admin, so up fails closed.
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = k0s_test_service(&dir).await;
         let err = svc
             .cluster_up(Request::new(ClusterUpRequest {
                 caller: "alice".into(),

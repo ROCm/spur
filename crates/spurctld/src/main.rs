@@ -315,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
         raft_handle.clone(),
         rpc_stats.clone(),
         sched_stats.clone(),
-        config.cluster.control_plane_replicas,
+        &config.cluster,
         jwt_key,
         &bearer,
     );
