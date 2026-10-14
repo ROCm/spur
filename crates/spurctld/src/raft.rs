@@ -389,10 +389,14 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), std::io::Error> {
     std::fs::rename(&tmp, path)
         .map_err(|e| std::io::Error::new(e.kind(), format!("{path:?}: {e}")))?;
 
+    // Fsync the directory so the rename itself is durable. Propagate failures:
+    // a rename that is not persisted means a crash can lose the write we just
+    // reported as durable.
     if let Some(dir) = path.parent() {
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        let d = std::fs::File::open(dir)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{dir:?}: {e}")))?;
+        d.sync_all()
+            .map_err(|e| std::io::Error::new(e.kind(), format!("{dir:?}: {e}")))?;
     }
     Ok(())
 }
