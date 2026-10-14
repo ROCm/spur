@@ -484,24 +484,14 @@ jobs:
           scp $SSH_OPTS -i "$KEY" "$KEY" ci@"$DRIVER_IP":"${{ env.RUN_DIR }}/ci-ssh-key"
           ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" "chmod 600 ${{ env.RUN_DIR }}/ci-ssh-key"
 
-      - name: Apply RBAC and verify cluster state
+      - name: Verify cluster state
         run: |
           DRIVER_IP="${{ steps.cluster.outputs.driver_ip }}"
           KEY="${{ steps.ssh.outputs.privkey }}"
-          NS="spur-ci-${{ github.run_id }}"
 
           ssh $SSH_OPTS -i "$KEY" ci@"$DRIVER_IP" bash -s <<REMOTE
           set -euo pipefail
           export KUBECONFIG=/home/ci/.kube/config
-
-          # Create test namespace
-          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-
-          # Apply RBAC with namespace patched
-          sed "s/namespace: spur/namespace: $NS/g" \
-            ${{ env.RUN_DIR }}/e2e-assets/tests/k8s/e2e/manifests/rbac.yaml | kubectl apply -f -
-
-          # Verify nodes are labeled
           echo "=== Labeled nodes ==="
           kubectl get nodes -l spur.amd.com/managed=true -o wide
           REMOTE
