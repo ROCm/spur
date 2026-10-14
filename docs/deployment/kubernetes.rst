@@ -111,6 +111,31 @@ config until restarted, at which point they re-read this same Secret and
 converge. To roll all controllers onto an updated Secret, restart the
 StatefulSet pods.
 
+Pod security
+------------
+
+``spurctld`` and ``spur-k8s-operator`` run under a restricted security context in
+``examples/k8s/``. Both pods:
+
+- run as the image's non-root ``spur`` user (UID and GID ``1001``), with
+  ``runAsNonRoot: true``;
+- use the ``RuntimeDefault`` seccomp profile;
+- drop all Linux capabilities and disallow privilege escalation;
+- run with a read-only root filesystem.
+
+This meets the Kubernetes ``restricted`` Pod Security Standard.
+
+Each pod gets a small writable ``emptyDir`` at ``/tmp``. ``spurctld`` keeps all
+of its state, including the Raft log, in its ``--state-dir`` (default
+``/var/spool/spur``), which is mounted from each pod's ``spool`` persistent
+volume claim. ``runAsUser`` and ``runAsGroup`` must match the user that owns the
+files in the image, so change them (and ``fsGroup`` on ``spurctld``) if you build
+an image with a different user. If you add a component that writes outside
+``/tmp`` or the ``--state-dir`` volume, mount a volume for that path.
+
+``spurd`` in ``examples/k8s/spurd.yaml`` stays privileged with ``hostPID``,
+because it launches jobs on the host and manages host devices such as GPUs.
+
 Submitting Jobs
 ---------------
 
