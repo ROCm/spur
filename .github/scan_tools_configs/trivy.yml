@@ -1,0 +1,28 @@
+# Trivy configuration for the ROCm security baseline scan.
+# Reference: https://trivy.dev/latest/docs/references/configuration/config-file/
+#
+# Rule-level suppressions live in /.trivyignore. Trivy has no inline ignores
+# for Kubernetes YAML or Dockerfiles, so files whose findings are inherent to
+# what they are, not fixable defects, are skipped here instead.
+
+scan:
+  skip-dirs:
+    - .git
+    - .venv
+    - venv
+    - build
+    - dist
+    - node_modules
+  skip-files:
+    # spurd is a privileged node agent: it runs as root with hostPID and host
+    # /dev and /sys to launch jobs and manage GPUs, so most pod and container
+    # hardening checks cannot pass. Trivy cannot ignore per file, so the whole
+    # file is skipped; review changes to it by hand.
+    - examples/k8s/spurd.yaml
+    # Vendored rancher/local-path-provisioner release, kept identical to
+    # upstream apart from the documented SPUR-local edits so bumps stay clean.
+    - crates/spur-core/src/assets/local-path-provisioner.yaml
+    # Docs build and lint image, used locally and by docs.yml, never published
+    # or deployed. It runs as root so it can write build output into a
+    # bind-mounted checkout regardless of the host UID.
+    - docs/Dockerfile

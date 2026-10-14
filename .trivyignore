@@ -1,0 +1,5 @@
+# Repo-wide: KSV-0056 flags write access to services, endpoints,
+# endpointslices, networkpolicies and ingresses in any Role or ClusterRole.
+# The operator creates and deletes the headless Services of multi-pod jobs.
+# Review new networking grants by hand.
+KSV-0056
