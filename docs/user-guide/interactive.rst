@@ -83,11 +83,15 @@ Common options:
      - Wall-clock limit.
    * - ``--pty``
      -
-     - Allocate a pseudo-terminal (use with an interactive shell). Inside an
-       existing allocation this runs as an interactive step: a single task on
-       one node, started in the *job's* environment and working directory
-       rather than your shell's. ``srun`` warns about the flags that implies it
-       must drop — ``--output``/``--error``/``--input``, the task-sizing flags,
+     - Allocate a pseudo-terminal (use with an interactive shell). The shell
+       gets the same environment as a plain ``srun`` step: your submitting
+       shell's variables (filtered by ``--export``, so ``PATH`` and
+       ``SPUR_CONTROLLER_ADDR`` carry over), the job and step variables, and the
+       GPU visibility variables. Inside an existing allocation this runs as an
+       interactive step: a single task on one node, started in the *job's*
+       working directory rather than your shell's. ``srun`` warns about the
+       flags that implies it must drop — ``--output``/``--error``/``--input``,
+       the task-sizing flags,
        and ``--cpu-bind``/``--gpu-bind``/``--label``/``--mpi``. ``--chdir`` moves
        the srun prolog/epilog but not the terminal. ``--container-image`` *is*
        honored — the interactive shell runs inside the container (see

@@ -229,6 +229,9 @@ pub struct InteractiveSessionHandle {
 
 /// Open the InteractiveSession RPC, returning the raw handle.
 ///
+/// `env` is the submitted environment for a new step, as a plain srun step
+/// sends it; empty when reattaching to an existing session.
+///
 /// Returns `Err(tonic::Status)` on RPC failure.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_interactive_session(
@@ -236,6 +239,7 @@ pub async fn open_interactive_session(
     job_id: u32,
     step_id: u32,
     argv: Vec<String>,
+    env: HashMap<String, String>,
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
     user: &str,
@@ -254,7 +258,7 @@ pub async fn open_interactive_session(
             pty: true,
             winsize: Some(winsize),
             argv,
-            env: HashMap::new(),
+            env,
             user: user.to_string(),
             container,
             non_interactive,
@@ -384,6 +388,7 @@ pub async fn run_interactive_session(
         job_id,
         step_id,
         argv,
+        HashMap::new(),
         winsize,
         overlap,
         user,
