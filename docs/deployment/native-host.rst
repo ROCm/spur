@@ -1004,6 +1004,63 @@ Operational notes
   A hang looks like ~100 % CPU on the rank processes and an empty ``.out``
   until cancel.
 
+.. _mpirun-setup:
+
+MPI via mpirun
+--------------
+
+``--mpi=mpirun`` launches ``mpirun`` as an external process and lets PRRTE
+place daemons via ``srun`` (``plm:slurm``).  No Spur PMIx plugin is needed on
+this path — PRRTE hosts its own PMIx server.
+
+Agent prerequisites
+~~~~~~~~~~~~~~~~~~~
+
+Install on **every agent** that will run ``--mpi=mpirun`` jobs:
+
+.. code-block:: bash
+
+   # Ubuntu / Debian
+   sudo apt-get install -y libopenmpi-dev openmpi-bin libpmix-dev
+
+   # RHEL / Rocky / Alma
+   sudo dnf install -y openmpi openmpi-devel pmix-devel
+   # then: source /etc/profile.d/modules.sh && module load mpi/openmpi-x86_64
+
+Verify the Slurm integration plugins are compiled in (``plm:slurm`` places
+daemons via ``srun``; ``ras:slurm`` reads the allocation from
+``SLURM_NODELIST`` / ``SLURM_TASKS_PER_NODE``):
+
+.. code-block:: bash
+
+   ompi_info --all 2>/dev/null | grep -E 'plm.*slurm|ras.*slurm'
+   # expected: plm: slurm  and  ras: slurm
+
+Without ``plm:slurm``, PRRTE falls back to SSH for daemon placement
+(``plm:rsh``), which requires passwordless SSH between compute nodes.
+
+Validated versions: Open MPI 4.1.6 (ORTE) and Open MPI 5.0.7 (PRRTE).  Both
+select ``plm:slurm`` when ``SLURM_JOBID`` is in the environment.  Spur's
+``srun --version`` outputs ``slurm 23.11.0 (spur X.Y.Z)``, which satisfies
+PRRTE's ``plm:slurm`` version check.
+
+Submit mpirun jobs
+~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+   # srun launches mpirun on node 0; PRRTE places daemons via srun
+   srun --mpi=mpirun -N 2 -n 8 --gres=gpu:8 ./hello_mpi
+
+   # Batch: the script calls mpirun directly; PRRTE auto-detects the allocation
+   sbatch -N 2 -n 8 --gres=gpu:8 train.sh
+   # inside train.sh:  mpirun -np 8 --bind-to none ./hello_mpi
+
+Spur sets ``SLURM_TASKS_PER_NODE`` in the ``N(xM)`` format that ``ras:slurm``
+requires.  No hostfile is needed.
+
+``--mpi=mpirun`` appears in ``srun --mpi=list``.
+
 Submitting Jobs
 ---------------
 

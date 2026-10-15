@@ -267,6 +267,7 @@ rocm
 FQDN
 GDS
 OpenPMIx
+ORTE
 loopback
 allow_non_loopback
 modex
