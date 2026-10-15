@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::mpi::MPI_PMIX;
+use crate::mpi::{MPI_MPIRUN, MPI_PMIX};
 use crate::spur_env::SpurEnv;
 use crate::step::{distribute_tasks, CpuBind, GpuBind, TaskDistribution};
 
@@ -106,6 +106,9 @@ pub fn batch_script_uses_step_launch(script: &str) -> bool {
 /// is set so direct batch launches (no inner `srun`) spawn one rank per task on
 /// the node. Standalone `srun` routed through the batch path uses `task_fanout`
 /// for the same effect with non-PMIx commands.
+///
+/// `--mpi=mpirun` never fans out: Spur launches exactly one task (mpirun) per
+/// node and mpirun handles rank fan-out internally.
 pub fn use_multi_task_launch(
     tasks_per_node: u32,
     task_fanout: bool,
@@ -113,6 +116,9 @@ pub fn use_multi_task_launch(
     script: &str,
 ) -> bool {
     if tasks_per_node <= 1 {
+        return false;
+    }
+    if mpi == MPI_MPIRUN {
         return false;
     }
     if task_fanout {
@@ -130,6 +136,8 @@ pub enum BatchLaunch {
     LoneRank,
     /// One wrapper per local task.
     FanOut,
+    /// `--mpi=mpirun`: one elected driver launches mpirun, non-drivers hold.
+    Mpirun,
 }
 
 pub fn batch_launch(
@@ -138,6 +146,9 @@ pub fn batch_launch(
     mpi: &str,
     script: &str,
 ) -> BatchLaunch {
+    if mpi == MPI_MPIRUN && task_fanout {
+        return BatchLaunch::Mpirun;
+    }
     if use_multi_task_launch(tasks_per_node, task_fanout, mpi, script) {
         return BatchLaunch::FanOut;
     }
@@ -226,6 +237,33 @@ pub fn build_step_task_plan(
     }
 
     plan
+}
+
+/// Format a task plan as the Slurm `N(xM)` string for `SLURM_TASKS_PER_NODE`.
+///
+/// Run-length encodes consecutive nodes with the same task count.
+/// Example: `[3, 3, 2]` → `"3(x2),2"`.
+pub fn slurm_tasks_per_node_str(plan: &[NodeStepTasks]) -> String {
+    if plan.is_empty() {
+        return "0".to_string();
+    }
+    let counts: Vec<u32> = plan.iter().map(|n| n.tasks_on_node).collect();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < counts.len() {
+        let val = counts[i];
+        let mut run = 1;
+        while i + run < counts.len() && counts[i + run] == val {
+            run += 1;
+        }
+        if run == 1 {
+            parts.push(format!("{val}"));
+        } else {
+            parts.push(format!("{val}(x{run})"));
+        }
+        i += run;
+    }
+    parts.join(",")
 }
 
 /// Apply GPU bind directives from the request environment into step launch env.
@@ -521,22 +559,35 @@ fn mpi_launch_preamble() -> &'static str {
     )
 }
 
-/// Legacy mpirun wrapper kept for unit tests; Spur PMIx jobs use direct per-rank
-/// launch via [`build_multi_task_pmix_wrapper`].
-pub fn build_mpi_mpirun_wrapper(user_script_path: &str, tasks_on_node: u32) -> String {
-    let quoted = bash_single_quote(user_script_path);
+/// Build a bash wrapper that launches `mpirun` with the total rank count.
+///
+/// PRRTE's `ras:slurm` reads the node list and slot counts from the Slurm
+/// environment (`SLURM_NODELIST`, `SLURM_TASKS_PER_NODE`), which Spur always
+/// sets. No hostfile is needed.
+///
+/// On multi-node steps only node-0 (`is_driver = true`) launches mpirun.
+/// Non-driver nodes exit immediately — PRRTE places its daemon via
+/// `srun --jobid` into each node's share of the allocation (plm:slurm).
+pub fn build_mpi_mpirun_wrapper(user_command: &str, total_tasks: u32, is_driver: bool) -> String {
+    if !is_driver {
+        // Step path: exit immediately. The step's lifetime is managed by the
+        // controller via RunStep; the non-driver's allocation share is held
+        // by the job, not this process.
+        return "#!/bin/bash\nexit 0\n".to_string();
+    }
+    let quoted = user_command;
     format!(
         concat!(
             "#!/bin/bash\n",
-            "_TASKS_ON_NODE={tasks_on_node}\n",
+            "_TOTAL_TASKS={total_tasks}\n",
             "{preamble}",
             "if [ \"$SPUR_LABEL\" = \"1\" ]; then\n",
-            "  exec \"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\" --bind-to none --tag-output {quoted}\n",
+            "  \"$SPUR_MPIRUN\" -np \"$_TOTAL_TASKS\" --bind-to none --tag-output {quoted}\n",
             "else\n",
-            "  exec \"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\" --bind-to none {quoted}\n",
+            "  \"$SPUR_MPIRUN\" -np \"$_TOTAL_TASKS\" --bind-to none {quoted}\n",
             "fi\n",
         ),
-        tasks_on_node = tasks_on_node,
+        total_tasks = total_tasks,
         preamble = mpi_launch_preamble(),
         quoted = quoted,
     )
@@ -901,6 +952,46 @@ mod tests {
     }
 
     #[test]
+    fn batch_launch_mpirun_with_task_fanout() {
+        assert_eq!(
+            batch_launch(4, true, MPI_MPIRUN, "/tmp/hello_mpi"),
+            BatchLaunch::Mpirun
+        );
+        assert_eq!(
+            batch_launch(1, true, MPI_MPIRUN, "/tmp/hello_mpi"),
+            BatchLaunch::Mpirun
+        );
+        // Without task_fanout, mpirun falls through to Script (batch script
+        // calls mpirun directly).
+        assert_eq!(
+            batch_launch(4, false, MPI_MPIRUN, "/tmp/hello_mpi"),
+            BatchLaunch::Script
+        );
+    }
+
+    #[test]
+    fn use_multi_task_launch_mpirun_never_fans_out() {
+        assert!(!use_multi_task_launch(
+            4,
+            false,
+            MPI_MPIRUN,
+            "/tmp/hello_mpi"
+        ));
+        assert!(!use_multi_task_launch(
+            4,
+            true,
+            MPI_MPIRUN,
+            "/tmp/hello_mpi"
+        ));
+        assert!(!use_multi_task_launch(
+            1,
+            false,
+            MPI_MPIRUN,
+            "/tmp/hello_mpi"
+        ));
+    }
+
+    #[test]
     fn use_multi_task_launch_batch_pmix_skips_inner_srun() {
         let direct = "#!/bin/bash\n#SBATCH --mpi=pmix\n/tmp/hello_mpi\n";
         assert!(use_multi_task_launch(2, false, MPI_PMIX, direct));
@@ -1015,19 +1106,60 @@ mod tests {
 
     #[test]
     fn mpi_mpirun_wrapper_uses_single_mpirun() {
-        let script = build_mpi_mpirun_wrapper("/tmp/hello_mpi", 4);
-        assert!(script.contains("\"$SPUR_MPIRUN\" -np \"$_TASKS_ON_NODE\""));
-        assert!(script.contains("_TASKS_ON_NODE=4"));
+        let script = build_mpi_mpirun_wrapper("/tmp/hello_mpi", 4, true);
+        assert!(script.contains("\"$SPUR_MPIRUN\" -np \"$_TOTAL_TASKS\""));
+        assert!(script.contains("_TOTAL_TASKS=4"));
         assert!(script.contains("PMIX_SERVER_URI4"));
-        assert!(script.contains("'/tmp/hello_mpi'"));
+        assert!(script.contains("/tmp/hello_mpi"));
         assert!(!script.contains("for SPUR_LOCALID in"));
     }
 
     #[test]
-    fn mpi_mpirun_wrapper_single_quotes_user_script() {
-        let script = build_mpi_mpirun_wrapper("$(rm -rf /)", 2);
+    fn mpi_mpirun_wrapper_embeds_command_verbatim() {
+        // The caller (agent_server) uses shlex::try_join to quote the
+        // command before passing it here, so the wrapper embeds it as-is.
+        let script = build_mpi_mpirun_wrapper("'$(rm -rf /)'", 2, true);
         assert!(script.contains("'$(rm -rf /)'"));
-        assert!(!script.contains("$(rm -rf /)\""));
+    }
+
+    #[test]
+    fn mpi_mpirun_wrapper_non_driver_exits_immediately() {
+        let script = build_mpi_mpirun_wrapper("/tmp/hello_mpi", 4, false);
+        assert!(script.contains("exit 0"));
+        assert!(!script.contains("SPUR_MPIRUN"));
+        assert!(!script.contains("mpirun"));
+    }
+
+    #[test]
+    fn mpi_mpirun_skips_cpu_bind_detects_real_bind() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_CPU_BIND".into(), "cores".into());
+        assert!(mpi_mpirun_skips_cpu_bind(&env));
+
+        env.insert("SPUR_CPU_BIND".into(), "none".into());
+        assert!(!mpi_mpirun_skips_cpu_bind(&env));
+
+        env.insert("SPUR_CPU_BIND".into(), "".into());
+        assert!(!mpi_mpirun_skips_cpu_bind(&env));
+
+        let empty: HashMap<String, String> = HashMap::new();
+        assert!(!mpi_mpirun_skips_cpu_bind(&empty));
+    }
+
+    #[test]
+    fn mpi_mpirun_skips_gpu_bind_detects_real_bind() {
+        let mut env = HashMap::new();
+        env.insert("SPUR_GPU_BIND".into(), "closest".into());
+        assert!(mpi_mpirun_skips_gpu_bind(&env));
+
+        env.insert("SPUR_GPU_BIND".into(), "none".into());
+        assert!(!mpi_mpirun_skips_gpu_bind(&env));
+
+        env.insert("SPUR_GPU_BIND".into(), "".into());
+        assert!(!mpi_mpirun_skips_gpu_bind(&env));
+
+        let empty: HashMap<String, String> = HashMap::new();
+        assert!(!mpi_mpirun_skips_gpu_bind(&empty));
     }
 
     #[test]
@@ -1265,5 +1397,14 @@ mod tests {
         let (program, args) = wrap_command_with_cpu_bind("hostname", &[], &env, 2);
         assert_eq!(program, "hostname");
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn multi_task_wrapper_waits_for_all_children() {
+        let script = build_multi_task_wrapper("/tmp/work.sh", 3, None);
+        assert!(
+            script.contains("done\nwait\n"),
+            "wrapper must wait for children"
+        );
     }
 }

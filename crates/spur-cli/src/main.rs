@@ -113,7 +113,17 @@ fn main() -> anyhow::Result<()> {
     if std::env::args_os().len() <= 2
         && matches!(std::env::args_os().nth(1).as_deref(), Some(a) if a == "-V" || a == "--version")
     {
-        println!("{}", spur_core::version::version_string());
+        let argv0 = std::env::args().next().unwrap_or_default();
+        let bin = std::path::Path::new(&argv0)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("spur");
+        let version = match bin {
+            "srun" | "sbatch" | "sinfo" | "squeue" | "scancel" | "salloc" | "scontrol"
+            | "sacct" | "sacctmgr" | "sshare" => spur_core::version::slurm_version_string(),
+            _ => spur_core::version::version_string(),
+        };
+        println!("{version}");
         std::process::exit(0);
     }
 

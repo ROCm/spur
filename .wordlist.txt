@@ -355,3 +355,8 @@ backend
 unschedulable
 enum
 deserializes
+mpi
+mpirun
+Mpirun
+PRRTE
+PRRTE's

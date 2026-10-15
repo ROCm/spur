@@ -21,6 +21,15 @@ pub fn version_string() -> String {
     format_version(env!("CARGO_PKG_VERSION"), GIT_SHA, GIT_DIRTY)
 }
 
+/// Slurm-compatible version string for PRRTE's plm:slurm selection gate.
+///
+/// `prte_common_slurm_version()` popens `srun --version` et al. and expects
+/// output starting with `"slurm"`.  This lets PRRTE select plm:slurm so
+/// multi-node mpirun daemon placement routes through Spur instead of SSH.
+pub fn slurm_version_string() -> String {
+    format!("slurm 23.11.0 (spur {})", env!("CARGO_PKG_VERSION"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

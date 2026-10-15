@@ -3498,6 +3498,21 @@ impl SlurmController for ControllerService {
                 Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
 
+        if step.state.is_terminal() {
+            let exit_code = step.exit_code.unwrap_or(0);
+            info!(
+                job_id,
+                step_id = req.step_id,
+                exit_code,
+                "step already completed; returning recorded exit code"
+            );
+            return Ok(Response::new(RunStepResponse {
+                exit_code,
+                stdout: String::new(),
+                stderr: String::new(),
+                node: step.nodes.join(","),
+            }));
+        }
         validate_step_nodes_for_run(
             job_id,
             req.step_id,
@@ -9733,7 +9748,7 @@ mod tests {
             .record_step_complete(job_id, 0, 0)
             .expect("test setup: complete step");
 
-        let err = svc
+        let resp = svc
             .run_step(Request::new(RunStepRequest {
                 job_id,
                 command: vec!["true".into()],
@@ -9742,13 +9757,9 @@ mod tests {
                 ..Default::default()
             }))
             .await
-            .expect_err("a completed step must not run");
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(
-            err.message().contains("COMPLETED"),
-            "unexpected message: {}",
-            err.message()
-        );
+            .expect("a completed step returns the recorded exit code")
+            .into_inner();
+        assert_eq!(resp.exit_code, 0, "recorded exit code must be returned");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
