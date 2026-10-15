@@ -13,6 +13,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use openraft::error::Fatal;
 use openraft::storage::{LogState, RaftLogReader, Snapshot, SnapshotMeta};
 use openraft::{
     BasicNode, Config, Entry, EntryPayload, LogId, Raft, RaftSnapshotBuilder, StorageError,
@@ -773,12 +774,8 @@ impl RaftHandle {
         live_leader_from_rx(&rx)
     }
 
-    /// Resolves once the Raft core has stopped. Returns the [`Fatal`] that
-    /// stopped it; a normal `raft.shutdown()` resolves with `Fatal::Stopped`,
-    /// which the caller can distinguish from a genuine crash.
-    ///
-    /// [`Fatal`]: openraft::error::Fatal
-    pub async fn wait_fatal(&self) -> openraft::error::Fatal<NodeId> {
+    /// Resolves with the [`Fatal`] that stopped the Raft core.
+    pub async fn wait_fatal(&self) -> Fatal<NodeId> {
         let mut rx = self.raft.metrics();
         wait_fatal_on(&mut rx).await
     }
@@ -800,12 +797,8 @@ impl RaftHandle {
     }
 }
 
-/// The leader reported by `metrics`, but only while the Raft core is still
-/// running. On a fatal storage error openraft stops the core and sets
-/// `running_state = Err` / `state = Shutdown`, yet leaves `current_leader`
-/// pointing at the now-dead node. Treating that as "no leader" makes every
-/// leadership check fail closed, so a stopped node stops scheduling and stops
-/// advertising itself as the write target instead of acting as a stale leader.
+/// The leader in `metrics`, or `None` once the core has stopped: openraft leaves
+/// `current_leader` pointing at the dead node after a fatal error.
 fn live_leader(metrics: &openraft::RaftMetrics<NodeId, openraft::BasicNode>) -> Option<NodeId> {
     if metrics.running_state.is_err() || metrics.state == openraft::ServerState::Shutdown {
         return None;
@@ -813,11 +806,8 @@ fn live_leader(metrics: &openraft::RaftMetrics<NodeId, openraft::BasicNode>) -> 
     metrics.current_leader
 }
 
-/// [`live_leader`] plus a check for a dropped metrics sender. A RaftCore panic
-/// or forced abort ends the task without running the graceful shutdown path that
-/// sets `running_state = Err`, so the last metrics snapshot can still show this
-/// node as a running leader. The dropped sender is then the only signal the core
-/// has stopped, so fail closed on it too.
+/// [`live_leader`], also failing closed on a dropped sender: a core panic never
+/// sets `running_state = Err`, so the closed channel is the only stop signal.
 fn live_leader_from_rx(
     rx: &tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, openraft::BasicNode>>,
 ) -> Option<NodeId> {
@@ -827,19 +817,11 @@ fn live_leader_from_rx(
     live_leader(&rx.borrow())
 }
 
-/// Core of [`RaftHandle::wait_fatal`], split from the handle so it can be driven
-/// by a plain `watch` channel in tests. Resolves with the `Fatal` that stopped
-/// the core.
-///
-/// A graceful stop (clean shutdown or a storage fault) always records
-/// `running_state = Err` before dropping the sender, so that error is returned
-/// verbatim (`Fatal::Stopped` for a clean shutdown). A sender that closes while
-/// `running_state` is still `Ok` means the core task ended without that path, a
-/// panic or forced abort, which is reported as `Fatal::Panicked` so the process
-/// exits non-zero rather than looking like a clean shutdown.
+/// Returns the recorded `Fatal`, or `Panicked` if the sender closed while
+/// `running_state` was still `Ok`.
 async fn wait_fatal_on(
     rx: &mut tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, openraft::BasicNode>>,
-) -> openraft::error::Fatal<NodeId> {
+) -> Fatal<NodeId> {
     loop {
         if let Err(e) = rx.borrow().running_state.clone() {
             return e;
@@ -847,7 +829,7 @@ async fn wait_fatal_on(
         if rx.changed().await.is_err() {
             return match rx.borrow().running_state.clone() {
                 Err(e) => e,
-                Ok(()) => openraft::error::Fatal::Panicked,
+                Ok(()) => Fatal::Panicked,
             };
         }
     }
@@ -1579,7 +1561,7 @@ mod tests {
         let mut m = openraft::RaftMetrics::<NodeId, openraft::BasicNode>::new_initial(1);
         m.state = openraft::ServerState::Leader;
         m.current_leader = Some(1);
-        m.running_state = Err(openraft::error::Fatal::Stopped);
+        m.running_state = Err(Fatal::Stopped);
         assert_eq!(super::live_leader(&m), None);
     }
 
@@ -1592,8 +1574,7 @@ mod tests {
         assert_eq!(super::live_leader_from_rx(&rx), Some(1));
     }
 
-    // A panic leaves the last snapshot showing this node as a running leader and
-    // only drops the sender. The dropped sender must still read as "no leader".
+    // A panic only drops the sender; the last snapshot still shows a running leader.
     #[test]
     fn live_leader_from_rx_fails_closed_when_sender_dropped() {
         let mut m = openraft::RaftMetrics::<NodeId, openraft::BasicNode>::new_initial(1);
@@ -1604,42 +1585,41 @@ mod tests {
         assert_eq!(super::live_leader_from_rx(&rx), None);
     }
 
-    // A genuine fatal (e.g. a storage write error) must surface as-is so the
-    // caller in `main` returns Err and exits non-zero for the supervisor.
     #[tokio::test]
-    async fn wait_fatal_returns_the_fatal_error() {
+    async fn wait_fatal_returns_the_recorded_error() {
         let (tx, mut rx) = tokio::sync::watch::channel(openraft::RaftMetrics::<
             NodeId,
             openraft::BasicNode,
         >::new_initial(1));
-        tx.send_modify(|m| m.running_state = Err(openraft::error::Fatal::Panicked));
+        let io = std::io::Error::other("disk full");
+        let err = StorageError::from_io_error(
+            openraft::ErrorSubject::Logs,
+            openraft::ErrorVerb::Write,
+            io,
+        );
+        tx.send_modify(|m| m.running_state = Err(Fatal::StorageError(err)));
         assert!(matches!(
             super::wait_fatal_on(&mut rx).await,
-            openraft::error::Fatal::Panicked
+            Fatal::StorageError(_)
         ));
     }
 
-    // A graceful stop records `running_state = Err(Stopped)` before dropping the
-    // sender (openraft's shutdown path), so it is reported as `Stopped` and
-    // `main` exits 0.
+    // Graceful shutdown records `Err(Stopped)` before dropping the sender.
     #[tokio::test]
     async fn wait_fatal_reports_stopped_on_graceful_shutdown() {
         let (tx, mut rx) = tokio::sync::watch::channel(openraft::RaftMetrics::<
             NodeId,
             openraft::BasicNode,
         >::new_initial(1));
-        tx.send_modify(|m| m.running_state = Err(openraft::error::Fatal::Stopped));
+        tx.send_modify(|m| m.running_state = Err(Fatal::Stopped));
         drop(tx);
         assert!(matches!(
             super::wait_fatal_on(&mut rx).await,
-            openraft::error::Fatal::Stopped
+            Fatal::Stopped
         ));
     }
 
-    // A panic or forced abort drops the sender while `running_state` is still
-    // `Ok` (the graceful path that sets `Err` never ran). Report `Panicked` so
-    // `main` exits non-zero and the supervisor restarts, instead of mistaking it
-    // for a clean shutdown.
+    // A panic drops the sender while `running_state` is still `Ok`.
     #[tokio::test]
     async fn wait_fatal_reports_panicked_when_sender_closes_without_error() {
         let (tx, mut rx) = tokio::sync::watch::channel(openraft::RaftMetrics::<
@@ -1649,12 +1629,11 @@ mod tests {
         drop(tx);
         assert!(matches!(
             super::wait_fatal_on(&mut rx).await,
-            openraft::error::Fatal::Panicked
+            Fatal::Panicked
         ));
     }
 
-    // The error can arrive after the wait begins: a later metrics update must
-    // wake the waiter and deliver it.
+    // The error arrives after the wait begins and must wake the waiter.
     #[tokio::test]
     async fn wait_fatal_wakes_on_a_later_error() {
         let (tx, mut rx) = tokio::sync::watch::channel(openraft::RaftMetrics::<
@@ -1662,11 +1641,9 @@ mod tests {
             openraft::BasicNode,
         >::new_initial(1));
         let waiter = tokio::spawn(async move { super::wait_fatal_on(&mut rx).await });
-        tx.send_modify(|m| m.running_state = Err(openraft::error::Fatal::Stopped));
-        assert!(matches!(
-            waiter.await.unwrap(),
-            openraft::error::Fatal::Stopped
-        ));
+        tokio::task::yield_now().await;
+        tx.send_modify(|m| m.running_state = Err(Fatal::Stopped));
+        assert!(matches!(waiter.await.unwrap(), Fatal::Stopped));
     }
 
     #[test]
@@ -1937,6 +1914,61 @@ mod tests {
         let inner = store.inner.read();
         assert!(inner.last_applied.is_none());
         assert_eq!(inner.last_membership, StoredMembership::default());
+    }
+
+    struct FailingSnapshotApplier;
+    impl StateMachineApply for FailingSnapshotApplier {
+        fn apply_operation(&self, _op: &WalOperation) -> ClientResponse {
+            ClientResponse::default()
+        }
+        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+            Err(anyhow::anyhow!("snapshot write failed"))
+        }
+        fn restore_from_snapshot(&self, _data: &[u8]) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
+
+    async fn start_single_node_leader(
+        dir: &Path,
+        applier: Arc<dyn StateMachineApply>,
+    ) -> RaftHandle {
+        let handle = start_raft(1, &["[::1]:0".into()], dir, applier)
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        handle
+    }
+
+    #[tokio::test]
+    async fn stopped_core_is_not_leader_and_wait_fatal_reports_stopped() {
+        let dir = TempDir::new().unwrap();
+        let handle = start_single_node_leader(dir.path(), noop_applier()).await;
+        assert!(handle.is_leader());
+
+        handle.raft.shutdown().await.unwrap();
+
+        assert!(!handle.is_leader());
+        assert_eq!(handle.current_leader(), None);
+        assert!(matches!(handle.wait_fatal().await, Fatal::Stopped));
+    }
+
+    #[tokio::test]
+    async fn storage_fatal_stops_leadership_and_wait_fatal_reports_it() {
+        let dir = TempDir::new().unwrap();
+        let handle = start_single_node_leader(dir.path(), Arc::new(FailingSnapshotApplier)).await;
+        assert!(handle.is_leader());
+
+        handle.raft.trigger().snapshot().await.unwrap();
+
+        assert!(matches!(handle.wait_fatal().await, Fatal::StorageError(_)));
+        assert!(!handle.is_leader());
+        assert_eq!(handle.current_leader(), None);
     }
 
     #[tokio::test]

@@ -316,6 +316,19 @@ Enable and start it:
    systemctl daemon-reload
    systemctl enable --now spurctld
 
+.. _spurctld-fatal-raft-error:
+
+.. important::
+
+   If Raft hits an unrecoverable error (for example a failed write to the state
+   directory, or an internal Raft panic), ``spurctld`` logs ``Raft core hit an
+   unrecoverable error`` and exits non-zero instead of running on as a stale
+   leader. ``Restart=on-failure`` makes the supervisor restart it, and it recovers
+   from the Raft log and snapshot on disk. With multiple controllers the cluster
+   re-elects a leader meanwhile; a single controller is unavailable until it is
+   back. A persistent fault restart-loops: check free space and permissions on the
+   state directory and ``journalctl -u spurctld``.
+
 .. note::
 
    The one-line installer places binaries in ``~/.local/bin`` by default. If you install
@@ -339,16 +352,6 @@ addresses, in the same order on every controller, to the ``peers`` list in the c
 
 Raft automatically elects a leader. Workers connect to any controller and are redirected
 to the current leader.
-
-.. important::
-
-   If ``spurctld`` hits an unrecoverable Raft storage error (for example a write
-   to the state directory fails), it exits non-zero rather than continuing to run
-   as a stale leader that accepts no writes. Rely on ``Restart=on-failure``
-   (as in the unit above) so the supervisor restarts it; on restart it recovers
-   its state from the Raft log and snapshot on disk, and the cluster re-elects a
-   leader. A persistent fault will restart-loop, which surfaces the problem in
-   ``systemctl status`` instead of silently wedging the cluster.
 
 Joining Worker Nodes
 --------------------

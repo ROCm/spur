@@ -393,27 +393,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     info!(%addr, "gRPC server listening");
-    // A fatal Raft storage error stops the core but leaves the process running;
-    // without this, the node would keep serving as a stale leader (the 2h+
-    // write stall this fixes). Exit non-zero instead so the supervisor
-    // (systemd `Restart=on-failure`, or Kubernetes) restarts it to recover from
-    // disk. Fall through to the shared shutdown path either way.
+    // A fatal Raft error stops the core but not the process; exit non-zero so the
+    // supervisor restarts it from disk.
+    let mut raft_fatal = None;
     let serve_result = tokio::select! {
         res = server::serve(addr, controller, accounting_service, bearer) => res,
-        fatal = raft_handle.wait_fatal() => match fatal {
-            openraft::error::Fatal::Stopped => {
-                info!("Raft core stopped; shutting down controller");
-                Ok(())
-            }
-            other => {
-                tracing::error!(
-                    error = %other,
-                    "Raft core hit an unrecoverable error; exiting so the supervisor restarts \
-                     spurctld to recover from disk"
-                );
-                Err(anyhow::anyhow!("raft core fatal error: {other}"))
-            }
-        },
+        fatal = raft_handle.wait_fatal() => {
+            tracing::error!(error = %fatal, "Raft core hit an unrecoverable error; exiting");
+            raft_fatal = Some(fatal);
+            Ok(())
+        }
     };
 
     sched_handle.abort();
@@ -423,6 +412,10 @@ async fn main() -> anyhow::Result<()> {
         .await
     {
         tracing::warn!("accounting writes still pending at shutdown; some rows were lost");
+    }
+    // Exit directly: runtime teardown would wait on any hung blocking call.
+    if raft_fatal.is_some() {
+        std::process::exit(1);
     }
     serve_result
 }
