@@ -3187,15 +3187,13 @@ impl ClusterManager {
     }
 
     /// Hold a *Pending* job whose batch dispatch failed to confirm on a node
-    /// (prolog rejection with `hold_on_prolog_fail` set). Same end state as
-    /// [`Self::hold_job`] (priority 0, `PendingReason::Held`), but carries the
-    /// launch-failure description so it reads the same as the pre-fix path
-    /// that reached this via a Running→Failed→Held detour: the job here never
-    /// actually left Pending, so that detour isn't available.
+    /// (prolog rejection with `hold_on_prolog_fail` set), with the reason
+    /// [`LAUNCH_FAILURE_HELD_DESC`] followed by `cause`. The job never left
+    /// Pending, so [`Self::requeue_after_launch_failure`] can't apply this hold.
     pub(crate) fn hold_job_for_launch_failure(
         &self,
         job_id: JobId,
-        reason_desc: Option<&str>,
+        cause: &str,
         run_attempt: u32,
     ) -> anyhow::Result<()> {
         let old_priority = {
@@ -3218,7 +3216,7 @@ impl ClusterManager {
             old_priority,
             new_priority: 0,
             pending_reason: Some(PendingReason::Held),
-            pending_reason_desc: Some(reason_desc.unwrap_or(LAUNCH_FAILURE_HELD_DESC).to_string()),
+            pending_reason_desc: Some(format!("{LAUNCH_FAILURE_HELD_DESC} ({cause})")),
             reset_requeue_count: false,
             clear_reservation: false,
             run_attempt: Some(run_attempt),
@@ -23689,7 +23687,8 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("prolog-hold"));
 
-        cm.hold_job_for_launch_failure(id, None, 1).unwrap();
+        cm.hold_job_for_launch_failure(id, "prolog check failed", 1)
+            .unwrap();
         wait_for("hold applied", || {
             cm.get_job(id).is_some_and(|j| j.priority == 0)
         });
@@ -23700,8 +23699,8 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::Held);
         assert_eq!(
             job.state_reason_display(),
-            LAUNCH_FAILURE_HELD_DESC,
-            "must carry the same description the old post-Running hold used"
+            "launch failed requeued held (prolog check failed)",
+            "a held job must say it is held, or nobody knows to release it"
         );
 
         // Releasing it behaves exactly like releasing a plain hold_job.
@@ -23731,7 +23730,9 @@ mod tests {
         .unwrap();
         settle(&cm, id, JobState::Running);
 
-        assert!(cm.hold_job_for_launch_failure(id, None, 1).is_err());
+        assert!(cm
+            .hold_job_for_launch_failure(id, "prolog check failed", 1)
+            .is_err());
     }
 
     // backoff_pending_job_after_dispatch_failure is confirm_dispatch_on_nodes's
@@ -23886,7 +23887,7 @@ mod tests {
         let id = submit_and_wait(&cm, basic_spec("prolog-fail-run-attempt"));
         assert_eq!(cm.get_job(id).unwrap().run_attempt, 0);
 
-        cm.hold_job_for_launch_failure(id, Some("prolog check failed"), 3)
+        cm.hold_job_for_launch_failure(id, "prolog check failed", 3)
             .unwrap();
         wait_for("hold applied", || {
             cm.get_job(id).is_some_and(|j| j.priority == 0)
