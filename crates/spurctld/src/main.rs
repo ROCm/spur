@@ -393,7 +393,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     info!(%addr, "gRPC server listening");
-    server::serve(addr, controller, accounting_service, bearer).await?;
+    // A fatal Raft error stops the core but not the process; exit non-zero so the
+    // supervisor restarts it from disk.
+    let mut raft_fatal = None;
+    let serve_result = tokio::select! {
+        res = server::serve(addr, controller, accounting_service, bearer) => res,
+        fatal = raft_handle.wait_fatal() => {
+            tracing::error!(error = %fatal, "Raft core hit an unrecoverable error; exiting");
+            raft_fatal = Some(fatal);
+            Ok(())
+        }
+    };
 
     sched_handle.abort();
     // Audit rows are written off the request path; the runtime would drop them.
@@ -403,7 +413,11 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("accounting writes still pending at shutdown; some rows were lost");
     }
-    Ok(())
+    // Exit directly: runtime teardown would wait on any hung blocking call.
+    if raft_fatal.is_some() {
+        std::process::exit(1);
+    }
+    serve_result
 }
 
 fn default_config() -> spur_core::config::SlurmConfig {

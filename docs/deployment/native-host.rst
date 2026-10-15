@@ -316,6 +316,19 @@ Enable and start it:
    systemctl daemon-reload
    systemctl enable --now spurctld
 
+.. _spurctld-fatal-raft-error:
+
+.. important::
+
+   If Raft hits an unrecoverable error (for example a failed write to the state
+   directory, or an internal Raft panic), ``spurctld`` logs ``Raft core hit an
+   unrecoverable error`` and exits non-zero instead of running on as a stale
+   leader. ``Restart=on-failure`` makes the supervisor restart it, and it recovers
+   from the Raft log and snapshot on disk. With multiple controllers the cluster
+   re-elects a leader meanwhile; a single controller is unavailable until it is
+   back. A persistent fault restart-loops: check free space and permissions on the
+   state directory and ``journalctl -u spurctld``.
+
 .. note::
 
    The one-line installer places binaries in ``~/.local/bin`` by default. If you install

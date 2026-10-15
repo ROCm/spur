@@ -167,6 +167,9 @@ Top-level keys
 Controller daemon (``spurctld``) network endpoints, state storage, job-ID range,
 and Raft high-availability topology.
 
+For what ``spurctld`` does on an unrecoverable Raft error, see
+:ref:`the native-host deployment guide <spurctld-fatal-raft-error>`.
+
 .. list-table::
    :header-rows: 1
    :widths: 24 12 18 14 32

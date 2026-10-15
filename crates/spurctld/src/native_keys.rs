@@ -68,14 +68,12 @@ pub fn peer() -> Option<Arc<PeerVerifier>> {
     PEER.get().cloned().flatten()
 }
 
+/// The current leader (0 if none, or if this node's Raft core has stopped) and term.
 pub fn leader_and_term() -> (u64, u64) {
     RAFT.get()
         .cloned()
         .flatten()
-        .map(|r| {
-            let m = r.raft.metrics().borrow().clone();
-            (m.current_leader.unwrap_or(r.node_id), m.current_term)
-        })
+        .map(|r| (r.current_leader().unwrap_or(0), r.current_term()))
         .unwrap_or((0, 0))
 }
 
