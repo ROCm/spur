@@ -4179,7 +4179,16 @@ impl SlurmController for ControllerService {
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.caller, __identity.as_ref());
         self.require_k0s_admin(__identity.as_ref(), &req.caller, "k0s cluster down")?;
-        self.require_k0s_reconcile("k0s cluster down")?;
+        // With no role assigned, recording `Down` is the whole teardown, so a cluster left in
+        // `provisioning` by a controller without the loop can still be cleared.
+        let role_held = self
+            .cluster
+            .get_nodes()
+            .iter()
+            .any(|n| n.k0s_role.is_some());
+        if role_held {
+            self.require_k0s_reconcile("k0s cluster down")?;
+        }
         self.cluster
             .set_k0s_phase(
                 spur_core::k0s::K0sPhase::Down,
@@ -10139,7 +10148,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cluster_down_is_refused_without_the_reconcile_loop() {
+    async fn cluster_down_is_refused_without_the_reconcile_loop_while_a_role_is_held() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         register_plain_node(&svc, "node-a", 6818).await;
@@ -10150,6 +10159,14 @@ mod tests {
                 vec!["node-a".into()],
                 vec!["node-a".into()],
                 false,
+            )
+            .unwrap();
+        svc.cluster
+            .assign_node_k0s(
+                "node-a",
+                spur_core::k0s::K0sRole::Single,
+                "10.44.0.1",
+                "10.42.0.0/24",
             )
             .unwrap();
         let err = svc
@@ -10163,6 +10180,32 @@ mod tests {
         assert_eq!(
             svc.cluster.k0s_state().phase,
             spur_core::k0s::K0sPhase::Ready
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_down_clears_a_stuck_provisioning_without_the_reconcile_loop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        register_plain_node(&svc, "node-a", 6818).await;
+        svc.cluster
+            .set_k0s_phase(
+                spur_core::k0s::K0sPhase::Provisioning,
+                Some("node-a".into()),
+                vec!["node-a".into()],
+                vec!["node-a".into()],
+                false,
+            )
+            .unwrap();
+        svc.cluster_down(Request::new(ClusterDownRequest {
+            caller: "root".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("no role is held, so recording Down is the whole teardown");
+        assert_eq!(
+            svc.cluster.k0s_state().phase,
+            spur_core::k0s::K0sPhase::Down
         );
     }
 
