@@ -1693,10 +1693,10 @@ async fn converge_provisioning(
             clear_node_error(cluster, node);
             continue;
         }
-        starts.note_failed_unit(cluster, node, component.as_deref(), phase, now);
         if !starts.may_start(node, phase, now) {
             continue;
         }
+        starts.note_failed_unit(cluster, node, component.as_deref(), phase, now);
         // The bootstrap seeds etcd — no join token. Its k0s config pins the CIDRs and CNI mode for
         // the whole cluster.
         let k0s_config = Some(controller_k0s_config(net, node, cp_count));
@@ -1728,7 +1728,6 @@ async fn converge_provisioning(
             clear_node_error(cluster, node);
             continue;
         }
-        starts.note_failed_unit(cluster, node, component.as_deref(), phase, now);
         if !starts.may_start(node, phase, now) {
             continue;
         }
@@ -1766,6 +1765,7 @@ async fn converge_provisioning(
                 }
             },
         };
+        starts.note_failed_unit(cluster, node, component.as_deref(), phase, now);
         spawn_start_component(
             cluster,
             starts,
@@ -2151,9 +2151,10 @@ impl StartTracker {
     }
 
     /// A unit systemd gave up on is a failed start even though the agent answered `started`.
-    /// It only spaces out retries: `spur k8s status` already shows the live `failed` state, and
-    /// writing a reason here would churn the record each tick for a unit that flaps.
-    fn note_failed_unit(
+    /// Called only as a start is sent, so each retry widens the backoff instead of re-arming an
+    /// expired one before it is read. It writes no reason: `spur k8s status` already shows the
+    /// live `failed` state, and a unit that flaps would rewrite the record each tick.
+    pub(crate) fn note_failed_unit(
         &mut self,
         cluster: &ClusterManager,
         node: &spur_core::node::Node,
@@ -2231,7 +2232,12 @@ impl StartTracker {
 
     /// A node coming back from `down`/`unknown` drops its backoff, since whatever failed may
     /// have been fixed while it was away.
-    fn may_start(&mut self, node: &spur_core::node::Node, phase: K0sPhase, now: Instant) -> bool {
+    pub(crate) fn may_start(
+        &mut self,
+        node: &spur_core::node::Node,
+        phase: K0sPhase,
+        now: Instant,
+    ) -> bool {
         use spur_core::node::NodeState;
         if let Some(since) = self.in_flight.get(&node.name) {
             // The task reports by START_TIMEOUT; the extra tick only covers a lost report.

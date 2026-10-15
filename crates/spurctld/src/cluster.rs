@@ -23149,6 +23149,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_unit_that_stays_failed_is_retried_with_a_widening_backoff() {
+        use crate::cluster_k8s::StartTracker;
+        use spur_core::k0s::K0sPhase;
+        use std::time::{Duration, Instant};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        let node = cm.get_node("node-a").unwrap();
+        let mut starts = StartTracker::default();
+        // Mirrors converge: check, and note the failed unit only when a start is sent.
+        let mut send = |at: Instant| {
+            let sent = starts.may_start(&node, K0sPhase::Ready, at);
+            if sent {
+                starts.note_failed_unit(&cm, &node, Some("failed"), K0sPhase::Ready, at);
+            }
+            sent
+        };
+        let t0 = Instant::now();
+        assert!(send(t0));
+        assert!(!send(t0 + Duration::from_secs(59)));
+        assert!(
+            send(t0 + Duration::from_secs(60)),
+            "retried once the first wait ends"
+        );
+        assert!(!send(t0 + Duration::from_secs(60 + 119)));
+        assert!(
+            send(t0 + Duration::from_secs(60 + 120)),
+            "the next wait doubled"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unchanged_k0s_reason_is_not_written_again() {
         use crate::cluster_k8s::set_reason_if_changed;
         let dir = TempDir::new().unwrap();

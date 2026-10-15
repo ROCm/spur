@@ -94,6 +94,25 @@ enum UnitOwner {
     Unknown,
 }
 
+/// A stop that left its unit running, as opposed to one that failed later, e.g. in `k0s reset`
+/// after the unit file was already purged.
+#[derive(Debug)]
+struct StillActive(String);
+
+impl std::fmt::Display for StillActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is still active after disable --now", self.0)
+    }
+}
+
+impl std::error::Error for StillActive {}
+
+/// Whether a failed stop should keep its supervisor: only when the unit is still up. Restoring
+/// it after a failed reset would rewrite the purged unit and start k0s on wiped state.
+fn unit_left_running(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<StillActive>().is_some()
+}
+
 fn is_spurd_unit(body: &str) -> bool {
     body.lines()
         .any(|l| l.starts_with("Description=") && l.contains(SPURD_UNIT_MARKER))
@@ -380,10 +399,7 @@ impl ClusterSupervisor {
     async fn disable_and_confirm(&self) -> anyhow::Result<()> {
         self.disable_unit().await;
         if self.unit_status_is(&["is-active"], "active").await {
-            anyhow::bail!(
-                "{} is still active after disable --now",
-                self.unit_file_name()
-            );
+            return Err(StillActive(self.unit_file_name()).into());
         }
         Ok(())
     }
@@ -882,8 +898,7 @@ impl K0sAgent {
             None => self.stop_untracked(reset).await,
         };
         if let Err(e) = stopped {
-            // The unit is still up: keep supervising (and reporting) it unless a start replaced it.
-            if let Some(sup) = taken {
+            if let Some(sup) = taken.filter(|_| unit_left_running(&e)) {
                 self.active.lock().await.get_or_insert(sup);
             }
             return Err(e);
@@ -1267,6 +1282,15 @@ mod tests {
         // k0s does not sd_notify: the unit must NOT be Type=notify (default simple is correct).
         assert!(!unit.contains("Type=notify"));
         assert_eq!(sup.unit_file_name(), "k0scontroller.service");
+    }
+
+    #[test]
+    fn a_failed_stop_keeps_its_supervisor_only_while_the_unit_runs() {
+        let still_up: anyhow::Error = StillActive("k0sworker.service".into()).into();
+        assert!(unit_left_running(&still_up));
+        assert!(unit_left_running(&still_up.context("stop k0s")));
+        let reset_failed = anyhow::anyhow!("k0s reset failed: exit status 1");
+        assert!(!unit_left_running(&reset_failed));
     }
 
     #[test]
