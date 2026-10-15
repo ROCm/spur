@@ -293,7 +293,9 @@ class TestSacctPreemptAndNodeDown:
         wait_job(c, aggressor, timeout=90)
         preempted_at = time.time()
 
-        doomed = _submit(c, "end-doomed", "sleep 600")
+        # Pin to the node we take down: on a cluster with spare nodes an
+        # unpinned job can land elsewhere and never see the outage.
+        doomed = _submit(c, "end-doomed", "sleep 600", "--exclusive", f"--nodelist={node}")
         wait_job_state(c, doomed, "R", timeout=120)
         # This path never notifies accounting; the reconcile pass writes the row.
         c.scontrol("update", f"NodeName={node}", "State=down", "Reason=e2e-maint")
