@@ -11,13 +11,13 @@ class TestK8sWithoutReconcileLoop:
     def test_up_is_refused_and_nothing_is_recorded(self, cluster):
         out = cluster.k8s_up(["--nodes", cluster.node_names[0]])
         assert REFUSAL in out, f"up must be refused: {out}"
+        assert "phase: down" in cluster.k8s_status()
 
-        status = cluster.cli_as_user("root", ["spur", "k8s", "status"])
-        assert "phase: down" in status, f"a refused up must record nothing: {status}"
+    def test_add_nodes_is_refused(self, cluster):
+        out = cluster.k8s_add_nodes(["--nodes", cluster.node_names[0]])
+        assert REFUSAL in out, f"add-nodes must be refused: {out}"
 
-    def test_down_and_add_nodes_are_refused(self, cluster):
-        down = cluster.k8s_down(reset=False)
-        assert REFUSAL in down, f"down must be refused: {down}"
-
-        add = cluster.k8s_add_nodes(["--nodes", cluster.node_names[0]])
-        assert REFUSAL in add, f"add-nodes must be refused: {add}"
+    def test_down_is_accepted_while_no_node_holds_a_role(self, cluster):
+        out = cluster.k8s_down(reset=False)
+        assert REFUSAL not in out, f"down with no role held must go through: {out}"
+        assert "phase: down" in cluster.k8s_status()
