@@ -80,6 +80,53 @@ impl ClusterRole {
     }
 }
 
+/// Written into every unit spurd renders. `k0s install` uses the same unit names, so this is
+/// the only way to tell spurd's k0s from an operator's.
+const SPURD_UNIT_MARKER: &str = "(managed by spurd)";
+
+/// Who wrote a k0s unit. `Unknown` is any failure to tell, which each caller resolves in its own
+/// safe direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitOwner {
+    Absent,
+    Spurd,
+    Foreign,
+    Unknown,
+}
+
+/// A stop that left its unit running, as opposed to one that failed later, e.g. in `k0s reset`
+/// after the unit file was already purged.
+#[derive(Debug)]
+struct StillActive(String);
+
+impl std::fmt::Display for StillActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is still active after disable --now", self.0)
+    }
+}
+
+impl std::error::Error for StillActive {}
+
+/// Whether a failed stop should keep its supervisor: only when the unit is still up. Restoring
+/// it after a failed reset would rewrite the purged unit and start k0s on wiped state.
+fn unit_left_running(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<StillActive>().is_some()
+}
+
+fn is_spurd_unit(body: &str) -> bool {
+    body.lines()
+        .any(|l| l.starts_with("Description=") && l.contains(SPURD_UNIT_MARKER))
+}
+
+/// What `K0sAgent::status` reports about this node's k0s unit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComponentStatus {
+    pub role: String,
+    pub state: String,
+    pub enabled: bool,
+    pub spurd_owned: bool,
+}
+
 /// Inputs the supervisor needs to own a k0s unit.
 ///
 /// Increment-2 prototype: sourced from env (`from_env`). Later increments populate this from
@@ -149,7 +196,7 @@ impl ClusterSupervisor {
         }
         format!(
             "[Unit]\n\
-             Description=k0s {role} (managed by spurd)\n\
+             Description=k0s {role} {SPURD_UNIT_MARKER}\n\
              Documentation=https://docs.k0sproject.io\n\
              ConditionFileIsExecutable={bin}\n\
              After=network-online.target\n\
@@ -290,6 +337,31 @@ impl ClusterSupervisor {
             .unwrap_or(0)
     }
 
+    /// Who wrote the unit systemd actually loaded. Reads `FragmentPath` rather than `unit_path`
+    /// so a same-named unit installed elsewhere is judged by its own file.
+    async fn unit_owner(&self) -> UnitOwner {
+        let unit = self.unit_file_name();
+        let Ok(out) = Command::new("systemctl")
+            .args(["show", &unit, "-p", "FragmentPath", "--value"])
+            .output()
+            .await
+        else {
+            return UnitOwner::Unknown;
+        };
+        if !out.status.success() {
+            return UnitOwner::Unknown;
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if path.is_empty() {
+            return UnitOwner::Absent;
+        }
+        match tokio::fs::read_to_string(&path).await {
+            Ok(body) if is_spurd_unit(&body) => UnitOwner::Spurd,
+            Ok(_) => UnitOwner::Foreign,
+            Err(_) => UnitOwner::Unknown,
+        }
+    }
+
     fn role(&self) -> ClusterRole {
         self.cfg.role
     }
@@ -309,24 +381,31 @@ impl ClusterSupervisor {
         parse_execstart(exec)
     }
 
-    /// Stop + disable the unit; optionally `k0s reset` (destructive) followed by purging the
-    /// spurd-owned unit file + join token so nothing restarts the component. Idempotent.
+    /// Stop + disable the unit; optionally `k0s reset` and purge it. Idempotent. A unit still
+    /// running is never reset: `k0s reset` would wipe state under it.
     async fn stop(&self, reset: bool) -> anyhow::Result<()> {
         if !self.systemd_available().await {
             anyhow::bail!("systemctl unavailable");
         }
-        self.disable_unit().await;
+        self.disable_and_confirm().await?;
         if reset {
             self.reset_and_purge().await?;
         }
         Ok(())
     }
 
-    /// `k0s reset` (wipes /var/lib/k0s) followed by `purge_unit` (removes the spurd-owned unit +
-    /// join token). Purges UNCONDITIONALLY, even if `k0s reset` fails (e.g. a broken/half-installed
-    /// k0s binary): a surviving token was minted against the torn-down CA and makes the node fail its
-    /// next join with a kubernetes-ca verification error, while the `Restart=always` unit keeps
-    /// restarting k0s with it. The reset failure is surfaced, but only after the purge.
+    /// `disable_unit`, then check the unit really stopped. The disable error is ignored because
+    /// an absent unit is fine, but that also hides a real failure (no privilege, a stuck stop).
+    async fn disable_and_confirm(&self) -> anyhow::Result<()> {
+        self.disable_unit().await;
+        if self.unit_status_is(&["is-active"], "active").await {
+            return Err(StillActive(self.unit_file_name()).into());
+        }
+        Ok(())
+    }
+
+    /// Purges even when `k0s reset` fails: a surviving token, minted against the torn-down CA,
+    /// fails the node's next join. The reset error is returned after the purge.
     async fn reset_and_purge(&self) -> anyhow::Result<()> {
         let reset_result = self.k0s_reset().await;
         self.purge_unit().await;
@@ -659,6 +738,15 @@ impl K0sAgent {
             if !probe.unit_status_is(&["is-active"], "active").await {
                 continue;
             }
+            // Adopting rewrites the unit as spurd's on the next heal, so an operator's own k0s
+            // would silently become spurd's and stoppable.
+            if probe.unit_owner().await != UnitOwner::Spurd {
+                info!(
+                    unit = probe_role.unit_name(),
+                    "found an active k0s unit spurd did not write; not adopting"
+                );
+                continue;
+            }
             match probe.read_cfg_from_unit().await {
                 Ok(cfg) => {
                     let role = cfg.role;
@@ -805,9 +893,15 @@ impl K0sAgent {
         // Take the supervisor out under the lock, then do the (blocking) stop OUTSIDE it so
         // concurrent status/start RPCs aren't serialized behind the seconds-long systemctl/k0s IO.
         let taken = self.active.lock().await.take();
-        match taken {
-            Some(sup) => sup.stop(reset).await?,
-            None => self.stop_untracked(reset).await?,
+        let stopped = match &taken {
+            Some(sup) => sup.stop(reset).await,
+            None => self.stop_untracked(reset).await,
+        };
+        if let Err(e) = stopped {
+            if let Some(sup) = taken.filter(|_| unit_left_running(&e)) {
+                self.active.lock().await.get_or_insert(sup);
+            }
+            return Err(e);
         }
         // Only after a successful stop — supervise() won't refresh this once `active` is empty.
         self.status.set_unit_active(false);
@@ -816,30 +910,42 @@ impl K0sAgent {
         Ok(())
     }
 
-    /// Stop/disable any spurd-owned k0s unit present on the host (a node runs at most one, but both
-    /// names are disabled idempotently), then `k0s reset` once if requested. Used when `active` is
-    /// empty so a lost in-memory state can't leave a running k0s unit behind. A failed reset is
-    /// surfaced so `down --reset` reports the partial teardown rather than a false success.
+    /// Teardown when no component is tracked (e.g. spurd restarted). A unit whose writer cannot
+    /// be told is treated as spurd's, so teardown fails closed; one spurd did not write is left
+    /// alone, and a running one blocks `k0s reset`, which would wipe its state.
     async fn stop_untracked(&self, reset: bool) -> anyhow::Result<()> {
+        let mut ours = Vec::new();
+        let mut foreign_running = false;
         for role in [ClusterRole::Controller, ClusterRole::Worker] {
-            self.probe_supervisor(role).disable_unit().await;
-        }
-        if reset {
-            // Purge UNCONDITIONALLY, even if `k0s reset` fails (broken/half-installed k0s binary):
-            // a surviving token was minted against the torn-down CA and makes the node fail its next
-            // join with a kubernetes-ca verification error. Surface the reset failure only after
-            // purging. The probe supervisor carries no token path, so also remove the token directly.
-            let reset_result = self
-                .probe_supervisor(ClusterRole::Controller)
-                .k0s_reset()
-                .await;
-            for role in [ClusterRole::Controller, ClusterRole::Worker] {
-                self.probe_supervisor(role).purge_unit().await;
+            let probe = self.probe_supervisor(role);
+            match probe.unit_owner().await {
+                UnitOwner::Spurd | UnitOwner::Unknown => ours.push(probe),
+                UnitOwner::Foreign => {
+                    foreign_running |= probe.unit_status_is(&["is-active"], "active").await;
+                }
+                UnitOwner::Absent => {}
             }
-            let _ = tokio::fs::remove_file(self.config_dir.join("token")).await;
-            reset_result?;
         }
-        Ok(())
+        for probe in &ours {
+            probe.disable_and_confirm().await?;
+        }
+        if !reset {
+            return Ok(());
+        }
+        if foreign_running {
+            anyhow::bail!("a k0s unit spurd did not write is running; not running k0s reset");
+        }
+        // Same purge-after-failed-reset rule as `reset_and_purge`. The probe supervisor carries no
+        // token path, so the token is removed directly.
+        let reset_result = self
+            .probe_supervisor(ClusterRole::Controller)
+            .k0s_reset()
+            .await;
+        for probe in &ours {
+            probe.purge_unit().await;
+        }
+        let _ = tokio::fs::remove_file(self.config_dir.join("token")).await;
+        reset_result
     }
 
     /// Mint a k0s join token on this (control-plane) node via `k0s token create`. Returns the
@@ -1034,31 +1140,39 @@ impl K0sAgent {
         Ok(())
     }
 
-    /// (role, active_state, enabled) for the node's component. When there is no tracked component,
-    /// it probes the actual spurd-owned units so a restarted spurd (before/without adoption) still
-    /// reports the truth instead of a false `inactive`.
-    pub async fn status(&self) -> (String, String, bool) {
+    /// The node's k0s component. When there is no tracked component, it probes the k0s unit
+    /// names so a restarted spurd (before/without adoption) still reports the truth instead of a
+    /// false `inactive`; `spurd_owned` says whether that unit is one spurd wrote.
+    pub async fn status(&self) -> ComponentStatus {
         // Snapshot out of the lock, then query systemctl OUTSIDE it (avoids serializing RPCs).
         let tracked = self.active.lock().await.clone();
         if let Some(sup) = tracked {
-            let enabled = sup.unit_status_is(&["is-enabled"], "enabled").await;
-            return (
-                sup.role().as_str().to_string(),
-                sup.component_state().await,
-                enabled,
-            );
+            return ComponentStatus {
+                role: sup.role().as_str().to_string(),
+                state: sup.component_state().await,
+                enabled: sup.unit_status_is(&["is-enabled"], "enabled").await,
+                spurd_owned: sup.unit_owner().await == UnitOwner::Spurd,
+            };
         }
-        // Untracked: report a running spurd-owned unit if there is one (Controller/Single share a
-        // unit name — reported as "controller").
-        for role in [ClusterRole::Worker, ClusterRole::Controller] {
+        // Untracked: report a running k0s unit if there is one (Controller/Single share a unit
+        // name — reported as "controller"). Controller first: an untracked stop disables both
+        // units, so a node running both must read as one the controller refuses to stop.
+        for role in [ClusterRole::Controller, ClusterRole::Worker] {
             let probe = self.probe_supervisor(role);
             let state = probe.component_state().await;
             if state != "inactive" && state != "unknown" {
-                let enabled = probe.unit_status_is(&["is-enabled"], "enabled").await;
-                return (role.as_str().to_string(), state, enabled);
+                return ComponentStatus {
+                    role: role.as_str().to_string(),
+                    state,
+                    enabled: probe.unit_status_is(&["is-enabled"], "enabled").await,
+                    spurd_owned: probe.unit_owner().await == UnitOwner::Spurd,
+                };
             }
         }
-        (String::new(), "inactive".to_string(), false)
+        ComponentStatus {
+            state: "inactive".to_string(),
+            ..Default::default()
+        }
     }
 
     /// Background heal loop: keep the active component's unit reconciled. Spawned from spurd
@@ -1163,9 +1277,38 @@ mod tests {
         assert!(unit.contains("KillMode=process"));
         assert!(unit.contains("Delegate=yes"));
         assert!(unit.contains("Restart=always"));
+        // Units already on disk carry this exact text; changing it would disown them.
+        assert!(unit.contains("Description=k0s k0scontroller (managed by spurd)\n"));
         // k0s does not sd_notify: the unit must NOT be Type=notify (default simple is correct).
         assert!(!unit.contains("Type=notify"));
         assert_eq!(sup.unit_file_name(), "k0scontroller.service");
+    }
+
+    #[test]
+    fn a_failed_stop_keeps_its_supervisor_only_while_the_unit_runs() {
+        let still_up: anyhow::Error = StillActive("k0sworker.service".into()).into();
+        assert!(unit_left_running(&still_up));
+        assert!(unit_left_running(&still_up.context("stop k0s")));
+        let reset_failed = anyhow::anyhow!("k0s reset failed: exit status 1");
+        assert!(!unit_left_running(&reset_failed));
+    }
+
+    #[test]
+    fn only_units_spurd_rendered_count_as_spurd_owned() {
+        let ours = ClusterSupervisor::new(ClusterConfig {
+            role: ClusterRole::Worker,
+            k0s_binary: PathBuf::from("/usr/local/bin/k0s"),
+            k0s_config: None,
+            join_token_file: None,
+            node_ip: None,
+        })
+        .render_unit();
+        assert!(is_spurd_unit(&ours));
+        let k0s_install = "[Unit]\nDescription=k0s - Zero Friction Kubernetes\n\n[Service]\n\
+                           ExecStart=/usr/local/bin/k0s worker --token-file=/etc/k0s/token\n";
+        assert!(!is_spurd_unit(k0s_install));
+        let mentioned_elsewhere = "[Unit]\nDescription=my k0s\n# (managed by spurd) once\n";
+        assert!(!is_spurd_unit(mentioned_elsewhere));
     }
 
     #[test]

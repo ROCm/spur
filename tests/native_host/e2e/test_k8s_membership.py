@@ -9,13 +9,14 @@ reconcile loop drives without k0s actually reaching `active`, exactly like
 test_k8s_scheduling). Full k0s convergence is covered on hardware, not in CI.
 """
 
+import re
 import time
 from contextlib import contextmanager
 
 import pytest
 
 STRAY_UNIT = "/run/systemd/system/k0sworker.service"
-STRAY_DROPIN = f"{STRAY_UNIT}.d/zz-e2e-stray.conf"
+INSTALLED_UNIT = "/etc/systemd/system/k0sworker.service"
 
 
 @pytest.fixture
@@ -31,48 +32,91 @@ def k8s_enabled_cluster(unstarted_cluster):
 
 
 @pytest.fixture
-def k8s_degraded_cluster(unstarted_cluster):
-    """`k8s_enabled_cluster` with a 5 s provisioning timeout. k0s never reaches `active`
-    here, and drift is only checked once the cluster has left `provisioning`."""
+def k8s_drift_cluster(unstarted_cluster):
+    """k8s enabled with spurd running as root, as in production: stopping a systemd unit needs
+    it. A 5 s provisioning timeout lets a bed where k0s cannot start settle in `degraded`;
+    where it can, the cluster comes up `ready`. Drift is checked in both."""
     unstarted_cluster.start(
-        config_overrides={"cluster": {"enabled": True, "k8s_provisioning_timeout_secs": 5}}
+        config_overrides={"cluster": {"enabled": True, "k8s_provisioning_timeout_secs": 5}},
+        agent_as_root=True,
     )
     yield unstarted_cluster
-    try:
-        unstarted_cluster.k8s_down(reset=True)
-    except Exception:
-        pass
+    # A teardown that does not converge must fail loudly: it leaves k0s behind for the next run.
+    unstarted_cluster.k8s_down(reset=True)
+    _wait_torn_down(unstarted_cluster)
+
+
+def _wait_torn_down(cluster, timeout: int = 180) -> None:
+    """`k8s down` only asks; the reconcile loop stops and resets each node over later ticks
+    and clears its role once k0s is gone. Killing spurd first would leave k0s running."""
+    deadline = time.time() + timeout
+    rows: list[str] = []
+    while time.time() < deadline:
+        rows = [
+            line
+            for line in cluster.k8s_status().splitlines()
+            if line[:1].isspace() and any(n in line for n in cluster.node_names)
+        ]
+        if not rows:
+            return
+        time.sleep(5)
+    raise TimeoutError(f"k0s teardown did not finish within {timeout}s: {rows}")
 
 
 @contextmanager
-def stray_k0s_worker(cluster, node_index: int):
+def stray_k0s_worker(cluster, node_index: int, spurd_owned: bool = False):
     """An active `k0sworker.service` that runs `sleep`, not k0s. spurd reads the unit's state
-    by name, so the controller sees a stray worker without anything joining a cluster."""
+    by name, so the controller sees a stray worker without anything joining a cluster.
+    `spurd_owned` gives the unit the description spurd writes, which makes it stoppable."""
     node, sudo = cluster.nodes[node_index], cluster._sudo_prefix()
+    unit_head = "[Unit]\\nDescription=k0s k0sworker (managed by spurd)\\n" if spurd_owned else ""
     try:
         node.exec(f"{sudo}true")
     except RuntimeError:
         pytest.skip(f"a stray k0s unit needs sudo on {cluster.node_names[node_index]}")
     if "active" in node.exec_allow_fail("systemctl is-active k0sworker k0scontroller").split():
         pytest.skip(f"{cluster.node_names[node_index]} already runs a k0s unit")
+    # A unit in /etc outranks the one written here, and its text decides spurd_owned. One spurd
+    # left behind is cleared so a bad earlier teardown cannot quietly skip these tests; anyone
+    # else's is not ours to delete.
+    installed = node.exec_allow_fail(f"cat {INSTALLED_UNIT} 2>/dev/null")
+    if installed and "(managed by spurd)" in installed:
+        node.exec(f"{sudo}rm -f {INSTALLED_UNIT} && {sudo}systemctl daemon-reload")
+    elif installed:
+        pytest.skip(f"{cluster.node_names[node_index]} has a k0s unit spurd did not write")
 
-    # The runtime unit serves a node with no k0sworker unit; on one that has it, the unit in
-    # /etc wins and the drop-in replaces its ExecStart.
     try:
         node.exec(
-            f"{sudo}sh -c \"mkdir -p {STRAY_UNIT}.d && "
-            f"printf '[Service]\\nExecStart=/bin/sleep infinity\\n' > {STRAY_UNIT} && "
-            f"printf '[Service]\\nType=simple\\nExecStart=\\nExecStart=/bin/sleep infinity\\n'"
-            f" > {STRAY_DROPIN}\""
+            f"{sudo}sh -c \"printf '{unit_head}[Service]\\nExecStart=/bin/sleep infinity\\n'"
+            f" > {STRAY_UNIT}\""
         )
         node.exec(f"{sudo}systemctl daemon-reload && {sudo}systemctl start k0sworker")
+        loaded = node.exec_allow_fail("systemctl show k0sworker -p FragmentPath --value").strip()
+        assert loaded == STRAY_UNIT, f"systemd loaded {loaded!r}, not the stray unit"
         yield
     finally:
         node.exec_allow_fail(
-            f"{sudo}systemctl stop k0sworker; {sudo}rm -f {STRAY_UNIT} {STRAY_DROPIN}; "
-            f"{sudo}rmdir {STRAY_UNIT}.d; {sudo}systemctl daemon-reload; "
-            f"{sudo}systemctl reset-failed k0sworker"
+            f"{sudo}systemctl stop k0sworker; {sudo}rm -f {STRAY_UNIT}; "
+            f"{sudo}systemctl daemon-reload; {sudo}systemctl reset-failed k0sworker"
         )
+
+
+def _wait_up(cluster, timeout: int = 600) -> str:
+    """Wait for `ready` or `degraded`. With a root agent k0s may really start, so which one
+    the cluster settles in depends on the bed; drift is checked in both."""
+    deadline = time.time() + timeout
+    status = ""
+    while time.time() < deadline:
+        status = cluster.k8s_status()
+        if re.search(r"^phase: (ready|degraded)$", status, re.M):
+            return status
+        time.sleep(5)
+    raise TimeoutError(f"k0s never reached ready or degraded within {timeout}s:\n{status}")
+
+
+def _names(line: str, node: str) -> bool:
+    """Whether a log line's `node=` field is exactly `node`, wherever it sits in the line."""
+    return re.search(rf"\bnode={re.escape(node)}(\s|$)", line) is not None
 
 
 def _drift_lines(cluster) -> list[str]:
@@ -169,27 +213,62 @@ class TestK8sOnlineMembership:
 
 
 class TestK8sMembershipDrift:
-    def test_k0s_running_outside_a_scoped_cluster_is_reported(self, k8s_degraded_cluster):
+    def test_k0s_spurd_did_not_install_is_reported_and_left_running(self, k8s_drift_cluster):
         """Nodes without the stray unit, the member included, are never reported."""
-        cluster = k8s_degraded_cluster
+        cluster = k8s_drift_cluster
         if len(cluster.node_names) < 2:
             pytest.skip("drift test needs a node outside the scope")
         member, stray = cluster.node_names[0], cluster.node_names[1]
         cluster.k8s_up(["--nodes", member, "--control-plane-node", member])
-        cluster.wait_k8s_phase("degraded", timeout=180)
+        _wait_up(cluster)
 
-        # Every node is a candidate and a tick visits one, so two visits take at most two
-        # sweeps of 30 s per node.
-        deadline = time.time() + 30 * (2 * len(cluster.node_names) + 2)
-        reported: list[str] = []
+        # A tick visits one node: up to one sweep of 30 s per node to the first visit, one more
+        # to confirm, and the refusal comes on the confirming visit.
+        refused: list[str] = []
         with stray_k0s_worker(cluster, 1):
+            deadline = time.time() + 30 * (3 * len(cluster.node_names) + 4)
             while time.time() < deadline:
-                reported = [line for line in _drift_lines(cluster) if f"node={stray} " in line]
-                if reported:
+                refused = [
+                    line
+                    for line in cluster.spurctld_log().splitlines()
+                    if _names(line, stray) and 'reason="not_spurd_owned"' in line
+                ]
+                if refused:
                     break
                 time.sleep(10)
+            still_running = cluster.nodes[1].exec_allow_fail("systemctl is-active k0sworker")
 
-        assert reported, f"{stray} was never reported:\n{cluster.spurctld_log()[-4000:]}"
-        assert 'kind="out_of_scope"' in reported[0], reported[0]
-        others = [line for line in _drift_lines(cluster) if f"node={stray} " not in line]
+        assert refused, f"{stray} was never refused:\n{cluster.spurctld_log()[-4000:]}"
+        assert still_running.strip() == "active", still_running
+        reported = [line for line in _drift_lines(cluster) if _names(line, stray)]
+        assert reported and 'kind="out_of_scope"' in reported[0], reported
+        others = [line for line in _drift_lines(cluster) if not _names(line, stray)]
         assert not others, f"drift reported on nodes without any: {others}"
+
+    def test_a_spurd_stray_outside_a_scoped_cluster_is_stopped(self, k8s_drift_cluster):
+        """The stop is confirmed by later checks, and the member is never stopped."""
+        cluster = k8s_drift_cluster
+        if len(cluster.node_names) < 2:
+            pytest.skip("drift test needs a node outside the scope")
+        member, stray = cluster.node_names[0], cluster.node_names[1]
+        cluster.k8s_up(["--nodes", member, "--control-plane-node", member])
+        _wait_up(cluster)
+
+        corrected: list[str] = []
+        with stray_k0s_worker(cluster, 1, spurd_owned=True):
+            # A tick visits one node, so each visit to the stray is a sweep of 30 s per node
+            # apart: up to one sweep to the first visit, two to confirm, two to call it stopped.
+            deadline = time.time() + 30 * (5 * len(cluster.node_names) + 4)
+            while time.time() < deadline:
+                log = cluster.spurctld_log().splitlines()
+                corrected = [line for line in log if _names(line, stray) and "stayed stopped" in line]
+                if corrected:
+                    break
+                time.sleep(10)
+            still_running = cluster.nodes[1].exec_allow_fail("systemctl is-active k0sworker")
+
+        log = cluster.spurctld_log()
+        assert corrected, f"{stray} was never confirmed stopped:\n{log[-4000:]}"
+        assert still_running.strip() != "active", still_running
+        stops = [line for line in log.splitlines() if "stopping stray k0s worker" in line]
+        assert len(stops) == 1 and _names(stops[0], stray), stops

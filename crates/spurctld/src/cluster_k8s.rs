@@ -9,7 +9,7 @@
 //! gated on Raft leadership. Phase transitions go through `ClusterManager::set_k0s_phase`
 //! (WAL-replicated) so a leadership change mid-provision is safe.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,19 +76,20 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
     info!(mesh = %net.mesh_cidr, pod = %net.pod_cidr, "k0s cluster reconcile loop started");
     let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
     let mut last_mesh: Vec<MeshNode> = Vec::new();
-    // Cache of the join token minted per node (worker or secondary control-plane), so we mint once
-    // (not every tick) while it joins — re-minting churns k0s server tokens and races the join.
-    let mut join_tokens: HashMap<String, String> = HashMap::new();
+    let mut starts = StartTracker::default();
     // Leader-local provisioning clock: a leader-flip or restart resets it, so the timeout re-arms
     // on the new leader rather than tripping instantly off a persisted start time.
     let mut provisioning_since: Option<Instant> = None;
     let mut drift = DriftTracker::default();
+    let mut correction = Correction::default();
     loop {
         interval.tick().await;
         if !raft.is_leader() {
             last_mesh.clear(); // forget on leadership loss so a new term re-logs the membership
             provisioning_since = None;
+            starts = StartTracker::default();
             drift = DriftTracker::default();
+            correction = Correction::default();
             continue; // only the leader reconciles
         }
         let state = cluster.k0s_state();
@@ -141,7 +142,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
         last_mesh = mesh.nodes.clone();
 
         let started = Instant::now();
-        let errored = reconcile_phase(&cluster, &net, &state, &mut join_tokens, timed_out).await;
+        let errored = reconcile_phase(&cluster, &net, &state, &mut starts, timed_out).await;
         let cluster_name = cluster.config().cluster_name.clone();
         cluster
             .k8s_metrics()
@@ -150,7 +151,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>, net: Clust
             cluster.k8s_metrics().record_reconcile_error(&cluster_name);
         }
 
-        detect_drift(&cluster, &mut drift).await;
+        detect_drift(&cluster, &raft, &mut drift, &mut correction).await;
     }
 }
 
@@ -182,7 +183,7 @@ pub(crate) async fn reconcile_phase(
     cluster: &ClusterManager,
     net: &ClusterNetworking,
     state: &K0sClusterState,
-    join_tokens: &mut HashMap<String, String>,
+    starts: &mut StartTracker,
     timed_out: bool,
 ) -> bool {
     match state.phase {
@@ -191,12 +192,12 @@ pub(crate) async fn reconcile_phase(
                 warn!(error = %e, "k0s provisioning assignment failed; will retry next tick");
                 return true;
             }
-            let (errors, active_cp) = converge_provisioning(cluster, net, join_tokens).await;
+            let (errors, active_cp) = converge_provisioning(cluster, net, starts).await;
             // converge may have flipped us to Ready this tick; only degrade a still-provisioning
             // cluster that has blown its deadline. Reuse converge's control-plane liveness (no second
             // per-node status sweep).
             if timed_out && cluster.k0s_state().phase == K0sPhase::Provisioning {
-                degrade_stuck_cluster(cluster, net, join_tokens, &active_cp).await;
+                degrade_stuck_cluster(cluster, net, &mut starts.join_tokens, &active_cp).await;
             }
             errors > 0
         }
@@ -204,7 +205,7 @@ pub(crate) async fn reconcile_phase(
             // Drop cached join tokens: they were minted against this incarnation's CA, which a
             // rebuild regenerates. Keeping them would hand a worker a stale-CA token on the next
             // `up` (roles are re-assigned before converge runs, so its empty-set clear never fires).
-            join_tokens.clear();
+            *starts = StartTracker::default();
             stop_all_components(cluster, state.reset_requested).await;
             false
         }
@@ -632,13 +633,18 @@ pub fn phase_str(p: K0sPhase) -> String {
     .to_string()
 }
 
-/// Reconcile ticks per drift sweep, so every candidate node is visited about once per ten
-/// minutes however large the fleet.
+/// Reconcile ticks per drift sweep. Every candidate is visited within
+/// `max(10 min, ceil(candidates / MAX_DRIFT_PROBES) × 30 s)`, except a node that joins behind the
+/// sweep cursor, which waits up to one extra sweep.
 const DRIFT_SWEEP_TICKS: usize = (600 / RECONCILE_INTERVAL.as_secs()) as usize;
 const _: () = assert!(
     DRIFT_SWEEP_TICKS > 0,
     "RECONCILE_INTERVAL exceeds a drift sweep"
 );
+
+/// Agents probed per tick at most. On a scoped cluster every node outside the scope is a
+/// candidate, so without a cap the per-tick fan-out would grow with the whole inventory.
+const MAX_DRIFT_PROBES: usize = 16;
 
 /// A disagreement between what the controller recorded for a node and what its agent runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +653,9 @@ enum Drift {
     /// k0s running on a node outside a scoped cluster's members.
     OutOfScope,
     RoleMismatch,
+    /// A roled node of a `degraded` cluster that was running when it degraded and no longer is.
+    /// Nothing restarts it there, so it is reported instead.
+    NotRunning,
     /// No usable reading, so no conclusion either way.
     Unknown,
 }
@@ -657,13 +666,43 @@ impl Drift {
             Drift::None => "none",
             Drift::OutOfScope => "out_of_scope",
             Drift::RoleMismatch => "role_mismatch",
+            Drift::NotRunning => "not_running",
             Drift::Unknown => "unknown",
         }
     }
 }
 
+/// Classify a node against the cluster record. Adds `NotRunning` to [`classify_drift`]: in
+/// `degraded` no reconcile restarts anything, and `degrade_stuck_cluster` records a reason on
+/// every node it left stopped, so a roled member with no reason that is not active died later.
+fn classify(
+    node: &spur_core::node::Node,
+    state: &K0sClusterState,
+    live: Option<&ComponentStatus>,
+) -> Drift {
+    let in_scope = state.is_member(&node.name);
+    let drift = classify_drift(
+        node.k0s_role,
+        in_scope,
+        live.map(|s| (s.role.as_str(), s.state.as_str())),
+    );
+    let expected_active = state.phase == K0sPhase::Degraded
+        && in_scope
+        && node.k0s_role.is_some()
+        && node.k0s_last_error.is_none();
+    match live {
+        // "unknown" is an agent that could not read systemd, not an answer.
+        Some(s) if s.state == "unknown" && expected_active => Drift::Unknown,
+        Some(s) if drift == Drift::None && expected_active && s.state != "active" => {
+            Drift::NotRunning
+        }
+        _ => drift,
+    }
+}
+
 /// Classify one node from its record and the agent's `(role, component_state)`. An inactive node,
-/// or an in-scope one with no role yet, is not drift: the reconcile starts or assigns it.
+/// or an in-scope one with no role yet, is not drift: in `ready` the reconcile starts or assigns
+/// it (`degraded` is handled by [`classify`]).
 fn classify_drift(
     ledger_role: Option<K0sRole>,
     in_scope: bool,
@@ -699,17 +738,29 @@ enum Sighting {
     Confirmed(Drift),
 }
 
+impl Sighting {
+    fn drift(self) -> Drift {
+        match self {
+            Sighting::Once(d) | Sighting::Confirmed(d) => d,
+        }
+    }
+}
+
 /// Round-robin drift sweep with two-visit confirmation, so one odd reading never counts.
 /// Leader-local: a new leader starts over and re-observes.
 #[derive(Debug, Default)]
 struct DriftTracker {
     last_visited: Option<String>,
     seen: HashMap<String, Sighting>,
+    /// Candidates whose last reading made them stoppable strays (see [`is_stoppable`]).
+    stoppable: HashSet<String>,
+    /// Candidates with a recorded role, as of the last `next_probe`.
+    roled: HashSet<String>,
 }
 
 impl DriftTracker {
-    /// This tick's nodes to probe. A sighting only survives back-to-back visits, so a node that
-    /// stops being checked, or a cluster leaving `ready`/`degraded`, starts over.
+    /// This tick's nodes to probe. A sighting survives while the node stays a candidate, so a
+    /// node that stops being checked, or a cluster leaving `ready`/`degraded`, starts over.
     fn next_probe<'a>(
         &mut self,
         state: &K0sClusterState,
@@ -717,22 +768,33 @@ impl DriftTracker {
         removing: &HashSet<String>,
     ) -> Vec<&'a spur_core::node::Node> {
         if !matches!(state.phase, K0sPhase::Ready | K0sPhase::Degraded) {
-            *self = Self::default();
+            self.seen.clear();
+            self.stoppable.clear();
             return Vec::new();
         }
         let candidates = drift_candidates(nodes, state, removing);
         let names: HashSet<&str> = candidates.iter().map(|n| n.name.as_str()).collect();
         self.seen.retain(|name, _| names.contains(name.as_str()));
+        self.stoppable.retain(|name| names.contains(name.as_str()));
+        self.roled = candidates
+            .iter()
+            .filter(|n| n.k0s_role.is_some())
+            .map(|n| n.name.clone())
+            .collect();
         self.next_slice(&candidates)
     }
 
-    /// The next slice of name-sorted `candidates`, sized to cover them all in one sweep. Resumes
-    /// after the last node visited, so nodes joining or leaving never shift the sweep past anyone.
+    /// The next slice of name-sorted `candidates`, sized to cover them all in one sweep up to
+    /// `MAX_DRIFT_PROBES`. Resumes after the last node visited, so nodes joining or leaving never
+    /// shift the sweep past anyone.
     fn next_slice<'a>(
         &mut self,
         candidates: &[&'a spur_core::node::Node],
     ) -> Vec<&'a spur_core::node::Node> {
-        let take = candidates.len().div_ceil(DRIFT_SWEEP_TICKS);
+        let take = candidates
+            .len()
+            .div_ceil(DRIFT_SWEEP_TICKS)
+            .min(MAX_DRIFT_PROBES);
         let start = self.last_visited.as_deref().map_or(0, |last| {
             candidates.partition_point(|n| n.name.as_str() <= last)
         });
@@ -771,6 +833,39 @@ impl DriftTracker {
             },
         }
     }
+
+    /// The node's confirmed drift, on every visit of the episode rather than only the first.
+    fn confirmed(&self, node: &str) -> Option<Drift> {
+        match self.seen.get(node) {
+            Some(Sighting::Confirmed(d)) => Some(*d),
+            _ => None,
+        }
+    }
+
+    /// Whether so many nodes look like stoppable strays that the record is more likely wrong
+    /// than the fleet. Measured against roled candidates plus non-members seen running k0s, not
+    /// the whole inventory.
+    fn breaker_tripped(&self) -> bool {
+        let strays = self
+            .seen
+            .iter()
+            .filter(|(name, s)| s.drift() == Drift::OutOfScope && !self.roled.contains(*name))
+            .count();
+        let limit = ((self.roled.len() + strays) / 4).max(BREAKER_FLOOR);
+        self.stoppable.len() > limit
+    }
+}
+
+/// Whether a node is the one kind of stray the controller stops: no role recorded, running a
+/// spurd-installed k0s worker. A controller may still hold etcd quorum for the live cluster, and
+/// a unit spurd did not write belongs to someone else.
+fn is_stoppable(node: &spur_core::node::Node, live: Option<&ComponentStatus>) -> bool {
+    node.k0s_role.is_none() && live.is_some_and(|s| s.role == "worker" && s.spurd_owned)
+}
+
+/// Nodes the controller holds unhealthy or in maintenance, which drift handling leaves alone.
+fn held_out(state: spur_core::node::NodeState) -> bool {
+    state.is_admin_hold() || state == spur_core::node::NodeState::Unknown
 }
 
 /// Nodes worth probing for drift, sorted by name. Skipped: in-scope nodes with no role, nodes
@@ -780,15 +875,9 @@ fn drift_candidates<'a>(
     state: &K0sClusterState,
     removing: &HashSet<String>,
 ) -> Vec<&'a spur_core::node::Node> {
-    use spur_core::node::NodeState;
     let mut out: Vec<_> = nodes
         .iter()
-        .filter(|n| {
-            !matches!(
-                n.state,
-                NodeState::Down | NodeState::Drain | NodeState::Draining | NodeState::Unknown
-            )
-        })
+        .filter(|n| !held_out(n.state))
         .filter(|n| n.k0s_role.is_some() || !state.is_member(&n.name))
         .filter(|n| !removing.contains(&n.name))
         .collect();
@@ -796,36 +885,449 @@ fn drift_candidates<'a>(
     out
 }
 
-/// Probe one slice of the fleet and report drift two successive readings agree on. Detection only.
-async fn detect_drift(cluster: &ClusterManager, tracker: &mut DriftTracker) {
+// A reason missing from the metrics list would never get its zero series.
+const _: () = assert!(Refusal::ALL.len() == spur_metrics::k8s::DRIFT_REFUSAL_REASONS.len());
+
+/// Strays the breaker always lets through together, however small the cluster: the few left
+/// behind by one `k8s down` are what correction exists for, and the budget still paces them.
+const BREAKER_FLOOR: usize = 3;
+
+/// Why a stop of a confirmed stray did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Disabled,
+    ControlPlane,
+    NotSpurdOwned,
+    CircuitBreaker,
+    /// Another stray was already stopped this tick.
+    Throttled,
+    /// The fleet-wide stop budget for the window is spent.
+    Budget,
+    Backoff,
+    NotLeader,
+    TermChange,
+    RecordChanged,
+    StopFailed,
+    StopUnconfirmed,
+}
+
+impl Refusal {
+    const ALL: [Refusal; 12] = [
+        Refusal::Disabled,
+        Refusal::ControlPlane,
+        Refusal::NotSpurdOwned,
+        Refusal::CircuitBreaker,
+        Refusal::Throttled,
+        Refusal::Budget,
+        Refusal::Backoff,
+        Refusal::NotLeader,
+        Refusal::TermChange,
+        Refusal::RecordChanged,
+        Refusal::StopFailed,
+        Refusal::StopUnconfirmed,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Refusal::Disabled => "disabled",
+            Refusal::ControlPlane => "control_plane",
+            Refusal::NotSpurdOwned => "not_spurd_owned",
+            Refusal::CircuitBreaker => "circuit_breaker",
+            Refusal::Throttled => "throttled",
+            Refusal::Budget => "budget",
+            Refusal::Backoff => "backoff",
+            Refusal::NotLeader => "not_leader",
+            Refusal::TermChange => "term_change",
+            Refusal::RecordChanged => "record_changed",
+            Refusal::StopFailed => "stop_failed",
+            Refusal::StopUnconfirmed => "stop_unconfirmed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Decision {
+    Report(String, Drift),
+    Stop(String),
+    Refuse(String, Refusal),
+    Corrected(String),
+    Recurred(String),
+}
+
+/// Caps what a wrong record can take down before an operator notices, however many nodes it
+/// misreports.
+const STOP_BUDGET: usize = 5;
+const STOP_BUDGET_WINDOW: Duration = Duration::from_secs(600);
+/// A node's wait between stops starts at one sweep and doubles up to an hour.
+const STOP_BACKOFF_FIRST: Duration = Duration::from_secs(600);
+const STOP_BACKOFF_MAX: Duration = Duration::from_secs(3600);
+/// Two, so a unit something restarts right after the stop is not counted as fixed.
+const CLEAN_VISITS_TO_CORRECT: u8 = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct StopBackoff {
+    last: Instant,
+    step: Duration,
+}
+
+/// Leader-local bookkeeping for stopping strays. Cleared with the tracker on any term change,
+/// which fails toward inaction: two fresh sightings are needed before the next stop.
+#[derive(Debug, Default)]
+struct Correction {
+    term: Option<u64>,
+    /// Nodes stopped and awaiting confirmation, with the clean visits seen since.
+    pending: HashMap<String, u8>,
+    /// Nodes whose stop was confirmed, so k0s coming back counts as a recurrence.
+    corrected: HashSet<String>,
+    backoff: HashMap<String, StopBackoff>,
+    recent: VecDeque<Instant>,
+}
+
+impl Correction {
+    fn budget_left(&mut self, now: Instant) -> bool {
+        while self
+            .recent
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= STOP_BUDGET_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.len() < STOP_BUDGET
+    }
+
+    fn backing_off(&self, node: &str, now: Instant) -> bool {
+        self.backoff
+            .get(node)
+            .is_some_and(|b| now.saturating_duration_since(b.last) < b.step)
+    }
+
+    /// Spend budget and arm the node's backoff for a stop about to be sent. A node quiet for
+    /// twice the ceiling starts again at the first step.
+    fn record_stop(&mut self, node: &str, now: Instant) {
+        self.recent.push_back(now);
+        let step = match self.backoff.get(node) {
+            Some(b) if now.saturating_duration_since(b.last) < STOP_BACKOFF_MAX * 2 => {
+                (b.step * 2).min(STOP_BACKOFF_MAX)
+            }
+            _ => STOP_BACKOFF_FIRST,
+        };
+        self.backoff
+            .insert(node.to_string(), StopBackoff { last: now, step });
+    }
+
+    /// A node admitted back into the cluster runs k0s legitimately; an old stop must not make
+    /// that read as a stray coming back.
+    fn forget(&mut self, node: &str) {
+        self.pending.remove(node);
+        self.corrected.remove(node);
+    }
+
+    fn retain_nodes(&mut self, nodes: &[spur_core::node::Node]) {
+        let names: HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        self.pending.retain(|n, _| names.contains(n.as_str()));
+        self.corrected.retain(|n| names.contains(n.as_str()));
+        self.backoff.retain(|n, _| names.contains(n.as_str()));
+    }
+
+    /// Success is never taken from the stop reply, which can claim a stop that did not happen.
+    fn settle(&mut self, node: &str, live: Option<&ComponentStatus>) -> Option<Decision> {
+        let live = live?;
+        let active = live.state == "active";
+        let Some(clean) = self.pending.get_mut(node) else {
+            if active && self.corrected.remove(node) {
+                return Some(Decision::Recurred(node.to_string()));
+            }
+            return None;
+        };
+        if active {
+            let decision = if *clean == 0 {
+                Decision::Refuse(node.to_string(), Refusal::StopUnconfirmed)
+            } else {
+                Decision::Recurred(node.to_string())
+            };
+            self.pending.remove(node);
+            return Some(decision);
+        }
+        *clean += 1;
+        if *clean < CLEAN_VISITS_TO_CORRECT {
+            return None;
+        }
+        self.pending.remove(node);
+        self.corrected.insert(node.to_string());
+        Some(Decision::Corrected(node.to_string()))
+    }
+}
+
+/// The drift decisions for one probed slice: what to report, which stray to stop, and why any
+/// confirmed stray is left running. Pure, so the wiring is unit-tested without agents; the
+/// checks that need Raft or a fresh record run in [`stop_stray`] just before the stop.
+fn decide(
+    state: &K0sClusterState,
+    slice: &[&spur_core::node::Node],
+    statuses: &HashMap<String, ComponentStatus>,
+    tracker: &mut DriftTracker,
+    correction: &mut Correction,
+    enabled: bool,
+    now: Instant,
+) -> Vec<Decision> {
+    let mut out = Vec::new();
+    let mut stop_chosen = false;
+    // A member with no role yet is not a candidate, so it is never visited to be forgotten.
+    let members: Vec<String> = correction
+        .pending
+        .keys()
+        .chain(correction.corrected.iter())
+        .filter(|n| state.is_member(n))
+        .cloned()
+        .collect();
+    for name in members {
+        correction.forget(&name);
+    }
+    for node in slice {
+        let name = &node.name;
+        let live = statuses.get(name);
+        if node.k0s_role.is_some() {
+            correction.forget(name);
+        }
+        let settled = correction.settle(name, live);
+        let just_settled = settled.is_some();
+        out.extend(settled);
+        let drift = classify(node, state, live);
+        // An unreachable node is no evidence of a stray, so it leaves the breaker's count too.
+        if drift == Drift::OutOfScope && is_stoppable(node, live) {
+            tracker.stoppable.insert(name.clone());
+        } else {
+            tracker.stoppable.remove(name);
+        }
+        let newly = tracker.observe(name, drift);
+        if let Some(kind) = newly {
+            out.push(Decision::Report(name.clone(), kind));
+        }
+        if just_settled {
+            continue;
+        }
+        let confirmed_stray = drift == Drift::OutOfScope
+            && tracker.confirmed(name) == Some(Drift::OutOfScope)
+            && node.k0s_role.is_none()
+            && !correction.pending.contains_key(name);
+        if !confirmed_stray {
+            continue;
+        }
+        let Some(live) = live else { continue };
+        let standing = if !enabled {
+            Some(Refusal::Disabled)
+        } else if live.role != "worker" {
+            Some(Refusal::ControlPlane)
+        } else if !live.spurd_owned {
+            Some(Refusal::NotSpurdOwned)
+        } else {
+            None
+        };
+        if let Some(reason) = standing {
+            if newly.is_some() {
+                out.push(Decision::Refuse(name.clone(), reason));
+            }
+            continue;
+        }
+        let refusal = if tracker.breaker_tripped() {
+            Some(Refusal::CircuitBreaker)
+        } else if stop_chosen {
+            Some(Refusal::Throttled)
+        } else if !correction.budget_left(now) {
+            Some(Refusal::Budget)
+        } else if correction.backing_off(name, now) {
+            Some(Refusal::Backoff)
+        } else {
+            None
+        };
+        match refusal {
+            Some(reason) => out.push(Decision::Refuse(name.clone(), reason)),
+            None => {
+                stop_chosen = true;
+                out.push(Decision::Stop(name.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Whether the record still calls for stopping `node`: re-read right before the stop so an
+/// admin change since the decision (an `add-nodes`, a drain, a teardown) wins.
+fn stop_still_warranted(
+    node: Option<&spur_core::node::Node>,
+    state: &K0sClusterState,
+    removing: &HashSet<String>,
+) -> bool {
+    let Some(node) = node else { return false };
+    node.k0s_role.is_none()
+        && !state.is_member(&node.name)
+        && matches!(state.phase, K0sPhase::Ready | K0sPhase::Degraded)
+        && !state.reset_requested
+        && !removing.contains(&node.name)
+        && !held_out(node.state)
+}
+
+/// The consensus checks a stop needs, behind a trait so the stop path is tested without Raft.
+trait Leadership {
+    async fn confirm(&self) -> bool;
+    fn term(&self) -> u64;
+}
+
+impl Leadership for RaftHandle {
+    async fn confirm(&self) -> bool {
+        // Drift handling runs inline on the reconcile loop; a stalled quorum round must not hold
+        // up mesh pushes, converge and teardown behind it.
+        tokio::time::timeout(AGENT_TIMEOUT, self.ensure_leader())
+            .await
+            .unwrap_or(false)
+    }
+
+    fn term(&self) -> u64 {
+        self.current_term()
+    }
+}
+
+/// The record a stop is re-checked against just before it is sent.
+struct StopRecord<'a> {
+    node: Option<&'a spur_core::node::Node>,
+    state: &'a K0sClusterState,
+    removing: &'a HashSet<String>,
+}
+
+/// Stop a stray `decide` chose. Free checks run before the quorum round, and budget is spent
+/// only on a stop that is actually sent.
+async fn stop_stray<L, F, Fut>(
+    leader: &L,
+    term: u64,
+    record: StopRecord<'_>,
+    correction: &mut Correction,
+    now: Instant,
+    send: F,
+) -> Result<(), Refusal>
+where
+    L: Leadership,
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), StopError>>,
+{
+    let Some(node) = record
+        .node
+        .filter(|n| stop_still_warranted(Some(n), record.state, record.removing))
+    else {
+        return Err(Refusal::RecordChanged);
+    };
+    let Some(endpoint) = node_endpoint(node) else {
+        warn!(node = %node.name, "stray has no agent address; cannot stop it");
+        return Err(Refusal::StopFailed);
+    };
+    if !leader.confirm().await {
+        return Err(Refusal::NotLeader);
+    }
+    if leader.term() != term {
+        return Err(Refusal::TermChange);
+    }
+    correction.record_stop(&node.name, now);
+    match send(endpoint).await {
+        // A slow `systemctl disable --now` can outlast the RPC bound; the next probe decides.
+        Ok(()) | Err(StopError::TimedOut) => {
+            correction.pending.insert(node.name.clone(), 0);
+            Ok(())
+        }
+        Err(StopError::Failed(detail)) => {
+            warn!(node = %node.name, detail = %detail, "stopping stray k0s failed");
+            Err(Refusal::StopFailed)
+        }
+    }
+}
+
+/// A new term means another leader may have acted, so sightings and stop bookkeeping start over.
+fn reset_on_new_term(term: u64, tracker: &mut DriftTracker, correction: &mut Correction) {
+    if correction.term == Some(term) {
+        return;
+    }
+    *tracker = DriftTracker::default();
+    *correction = Correction {
+        term: Some(term),
+        ..Default::default()
+    };
+}
+
+/// Probe one slice of the fleet, report drift two successive readings agree on, and stop a
+/// confirmed stray when every guard allows it.
+async fn detect_drift(
+    cluster: &ClusterManager,
+    raft: &RaftHandle,
+    tracker: &mut DriftTracker,
+    correction: &mut Correction,
+) {
+    let term = raft.current_term();
+    reset_on_new_term(term, tracker, correction);
+    let enabled = cluster.config().cluster.k8s_drift_correction;
     let state = cluster.k0s_state();
     let nodes = cluster.get_nodes();
+    correction.retain_nodes(&nodes);
     let slice = tracker.next_probe(&state, &nodes, &cluster.k0s_removals_in_flight());
-    let mut statuses = fetch_component_statuses(cluster, &slice).await;
+    let statuses = fetch_component_statuses(&slice).await;
+    let decisions = decide(
+        &state,
+        &slice,
+        &statuses,
+        tracker,
+        correction,
+        enabled,
+        Instant::now(),
+    );
+    let metrics = cluster.k8s_metrics();
     let cluster_name = cluster.config().cluster_name.clone();
-    for node in slice {
-        let live = statuses.remove(&node.name);
-        let drift = classify_drift(
-            node.k0s_role,
-            state.is_member(&node.name),
-            live.as_ref()
-                .map(|(role, s, _)| (role.as_str(), s.as_str())),
-        );
-        let Some(kind) = tracker.observe(&node.name, drift) else {
-            continue;
-        };
-        let (live_role, live_state, _) = live.unwrap_or_default();
-        warn!(
-            node = %node.name,
-            kind = kind.label(),
-            recorded_role = %node.k0s_role.map(role_str).unwrap_or_default(),
-            live_role = %live_role,
-            live_state = %live_state,
-            "k0s membership drift"
-        );
-        cluster
-            .k8s_metrics()
-            .record_drift_detected(&cluster_name, kind.label());
+    for decision in decisions {
+        match decision {
+            Decision::Report(node, kind) => {
+                let live = statuses.get(&node).cloned().unwrap_or_default();
+                let recorded = nodes
+                    .iter()
+                    .find(|n| n.name == node)
+                    .and_then(|n| n.k0s_role);
+                warn!(
+                    node = %node,
+                    kind = kind.label(),
+                    recorded_role = %recorded.map(role_str).unwrap_or_default(),
+                    live_role = %live.role,
+                    live_state = %live.state,
+                    spurd_owned = live.spurd_owned,
+                    "k0s membership drift"
+                );
+                metrics.record_drift_detected(&cluster_name, kind.label());
+            }
+            Decision::Stop(node) => {
+                let fresh = cluster.get_node(&node);
+                let fresh_state = cluster.k0s_state();
+                let removing = cluster.k0s_removals_in_flight();
+                let record = StopRecord {
+                    node: fresh.as_ref(),
+                    state: &fresh_state,
+                    removing: &removing,
+                };
+                let send = |endpoint| send_stop(endpoint, node.clone(), false);
+                match stop_stray(raft, term, record, correction, Instant::now(), send).await {
+                    Ok(()) => info!(node = %node, "stopping stray k0s worker outside the cluster"),
+                    Err(reason) => {
+                        warn!(node = %node, reason = reason.label(), "stray k0s left running");
+                        metrics.record_drift_refused(&cluster_name, reason.label());
+                    }
+                }
+            }
+            Decision::Refuse(node, reason) => {
+                warn!(node = %node, reason = reason.label(), "stray k0s left running");
+                metrics.record_drift_refused(&cluster_name, reason.label());
+            }
+            Decision::Corrected(node) => {
+                info!(node = %node, "stray k0s stayed stopped");
+                metrics.record_drift_corrected(&cluster_name, Drift::OutOfScope.label());
+            }
+            Decision::Recurred(node) => {
+                warn!(node = %node, "stray k0s came back after it was stopped");
+                metrics.record_drift_recurred(&cluster_name);
+            }
+        }
     }
 }
 
@@ -929,9 +1431,13 @@ fn mesh_from_nodes(
 
 /// Resolve a node's agent endpoint (`http://addr:port`), or None if it has no address.
 fn agent_endpoint(cluster: &ClusterManager, node: &str) -> Option<String> {
-    let n = cluster.get_node(node)?;
-    let addr = n.address?;
-    Some(format!("http://{}:{}", addr, n.port))
+    node_endpoint(&cluster.get_node(node)?)
+}
+
+/// [`agent_endpoint`] for a node snapshot already in hand.
+fn node_endpoint(node: &spur_core::node::Node) -> Option<String> {
+    let addr = node.address.as_ref()?;
+    Some(format!("http://{}:{}", addr, node.port))
 }
 
 /// Dial a healthy control-plane agent, timing out per `AGENT_TIMEOUT`. Tries the bootstrap node
@@ -1014,24 +1520,30 @@ pub async fn fetch_user_kubeconfig(
     Ok(resp.into_inner().kubeconfig)
 }
 
-/// Query a node's live k0s `(role, component_state, enabled)` via its agent, with a timeout. Returns
-/// None if the node is unreachable or has no component yet.
-async fn fetch_component_status(
-    cluster: &ClusterManager,
-    node: &str,
-) -> Option<(String, String, bool)> {
+/// A node's live k0s component as its agent reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ComponentStatus {
+    role: String,
+    state: String,
+    enabled: bool,
+    /// The unit was written by spurd; agents that predate the field report false.
+    spurd_owned: bool,
+}
+
+/// Query a node's live k0s component via its agent, with a timeout. Returns None if the node is
+/// unreachable or has no component yet.
+async fn fetch_component_status(cluster: &ClusterManager, node: &str) -> Option<ComponentStatus> {
     query_component_status(agent_endpoint(cluster, node)?).await
 }
 
 /// `fetch_component_status` for every node at once, so a tick waits one `AGENT_TIMEOUT` however
 /// many agents are slow. Unreachable nodes are absent from the result.
 async fn fetch_component_statuses(
-    cluster: &ClusterManager,
     nodes: &[&spur_core::node::Node],
-) -> HashMap<String, (String, String, bool)> {
+) -> HashMap<String, ComponentStatus> {
     let mut set = tokio::task::JoinSet::new();
     for node in nodes {
-        let Some(endpoint) = agent_endpoint(cluster, &node.name) else {
+        let Some(endpoint) = node_endpoint(node) else {
             continue;
         };
         let name = node.name.clone();
@@ -1039,14 +1551,18 @@ async fn fetch_component_statuses(
     }
     let mut out = HashMap::new();
     while let Some(joined) = set.join_next().await {
-        if let Ok((name, Some(status))) = joined {
-            out.insert(name, status);
+        match joined {
+            Ok((name, Some(status))) => {
+                out.insert(name, status);
+            }
+            Ok((_, None)) => {}
+            Err(e) => warn!(error = %e, "k0s status probe task panicked"),
         }
     }
     out
 }
 
-async fn query_component_status(endpoint: String) -> Option<(String, String, bool)> {
+async fn query_component_status(endpoint: String) -> Option<ComponentStatus> {
     let fut = async {
         let mut client = crate::agent_client::connect(endpoint).await.ok()?;
         let resp = client
@@ -1054,7 +1570,12 @@ async fn query_component_status(endpoint: String) -> Option<(String, String, boo
             .await
             .ok()?;
         let r = resp.into_inner();
-        Some((r.role, r.component_state, r.enabled))
+        Some(ComponentStatus {
+            role: r.role,
+            state: r.component_state,
+            enabled: r.enabled,
+            spurd_owned: r.spurd_owned,
+        })
     };
     tokio::time::timeout(AGENT_TIMEOUT, fut)
         .await
@@ -1063,9 +1584,7 @@ async fn query_component_status(endpoint: String) -> Option<(String, String, boo
 }
 
 async fn fetch_component_state(cluster: &ClusterManager, node: &str) -> Option<String> {
-    fetch_component_status(cluster, node)
-        .await
-        .map(|(_, state, _)| state)
+    fetch_component_status(cluster, node).await.map(|s| s.state)
 }
 
 /// The address Calico/kubelet should use for `node`: its mesh IP when the mesh is configured
@@ -1123,23 +1642,30 @@ fn controller_k0s_config(
 
 /// One convergence pass: start any assigned component not yet active and, once the control-plane
 /// quorum is up, mark the cluster Ready (partial-Ready — workers keep converging in the background).
-/// `join_tokens` caches each worker's minted join token across ticks so we mint once per join.
+/// `starts` caches each worker's minted join token across ticks so we mint once per join, and
+/// reads start results back so a failing node is recorded and, in `ready`, spaced out.
 /// Returns the error count for this pass (currently join-token mint failures, surfaced via
 /// `spur_k8s_reconcile_errors_total`) plus the set of control-plane nodes observed `active` this
 /// pass, so the caller can decide the degrade/Ready edge without a second per-node status sweep.
 async fn converge_provisioning(
     cluster: &ClusterManager,
     net: &ClusterNetworking,
-    join_tokens: &mut HashMap<String, String>,
+    starts: &mut StartTracker,
 ) -> (u64, HashSet<String>) {
     let mut errors = 0u64;
+    let phase = cluster.k0s_state().phase;
+    let now = Instant::now();
+    starts.absorb_outcomes(cluster, phase, now);
     let assigned: Vec<_> = cluster
         .get_nodes()
         .into_iter()
         .filter(|n| n.k0s_role.is_some())
         .collect();
+    starts
+        .backoff
+        .retain(|name, _| assigned.iter().any(|n| &n.name == name));
     if assigned.is_empty() {
-        join_tokens.clear();
+        starts.join_tokens.clear();
         return (errors, HashSet::new());
     }
     let bootstrap = cluster.k0s_state().bootstrap();
@@ -1159,16 +1685,22 @@ async fn converge_provisioning(
         if !is_bootstrap {
             continue;
         }
-        if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
+        let component = fetch_component_state(cluster, &node.name).await;
+        if component.as_deref() == Some("active") {
             bootstrap_active = true;
             active_cp.insert(node.name.clone());
+            starts.on_active(&node.name);
             clear_node_error(cluster, node);
             continue;
         }
+        if !starts.may_start(node, phase, now) {
+            continue;
+        }
+        starts.note_failed_unit(cluster, node, component.as_deref(), phase, now);
         // The bootstrap seeds etcd — no join token. Its k0s config pins the CIDRs and CNI mode for
         // the whole cluster.
         let k0s_config = Some(controller_k0s_config(net, node, cp_count));
-        spawn_start_component(cluster, &node.name, role, None, k0s_config, None);
+        spawn_start_component(cluster, starts, &node.name, role, None, k0s_config, None);
     }
     // Don't mint join tokens for secondary CPs / workers until the bootstrap's etcd is seeded and its
     // API answers: a controller token minted before then would race the quorum. But if a quorum of
@@ -1186,12 +1718,17 @@ async fn converge_provisioning(
         if is_bootstrap {
             continue; // handled above
         }
-        if fetch_component_state(cluster, &node.name).await.as_deref() == Some("active") {
-            join_tokens.remove(&node.name); // joined — drop the cached token
+        let component = fetch_component_state(cluster, &node.name).await;
+        if component.as_deref() == Some("active") {
+            starts.join_tokens.remove(&node.name); // joined — drop the cached token
             if role == K0sRole::Controller {
                 active_cp.insert(node.name.clone());
             }
+            starts.on_active(&node.name);
             clear_node_error(cluster, node);
+            continue;
+        }
+        if !starts.may_start(node, phase, now) {
             continue;
         }
         let token_role = if role == K0sRole::Controller {
@@ -1214,11 +1751,11 @@ async fn converge_provisioning(
         };
         // Mint the join token once and cache it: re-minting every tick churns k0s server tokens and
         // races the join. Reuse the cached token on later ticks until the node joins.
-        let token = match join_tokens.get(&node.name) {
+        let token = match starts.join_tokens.get(&node.name) {
             Some(cached) => cached.clone(),
             None => match mint_join_token(cluster, token_role).await {
                 Ok(token) => {
-                    join_tokens.insert(node.name.clone(), token.clone());
+                    starts.join_tokens.insert(node.name.clone(), token.clone());
                     token
                 }
                 Err(e) => {
@@ -1228,7 +1765,16 @@ async fn converge_provisioning(
                 }
             },
         };
-        spawn_start_component(cluster, &node.name, role, Some(token), k0s_config, node_ip);
+        starts.note_failed_unit(cluster, node, component.as_deref(), phase, now);
+        spawn_start_component(
+            cluster,
+            starts,
+            &node.name,
+            role,
+            Some(token),
+            k0s_config,
+            node_ip,
+        );
     }
     maybe_mark_ready(cluster, &active_cp);
     (errors, active_cp)
@@ -1439,23 +1985,48 @@ async fn stop_component_now(
     node: &str,
     reset: bool,
 ) -> anyhow::Result<()> {
+    request_stop(cluster, node, reset)
+        .await
+        .map_err(|e| match e {
+            StopError::TimedOut => anyhow::anyhow!("stop_cluster_component {node} timed out"),
+            StopError::Failed(detail) => anyhow::anyhow!(detail),
+        })
+}
+
+#[derive(Debug)]
+enum StopError {
+    /// No answer within `AGENT_TIMEOUT`; the agent may still be stopping.
+    TimedOut,
+    Failed(String),
+}
+
+async fn request_stop(cluster: &ClusterManager, node: &str, reset: bool) -> Result<(), StopError> {
     let endpoint = agent_endpoint(cluster, node)
-        .ok_or_else(|| anyhow::anyhow!("{node} has no agent address"))?;
+        .ok_or_else(|| StopError::Failed(format!("{node} has no agent address")))?;
+    send_stop(endpoint, node.to_string(), reset).await
+}
+
+/// One bounded StopClusterComponent, keeping a timeout distinct from a failure.
+async fn send_stop(endpoint: String, node: String, reset: bool) -> Result<(), StopError> {
     let fut = async {
         let mut client = crate::agent_client::connect(endpoint)
             .await
-            .map_err(|e| anyhow::anyhow!("connect to agent {node} failed: {e}"))?;
+            .map_err(|e| format!("connect to agent {node} failed: {e}"))?;
         client
             .stop_cluster_component(StopClusterComponentRequest { reset })
             .await
-            .map_err(|e| anyhow::anyhow!("stop_cluster_component {node} failed: {e}"))
+            .map_err(|e| format!("stop_cluster_component {node} failed: {e}"))
     };
     let r = tokio::time::timeout(AGENT_TIMEOUT, fut)
         .await
-        .map_err(|_| anyhow::anyhow!("stop_cluster_component {node} timed out"))??
+        .map_err(|_| StopError::TimedOut)?
+        .map_err(StopError::Failed)?
         .into_inner();
     if !r.stopped {
-        anyhow::bail!("stop/reset of {node} did not complete: {}", r.message);
+        return Err(StopError::Failed(format!(
+            "stop/reset of {node} did not complete: {}",
+            r.message
+        )));
     }
     Ok(())
 }
@@ -1524,9 +2095,201 @@ async fn stop_all_components(cluster: &ClusterManager, reset: bool) {
     }
 }
 
-/// Fire-and-forget StartClusterComponent to a node's agent (off the reconcile thread).
-fn spawn_start_component(
+/// Bound on a spawned start. Dropping the call cancels the agent's handler, and a start may
+/// download k0s first, so this must outlast that download; anything slower has failed anyway.
+const START_TIMEOUT: Duration =
+    Duration::from_secs(spur_update::k0s::DOWNLOAD_TIMEOUT.as_secs() + 300);
+/// In `ready`, a node whose start failed waits two ticks before the next, doubling to ten minutes.
+const START_BACKOFF_FIRST: Duration = Duration::from_secs(60);
+const START_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
+#[derive(Debug)]
+pub(crate) enum StartOutcome {
+    Started,
+    Failed(String),
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StartBackoff {
+    until: Instant,
+    step: Duration,
+    last_state: spur_core::node::NodeState,
+}
+
+/// Leader-local bookkeeping for k0s starts, so a node that keeps failing is recorded and spaced
+/// out instead of silently re-sent every tick.
+#[derive(Debug, Default)]
+pub(crate) struct StartTracker {
+    /// Join token minted per node (worker or secondary control-plane), so we mint once (not every
+    /// tick) while it joins — re-minting churns k0s server tokens and races the join.
+    pub(crate) join_tokens: HashMap<String, String>,
+    in_flight: HashMap<String, Instant>,
+    outcomes: Arc<parking_lot::Mutex<Vec<(String, StartOutcome)>>>,
+    backoff: HashMap<String, StartBackoff>,
+}
+
+impl StartTracker {
+    /// Fold in the results of starts spawned on earlier ticks. Results that land while the
+    /// cluster is `degraded` wait for the next `up`, since converge does not run there.
+    pub(crate) fn absorb_outcomes(
+        &mut self,
+        cluster: &ClusterManager,
+        phase: K0sPhase,
+        now: Instant,
+    ) {
+        let outcomes = std::mem::take(&mut *self.outcomes.lock());
+        for (node, outcome) in outcomes {
+            self.in_flight.remove(&node);
+            let reason = match outcome {
+                StartOutcome::Started => continue,
+                StartOutcome::Failed(detail) => format!("start failed: {detail}"),
+                StartOutcome::TimedOut => "start timed out".to_string(),
+            };
+            self.record_failure(cluster, &node, &reason, phase, now);
+        }
+    }
+
+    /// A unit systemd gave up on is a failed start even though the agent answered `started`.
+    /// Called only as a start is sent, so each retry widens the backoff instead of re-arming an
+    /// expired one before it is read. It writes no reason: `spur k8s status` already shows the
+    /// live `failed` state, and a unit that flaps would rewrite the record each tick.
+    pub(crate) fn note_failed_unit(
+        &mut self,
+        cluster: &ClusterManager,
+        node: &spur_core::node::Node,
+        component: Option<&str>,
+        phase: K0sPhase,
+        now: Instant,
+    ) {
+        if component == Some("failed") && phase == K0sPhase::Ready {
+            self.arm_backoff(cluster, &node.name, now);
+        }
+    }
+
+    fn record_failure(
+        &mut self,
+        cluster: &ClusterManager,
+        node: &str,
+        reason: &str,
+        phase: K0sPhase,
+        now: Instant,
+    ) {
+        self.join_tokens.remove(node);
+        if set_reason_if_changed(cluster, node, reason) {
+            cluster
+                .k8s_metrics()
+                .record_start_failure(&cluster.config().cluster_name);
+        }
+        // Provisioning keeps retrying every tick; its timeout already bounds the attempts.
+        if phase == K0sPhase::Ready {
+            self.arm_backoff(cluster, node, now);
+        }
+    }
+
+    fn arm_backoff(&mut self, cluster: &ClusterManager, node: &str, now: Instant) {
+        let step = match self.backoff.get(node) {
+            Some(b) if now < b.until => return,
+            Some(b) => (b.step * 2).min(START_BACKOFF_MAX),
+            None => START_BACKOFF_FIRST,
+        };
+        let last_state = cluster
+            .get_node(node)
+            .map_or(spur_core::node::NodeState::Unknown, |n| n.state);
+        self.backoff.insert(
+            node.to_string(),
+            StartBackoff {
+                until: now + step,
+                step,
+                last_state,
+            },
+        );
+    }
+
+    fn on_active(&mut self, node: &str) {
+        self.backoff.remove(node);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_outcome(&self, node: &str, outcome: StartOutcome) {
+        self.outcomes.lock().push((node.to_string(), outcome));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_backoff(&self, node: &str) -> bool {
+        self.backoff.contains_key(node)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_flight(&self, node: &str) -> bool {
+        self.in_flight.contains_key(node)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_outcome(&self) -> bool {
+        !self.outcomes.lock().is_empty()
+    }
+
+    /// A node coming back from `down`/`unknown` drops its backoff, since whatever failed may
+    /// have been fixed while it was away.
+    pub(crate) fn may_start(
+        &mut self,
+        node: &spur_core::node::Node,
+        phase: K0sPhase,
+        now: Instant,
+    ) -> bool {
+        use spur_core::node::NodeState;
+        if let Some(since) = self.in_flight.get(&node.name) {
+            // The task reports by START_TIMEOUT; the extra tick only covers a lost report.
+            if now.saturating_duration_since(*since) < START_TIMEOUT + RECONCILE_INTERVAL {
+                return false;
+            }
+            self.in_flight.remove(&node.name);
+        }
+        if phase != K0sPhase::Ready {
+            return true;
+        }
+        let Some(backoff) = self.backoff.get_mut(&node.name) else {
+            return true;
+        };
+        let away = |s: NodeState| matches!(s, NodeState::Down | NodeState::Unknown);
+        let came_back = away(backoff.last_state) && !away(node.state);
+        backoff.last_state = node.state;
+        if came_back {
+            self.backoff.remove(&node.name);
+            return true;
+        }
+        now >= backoff.until
+    }
+}
+
+/// Writes only on a change, so a node that keeps failing the same way costs one Raft write
+/// rather than one per tick.
+pub(crate) fn set_reason_if_changed(cluster: &ClusterManager, node: &str, reason: &str) -> bool {
+    let current = cluster.get_node(node).and_then(|n| n.k0s_last_error);
+    if current.as_deref() == Some(reason) {
+        return false;
+    }
+    record_node_k0s_error(cluster, node, reason);
+    true
+}
+
+/// `None` is a start that did not answer within `START_TIMEOUT`.
+fn start_outcome(
+    reply: Option<Result<spur_proto::proto::StartClusterComponentResponse, String>>,
+) -> StartOutcome {
+    match reply {
+        None => StartOutcome::TimedOut,
+        Some(Err(detail)) => StartOutcome::Failed(detail),
+        Some(Ok(r)) if r.started => StartOutcome::Started,
+        Some(Ok(r)) => StartOutcome::Failed(r.message),
+    }
+}
+
+/// Runs off the reconcile thread; the outcome is folded in on a later tick.
+pub(crate) fn spawn_start_component(
     cluster: &ClusterManager,
+    starts: &mut StartTracker,
     node: &str,
     role: K0sRole,
     join_token: Option<String>,
@@ -1537,23 +2300,36 @@ fn spawn_start_component(
         warn!(node = %node, "no agent address; cannot start k0s component");
         return;
     };
+    starts.in_flight.insert(node.to_string(), Instant::now());
+    let outcomes = starts.outcomes.clone();
     let node = node.to_string();
     let role = role_str(role);
     tokio::spawn(async move {
-        match crate::agent_client::connect(endpoint).await {
-            Ok(mut client) => {
-                let req = StartClusterComponentRequest {
-                    role,
-                    join_token,
-                    k0s_config,
-                    node_ip,
-                };
-                if let Err(e) = client.start_cluster_component(req).await {
-                    warn!(node = %node, error = %e, "start_cluster_component failed");
-                }
-            }
-            Err(e) => warn!(node = %node, error = %e, "connect to agent failed"),
+        let fut = async {
+            let mut client = crate::agent_client::connect(endpoint)
+                .await
+                .map_err(|e| format!("connect to agent failed: {e}"))?;
+            let req = StartClusterComponentRequest {
+                role,
+                join_token,
+                k0s_config,
+                node_ip,
+            };
+            client
+                .start_cluster_component(req)
+                .await
+                .map_err(|e| format!("start_cluster_component failed: {}", e.message()))
+        };
+        let outcome = start_outcome(
+            tokio::time::timeout(START_TIMEOUT, fut)
+                .await
+                .ok()
+                .map(|r| r.map(tonic::Response::into_inner)),
+        );
+        if let StartOutcome::Failed(detail) = &outcome {
+            warn!(node = %node, detail = %detail, "k0s component start failed");
         }
+        outcomes.lock().push((node, outcome));
     });
 }
 
@@ -1646,14 +2422,17 @@ pub async fn live_node_statuses(cluster: &ClusterManager) -> Vec<ClusterNodeStat
     for n in cluster.get_nodes() {
         let Some(role) = n.k0s_role else { continue };
         // Report the agent's real (state, enabled) — not a hard-coded enabled=true.
-        let (_, component_state, enabled) = fetch_component_status(cluster, &n.name)
+        let live = fetch_component_status(cluster, &n.name)
             .await
-            .unwrap_or_else(|| (String::new(), "unknown".to_string(), false));
+            .unwrap_or_else(|| ComponentStatus {
+                state: "unknown".to_string(),
+                ..Default::default()
+            });
         out.push(ClusterNodeStatus {
             node: n.name,
             role: role_str(role),
-            component_state,
-            enabled,
+            component_state: live.state,
+            enabled: live.enabled,
             reason: n.k0s_last_error.unwrap_or_default(),
         });
     }
@@ -2480,7 +3259,7 @@ mod tests {
             let nodes = workers(&names.iter().map(String::as_str).collect::<Vec<_>>());
             let mut t = DriftTracker::default();
             let mut visits: HashMap<String, usize> = HashMap::new();
-            let ticks = len.min(DRIFT_SWEEP_TICKS);
+            let ticks = len.div_ceil(len.div_ceil(DRIFT_SWEEP_TICKS).min(MAX_DRIFT_PROBES));
             for _ in 0..ticks {
                 for name in slice_names(&mut t, &nodes) {
                     *visits.entry(name).or_default() += 1;
@@ -2499,14 +3278,32 @@ mod tests {
     }
 
     #[test]
-    fn the_slice_grows_with_the_fleet() {
-        let four: Vec<String> = (0..4).map(|i| format!("n{i}")).collect();
-        let many: Vec<String> = (0..400).map(|i| format!("n{i:03}")).collect();
+    fn the_slice_grows_with_the_fleet_up_to_the_cap() {
+        let names = |len: usize| -> Vec<String> { (0..len).map(|i| format!("n{i:04}")).collect() };
+        let as_nodes = |v: &[String]| workers(&v.iter().map(String::as_str).collect::<Vec<_>>());
         let mut t = DriftTracker::default();
-        let as_strs = |v: &[String]| workers(&v.iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!(slice_names(&mut t, &as_strs(&four)).len(), 1);
-        assert_eq!(slice_names(&mut t, &as_strs(&many)).len(), 20);
+        assert_eq!(slice_names(&mut t, &as_nodes(&names(4))).len(), 1);
+        assert_eq!(slice_names(&mut t, &as_nodes(&names(200))).len(), 10);
+        assert_eq!(
+            slice_names(&mut t, &as_nodes(&names(1000))).len(),
+            MAX_DRIFT_PROBES
+        );
         assert!(slice_names(&mut t, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_phase_blip_resets_readings_but_not_the_sweep_cursor() {
+        let nodes = workers(&["a", "b", "c"]);
+        let mut t = DriftTracker::default();
+        assert_eq!(slice_names(&mut t, &nodes), ["a"]);
+        t.observe("a", Drift::RoleMismatch);
+        let paused = K0sClusterState {
+            phase: K0sPhase::Provisioning,
+            ..Default::default()
+        };
+        assert!(t.next_probe(&paused, &nodes, &HashSet::new()).is_empty());
+        assert!(t.seen.is_empty());
+        assert_eq!(slice_names(&mut t, &nodes), ["b"]);
     }
 
     #[test]
@@ -2627,6 +3424,8 @@ mod tests {
             ("drain", NodeState::Drain),
             ("draining", NodeState::Draining),
             ("unknown", NodeState::Unknown),
+            ("error", NodeState::Error),
+            ("suspended", NodeState::Suspended),
             ("busy", NodeState::Allocated),
         ] {
             let mut n = drift_node(name, Some(K0sRole::Worker));
@@ -2637,5 +3436,665 @@ mod tests {
             candidate_names(&nodes, &K0sClusterState::default()),
             ["busy"]
         );
+    }
+
+    fn live(role: &str, state: &str, spurd_owned: bool) -> ComponentStatus {
+        ComponentStatus {
+            role: role.to_string(),
+            state: state.to_string(),
+            enabled: state == "active",
+            spurd_owned,
+        }
+    }
+
+    /// A ready cluster scoped to `members`, each recorded as a worker, plus `outside` nodes with
+    /// no role.
+    fn scoped(members: &[&str], outside: &[&str]) -> (K0sClusterState, Vec<spur_core::node::Node>) {
+        let state = K0sClusterState {
+            phase: K0sPhase::Ready,
+            member_nodes: members.iter().map(|m| m.to_string()).collect(),
+            ..Default::default()
+        };
+        let mut nodes = workers(members);
+        nodes.extend(outside.iter().map(|n| drift_node(n, None)));
+        (state, nodes)
+    }
+
+    fn statuses(entries: &[(&str, ComponentStatus)]) -> HashMap<String, ComponentStatus> {
+        entries
+            .iter()
+            .map(|(n, s)| (n.to_string(), s.clone()))
+            .collect()
+    }
+
+    /// Run `decide` over every candidate at once, as one full sweep would.
+    fn sweep(
+        t: &mut DriftTracker,
+        c: &mut Correction,
+        state: &K0sClusterState,
+        nodes: &[spur_core::node::Node],
+        live: &HashMap<String, ComponentStatus>,
+        enabled: bool,
+        now: Instant,
+    ) -> Vec<Decision> {
+        let none = HashSet::new();
+        let _ = t.next_probe(state, nodes, &none);
+        let candidates = drift_candidates(nodes, state, &none);
+        decide(state, &candidates, live, t, c, enabled, now)
+    }
+
+    #[test]
+    fn a_node_admitted_back_is_not_mistaken_for_a_returning_stray() {
+        let (state, nodes, _) = stray_cluster();
+        let mut c = Correction::default();
+        c.corrected.insert("stray".into());
+        c.pending.insert("other".into(), 1);
+        let mut admitted = state.clone();
+        admitted.member_nodes.push("stray".into());
+        let live = statuses(&[
+            ("m1", live("worker", "active", true)),
+            ("stray", live("worker", "active", true)),
+        ]);
+        let mut t = DriftTracker::default();
+        let decisions = sweep(
+            &mut t,
+            &mut c,
+            &admitted,
+            &nodes,
+            &live,
+            true,
+            Instant::now(),
+        );
+        assert!(decisions.is_empty(), "{decisions:?}");
+        assert!(!c.corrected.contains("stray"));
+        assert!(
+            c.pending.contains_key("other"),
+            "a non-member's pending stop is kept"
+        );
+    }
+
+    fn stray_cluster() -> (
+        K0sClusterState,
+        Vec<spur_core::node::Node>,
+        HashMap<String, ComponentStatus>,
+    ) {
+        let (state, nodes) = scoped(&["m1"], &["stray"]);
+        let live = statuses(&[
+            ("m1", live("worker", "active", true)),
+            ("stray", live("worker", "active", true)),
+        ]);
+        (state, nodes, live)
+    }
+
+    #[test]
+    fn a_single_sighting_neither_reports_nor_stops() {
+        let (state, nodes, live) = stray_cluster();
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        assert!(sweep(&mut t, &mut c, &state, &nodes, &live, true, now).is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_spurd_stray_is_reported_and_stopped() {
+        let (state, nodes, live) = stray_cluster();
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        assert_eq!(
+            sweep(&mut t, &mut c, &state, &nodes, &live, true, now),
+            [
+                Decision::Report("stray".into(), Drift::OutOfScope),
+                Decision::Stop("stray".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_stop_is_reconsidered_on_later_visits() {
+        let (state, nodes, live) = stray_cluster();
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        c.recent.extend(std::iter::repeat_n(now, STOP_BUDGET));
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        assert_eq!(
+            sweep(&mut t, &mut c, &state, &nodes, &live, true, now),
+            [
+                Decision::Report("stray".into(), Drift::OutOfScope),
+                Decision::Refuse("stray".into(), Refusal::Budget)
+            ]
+        );
+        let later = now + STOP_BUDGET_WINDOW;
+        assert_eq!(
+            sweep(&mut t, &mut c, &state, &nodes, &live, true, later),
+            [Decision::Stop("stray".into())]
+        );
+    }
+
+    #[test]
+    fn strays_that_are_not_ours_to_stop_are_refused_once_per_episode() {
+        for (status, enabled, reason) in [
+            (
+                live("controller", "active", true),
+                true,
+                Refusal::ControlPlane,
+            ),
+            (
+                live("worker", "active", false),
+                true,
+                Refusal::NotSpurdOwned,
+            ),
+            (live("worker", "active", true), false, Refusal::Disabled),
+            (live("controller", "active", true), false, Refusal::Disabled),
+        ] {
+            let (state, nodes) = scoped(&["m1"], &["stray"]);
+            let live = statuses(&[("m1", live("worker", "active", true)), ("stray", status)]);
+            let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+            let now = Instant::now();
+            sweep(&mut t, &mut c, &state, &nodes, &live, enabled, now);
+            assert_eq!(
+                sweep(&mut t, &mut c, &state, &nodes, &live, enabled, now),
+                [
+                    Decision::Report("stray".into(), Drift::OutOfScope),
+                    Decision::Refuse("stray".into(), reason)
+                ],
+                "{reason:?}"
+            );
+            assert!(
+                sweep(&mut t, &mut c, &state, &nodes, &live, enabled, now).is_empty(),
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_member_with_a_recorded_role_is_reported_but_never_stopped() {
+        let (state, mut nodes, live) = stray_cluster();
+        nodes[1].k0s_role = Some(K0sRole::Worker);
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        assert_eq!(
+            sweep(&mut t, &mut c, &state, &nodes, &live, true, now),
+            [Decision::Report("stray".into(), Drift::OutOfScope)]
+        );
+    }
+
+    fn all_workers_active(names: &[&str]) -> HashMap<String, ComponentStatus> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), live("worker", "active", true)))
+            .collect()
+    }
+
+    #[test]
+    fn mass_drift_trips_the_breaker() {
+        let strays = ["s1", "s2", "s3", "s4"];
+        let (state, nodes) = scoped(&["m1"], &strays);
+        let live = all_workers_active(&["m1", "s1", "s2", "s3", "s4"]);
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        let refusals: Vec<_> = sweep(&mut t, &mut c, &state, &nodes, &live, true, now)
+            .into_iter()
+            .filter(|d| matches!(d, Decision::Refuse(_, Refusal::CircuitBreaker)))
+            .collect();
+        assert_eq!(refusals.len(), strays.len());
+    }
+
+    #[test]
+    fn strays_left_by_a_small_cluster_are_stopped_one_per_tick() {
+        let (state, nodes) = scoped(&["a", "b"], &["c", "d"]);
+        let live = all_workers_active(&["a", "b", "c", "d"]);
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        let decisions = sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        assert!(
+            decisions.contains(&Decision::Stop("c".into())),
+            "{decisions:?}"
+        );
+        assert!(decisions.contains(&Decision::Refuse("d".into(), Refusal::Throttled)));
+    }
+
+    #[test]
+    fn an_unreachable_stray_leaves_the_breaker_count() {
+        let (state, nodes, live) = stray_cluster();
+        let mut t = DriftTracker::default();
+        let mut c = Correction::default();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, Instant::now());
+        assert!(t.stoppable.contains("stray"));
+        let unreachable = statuses(&[("m1", live["m1"].clone())]);
+        sweep(
+            &mut t,
+            &mut c,
+            &state,
+            &nodes,
+            &unreachable,
+            true,
+            Instant::now(),
+        );
+        assert!(!t.stoppable.contains("stray"));
+    }
+
+    #[test]
+    fn a_stop_that_did_not_take_is_refused_once_per_visit() {
+        let (state, nodes, live) = stray_cluster();
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        c.record_stop("stray", now);
+        c.pending.insert("stray".into(), 0);
+        assert_eq!(
+            sweep(&mut t, &mut c, &state, &nodes, &live, true, now),
+            [Decision::Refuse("stray".into(), Refusal::StopUnconfirmed)]
+        );
+    }
+
+    #[test]
+    fn every_reported_label_has_a_pre_created_series() {
+        for reason in Refusal::ALL {
+            assert!(
+                spur_metrics::k8s::DRIFT_REFUSAL_REASONS.contains(&reason.label()),
+                "{reason:?}"
+            );
+        }
+        for kind in [Drift::OutOfScope, Drift::RoleMismatch, Drift::NotRunning] {
+            assert!(
+                spur_metrics::k8s::DRIFT_KINDS.contains(&kind.label()),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_term_starts_drift_handling_over() {
+        let mut t = DriftTracker::default();
+        let mut c = Correction::default();
+        reset_on_new_term(4, &mut t, &mut c);
+        t.observe("n", Drift::OutOfScope);
+        c.pending.insert("n".into(), 0);
+        reset_on_new_term(4, &mut t, &mut c);
+        assert!(t.seen.contains_key("n") && c.pending.contains_key("n"));
+        reset_on_new_term(5, &mut t, &mut c);
+        assert!(t.seen.is_empty() && c.pending.is_empty());
+        assert_eq!(c.term, Some(5));
+    }
+
+    #[test]
+    fn a_stray_controller_does_not_hold_the_breaker_shut() {
+        let (state, nodes) = scoped(&["m1"], &["ctl", "stray"]);
+        let live = statuses(&[
+            ("m1", live("worker", "active", true)),
+            ("ctl", live("controller", "active", true)),
+            ("stray", live("worker", "active", true)),
+        ]);
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        let decisions = sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        assert!(decisions.contains(&Decision::Stop("stray".into())));
+    }
+
+    #[test]
+    fn at_most_one_stray_is_stopped_per_tick() {
+        let members: Vec<String> = (0..8).map(|i| format!("m{i}")).collect();
+        let members: Vec<&str> = members.iter().map(String::as_str).collect();
+        let (state, nodes) = scoped(&members, &["s1", "s2"]);
+        let mut entries: Vec<(&str, ComponentStatus)> = members
+            .iter()
+            .map(|m| (*m, live("worker", "active", true)))
+            .collect();
+        entries.push(("s1", live("worker", "active", true)));
+        entries.push(("s2", live("worker", "active", true)));
+        let live = statuses(&entries);
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        let decisions = sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        assert!(decisions.contains(&Decision::Stop("s1".into())));
+        assert!(decisions.contains(&Decision::Refuse("s2".into(), Refusal::Throttled)));
+    }
+
+    #[test]
+    fn a_node_waits_out_its_backoff_before_another_stop() {
+        let (state, nodes, live) = stray_cluster();
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        c.record_stop("stray", now);
+        sweep(&mut t, &mut c, &state, &nodes, &live, true, now);
+        assert!(sweep(&mut t, &mut c, &state, &nodes, &live, true, now)
+            .contains(&Decision::Refuse("stray".into(), Refusal::Backoff)));
+        assert!(sweep(
+            &mut t,
+            &mut c,
+            &state,
+            &nodes,
+            &live,
+            true,
+            now + STOP_BACKOFF_FIRST
+        )
+        .contains(&Decision::Stop("stray".into())));
+    }
+
+    #[test]
+    fn stop_backoff_doubles_to_its_ceiling_and_resets_after_a_quiet_spell() {
+        let mut c = Correction::default();
+        let t0 = Instant::now();
+        c.record_stop("n", t0);
+        assert_eq!(c.backoff["n"].step, STOP_BACKOFF_FIRST);
+        c.record_stop("n", t0);
+        assert_eq!(c.backoff["n"].step, STOP_BACKOFF_FIRST * 2);
+        for _ in 0..10 {
+            c.record_stop("n", t0);
+        }
+        assert_eq!(c.backoff["n"].step, STOP_BACKOFF_MAX);
+        c.record_stop("n", t0 + STOP_BACKOFF_MAX * 2);
+        assert_eq!(c.backoff["n"].step, STOP_BACKOFF_FIRST);
+    }
+
+    #[test]
+    fn a_stop_counts_only_once_the_node_stays_stopped() {
+        let mut c = Correction::default();
+        let inactive = live("", "inactive", false);
+        c.pending.insert("n".into(), 0);
+        assert_eq!(c.settle("n", Some(&inactive)), None);
+        assert_eq!(c.settle("n", None), None);
+        assert_eq!(
+            c.settle("n", Some(&inactive)),
+            Some(Decision::Corrected("n".into()))
+        );
+        assert_eq!(
+            c.settle("n", Some(&live("worker", "active", true))),
+            Some(Decision::Recurred("n".into()))
+        );
+    }
+
+    #[test]
+    fn a_stop_that_did_not_take_or_came_back_is_flagged() {
+        let active = live("worker", "active", true);
+        let mut c = Correction::default();
+        c.pending.insert("n".into(), 0);
+        assert_eq!(
+            c.settle("n", Some(&active)),
+            Some(Decision::Refuse("n".into(), Refusal::StopUnconfirmed))
+        );
+
+        c.pending.insert("n".into(), 0);
+        c.settle("n", Some(&live("", "inactive", false)));
+        assert_eq!(
+            c.settle("n", Some(&active)),
+            Some(Decision::Recurred("n".into()))
+        );
+    }
+
+    #[test]
+    fn a_stop_waits_for_the_record_to_still_call_for_it() {
+        let (state, nodes) = scoped(&["m1"], &["stray"]);
+        let stray = &nodes[1];
+        let none = HashSet::new();
+        assert!(stop_still_warranted(Some(stray), &state, &none));
+        assert!(!stop_still_warranted(None, &state, &none));
+
+        let mut roled = stray.clone();
+        roled.k0s_role = Some(K0sRole::Worker);
+        assert!(!stop_still_warranted(Some(&roled), &state, &none));
+
+        let mut added = state.clone();
+        added.member_nodes.push("stray".into());
+        assert!(!stop_still_warranted(Some(stray), &added, &none));
+
+        let mut resetting = state.clone();
+        resetting.reset_requested = true;
+        assert!(!stop_still_warranted(Some(stray), &resetting, &none));
+
+        let mut down = state.clone();
+        down.phase = K0sPhase::Down;
+        assert!(!stop_still_warranted(Some(stray), &down, &none));
+
+        let mut drained = stray.clone();
+        drained.state = spur_core::node::NodeState::Drain;
+        assert!(!stop_still_warranted(Some(&drained), &state, &none));
+
+        let removing = HashSet::from(["stray".to_string()]);
+        assert!(!stop_still_warranted(Some(stray), &state, &removing));
+    }
+
+    #[test]
+    fn a_degraded_member_that_died_after_degrading_is_not_running() {
+        let degraded = K0sClusterState {
+            phase: K0sPhase::Degraded,
+            ..Default::default()
+        };
+        let node = drift_node("w1", Some(K0sRole::Worker));
+        let inactive = live("", "inactive", false);
+        assert_eq!(
+            classify(&node, &degraded, Some(&inactive)),
+            Drift::NotRunning
+        );
+        assert_eq!(
+            classify(&node, &degraded, Some(&live("worker", "active", true))),
+            Drift::None
+        );
+        assert_eq!(classify(&node, &degraded, None), Drift::Unknown);
+
+        let mut stopped_by_degrade = node.clone();
+        stopped_by_degrade.k0s_last_error = Some("not active after 600s".into());
+        assert_eq!(
+            classify(&stopped_by_degrade, &degraded, Some(&inactive)),
+            Drift::None
+        );
+        assert_eq!(classify(&node, &ready(), Some(&inactive)), Drift::None);
+        assert_eq!(
+            classify(&node, &degraded, Some(&live("worker", "unknown", false))),
+            Drift::Unknown,
+            "an agent that could not read systemd is not a dead node"
+        );
+    }
+
+    #[test]
+    fn a_not_running_episode_ends_when_the_node_runs_again() {
+        let degraded = K0sClusterState {
+            phase: K0sPhase::Degraded,
+            ..Default::default()
+        };
+        let nodes = workers(&["w1"]);
+        let down = statuses(&[("w1", live("", "inactive", false))]);
+        let up = statuses(&[("w1", live("worker", "active", true))]);
+        let (mut t, mut c) = (DriftTracker::default(), Correction::default());
+        let now = Instant::now();
+        sweep(&mut t, &mut c, &degraded, &nodes, &down, true, now);
+        assert_eq!(
+            sweep(&mut t, &mut c, &degraded, &nodes, &down, true, now),
+            [Decision::Report("w1".into(), Drift::NotRunning)]
+        );
+        sweep(&mut t, &mut c, &degraded, &nodes, &up, true, now);
+        sweep(&mut t, &mut c, &degraded, &nodes, &down, true, now);
+        assert_eq!(
+            sweep(&mut t, &mut c, &degraded, &nodes, &down, true, now),
+            [Decision::Report("w1".into(), Drift::NotRunning)]
+        );
+    }
+
+    fn backed_off(until: Instant, last_state: spur_core::node::NodeState) -> StartTracker {
+        let mut s = StartTracker::default();
+        s.backoff.insert(
+            "w1".into(),
+            StartBackoff {
+                until,
+                step: START_BACKOFF_FIRST,
+                last_state,
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn a_start_still_running_is_not_resent() {
+        let node = drift_node("w1", Some(K0sRole::Worker));
+        let now = Instant::now();
+        let mut s = StartTracker::default();
+        s.in_flight.insert("w1".into(), now);
+        assert!(!s.may_start(&node, K0sPhase::Provisioning, now + START_TIMEOUT));
+        assert!(s.may_start(
+            &node,
+            K0sPhase::Provisioning,
+            now + START_TIMEOUT + RECONCILE_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn a_failing_start_is_spaced_out_only_while_ready() {
+        use spur_core::node::NodeState;
+        let node = drift_node("w1", Some(K0sRole::Worker));
+        let now = Instant::now();
+        let until = now + START_BACKOFF_FIRST;
+        assert!(!backed_off(until, NodeState::Idle).may_start(&node, K0sPhase::Ready, now));
+        assert!(backed_off(until, NodeState::Idle).may_start(&node, K0sPhase::Ready, until));
+        assert!(backed_off(until, NodeState::Idle).may_start(&node, K0sPhase::Provisioning, now));
+    }
+
+    #[test]
+    fn a_node_back_from_down_drops_its_start_backoff() {
+        use spur_core::node::NodeState;
+        let mut node = drift_node("w1", Some(K0sRole::Worker));
+        let now = Instant::now();
+        let mut s = backed_off(now + START_BACKOFF_MAX, NodeState::Idle);
+        node.state = NodeState::Down;
+        assert!(!s.may_start(&node, K0sPhase::Ready, now));
+        node.state = NodeState::Idle;
+        assert!(s.may_start(&node, K0sPhase::Ready, now));
+        assert!(!s.backoff.contains_key("w1"));
+    }
+
+    #[test]
+    fn a_start_reply_is_classified_by_what_the_agent_said() {
+        use spur_proto::proto::StartClusterComponentResponse as Reply;
+        let reply = |started: bool, message: &str| Reply {
+            started,
+            message: message.into(),
+            ..Default::default()
+        };
+        assert!(matches!(start_outcome(None), StartOutcome::TimedOut));
+        assert!(matches!(
+            start_outcome(Some(Err("connect failed".into()))),
+            StartOutcome::Failed(d) if d == "connect failed"
+        ));
+        assert!(matches!(
+            start_outcome(Some(Ok(reply(false, "k0s missing")))),
+            StartOutcome::Failed(d) if d == "k0s missing"
+        ));
+        assert!(matches!(
+            start_outcome(Some(Ok(reply(true, "")))),
+            StartOutcome::Started
+        ));
+    }
+
+    struct FakeLeader {
+        leader: bool,
+        term: u64,
+    }
+
+    impl Leadership for FakeLeader {
+        async fn confirm(&self) -> bool {
+            self.leader
+        }
+
+        fn term(&self) -> u64 {
+            self.term
+        }
+    }
+
+    /// Runs `stop_stray` for the stray of `stray_cluster`, with an address unless `addressless`,
+    /// answering the stop with `reply`. Returns the result and whether a stop was sent.
+    async fn try_stop(
+        leader: FakeLeader,
+        mutate: impl FnOnce(&mut spur_core::node::Node),
+        reply: Result<(), StopError>,
+        c: &mut Correction,
+    ) -> (Result<(), Refusal>, bool) {
+        let (state, nodes, _) = stray_cluster();
+        let mut stray = nodes[1].clone();
+        stray.address = Some("127.0.0.1".into());
+        mutate(&mut stray);
+        let sent = std::cell::Cell::new(false);
+        let record = StopRecord {
+            node: Some(&stray),
+            state: &state,
+            removing: &HashSet::new(),
+        };
+        let send = |_endpoint: String| {
+            sent.set(true);
+            async move { reply }
+        };
+        let result = stop_stray(&leader, 7, record, c, Instant::now(), send).await;
+        (result, sent.get())
+    }
+
+    fn leader() -> FakeLeader {
+        FakeLeader {
+            leader: true,
+            term: 7,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_sent_only_when_every_guard_passes() {
+        let mut c = Correction::default();
+        assert_eq!(
+            try_stop(leader(), |_| {}, Ok(()), &mut c).await,
+            (Ok(()), true)
+        );
+        assert_eq!(c.pending.get("stray"), Some(&0));
+        assert_eq!(c.recent.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_guard_sends_nothing_and_spends_no_budget() {
+        type Mutate = fn(&mut spur_core::node::Node);
+        let cases: [(FakeLeader, Mutate, Refusal); 4] = [
+            (
+                leader(),
+                |n| n.k0s_role = Some(K0sRole::Worker),
+                Refusal::RecordChanged,
+            ),
+            (leader(), |n| n.address = None, Refusal::StopFailed),
+            (
+                FakeLeader {
+                    leader: false,
+                    term: 7,
+                },
+                |_| {},
+                Refusal::NotLeader,
+            ),
+            (
+                FakeLeader {
+                    leader: true,
+                    term: 8,
+                },
+                |_| {},
+                Refusal::TermChange,
+            ),
+        ];
+        for (leader, mutate, want) in cases {
+            let mut c = Correction::default();
+            let got = try_stop(leader, mutate, Ok(()), &mut c).await;
+            assert_eq!(got, (Err(want), false), "{want:?}");
+            assert!(c.recent.is_empty() && c.backoff.is_empty(), "{want:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_stop_waits_for_the_next_probe_and_a_failed_one_backs_off() {
+        let mut c = Correction::default();
+        let got = try_stop(leader(), |_| {}, Err(StopError::TimedOut), &mut c).await;
+        assert_eq!(got, (Ok(()), true));
+        assert!(c.pending.contains_key("stray"));
+
+        let mut c = Correction::default();
+        let failed = Err(StopError::Failed("refused".into()));
+        let got = try_stop(leader(), |_| {}, failed, &mut c).await;
+        assert_eq!(got, (Err(Refusal::StopFailed), true));
+        assert!(c.pending.is_empty() && c.backoff.contains_key("stray"));
     }
 }

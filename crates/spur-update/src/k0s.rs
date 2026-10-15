@@ -22,8 +22,9 @@ use sha2::{Digest, Sha256};
 /// GitHub repo k0s releases come from.
 const K0S_REPO: &str = "k0sproject/k0s";
 const GITHUB_API: &str = "https://api.github.com";
-/// Generous ceiling for the ~260 MB binary download.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// Generous ceiling for the ~260 MB binary download. The controller bounds a k0s start by this
+/// plus slack, so raising it here keeps the two in step.
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// k0s asset arch suffix for the host (`amd64`/`arm64`).
 fn host_arch() -> Result<&'static str> {

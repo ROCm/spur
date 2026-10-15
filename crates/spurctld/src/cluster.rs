@@ -706,7 +706,7 @@ impl Drop for K0sRemoval<'_> {
         let Some(count) = removals.get_mut(&self.node) else {
             return;
         };
-        *count -= 1;
+        *count = count.saturating_sub(1);
         if *count == 0 {
             removals.remove(&self.node);
         }
@@ -23689,7 +23689,7 @@ mod tests {
             control_plane_node: Some("node-a".into()),
             provisioning_timeout: std::time::Duration::from_secs(600),
         };
-        let mut tokens = std::collections::HashMap::new();
+        let mut tokens = crate::cluster_k8s::StartTracker::default();
         crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, false).await;
 
         wait_for("un-roled node assigned by a Ready-phase tick", || {
@@ -23732,7 +23732,7 @@ mod tests {
         });
 
         let net = k0s_test_net();
-        let mut tokens = std::collections::HashMap::new();
+        let mut tokens = crate::cluster_k8s::StartTracker::default();
         crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, true).await;
 
         wait_for("degraded", || cm.k0s_state().phase == K0sPhase::Degraded);
@@ -23762,7 +23762,7 @@ mod tests {
         });
 
         let net = k0s_test_net();
-        let mut tokens = std::collections::HashMap::new();
+        let mut tokens = crate::cluster_k8s::StartTracker::default();
         crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, false).await;
 
         assert_eq!(cm.k0s_state().phase, K0sPhase::Provisioning);
@@ -23791,6 +23791,135 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_start_is_recorded_and_backed_off_only_while_ready() {
+        use crate::cluster_k8s::{StartOutcome, StartTracker};
+        use spur_core::k0s::K0sPhase;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        register_node(&cm, "node-b", 4, 8000);
+        wait_for("registered", || cm.get_node("node-b").is_some());
+        let reason = |n: &str| cm.get_node(n).and_then(|n| n.k0s_last_error);
+        let now = std::time::Instant::now();
+
+        let mut ready = StartTracker::default();
+        ready.join_tokens.insert("node-a".into(), "tok".into());
+        ready.push_outcome("node-a", StartOutcome::Failed("boom".into()));
+        ready.absorb_outcomes(&cm, K0sPhase::Ready, now);
+        wait_for("failure recorded", || {
+            reason("node-a").as_deref() == Some("start failed: boom")
+        });
+        assert!(!ready.join_tokens.contains_key("node-a"));
+        assert!(ready.has_backoff("node-a"));
+
+        let mut provisioning = StartTracker::default();
+        provisioning.push_outcome("node-b", StartOutcome::TimedOut);
+        provisioning.push_outcome("node-a", StartOutcome::Started);
+        provisioning.absorb_outcomes(&cm, K0sPhase::Provisioning, now);
+        wait_for("timeout recorded", || {
+            reason("node-b").as_deref() == Some("start timed out")
+        });
+        assert!(!provisioning.has_backoff("node-b"));
+        assert_eq!(reason("node-a").as_deref(), Some("start failed: boom"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_that_cannot_reach_its_agent_surfaces_as_the_nodes_reason() {
+        use crate::cluster_k8s::{spawn_start_component, StartTracker};
+        use spur_core::k0s::{K0sPhase, K0sRole};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        // Port 1 is privileged and unassigned, so the dial is refused rather than answered.
+        cm.register_node(
+            "node-a".into(),
+            "node-a".into(),
+            ResourceSet::default(),
+            "127.0.0.1".into(),
+            1,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
+        wait_for("registered", || cm.get_node("node-a").is_some());
+
+        let mut starts = StartTracker::default();
+        spawn_start_component(
+            &cm,
+            &mut starts,
+            "node-a",
+            K0sRole::Worker,
+            None,
+            None,
+            None,
+        );
+        assert!(starts.is_in_flight("node-a"));
+        wait_for("start reported back", || starts.has_outcome());
+        starts.absorb_outcomes(&cm, K0sPhase::Ready, std::time::Instant::now());
+        assert!(!starts.is_in_flight("node-a"));
+        assert!(starts.has_backoff("node-a"));
+        wait_for("reason recorded", || {
+            cm.get_node("node-a")
+                .and_then(|n| n.k0s_last_error)
+                .is_some_and(|r| r.starts_with("start failed: "))
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_unit_that_stays_failed_is_retried_with_a_widening_backoff() {
+        use crate::cluster_k8s::StartTracker;
+        use spur_core::k0s::K0sPhase;
+        use std::time::{Duration, Instant};
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        let node = cm.get_node("node-a").unwrap();
+        let mut starts = StartTracker::default();
+        // Mirrors converge: check, and note the failed unit only when a start is sent.
+        let mut send = |at: Instant| {
+            let sent = starts.may_start(&node, K0sPhase::Ready, at);
+            if sent {
+                starts.note_failed_unit(&cm, &node, Some("failed"), K0sPhase::Ready, at);
+            }
+            sent
+        };
+        let t0 = Instant::now();
+        assert!(send(t0));
+        assert!(!send(t0 + Duration::from_secs(59)));
+        assert!(
+            send(t0 + Duration::from_secs(60)),
+            "retried once the first wait ends"
+        );
+        assert!(!send(t0 + Duration::from_secs(60 + 119)));
+        assert!(
+            send(t0 + Duration::from_secs(60 + 120)),
+            "the next wait doubled"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unchanged_k0s_reason_is_not_written_again() {
+        use crate::cluster_k8s::set_reason_if_changed;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node-a", 4, 8000);
+        wait_for("registered", || cm.get_node("node-a").is_some());
+        let reason = |cm: &ClusterManager| cm.get_node("node-a").and_then(|n| n.k0s_last_error);
+
+        assert!(set_reason_if_changed(&cm, "node-a", "start failed: boom"));
+        wait_for("reason recorded", || {
+            reason(&cm).as_deref() == Some("start failed: boom")
+        });
+        assert!(!set_reason_if_changed(&cm, "node-a", "start failed: boom"));
+        assert!(set_reason_if_changed(&cm, "node-a", "start timed out"));
+        wait_for("reason replaced", || {
+            reason(&cm).as_deref() == Some("start timed out")
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_phase_reports_no_error_for_down_and_degraded() {
         use spur_core::k0s::K0sPhase;
         let dir = TempDir::new().unwrap();
@@ -23806,10 +23935,12 @@ mod tests {
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
         };
-        let mut tokens = std::collections::HashMap::new();
+        let mut tokens = crate::cluster_k8s::StartTracker::default();
         // A token cached from the torn-down incarnation must not survive the Down tick: reusing it
         // on the next `up` would hand a worker a stale-CA token, failing its join.
-        tokens.insert("worker-1".to_string(), "stale-ca-token".to_string());
+        tokens
+            .join_tokens
+            .insert("worker-1".to_string(), "stale-ca-token".to_string());
 
         let down = spur_core::k0s::K0sClusterState {
             phase: K0sPhase::Down,
@@ -23817,7 +23948,7 @@ mod tests {
         };
         assert!(!crate::cluster_k8s::reconcile_phase(&cm, &net, &down, &mut tokens, false).await);
         assert!(
-            tokens.is_empty(),
+            tokens.join_tokens.is_empty(),
             "Down reconcile must clear cached join tokens so a rebuild mints fresh ones"
         );
 

@@ -155,7 +155,30 @@ struct DriftLabel {
 }
 
 /// Drift kinds the controller reports, pre-created at zero by `ensure_series`.
-const DRIFT_KINDS: [&str; 2] = ["out_of_scope", "role_mismatch"];
+pub const DRIFT_KINDS: [&str; 3] = ["out_of_scope", "role_mismatch", "not_running"];
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct RefusalLabel {
+    distribution: String,
+    cluster: String,
+    reason: String,
+}
+
+/// Why the controller declined to stop a stray, pre-created at zero by `ensure_series`.
+pub const DRIFT_REFUSAL_REASONS: [&str; 12] = [
+    "disabled",
+    "control_plane",
+    "not_spurd_owned",
+    "circuit_breaker",
+    "throttled",
+    "budget",
+    "backoff",
+    "not_leader",
+    "term_change",
+    "record_changed",
+    "stop_failed",
+    "stop_unconfirmed",
+];
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct NodeBaseLabel {
@@ -179,6 +202,10 @@ pub struct K8sMetrics {
     reconcile_errors: Family<BaseLabel, Counter>,
     reconcile_duration: Family<BaseLabel, Histogram>,
     drift_detected: Family<DriftLabel, Counter>,
+    drift_corrected: Family<DriftLabel, Counter>,
+    drift_refused: Family<RefusalLabel, Counter>,
+    drift_recurred: Family<BaseLabel, Counter>,
+    start_failures: Family<BaseLabel, Counter>,
     node_up: Family<NodeBaseLabel, Gauge>,
     node_restarts: Family<NodeBaseLabel, Counter>,
     node_install_duration: Family<NodeBaseLabel, Histogram>,
@@ -197,6 +224,10 @@ impl Default for K8sMetrics {
         let reconcile_duration: Family<BaseLabel, Histogram> =
             Family::new_with_constructor(reconcile_buckets);
         let drift_detected = Family::default();
+        let drift_corrected = Family::default();
+        let drift_refused = Family::default();
+        let drift_recurred = Family::default();
+        let start_failures = Family::default();
         let node_up = Family::default();
         let node_restarts = Family::default();
         let node_install_duration: Family<NodeBaseLabel, Histogram> =
@@ -234,6 +265,26 @@ impl Default for K8sMetrics {
             drift_detected.clone(),
         );
         registry.register(
+            "spur_k8s_drift_corrected",
+            "Strays the controller stopped, counted once the node stays stopped across two checks",
+            drift_corrected.clone(),
+        );
+        registry.register(
+            "spur_k8s_drift_refused",
+            "Stops of a confirmed stray the controller declined, by reason",
+            drift_refused.clone(),
+        );
+        registry.register(
+            "spur_k8s_drift_recurred",
+            "Corrected strays whose k0s came back after the stop",
+            drift_recurred.clone(),
+        );
+        registry.register(
+            "spur_k8s_start_failures",
+            "Nodes newly recorded as failing to start k0s",
+            start_failures.clone(),
+        );
+        registry.register(
             "spur_k8s_node_up",
             "Whether a node's k0s systemd unit reports active (1) or not (0)",
             node_up.clone(),
@@ -256,6 +307,10 @@ impl Default for K8sMetrics {
             reconcile_errors,
             reconcile_duration,
             drift_detected,
+            drift_corrected,
+            drift_refused,
+            drift_recurred,
+            start_failures,
             node_up,
             node_restarts,
             node_install_duration,
@@ -323,6 +378,38 @@ impl K8sMetrics {
             .inc();
     }
 
+    /// Record a stray that stayed stopped after the controller stopped it.
+    pub fn record_drift_corrected(&self, cluster: &str, kind: &str) {
+        self.drift_corrected
+            .get_or_create(&self.drift_label(cluster, kind))
+            .inc();
+    }
+
+    /// Record a declined stop; `reason` is one of [`DRIFT_REFUSAL_REASONS`].
+    pub fn record_drift_refused(&self, cluster: &str, reason: &str) {
+        self.drift_refused
+            .get_or_create(&self.refusal_label(cluster, reason))
+            .inc();
+    }
+
+    /// Record a corrected stray whose k0s came back.
+    pub fn record_drift_recurred(&self, cluster: &str) {
+        self.drift_recurred.get_or_create(&self.base(cluster)).inc();
+    }
+
+    /// Record a k0s start that failed or timed out.
+    pub fn record_start_failure(&self, cluster: &str) {
+        self.start_failures.get_or_create(&self.base(cluster)).inc();
+    }
+
+    fn refusal_label(&self, cluster: &str, reason: &str) -> RefusalLabel {
+        RefusalLabel {
+            distribution: DEFAULT_DISTRIBUTION.into(),
+            cluster: cluster.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
     fn drift_label(&self, cluster: &str, kind: &str) -> DriftLabel {
         DriftLabel {
             distribution: DEFAULT_DISTRIBUTION.into(),
@@ -384,10 +471,20 @@ impl K8sMetrics {
         let _ = self.provision_failures.get_or_create(&base);
         let _ = self.reconcile_errors.get_or_create(&base);
         let _ = self.reconcile_duration.get_or_create(&base);
+        let _ = self.drift_recurred.get_or_create(&base);
+        let _ = self.start_failures.get_or_create(&base);
         for kind in DRIFT_KINDS {
             let _ = self
                 .drift_detected
                 .get_or_create(&self.drift_label(cluster, kind));
+        }
+        let _ = self
+            .drift_corrected
+            .get_or_create(&self.drift_label(cluster, "out_of_scope"));
+        for reason in DRIFT_REFUSAL_REASONS {
+            let _ = self
+                .drift_refused
+                .get_or_create(&self.refusal_label(cluster, reason));
         }
     }
 
@@ -457,5 +554,35 @@ mod tests {
         let body = metrics.encode();
         assert!(body.contains(&format!("{} 0\n", series("out_of_scope"))));
         assert!(body.contains(&format!("{} 1\n", series("role_mismatch"))));
+    }
+
+    #[test]
+    fn correction_series_start_at_zero_and_count() {
+        let metrics = K8sMetrics::new();
+        metrics.ensure_series("prod");
+        let base = "distribution=\"k0s\",cluster=\"prod\"";
+        let corrected = format!("spur_k8s_drift_corrected_total{{{base},kind=\"out_of_scope\"}}");
+        let refused =
+            |reason: &str| format!("spur_k8s_drift_refused_total{{{base},reason=\"{reason}\"}}");
+        let body = metrics.encode();
+        assert!(body.contains(&format!("{corrected} 0\n")));
+        for reason in DRIFT_REFUSAL_REASONS {
+            assert!(
+                body.contains(&format!("{} 0\n", refused(reason))),
+                "{reason}"
+            );
+        }
+        assert!(body.contains(&format!("spur_k8s_drift_recurred_total{{{base}}} 0\n")));
+        assert!(body.contains(&format!("spur_k8s_start_failures_total{{{base}}} 0\n")));
+
+        metrics.record_drift_corrected("prod", "out_of_scope");
+        metrics.record_drift_refused("prod", "budget");
+        metrics.record_drift_recurred("prod");
+        metrics.record_start_failure("prod");
+        let body = metrics.encode();
+        assert!(body.contains(&format!("{corrected} 1\n")));
+        assert!(body.contains(&format!("{} 1\n", refused("budget"))));
+        assert!(body.contains(&format!("spur_k8s_drift_recurred_total{{{base}}} 1\n")));
+        assert!(body.contains(&format!("spur_k8s_start_failures_total{{{base}}} 1\n")));
     }
 }
