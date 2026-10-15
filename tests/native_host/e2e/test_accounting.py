@@ -87,6 +87,10 @@ class TestSacctNodeFailState:
             f"sacct --state=COMPLETED must not match a NODE_FAIL job: {completed_out!r}"
         )
 
+        end = _wait_end(c.cli, job_id)
+        assert end["reason"] == "NodeRemoved", end
+        assert end["detail"] == f"node {node0}: node-fail accounting test", end
+
 
 class TestSacctExitReporting:
     def test_signal_half_and_derived_exit_code(self, accounting_cluster):
@@ -118,6 +122,223 @@ class TestSacctExitReporting:
         fields = row.split()
         assert fields[1] == "3:0", f"expected ExitCode 3:0, got {fields!r}"
         assert fields[2] == "7:0", f"expected DerivedExitCode 7:0, got {fields!r}"
+
+
+def _sacct_field(run, job_id: int, field: str, width: int) -> str:
+    return run(["sacct", "-n", "-j", str(job_id), f"--format={field}%{width}"]).strip()
+
+
+def _wait_end(run, job_id: int, timeout: int = 90) -> dict:
+    """Poll until the job's accounting row carries an end reason, then read the
+    provenance fields. *run* is a CLI runner, so callers can pick the identity."""
+    deadline = time.time() + timeout
+    reason = ""
+    while time.time() < deadline:
+        reason = _sacct_field(run, job_id, "Reason", 30)
+        if reason not in ("", "N/A"):
+            break
+        time.sleep(2)
+    return {
+        "reason": reason,
+        "detail": _sacct_field(run, job_id, "ReasonDetail", 90),
+        "ended_by": _sacct_field(run, job_id, "EndedBy", 30),
+    }
+
+
+def _submit(cluster, name: str, body: str, *flags: str) -> int:
+    script = cluster.write_file(f"{name}.sh", f"#!/bin/bash\n{body}\n")
+    job_id = parse_job_id(cluster.sbatch(["-J", name, "-N", "1", *flags, script]))
+    assert job_id is not None, f"{name}: submit failed"
+    return job_id
+
+
+class TestSacctEndReason:
+    """Each way a job fails is recorded with its own reason code."""
+
+    def test_each_failure_records_its_reason(self, accounting_cluster):
+        c = accounting_cluster
+        exit1 = _submit(c, "end-exit1", "exit 1")
+        exit127 = _submit(c, "end-exit127", "exit 127")
+        segv = _submit(c, "end-segv", "kill -SEGV $$")
+        tlimit = _submit(c, "end-tlimit", "sleep 600", "-t", "1")
+        deadline = _submit(
+            c, "end-deadline", "sleep 5", "--begin=now+600", "--deadline=now+30"
+        )
+        for job_id in (exit1, exit127, segv, tlimit, deadline):
+            wait_job(c, job_id, timeout=240)
+
+        assert _wait_end(c.cli, exit1) == {
+            "reason": "NonZeroExitCode", "detail": "", "ended_by": "N/A",
+        }
+        end = _wait_end(c.cli, exit127)
+        assert end["reason"] == "NonZeroExitCode", end
+        assert end["detail"] == "exit 127: command not found (shell convention)", end
+        end = _wait_end(c.cli, segv)
+        assert end["reason"] == "RaisedSignal", end
+        assert end["detail"] == "signal 11 (Segmentation_fault)", end
+        assert _wait_end(c.cli, tlimit)["reason"] == "TimeLimit"
+        assert _wait_end(c.cli, deadline)["reason"] == "DeadLine"
+
+
+_JWT_KEY = "e2e-end-reason-key"
+_JOB_OWNER = "root"
+# Exists in NSS everywhere and is neither the owner nor an admin.
+_BYSTANDER = "nobody"
+
+
+class TestSacctCancelOrigin:
+    """A cancel is labelled by who issued it, and only the audit log's audience
+    sees the canceller's name. JWT gives each caller its own identity."""
+
+    @pytest.fixture
+    def cluster_config_overrides(self, ssh_nodes):
+        return {
+            "auth": {
+                "plugin": "jwt",
+                "jwt_key": _JWT_KEY,
+                "cluster_admins": [ssh_nodes[0].user],
+                "allow_root_jobs": True,
+            }
+        }
+
+    def test_cancel_origin_and_canceller_visibility(self, accounting_cluster):
+        c = accounting_cluster
+        admin = c.nodes[0].user
+        if admin == _JOB_OWNER:
+            pytest.skip("SSH login is root; need a login distinct from the job owner")
+
+        def token(user):
+            out = c.cli(
+                ["spur", "token", "user", f"--user={user}", f"--config={c.etc_dir}/spur.conf"]
+            )
+            return out.strip().split("\n")[0]
+
+        def as_user(user):
+            env = {"SPUR_AUTH_TOKEN": token(user)}
+            return lambda args: c.cli_as_user(admin, args, extra_env=env, check=True)
+
+        owner, operator, bystander = as_user(_JOB_OWNER), as_user(admin), as_user(_BYSTANDER)
+
+        def submit_as_owner(name, body, *flags):
+            script = c.write_file(f"{name}.sh", f"#!/bin/bash\n{body}\n")
+            job_id = parse_job_id(owner(["sbatch", "-J", name, "-N", "1", *flags, script]))
+            assert job_id is not None, f"{name}: submit failed"
+            return job_id
+
+        by_owner = submit_as_owner("cancel-owner", "sleep 5", "--begin=now+600")
+        by_admin = submit_as_owner("cancel-admin", "sleep 5", "--begin=now+600")
+        parent = submit_as_owner("cancel-parent", "exit 1")
+        wait_job(c, parent, timeout=60)
+        child = submit_as_owner("cancel-child", "sleep 5", f"--dependency=afterok:{parent}")
+
+        owner(["scancel", str(by_owner)])
+        operator(["scancel", str(by_admin)])
+        for job_id in (by_owner, by_admin, child):
+            wait_job(c, job_id, timeout=90)
+
+        assert _wait_end(operator, by_owner) == {
+            "reason": "UserCancel", "detail": "", "ended_by": _JOB_OWNER,
+        }
+        assert _wait_end(operator, by_admin) == {
+            "reason": "AdminCancel", "detail": "", "ended_by": admin,
+        }
+        assert _wait_end(operator, child) == {
+            "reason": "SystemCancel", "detail": "", "ended_by": "N/A",
+        }
+        hidden = _wait_end(bystander, by_admin)
+        assert hidden["reason"] == "AdminCancel", hidden
+        assert hidden["ended_by"] == "N/A", hidden
+
+
+class TestSacctPreemptAndNodeDown:
+    """A preempt-cancel stays PREEMPTED across an accounting reconcile pass, and
+    an operator taking a node down records which node and why."""
+
+    # Reconcile runs at controller start and every 120 s.
+    RECONCILE_SECS = 135
+
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {
+            "partitions": [
+                {
+                    "name": "default",
+                    "state": "UP",
+                    "default": True,
+                    "nodes": "ALL",
+                    "max_time": "24:00:00",
+                    "default_time": "10:00",
+                    "preempt_mode": "cancel",
+                }
+            ],
+            "scheduler": {"preempt_type": "qos_priority"},
+            "auth": {"allow_root_jobs": True},
+        }
+
+    def test_preempt_cancel_and_node_down_reasons(self, accounting_cluster):
+        c = accounting_cluster
+        node = c.node_names[0]
+        c.sacctmgr(["add", "qos", "name=end-fragile", "priority=-1000", "preemptmode=cancel"])
+        c.sacctmgr(["add", "qos", "name=end-strong", "priority=100000", "preempt=end-fragile"])
+        time.sleep(15)
+
+        victim = _submit(
+            c, "end-victim", "sleep 600", "--exclusive", f"--nodelist={node}", "-q", "end-fragile"
+        )
+        wait_job_state(c, victim, "R", timeout=60)
+        aggressor = _submit(
+            c, "end-aggressor", "sleep 2", "--exclusive", f"--nodelist={node}", "-q", "end-strong"
+        )
+        wait_job(c, victim, timeout=90)
+        wait_job(c, aggressor, timeout=90)
+        preempted_at = time.time()
+
+        doomed = _submit(c, "end-doomed", "sleep 600")
+        wait_job_state(c, doomed, "R", timeout=120)
+        # This path never notifies accounting; the reconcile pass writes the row.
+        c.scontrol("update", f"NodeName={node}", "State=down", "Reason=e2e-maint")
+
+        remaining = self.RECONCILE_SECS - (time.time() - preempted_at)
+        if remaining > 0:
+            time.sleep(remaining)
+
+        assert wait_sacct_row(c, victim, "JobID,State").split()[1] == "PREEMPTED"
+        end = _wait_end(c.cli, victim)
+        assert end["reason"] == "Preempted", end
+        assert end["detail"].startswith(f"preempted by job {aggressor}"), end
+
+        end = _wait_end(c.cli, doomed, timeout=180)
+        assert end["reason"] == "NodeDown", end
+        assert end["detail"].startswith(f"node {node}: e2e-maint"), end
+
+
+class TestLiveJobActors:
+    """scontrol show job names who suspended a job and why it was last requeued."""
+
+    def test_suspend_resume_and_requeue_are_shown(self, accounting_cluster):
+        c = accounting_cluster
+        job_id = _submit(c, "end-live", "sleep 600")
+        wait_job_state(c, job_id, "R", timeout=60)
+        me = c.nodes[0].user
+
+        c.scontrol("suspend", str(job_id))
+        wait_job_state(c, job_id, "S", timeout=30)
+        assert f"SuspendedBy={me}" in c.scontrol("show", "job", str(job_id))
+
+        c.scontrol("resume", str(job_id))
+        wait_job_state(c, job_id, "R", timeout=30)
+        assert "SuspendedBy=" not in c.scontrol("show", "job", str(job_id))
+
+        c.scontrol("requeue", str(job_id))
+        deadline = time.time() + 30
+        shown = ""
+        while time.time() < deadline:
+            shown = c.scontrol("show", "job", str(job_id))
+            if "LastRequeue=" in shown:
+                break
+            time.sleep(2)
+        assert f"LastRequeue=Admin({me})" in shown, shown
+        c.cli_allow_fail(["scancel", str(job_id)])
 
 
 def _reason(cluster, job_id: int) -> str:
