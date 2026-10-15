@@ -22,8 +22,11 @@ from kubernetes.utils import create_from_dict
 
 logger = logging.getLogger(__name__)
 
-_MANIFESTS_DIR = Path(__file__).resolve().parent / "manifests"
+# Deploy the same manifests users apply, so e2e exercises them as shipped.
+# ci.yml packs examples/k8s beside tests/, so this also resolves in e2e-assets.
+_MANIFESTS_DIR = Path(__file__).resolve().parents[3] / "examples" / "k8s"
 _DEFAULT_IMAGE = "ghcr.io/rocm/spur:ci"
+_WORKLOAD_KINDS = frozenset({"StatefulSet", "Deployment"})
 
 SPUR_JOB_GROUP = "spur.amd.com"
 SPUR_JOB_VERSION = "v1alpha1"
@@ -120,6 +123,20 @@ def patch_namespace_in_value(value: dict, namespace: str) -> dict:
         f".{namespace}.svc.cluster.local",
     )
     return json.loads(patched)
+
+
+def _override_workload(value: dict, image: str, replicas: int | None) -> None:
+    if value.get("kind") not in _WORKLOAD_KINDS:
+        return
+    spec = value["spec"]
+    if replicas is not None:
+        spec["replicas"] = replicas
+    pod_spec = spec["template"]["spec"]
+    for container in pod_spec.get("initContainers", []) + pod_spec["containers"]:
+        container["image"] = image
+        # Test images are usually side-loaded into containerd. A :latest or
+        # untagged one would default to Always and ignore the local copy.
+        container["imagePullPolicy"] = "IfNotPresent"
 
 
 @dataclass
@@ -287,33 +304,31 @@ class ClusterFixture:
         fixture = cls(suite, cfg)
         fixture.teardown_workloads()
         fixture.apply_rbac()
-        fixture.apply_configmap()
+        fixture.apply_config()
         fixture.apply_controller()
         fixture.apply_operator()
         fixture.wait_ready()
         return fixture
 
-    def apply_configmap(self) -> None:
+    def apply_config(self) -> None:
         config_toml = self.config.config_toml.replace(
             ".spur.svc.cluster.local",
             f".{self.namespace}.svc.cluster.local",
         )
-        body = client.V1ConfigMap(
+        body = client.V1Secret(
             metadata=client.V1ObjectMeta(
                 name="spur-config",
                 namespace=self.namespace,
             ),
-            data={"spur.conf": config_toml},
+            string_data={"spur.conf": config_toml},
         )
         try:
-            self.core_v1.create_namespaced_config_map(self.namespace, body)
+            self.core_v1.create_namespaced_secret(self.namespace, body)
         except ApiException as exc:
             if not _is_already_exists(exc):
                 raise
-            self.core_v1.replace_namespaced_config_map(
-                "spur-config", self.namespace, body
-            )
-        logger.info("ConfigMap spur-config applied")
+            self.core_v1.replace_namespaced_secret("spur-config", self.namespace, body)
+        logger.info("Secret spur-config applied")
 
     def _force_delete_pods(self, label_selector: str) -> None:
         pods = self.core_v1.list_namespaced_pod(
@@ -380,32 +395,25 @@ class ClusterFixture:
                 raise
 
     def _apply_yaml_docs(self, yaml_path: Path, replicas: int | None) -> None:
-        content = yaml_path.read_text()
         api_client = client.ApiClient()
-        for doc in content.split("\n---"):
-            doc = doc.strip()
-            if not doc:
+        for value in yaml.safe_load_all(yaml_path.read_text()):
+            if not value:
                 continue
-            patched = doc.replace(_DEFAULT_IMAGE, self.config.image)
-            if replicas is not None:
-                patched = patched.replace("replicas: 3", f"replicas: {replicas}")
-            value = yaml.safe_load(patched)
             value = patch_namespace_in_value(value, self.namespace)
             value.setdefault("metadata", {})["namespace"] = self.namespace
+            _override_workload(value, self.config.image, replicas)
             kind = value.get("kind", "")
             name = value["metadata"]["name"]
             self._delete_resource(kind, name)
             create_from_dict(api_client, value, namespace=self.namespace)
 
     def apply_rbac(self) -> None:
-        content = (_MANIFESTS_DIR / "rbac.yaml").read_text()
         api_client = client.ApiClient()
         rbac_api = client.RbacAuthorizationV1Api()
-        for doc in content.split("\n---"):
-            doc = doc.strip()
-            if not doc:
+        for value in yaml.safe_load_all((_MANIFESTS_DIR / "rbac.yaml").read_text()):
+            if not value:
                 continue
-            value = patch_namespace_in_value(yaml.safe_load(doc), self.namespace)
+            value = patch_namespace_in_value(value, self.namespace)
             kind = value.get("kind", "")
             name = value["metadata"]["name"]
             if kind not in CLUSTER_SCOPED_KINDS:
@@ -502,9 +510,7 @@ class ClusterFixture:
             lambda: self.core_v1.delete_namespaced_service(
                 "spur-k8s-operator", self.namespace
             ),
-            lambda: self.core_v1.delete_namespaced_config_map(
-                "spur-config", self.namespace
-            ),
+            lambda: self.core_v1.delete_namespaced_secret("spur-config", self.namespace),
         ]:
             try:
                 delete_fn()

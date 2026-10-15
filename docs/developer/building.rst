@@ -266,7 +266,7 @@ Export these so the test process can read them:
      - Path to kubeconfig file. Defaults to ``~/.kube/config``.
      - ``/home/user/.kube/config``
    * - ``SPUR_CI_IMAGE`` *(optional)*
-     - Container image for the controller and operator. Defaults to ``spur:ci``.
+     - Container image for the controller and operator. Defaults to ``ghcr.io/rocm/spur:ci``.
      - ``ghcr.io/rocm/spur:abc123``
    * - ``SPUR_TEST_NS`` *(optional)*
      - Kubernetes namespace for the test run. Defaults to ``spur-ci-{pid}-{timestamp}``. Set explicitly for local runs so cleanup and log inspection are predictable.
@@ -290,7 +290,7 @@ Setup
    # On each node:
    sudo ctr -n k8s.io images import /tmp/spur-ci.tar
 
-The harness applies manifests from ``tests/k8s/e2e/manifests/`` (CRD, RBAC, controller, operator). Production-oriented samples live under ``examples/k8s/``. You do not need a separate ``kubectl apply`` before ``pytest`` unless you are debugging RBAC outside the suite.
+The harness applies the ``examples/k8s/`` manifests (CRD, RBAC, controller, operator), the same ones the deployment guide uses, overriding only the image, image pull policy (``IfNotPresent``, since the image is loaded locally), replica count, and namespace per test. It creates the ``spur-config`` Secret itself. You do not need a separate ``kubectl apply`` before ``pytest`` unless you are debugging RBAC outside the suite.
 
 Running the Tests
 ~~~~~~~~~~~~~~~~~
