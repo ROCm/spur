@@ -340,6 +340,9 @@ addresses, in the same order on every controller, to the ``peers`` list in the c
 Raft automatically elects a leader. Workers connect to any controller and are redirected
 to the current leader.
 
+Each controller writes its Raft snapshot atomically, so ``state_dir`` needs free space for
+about two copies of ``raft/snapshot.json`` (the current file plus the new temporary one).
+
 Joining Worker Nodes
 --------------------
 
