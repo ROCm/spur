@@ -90,7 +90,7 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
 
     let expected: Vec<(JobId, String)> = candidates
         .iter()
-        .map(|j| (j.job_id, accounting_expected_state(j.state)))
+        .map(|j| (j.job_id, accounting_state(j).display().to_owned()))
         .collect();
 
     let job_ids: Vec<JobId> = candidates.iter().map(|j| j.job_id).collect();
@@ -157,12 +157,14 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
 /// it stays in that state. Uses `is_finalized()`, not `is_terminal()`, so a
 /// durably `Preempted` job (which `is_terminal()` excludes but which can get
 /// stranded there on a partial-proposal failure) is compared against its own
-/// state rather than against `RUNNING`.
-fn accounting_expected_state(state: JobState) -> String {
-    if state.is_finalized() {
-        state.display().to_owned()
+/// state rather than against `RUNNING`. Finalized jobs use the end-of-run
+/// state, as the live end write does; `end_of_run_state` ignores the state it
+/// is given, so it must only see finalized jobs.
+fn accounting_state(job: &Job) -> JobState {
+    if job.state.is_finalized() {
+        job.end_of_run_state(job.state)
     } else {
-        JobState::Running.display().to_owned()
+        JobState::Running
     }
 }
 
@@ -268,18 +270,26 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
 }
 
 async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<()> {
-    let end_time = job.end_time.unwrap_or_else(Utc::now);
+    let state = accounting_state(job);
+    let (reason, reason_detail) = job.end_reason(state);
+    let ended_by = job.ended_by(reason);
     db::record_job_end(
         conn,
-        job.job_id,
-        job.state.display(),
-        job.exit_code.unwrap_or(0),
-        end_time,
-        job.exit_signal,
-        job.derived_exit_code,
-        job.preempted_by,
-        job.preempt_mode.as_deref().unwrap_or(""),
-        job.preempt_qos.as_deref().unwrap_or(""),
+        &db::JobEndRecord {
+            job_id: job.job_id,
+            state: state.display().to_owned(),
+            exit_code: job.exit_code.unwrap_or(0),
+            end_time: job.end_time.unwrap_or_else(Utc::now),
+            exit_signal: job.exit_signal,
+            derived_exit_code: job.derived_exit_code,
+            preempted_by: job.preempted_by,
+            preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
+            preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
+            reason: Some(reason),
+            reason_detail: reason_detail.unwrap_or_default(),
+            ended_by: ended_by.map(|c| c.user.clone()).unwrap_or_default(),
+            ended_by_uid: ended_by.and_then(|c| c.uid),
+        },
     )
     .await
 }
@@ -393,12 +403,18 @@ mod tests {
     // can't represent must map to RUNNING for comparison — otherwise a
     // suspended/completing job is flagged stale forever.
     #[test]
-    fn accounting_expected_state_maps_non_finalized_states_to_running() {
-        assert_eq!(accounting_expected_state(JobState::Running), "RUNNING");
-        assert_eq!(accounting_expected_state(JobState::Suspended), "RUNNING");
-        assert_eq!(accounting_expected_state(JobState::Completing), "RUNNING");
-        assert_eq!(accounting_expected_state(JobState::Completed), "COMPLETED");
-        assert_eq!(accounting_expected_state(JobState::Failed), "FAILED");
+    fn accounting_state_maps_non_finalized_states_to_running() {
+        for state in [JobState::Running, JobState::Suspended, JobState::Completing] {
+            assert_eq!(accounting_state(&test_job(1, state)), JobState::Running);
+        }
+        assert_eq!(
+            accounting_state(&test_job(1, JobState::Completed)),
+            JobState::Completed
+        );
+        assert_eq!(
+            accounting_state(&test_job(1, JobState::Failed)),
+            JobState::Failed
+        );
     }
 
     // is_finalized(), not is_terminal(): a durably Preempted job (which
@@ -406,10 +422,53 @@ mod tests {
     // mapped to RUNNING — otherwise a resync pass would clobber a correct
     // PREEMPTED record with RUNNING/no-end_time on every single cycle.
     #[test]
-    fn accounting_expected_state_uses_is_finalized_for_preempted() {
+    fn accounting_state_uses_is_finalized_for_preempted() {
         assert!(!JobState::Preempted.is_terminal());
         assert!(JobState::Preempted.is_finalized());
-        assert_eq!(accounting_expected_state(JobState::Preempted), "PREEMPTED");
+        assert_eq!(
+            accounting_state(&test_job(1, JobState::Preempted)),
+            JobState::Preempted
+        );
+    }
+
+    fn preempt_cancelled(job_id: JobId, state: JobState) -> Job {
+        let mut job = test_job(job_id, state);
+        job.cancel_signaled_at = Some(Utc::now());
+        job.preempt_mode = Some("Cancel".into());
+        job
+    }
+
+    #[test]
+    fn a_finished_preempt_cancel_is_preempted_in_accounting() {
+        assert_eq!(
+            accounting_state(&preempt_cancelled(1, JobState::Cancelled)),
+            JobState::Preempted
+        );
+    }
+
+    #[test]
+    fn a_preempt_cancel_still_completing_is_running_in_accounting() {
+        assert_eq!(
+            accounting_state(&preempt_cancelled(1, JobState::Completing)),
+            JobState::Running
+        );
+    }
+
+    #[test]
+    fn a_user_cancel_stays_cancelled_in_accounting() {
+        let mut job = test_job(1, JobState::Cancelled);
+        job.cancel_signaled_at = Some(Utc::now());
+        assert_eq!(accounting_state(&job), JobState::Cancelled);
+    }
+
+    #[test]
+    fn jobs_needing_resync_leaves_a_preempted_row_of_a_preempt_cancel_alone() {
+        let job = preempt_cancelled(1, JobState::Cancelled);
+        let expected = vec![(1, accounting_state(&job).display().to_owned())];
+        let mut accounting = HashMap::new();
+        accounting.insert(1, synced_row("PREEMPTED"));
+
+        assert!(jobs_needing_resync(&expected, &accounting, &no_unknown()).is_empty());
     }
 
     #[test]
@@ -418,7 +477,12 @@ mod tests {
         // pre-fix behavior, since is_terminal() excluded Preempted from ever
         // getting write_end'd) must be flagged for resync so it converges on
         // PREEMPTED rather than being ignored forever.
-        let expected = vec![(1, accounting_expected_state(JobState::Preempted))];
+        let expected = vec![(
+            1,
+            accounting_state(&test_job(1, JobState::Preempted))
+                .display()
+                .to_owned(),
+        )];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -429,7 +493,12 @@ mod tests {
 
     #[test]
     fn jobs_needing_resync_ignores_suspended_job_matching_running_row() {
-        let expected = vec![(1, accounting_expected_state(JobState::Suspended))];
+        let expected = vec![(
+            1,
+            accounting_state(&test_job(1, JobState::Suspended))
+                .display()
+                .to_owned(),
+        )];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -474,6 +543,24 @@ mod tests {
         Ok(pool)
     }
 
+    fn bare_end(job_id: JobId, state: &str, end_time: chrono::DateTime<Utc>) -> db::JobEndRecord {
+        db::JobEndRecord {
+            job_id,
+            state: state.to_string(),
+            exit_code: 0,
+            end_time,
+            exit_signal: 0,
+            derived_exit_code: 0,
+            preempted_by: None,
+            preempt_mode: String::new(),
+            preempt_qos: String::new(),
+            reason: None,
+            reason_detail: String::new(),
+            ended_by: String::new(),
+            ended_by_uid: None,
+        }
+    }
+
     async fn delete_job(pool: &PgPool, job_id: JobId) {
         let _ = sqlx::query("DELETE FROM jobs WHERE job_id = $1")
             .bind(job_id as i64)
@@ -498,15 +585,7 @@ mod tests {
         let mut conn = pool.acquire().await?;
         db::record_job_end(
             &mut conn,
-            job_id,
-            job.state.display(),
-            0,
-            job.end_time.unwrap(),
-            0,
-            0,
-            None,
-            "",
-            "",
+            &bare_end(job_id, job.state.display(), job.end_time.unwrap()),
         )
         .await?;
         drop(conn);
@@ -519,7 +598,7 @@ mod tests {
         assert_eq!(bare.state, "COMPLETED");
 
         // The diff must flag this job even though state already matches.
-        let expected = vec![(job_id, accounting_expected_state(job.state))];
+        let expected = vec![(job_id, accounting_state(&job).display().to_owned())];
         let mut accounting = HashMap::new();
         accounting.insert(job_id, bare);
         let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
@@ -561,6 +640,32 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn resync_job_writes_a_preempt_cancel_as_preempted() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let job_id = test_job_id(7);
+        delete_job(&pool, job_id).await;
+        let mut job = preempt_cancelled(job_id, JobState::Cancelled);
+        // Its own user, so the usage cleanup below cannot race the backfill test's.
+        job.spec.user = format!("spur_reconcile_preempt_{}", std::process::id());
+
+        resync_job(&pool, &job, true, false).await;
+
+        let state: String = sqlx::query("SELECT state FROM jobs WHERE job_id = $1")
+            .bind(job_id as i64)
+            .fetch_one(&pool)
+            .await?
+            .get("state");
+        delete_job(&pool, job_id).await;
+        sqlx::query("DELETE FROM usage WHERE user_name = $1")
+            .bind(&job.spec.user)
+            .execute(&pool)
+            .await?;
+        assert_eq!(state, "PREEMPTED");
+        Ok(())
+    }
+
     // End to end: a suspended job's accounting row correctly shows RUNNING
     // (accounting has no SUSPENDED state); a resync pass must not treat that
     // as stale and must not clobber the row.
@@ -579,7 +684,10 @@ mod tests {
             .await?
             .remove(&job_id)
             .expect("row exists");
-        let expected = vec![(job_id, accounting_expected_state(suspended_job.state))];
+        let expected = vec![(
+            job_id,
+            accounting_state(&suspended_job).display().to_owned(),
+        )];
         let mut accounting = HashMap::new();
         accounting.insert(job_id, row);
 
@@ -642,15 +750,7 @@ mod tests {
             .await?;
             db::record_job_end(
                 &mut conn,
-                job_id,
-                "COMPLETED",
-                0,
-                job.end_time.unwrap(),
-                0,
-                0,
-                None,
-                "",
-                "",
+                &bare_end(job_id, "COMPLETED", job.end_time.unwrap()),
             )
             .await?;
         }

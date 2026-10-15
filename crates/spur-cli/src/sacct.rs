@@ -73,7 +73,7 @@ pub struct SacctArgs {
 
 const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
 const SACCT_LONG_FORMAT: &str =
-    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q";
+    "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q %18r";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
 
 pub fn sacct_header(spec: char) -> &'static str {
@@ -101,6 +101,9 @@ pub fn sacct_header(spec: char) -> &'static str {
         'm' => "PreemptMode",
         'q' => "PreemptQOS",
         'W' => "Borrowed",
+        'r' => "Reason",
+        'z' => "ReasonDetail",
+        'e' => "EndedBy",
         _ => "?",
     }
 }
@@ -129,6 +132,9 @@ fn sacct_field_spec(name: &str) -> Option<char> {
         "preemptmode" => Some('m'),
         "preemptqos" => Some('q'),
         "borrowed" => Some('W'),
+        "reason" => Some('r'),
+        "reasondetail" => Some('z'),
+        "endedby" => Some('e'),
         _ => None,
     }
 }
@@ -268,6 +274,21 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         // Whether the run took borrowed capacity. Same letter as squeue's %W so the
         // two commands agree on how to ask.
         'W' => if job.idle_fill { "yes" } else { "no" }.into(),
+        'r' => {
+            if job.end_reason.is_empty() {
+                "N/A".into()
+            } else {
+                job.end_reason.clone()
+            }
+        }
+        'z' => job.end_reason_detail.clone(),
+        'e' => {
+            if job.ended_by.is_empty() {
+                "N/A".into()
+            } else {
+                job.ended_by.clone()
+            }
+        }
         _ => "?".into(),
     }
 }
@@ -326,6 +347,38 @@ mod tests {
             derived_exit_code,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn reason_shows_the_recorded_code_and_na_for_older_rows() {
+        let mut j = job(127, 0, 0);
+        j.end_reason = "NonZeroExitCode".into();
+        assert_eq!(resolve_sacct_field(&j, 'r'), "NonZeroExitCode");
+        assert_eq!(resolve_sacct_field(&job(0, 0, 0), 'r'), "N/A");
+    }
+
+    #[test]
+    fn reason_detail_is_blank_when_there_is_none() {
+        let mut j = job(127, 0, 0);
+        j.end_reason_detail = "exit 127: command not found (shell convention)".into();
+        assert_eq!(
+            resolve_sacct_field(&j, 'z'),
+            "exit 127: command not found (shell convention)"
+        );
+        assert_eq!(resolve_sacct_field(&job(0, 0, 0), 'z'), "");
+    }
+
+    #[test]
+    fn ended_by_names_the_canceller_or_na() {
+        let mut j = job(0, 0, 0);
+        j.ended_by = "alice".into();
+        assert_eq!(resolve_sacct_field(&j, 'e'), "alice");
+        assert_eq!(resolve_sacct_field(&job(0, 0, 0), 'e'), "N/A");
+    }
+
+    #[test]
+    fn long_format_ends_with_reason() {
+        assert!(SACCT_LONG_FORMAT.ends_with("%18r"));
     }
 
     #[test]
@@ -453,6 +506,9 @@ mod tests {
             "preemptmode",
             "preemptqos",
             "borrowed",
+            "reason",
+            "reasondetail",
+            "endedby",
         ];
         let job = JobInfo::default();
         for name in names {

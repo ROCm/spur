@@ -416,7 +416,8 @@ Flags:
      - Comma-separated field names (see below).
    * - ``--long``
      - ``-l``
-     - Long form; adds DerivedExitCode, Start, End, TimeLimit.
+     - Long form; adds DerivedExitCode, Start, End, TimeLimit, the three
+       preemption fields, and Reason.
    * - ``--brief``
      - ``-b``
      - Brief form: JobID, State, ExitCode.
@@ -432,7 +433,8 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
 ``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
-and ``Borrowed``. Set a per-field width with ``Field%N``, e.g. ``JobName%20``.
+``Borrowed``, ``Reason``, ``ReasonDetail``, and ``EndedBy``. Set a per-field width with
+``Field%N``, e.g. ``JobName%20``.
 
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
 preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
@@ -452,6 +454,106 @@ question ``squeue``'s ``%W`` answers for a running job:
    JobID  User     State      Borrowed
    19     ifbob    PREEMPTED  yes
    21     ifalice  COMPLETED  no
+
+Why a job ended
+~~~~~~~~~~~~~~~
+
+``Reason`` is a short code saying why the job's run ended, and ``ReasonDetail``
+adds what Spur knew beyond the code. Use ``Reason`` to group failures, for
+example ``sacct -n -s FAILED,NODE_FAIL --format=Reason`` piped through
+``sort | uniq -c``.
+
+.. code-block:: console
+
+   $ sacct --format=JobID,State,ExitCode,Reason,ReasonDetail
+   JobID  State      ExitCode  Reason             ReasonDetail
+   41     FAILED     127:0     NonZeroExitCode    exit 127: command not found (shell convention)
+   42     FAILED     0:11      RaisedSignal       signal 11 (Segmentation_fault)
+   43     FAILED     1:0       CompletingTimeout  no completion reported by node3
+   44     TIMEOUT    0:15      TimeLimit
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 60
+
+   * - Reason
+     - State
+     - When
+   * - ``None``
+     - COMPLETED
+     - The job ended normally.
+   * - ``NonZeroExitCode``
+     - FAILED
+     - The job exited with a non-zero code. For 126 and 127 the detail notes
+       the shell convention ("not executable", "command not found"); that is a
+       hint, since a script may also exit 127 itself.
+   * - ``RaisedSignal``
+     - FAILED
+     - A signal ended the job; the detail names it.
+   * - ``CompletingTimeout``
+     - FAILED
+     - The controller stopped waiting for the job's nodes to report; the
+       detail lists the nodes that never did.
+   * - ``TimeLimit``
+     - TIMEOUT
+     - The job reached its time limit, however the process then died.
+   * - ``DeadLine``
+     - DEADLINE
+     - The job's ``--deadline`` passed before it could run.
+   * - ``OutOfMemory``
+     - OUT_OF_MEMORY
+     - The kernel killed the job for exceeding its memory limit.
+   * - ``Preempted``
+     - PREEMPTED
+     - A higher-priority job preempted it; the detail names that job and its
+       QOS.
+   * - ``UserCancel``
+     - CANCELLED
+     - The job's owner cancelled it.
+   * - ``AdminCancel``
+     - CANCELLED
+     - An operator or administrator cancelled someone else's job.
+   * - ``SystemCancel``
+     - CANCELLED
+     - Spur cancelled it: a dependency that can never be met, an ended
+       reservation, a failed prolog on an interactive or ``srun`` job, or an
+       in-cluster daemon (including an FFI ``slurm_kill_job`` call made
+       without credentials).
+   * - ``Cancelled``
+     - CANCELLED
+     - Cancelled, but who did it was not recorded: the job was cancelled
+       before this release, or by an older controller during a rolling
+       upgrade.
+   * - ``Requeued``
+     - REQUEUED
+     - The job's owner or an operator requeued it while it was running.
+   * - ``NodeDown``
+     - NODE_FAIL
+     - A node the job ran on went down. The detail names the node and its
+       down reason, as ``sinfo -R`` shows it (for example ``Not responding``
+       after lost heartbeats), plus the uid that set it when an operator did.
+   * - ``NodeRemoved``
+     - NODE_FAIL
+     - A node the job ran on was removed from the cluster; the detail names
+       the node and the removal reason.
+   * - ``JobLaunchFailure``
+     - NODE_FAIL
+     - The job could not be started on every node; the detail says why.
+
+``EndedBy`` is the user who cancelled the job, for ``UserCancel`` and
+``AdminCancel``; a ``SystemCancel`` has no user and, like every other reason,
+shows ``N/A``. It is shown to operators and administrators, the same audience as
+``sacctmgr show txn``; for anyone else it reads ``N/A``. When ``[auth]`` runs in
+``disabled`` or ``permissive`` mode an unauthenticated caller counts as that
+audience, as it does for the audit log.
+
+``Reason`` reads ``N/A`` for a job that is still running, for rows written
+before this field existed, and for rows written through the external
+``RecordJobEnd`` accounting RPC. Accounting keeps one row per job,
+so a requeued job's next run replaces the reason with its own. During a
+rolling upgrade, a job that restarts and then ends while an older controller
+is leader keeps the reason of its previous run, and a run the older controller
+force-finished reads ``NonZeroExitCode`` rather than ``CompletingTimeout``.
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode``.
@@ -500,8 +602,25 @@ an entity: ``job``, ``node``, ``partition``, ``reservation``, ``step``, or
    unset string, so a parser must key on the field name rather than on a line
    being absent. Some fields still appear only when set (``Comment``,
    ``Reservation``, ``ArrayJobId``, ``SchedNodeList``, ``StdIn``, the GPU line,
-   and the preemption line), and ``MinMemoryNode`` is spelled ``MinMemoryCPU``
-   for a ``--mem-per-cpu`` job.
+   the preemption line, and the ``SuspendedBy``/``LastRequeue`` line), and
+   ``MinMemoryNode`` is spelled ``MinMemoryCPU`` for a ``--mem-per-cpu`` job.
+
+For a live job someone acted on, ``scontrol show job`` adds a line naming who.
+``SuspendedBy`` is the user who suspended the job, only while it stays
+suspended; a job paused by preemption shows the preemption line instead.
+``LastRequeue`` says why the job last went back to the queue: ``Failure`` (a
+launch failure, time limit or node failure with ``--requeue``), ``Preempt``, or
+``Admin`` (an ``scontrol requeue`` by the owner or an operator), with whoever
+requeued it in parentheses for ``Admin``:
+
+.. code-block:: console
+
+   SuspendedBy=alice LastRequeue=Admin(ops)
+
+The user names are shown to the same audience as ``EndedBy`` in ``sacct``
+(operators, administrators, and unauthenticated callers when ``[auth]`` is
+``disabled`` or ``permissive``); for anyone else they are blank and
+``LastRequeue`` shows the kind alone.
 
 .. code-block:: bash
 

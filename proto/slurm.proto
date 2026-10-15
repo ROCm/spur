@@ -303,6 +303,22 @@ message JobInfo {
   // node quota and was placed on nodes nobody with a quota claim wanted, so it
   // is reclaimable if such a job needs them.
   bool idle_fill = 80;
+
+  // Why the run ended, from accounting history only; empty on live job
+  // queries and on rows written before this field existed.
+  string end_reason = 81;
+  string end_reason_detail = 82;
+  // Who cancelled the run, for a cancel reason only. Blank unless the caller
+  // may read the audit log.
+  string ended_by = 83;
+  optional uint32 ended_by_uid = 84;
+
+  // Live view of who acted on the job. `last_requeue` is "Failure", "Preempt"
+  // or "Admin"; the user names are blank unless the caller may read the audit
+  // log.
+  string suspended_by = 85;
+  string last_requeue = 86;
+  string last_requeue_by = 87;
 }
 
 message NodeInfo {

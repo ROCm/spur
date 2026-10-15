@@ -19,7 +19,7 @@ use spur_proto::proto::{
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
-use crate::cluster::{ClusterManager, JobFilter};
+use crate::cluster::{ClusterManager, JobEndFacts, JobFilter};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 
@@ -440,7 +440,7 @@ async fn process_assignment(
                 "PrologSlurmctld failed"
             );
             if job.spec.interactive {
-                if let Err(ce) = cluster.cancel_job(assignment.job_id, &job.spec.user) {
+                if let Err(ce) = cluster.cancel_job_as_system(assignment.job_id) {
                     error!(job_id = assignment.job_id, error = %ce, "failed to cancel job after PrologSlurmctld failure");
                 }
             } else if let Err(re) = cluster.requeue_job(assignment.job_id) {
@@ -2120,7 +2120,7 @@ fn settle_prolog_failures(
         return false;
     }
     if spec.interactive || spec.srun_job {
-        if let Err(e) = cluster.cancel_job(job_id, &spec.user) {
+        if let Err(e) = cluster.cancel_job_as_system(job_id) {
             error!(job_id, error = %e, "failed to cancel client-attached job after prolog failure");
         }
     } else if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(detail), run_attempt) {
@@ -2947,6 +2947,7 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         }
     }
 
+    let unreported_nodes = missing.clone();
     if !missing.is_empty() {
         let cluster = cluster.clone();
         let job_id = job.job_id;
@@ -2963,7 +2964,15 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         "completing timeout expired — force-finishing job"
     );
 
-    if let Err(e) = cluster.complete_job(job.job_id, exit_code, state) {
+    if let Err(e) = cluster.complete_job_with(
+        job.job_id,
+        exit_code,
+        state,
+        JobEndFacts {
+            unreported_nodes,
+            ..Default::default()
+        },
+    ) {
         warn!(
             job_id = job.job_id,
             error = %e,
@@ -5189,6 +5198,10 @@ mod tests {
 
             let job = cm.get_job(job_id).unwrap();
             force_finish_completing_job(&cm, &job).await;
+            assert_eq!(
+                cm.get_job(job_id).unwrap().unreported_nodes,
+                vec!["n2".to_string()]
+            );
 
             wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
             assert_eq!(

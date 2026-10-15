@@ -113,12 +113,24 @@ fn require_admin_identity(
     cache: Option<&crate::association_cache::AssociationCache>,
     op: &str,
 ) -> Result<(), Status> {
-    let denied = || {
-        spur_core::native_metrics::inc_role_deny();
-        Status::permission_denied(format!("{op} requires cluster operator or administrator"))
-    };
-    let Some(id) = identity else {
+    if identity_operates_jobs(identity, auth, cache) {
         return Ok(());
+    }
+    spur_core::native_metrics::inc_role_deny();
+    Err(Status::permission_denied(format!(
+        "{op} requires cluster operator or administrator"
+    )))
+}
+
+/// The role check behind `require_admin_identity`, with no deny metric, for
+/// callers that only trim what they return. Anonymous passes.
+fn identity_operates_jobs(
+    identity: Option<&spur_core::auth::Identity>,
+    auth: &spur_core::config::AuthConfig,
+    cache: Option<&crate::association_cache::AssociationCache>,
+) -> bool {
+    let Some(id) = identity else {
+        return true;
     };
     let (level, loaded) = match cache {
         Some(cache) => (cache.admin_level(&id.user), cache.is_loaded()),
@@ -129,12 +141,8 @@ fn require_admin_identity(
     } else {
         spur_core::privilege::named_user_groups(&id.user).unwrap_or_default()
     };
-    let role = spur_core::rbac::resolve_role(id, auth, level.as_deref(), loaded, &groups, false);
-    if role.operates_jobs() {
-        Ok(())
-    } else {
-        Err(denied())
-    }
+    spur_core::rbac::resolve_role(id, auth, level.as_deref(), loaded, &groups, false)
+        .operates_jobs()
 }
 
 /// The accounting gRPC service. The pool is held behind a shared, swappable
@@ -220,6 +228,18 @@ impl AccountingService {
             &auth,
             assoc.as_ref().map(std::sync::Arc::as_ref),
             op,
+        )
+    }
+
+    /// Whether this caller may see who acted on a job, the same audience as
+    /// `get_transactions`.
+    fn may_see_actors<T>(&self, request: &Request<T>) -> bool {
+        let auth = self.inner.auth.read();
+        let assoc = self.inner.assoc.read();
+        identity_operates_jobs(
+            request.extensions().get::<spur_core::auth::Identity>(),
+            &auth,
+            assoc.as_ref().map(std::sync::Arc::as_ref),
         )
     }
 
@@ -340,15 +360,21 @@ impl SlurmAccounting for AccountingService {
             .map_err(|e| Status::internal(e.to_string()))?;
         db::record_job_end(
             &mut tx,
-            req.job_id,
-            state_str,
-            req.exit_code,
-            end_time,
-            req.exit_signal,
-            req.derived_exit_code,
-            None,
-            "",
-            "",
+            &db::JobEndRecord {
+                job_id: req.job_id,
+                state: state_str.to_string(),
+                exit_code: req.exit_code,
+                end_time,
+                exit_signal: req.exit_signal,
+                derived_exit_code: req.derived_exit_code,
+                preempted_by: None,
+                preempt_mode: String::new(),
+                preempt_qos: String::new(),
+                reason: None,
+                reason_detail: String::new(),
+                ended_by: String::new(),
+                ended_by_uid: None,
+            },
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -365,6 +391,7 @@ impl SlurmAccounting for AccountingService {
     ) -> Result<Response<GetJobHistoryResponse>, Status> {
         let pool = self.pool()?;
         let pool = &pool;
+        let show_actors = self.may_see_actors(&request);
         let req = request.into_inner();
 
         let start_after = timestamp_to_utc(req.start_after)?;
@@ -450,6 +477,18 @@ impl SlurmAccounting for AccountingService {
                 preempt_mode: r.preempt_mode.clone(),
                 preempt_qos: r.preempt_qos.clone(),
                 idle_fill: r.idle_fill,
+                end_reason: r.reason.clone(),
+                end_reason_detail: r.reason_detail.clone(),
+                ended_by: if show_actors {
+                    r.ended_by.clone()
+                } else {
+                    String::new()
+                },
+                ended_by_uid: r.ended_by_uid.filter(|_| show_actors),
+                // Live-only: a finished row has no current suspend or requeue.
+                suspended_by: String::new(),
+                last_requeue: String::new(),
+                last_requeue_by: String::new(),
                 // Kept exhaustive so a new JobInfo field forces a decision here;
                 // the accounting store has no requested-placement columns.
                 req_nodelist: String::new(),
@@ -1364,6 +1403,20 @@ mod tests {
 
         let anon = Request::new(AddUserRequest::default());
         assert!(service.require_admin(&anon, "add user").is_ok());
+    }
+
+    #[test]
+    fn only_the_audit_log_audience_sees_who_ended_a_job() {
+        let service = AccountingService::unavailable("no DB needed for this test");
+        let mut admin = Request::new(GetJobHistoryRequest::default());
+        admin.extensions_mut().insert(identity("root", true));
+        assert!(service.may_see_actors(&admin));
+
+        let mut user = Request::new(GetJobHistoryRequest::default());
+        user.extensions_mut().insert(identity("mallory", false));
+        assert!(!service.may_see_actors(&user));
+
+        assert!(service.may_see_actors(&Request::new(GetJobHistoryRequest::default())));
     }
 
     #[test]

@@ -67,6 +67,12 @@ pub enum WalOperation {
         job_id: JobId,
         exit_code: i32,
         state: JobState,
+        /// Allocated nodes that never reported, set only when the controller
+        /// force-finishes a completing run.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unreported_nodes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::end_reason::CancelProvenance>,
     },
     JobNodeComplete {
         job_id: JobId,
@@ -88,6 +94,8 @@ pub enum WalOperation {
     JobCancelSignaled {
         job_id: JobId,
         at: chrono::DateTime<chrono::Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancel: Option<crate::end_reason::CancelProvenance>,
     },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
@@ -185,6 +193,8 @@ pub enum WalOperation {
         hold: bool,
         #[serde(default)]
         begin_time: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<crate::end_reason::Actor>,
     },
     JobSuspend {
         job_id: JobId,
@@ -197,6 +207,8 @@ pub enum WalOperation {
         preempted_by: Option<JobId>,
         #[serde(default)]
         preempt_qos: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<crate::end_reason::Actor>,
     },
     JobResume {
         job_id: JobId,
@@ -373,6 +385,26 @@ pub enum WalOperation {
 }
 
 impl WalOperation {
+    pub fn job_complete(job_id: JobId, exit_code: i32, state: JobState) -> Self {
+        Self::JobComplete {
+            job_id,
+            exit_code,
+            state,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+        }
+    }
+
+    pub fn job_cancelled(job_id: JobId, cancel: crate::end_reason::CancelProvenance) -> Self {
+        Self::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Cancelled,
+            unreported_nodes: Vec::new(),
+            cancel: Some(cancel),
+        }
+    }
+
     pub fn job_state_change(job_id: JobId, old_state: JobState, new_state: JobState) -> Self {
         Self::JobStateChange {
             job_id,
@@ -1273,6 +1305,7 @@ mod suspend_wal_tests {
                 job_id: 42,
                 hold,
                 begin_time,
+                by: None,
             };
             let json = serde_json::to_string(&op).unwrap();
             let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1281,6 +1314,7 @@ mod suspend_wal_tests {
                     job_id,
                     hold: got_hold,
                     begin_time: got_begin,
+                    ..
                 } => {
                     assert_eq!(job_id, 42);
                     assert_eq!(got_hold, hold);
@@ -1302,10 +1336,12 @@ mod suspend_wal_tests {
                 job_id,
                 hold,
                 begin_time,
+                by,
             } => {
                 assert_eq!(job_id, 7);
                 assert!(!hold);
                 assert_eq!(begin_time, None);
+                assert_eq!(by, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1320,6 +1356,7 @@ mod suspend_wal_tests {
                 at,
                 preempted_by: None,
                 preempt_qos: None,
+                by: None,
             },
             WalOperation::JobResume { job_id: 7, at },
         ] {
@@ -1380,19 +1417,72 @@ mod suspend_wal_tests {
     #[test]
     fn job_cancel_signaled_op_round_trips() {
         let at = chrono::Utc::now();
-        let op = WalOperation::JobCancelSignaled { job_id: 21, at };
+        let op = WalOperation::JobCancelSignaled {
+            job_id: 21,
+            at,
+            cancel: None,
+        };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobCancelSignaled {
                 job_id,
                 at: at_back,
+                ..
             } => {
                 assert_eq!(job_id, 21);
                 assert_eq!(at_back, at);
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn a_job_complete_written_before_unreported_nodes_existed_still_replays() {
+        let old = r#"{"JobComplete":{"job_id":5,"exit_code":1,"state":"FAILED"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobComplete { job_id: 5, ref unreported_nodes, .. }
+                if unreported_nodes.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_cancel_signal_written_before_provenance_existed_still_replays() {
+        let old = r#"{"JobCancelSignaled":{"job_id":5,"at":"2026-10-13T00:00:00Z"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobCancelSignaled {
+                job_id: 5,
+                cancel: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_suspend_written_before_the_actor_existed_still_replays() {
+        let old = r#"{"JobSuspend":{"job_id":5,"at":"2026-10-13T00:00:00Z"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobSuspend {
+                job_id: 5,
+                by: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_job_complete_serializes_as_before() {
+        let op = WalOperation::job_complete(5, 1, JobState::Failed);
+        assert_eq!(
+            serde_json::to_string(&op).unwrap(),
+            r#"{"JobComplete":{"job_id":5,"exit_code":1,"state":"FAILED"}}"#
+        );
     }
 }
 

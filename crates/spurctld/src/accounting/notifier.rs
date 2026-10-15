@@ -4,13 +4,10 @@
 use std::future::Future;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::error;
 
-use spur_core::job::{JobId, JobState};
-
-use super::db::JobStartRecord;
+use super::db::{JobEndRecord, JobStartRecord};
 use super::txn::{TxnOutcome, TxnRecord};
 
 const RETRY_ATTEMPTS: u32 = 3;
@@ -139,40 +136,16 @@ impl AccountingNotifier {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn notify_job_end(
-        &self,
-        job_id: JobId,
-        state: JobState,
-        exit_code: i32,
-        end_time: DateTime<Utc>,
-        exit_signal: i32,
-        derived_exit_code: i32,
-        preempted_by: Option<JobId>,
-        preempt_mode: Option<String>,
-        preempt_qos: Option<String>,
-    ) {
+    pub fn notify_job_end(&self, record: JobEndRecord) {
         let pool = self.pool.clone();
-        let state_str = state.display().to_owned();
+        let job_id = record.job_id;
         let inflight = self.inflight.clone();
         inflight.enter();
         tokio::spawn(async move {
             let _guard = InFlightGuard(inflight);
             let write = || async {
                 let mut tx = pool.begin().await?;
-                super::db::record_job_end(
-                    &mut tx,
-                    job_id,
-                    &state_str,
-                    exit_code,
-                    end_time,
-                    exit_signal,
-                    derived_exit_code,
-                    preempted_by,
-                    preempt_mode.as_deref().unwrap_or(""),
-                    preempt_qos.as_deref().unwrap_or(""),
-                )
-                .await?;
+                super::db::record_job_end(&mut tx, &record).await?;
                 tx.commit().await?;
                 Ok(())
             };
