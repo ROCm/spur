@@ -361,3 +361,14 @@ mpirun
 Mpirun
 PRRTE
 PRRTE's
+ArgoCD
+CEL
+DRA
+DeviceClass
+DeviceConfig
+GitOps
+KServe
+PCI
+ResourceSlice
+gpu
+unshareable
