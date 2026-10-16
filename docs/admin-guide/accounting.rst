@@ -531,7 +531,12 @@ QOS keys
      - TRES cap across all of one user's jobs under this QOS.
    * - ``grptres``
      - ``""``
-     - Aggregate TRES cap across all jobs under this QOS.
+     - Aggregate TRES cap across all jobs under this QOS. Counted against running
+       jobs and the jobs starting in the same scheduling pass. A pending job that
+       fits the cap but cannot be placed yet, for example because it waits for a
+       busy node, keeps its place in the queue but does not hold the rest of the
+       cap from lower-priority jobs that can start now. The same applies to an
+       account's ``grptres``.
    * - ``grpwall``
      - unset (no limit)
      - Aggregate wall-clock budget across all jobs under this QOS. A bare integer

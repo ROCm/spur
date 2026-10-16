@@ -595,15 +595,18 @@ fn gpu_ids_match(a: &[u64], b: &[u64]) -> bool {
     sa == sb
 }
 
-struct PendingJobClassification {
-    jobs: Vec<Job>,
+pub(crate) struct PendingJobClassification {
+    pub(crate) jobs: Vec<Job>,
     reason_updates: Vec<(JobId, PendingReason)>,
     bb_stage_candidates: Vec<JobId>,
     /// Jobs refused solely by their QOS group node cap that may run on capacity
     /// nobody with a claim wants. They are *not* in `jobs`: they keep reporting
     /// their real reason and are appended below every in-quota job at placement
     /// time (§5.1).
-    idle_fill_candidates: Vec<Job>,
+    pub(crate) idle_fill_candidates: Vec<Job>,
+    /// A QOS or account limit refused a job while earlier candidates held claims on
+    /// it, so a claim that never turns into a start may be what blocked it.
+    pub(crate) claims_blocked: bool,
 }
 
 /// Whether a QOS is holding more nodes than its group node cap allows, counting its
@@ -4361,8 +4364,24 @@ impl ClusterManager {
     /// in its own right: the caller appends them below every in-quota job, and only
     /// after deriving the node set and depth-limit metric from the in-quota list
     /// alone (§5.3, D16).
+    #[cfg(test)]
     pub fn pending_jobs_with_idle_fill_candidates(&self) -> (Vec<Job>, Vec<Job>) {
-        let classification = self.classify_pending_jobs();
+        self.apply_classification(self.classify_pending_jobs())
+    }
+
+    /// One classification for the scheduler loop, without side effects. Jobs in
+    /// `unclaimed` stay candidates, so placement still reserves their future slot,
+    /// but take no QOS or account headroom from the jobs behind them.
+    pub(crate) fn classify_for_pass(&self, unclaimed: &HashSet<JobId>) -> PendingJobClassification {
+        self.classify_pending_jobs_with(unclaimed)
+    }
+
+    /// Apply a classification's reasons, stage-in and evaluation stamps, and return
+    /// its in-quota jobs and borrow candidates.
+    pub(crate) fn apply_classification(
+        &self,
+        classification: PendingJobClassification,
+    ) -> (Vec<Job>, Vec<Job>) {
         let evaluated: Vec<JobId> = classification
             .jobs
             .iter()
@@ -4394,6 +4413,10 @@ impl ClusterManager {
     }
 
     fn classify_pending_jobs(&self) -> PendingJobClassification {
+        self.classify_pending_jobs_with(&HashSet::new())
+    }
+
+    fn classify_pending_jobs_with(&self, unclaimed: &HashSet<JobId>) -> PendingJobClassification {
         let jobs = self.jobs.read();
         let now = Utc::now();
         let running_array_counts = running_array_counts(&jobs);
@@ -4535,8 +4558,10 @@ impl ClusterManager {
             .map(|candidate| (candidate.job.job_id, self.resolve_qos(&candidate.job)))
             .collect();
 
+        let mut claims_blocked = false;
         {
             let mut reserved = PassReservations::default();
+            let mut claimed_any = false;
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
             // An unplaceable job must not reserve grp-node quota it never uses.
@@ -4578,7 +4603,10 @@ impl ClusterManager {
                     &reserved,
                 ) {
                     Ok(admitted) => admitted,
-                    Err(reason) => return GateOutcome::Block(reason),
+                    Err(reason) => {
+                        claims_blocked |= claimed_any;
+                        return GateOutcome::Block(reason);
+                    }
                 };
                 let consumed_wall = job
                     .spec
@@ -4595,6 +4623,7 @@ impl ClusterManager {
                 ) {
                     Ok(charge) => charge,
                     Err(blocked) => {
+                        claims_blocked |= claimed_any;
                         // The ceiling is consulted here, at the moment a new borrow
                         // would be admitted, which is what keeps it one-directional:
                         // lowering it denies the next loan without disturbing runs
@@ -4642,7 +4671,10 @@ impl ClusterManager {
                         return GateOutcome::Block(blocked.reason);
                     }
                 };
-                reserved.reserve(job, qos_charge, admitted.charge);
+                if !unclaimed.contains(&job.job_id) {
+                    reserved.reserve(job, qos_charge, admitted.charge);
+                    claimed_any = true;
+                }
                 GateOutcome::Keep
             });
 
@@ -4733,6 +4765,7 @@ impl ClusterManager {
             reason_updates,
             bb_stage_candidates,
             idle_fill_candidates,
+            claims_blocked,
         }
     }
 
@@ -21814,6 +21847,115 @@ mod tests {
             "placement must land on an already-occupied node (n1/n2), not the idle n3: {:?}",
             assignment.nodes
         );
+    }
+
+    /// Three nodes under a QOS capped at `node=cap`, with a job of that QOS
+    /// running on n1 and filling it, so n1 is eligible but not free now.
+    async fn grp_node_cluster(dir: &TempDir, cap: u64) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        for n in ["n1", "n2", "n3"] {
+            register_node(&cm, n, 8, 128000);
+        }
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, cap);
+        cm.qos_cache().insert(Qos {
+            name: "pool".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut running = make_running_job(100, &["n1"], 8);
+        running.spec.qos = Some("pool".into());
+        cm.jobs.write().insert(100, running);
+        cm.nodes
+            .write()
+            .get_mut("n1")
+            .expect("n1 registered")
+            .alloc_resources
+            .cpus = 8;
+        cm
+    }
+
+    fn pool_job(name: &str, nodes: u32, nodelist: Option<&str>) -> JobSpec {
+        let mut spec = basic_spec(name);
+        spec.qos = Some("pool".into());
+        spec.num_nodes = nodes;
+        spec.num_tasks = nodes;
+        spec.exclusive = true;
+        spec.nodelist = nodelist.map(str::to_string);
+        spec
+    }
+
+    fn place(cm: &ClusterManager, pending: &[Job]) -> Vec<JobId> {
+        use spur_sched::traits::Scheduler as _;
+        let (nodes, partitions, reservations) =
+            (cm.get_nodes(), cm.get_partitions(), cm.get_reservations());
+        let state = spur_sched::traits::ClusterState {
+            busy_until: &HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+        };
+        spur_sched::backfill::BackfillScheduler::new(10)
+            .schedule(pending, &state)
+            .into_iter()
+            .map(|a| a.job_id)
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_waiting_for_nodes_does_not_hold_grp_node_quota_from_jobs_that_can_start() {
+        // The reported shape: 1 of 3 nodes in use, yet a job that fits pends on
+        // QOSGrpNodeLimit because a higher-priority job claimed the rest of the cap
+        // and then could not be placed.
+        let dir = TempDir::new().unwrap();
+        let cm = grp_node_cluster(&dir, 3).await;
+        let waiting = submit_and_wait(&cm, pool_job("waits-for-n1", 2, Some("n1,n2")));
+        let fits = submit_and_wait(&cm, pool_job("fits-now", 1, None));
+
+        let single_pass: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            single_pass.contains(&waiting) && !single_pass.contains(&fits),
+            "one classification still charges the waiting job's claim: {single_pass:?}"
+        );
+
+        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
+        let (classification, unclaimed) =
+            crate::scheduler_loop::classify_without_phantom_claims(&cm, &mut scheduler, None);
+        let admitted: Vec<JobId> = classification.jobs.iter().map(|j| j.job_id).collect();
+        assert!(
+            admitted.contains(&waiting),
+            "it keeps its place and future slot"
+        );
+        assert!(admitted.contains(&fits), "{admitted:?}");
+        assert_eq!(unclaimed, HashSet::from([waiting]));
+
+        let started = place(&cm, &classification.jobs);
+        assert!(started.contains(&fits), "{started:?}");
+        assert!(!started.contains(&waiting));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jobs_that_can_all_start_still_cannot_go_over_the_grp_node_cap_together() {
+        let dir = TempDir::new().unwrap();
+        let cm = grp_node_cluster(&dir, 2).await;
+        let first = submit_and_wait(&cm, pool_job("first", 1, None));
+        let second = submit_and_wait(&cm, pool_job("second", 1, None));
+
+        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
+        let (classification, unclaimed) =
+            crate::scheduler_loop::classify_without_phantom_claims(&cm, &mut scheduler, None);
+        let admitted: Vec<JobId> = classification.jobs.iter().map(|j| j.job_id).collect();
+        assert_eq!(
+            admitted,
+            vec![first],
+            "only one more node fits under node=2"
+        );
+        assert!(unclaimed.is_empty());
+        assert!(!admitted.contains(&second));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
