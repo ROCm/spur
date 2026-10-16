@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};
@@ -90,7 +91,7 @@ async fn health_only_livez(State(raft): State<Arc<RaftHandle>>) -> Response {
 }
 
 async fn health_only_readyz(State(raft): State<Arc<RaftHandle>>) -> Response {
-    readiness(&raft)
+    readiness(&raft).await
 }
 
 /// Liveness: is this process still a working Raft node?
@@ -115,17 +116,31 @@ fn liveness(raft: &RaftHandle) -> Response {
 /// one cannot serve a read that means anything, and it must stay out of the
 /// Service until it has.
 async fn readyz(State(state): State<Arc<MetricsState>>) -> Response {
-    readiness(&state.raft)
+    readiness(&state.raft).await
 }
 
-fn readiness(raft: &RaftHandle) -> Response {
+/// Below the kubelet's default probe timeout of one second.
+const LEADER_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
+
+async fn readiness(raft: &RaftHandle) -> Response {
     if !raft.is_core_running() {
         return (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response();
     }
-    if raft.current_leader().is_none() {
+    let Some(leader) = raft.current_leader() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no leader elected\n").into_response();
+    };
+    // openraft keeps a leader that lost its quorum in the Leader state, so its
+    // cached view never clears; only a heartbeat round tells it that it cannot commit.
+    if leader == raft.node_id && !confirm_leadership(raft).await {
+        return (StatusCode::SERVICE_UNAVAILABLE, "leader has no quorum\n").into_response();
     }
     (StatusCode::OK, "ok\n").into_response()
+}
+
+async fn confirm_leadership(raft: &RaftHandle) -> bool {
+    tokio::time::timeout(LEADER_CONFIRM_TIMEOUT, raft.ensure_leader())
+        .await
+        .unwrap_or(false)
 }
 
 async fn metrics_jobs(State(state): State<Arc<MetricsState>>) -> Response {
@@ -215,7 +230,6 @@ fn metrics_response(body: String) -> Response {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::Duration;
 
     use axum::body::Body;
     use http_body_util::BodyExt;
@@ -641,6 +655,42 @@ mod tests {
         assert_eq!(live.status(), StatusCode::OK);
 
         // Not ready: it has no leader to answer for.
+        let ready = app
+            .oneshot(
+                axum::http::Request::get("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// openraft keeps a leader that lost its followers in the Leader state, so
+    /// `current_leader()` still names it. It cannot commit a write, so it must
+    /// not stay in the Service.
+    #[tokio::test]
+    async fn readyz_refuses_a_leader_that_lost_its_quorum() {
+        let dir = TempDir::new().unwrap();
+        let (leader, follower) = two_node_raft(&dir).await;
+        let app = Router::new()
+            .route("/readyz", get(health_only_readyz))
+            .with_state(leader.clone());
+
+        let ready = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        follower.raft.shutdown().await.unwrap();
+        assert_eq!(leader.current_leader(), Some(leader.node_id));
+
         let ready = app
             .oneshot(
                 axum::http::Request::get("/readyz")

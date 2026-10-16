@@ -984,7 +984,7 @@ Endpoints
    * - ``/readyz``
      - Live
      - Readiness. ``200`` when the Raft core runs AND this node knows a leader,
-       ``503`` otherwise.
+       and, on the leader, a quorum answers a heartbeat. ``503`` otherwise.
 
 Probe endpoints — ``/livez`` and ``/readyz``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -998,8 +998,11 @@ the port normally.
 also exits, see :ref:`the native-host deployment guide <spurctld-fatal-raft-error>`.
 
 ``/readyz`` adds a known leader, so a replica that cannot answer a read leaves
-the load balancer. Both are unauthenticated and carry no cluster data, which is
-what a kubelet probe needs.
+the load balancer. On the leader it also sends one heartbeat round and waits
+up to 500 ms for a quorum to answer. A leader that lost its followers keeps
+its leader role and cannot commit a write, so it must also leave the load
+balancer. Both are unauthenticated and carry no cluster data, which is what a
+kubelet probe needs.
 
 Both listen on their own port, ``6823``, set by ``probes.listen_addr``, and they
 bind every interface. They are also mounted on the metrics port for a local
