@@ -1042,6 +1042,15 @@ impl ControllerService {
     /// are untouched. Returns a warning string; `submit_job` surfaces it in the response, and
     /// `update_job` logs it (UpdateJob has no response field). Operates on the raw `Option<u32>` so
     /// submit and `scontrol update` share one policy — the ceiling can't be dodged by boosting later.
+    /// As in Slurm, a job's owner may shorten its time limit but only an operator may lengthen it;
+    /// otherwise an owner could run past the QOS `MaxWall` their limit was capped to at submit.
+    fn raises_time_limit(
+        current: Option<chrono::Duration>,
+        requested: Option<chrono::Duration>,
+    ) -> bool {
+        matches!((current, requested), (Some(current), Some(requested)) if requested > current)
+    }
+
     fn clamp_priority(
         priority: &mut Option<u32>,
         caller_is_privileged: bool,
@@ -1829,6 +1838,13 @@ impl SlurmController for ControllerService {
         }
 
         let time_limit = req.time_limit.map(|d| chrono::Duration::seconds(d.seconds));
+        let may_raise = caller_is_privileged || self.caller_is_operator(__identity.as_ref());
+        if !may_raise && Self::raises_time_limit(job.spec.time_limit, time_limit) {
+            return Err(Status::permission_denied(format!(
+                "only an operator can raise the time limit of job {}",
+                req.job_id
+            )));
+        }
 
         self.cluster
             .update_job(
@@ -9545,6 +9561,107 @@ mod tests {
         assert_eq!(
             svc.cluster.get_job(job_id).unwrap().spec.comment,
             Some("reviewed".into())
+        );
+    }
+
+    #[test]
+    fn only_a_longer_finite_limit_counts_as_a_raise() {
+        let mins = |m| Some(chrono::Duration::minutes(m));
+        assert!(ControllerService::raises_time_limit(mins(60), mins(61)));
+        assert!(!ControllerService::raises_time_limit(mins(60), mins(60)));
+        assert!(!ControllerService::raises_time_limit(mins(60), mins(30)));
+        assert!(!ControllerService::raises_time_limit(None, mins(30)));
+        assert!(!ControllerService::raises_time_limit(mins(60), None));
+    }
+
+    async fn job_with_time_limit(svc: &ControllerService, owner: &str, minutes: i64) -> u32 {
+        let job_id = running_job_owned_by(svc, owner).await;
+        svc.cluster
+            .update_job(
+                job_id,
+                Some(chrono::Duration::minutes(minutes)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        job_id
+    }
+
+    fn time_limit_update(
+        job_id: u32,
+        minutes: i64,
+        as_user: &str,
+        is_admin: bool,
+    ) -> Request<UpdateJobRequest> {
+        let mut req = Request::new(UpdateJobRequest {
+            job_id,
+            time_limit: Some(prost_types::Duration {
+                seconds: minutes * 60,
+                nanos: 0,
+            }),
+            user: as_user.into(),
+            ..Default::default()
+        });
+        req.extensions_mut().insert(spur_core::auth::Identity {
+            user: as_user.into(),
+            uid: 1001,
+            gid: 1001,
+            is_admin,
+            trusted_unix: false,
+        });
+        req
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_cannot_raise_their_jobs_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+
+        let err = svc
+            .update_job(time_limit_update(job_id, 2880, "ubuntu", false))
+            .await
+            .expect_err("an owner must not lengthen their own job's limit");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(60))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_can_shorten_their_jobs_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+
+        svc.update_job(time_limit_update(job_id, 30, "ubuntu", false))
+            .await
+            .expect("an owner may shorten their own job's limit");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(30))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admin_can_raise_a_jobs_time_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = job_with_time_limit(&svc, "ubuntu", 60).await;
+
+        svc.update_job(time_limit_update(job_id, 120, "root", true))
+            .await
+            .expect("an admin may lengthen any job's limit");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().spec.time_limit,
+            Some(chrono::Duration::minutes(120))
         );
     }
 

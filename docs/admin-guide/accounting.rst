@@ -628,7 +628,9 @@ applied over it.
    Jobs already running when this behaviour arrives keep the unbounded limit they
    were submitted with; the QOS cap applies to submissions from then on. To bound
    an existing job, set its limit directly with
-   ``scontrol update job <id> TimeLimit=<time>``.
+   ``scontrol update job <id> TimeLimit=<time>``. Only an operator or
+   administrator can lengthen a limit this way, so an owner cannot run past the
+   cap the QOS gave their job at submit.
 
 .. _limits-unreadable:
 
