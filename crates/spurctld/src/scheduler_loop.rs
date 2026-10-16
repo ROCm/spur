@@ -190,8 +190,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // stage candidates. Real agent-side data movement is a follow-up;
         // drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
-        // Held back for a full dispatch_timeout_secs after a leadership change:
-        // an RPC the old leader had in flight needs time to land or time out first.
+        // Held back for twice dispatch_timeout_secs after a leadership change so an old
+        // leader's in-flight RPC can land or time out; a backstop to the sweep's agent cancel.
         let leader_since = *leader_since_rx.borrow();
         if should_sweep_orphaned_placements(
             dispatch_deadline(&cluster),
@@ -651,6 +651,7 @@ async fn process_assignment(
     // has confirmed (LaunchJob for batch dispatch above, or
     // RegisterJobAllocation for the pure interactive case above that). The
     // placement itself is already in the log (see `reserve_placement` above).
+    // No tracker guard is held here: safe only because the orphan sweep runs in this same task.
     let start_result = cluster.activate_job(
         job_id,
         run_attempt,
@@ -2476,9 +2477,7 @@ async fn confirm_dispatch_on_nodes(
         ) {
             error!(job_id, "{detail}");
             let _ = cluster.set_job_launch_failure_detail(job_id, detail.clone());
-            // Left charged: a held job (priority 0) is not re-picked, so the
-            // slice sits idle until an operator releases it or
-            // `abort_orphaned_placements` reclaims it.
+            // The Held apply frees the reservation along with the hold.
             if let Err(e) = cluster.hold_job_for_launch_failure(job_id, Some(&detail), run_attempt)
             {
                 error!(job_id, error = %e, "failed to hold job for unsupported multi-node PMIx");
