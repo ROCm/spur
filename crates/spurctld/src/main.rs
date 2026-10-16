@@ -185,6 +185,24 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let raft_handle = Arc::new(handle);
+
+    // The health listener must be up before the wait below: the liveness
+    // probe has to answer while the node waits, or an orchestrator kills the
+    // node before an administrator can add it.
+    if config.probes.enabled {
+        let probes_addr = config.probes.effective_listen_addr()?;
+        let health_raft = raft_handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics_server::serve_probes(probes_addr, health_raft).await {
+                tracing::error!(error = %e, "probe server failed");
+            }
+        });
+    }
+
+    // The wait must come after the Raft server is up: a node outside the
+    // membership can only be added by a leader that can reach it.
+    raft_handle.wait_until_member().await;
+
     cluster.set_raft(raft_handle.raft.clone());
     crate::native_keys::install(
         &config.cluster_name,
@@ -427,6 +445,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         accounting: Default::default(),
         scheduler: Default::default(),
         auth: Default::default(),
+        probes: Default::default(),
         partitions: vec![spur_core::config::PartitionConfig {
             name: "default".into(),
             default: true,
