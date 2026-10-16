@@ -85,7 +85,7 @@ pub enum WalOperation {
         unreported_nodes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancel: Option<crate::end_reason::CancelProvenance>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobNodeComplete {
