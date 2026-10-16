@@ -378,3 +378,14 @@ NaN
 PromQL
 deduplication
 failovers
+ArgoCD
+CEL
+DRA
+DeviceClass
+DeviceConfig
+GitOps
+KServe
+PCI
+ResourceSlice
+gpu
+unshareable
