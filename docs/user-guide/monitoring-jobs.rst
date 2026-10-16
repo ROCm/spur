@@ -978,6 +978,42 @@ Endpoints
      - Planned
      - Per-user/per-account breakdown. Returns ``404`` until implemented, even
        with ``high_cardinality = true``.
+   * - ``/livez``
+     - Live
+     - Liveness. ``200`` while the Raft core runs, ``503`` when it has stopped.
+   * - ``/readyz``
+     - Live
+     - Readiness. ``200`` when the Raft core runs AND this node knows a leader,
+       and, on the leader, a quorum answers a heartbeat. ``503`` otherwise.
+
+Probe endpoints — ``/livez`` and ``/readyz``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use these to decide whether a controller is working. A TCP check on the gRPC
+port cannot: the Raft core is a task of its own, and when it stops the listener
+still accepts connections, so a controller that can replicate nothing answers
+the port normally.
+
+``/livez`` reports whether the Raft core runs. When the core stops, spurctld
+also exits, see :ref:`the native-host deployment guide <spurctld-fatal-raft-error>`.
+
+``/readyz`` adds a known leader, so a replica that cannot answer a read leaves
+the load balancer. On the leader it also sends one heartbeat round and waits
+up to 500 ms for a quorum to answer. A leader that lost its followers keeps
+its leader role and cannot commit a write, so it must also leave the load
+balancer. Both are unauthenticated and carry no cluster data, which is what a
+kubelet probe needs.
+
+Both listen on their own port, ``6823``, set by ``probes.listen_addr``, and they
+bind every interface. They are also mounted on the metrics port for a local
+check.
+
+.. important::
+
+   Configure the probe against port ``6823`` and not the metrics port. Metrics
+   bind to loopback by default and ``metrics.enabled`` can turn them off, so a
+   probe on that port answers nothing and every replica stays unready for good.
+   ``[probes]`` is separate for exactly this reason.
 
 Job metrics — ``/metrics/jobs``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

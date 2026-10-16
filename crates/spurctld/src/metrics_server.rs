@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{header, StatusCode};
@@ -56,6 +57,8 @@ pub async fn serve(
         .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
         .route("/metrics/auth", get(metrics_auth))
         .route("/metrics/audit", get(metrics_audit))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -63,6 +66,81 @@ pub async fn serve(
     info!(%bound, "metrics HTTP server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Start the probe HTTP server. Runs until the listener is closed.
+///
+/// A listener of its own, because an orchestrator must reach `/readyz` whatever
+/// the metrics settings say. `[metrics]` defaults to loopback and can be turned
+/// off; either one would make every replica fail its probe for good.
+pub async fn serve_probes(listen: SocketAddr, raft: Arc<RaftHandle>) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/livez", get(health_only_livez))
+        .route("/readyz", get(health_only_readyz))
+        .with_state(raft);
+
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let bound = listener.local_addr()?;
+    info!(%bound, "probe HTTP server listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn health_only_livez(State(raft): State<Arc<RaftHandle>>) -> Response {
+    liveness(&raft)
+}
+
+async fn health_only_readyz(State(raft): State<Arc<RaftHandle>>) -> Response {
+    readiness(&raft).await
+}
+
+/// Liveness: is this process still a working Raft node?
+///
+/// A TCP probe on the gRPC port cannot answer that: the listener accepts
+/// connections whatever Raft is doing.
+async fn livez(State(state): State<Arc<MetricsState>>) -> Response {
+    liveness(&state.raft)
+}
+
+fn liveness(raft: &RaftHandle) -> Response {
+    if raft.is_core_running() {
+        (StatusCode::OK, "ok\n").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response()
+    }
+}
+
+/// Readiness: may this replica take traffic?
+///
+/// Adds a known leader to the liveness check. A replica that has not yet found
+/// one cannot serve a read that means anything, and it must stay out of the
+/// Service until it has.
+async fn readyz(State(state): State<Arc<MetricsState>>) -> Response {
+    readiness(&state.raft).await
+}
+
+/// Below the kubelet's default probe timeout of one second.
+const LEADER_CONFIRM_TIMEOUT: Duration = Duration::from_millis(500);
+
+async fn readiness(raft: &RaftHandle) -> Response {
+    if !raft.is_core_running() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "raft core stopped\n").into_response();
+    }
+    let Some(leader) = raft.current_leader() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no leader elected\n").into_response();
+    };
+    // openraft keeps a leader that lost its quorum in the Leader state, so its
+    // cached view never clears; only a heartbeat round tells it that it cannot commit.
+    if leader == raft.node_id && !confirm_leadership(raft).await {
+        return (StatusCode::SERVICE_UNAVAILABLE, "leader has no quorum\n").into_response();
+    }
+    (StatusCode::OK, "ok\n").into_response()
+}
+
+async fn confirm_leadership(raft: &RaftHandle) -> bool {
+    tokio::time::timeout(LEADER_CONFIRM_TIMEOUT, raft.ensure_leader())
+        .await
+        .unwrap_or(false)
 }
 
 async fn metrics_jobs(State(state): State<Arc<MetricsState>>) -> Response {
@@ -152,7 +230,6 @@ fn metrics_response(body: String) -> Response {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::Duration;
 
     use axum::body::Body;
     use http_body_util::BodyExt;
@@ -205,6 +282,7 @@ mod tests {
             isolation: Default::default(),
             licenses: HashMap::new(),
             update: Default::default(),
+            probes: Default::default(),
             metrics: Default::default(),
             rest_api: Default::default(),
             hooks: Default::default(),
@@ -478,5 +556,149 @@ mod tests {
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             CONTENT_TYPE
         );
+    }
+
+    /// The probes must answer from Raft state. A running core with a leader is
+    /// both live and ready; a follower whose core is running is ready too,
+    /// because a follower serves reads and forwards writes.
+    #[tokio::test]
+    async fn livez_and_readyz_report_a_running_core() {
+        let dir = TempDir::new().unwrap();
+        let (leader, follower) = two_node_raft(&dir).await;
+
+        for handle in [&leader, &follower] {
+            assert!(handle.is_core_running(), "core must be running");
+            // current_leader is a cached value that a follower can briefly report
+            // as None between terms. Wait for the settled view rather than race it.
+            handle
+                .raft
+                .wait(Some(Duration::from_secs(10)))
+                .metrics(|m| m.current_leader.is_some(), "leader known to this node")
+                .await
+                .expect("both nodes must settle on a leader");
+            let state = Arc::new(MetricsState {
+                cluster: Arc::new(
+                    ClusterManager::new(test_config(), &dir.path().join("probe")).unwrap(),
+                ),
+                raft: handle.clone(),
+                rpc_stats: Arc::new(RpcStatsCollector::new()),
+                sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+            });
+            let app = Router::new()
+                .route("/livez", get(livez))
+                .route("/readyz", get(readyz))
+                .with_state(state);
+
+            let live = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get("/livez")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(live.status(), StatusCode::OK);
+
+            let ready = app
+                .oneshot(
+                    axum::http::Request::get("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(ready.status(), StatusCode::OK);
+        }
+    }
+
+    /// The whole point of the endpoint: a node with no leader is NOT ready, so
+    /// the Service stops sending it reads it cannot answer. A TCP probe on the
+    /// gRPC port reported such a node healthy.
+    #[tokio::test]
+    async fn readyz_refuses_while_no_leader_is_known() {
+        let dir = TempDir::new().unwrap();
+        // Two voters, only one started: no quorum, so no leader is ever elected.
+        let peers = vec!["[::1]:1".to_string(), "[::1]:2".to_string()];
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let handle = Arc::new(
+            crate::raft::start_raft(1, &peers, dir.path(), cm)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            handle.current_leader().is_none(),
+            "no leader without quorum"
+        );
+
+        let state = Arc::new(MetricsState {
+            cluster: Arc::new(ClusterManager::new(test_config(), &dir.path().join("c")).unwrap()),
+            raft: handle.clone(),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+        });
+        let app = Router::new()
+            .route("/livez", get(livez))
+            .route("/readyz", get(readyz))
+            .with_state(state);
+
+        // Live: the process and its core are fine.
+        let live = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/livez")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+
+        // Not ready: it has no leader to answer for.
+        let ready = app
+            .oneshot(
+                axum::http::Request::get("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// openraft keeps a leader that lost its followers in the Leader state, so
+    /// `current_leader()` still names it. It cannot commit a write, so it must
+    /// not stay in the Service.
+    #[tokio::test]
+    async fn readyz_refuses_a_leader_that_lost_its_quorum() {
+        let dir = TempDir::new().unwrap();
+        let (leader, follower) = two_node_raft(&dir).await;
+        let app = Router::new()
+            .route("/readyz", get(health_only_readyz))
+            .with_state(leader.clone());
+
+        let ready = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        follower.raft.shutdown().await.unwrap();
+        assert_eq!(leader.current_leader(), Some(leader.node_id));
+
+        let ready = app
+            .oneshot(
+                axum::http::Request::get("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
