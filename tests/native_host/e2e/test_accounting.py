@@ -789,6 +789,67 @@ class TestQosLimitReasons:
             for job_id in submitted:
                 c.scancel(job_id)
 
+    def test_a_job_waiting_for_nodes_holds_no_grp_node_quota_from_one_that_can_start(
+        self, accounting_cluster
+    ):
+        """A job that fits the grp node cap but is waiting for a busy node must not
+        hold the rest of the cap from a lower-priority job that can start now.
+
+        The reported production shape: 29 nodes running against a cap of 32 while
+        fresh jobs were refused with QOSGrpNodeLimit.
+        """
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("requires 2 nodes: one busy, one free")
+        first, second = c.node_names[0], c.node_names[1]
+
+        c.sacctmgr(["add", "qos", "name=waitcap", "grptres=node=3"])
+        time.sleep(15)
+
+        hold = c.write_file("waitcap-hold.sh", "#!/bin/bash\nsleep 900\n")
+        submitted = []
+
+        def submit(name, nodes, minutes, nodelist=None):
+            args = ["-J", name, "-N", str(nodes), "-n", str(nodes), "--exclusive",
+                    "-t", str(minutes), "-q", "waitcap"]
+            if nodelist:
+                args += ["-w", nodelist]
+            job_id = parse_job_id(c.sbatch(args + [hold]))
+            assert job_id is not None
+            submitted.append(job_id)
+            return job_id
+
+        try:
+            occupied = submit("wc-hold", 1, 30, first)
+            wait_job_state(c, occupied, "R", timeout=60)
+
+            # 1 + 2 nodes fits the cap of 3, but it needs the busy node, so it waits
+            # for the holder and is ahead of the next job in priority.
+            waiting = submit("wc-wait", 2, 10, f"{first},{second}")
+            time.sleep(10)
+            assert job_state(c.squeue_all(), waiting) == "PD", (
+                f"fixture needs the 2-node job waiting: {_reason(c, waiting)!r}"
+            )
+
+            # 1 node running against a cap of 3, on the free node, and short enough to
+            # finish before the waiting job could start, so nothing but a held claim
+            # can stop it.
+            legit = submit("wc-legit", 1, 5)
+            try:
+                wait_job_state(c, legit, "R", timeout=90)
+            except (AssertionError, TimeoutError) as exc:
+                raise AssertionError(
+                    f"a job waiting for nodes held grp node quota: {_reason(c, legit)!r}\n"
+                    f"{c.squeue(['-t', 'all', '-o', '%i %j %t %r'])}"
+                ) from exc
+            assert job_state(c.squeue_all(), occupied) == "R"
+            assert job_state(c.squeue_all(), waiting) == "PD", (
+                "the waiting job must keep waiting; only its quota claim was released"
+            )
+        finally:
+            for job_id in submitted:
+                c.scancel(job_id)
+
     def test_grp_node_cap_admits_job_packable_onto_already_used_nodes(self, accounting_cluster):
         # A QOS grp node=2 cap is fully occupied by two 1-cpu jobs pinned to
         # two of the three available nodes, each with plenty of spare CPU. A

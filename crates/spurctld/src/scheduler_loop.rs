@@ -323,7 +323,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
-        let (mut pending, idle_fill_candidates) = cluster.pending_jobs_with_idle_fill_candidates();
+        let (classification, unclaimed) =
+            classify_without_phantom_claims(&cluster, &mut scheduler, topology.as_ref());
+        let (mut pending, idle_fill_candidates) = cluster.apply_classification(classification);
         if pending.is_empty() && idle_fill_candidates.is_empty() {
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
@@ -517,6 +519,15 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let mut jobs_started_cycle = 0u64;
         let total_assignments = assignments.len();
         for (done, assignment) in assignments.into_iter().enumerate() {
+            // It took no quota this pass, so starting it could breach a cap. Placement
+            // cannot normally reach it: it failed with the same jobs ahead of it.
+            if unclaimed.contains(&assignment.job_id) {
+                warn!(
+                    job_id = assignment.job_id,
+                    "not starting a job that held no quota claim this pass"
+                );
+                continue;
+            }
             // `Assignment` carries no tier information, but this loop appended the
             // candidates, so results are tagged by job-ID membership rather than by
             // changing the scheduler's signature (§5.2).
@@ -940,6 +951,83 @@ pub(crate) fn compute_job_allocation(
 
 /// Real per-node "free again at" times derived from running jobs, so backfill
 /// doesn't fall back to a flat placeholder for every busy node.
+/// Classification rounds a pass may run to release claims that placement left unused.
+const MAX_CLAIM_ROUNDS: usize = 3;
+
+/// Classify for this pass so a job that is admitted but cannot be placed does not hold
+/// QOS or account headroom against the jobs behind it.
+///
+/// Admission charges each kept job's quota before placement, so jobs admitted together
+/// cannot breach a cap. When a cap then refused someone, placement is tried; jobs it
+/// could not start are reclassified as `unclaimed`. They stay candidates, so the final
+/// placement still reserves their future slot, but release their headroom.
+pub(crate) fn classify_without_phantom_claims(
+    cluster: &ClusterManager,
+    scheduler: &mut BackfillScheduler,
+    topology: Option<&spur_core::topology::TopologyTree>,
+) -> (
+    crate::cluster::PendingJobClassification,
+    HashSet<spur_core::job::JobId>,
+) {
+    let mut unclaimed = HashSet::new();
+    let mut classification = cluster.classify_for_pass(&unclaimed);
+    for _ in 1..MAX_CLAIM_ROUNDS {
+        if !classification.claims_blocked || classification.jobs.is_empty() {
+            break;
+        }
+        let placed = trial_placement(cluster, scheduler, topology, &classification);
+        let newly_unclaimed: Vec<_> = classification
+            .jobs
+            .iter()
+            .map(|job| job.job_id)
+            .filter(|id| !placed.contains(id) && !unclaimed.contains(id))
+            .collect();
+        if newly_unclaimed.is_empty() {
+            break;
+        }
+        unclaimed.extend(newly_unclaimed);
+        classification = cluster.classify_for_pass(&unclaimed);
+    }
+    (classification, unclaimed)
+}
+
+/// Which in-quota jobs this classification's placement would start now. Same inputs as
+/// the real pass, including borrow candidates at the tail; nothing is dispatched.
+fn trial_placement(
+    cluster: &ClusterManager,
+    scheduler: &mut BackfillScheduler,
+    topology: Option<&spur_core::topology::TopologyTree>,
+    classification: &crate::cluster::PendingJobClassification,
+) -> HashSet<spur_core::job::JobId> {
+    let nodes = cluster.nodes_off_dispatch_cooldown(&classification.jobs);
+    let partitions = cluster.get_partitions();
+    let reservations = cluster.get_reservations();
+    let busy_until = running_jobs_busy_until(cluster);
+    let state = ClusterState {
+        nodes: &nodes,
+        partitions: &partitions,
+        reservations: &reservations,
+        topology,
+        busy_until: &busy_until,
+    };
+    let mut list = classification.jobs.clone();
+    list.extend(
+        classification
+            .idle_fill_candidates
+            .iter()
+            .cloned()
+            .map(|mut job| {
+                job.idle_fill = true;
+                job
+            }),
+    );
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scheduler.schedule(&list, &state)
+    }))
+    .map(|assignments| assignments.into_iter().map(|a| a.job_id).collect())
+    .unwrap_or_default()
+}
+
 pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime<Utc>> {
     let running = cluster.get_jobs(&JobFilter {
         states: &[
