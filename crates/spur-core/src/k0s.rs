@@ -362,6 +362,57 @@ pub enum K0sRole {
     Single,
 }
 
+/// The Kubernetes Node name of the host `hostname`. k0s starts the kubelet
+/// without `--hostname-override`, and the kubelet lowercases the hostname.
+pub fn k8s_node_name(hostname: &str) -> String {
+    hostname.to_lowercase()
+}
+
+/// Whether `name` is a DNS-1123 label: 1 to 63 lowercase alphanumerics or
+/// `-`, starting and ending with an alphanumeric.
+pub fn is_dns1123_label(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let alnum = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    (1..=63).contains(&bytes.len())
+        && bytes.iter().all(|c| alnum(c) || *c == b'-')
+        && bytes.first().is_some_and(alnum)
+        && bytes.last().is_some_and(alnum)
+}
+
+#[cfg(test)]
+mod node_name_tests {
+    use super::*;
+
+    #[test]
+    fn node_name_is_the_lowercase_hostname() {
+        assert_eq!(k8s_node_name("GPU-Node-1"), "gpu-node-1");
+    }
+
+    #[test]
+    fn dns1123_label_accepts_node_names() {
+        for name in ["a", "gpu-node-1", "0node", &"a".repeat(63)] {
+            assert!(is_dns1123_label(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn dns1123_label_rejects_what_kubernetes_rejects() {
+        for name in [
+            "",
+            "-node",
+            "node-",
+            "Node",
+            "node.domain",
+            "node_1",
+            "node 1",
+            "nöde",
+            &"a".repeat(64),
+        ] {
+            assert!(!is_dns1123_label(name), "{name:?}");
+        }
+    }
+}
+
 /// Lifecycle phase of the SPUR-managed k0s cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
