@@ -7,6 +7,7 @@ Ansible
 apiserver
 AppArmor
 Apptainer
+ArgoCD
 artifactory
 auth
 autouse
@@ -22,6 +23,7 @@ BPF
 cAdvisor
 Cargo
 CDI
+CEL
 Ceph
 CFS
 cgroup
@@ -74,6 +76,8 @@ Deregister
 deserialize
 deserializes
 dev
+DeviceClass
+DeviceConfig
 dir
 distro
 DME
@@ -81,6 +85,7 @@ DNATs
 DNS
 Dockerfile
 DPX
+DRA
 drivable
 DRM
 DSN
@@ -108,8 +113,10 @@ gapped
 GDS
 GiB
 gid
+GitOps
 glibc
 goroutine
+gpu
 GPURawUsage
 GPU's
 GPUs
@@ -152,6 +159,7 @@ keepalive
 keepalives
 KFD
 konnectivity
+KServe
 kube
 kubeconfig
 kubectl
@@ -272,6 +280,7 @@ requeued
 requeues
 requeuing
 RESources
+ResourceSlice
 reStructuredText
 reweights
 RHEL
@@ -393,6 +402,7 @@ unioned
 unlaunched
 unschedulable
 unsets
+unshareable
 untrusted
 upsert
 upserts
