@@ -424,6 +424,14 @@ Flags:
    * - ``--noheader``
      - ``-n``
      - Omit the header line.
+   * - ``--parsable2``
+     - ``-P``
+     - Print fields ``|`` delimited, **without** a trailing ``|``: one header
+       line (none with ``-n``), no padding, no truncation.
+   * - ``--parsable``
+     - ``-p``
+     - As ``-P``, but every line ends with a trailing ``|``. When both are given,
+       the last one wins.
    * - ``--limit``
      -
      - Maximum rows to return. Default ``100``.

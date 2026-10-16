@@ -291,11 +291,6 @@ fn format_field(value: &str, field: &FormatField) -> String {
     }
 }
 
-/// Print a header row followed by a separator line (dashes under text, spaces under spaces).
-pub fn print_header(tokens: &[FormatToken]) {
-    OutputStyle::default().print_header(tokens);
-}
-
 /// Separator used by Slurm's `--parsable` family.
 const DELIMITER: char = '|';
 

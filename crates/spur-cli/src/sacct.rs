@@ -58,6 +58,14 @@ pub struct SacctArgs {
     #[arg(long)]
     pub noconvert: bool,
 
+    /// Output '|' delimited with a trailing '|'
+    #[arg(short = 'p', long, overrides_with = "parsable2")]
+    pub parsable: bool,
+
+    /// Output '|' delimited without a trailing '|'
+    #[arg(short = 'P', long, overrides_with = "parsable")]
+    pub parsable2: bool,
+
     /// Max records
     #[arg(long, default_value = "100")]
     pub limit: u32,
@@ -69,6 +77,20 @@ pub struct SacctArgs {
         default_value = "http://localhost:6817"
     )]
     pub controller: String,
+}
+
+impl SacctArgs {
+    fn output_style(&self) -> format_engine::OutputStyle {
+        let layout = if self.parsable2 {
+            format_engine::RowLayout::Delimited
+        } else if self.parsable {
+            format_engine::RowLayout::DelimitedTrailing
+        } else {
+            format_engine::RowLayout::Aligned
+        };
+
+        format_engine::OutputStyle::new(self.noheader, layout)
+    }
 }
 
 const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
@@ -145,6 +167,7 @@ pub async fn main() -> Result<()> {
 
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<SacctArgs>(&args);
+    let style = args.output_style();
 
     // -o/--format uses Slurm's comma-separated field-name syntax, not %-specifiers.
     let fields = if let Some(ref f) = args.format {
@@ -208,17 +231,24 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("failed to get job history")?;
 
     let jobs = response.into_inner().jobs;
-
-    if !args.noheader {
-        format_engine::print_header(&fields);
-    }
-
-    for job in &jobs {
-        let row = format_engine::format_row(&fields, &|spec| resolve_sacct_field(job, spec));
-        println!("{}", row);
+    for line in render(style, &fields, &jobs) {
+        println!("{line}");
     }
 
     Ok(())
+}
+
+fn render(
+    style: format_engine::OutputStyle,
+    fields: &[format_engine::FormatToken],
+    jobs: &[spur_proto::proto::JobInfo],
+) -> Vec<String> {
+    let mut lines = style.header_lines(fields);
+    lines.extend(
+        jobs.iter()
+            .map(|job| style.row(fields, &|spec| resolve_sacct_field(job, spec))),
+    );
+    lines
 }
 
 fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
@@ -557,6 +587,85 @@ mod tests {
         assert!(row.contains("42"));
         assert!(row.contains("train"));
         assert!(row.contains("gpu"));
+    }
+
+    fn coco_fields() -> Vec<format_engine::FormatToken> {
+        format_engine::parse_named_format(
+            "JobID,State,ExitCode,NodeList",
+            &sacct_field_spec,
+            &sacct_header,
+        )
+    }
+
+    fn history() -> Vec<JobInfo> {
+        vec![
+            JobInfo {
+                job_id: 34,
+                state: JobState::JobTimeout as i32,
+                exit_code: 143,
+                nodelist: "node1".into(),
+                ..Default::default()
+            },
+            JobInfo {
+                job_id: 35,
+                state: JobState::JobCancelled as i32,
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn render_with(flags: &[&str]) -> Vec<String> {
+        let args = SacctArgs::try_parse_from(std::iter::once("sacct").chain(flags.iter().copied()))
+            .unwrap();
+        render(args.output_style(), &coco_fields(), &history())
+    }
+
+    #[test]
+    fn parsable2_is_pipe_delimited_with_no_trailing_pipe() {
+        let expected = [
+            "JobID|State|ExitCode|NodeList",
+            "34|TIMEOUT|143:0|node1",
+            "35|CANCELLED|0:0|",
+        ];
+        assert_eq!(render_with(&["-P"]), expected);
+        assert_eq!(render_with(&["--parsable2"]), expected);
+    }
+
+    #[test]
+    fn parsable_ends_every_line_with_a_pipe() {
+        let expected = [
+            "JobID|State|ExitCode|NodeList|",
+            "34|TIMEOUT|143:0|node1|",
+            "35|CANCELLED|0:0||",
+        ];
+        assert_eq!(render_with(&["-p"]), expected);
+        assert_eq!(render_with(&["--parsable"]), expected);
+    }
+
+    #[test]
+    fn noheader_drops_the_parsable_header_line() {
+        assert_eq!(
+            render_with(&["-n", "-P"]),
+            ["34|TIMEOUT|143:0|node1", "35|CANCELLED|0:0|"]
+        );
+    }
+
+    #[test]
+    fn the_last_parsable_flag_wins_as_in_slurm() {
+        assert_eq!(render_with(&["-p", "-P"]), render_with(&["-P"]));
+        assert_eq!(render_with(&["-P", "-p"]), render_with(&["-p"]));
+        assert_eq!(
+            render_with(&["--parsable2", "--parsable"]),
+            render_with(&["-p"])
+        );
+    }
+
+    #[test]
+    fn without_a_parsable_flag_the_table_stays_aligned() {
+        let lines = render_with(&[]);
+        assert_eq!(lines.len(), 4, "header, rule, two rows: {lines:?}");
+        assert!(lines.iter().all(|l| !l.contains('|')), "{lines:?}");
+        assert!(lines[1].starts_with("-----"), "{lines:?}");
     }
 
     #[tokio::test]
