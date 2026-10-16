@@ -1795,6 +1795,7 @@ impl SlurmController for ControllerService {
                     ("account", req.account.clone().map(Into::into)),
                     ("priority", req.priority.map(Into::into)),
                     ("comment", req.comment.clone().map(Into::into)),
+                    ("exclude", req.exclude.clone().map(Into::into)),
                 ]),
             )
             .asserted_actor(&req.user),
@@ -1854,6 +1855,7 @@ impl SlurmController for ControllerService {
                 req.comment,
                 req.account,
                 req.qos,
+                req.exclude,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 

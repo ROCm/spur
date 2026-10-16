@@ -1200,12 +1200,27 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
-``Account=``, ``Comment=``, and ``QOS=``. Node updates need ``NodeName=`` and
-accept ``State=`` and ``Reason=``.
+``Account=``, ``Comment=``, ``QOS=``, and ``ExcNodeList=`` (also spelled
+``ExcludedNodes=``). Node updates need ``NodeName=`` and accept ``State=`` and
+``Reason=``.
+
+``ExcNodeList=`` takes a hostlist expression and replaces the job's excluded
+nodes, the list ``sbatch -x`` sets; an empty value clears it. It applies only
+while the job is pending and not yet being started on nodes the scheduler has
+already reserved for it, and the next scheduling pass honors it. Use it to keep
+queued jobs off a node you have just found to be bad.
+
+The whole request is rejected, with a non-zero exit and nothing changed, if any
+key is unknown or belongs to the other kind of update (``State=`` on a job,
+``TimeLimit=`` beside ``NodeName=``), any value is malformed, or a job update
+names no field to change. ``TimeLimit=UNLIMITED``, which Slurm accepts, is
+refused: give an explicit limit.
 
 .. code-block:: bash
 
    scontrol update JobId=1024 TimeLimit=2:00:00 Priority=100
+   scontrol update JobId=1024 ExcNodeList=node[07-08]
+   scontrol update JobId=1024 ExcNodeList=        # clear the exclusions
    scontrol update NodeName=node01 State=drain Reason="maintenance"
 
 See Also

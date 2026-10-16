@@ -660,6 +660,7 @@ message UpdateJobRequest {
   optional string comment = 7;
   optional string qos = 8;
   string user = 9;   // Requesting user; verified identity must own the job; the controller/admin credential overrides
+  optional string exclude = 10;  // Hostlist expression replacing the job's excluded nodes; "" clears. Pending jobs only.
 }
 
 message RequeueJobRequest {

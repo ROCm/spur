@@ -560,6 +560,9 @@ pub struct ClusterManager {
     /// sweep can tell an abandoned reservation from one still being dispatched.
     /// Leader-local, never persisted: a new leader has issued no launches yet.
     dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
+    /// Serializes `reserve_placement` with excluded-node updates, so an update either
+    /// lands before a reservation (which then honors it) or is refused after one.
+    placement_gate: parking_lot::Mutex<()>,
 }
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
@@ -845,6 +848,7 @@ impl ClusterManager {
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
+            placement_gate: parking_lot::Mutex::new(()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -2080,6 +2084,7 @@ impl ClusterManager {
                 );
             }
         }
+        let _gate = self.placement_gate.lock();
         let run_attempt = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -2092,6 +2097,14 @@ impl ClusterManager {
             // node's charge and collide two runs onto the same run_attempt.
             if job.holds_a_placement() {
                 anyhow::bail!("job {} already holds a placement", job_id);
+            }
+            // The caller chose these nodes from an earlier snapshot; an exclusion set
+            // since then must still win.
+            if let Some(excluded) = job.spec.exclude.as_deref().filter(|e| !e.is_empty()) {
+                let excluded = spur_sched::node_match::expand_hostlist_or_split(excluded);
+                if let Some(node) = node_names.iter().find(|n| excluded.contains(n)) {
+                    anyhow::bail!("job {job_id}: node {node} is now excluded");
+                }
             }
             job.run_attempt.saturating_add(1)
         };
@@ -3690,14 +3703,37 @@ impl ClusterManager {
         comment: Option<String>,
         account: Option<String>,
         qos: Option<String>,
+        exclude: Option<String>,
     ) -> anyhow::Result<()> {
-        let (job_user, job_account) = {
+        // Held to the end so the placement check below stays true until the exclusion
+        // is written; `reserve_placement` takes the same gate.
+        let _gate = exclude.is_some().then(|| self.placement_gate.lock());
+        let (job_user, job_account, job_state, placed) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            (job.spec.user.clone(), job.spec.account.clone())
+            (
+                job.spec.user.clone(),
+                job.spec.account.clone(),
+                job.state,
+                job.holds_a_placement(),
+            )
         };
+
+        if exclude.is_some() {
+            if job_state != JobState::Pending {
+                anyhow::bail!(
+                    "job {job_id} is {}: excluded nodes can only be changed while it is pending",
+                    job_state.display()
+                );
+            }
+            if placed {
+                anyhow::bail!(
+                    "job {job_id} already has nodes reserved: excluded nodes can only be changed before placement"
+                );
+            }
+        }
 
         // Reject before mutating: an unknown QOS resolves to the limitless
         // default and an empty QOS clears enforcement — both reopen the bypass.
@@ -3807,6 +3843,9 @@ impl ClusterManager {
             }
             if let Some(q) = qos {
                 job.spec.qos = Some(q);
+            }
+            if let Some(ex) = exclude {
+                job.spec.exclude = (!ex.is_empty()).then_some(ex);
             }
         }
         info!(job_id, "job updated");
@@ -26372,12 +26411,147 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("prio"));
 
-        cm.update_job(id, None, Some(5000), None, None, None, None)
+        cm.update_job(id, None, Some(5000), None, None, None, None, None)
             .unwrap();
         wait_for("priority updated", || {
             cm.get_job(id).is_some_and(|j| j.priority == 5000)
         });
         assert_eq!(cm.get_job(id).unwrap().priority, 5000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_replaces_and_clears_excluded_nodes_on_a_pending_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("ex");
+        spec.exclude = Some("n9".into());
+        let id = submit_and_wait(&cm, spec);
+        cm.hold_job(id).unwrap();
+
+        cm.update_job(
+            id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("n[1-2]".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.exclude.as_deref(),
+            Some("n[1-2]")
+        );
+
+        cm.update_job(id, None, None, None, None, None, None, Some(String::new()))
+            .unwrap();
+        assert_eq!(cm.get_job(id).unwrap().spec.exclude, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_rejects_excluded_nodes_once_a_placement_is_reserved() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("reserved"));
+        let res = scalar_alloc(4, 8000);
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .unwrap();
+        wait_for("charged", || cm.get_job(id).unwrap().holds_a_placement());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Pending);
+
+        let err = cm
+            .update_job(id, None, None, None, None, None, None, Some("n1".into()))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already has nodes reserved"),
+            "{err}"
+        );
+        assert_eq!(cm.get_job(id).unwrap().spec.exclude, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_picked_before_an_exclusion_cannot_land_on_the_excluded_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("raced"));
+        let res = scalar_alloc(4, 8000);
+
+        cm.update_job(id, None, None, None, None, None, None, Some("n1".into()))
+            .unwrap();
+        let err = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("node n1 is now excluded"), "{err}");
+        assert!(!cm.get_job(id).unwrap().holds_a_placement());
+
+        cm.reserve_placement(
+            id,
+            vec!["n2".into()],
+            res.clone(),
+            per_node_for(&["n2"], res),
+            false,
+            false,
+        )
+        .expect("a node outside the exclusion still reserves");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_job_rejects_excluded_nodes_once_the_job_runs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("run"));
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        let err = cm
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                Some("set alongside".into()),
+                None,
+                None,
+                Some("n1".into()),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only be changed while it is pending"),
+            "{err}"
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.spec.exclude, None);
+        assert_eq!(
+            job.spec.comment, None,
+            "rejected before any field is applied"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -26395,7 +26569,7 @@ mod tests {
 
         // Unknown QOS rejected.
         let err = cm
-            .update_job(id, None, None, None, None, None, Some("ghost".into()))
+            .update_job(id, None, None, None, None, None, Some("ghost".into()), None)
             .unwrap_err();
         assert!(err.to_string().contains("QOS 'ghost' does not exist"));
         assert!(!err.to_string().contains("accounting may not be enabled"));
@@ -26403,14 +26577,23 @@ mod tests {
 
         // Empty QOS (clear-to-limitless) rejected.
         let err = cm
-            .update_job(id, None, None, None, None, None, Some(String::new()))
+            .update_job(id, None, None, None, None, None, Some(String::new()), None)
             .unwrap_err();
         assert!(err.to_string().contains("cannot clear a job's QOS"));
         assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
 
         // A valid QOS is applied.
-        cm.update_job(id, None, None, None, None, None, Some("highprio".into()))
-            .unwrap();
+        cm.update_job(
+            id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("highprio".into()),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             cm.get_job(id).unwrap().spec.qos.as_deref(),
             Some("highprio")
@@ -26425,7 +26608,16 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
 
         let err = cm
-            .update_job(id, None, None, None, None, None, Some("any-qos".into()))
+            .update_job(
+                id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("any-qos".into()),
+                None,
+            )
             .unwrap_err();
         assert!(err.to_string().contains("QOS 'any-qos' does not exist"));
         assert!(err.to_string().contains("accounting may not be enabled"));
@@ -26466,6 +26658,7 @@ mod tests {
                 None,
                 None,
                 Some("other-teams-qos".into()),
+                None,
             )
             .unwrap_err();
         assert!(err
@@ -26478,8 +26671,17 @@ mod tests {
         );
 
         // The association's own default QOS is still accepted explicitly.
-        cm.update_job(id, None, None, None, None, None, Some("highprio".into()))
-            .unwrap();
+        cm.update_job(
+            id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("highprio".into()),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             cm.get_job(id).unwrap().spec.qos.as_deref(),
             Some("highprio")
@@ -26514,6 +26716,7 @@ mod tests {
                 None,
                 Some("made-up-account".into()),
                 Some("other-teams-qos".into()),
+                None,
             )
             .unwrap_err();
         assert!(
@@ -26537,6 +26740,7 @@ mod tests {
                 None,
                 Some(String::new()),
                 Some("other-teams-qos".into()),
+                None,
             )
             .unwrap_err();
         assert!(
@@ -26567,7 +26771,7 @@ mod tests {
         spec.account = Some("research".into());
         let id = submit_and_wait(&cm, spec);
 
-        cm.update_job(id, None, None, None, None, None, Some("b".into()))
+        cm.update_job(id, None, None, None, None, None, Some("b".into()), None)
             .unwrap();
         assert_eq!(cm.get_job(id).unwrap().spec.qos.as_deref(), Some("b"));
 
@@ -26580,6 +26784,7 @@ mod tests {
                 None,
                 None,
                 Some("other-teams-qos".into()),
+                None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("is not permitted"));
