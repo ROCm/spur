@@ -393,9 +393,9 @@ impl NodeReporter {
             node_token,
         };
         let response = self
-            .with_controller(
-                move |mut client| async move { client.get_gpu_sharing_kubeconfig(req).await },
-            )
+            .with_controller(move |mut client| async move {
+                client.get_gpu_sharing_kubeconfig(req).await
+            })
             .await
             .context("GPU sharing kubeconfig request failed")?;
         Ok(response.kubeconfig)
