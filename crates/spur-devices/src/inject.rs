@@ -90,6 +90,9 @@ pub struct HostInjectionPlan {
     pub env: HashMap<String, String>,
     pub visible_devices: Vec<String>,
     pub device_paths: Vec<String>,
+    /// GPU ids whose device nodes `visible_devices` stages.
+    #[serde(default)]
+    pub gpu_ids: Vec<u32>,
 }
 
 /// Merge container edits and inject actions from resolved registry entries.
@@ -291,6 +294,7 @@ impl HostInjector {
         }
 
         apply_gpu_visibility(&mut plan.env, &edits.inject_actions, device_ids);
+        plan.gpu_ids = device_ids.to_vec();
 
         plan.visible_devices = edits
             .device_edits
@@ -594,6 +598,7 @@ mod tests {
             .device_paths
             .contains(&"/dev/dri/renderD129".to_string()));
         assert!(plan.device_paths.contains(&"/dev/kfd".to_string()));
+        assert_eq!(plan.gpu_ids, vec![0, 1]);
     }
 
     #[test]
