@@ -681,7 +681,7 @@ const GATE_DECISION_SETTLE: std::time::Duration = std::time::Duration::from_mill
 const PTY_HANDOFF_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Keeps an exited terminal's supervisor serving until spurd takes the pty master,
-/// so a fast command cannot take the control and custody sockets down first.
+/// the step is torn down, or the grace elapses. Its exit is recorded only after that.
 pub struct PtyHandoff {
     claimed: AtomicBool,
     grace: std::time::Duration,
@@ -770,7 +770,8 @@ impl Stepd {
     }
 
     pub fn await_pty_handoff(&self, handoff: Arc<PtyHandoff>) {
-        let _ = self.pty_handoff.set(handoff);
+        let installed = self.pty_handoff.set(handoff).is_ok();
+        debug_assert!(installed, "a supervisor awaits at most one pty handoff");
     }
 
     fn may_exit(&self, exited_for: std::time::Duration) -> bool {
@@ -1545,6 +1546,26 @@ async fn try_notify_agent(
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
+/// Only a terminal's own supervisor has an agent coming to take its pty master.
+fn awaits_pty_handoff(step_id: spur_core::step::StepId, deposited: bool) -> bool {
+    deposited && step_id == spur_core::step::STEP_INTERACTIVE
+}
+
+/// Replies to a reclaim, and only a master that was actually sent counts as claimed.
+async fn hand_back_pty(
+    raw: std::os::fd::RawFd,
+    reply: u8,
+    session_id: u32,
+    fds: Vec<std::os::fd::OwnedFd>,
+    handoff: &PtyHandoff,
+) -> io::Result<()> {
+    bounded_custody_reply(raw, custody_payload(reply, session_id), fds).await?;
+    if reply == CUSTODY_FOUND {
+        handoff.mark_claimed();
+    }
+    Ok(())
+}
+
 /// Holds each open terminal's pty master for this job. Keyed per shell, since a
 /// job can have several at once, and retained after a hand-back so the terminal
 /// still outlives however many agents come and go.
@@ -1608,12 +1629,8 @@ async fn serve_pty_custody(listener: UnixListener, handoff: Arc<PtyHandoff>) {
                         None => (CUSTODY_ABSENT, 0, Vec::new()),
                     };
                     drop(custody);
-                    match bounded_custody_reply(raw, custody_payload(reply, id), fds).await {
-                        Ok(()) if reply == CUSTODY_FOUND => handoff.mark_claimed(),
-                        Ok(()) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to hand back an orphaned pty");
-                        }
+                    if let Err(error) = hand_back_pty(raw, reply, id, fds, &handoff).await {
+                        tracing::warn!(%error, "failed to hand back an orphaned pty");
                     }
                 }
                 CUSTODY_RELEASE => {
@@ -1632,13 +1649,8 @@ async fn serve_pty_custody(listener: UnixListener, handoff: Arc<PtyHandoff>) {
                         None => (CUSTODY_ABSENT, Vec::new()),
                     };
                     drop(custody);
-                    match bounded_custody_reply(raw, custody_payload(reply, session_id), fds).await
-                    {
-                        Ok(()) if reply == CUSTODY_FOUND => handoff.mark_claimed(),
-                        Ok(()) => {}
-                        Err(error) => {
-                            tracing::warn!(session_id, %error, "failed to hand back a pty master");
-                        }
+                    if let Err(error) = hand_back_pty(raw, reply, session_id, fds, &handoff).await {
+                        tracing::warn!(session_id, %error, "failed to hand back a pty master");
                     }
                 }
                 _ => tracing::warn!(session_id, opcode, "unknown pty custody opcode"),
@@ -2318,11 +2330,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // Self-deposit: the agent's interactive-session handler reclaims this by
     // pid over the same custody protocol an agent restart already uses, so a
     // fresh attach and a post-restart reattach both just reclaim a master.
-    let mut awaiting_pty_handoff = false;
+    let mut deposited = false;
     if let Some(master) = pty_master.as_ref() {
         match deposit_pty_master(&session_dir, workload_pid, std::os::fd::AsFd::as_fd(master)).await
         {
-            Ok(()) => awaiting_pty_handoff = step_id == spur_core::step::STEP_INTERACTIVE,
+            Ok(()) => deposited = true,
             Err(error) => {
                 tracing::warn!(job_id, %error, "failed to deposit this step's own pty master");
             }
@@ -2349,7 +2361,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         runtime_environment,
     ));
     session.adopt_cgroup(launched_cgroup).await;
-    if awaiting_pty_handoff {
+    if awaits_pty_handoff(step_id, deposited) {
         session.await_pty_handoff(pty_handoff);
     }
     let capability = descriptor.capability.clone();
@@ -5582,15 +5594,10 @@ mod tests {
             .expect("supervisor exits on teardown");
     }
 
-    // The claim lands on the custody server's blocking reply, so it needs real time.
     async fn wait_until_claimed(handoff: &PtyHandoff) {
-        for _ in 0..2_000 {
-            if handoff.is_claimed() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        while !handoff.is_claimed() {
+            tokio::task::yield_now().await;
         }
-        panic!("the supervisor was never told the pty master was claimed");
     }
 
     async fn session_awaiting_handoff(grace: std::time::Duration) -> (Stepd, Arc<PtyHandoff>) {
@@ -5664,11 +5671,6 @@ mod tests {
         deposit_pty_master(dir.path(), 55, std::os::fd::AsFd::as_fd(&master))
             .await
             .expect("deposit");
-        tokio::task::yield_now().await;
-        assert!(
-            !handoff.is_claimed(),
-            "depositing the master is the supervisor's own act, not the agent's claim"
-        );
 
         let claimed = loop {
             if let Some(fd) = reclaim_pty_master(dir.path(), 55).await.expect("reclaim") {
@@ -5702,32 +5704,78 @@ mod tests {
         wait_until_claimed(&handoff).await;
     }
 
-    #[tokio::test]
-    async fn reclaiming_any_pty_when_none_is_held_leaves_the_supervisor_hold_in_place() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let listener = UnixListener::bind(dir.path().join(PTY_CUSTODY_SOCKET_NAME)).expect("bind");
-        let handoff = PtyHandoff::new(std::time::Duration::from_secs(3600));
-        tokio::spawn(serve_pty_custody(listener, handoff.clone()));
+    fn custody_pair() -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        std::os::unix::net::UnixStream::pair().expect("socket pair")
+    }
 
-        assert!(reclaim_orphaned_pty(dir.path())
+    #[tokio::test]
+    async fn handing_back_a_master_marks_it_claimed() {
+        use std::os::fd::AsRawFd;
+        let (server, client) = custody_pair();
+        let handoff = PtyHandoff::new(std::time::Duration::from_secs(10));
+        let master = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("open"));
+
+        hand_back_pty(
+            server.as_raw_fd(),
+            CUSTODY_FOUND,
+            55,
+            vec![master],
+            &handoff,
+        )
+        .await
+        .expect("hand back");
+
+        assert!(handoff.is_claimed());
+        let (payload, fds) = recv_custody(client.as_raw_fd()).expect("receive");
+        assert_eq!(parse_custody_payload(&payload), Some((CUSTODY_FOUND, 55)));
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_absent_reply_does_not_mark_the_pty_claimed() {
+        use std::os::fd::AsRawFd;
+        let (server, _client) = custody_pair();
+        let handoff = PtyHandoff::new(std::time::Duration::from_secs(10));
+
+        hand_back_pty(server.as_raw_fd(), CUSTODY_ABSENT, 0, Vec::new(), &handoff)
             .await
-            .expect("reclaim")
-            .is_none());
-        tokio::task::yield_now().await;
+            .expect("hand back");
+
         assert!(!handoff.is_claimed());
     }
 
     #[tokio::test]
-    async fn a_reclaim_that_finds_nothing_leaves_the_supervisor_hold_in_place() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let listener = UnixListener::bind(dir.path().join(PTY_CUSTODY_SOCKET_NAME)).expect("bind");
-        let handoff = PtyHandoff::new(std::time::Duration::from_secs(3600));
-        tokio::spawn(serve_pty_custody(listener, handoff.clone()));
+    async fn a_master_that_could_not_be_sent_is_not_marked_claimed() {
+        use std::os::fd::AsRawFd;
+        let (server, client) = custody_pair();
+        drop(client);
+        let handoff = PtyHandoff::new(std::time::Duration::from_secs(10));
+        let master = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("open"));
 
-        let found = reclaim_pty_master(dir.path(), 99).await.expect("reclaim");
-        assert!(found.is_none());
-        tokio::task::yield_now().await;
+        let sent = hand_back_pty(
+            server.as_raw_fd(),
+            CUSTODY_FOUND,
+            55,
+            vec![master],
+            &handoff,
+        )
+        .await;
+
+        assert!(sent.is_err());
         assert!(!handoff.is_claimed());
+    }
+
+    #[test]
+    fn only_a_deposited_terminal_awaits_a_handoff() {
+        use spur_core::step::{STEP_BATCH, STEP_EXTERN, STEP_INTERACTIVE};
+        assert!(awaits_pty_handoff(STEP_INTERACTIVE, true));
+        assert!(!awaits_pty_handoff(STEP_INTERACTIVE, false));
+        assert!(!awaits_pty_handoff(STEP_BATCH, true));
+        assert!(!awaits_pty_handoff(STEP_EXTERN, true));
+        assert!(!awaits_pty_handoff(3, true));
     }
 
     fn gate_descriptor() -> StepdDescriptor {

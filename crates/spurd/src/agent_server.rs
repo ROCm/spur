@@ -3133,6 +3133,11 @@ fn interactive_step_environment(
     environment
 }
 
+/// A pid whose supervisor says the workload has exited may already be gone or reused.
+fn is_live_workload(snapshot: &crate::stepd::StepdSnapshot) -> bool {
+    snapshot.active && snapshot.job_pid != 0
+}
+
 /// The supervisor forks the workload after the gate opens, so its pid is not
 /// available the instant `start_job` returns. Its control socket does not
 /// start serving requests until that fork (openpty, container rootfs staging,
@@ -3919,7 +3924,7 @@ impl AgentService {
             let state =
                 crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string()).await;
             match state {
-                Ok(snapshot) if snapshot.job_pid != 0 => return Some(snapshot),
+                Ok(snapshot) if is_live_workload(&snapshot) => return Some(snapshot),
                 Ok(_) => {}
                 Err(error) => warn!(job_id, step_id = descriptor.step_id, %error,
                     "could not read the supervised job's state"),
@@ -12922,6 +12927,26 @@ mod tests {
     // actually starting to accept control connections: `launch_job` (openpty,
     // container rootfs staging, priv drop) runs in between, and nothing serves
     // `QueryState` on the socket until it returns.
+    fn workload_snapshot(active: bool, job_pid: i32) -> crate::stepd::StepdSnapshot {
+        crate::stepd::StepdSnapshot {
+            job_id: 7,
+            run_attempt: 1,
+            step_id: spur_core::step::STEP_INTERACTIVE,
+            active,
+            exit_code: None,
+            signal: None,
+            job_pid,
+            cgroup_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_a_running_workload_with_a_pid_is_live() {
+        assert!(is_live_workload(&workload_snapshot(true, 4242)));
+        assert!(!is_live_workload(&workload_snapshot(true, 0)));
+        assert!(!is_live_workload(&workload_snapshot(false, 4242)));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn supervised_step_workload_pid_survives_a_supervisor_that_is_slow_to_start_serving() {
         let dir = tempfile::tempdir().expect("tempdir");

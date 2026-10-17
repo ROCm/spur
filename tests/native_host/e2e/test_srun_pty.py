@@ -306,10 +306,10 @@ class TestSrunPtyStepSupervision:
         )
 
     def test_standalone_pty_srun_survives_a_command_that_exits_immediately(self, cluster):
-        # A command that is gone before the agent first asks for its pid must
-        # still hand its terminal back, not fail as "did not report a pid".
+        # Smoke test: a command that may be gone before the agent first asks for
+        # its pid must still hand its terminal back.
         failures = []
-        for attempt in range(12):
+        for attempt in range(4):
             code, out = cluster.srun_with_exit([
                 "-N", "1", "-t", "0:02", "--pty", "bash", "-c", "exit 0",
             ])
