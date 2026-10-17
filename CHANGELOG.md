@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/ROCm/spur/compare/v0.15.0...v0.16.0) (2026-10-17)
+
+
+### Features
+
+* **spurctld:** commit placement to Raft before dispatch ([#924](https://github.com/ROCm/spur/issues/924)) ([b050388](https://github.com/ROCm/spur/commit/b050388f877aa2331331a3e67746548979338ec0))
+
 ## [0.15.0](https://github.com/ROCm/spur/compare/v0.14.0...v0.15.0) (2026-10-16)
 
 
