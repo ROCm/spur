@@ -489,6 +489,10 @@ pub struct ClusterManager {
     /// from the durable job store / node reasons instead, so they survive
     /// failover.
     health_last_check: parking_lot::Mutex<HashMap<(usize, String), std::time::Instant>>,
+    /// Launches this controller currently has on the wire, so the orphaned-placement
+    /// sweep can tell an abandoned reservation from one still being dispatched.
+    /// Leader-local, never persisted: a new leader has issued no launches yet.
+    dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
 }
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
@@ -770,6 +774,7 @@ impl ClusterManager {
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
+            dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -1726,6 +1731,7 @@ impl ClusterManager {
             hold,
             begin_time,
             by: (!actor.user.is_empty()).then(|| actor.clone()),
+            at: None,
         })?;
         // Fires accounting-end + epilog for the finalized run (live path only;
         // an already-terminal job emits no finalized entry here).
@@ -1891,9 +1897,13 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Start a job on specific nodes.
+    /// Start a job on specific nodes in one step (reserve immediately followed
+    /// by activate). Used by tests with nothing to dispatch in between; the
+    /// scheduler loop itself uses `reserve_placement` + `activate_job`
+    /// separately so a real launch RPC can happen in between.
     /// Transition a pending job to Running and record its allocation. Returns
     /// the run epoch assigned to this dispatch (threaded into the launch RPC).
+    #[cfg(test)]
     pub fn start_job(
         &self,
         job_id: JobId,
@@ -1931,20 +1941,38 @@ impl ClusterManager {
         team_over_quota(cap, legitimate, borrowed)
     }
 
-    /// Start a job as *borrowed*: it exceeded its QOS group node cap and is running
-    /// on capacity nobody with a claim wanted. The stamp is what holds it outside
-    /// every quota aggregate and what makes it reclaimable.
-    pub fn start_borrowed_job(
+    #[cfg(test)]
+    pub(crate) fn start_job_impl(
         &self,
         job_id: JobId,
         node_names: Vec<String>,
         resources: ResourceAllocations,
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+        idle_fill: bool,
     ) -> anyhow::Result<u32> {
-        self.start_job_impl(job_id, node_names, resources, per_node_alloc, false, true)
+        let run_attempt = self.reserve_placement(
+            job_id,
+            node_names.clone(),
+            resources.clone(),
+            per_node_alloc.clone(),
+            srun_step_dispatch,
+            idle_fill,
+        )?;
+        self.activate_job(
+            job_id,
+            run_attempt,
+            node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            idle_fill,
+        )
     }
 
-    pub(crate) fn start_job_impl(
+    /// Charge a placement in Raft before dispatching, so a leader change
+    /// mid-dispatch finds it charged rather than free. Returns the run epoch.
+    pub fn reserve_placement(
         &self,
         job_id: JobId,
         node_names: Vec<String>,
@@ -1962,42 +1990,122 @@ impl ClusterManager {
                 );
             }
         }
+        let run_attempt = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state != JobState::Pending {
+                anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
+            }
+            // A second reservation on top of one already charged would double the
+            // node's charge and collide two runs onto the same run_attempt.
+            if job.holds_a_placement() {
+                anyhow::bail!("job {} already holds a placement", job_id);
+            }
+            job.run_attempt.saturating_add(1)
+        };
+        // `JobStart`'s apply has no state guard, so it charges the slice while
+        // the job is still Pending; the transition to Running follows once the
+        // dispatch is confirmed (see `activate_job`).
+        let resp = self.propose(WalOperation::JobStart {
+            job_id,
+            nodes: node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            run_attempt,
+            idle_fill,
+            at: None,
+        })?;
+        // The read-then-propose above is not atomic, so a second caller can lose
+        // the apply-side duplicate check even though this call's own precheck
+        // passed; treat that as a failed reservation rather than a false Ok.
+        if !resp.job_started {
+            anyhow::bail!("job {} lost a concurrent reservation race", job_id);
+        }
+        Ok(run_attempt)
+    }
 
-        // Validate job exists and can transition
-        let old_state;
+    /// Give up the reservation named by `run_attempt`, freeing its charge and
+    /// backing the job off. No-op if it's since left Pending or reserved anew.
+    pub fn abort_placement(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        spare_requeue_budget: bool,
+    ) -> anyhow::Result<()> {
+        let Some(job) = self.get_job(job_id) else {
+            return Ok(());
+        };
+        if !job.holds_a_placement() {
+            return Ok(());
+        }
+        // Folded into this same propose (not a separate hold_job_at_max_requeue
+        // call) so it shares this op's Pending/run_attempt gate at apply time.
+        let at_max_requeue = !spare_requeue_budget
+            && job.requeue_count >= self.config().controller.max_batch_requeue;
+        let begin_time = self.launch_backoff_until(&job);
+        self.propose(WalOperation::JobDispatchBackoff {
+            job_id,
+            begin_time,
+            spare_requeue_budget,
+            run_attempt,
+            at_max_requeue,
+        })?;
+        Ok(())
+    }
+
+    /// Make a reserved job Running, once every node has confirmed its launch.
+    /// The placement is already in the log (see `reserve_placement`), so this
+    /// is the state transition and its bookkeeping only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn activate_job(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+        idle_fill: bool,
+    ) -> anyhow::Result<u32> {
         let spec_for_notify;
         let submit_time_for_notify;
-        let run_attempt;
         {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            old_state = job.state;
             spec_for_notify = job.spec.clone();
             submit_time_for_notify = job.submit_time;
-            // Next run epoch (first dispatch = 1), threaded to the agents.
-            run_attempt = job.run_attempt.saturating_add(1);
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
+            // A delayed activation must not flip a replacement reservation
+            // Running just because it shares this job's Pending state.
+            if job.run_attempt != run_attempt {
+                anyhow::bail!(
+                    "job {} reservation is stale: have run_attempt {}, dispatch was for {}",
+                    job_id,
+                    job.run_attempt,
+                    run_attempt
+                );
+            }
         }
 
-        // propose() handles: state transition, resource allocation, license subtraction
-        self.propose(WalOperation::job_state_change(
+        // Backstop for the precheck above: apply re-verifies both, so a race
+        // between this read and the propose can't flip a stale reservation Running.
+        let resp = self.propose(WalOperation::job_state_change_activating(
             job_id,
-            old_state,
-            JobState::Running,
-        ))?;
-        self.propose(WalOperation::JobStart {
-            job_id,
-            nodes: node_names.clone(),
-            resources: resources.clone(),
-            per_node_alloc: per_node_alloc.clone(),
-            srun_step_dispatch,
             run_attempt,
-            idle_fill,
-        })?;
+        ))?;
+        if !resp.state_change_applied {
+            anyhow::bail!(
+                "job {} reservation was superseded or released before activation",
+                job_id
+            );
+        }
 
         let node_count = node_names.len().max(1) as u32;
         let per_node = node_names
@@ -2059,8 +2167,49 @@ impl ClusterManager {
             });
         }
 
-        debug!(job_id, "job started");
+        debug!(job_id, "job activated");
         Ok(run_attempt)
+    }
+
+    /// Reservations this controller cannot finish dispatching: a leader that
+    /// died between charging and dispatch left them unanswered. Named nodes
+    /// let the caller cancel on the agent (a `RegisterJobAllocation` it already
+    /// accepted is otherwise never told to let go) before the charge is freed.
+    pub fn orphaned_placements(&self) -> Vec<(JobId, u32, Vec<String>)> {
+        // Read after the job records, never before: a reservation taken between the two
+        // reads would then be absent from one and present in the other, and taken back.
+        let jobs = self.jobs.read();
+        let in_flight = self.dispatch_tracker.jobs_in_flight();
+        jobs.values()
+            .filter(|job| job.state == JobState::Pending && job.holds_a_placement())
+            // A set exit_code means a finished run's own gate deferred the clear,
+            // not an unconfirmed reservation; that debt is real, not abandoned.
+            .filter(|job| job.exit_code.is_none())
+            .map(|job| (job.job_id, job.run_attempt, job.allocated_nodes.clone()))
+            .filter(|(job_id, ..)| !in_flight.contains(job_id))
+            .collect()
+    }
+
+    /// Give up every reservation `orphaned_placements` names. Does not touch
+    /// the agent side — see `orphaned_placements`'s own doc for why a caller
+    /// with RPC access should cancel on those nodes first.
+    pub fn abort_orphaned_placements(&self) {
+        for (job_id, run_attempt, _) in self.orphaned_placements() {
+            warn!(
+                job_id,
+                "giving up a reservation no dispatch is answering for"
+            );
+            // Not the job's fault: a leader failover, not a launch failure, so
+            // it must not spend the job's max_batch_requeue budget.
+            if let Err(error) = self.abort_placement(job_id, run_attempt, true) {
+                warn!(job_id, %error, "could not give up the reservation; it stays charged");
+            }
+        }
+    }
+
+    /// The launches this controller currently has on the wire.
+    pub(crate) fn dispatch_tracker(&self) -> &Arc<crate::dispatch_tracker::DispatchTracker> {
+        &self.dispatch_tracker
     }
 
     /// Record completion from one allocated node (multi-node COMPLETING flow).
@@ -2110,6 +2259,8 @@ impl ClusterManager {
                 node_name: node_name.to_string(),
                 exit_code,
                 signal,
+                run_attempt,
+                at: None,
             })
             .map_err(|source| NodeCompleteError::RaftPropose { source })?;
 
@@ -2184,6 +2335,7 @@ impl ClusterManager {
             state,
             unreported_nodes: facts.unreported_nodes,
             cancel: facts.cancel,
+            at: None,
         })?;
         self.run_all_finalized_side_effects(&resp);
 
@@ -2288,6 +2440,7 @@ impl ClusterManager {
                     begin_time,
                     preempted_by,
                     preempt_qos,
+                    at: None,
                 })?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, hold_secs, "job preempted (requeue)");
@@ -2795,7 +2948,7 @@ impl ClusterManager {
         job_id: JobId,
         run_attempt: u32,
     ) -> anyhow::Result<()> {
-        let begin_time = {
+        let (begin_time, at_max_requeue) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
@@ -2805,17 +2958,16 @@ impl ClusterManager {
                 // failed confirmation and this call — nothing to back off.
                 return Ok(());
             }
-            if job.requeue_count >= self.config().controller.max_batch_requeue {
-                drop(jobs);
-                return self.hold_job_at_max_requeue(job_id, Some(run_attempt));
-            }
-            self.launch_backoff_until(job)
+            let at_max_requeue = job.requeue_count >= self.config().controller.max_batch_requeue;
+            (self.launch_backoff_until(job), at_max_requeue)
         };
 
         self.propose(WalOperation::JobDispatchBackoff {
             job_id,
             begin_time,
+            spare_requeue_budget: false,
             run_attempt,
+            at_max_requeue,
         })?;
         info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
         Ok(())
@@ -2877,7 +3029,11 @@ impl ClusterManager {
                 return Ok(());
             }
         }
-        let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
+        let resp = self.propose(WalOperation::JobEvict {
+            job_id,
+            detail,
+            at: None,
+        })?;
         self.run_all_finalized_side_effects(&resp);
         Ok(())
     }
@@ -3627,6 +3783,7 @@ impl ClusterManager {
             admin_locked,
             reason_uid,
             reason_time,
+            at: None,
         })?;
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
@@ -3861,6 +4018,7 @@ impl ClusterManager {
                         admin_locked,
                         reason_uid,
                         reason_time,
+                        at: None,
                     }) {
                         Ok(resp) => {
                             // A node that stopped heartbeating won't refresh its k0s unit gauge, so
@@ -3896,6 +4054,7 @@ impl ClusterManager {
                         admin_locked,
                         reason_uid,
                         reason_time,
+                        at: None,
                     }) {
                         warn!(error = %e, "failed to propose node recovery");
                     }
@@ -3950,6 +4109,7 @@ impl ClusterManager {
             admin_locked: true,
             reason_uid,
             reason_time,
+            at: None,
         })?;
         info!(node = %name, state = %target_state, "node drain requested");
         Ok((target_state, running_count))
@@ -4005,6 +4165,7 @@ impl ClusterManager {
             admin_locked,
             reason_uid,
             reason_time,
+            at: None,
         })?;
         self.k8s_metrics
             .set_node_up(&self.config().cluster_name, name, false);
@@ -4037,6 +4198,7 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::NodeRemove {
             name: name.to_string(),
             reason,
+            at: None,
         })?;
         self.k8s_metrics
             .remove_node(&self.config().cluster_name, name);
@@ -4259,6 +4421,11 @@ impl ClusterManager {
             }
             *count += 1;
         }
+
+        // Already reserved: it already counts in every gate's existing-usage
+        // baseline below (via `occupies_resources`), so admitting it again as a
+        // candidate would charge its own slot twice against its own cap.
+        candidates.retain(|candidate| !candidate.job.holds_a_placement());
 
         // Eligible-only: an unreadable cap is transient, not structural, so it must
         // not claim a begin-deferred job and report itself in place of BeginTime.
@@ -4484,10 +4651,11 @@ impl ClusterManager {
     fn licenses_in_use(jobs: &HashMap<JobId, Job>) -> HashMap<String, u64> {
         let mut used: HashMap<String, u64> = HashMap::new();
         for job in jobs.values() {
-            if matches!(
+            let holds = matches!(
                 job.state,
                 JobState::Running | JobState::Suspended | JobState::Completing
-            ) {
+            ) || job.occupies_resources();
+            if holds {
                 for (lic, n) in extract_license_requirements(&job.spec) {
                     *used.entry(lic).or_insert(0) += n;
                 }
@@ -6102,7 +6270,10 @@ impl ClusterManager {
     }
 
     #[allow(clippy::result_large_err)]
-    fn propose(&self, op: WalOperation) -> anyhow::Result<ClientResponse> {
+    fn propose(&self, mut op: WalOperation) -> anyhow::Result<ClientResponse> {
+        // Stamped at the one chokepoint into the log rather than at each call
+        // site, so no operation can reach it undated and be re-dated on replay.
+        op.stamp_occurred_at(Utc::now());
         let raft = self
             .raft
             .read()
@@ -6305,6 +6476,31 @@ impl ClusterManager {
                 response.jobs_finalized.push(fin);
             }
         }
+
+        // A reserved-but-unconfirmed Pending job has no process to fail (no
+        // legal Pending -> NodeFail transition) — only a charge to free.
+        let stranded: Vec<JobId> = jobs
+            .iter()
+            .filter(|(_, j)| j.state == JobState::Pending && j.is_held_on(node_name))
+            .map(|(&id, _)| id)
+            .collect();
+        for jid in stranded {
+            if let Some(job) = jobs.get_mut(&jid) {
+                let freed_nodes = job.allocated_nodes.clone();
+                let allocated_resources = job.allocated_resources.clone();
+                let per_node_map = job.per_node_alloc.clone();
+                Self::clear_run_state_for_requeue(job);
+                job.set_pending_reason(PendingReason::NodeDown);
+                Self::deallocate_job_slices(
+                    nodes,
+                    &freed_nodes,
+                    allocated_resources.as_ref(),
+                    &per_node_map,
+                    &[],
+                    jid,
+                );
+            }
+        }
     }
 
     /// Apply a WalOperation to in-memory state.
@@ -6314,7 +6510,10 @@ impl ClusterManager {
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
         let mut next_id = self.next_job_id.load(Ordering::Relaxed);
-        let timestamp = Utc::now();
+        // Dated from the leader's stamp when the op carries one, so every
+        // replica (and a later replay) records the same instant rather than
+        // each reading its own clock.
+        let timestamp = op.occurred_at().unwrap_or_else(Utc::now);
 
         match op {
             WalOperation::JobSubmit { job_id, spec } => {
@@ -6343,9 +6542,23 @@ impl ClusterManager {
                 pending_priority,
                 begin_time,
                 pending_reason_desc,
+                expected_run_attempt,
+                at,
                 ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
+                    // A stale activation can find a replacement reservation (epoch
+                    // bumped) or none at all (charge freed elsewhere) — check both.
+                    if expected_run_attempt.is_some()
+                        && (*expected_run_attempt != Some(job.run_attempt)
+                            || !job.holds_a_placement())
+                    {
+                        warn!(
+                            job_id = *job_id,
+                            "ignoring a stale activation for a superseded or released reservation"
+                        );
+                        return ClientResponse::default();
+                    }
                     let outcome = match job.apply_transition(*new_state) {
                         Ok(outcome) => outcome,
                         Err(e) => {
@@ -6353,6 +6566,10 @@ impl ClusterManager {
                             TransitionOutcome::NoOp
                         }
                     };
+                    response.state_change_applied = outcome == TransitionOutcome::Applied;
+                    if outcome == TransitionOutcome::Applied && *new_state == JobState::Running {
+                        job.start_time = Some(at.unwrap_or(timestamp));
+                    }
                     // Gated on a real transition so a replay doesn't re-wipe
                     // fields or double-count requeue_count.
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Pending {
@@ -6379,27 +6596,66 @@ impl ClusterManager {
             WalOperation::JobDispatchBackoff {
                 job_id,
                 begin_time,
+                spare_requeue_budget,
                 run_attempt,
+                at_max_requeue,
             } => {
                 // NoOp if the job left Pending since the leader proposed this
-                // (e.g. a concurrent cancel).
+                // (e.g. a concurrent cancel or a concurrently-applied activation).
                 let Some(job) = jobs.get_mut(job_id) else {
                     return ClientResponse::default();
                 };
                 if job.state != JobState::Pending {
                     return ClientResponse::default();
                 }
-                Self::reset_job_for_requeue(job);
-                job.spec.begin_time = Some(*begin_time);
-                job.set_pending_reason(PendingReason::JobLaunchFailure);
+                // 0 disables the check (pre-upgrade entries); otherwise an older
+                // epoch means a newer reservation already superseded the one
+                // being aborted. Forward epochs (a backoff advancing past what's
+                // stored) are legitimate and must not be rejected as stale.
+                if *run_attempt != 0 && job.run_attempt != 0 && *run_attempt < job.run_attempt {
+                    return ClientResponse::default();
+                }
+                // A reservation charged by `reserve_placement` before dispatch may
+                // still be held here (a caller backing off a job that never
+                // reserved one has nothing charged to free); free it before the
+                // reset below wipes where it went.
+                let freed_nodes = job.allocated_nodes.clone();
+                let allocated_resources = job.allocated_resources.clone();
+                let per_node_map = job.per_node_alloc.clone();
+                if *at_max_requeue {
+                    // Already at the cap: park it instead of charging another
+                    // retry, same as hold_job_at_max_requeue's Pending branch.
+                    Self::clear_run_state_for_requeue(job);
+                    job.priority = 0;
+                    job.set_pending_reason(PendingReason::JobHoldMaxRequeue);
+                } else if *spare_requeue_budget {
+                    // Not the job's fault: hold it without spending its
+                    // max_batch_requeue budget.
+                    Self::clear_run_state_for_requeue(job);
+                    job.spec.begin_time = Some(*begin_time);
+                    job.set_pending_reason(PendingReason::JobLaunchFailure);
+                } else {
+                    Self::reset_job_for_requeue(job);
+                    job.spec.begin_time = Some(*begin_time);
+                    job.set_pending_reason(PendingReason::JobLaunchFailure);
+                }
                 // Monotonic: never regress on an out-of-order/duplicate replay.
                 job.run_attempt = (*run_attempt).max(job.run_attempt);
+                Self::deallocate_job_slices(
+                    &mut nodes,
+                    &freed_nodes,
+                    allocated_resources.as_ref(),
+                    &per_node_map,
+                    &[],
+                    *job_id,
+                );
             }
             WalOperation::JobPreemptRequeue {
                 job_id,
                 begin_time,
                 preempted_by,
                 preempt_qos,
+                ..
             } => {
                 // Only a running job is preempted; on replay the job is already
                 // Pending, so this is a NoOp (no re-dealloc, no double requeue).
@@ -6471,6 +6727,7 @@ impl ClusterManager {
                 hold,
                 begin_time,
                 by,
+                ..
             } => {
                 // A live job is finalized once (routed through Requeued so
                 // accounting/steps see a finished run) then re-pended; an
@@ -6684,7 +6941,7 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobEvict { job_id, detail } => {
+            WalOperation::JobEvict { job_id, detail, .. } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
@@ -6712,9 +6969,21 @@ impl ClusterManager {
                 srun_step_dispatch,
                 run_attempt,
                 idle_fill,
+                at: _,
             } => {
+                // Durable backstop for `reserve_placement`'s own pre-check: a racing
+                // second propose for the same job must not double-charge nodes.
+                // Not gated on job state — a legitimate JobStart can apply against
+                // a job in any state, only ever against one that isn't already
+                // charged.
+                if jobs.get(job_id).is_some_and(Job::holds_a_placement) {
+                    warn!(job_id = *job_id, "ignoring a duplicate JobStart replay");
+                    return ClientResponse::default();
+                }
+                response.job_started = true;
                 if let Some(job) = jobs.get_mut(job_id) {
-                    job.start_time = Some(timestamp);
+                    // start_time is set on activation (see JobStateChange), not
+                    // here: a job that never gets past this reservation never ran.
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
@@ -6758,11 +7027,21 @@ impl ClusterManager {
                 node_name,
                 exit_code,
                 signal,
+                run_attempt,
+                ..
             } => {
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
+                    // Re-checked here, not just where this was proposed: a requeue
+                    // can commit in between, and a stale report must not discharge
+                    // the run that replaced the one it was sent for. 0 is legacy
+                    // (pre-upgrade entries, and either side never having run this
+                    // job more than once), and disables the check.
+                    if *run_attempt != 0 && job.run_attempt != 0 && *run_attempt < job.run_attempt {
+                        return ClientResponse::default();
+                    }
                     // A completion for a non-active job is stale/replayed; skip
                     // it rather than forcing an illegal finalize transition.
                     if !job.state.is_active() {
@@ -6914,6 +7193,7 @@ impl ClusterManager {
                 state,
                 unreported_nodes,
                 cancel,
+                ..
             } => {
                 let freed_nodes;
                 let allocated_resources;
@@ -7049,6 +7329,34 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.priority = *new_priority;
                     if let Some(reason) = pending_reason {
+                        // A concurrently-applied activate_job can beat this hold's
+                        // propose-time Pending check; recheck Pending (and the attempt,
+                        // if one was named) here, under the apply lock, before freeing
+                        // a reservation — or a hold can release a job's live nodes.
+                        let attempt_is_current = match run_attempt {
+                            Some(ra) if *ra != 0 && job.run_attempt != 0 => *ra >= job.run_attempt,
+                            _ => true,
+                        };
+                        if reason.is_scheduling_hold()
+                            && job.state == JobState::Pending
+                            && attempt_is_current
+                            && job.holds_a_placement()
+                        {
+                            let freed_nodes = job.allocated_nodes.clone();
+                            let allocated_resources = job.allocated_resources.clone();
+                            let per_node_map = job.per_node_alloc.clone();
+                            job.allocated_nodes.clear();
+                            job.allocated_resources = None;
+                            job.per_node_alloc.clear();
+                            Self::deallocate_job_slices(
+                                &mut nodes,
+                                &freed_nodes,
+                                allocated_resources.as_ref(),
+                                &per_node_map,
+                                &[],
+                                *job_id,
+                            );
+                        }
                         match pending_reason_desc {
                             Some(desc) => job.set_pending_reason_desc(reason.clone(), desc.clone()),
                             None => job.set_pending_reason(reason.clone()),
@@ -7229,7 +7537,7 @@ impl ClusterManager {
                     self.apply_node_config_policy(node);
                 }
             }
-            WalOperation::NodeRemove { name, reason } => {
+            WalOperation::NodeRemove { name, reason, .. } => {
                 let failure = NodeFailure {
                     node: name.clone(),
                     reason: reason.clone().unwrap_or_default(),
@@ -8109,7 +8417,7 @@ fn qos_block_with(
     let mut running_count = jobs
         .values()
         .filter(|j| {
-            j.state == JobState::Running
+            j.occupies_resources()
                 && !j.idle_fill
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
@@ -8228,7 +8536,7 @@ fn account_block_with(
     let mut running_count = jobs
         .values()
         .filter(|j| {
-            j.state == JobState::Running
+            j.occupies_resources()
                 && !j.idle_fill
                 && j.spec.user == *user
                 && j.spec.account.as_deref() == Some(account)
@@ -8484,7 +8792,7 @@ fn running_array_counts(jobs: &HashMap<JobId, Job>) -> HashMap<JobId, u32> {
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut acc = RunningTresAccumulator::default();
     for j in jobs.values() {
-        if j.state == JobState::Running && pred(j) {
+        if j.occupies_resources() && pred(j) {
             acc.add(j);
         }
     }
@@ -8579,7 +8887,7 @@ fn scope_usage(
         if !(is_submitted(job) && in_scope(job)) {
             continue;
         }
-        let running = job.state == JobState::Running;
+        let running = job.occupies_resources();
         // Group figures are the scope's own and are never narrowed by `only_user`.
         grp_submitted_jobs += 1;
         if running {
@@ -8631,7 +8939,7 @@ fn scope_usage(
 /// instead of always requiring brand-new distinct nodes.
 fn occupied_nodes(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> HashSet<String> {
     jobs.values()
-        .filter(|j| j.state == JobState::Running && pred(j))
+        .filter(|j| j.occupies_resources() && pred(j))
         .flat_map(|j| j.allocated_nodes.iter().cloned())
         .collect()
 }
@@ -10222,6 +10530,694 @@ mod tests {
         });
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reserved_placement_is_charged_before_the_job_runs() {
+        // The window this closes: a leader change between placing a job and
+        // launching it used to find the slice free and place a second job here.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "a reservation is not a start"
+        );
+
+        cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("activate");
+        settle(&cm, id, JobState::Running);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activate_job_refuses_a_stale_run_attempt() {
+        // A delayed activation for a superseded attempt must not flip the
+        // *replacement* reservation Running just because the job is Pending.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        let stale_attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve A");
+        cm.abort_placement(id, stale_attempt, false)
+            .expect("abort A");
+        wait_for("A's charge freed", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 0
+        });
+
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res.clone()),
+            false,
+            false,
+        )
+        .expect("reserve B");
+
+        let result = cm.activate_job(
+            id,
+            stale_attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "activation for attempt A must be refused once B holds the placement"
+        );
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "the refused activation must not flip B to Running"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reserve_placement_refuses_a_second_reservation_on_the_same_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res.clone()),
+            false,
+            false,
+        )
+        .expect("first reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+
+        let second = cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        );
+        assert!(
+            second.is_err(),
+            "a job already holding a placement must refuse a second one"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "the refused second reservation must not double-charge the node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_start_apply_reports_job_started_false_on_a_duplicate() {
+        // The signal `reserve_placement` relies on to turn a race it lost into
+        // an error instead of a false Ok: the in-memory precheck alone cannot
+        // tell a caller its own proposal was the one the backstop ignored.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+        let start = |run_attempt| WalOperation::JobStart {
+            job_id: id,
+            nodes: vec!["n1".into()],
+            resources: res.clone(),
+            per_node_alloc: per_node_for(&["n1"], res.clone()),
+            srun_step_dispatch: false,
+            run_attempt,
+            idle_fill: false,
+            at: None,
+        };
+
+        let first = cm.apply_operation(&start(1));
+        assert!(first.job_started, "the first proposal actually charges it");
+
+        let second = cm.apply_operation(&start(1));
+        assert!(
+            !second.job_started,
+            "a racing duplicate must be reported as not-charged, not silently Ok"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "the duplicate must not double-charge the node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn giving_up_a_reservation_frees_what_it_charged() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res),
+                false,
+                false,
+            )
+            .expect("reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+
+        cm.abort_placement(id, attempt, false).expect("abort");
+        wait_for("freed", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 0
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "the job goes back to the queue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn giving_up_a_placement_that_never_charged_is_harmless() {
+        // A pre-upgrade backoff entry carries no allocation, and replaying one
+        // must not free anything.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+
+        cm.abort_placement(id, 0, false).expect("abort");
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_placement_ignores_a_stale_attempt_after_a_newer_reservation() {
+        // The scenario the WAL's run_attempt fencing exists for: an abort meant
+        // for attempt A must not wipe out attempt B once B has replaced it.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        let attempt_a = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve A");
+        cm.abort_placement(id, attempt_a, false).expect("abort A");
+        wait_for("A's charge freed", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 0
+        });
+
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve B");
+        wait_for("B charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+
+        // A delayed abort for the superseded attempt A must be a no-op now.
+        cm.abort_placement(id, attempt_a, false)
+            .expect("stale abort A");
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "a stale abort for attempt A must not free attempt B's charge"
+        );
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "B is still an unconfirmed reservation, not yet running"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_placement_holds_instead_of_requeuing_past_max_batch_requeue() {
+        // Every other backoff call site caps at max_batch_requeue and holds the
+        // job instead of requeuing forever; abort_placement must too.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let max = cm.config().controller.max_batch_requeue;
+        let id = submit_and_wait(&cm, basic_spec("abort-at-cap"));
+        let res = scalar_alloc(4, 8000);
+
+        for _ in 0..=max {
+            let attempt = cm
+                .reserve_placement(
+                    id,
+                    vec!["n1".into()],
+                    res.clone(),
+                    per_node_for(&["n1"], res.clone()),
+                    false,
+                    false,
+                )
+                .expect("reserve");
+            cm.abort_placement(id, attempt, false).expect("abort");
+        }
+
+        wait_for("job held at max requeue", || {
+            cm.get_job(id)
+                .is_some_and(|j| j.pending_reason == PendingReason::JobHoldMaxRequeue)
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().requeue_count,
+            max,
+            "the hold must not keep bumping requeue_count past the cap"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            0,
+            "the final hold must not leave the last reservation's charge stranded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_placement_at_cap_ignores_a_stale_attempt_once_a_newer_one_is_running() {
+        // A delayed abort for a superseded attempt must not force-hold a job
+        // that has since activated under a newer one, even once the cap trips.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let max = cm.config().controller.max_batch_requeue;
+        let id = submit_and_wait(&cm, basic_spec("stale-abort-at-cap"));
+        let res = scalar_alloc(4, 8000);
+
+        let mut stale_attempt = 0;
+        for _ in 0..max {
+            stale_attempt = cm
+                .reserve_placement(
+                    id,
+                    vec!["n1".into()],
+                    res.clone(),
+                    per_node_for(&["n1"], res.clone()),
+                    false,
+                    false,
+                )
+                .expect("reserve");
+            cm.abort_placement(id, stale_attempt, false).expect("abort");
+        }
+        assert_eq!(cm.get_job(id).unwrap().requeue_count, max);
+
+        let running_attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve newer attempt");
+        cm.activate_job(
+            id,
+            running_attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("activate newer attempt");
+        settle(&cm, id, JobState::Running);
+
+        // Next abort for `stale_attempt` would hit the cap if it weren't stale.
+        cm.abort_placement(id, stale_attempt, false)
+            .expect("stale abort at cap");
+
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Running,
+            "a stale abort must not force-fail the job running under a newer attempt"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "the running attempt's charge must survive the stale abort"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_priority_change_apply_does_not_free_a_running_jobs_allocation() {
+        // The apply-level race the public hold methods can't fully guard against:
+        // a hold's own Pending precheck passed before activate_job's entry landed
+        // first. Exercised directly against apply_operation, same as the sibling
+        // JobDispatchBackoff apply-race tests above.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("hold-race"));
+        let res = scalar_alloc(4, 8000);
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve");
+        cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("activate");
+        settle(&cm, id, JobState::Running);
+
+        cm.apply_operation(&WalOperation::JobPriorityChange {
+            job_id: id,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: Some(attempt),
+        });
+
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Running,
+            "a late hold must not touch a job that already activated"
+        );
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "a Running job's charge must survive a hold whose precheck raced activation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_priority_change_apply_ignores_a_hold_for_a_superseded_attempt() {
+        // Same race, one step earlier: the hold still finds the job Pending, but
+        // a newer reservation has already replaced the attempt it was issued for.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("hold-stale-attempt"));
+        let res = scalar_alloc(4, 8000);
+        let attempt_a = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve A");
+        cm.abort_placement(id, attempt_a, false).expect("abort A");
+        wait_for("A's charge freed", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 0
+        });
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve B");
+
+        cm.apply_operation(&WalOperation::JobPriorityChange {
+            job_id: id,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::Held),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: Some(attempt_a),
+        });
+
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "a stale hold for attempt A must not free attempt B's charge"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activate_job_refuses_a_reservation_stranded_by_a_node_going_down() {
+        // A late-succeeding RPC can outlive the node-down release; run_attempt
+        // alone doesn't change, so activation must also check the placement.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve");
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some("heartbeat timeout".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+        assert!(
+            !cm.get_job(id).unwrap().holds_a_placement(),
+            "the node-down strand path must have released the charge"
+        );
+
+        let result = cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "a delayed activation for a stranded reservation must be refused"
+        );
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "the refused activation must not flip the job Running with no placement"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activate_job_sets_start_time_not_reserve_placement() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve");
+        assert!(
+            cm.get_job(id).unwrap().start_time.is_none(),
+            "reserving a placement is not starting a run"
+        );
+
+        cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("activate");
+        assert!(
+            cm.get_job(id).unwrap().start_time.is_some(),
+            "activation is what starts the run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_orphan_sweep_spares_the_requeue_budget_a_direct_abort_still_spends() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let res = scalar_alloc(4, 8000);
+
+        let direct = submit_and_wait(&cm, basic_spec("direct"));
+        let direct_attempt = cm
+            .reserve_placement(
+                direct,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+                false,
+            )
+            .expect("reserve direct");
+        cm.abort_placement(direct, direct_attempt, false)
+            .expect("direct abort");
+        assert_eq!(
+            cm.get_job(direct).unwrap().requeue_count,
+            1,
+            "a direct dispatch-failure abort still spends the budget"
+        );
+
+        let swept = submit_and_wait(&cm, basic_spec("swept"));
+        cm.reserve_placement(
+            swept,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve swept");
+        cm.abort_orphaned_placements();
+        wait_for("swept job's charge freed", || {
+            !cm.get_job(swept).unwrap().holds_a_placement()
+        });
+        assert_eq!(
+            cm.get_job(swept).unwrap().requeue_count,
+            0,
+            "a failover-triggered sweep must not spend the job's requeue budget"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_orphan_sweep_gives_up_a_reservation_nothing_is_dispatching() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+
+        cm.abort_orphaned_placements();
+        wait_for("the abandoned reservation is freed", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 0
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_orphan_sweep_does_not_touch_a_reservation_still_being_dispatched() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+
+        // Held open for the duration of the sweep, as a real in-flight launch
+        // RPC would hold it.
+        let _in_flight = cm.dispatch_tracker().begin("n1", id);
+        cm.abort_orphaned_placements();
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "a dispatch still on the wire must not be treated as abandoned"
+        );
+    }
+
     /// Submit a health check via the pass and drive it to Running on `node`,
     /// returning its job id — the setup a completion-reaction test needs.
     async fn health_job_running_on(cm: &ClusterManager, node: &str) -> JobId {
@@ -11011,10 +12007,14 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         let job = cm.get_job(1).unwrap();
-        assert!(job.start_time.is_some());
+        assert!(
+            job.start_time.is_none(),
+            "a reservation is not a run yet: start_time is set on activation"
+        );
         assert_eq!(job.allocated_nodes, vec!["node1"]);
 
         let node = cm.get_node("node1").unwrap();
@@ -11095,6 +12095,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         // Bug reproduction: the stale positional ids match no live stable_id, so
@@ -11178,6 +12179,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         let before = cm.get_node("n1").unwrap().alloc_resources.clone();
@@ -11209,6 +12211,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
@@ -11848,6 +12851,7 @@ mod tests {
             admin_locked: true,
             reason_uid: None,
             reason_time: None,
+            at: None,
         });
 
         let node = cm.get_node("n1").unwrap();
@@ -12234,6 +13238,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -12241,6 +13246,8 @@ mod tests {
             node_name: "worker1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -12276,6 +13283,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -12283,6 +13291,8 @@ mod tests {
             node_name: "worker1".into(),
             exit_code: 0,
             signal: spur_core::job::OOM_SIGNAL_FLAG | 9,
+            at: None,
+            run_attempt: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -12319,6 +13329,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -12326,6 +13337,8 @@ mod tests {
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Completing);
@@ -12338,6 +13351,8 @@ mod tests {
             node_name: "n2".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
@@ -12346,6 +13361,8 @@ mod tests {
             node_name: "n3".into(),
             exit_code: 42,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -12385,6 +13402,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -12415,6 +13433,8 @@ mod tests {
             node_name: "n1".into(),
             exit_code: 2,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
@@ -12447,6 +13467,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
             step: Box::new(spur_core::step::JobStep {
@@ -12474,6 +13495,8 @@ mod tests {
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
 
         let swept = cm
@@ -12512,6 +13535,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         };
 
         cm.apply_operation(&WalOperation::JobSubmit {
@@ -12534,6 +13558,8 @@ mod tests {
             node_name: "n1".into(),
             exit_code: 0,
             signal: 9,
+            at: None,
+            run_attempt: 0,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!((job.derived_exit_code, job.exit_signal), (5, 9));
@@ -12543,6 +13569,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Pending);
@@ -12620,6 +13647,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -12627,6 +13655,8 @@ mod tests {
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
         assert!(r1.jobs_finalized.is_empty());
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
@@ -12636,6 +13666,8 @@ mod tests {
             node_name: "n2".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
         let f = r2
             .jobs_finalized
@@ -12671,6 +13703,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         let resp = cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
@@ -12707,6 +13740,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         let first = cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
@@ -12757,12 +13791,15 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
 
         let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
@@ -12799,12 +13836,14 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: true,
+            at: None,
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
             preempted_by: Some(2),
             preempt_qos: None,
+            at: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -12854,6 +13893,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         let err = cm.node_complete(1, "n2", 0, 0, 0).unwrap_err();
@@ -12887,6 +13927,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         cm.node_complete(1, "n1", 0, 9, 0).unwrap();
@@ -13074,6 +14115,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
@@ -13110,6 +14152,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         cm.node_complete(1, "n1", 42, 0, 0).unwrap();
@@ -13149,6 +14192,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 2,
             idle_fill: false,
+            at: None,
         });
 
         // Stale SIGKILL report from epoch 1 must be ignored.
@@ -13189,6 +14233,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -13196,6 +14241,8 @@ mod tests {
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -13219,6 +14266,8 @@ mod tests {
                 node_name: name.into(),
                 exit_code: 0,
                 signal: 0,
+                run_attempt: 0,
+                at: None,
             });
         }
 
@@ -13264,12 +14313,15 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
 
         cm.cancel_job(1, "testuser").unwrap();
@@ -13465,6 +14517,8 @@ mod tests {
             node_name: "worker1".into(),
             exit_code: 0,
             signal: 15,
+            run_attempt: 0,
+            at: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -13534,6 +14588,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
 
         assert!(cm.get_job(job_id).unwrap().cancelled_by.is_none());
@@ -13594,6 +14649,8 @@ mod tests {
             node_name: "worker1".into(),
             exit_code: 1,
             signal: 0,
+            run_attempt: 0,
+            at: None,
         });
 
         let job = cm.get_job(job_id).unwrap();
@@ -13672,6 +14729,7 @@ mod tests {
             begin_time: Utc::now(),
             preempted_by: Some(job_id + 1),
             preempt_qos: None,
+            at: None,
         });
 
         let last = cm.get_job(job_id).unwrap().last_requeue.unwrap();
@@ -13700,6 +14758,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
 
         assert!(cm.get_job(job_id).unwrap().unreported_nodes.is_empty());
@@ -13752,6 +14811,8 @@ mod tests {
             node_name: "worker1".into(),
             exit_code: 0,
             signal: 11,
+            run_attempt: 0,
+            at: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -13772,6 +14833,7 @@ mod tests {
         let resp = cm.apply_operation(&WalOperation::JobEvict {
             job_id,
             detail: Some("pmix bootstrap timed out".into()),
+            at: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -13797,6 +14859,7 @@ mod tests {
             admin_locked: false,
             reason_uid: None,
             reason_time: None,
+            at: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -13822,6 +14885,7 @@ mod tests {
             admin_locked: true,
             reason_uid: Some(0),
             reason_time: Some(Utc::now()),
+            at: None,
         });
 
         assert_eq!(
@@ -13840,6 +14904,7 @@ mod tests {
         let resp = cm.apply_operation(&WalOperation::NodeRemove {
             name: "worker1".into(),
             reason: Some("decommissioned".into()),
+            at: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -13867,6 +14932,7 @@ mod tests {
             admin_locked: false,
             reason_uid: None,
             reason_time: None,
+            at: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -13886,6 +14952,7 @@ mod tests {
             begin_time: Utc::now(),
             preempted_by: Some(job_id + 1),
             preempt_qos: None,
+            at: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -13908,6 +14975,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
 
         assert_eq!(resp.jobs_finalized[0].reason, EndReason::Requeued);
@@ -13948,12 +15016,16 @@ mod tests {
             node_name: "worker2".into(),
             exit_code: 1,
             signal: 0,
+            run_attempt: 0,
+            at: None,
         });
         let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id,
             node_name: "worker1".into(),
             exit_code: 0,
             signal: 0,
+            run_attempt: 0,
+            at: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -13978,6 +15050,8 @@ mod tests {
             node_name: "worker1".into(),
             exit_code: 0,
             signal: 0,
+            run_attempt: 0,
+            at: None,
         });
 
         assert_eq!(resp.jobs_finalized[0].reason, EndReason::None);
@@ -13997,6 +15071,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
 
         let requeued = cm.get_job(job_id).unwrap();
@@ -14036,6 +15111,8 @@ mod tests {
                 node_name: "worker1".into(),
                 exit_code: 0,
                 signal,
+                run_attempt: 0,
+                at: None,
             });
 
             assert_eq!(resp.jobs_finalized[0].reason, expected, "signal {signal}");
@@ -14492,6 +15569,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_excludes_a_job_already_holding_a_placement() {
+        // A reserved-but-undispatched job offered to the scheduler again could
+        // win a second node this pass before reserve_placement's own duplicate
+        // guard rejects it, idling that node until the next cycle.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("already-reserved"));
+        let res = scalar_alloc(4, 8000);
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+
+        assert!(
+            !cm.pending_jobs().iter().any(|j| j.job_id == id),
+            "a job already holding a placement must not be offered again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qos_max_jobs_does_not_double_count_a_reserved_jobs_own_slot() {
+        // A reserved job already counts via `occupies_resources` in the gate's
+        // existing-usage scan; admitting it again as a same-pass candidate
+        // charged its own slot a second time, wrongly blocking a sibling that
+        // fit within the real (not doubled) cap.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            limits: spur_core::accounting::QosLimits {
+                max_jobs_per_user: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut reserved_spec = basic_spec("reserved");
+        reserved_spec.qos = Some("cnt".into());
+        let reserved_id = submit_and_wait(&cm, reserved_spec);
+        let res = scalar_alloc(1, 1000);
+        cm.reserve_placement(
+            reserved_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+
+        let mut sibling_spec = basic_spec("waiting-sibling");
+        sibling_spec.qos = Some("cnt".into());
+        let sibling_id = submit_and_wait(&cm, sibling_spec);
+
+        cm.refresh_pending_reasons();
+        assert_ne!(
+            cm.get_job(sibling_id).unwrap().pending_reason,
+            PendingReason::QoSMaxJobsPerUser,
+            "one reserved job must not consume both of a cap of two slots"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn user_requeue_suspended_job_repends() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -14609,6 +15756,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::Requeued);
@@ -14621,6 +15769,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
         assert!(
             resp.jobs_finalized.is_empty(),
@@ -14956,6 +16105,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
         assert_eq!(cm.get_job(job_id).unwrap().user_requeue_count, 1);
@@ -14967,6 +16117,7 @@ mod tests {
             hold: false,
             begin_time: None,
             by: None,
+            at: None,
         });
         assert_eq!(
             cm.get_job(job_id).unwrap().user_requeue_count,
@@ -15630,6 +16781,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -15664,6 +16816,8 @@ mod tests {
             node_name: "worker1".into(),
             exit_code: -1,
             signal: 15,
+            run_attempt: 0,
+            at: None,
         });
         assert_eq!(done.jobs_finalized.len(), 1);
         assert_eq!(done.jobs_finalized[0].state, JobState::Preempted);
@@ -15941,6 +17095,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
         cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
 
@@ -16017,6 +17172,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -16028,6 +17184,7 @@ mod tests {
             begin_time,
             preempted_by: None,
             preempt_qos: None,
+            at: None,
         });
         // One op finalizes the prior run as PREEMPTED (drives accounting) ...
         assert_eq!(resp.jobs_finalized.len(), 1);
@@ -16050,6 +17207,7 @@ mod tests {
             begin_time,
             preempted_by: None,
             preempt_qos: None,
+            at: None,
         });
         assert!(
             replay.jobs_finalized.is_empty(),
@@ -16149,6 +17307,8 @@ mod tests {
             node_name: "worker1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
         assert!(
             resp.jobs_finalized.is_empty(),
@@ -19873,6 +21033,56 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assoc_mgr_info_counts_a_reserved_but_still_pending_job_as_running() {
+        // reserve_placement charges a job's nodes while it's still Pending
+        // (before dispatch confirms), so usage reporting must see it too — a
+        // raw `state == Running` filter under-counts a reserving job's charge.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "cnt".into(),
+            ..Default::default()
+        });
+
+        let mut spec = basic_spec("reserved-not-running");
+        spec.qos = Some("cnt".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.reserve_placement(
+            job_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+        assert_eq!(
+            cm.get_job(job_id).unwrap().state,
+            JobState::Pending,
+            "the reservation must not itself advance the job to Running"
+        );
+
+        let info = cm.assoc_mgr_info(None);
+        let record = info
+            .qos_records
+            .iter()
+            .find(|r| r.scope == "cnt")
+            .expect("cnt record");
+        assert_eq!(
+            record.grp_running_jobs, 1,
+            "a reserved-but-Pending job already occupies its node and must count"
+        );
+        let user = record
+            .users
+            .iter()
+            .find(|u| u.user == "testuser")
+            .expect("testuser row");
+        assert_eq!(user.running_jobs, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_default_qos_reaches_real_enforcement() {
         // A cluster fallback QOS must bind a no-qos job and its limits must
         // actually block a second job — end to end.
@@ -21759,6 +22969,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn licenses_in_use_counts_a_reserved_but_still_pending_job() {
+        // reserve_placement charges a job's nodes while it's still Pending, so
+        // the license budget must see it too, not just Running/Suspended/Completing.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.license_pool.write().insert("fluent".into(), 1);
+
+        let mut spec_a = basic_spec("license-a");
+        spec_a.gres = vec!["license:fluent:1".into()];
+        let a = submit_and_wait(&cm, spec_a);
+        let res = scalar_alloc(1, 1000);
+        cm.reserve_placement(
+            a,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        )
+        .expect("reserve");
+
+        let mut spec_b = basic_spec("license-b");
+        spec_b.gres = vec!["license:fluent:1".into()];
+        let b = submit_and_wait(&cm, spec_b);
+
+        cm.refresh_pending_reasons();
+        assert_eq!(
+            cm.get_job(b).unwrap().pending_reason,
+            PendingReason::Licenses,
+            "a's reserved-but-unconfirmed license claim must still count against b"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn array_throttle_reason_hands_off_to_license_blocker() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -22854,6 +24099,7 @@ mod tests {
             admin_locked: false,
             reason_uid: None,
             reason_time: None,
+            at: None,
         });
 
         settle(&cm, job_id, JobState::Cancelled);
@@ -22877,6 +24123,7 @@ mod tests {
             admin_locked: false,
             reason_uid: None,
             reason_time: None,
+            at: None,
         });
 
         assert_eq!(resp.jobs_finalized.len(), 1);
@@ -24667,7 +25914,9 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: id,
             begin_time: Utc::now(),
+            spare_requeue_budget: false,
             run_attempt: 2,
+            at_max_requeue: false,
         });
         assert_eq!(cm.get_job(id).unwrap().run_attempt, 5);
     }
@@ -24820,7 +26069,9 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: 999,
             begin_time: Utc::now(),
+            spare_requeue_budget: false,
             run_attempt: 1,
+            at_max_requeue: false,
         });
         assert!(cm.get_job(999).is_none());
     }
@@ -24837,7 +26088,9 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: id,
             begin_time: Utc::now(),
+            spare_requeue_budget: false,
             run_attempt: 1,
+            at_max_requeue: false,
         });
 
         let job = cm.get_job(id).unwrap();
@@ -25727,6 +26980,8 @@ mod tests {
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
         settle(&cm, job_a, JobState::Completing);
         assert_eq!(
@@ -28360,6 +29615,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
     }
 
@@ -28377,6 +29633,7 @@ mod tests {
             srun_step_dispatch: true,
             run_attempt: 0,
             idle_fill: false,
+            at: None,
         });
     }
 
@@ -28398,6 +29655,7 @@ mod tests {
             admin_locked: false,
             reason_uid: None,
             reason_time: None,
+            at: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].job_id, id);
@@ -28409,6 +29667,49 @@ mod tests {
 
         let node = cm.get_node("n1").unwrap();
         assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_state_change_to_down_frees_a_pending_reservation_on_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("stranded-reservation"));
+        let res = ResourceAllocations::with_scalar(1, 0);
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            [("n1".to_string(), res)].into_iter().collect(),
+            false,
+            false,
+        )
+        .expect("reserve");
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Pending);
+        assert!(cm.get_job(id).unwrap().holds_a_placement());
+
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("heartbeat timeout".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+        // Nothing to finalize: the job never left Pending, so there's no
+        // terminal transition to report — only a charge to free.
+        assert!(resp.jobs_finalized.is_empty());
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(!job.holds_a_placement());
+        assert_eq!(job.pending_reason, PendingReason::NodeDown);
+
+        let node = cm.get_node("n1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 0);
     }
 
@@ -28427,6 +29728,7 @@ mod tests {
             admin_locked: false,
             reason_uid: None,
             reason_time: None,
+            at: None,
         });
         assert!(resp.jobs_finalized.is_empty());
         assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
@@ -28443,6 +29745,7 @@ mod tests {
         cm.apply_operation(&WalOperation::NodeRemove {
             name: "n1".into(),
             reason: Some("decommission".into()),
+            at: None,
         });
         assert!(cm.get_node("n1").is_none());
     }
@@ -28459,6 +29762,7 @@ mod tests {
         let resp = cm.apply_operation(&WalOperation::NodeRemove {
             name: "n1".into(),
             reason: None,
+            at: None,
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::NodeFail);
@@ -28667,6 +29971,7 @@ mod tests {
             admin_locked: false,
             reason_uid: Some(0),
             reason_time: Some(Utc::now()),
+            at: None,
         });
         let node = cm.get_node("n1").unwrap();
         assert_eq!(node.state, NodeState::Down);
@@ -28739,6 +30044,8 @@ mod tests {
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            at: None,
+            run_attempt: 0,
         });
 
         let node = cm.get_node("n1").unwrap();

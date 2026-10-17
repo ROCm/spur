@@ -680,8 +680,9 @@ the job starts on its own once matching nodes join.
    * - ``ExcNodeList``
      - Nodes excluded with ``-x/--exclude``.
    * - ``NodeList``
-     - Nodes actually **allocated**. Empty (``(null)``) while pending — do not
-       confuse it with ``ReqNodeList``.
+     - Nodes actually **allocated**. Empty (``(null)``) while pending, except
+       briefly while the controller reserves nodes and confirms the launch
+       (bounded by ``dispatch_timeout_secs``). Not the same as ``ReqNodeList``.
    * - ``Features``
      - Node feature constraint from ``-C/--constraint``.
    * - ``ReqTRES``

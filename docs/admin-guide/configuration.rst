@@ -322,6 +322,13 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        dispatch for the same span, and is not marked down, so it still
        appears available in ``sinfo`` while being skipped.
 
+       Also sets how long a newly elected leader waits before reclaiming a
+       placement reserved by a dispatch the previous leader never
+       confirmed: ``2 ×`` this value, to cover a two-phase PMIx dispatch
+       where each phase gets its own full budget. Raising this value
+       toward its max therefore also raises how long a node can sit
+       idle-but-charged after a failover.
+
 ``[spurd]``
 -----------
 
