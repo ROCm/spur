@@ -578,21 +578,21 @@ fn find_card_for_render_minor(render_minor: u32) -> Option<u32> {
     None
 }
 
+// Plain text so that scripts/sync-amd-gpu-ids.sh can update it without editing Rust.
+const AMD_GPU_IDS: &str = include_str!("amd_gpu_ids.txt");
+
+fn amd_gpu_id_entries() -> impl Iterator<Item = (&'static str, &'static str)> {
+    AMD_GPU_IDS.lines().filter_map(|line| {
+        let mut fields = line.split('#').next()?.split_whitespace();
+        Some((fields.next()?, fields.next()?))
+    })
+}
+
 fn detect_amd_gpu_type_from_id(device_id: u32) -> String {
-    let dev_id = format!("0x{:04x}", device_id);
-    match dev_id.as_str() {
-        "0x74a1" | "0x74a9" | "0x74bd" => "mi300x".into(),
-        "0x74a0" => "mi300a".into(),
-        "0x74a5" => "mi325x".into(),
-        "0x74a2" | "0x74a8" => "mi308x".into(),
-        "0x75a0" => "mi350x".into(),
-        "0x75a3" => "mi355x".into(),
-        "0x740f" => "mi210".into(),
-        "0x7408" | "0x740c" => "mi250x".into(),
-        "0x738c" | "0x738e" => "mi100".into(),
-        "0x7550" | "0x7551" => "rx9070".into(),
-        _ => format!("amdgpu-{dev_id}"),
-    }
+    let id = format!("{device_id:04x}");
+    amd_gpu_id_entries()
+        .find(|(entry_id, _)| *entry_id == id)
+        .map_or_else(|| format!("amdgpu-0x{id}"), |(_, gpu_type)| gpu_type.into())
 }
 
 pub(crate) fn normalize_gpu_name(name: &str) -> String {
@@ -791,7 +791,32 @@ mod tests {
     fn test_detect_amd_gpu_type_from_id() {
         assert_eq!(detect_amd_gpu_type_from_id(0x74a2), "mi308x");
         assert_eq!(detect_amd_gpu_type_from_id(0x74a1), "mi300x");
+        assert_eq!(detect_amd_gpu_type_from_id(0x74b5), "mi300x");
+        assert_eq!(detect_amd_gpu_type_from_id(0x74b9), "mi325x");
+        assert_eq!(detect_amd_gpu_type_from_id(0x7550), "rx9070");
         assert_eq!(detect_amd_gpu_type_from_id(0xffff), "amdgpu-0xffff");
+    }
+
+    #[test]
+    fn test_amd_gpu_ids_are_well_formed() {
+        let mut seen = std::collections::HashSet::new();
+        for (id, gpu_type) in amd_gpu_id_entries() {
+            assert!(
+                id.len() == 4 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "bad device id {id:?}"
+            );
+            assert!(
+                gpu_type
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "bad gpu type {gpu_type:?} for {id}"
+            );
+            assert!(seen.insert(id), "duplicate device id {id}");
+        }
+        assert!(
+            !AMD_GPU_IDS.contains("TODO"),
+            "review the suggested GPU types marked TODO in amd_gpu_ids.txt"
+        );
     }
 
     #[test]

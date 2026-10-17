@@ -1,0 +1,46 @@
+# AMD GPU PCI device ID to Spur GPU type, one "<id> <type>" pair per line.
+# scripts/sync-amd-gpu-ids.sh keeps the IDs in sync with the AMD GPU operator
+# NodeFeatureRule. The trailing comment is the upstream name of the device.
+# A virtual function or a board variant (HF, dual slot) uses the GPU type of
+# its physical card, so that one job request matches all of them.
+738c mi100  # MI100
+738e mi100  # MI100
+73a1 v620  # V620
+73a2 w6900x  # W6900X
+73a3 w6800  # W6800 GL-XL
+73ab w6800x  # W6800X / W6800X Duo
+73ae v620  # Radeon Pro V620 MxGPU
+73af rx6900xt  # RX 6900 XT
+73bf rx6800  # RX 6800 / 6800 XT / 6900 XT
+7408 mi250x  # MI250X
+740c mi250x  # MI250/MI250X
+740f mi210  # MI210
+7410 mi210  # MI210 VF
+7448 w7900  # W7900
+7449 w7800-48gb  # W7800 48GB
+744a w7900  # W7900 Dual Slot
+744b w7900d  # W7900D
+744c rx7900  # RX 7900 XT / 7900 XTX / 7900 GRE / 7900M
+745e w7800  # W7800
+7460 v710  # V710
+7461 v710  # Radeon Pro V710 MxGPU
+74a0 mi300a  # MI300A
+74a1 mi300x  # MI300X
+74a2 mi308x  # MI308X
+74a5 mi325x  # MI325X
+74a8 mi308x  # MI308X HF
+74a9 mi300x  # MI300X HF
+74b5 mi300x  # MI300X VF
+74b6 mi308x  # MI308X VF
+74b9 mi325x  # Mi325X VF
+74bc mi308x  # MI308X HF VF
+74bd mi300x  # MI300X HF VF
+7550 rx9070  # RX 9070 / 9070 XT
+7551 rx9070  # AI PRO R9700 / R9700S / R9600D
+7590 rx9060  # RX 9060 XT
+75a0 mi350x  # MI350X
+75a3 mi355x  # MI355X
+75a8 mi350p  # MI350P
+75b0 mi350x  # Mi350X VF
+75b3 mi355x  # Mi355X VF
+75b8 mi350p  # MI350P VF
