@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
+use crate::cdi::annotations;
 use crate::cdi::spec::{CdiDevice, CdiSpec};
 
 pub const DEFAULT_SPEC_DIRS: &[&str] = &["/etc/cdi", "/var/run/cdi"];
@@ -176,6 +177,18 @@ impl CdiCache {
                         self.errors
                             .add(&path.display().to_string(), format!("validation: {}", e));
                         warn!(path = %path.display(), error = %e, "invalid CDI spec, skipping");
+                        continue;
+                    }
+                    // A saved copy of spurd's own discovery, e.g. the spec it
+                    // writes for k0s's containerd. Live discovery replaces it, so
+                    // a later partition change is seen.
+                    if spec
+                        .annotations
+                        .get(annotations::AUTO_DETECTED)
+                        .map(String::as_str)
+                        == Some("true")
+                    {
+                        debug!(path = %path.display(), "auto-detected CDI spec, skipping");
                         continue;
                     }
                     let path_str = path.display().to_string();
@@ -371,6 +384,27 @@ mod tests {
 
         assert_eq!(cache.len(), 1);
         assert!(cache.get_device("amd.com/gpu=0").is_some());
+    }
+
+    /// spurd writes its own discovery to disk for k0s's containerd. Reading
+    /// that copy back as inventory hides a later partition change.
+    #[test]
+    fn an_auto_detected_spec_on_disk_is_not_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut snapshot = make_amd_spec(&["0", "1"]);
+        snapshot
+            .annotations
+            .insert(crate::cdi::annotations::AUTO_DETECTED.into(), "true".into());
+        snapshot.write_json(&dir.path().join("amd.json")).unwrap();
+        make_amd_spec(&["7"])
+            .write_json(&dir.path().join("admin.json"))
+            .unwrap();
+
+        let mut cache = CdiCache::new();
+        cache.load_from_dirs(&[dir.path().to_path_buf()]);
+
+        assert!(cache.get_errors().is_empty());
+        assert_eq!(cache.list_devices(), vec!["amd.com/gpu=7"]);
     }
 
     #[test]
