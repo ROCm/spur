@@ -53,6 +53,10 @@ pub const RAFT_MAX_MESSAGE_SIZE: usize = 32 * 1024 * 1024;
 /// snapshot simply ships in more chunks.
 pub const RAFT_SNAPSHOT_MAX_CHUNK_SIZE: u64 = 1024 * 1024;
 
+/// Covers a quorum heartbeat round plus a short apply catch-up; past this the
+/// node is treated as not leading rather than stalling its caller.
+const LEADER_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Build a Raft gRPC client with message-size limits raised to
 /// `RAFT_MAX_MESSAGE_SIZE`. Used by both the live network path and tests so the
 /// exact transport configuration is covered.
@@ -862,8 +866,8 @@ pub struct RaftHandle {
 }
 
 impl RaftHandle {
-    /// Cheap, locally-cached leadership check. Can be stale for the length of
-    /// an election timeout after a partition — callers that need a
+    /// Cheap, locally-cached leadership check. A leader that lost quorum keeps
+    /// reporting `true` until it sees a higher term — callers that need a
     /// consensus-backed answer (e.g. before writes that bypass Raft, like
     /// accounting reconciliation) must use `ensure_leader` instead.
     pub fn is_leader(&self) -> bool {
@@ -871,12 +875,21 @@ impl RaftHandle {
         live_leader_from_rx(&rx) == Some(self.node_id)
     }
 
-    /// Consensus-backed leadership check: confirms leadership by exchanging
-    /// heartbeats with a quorum of followers, so a partitioned former leader
-    /// gets `false` rather than a stale cached `true`. Costs a network
-    /// round-trip; use for periodic/batch operations, not on every request.
+    /// Consensus-backed leadership check (one quorum heartbeat round); also `false`
+    /// when confirmation plus apply catch-up exceeds `LEADER_CONFIRM_TIMEOUT`.
     pub async fn ensure_leader(&self) -> bool {
-        self.raft.ensure_linearizable().await.is_ok()
+        self.ensure_leader_within(LEADER_CONFIRM_TIMEOUT).await
+    }
+
+    async fn ensure_leader_within(&self, limit: std::time::Duration) -> bool {
+        if !self.is_leader() {
+            return false;
+        }
+        // The apply wait inside `ensure_linearizable` is unbounded.
+        matches!(
+            tokio::time::timeout(limit, self.raft.ensure_linearizable()).await,
+            Ok(Ok(_))
+        )
     }
 
     pub fn current_leader(&self) -> Option<NodeId> {
@@ -1269,6 +1282,48 @@ pub async fn start_raft_with_recovery_mode(
         node_id,
         peers: peer_map,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// Blocks state-machine applies while closed, to model a stuck apply.
+    #[derive(Default)]
+    pub(crate) struct ApplyGate {
+        closed: Mutex<bool>,
+        cvar: Condvar,
+        held: tokio::sync::Notify,
+    }
+
+    impl ApplyGate {
+        pub(crate) fn wait_open(&self) {
+            let closed = self.closed.lock().unwrap();
+            if *closed {
+                self.held.notify_one();
+            }
+            let _open = self.cvar.wait_while(closed, |closed| *closed).unwrap();
+        }
+
+        /// Reopens on drop, so a failing test cannot leave a runtime worker blocked.
+        pub(crate) fn close(self: &Arc<Self>) -> ClosedGate {
+            *self.closed.lock().unwrap() = true;
+            ClosedGate(self.clone())
+        }
+
+        pub(crate) async fn apply_held(&self) {
+            self.held.notified().await;
+        }
+    }
+
+    pub(crate) struct ClosedGate(Arc<ApplyGate>);
+
+    impl Drop for ClosedGate {
+        fn drop(&mut self) {
+            *self.0.closed.lock().unwrap() = false;
+            self.0.cvar.notify_all();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2283,6 +2338,56 @@ mod tests {
             .await
             .expect("single-node raft did not self-elect within 5s");
         handle
+    }
+
+    struct GatedApplier(Arc<test_support::ApplyGate>);
+    impl StateMachineApply for GatedApplier {
+        fn apply_operation(&self, _op: &WalOperation) -> ClientResponse {
+            self.0.wait_open();
+            ClientResponse::default()
+        }
+        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+            Ok(Vec::new())
+        }
+        fn restore_from_snapshot(&self, _data: &[u8]) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_leader_gives_up_instead_of_waiting_on_a_stuck_apply() {
+        let dir = TempDir::new().unwrap();
+        let gate = Arc::new(test_support::ApplyGate::default());
+        let handle =
+            start_single_node_leader(dir.path(), Arc::new(GatedApplier(gate.clone()))).await;
+        assert!(handle.ensure_leader().await);
+
+        let closed = gate.close();
+        let raft = handle.raft.clone();
+        let write = tokio::spawn(async move {
+            raft.client_write(WalOperation::TokenRevoke {
+                token_id: "t".into(),
+            })
+            .await
+        });
+        gate.apply_held().await;
+        assert!(
+            !handle
+                .ensure_leader_within(std::time::Duration::from_millis(200))
+                .await
+        );
+
+        drop(closed);
+        write.await.unwrap().unwrap();
+        assert!(handle.ensure_leader().await);
+    }
+
+    #[tokio::test]
+    async fn ensure_leader_is_false_without_a_network_round_on_a_non_leader() {
+        let dir = TempDir::new().unwrap();
+        let handle = start_single_node_leader(dir.path(), noop_applier()).await;
+        handle.raft.shutdown().await.unwrap();
+        assert!(!handle.ensure_leader().await);
     }
 
     #[tokio::test]

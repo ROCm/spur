@@ -331,6 +331,18 @@ Enable and start it:
 
 .. note::
 
+   A request that changes cluster state (for example ``sbatch``, ``scancel``, or a node
+   registering) fails after 30 seconds with ``raft propose timed out ... outcome unknown``
+   if the controller cannot commit it in time. The change may still take effect
+   afterwards, so check with ``squeue`` before resubmitting. If the leader's scheduler
+   loop makes no progress for at least 5 minutes (longer when
+   ``controller.dispatch_timeout_secs`` or ``scheduler.interval_secs`` is large),
+   ``spurctld`` logs ``scheduler loop has made no progress`` at error level and repeats it
+   while the stall lasts; restart ``spurctld`` on that controller to recover. The 30-second
+   and 5-minute values are fixed, not configurable.
+
+.. note::
+
    The one-line installer places binaries in ``~/.local/bin`` by default. If you install
    that way, adjust ``ExecStart`` to match — this unit assumes ``/usr/local/bin``.
 

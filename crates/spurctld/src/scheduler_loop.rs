@@ -73,6 +73,97 @@ fn should_sweep_orphaned_placements(
     }
 }
 
+/// Floor for the stall threshold; see `stall_threshold` for what raises it.
+const MIN_STALL_THRESHOLD: Duration = Duration::from_secs(300);
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Long enough to cover an idle tick and one PMIx dispatch (prepare plus launch)
+/// that runs to its deadline, so a slow but moving loop is not reported as stalled.
+fn stall_threshold(interval: Duration, dispatch_deadline: Option<Duration>) -> Duration {
+    let dispatch = dispatch_deadline.map_or(Duration::ZERO, |d| d * 2 + STALL_CHECK_INTERVAL);
+    MIN_STALL_THRESHOLD.max(interval * 2).max(dispatch)
+}
+
+/// A node that leads by its own account but cannot confirm it is not making
+/// progress, even though its loop keeps waking.
+fn wake_is_progress(confirmed_leader: bool, believes_leader: bool) -> bool {
+    confirmed_leader || !believes_leader
+}
+
+/// Last time the scheduler loop made progress: a wake that was not blocked on
+/// leadership, or an assignment it moved past.
+#[derive(Clone)]
+struct ProgressMark(Arc<parking_lot::Mutex<Instant>>);
+
+impl Default for ProgressMark {
+    fn default() -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(Instant::now())))
+    }
+}
+
+impl ProgressMark {
+    fn mark(&self) {
+        *self.0.lock() = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.0.lock()
+    }
+}
+
+/// Rate-limits stall reports to one per threshold window.
+#[derive(Default)]
+struct StallReporter {
+    last_report: Option<Instant>,
+}
+
+impl StallReporter {
+    /// Returns how long the loop has been stalled when a report is due.
+    fn observe(
+        &mut self,
+        last_progress: Instant,
+        now: Instant,
+        is_leader: bool,
+        threshold: Duration,
+    ) -> Option<Duration> {
+        let stalled_for = now.saturating_duration_since(last_progress);
+        if stalled_for < threshold {
+            return None;
+        }
+        let recently_reported = self
+            .last_report
+            .is_some_and(|at| now.saturating_duration_since(at) < threshold);
+        if !is_leader || recently_reported {
+            return None;
+        }
+        self.last_report = Some(now);
+        Some(stalled_for)
+    }
+}
+
+async fn watch_scheduler_progress(
+    cluster: Arc<ClusterManager>,
+    raft: Arc<RaftHandle>,
+    progress: ProgressMark,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(STALL_CHECK_INTERVAL);
+    let mut reporter = StallReporter::default();
+    loop {
+        ticker.tick().await;
+        let threshold = stall_threshold(interval, dispatch_deadline(&cluster));
+        let Some(stalled_for) =
+            reporter.observe(progress.last(), Instant::now(), raft.is_leader(), threshold)
+        else {
+            continue;
+        };
+        error!(
+            stalled_secs = stalled_for.as_secs(),
+            "scheduler loop has made no progress; jobs may not be getting scheduled"
+        );
+    }
+}
+
 /// Drop everything a former leader may no longer speak for.
 pub(crate) fn relinquish_leadership(
     cluster: &Arc<ClusterManager>,
@@ -115,6 +206,19 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let startup_config = cluster.config();
     let interval_secs = startup_config.scheduler.interval_secs.max(1) as u64;
     let max_jobs = startup_config.scheduler.max_jobs_per_cycle as usize;
+    let progress = ProgressMark::default();
+    let watcher_cluster = cluster.clone();
+    let watcher_raft = raft.clone();
+    let watcher_progress = progress.clone();
+    tokio::spawn(async move {
+        watch_scheduler_progress(
+            watcher_cluster,
+            watcher_raft,
+            watcher_progress,
+            Duration::from_secs(interval_secs),
+        )
+        .await;
+    });
 
     let mut scheduler = BackfillScheduler::new(max_jobs);
 
@@ -173,9 +277,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             _ = interval.tick() => {}
         }
 
-        let is_leader = raft.is_leader();
-
-        if !is_leader {
+        // Consensus-backed: a restart can briefly restore a stale-term leadership.
+        let confirmed = raft.ensure_leader().await;
+        if wake_is_progress(confirmed, raft.is_leader()) {
+            progress.mark();
+        }
+        if !confirmed {
             // A former leader must not keep serving planned-reservation info
             // from before it lost leadership.
             relinquish_leadership(&cluster, &mut scheduler);
@@ -404,13 +511,26 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         let mut jobs_started_cycle = 0u64;
-        for assignment in assignments {
+        let total_assignments = assignments.len();
+        for (done, assignment) in assignments.into_iter().enumerate() {
             // `Assignment` carries no tier information, but this loop appended the
             // candidates, so results are tagged by job-ID membership rather than by
             // changing the scheduler's signature (§5.2).
             let borrowed = borrow_ids.contains(&assignment.job_id);
-            if process_assignment(cluster.clone(), assignment, borrowed).await {
+            let started = process_assignment(cluster.clone(), assignment, borrowed).await;
+            progress.mark();
+            if started {
                 jobs_started_cycle += 1;
+                continue;
+            }
+            // openraft never steps down on lost quorum, so re-confirm before the
+            // next assignment's prolog and placement write.
+            if !raft.ensure_leader().await {
+                info!(
+                    skipped = total_assignments - done - 1,
+                    "leadership not confirmed mid-pass; leaving the remaining assignments"
+                );
+                break;
             }
         }
 
@@ -2719,7 +2839,7 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
     loop {
         interval.tick().await;
 
-        if !raft.is_leader() {
+        if !raft.ensure_leader().await {
             continue;
         }
 
@@ -2828,6 +2948,11 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
             was_leader = false;
             continue;
         }
+        // A failed confirmation only skips this tick; resetting the timers on it
+        // would hand every idle allocation a fresh grace window.
+        if !raft.ensure_leader().await {
+            continue;
+        }
 
         if !was_leader {
             // (Re)gained leadership: drop stale timers so the reap check below
@@ -2925,7 +3050,7 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
     loop {
         interval.tick().await;
 
-        if !raft.is_leader() {
+        if !raft.ensure_leader().await {
             continue;
         }
 
@@ -3060,7 +3185,7 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     loop {
         interval.tick().await;
 
-        if !raft.is_leader() {
+        if !raft.ensure_leader().await {
             continue;
         }
 
@@ -3423,6 +3548,65 @@ mod tests {
         ResourceAllocations, ResourceSet,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn stall_reporter_reports_a_stalled_leader_once_per_window() {
+        let threshold = Duration::from_secs(300);
+        let mark = Instant::now();
+        let stalled = mark + threshold;
+        let mut reporter = StallReporter::default();
+
+        assert_eq!(reporter.observe(mark, mark, true, threshold), None);
+        assert_eq!(
+            reporter.observe(mark, stalled, true, threshold),
+            Some(threshold)
+        );
+        assert_eq!(
+            reporter.observe(mark, stalled + Duration::from_secs(1), true, threshold),
+            None,
+            "already reported within this window"
+        );
+        let next_window = stalled + threshold;
+        assert_eq!(
+            reporter.observe(mark, next_window, true, threshold),
+            Some(next_window - mark)
+        );
+    }
+
+    #[test]
+    fn stall_reporter_stays_quiet_on_a_follower() {
+        let threshold = Duration::from_secs(300);
+        let mark = Instant::now();
+        let mut reporter = StallReporter::default();
+        assert_eq!(
+            reporter.observe(mark, mark + threshold * 3, false, threshold),
+            None
+        );
+    }
+
+    #[test]
+    fn stall_threshold_outlasts_an_idle_tick_and_a_full_dispatch() {
+        let secs = Duration::from_secs;
+        assert_eq!(stall_threshold(secs(1), None), MIN_STALL_THRESHOLD);
+        assert_eq!(stall_threshold(secs(600), None), secs(1200));
+        assert_eq!(
+            stall_threshold(secs(1), Some(secs(300))),
+            secs(600) + STALL_CHECK_INTERVAL
+        );
+    }
+
+    #[test]
+    fn unconfirmed_leadership_is_not_progress() {
+        assert!(wake_is_progress(true, true));
+        assert!(
+            wake_is_progress(false, false),
+            "a follower has nothing to do"
+        );
+        assert!(
+            !wake_is_progress(false, true),
+            "a leader that cannot confirm itself schedules nothing"
+        );
+    }
 
     fn job_with_spec(mut spec: JobSpec) -> Job {
         spec.cpus_per_task = spec.cpus_per_task.max(1);

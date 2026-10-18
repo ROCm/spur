@@ -243,6 +243,10 @@ pub struct SubmitOutcome {
 /// oversized batch scripts.
 const MAX_JOB_SPEC_SIZE: usize = 4 * 1024 * 1024;
 
+/// openraft leaves a write unanswered when a snapshot install skips past it, so
+/// an unbounded wait can wedge its caller; on timeout the write may still commit.
+const PROPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A `std::io::Write` that only tallies byte counts and discards the data. Used
 /// to measure a value's serialized size without allocating the serialized bytes.
 #[derive(Default)]
@@ -461,6 +465,7 @@ pub struct ClusterManager {
     /// node keep it marked until the last finishes. Leader-local, like the handler that sets it.
     k0s_removals: parking_lot::Mutex<HashMap<String, usize>>,
     raft: RwLock<Option<SpurRaft>>,
+    propose_timeout: std::time::Duration,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
@@ -762,6 +767,7 @@ impl ClusterManager {
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             k0s_removals: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
+            propose_timeout: PROPOSE_TIMEOUT,
             accounting: RwLock::new(None),
             fairshare_cache,
             qos_cache,
@@ -6279,9 +6285,12 @@ impl ClusterManager {
             .read()
             .clone()
             .expect("raft must be set before propose is called");
+        let limit = self.propose_timeout;
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async { raft.client_write(op).await })
+            tokio::runtime::Handle::current()
+                .block_on(async { tokio::time::timeout(limit, raft.client_write(op)).await })
         })
+        .map_err(|_| anyhow::anyhow!("raft propose timed out after {limit:?}; outcome unknown"))?
         .map(|res| res.data)
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
@@ -10250,7 +10259,12 @@ mod tests {
         panic!("timed out waiting for: {label}");
     }
 
-    fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
+    fn try_register_node(
+        cm: &ClusterManager,
+        name: &str,
+        cpus: u32,
+        mem: u64,
+    ) -> Result<(), RegisterNodeError> {
         cm.register_node(
             name.into(),
             name.into(),
@@ -10267,10 +10281,66 @@ mod tests {
             HashMap::new(),
             true,
         )
-        .unwrap();
+    }
+
+    fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
+        try_register_node(cm, name, cpus, mem).unwrap();
         let n = name.to_string();
         wait_for(&format!("node '{n}' registered"), || {
             cm.get_node(&n).is_some()
+        });
+    }
+
+    struct GatedApplier {
+        inner: Arc<ClusterManager>,
+        gate: Arc<crate::raft::test_support::ApplyGate>,
+    }
+
+    impl StateMachineApply for GatedApplier {
+        fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+            self.gate.wait_open();
+            self.inner.apply_operation(op)
+        }
+        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+            StateMachineApply::snapshot_state(&*self.inner)
+        }
+        fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+            StateMachineApply::restore_from_snapshot(&*self.inner, data)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn propose_returns_an_error_when_the_write_is_never_applied() {
+        let dir = TempDir::new().unwrap();
+        let mut cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.propose_timeout = std::time::Duration::from_millis(200);
+        let cm = Arc::new(cm);
+        let gate = Arc::new(crate::raft::test_support::ApplyGate::default());
+        let applier = Arc::new(GatedApplier {
+            inner: cm.clone(),
+            gate: gate.clone(),
+        });
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), applier)
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+        register_node(&cm, "n1", 4, 1024);
+
+        let closed = gate.close();
+        let err = try_register_node(&cm, "n2", 4, 1024)
+            .expect_err("a write that is never applied must not block its caller");
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        // A timeout is an unknown outcome, not a failure: the write still lands.
+        drop(closed);
+        wait_for("n2 applied after the gate opens", || {
+            cm.get_node("n2").is_some()
         });
     }
 
