@@ -7,7 +7,7 @@
 #
 # Findings go to code scanning as SARIF, never to logs or the job summary,
 # which are public. Same-repo PRs also get the baseline's findings comment.
-# See nightly-security-scan.yml for the full-repository scan.
+# See nightly-security.yml for the full-repository scan.
 
 name: Security
 
