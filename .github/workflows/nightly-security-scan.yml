@@ -1,17 +1,15 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 #
-# Weekly security scan: runs on a fixed cadence and pushes SARIF findings
-# to the repository's code-scanning Security tab. Complements
-# `pr-security-scan.yml`, which scans only what changed in a PR and
-# uploads reviewer-readable artifacts for in-review browsing.
+# Nightly security scan: scans the whole repository and pushes SARIF
+# findings to the repository's code-scanning Security tab. Complements
+# `pr-security-scan.yml`, which scans only what changed in a PR.
 
-name: Security scan (Weekly)
+name: Security scan (Nightly)
 
 on:
-  # Run every Saturday at 10:00 UTC.
   schedule:
-    - cron: "0 10 * * 6"
+    - cron: "17 5 * * *"
   workflow_dispatch:
 
 permissions:
@@ -20,6 +18,8 @@ permissions:
 jobs:
   security:
     name: Security scan
+    # Forks inherit the schedule but have no code scanning to report to.
+    if: github.event.repository.fork == false
     # Only the job that uploads SARIF gets write access to code scanning.
     permissions:
       contents: read

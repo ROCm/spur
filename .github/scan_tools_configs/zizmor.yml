@@ -11,5 +11,4 @@
 # Keep repository-specific suppressions and tuning here.
 #
 # Add rule-specific settings and suppressions under `rules:`.
-
 rules: {}

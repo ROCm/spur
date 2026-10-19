@@ -16,7 +16,7 @@
 # Use `.gitleaksignore` for one-off finding fingerprints. Add recurring path
 # or regex exclusions to `[[allowlists]]` in this file.
 
-title = "gitleaks config"
+title = "rocm-security-gh gitleaks config"
 
 [extend]
 # Inherit gitleaks' built-in ruleset (rotations, AWS, GCP, Slack, ...).
@@ -53,11 +53,7 @@ regexTarget = "match"
 regexes = [
   '''(?i)\bINVALID_TOKEN\s*=''',
   '''(?i)\bwrong_secret\s*=''',
-  # Explicit test-only secret identifiers
-  '''(?i)\btest_secret\s*=''',
-  '''(?i)\bdummy_secret\s*=''',
-  '''(?i)\bfake_secret\s*=''',
-  '''(?i)\bexample_secret\s*='''
+  '''\bFormat\.Graphics\.PixelValueAccessMode\s*=''',
 ]
 
 [[allowlists]]

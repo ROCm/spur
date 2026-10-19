@@ -14,9 +14,8 @@
 # paths are absent from clean CI checkouts.
 exclude_dirs:
   - .git
-  - .venv*
-  - venv*
+  - .venv
+  - venv
   - build
   - dist
   - node_modules
-  - __pycache__
