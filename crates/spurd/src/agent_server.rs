@@ -9594,7 +9594,9 @@ impl AgentService {
                 .await;
             return;
         }
-        let async_fd = match AsyncFd::new(master) {
+        // SAFETY: `master` is an `OwnedFd` moved into the `AsyncFd`, so the fd
+        // stays open and unchanged for the `AsyncFd`'s whole lifetime.
+        let async_fd = match unsafe { AsyncFd::register(master) } {
             Ok(fd) => fd,
             Err(e) => {
                 let _ = tx
