@@ -2383,7 +2383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_leader_is_false_without_a_network_round_on_a_non_leader() {
+    async fn ensure_leader_is_false_once_the_core_stops() {
         let dir = TempDir::new().unwrap();
         let handle = start_single_node_leader(dir.path(), noop_applier()).await;
         handle.raft.shutdown().await.unwrap();

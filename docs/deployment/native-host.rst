@@ -334,9 +334,10 @@ Enable and start it:
    A request that changes cluster state (for example ``sbatch``, ``scancel``, or a node
    registering) fails after 30 seconds with ``raft propose timed out ... outcome unknown``
    if the controller cannot commit it in time. The change may still take effect
-   afterwards; if it does, the controller still signals the job's nodes as it would
-   have (for example stopping a requeued or suspended job). Check with ``squeue``
-   before retrying or resubmitting. If the leader's scheduler
+   afterwards. If a requeue, suspend, resume, or preemption does, the controller still
+   sends the job's nodes the matching cancel or signal. An array requeue stops at the
+   first task that times out and reports the rest as not attempted. Check with
+   ``squeue`` before retrying or resubmitting. If the leader's scheduler
    loop makes no progress for at least 5 minutes (longer when
    ``controller.dispatch_timeout_secs`` or ``scheduler.interval_secs`` is large),
    ``spurctld`` logs ``scheduler loop has made no progress`` at error level and repeats it

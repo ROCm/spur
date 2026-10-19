@@ -3289,6 +3289,58 @@ fn follow_late_preemption(
     });
 }
 
+/// Cancels the old run of an admin requeue whose write applied after its RPC gave up.
+pub(crate) fn follow_late_requeue(
+    cluster: &Arc<ClusterManager>,
+    late: &crate::cluster::LateRequeue,
+) {
+    let Some(killed) = late.killed.clone() else {
+        return;
+    };
+    let cluster = cluster.clone();
+    late.write.on_late_apply(move |resp| async move {
+        finish_late_requeue(&cluster, &killed, &resp).await;
+    });
+}
+
+/// The job may already be running again by now, so the cancel goes to the old attempt only.
+async fn finish_late_requeue(
+    cluster: &Arc<ClusterManager>,
+    killed: &spur_core::job::Job,
+    resp: &crate::raft::ClientResponse,
+) {
+    cluster.run_all_finalized_side_effects(resp);
+    if !resp
+        .jobs_finalized
+        .iter()
+        .any(|f| f.job_id == killed.job_id)
+    {
+        return;
+    }
+    cluster.scheduler_notify.notify_one();
+    send_cancel_to_agents(cluster, killed, 0).await;
+}
+
+/// Sends the signal of a suspend or resume whose write applied late, if the job is still in `want`.
+pub(crate) fn follow_late_suspend(
+    cluster: &Arc<ClusterManager>,
+    err: &anyhow::Error,
+    job_id: spur_core::job::JobId,
+    want: spur_core::job::JobState,
+) {
+    let Some(late) = err.downcast_ref::<crate::cluster::OutcomeUnknown>() else {
+        return;
+    };
+    let cluster = cluster.clone();
+    late.on_late_apply(move |_| async move {
+        let Some(job) = cluster.get_job(job_id).filter(|j| j.state == want) else {
+            return;
+        };
+        let resume = want == spur_core::job::JobState::Running;
+        send_suspend_to_agents(&cluster, &job, resume).await;
+    });
+}
+
 /// Send CancelJob RPC to all agents for a job with a specific signal.
 pub async fn send_cancel_to_agents(
     cluster: &Arc<ClusterManager>,
@@ -4771,6 +4823,8 @@ mod tests {
             /// start_job fails, standing in for a node that confirmed its
             /// launch but could not then release the workload.
             reject_start: bool,
+            cancelled_attempts: Arc<std::sync::Mutex<Vec<u32>>>,
+            suspend_calls: Arc<AtomicU32>,
         }
 
         #[tonic::async_trait]
@@ -4870,11 +4924,15 @@ mod tests {
 
             async fn cancel_job(
                 &self,
-                _request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
+                request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
             ) -> Result<tonic::Response<()>, tonic::Status> {
                 if !self.cancel_delay.is_zero() {
                     tokio::time::sleep(self.cancel_delay).await;
                 }
+                self.cancelled_attempts
+                    .lock()
+                    .unwrap()
+                    .push(request.get_ref().run_attempt);
                 self.cancel_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(()))
             }
@@ -4883,6 +4941,7 @@ mod tests {
                 &self,
                 _request: tonic::Request<spur_proto::proto::AgentSuspendJobRequest>,
             ) -> Result<tonic::Response<()>, tonic::Status> {
+                self.suspend_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(()))
             }
 
@@ -5137,6 +5196,8 @@ mod tests {
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
                 cancel_delay,
+                cancelled_attempts: Default::default(),
+                suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -5165,6 +5226,8 @@ mod tests {
                 fanout_calls: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
+                cancelled_attempts: Default::default(),
+                suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -5193,6 +5256,8 @@ mod tests {
                 fanout_calls: None,
                 reject_start: true,
                 cancel_delay: Duration::ZERO,
+                cancelled_attempts: Default::default(),
+                suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -5203,6 +5268,40 @@ mod tests {
                     .await;
             });
             (addr, cancel_calls)
+        }
+
+        /// Mock agent that records the run attempt of each cancel and counts suspend/resume calls.
+        async fn spawn_mock_agent_recording() -> (
+            std::net::SocketAddr,
+            Arc<std::sync::Mutex<Vec<u32>>>,
+            Arc<AtomicU32>,
+        ) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let cancelled_attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let suspend_calls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                cancelled_attempts: cancelled_attempts.clone(),
+                suspend_calls: suspend_calls.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, cancelled_attempts, suspend_calls)
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted,
@@ -5426,6 +5525,105 @@ mod tests {
                 cancel_calls.load(Ordering::SeqCst) == 1
             });
             settle(&cm, job_id, JobState::Pending);
+        }
+
+        fn run_on(cm: &ClusterManager, name: &str, node: &str) -> spur_core::job::Job {
+            let spec = JobSpec {
+                name: name.into(),
+                user: "testuser".into(),
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(cm, spec);
+            start_on(cm, job_id, node);
+            cm.get_job(job_id).unwrap()
+        }
+
+        fn start_on(cm: &ClusterManager, job_id: spur_core::job::JobId, node: &str) {
+            let alloc = ResourceAllocations::with_scalar(1, 0);
+            let per_node = HashMap::from([(node.to_string(), alloc.clone())]);
+            cm.start_job(job_id, vec![node.into()], alloc, per_node)
+                .unwrap();
+            settle(cm, job_id, spur_core::job::JobState::Running);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_requeue_that_applies_late_still_cancels_the_old_run() {
+            let dir = TempDir::new().unwrap();
+            let (cm, gate) = crate::cluster::gated::cluster(&dir, test_config()).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "requeued", "n1");
+
+            let closed = gate.close();
+            let err = cm
+                .requeue_job_by_user(job.job_id, "", true, false)
+                .expect_err("the requeue cannot apply while the gate is closed");
+            let late = err
+                .downcast_ref::<crate::cluster::LateRequeue>()
+                .expect("a timed-out requeue hands off its write");
+            follow_late_requeue(&cm, late);
+            assert!(cancelled.lock().unwrap().is_empty());
+
+            drop(closed);
+            wait_for("old run cancelled once the requeue applies", || {
+                *cancelled.lock().unwrap() == [job.run_attempt]
+            });
+            settle(&cm, job.job_id, spur_core::job::JobState::Pending);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_late_requeue_cancels_the_old_run_even_after_the_job_runs_again() {
+            let dir = TempDir::new().unwrap();
+            let (cm, gate) = crate::cluster::gated::cluster(&dir, test_config()).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "requeued", "n1");
+
+            let closed = gate.close();
+            let err = cm
+                .requeue_job_by_user(job.job_id, "", true, false)
+                .expect_err("the requeue cannot apply while the gate is closed");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            err.downcast_ref::<crate::cluster::LateRequeue>()
+                .expect("a timed-out requeue hands off its write")
+                .write
+                .on_late_apply(move |resp| async move {
+                    let _ = tx.send(resp);
+                });
+            drop(closed);
+            let resp = rx.await.expect("the requeue applies once the gate opens");
+
+            start_on(&cm, job.job_id, "n1");
+            assert_ne!(cm.get_job(job.job_id).unwrap().run_attempt, job.run_attempt);
+            finish_late_requeue(&cm, &job, &resp).await;
+            wait_for("only the old run is cancelled", || {
+                *cancelled.lock().unwrap() == [job.run_attempt]
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_suspend_that_applies_late_still_signals_the_agent() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let (cm, gate) = crate::cluster::gated::cluster(&dir, test_config()).await;
+            let (addr, _, suspend_calls) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "suspended", "n1");
+
+            let closed = gate.close();
+            let err = cm
+                .suspend_job_for(job.job_id, "", true)
+                .expect_err("the suspend cannot apply while the gate is closed");
+            follow_late_suspend(&cm, &err, job.job_id, JobState::Suspended);
+            assert_eq!(suspend_calls.load(Ordering::SeqCst), 0);
+
+            drop(closed);
+            wait_for("agent told to suspend once the write applies", || {
+                suspend_calls.load(Ordering::SeqCst) == 1
+            });
+            settle(&cm, job.job_id, JobState::Suspended);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -1720,7 +1720,8 @@ impl ClusterManager {
         // failures. Only fail outright if no task could be requeued at all.
         let total = targets.len();
         let mut outcome = RequeueOutcome::default();
-        for id in targets {
+        let mut targets = targets.into_iter();
+        for id in targets.by_ref() {
             match self.requeue_one_job(id, actor, caller_is_admin, hold) {
                 Ok((true, killed)) => {
                     outcome.requeued += 1;
@@ -1729,15 +1730,21 @@ impl ClusterManager {
                 Ok((false, _)) => outcome
                     .skipped
                     .push(format!("job {id}: state changed before requeue")),
-                Err(e) => {
-                    outcome.skipped.push(format!("job {id}: {e}"));
-                    if let Ok(late) = e.downcast::<LateRequeue>() {
+                Err(e) => match e.downcast::<LateRequeue>() {
+                    Ok(late) => {
+                        outcome.skipped.push(format!("job {id}: {late}"));
                         outcome.late.push(late);
+                        // Raft is not applying; every later task would wait out the same timeout.
+                        break;
                     }
-                }
+                    Err(e) => outcome.skipped.push(format!("job {id}: {e}")),
+                },
             }
         }
-        if outcome.requeued == 0 && outcome.skipped.len() == total {
+        outcome
+            .skipped
+            .extend(targets.map(|id| format!("job {id}: not attempted")));
+        if outcome.requeued == 0 && outcome.late.is_empty() && outcome.skipped.len() == total {
             anyhow::bail!(
                 "no tasks of array {} could be requeued: {}",
                 job_id,
@@ -10484,49 +10491,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_late_user_requeue_keeps_the_run_it_must_cancel() {
+    async fn a_late_array_requeue_stops_at_the_first_task_and_keeps_its_write() {
         let dir = TempDir::new().unwrap();
         let (cm, gate) = gated::cluster(&dir, test_config()).await;
         register_node(&cm, "worker1", 8, 16000);
-        let job_id = run_job_on(&cm, "requeued", "worker1");
-        let running = cm.get_job(job_id).unwrap();
+        let mut spec = basic_spec("array-late");
+        spec.array_spec = Some("0-1".into());
+        let parent = cm.submit_job(spec).unwrap().job_id;
+        wait_for("array tasks applied", || {
+            cm.get_jobs(&JobFilter::default())
+                .iter()
+                .filter(|j| j.spec.array_job_id == Some(parent))
+                .count()
+                == 2
+        });
+        let mut task_ids: Vec<JobId> = cm
+            .get_jobs(&JobFilter::default())
+            .iter()
+            .filter(|j| j.spec.array_job_id == Some(parent))
+            .map(|j| j.job_id)
+            .collect();
+        task_ids.sort_unstable();
+        for &id in &task_ids {
+            let resources = scalar_alloc(2, 4000);
+            cm.start_job(
+                id,
+                vec!["worker1".into()],
+                resources.clone(),
+                per_node_for(&["worker1"], resources),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+        }
 
         let closed = gate.close();
-        let err = cm
-            .requeue_job_by_user(job_id, "", true, false)
-            .expect_err("the requeue cannot apply while the gate is closed");
-        let late = err
-            .downcast_ref::<LateRequeue>()
-            .expect("a timed-out requeue carries the run to cancel");
-        let killed = late.killed.as_ref().expect("the job was running");
-        assert_eq!(killed.run_attempt, running.run_attempt);
-        assert_eq!(killed.allocated_nodes, running.allocated_nodes);
+        let outcome = cm
+            .requeue_job_by_user(parent, "testuser", false, false)
+            .expect("a timed-out array requeue still hands back its write");
+        assert_eq!(outcome.requeued, 0);
+        assert_eq!(outcome.late.len(), 1);
+        assert_eq!(outcome.skipped.len(), 2, "{:?}", outcome.skipped);
+        assert!(
+            outcome.skipped[1].ends_with("not attempted"),
+            "{:?}",
+            outcome.skipped
+        );
 
         drop(closed);
-        settle(&cm, job_id, JobState::Pending);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_late_suspend_still_reaches_its_follow_up() {
-        let dir = TempDir::new().unwrap();
-        let (cm, gate) = gated::cluster(&dir, test_config()).await;
-        register_node(&cm, "worker1", 8, 16000);
-        let job_id = run_job_on(&cm, "suspended", "worker1");
-
-        let closed = gate.close();
-        let err = cm
-            .suspend_job_for(job_id, "", true)
-            .expect_err("the suspend cannot apply while the gate is closed");
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        gated::late(&err)
-            .expect("a timed-out suspend hands off its write")
-            .on_late_apply(move |_| async move {
-                let _ = tx.send(());
-            });
-
-        drop(closed);
-        rx.await.expect("the follow-up runs once the write applies");
-        settle(&cm, job_id, JobState::Suspended);
+        settle(&cm, task_ids[0], JobState::Pending);
+        assert_eq!(cm.get_job(task_ids[1]).unwrap().state, JobState::Running);
     }
 
     fn health_check(program: &str, interval_secs: u64) -> HealthCheck {
