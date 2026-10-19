@@ -1,9 +1,9 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 #
-# Nightly security scan: scans the whole repository and pushes SARIF
-# findings to the repository's code-scanning Security tab. Complements
-# `pr-security-scan.yml`, which scans only what changed in a PR.
+# Nightly security scan: scans the whole repository and the shipped image
+# and pushes SARIF findings to the repository's code-scanning Security tab.
+# Complements `pr-security-scan.yml`, which scans only what changed in a PR.
 
 name: Nightly Security
 
@@ -31,3 +31,51 @@ jobs:
       gitleaks_config_path: .github/scan_tools_configs/gitleaks.toml
       trivy_config_path: .github/scan_tools_configs/trivy.yml
       zizmor_config_path: .github/scan_tools_configs/zizmor.yml
+
+  # The baseline scans the source tree, not the OS packages in the shipped
+  # image, so new CVEs there only surface from rescanning the image itself.
+  image:
+    if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          target: runtime
+          push: false
+          load: true
+          tags: spur:nightly-scan
+          cache-from: type=gha,scope=nightly-docker
+
+      - name: Scan image for vulnerabilities and secrets
+        id: scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.74.0
+          image-ref: spur:nightly-scan
+          scanners: vuln,secret
+          format: sarif
+          output: trivy-nightly.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+          exit-code: "0"
+
+      - name: Upload SARIF to GitHub Security
+        if: always() && steps.scan.outcome != 'skipped'
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: trivy-nightly.sarif
+          category: trivy-nightly
