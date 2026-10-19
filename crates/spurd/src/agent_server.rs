@@ -193,6 +193,32 @@ fn session_dir_prepare_error(
 /// cannot be reached without one.
 type StepLaunchAdmission = crate::job_lifecycle::KeyedLifecycleGuard<SessionIdentity>;
 
+/// Records this launch as the session's owner before the supervisor exists, and
+/// gives the claim back if it cannot be recorded.
+fn claim_session_provisionally(
+    store: &crate::stepd::StepdStore,
+    descriptor: &mut crate::stepd::StepdDescriptor,
+    launch_path: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> Result<(), executor::LaunchError> {
+    descriptor.mark_provisional();
+    let Err(error) = store.publish(descriptor) else {
+        return Ok(());
+    };
+    cleanup_unstarted_stepd(
+        store,
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+        0,
+    );
+    Err(executor::classify_spool_error(
+        launch_path,
+        state_dir,
+        anyhow::Error::from(error).context("publish provisional runtime descriptor"),
+    ))
+}
+
 async fn launch_stepd(
     config: &executor::JobLaunchConfig,
     run_attempt: u32,
@@ -269,11 +295,7 @@ async fn launch_stepd(
     })?;
     // Published before the spawn so the window between claiming the directory
     // and the supervisor publishing itself never reads as an unowned session.
-    descriptor.mark_provisional();
-    if let Err(error) = store.publish(&descriptor) {
-        warn!(job_id = config.job_id, run_attempt, %error,
-            "failed to publish the provisional runtime descriptor");
-    }
+    claim_session_provisionally(&store, &mut descriptor, &launch_path, state_dir)?;
     let executable = resolve_stepd_executable();
     info!(job_id = config.job_id, run_attempt, state_dir = %state_dir.display(), executable = %executable.display(), "starting stepd process");
     let spawn_args = vec![
@@ -781,8 +803,8 @@ fn unreported_durable_exit(
         .unwrap_or(false)
 }
 
-/// Whether the session directory belongs to a running supervisor other than the
-/// one this launch spawned — someone else's session, not ours to delete.
+/// Whether the session directory belongs to a supervisor this launch has no claim
+/// to delete: another live one, or any whose socket is still being served.
 fn session_dir_has_live_owner(
     store: &crate::stepd::StepdStore,
     session_dir: &std::path::Path,
@@ -10341,6 +10363,66 @@ mod tests {
         );
     }
 
+    fn claimed_session(
+        state: &std::path::Path,
+    ) -> (
+        crate::stepd::StepdStore,
+        std::path::PathBuf,
+        crate::stepd::StepdDescriptor,
+    ) {
+        let store = crate::stepd::StepdStore::new(state);
+        let step_id = spur_core::step::STEP_BATCH;
+        let session = store
+            .claim_session_dir(42, 7, step_id)
+            .expect("session directory");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            step_id,
+            0,
+            0,
+            session.join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        (store, session, descriptor)
+    }
+
+    #[test]
+    fn a_launch_records_itself_as_the_provisional_owner_before_spawning() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let (store, session, mut descriptor) = claimed_session(state.path());
+
+        let outcome = claim_session_provisionally(
+            &store,
+            &mut descriptor,
+            &session.join("launch.json"),
+            state.path(),
+        );
+
+        assert!(outcome.is_ok());
+        let published = store.load_descriptor(&session).expect("published");
+        assert!(published.is_provisional());
+    }
+
+    #[test]
+    fn a_launch_that_cannot_record_its_claim_does_not_spawn() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let (store, session, mut descriptor) = claimed_session(state.path());
+        std::fs::create_dir(session.join("descriptor.json")).expect("block the descriptor path");
+
+        let outcome = claim_session_provisionally(
+            &store,
+            &mut descriptor,
+            &session.join("launch.json"),
+            state.path(),
+        );
+
+        assert!(
+            outcome.is_err(),
+            "an unrecorded claim must abort the launch, not spawn an unowned supervisor"
+        );
+    }
+
     #[test]
     fn unstarted_runtime_cleanup_removes_its_own_provisional_session() {
         let state = tempfile::tempdir().expect("runtime state directory");
@@ -12923,10 +13005,6 @@ mod tests {
         assert!(!running.lock().await.contains_key(&42));
     }
 
-    // Reproduces the gap between the launch gate opening and `run_supervisor`
-    // actually starting to accept control connections: `launch_job` (openpty,
-    // container rootfs staging, priv drop) runs in between, and nothing serves
-    // `QueryState` on the socket until it returns.
     fn workload_snapshot(active: bool, job_pid: i32) -> crate::stepd::StepdSnapshot {
         crate::stepd::StepdSnapshot {
             job_id: 7,
@@ -12947,6 +13025,10 @@ mod tests {
         assert!(!is_live_workload(&workload_snapshot(false, 4242)));
     }
 
+    // Reproduces the gap between the launch gate opening and `run_supervisor`
+    // actually starting to accept control connections: `launch_job` (openpty,
+    // container rootfs staging, priv drop) runs in between, and nothing serves
+    // `QueryState` on the socket until it returns.
     #[tokio::test(start_paused = true)]
     async fn supervised_step_workload_pid_survives_a_supervisor_that_is_slow_to_start_serving() {
         let dir = tempfile::tempdir().expect("tempdir");

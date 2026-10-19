@@ -8040,19 +8040,23 @@ impl StateMachineApply for ClusterManager {
     }
 
     fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+        // Taken in allocator order and released before the literal: its other
+        // `read()` temporaries would otherwise hold `steps` while this waits.
+        let next_step_id = self.next_step_id.read().clone();
+        let steps: Vec<_> = self.steps.read().values().cloned().collect();
         let snap = ClusterSnapshot {
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
             partitions: Some(self.partitions.read().clone()),
             deleted_partition_names: self.deleted_partition_names.read().clone(),
-            steps: self.steps.read().values().cloned().collect(),
+            steps,
             license_pool: self.license_pool.read().clone(),
             tokens: self.tokens.read().values().cloned().collect(),
             burst_buffer_total_gb: *self.burst_buffer_total_gb.read(),
             k0s: self.k0s.read().clone(),
             next_job_id: self.next_job_id.load(Ordering::Relaxed),
-            next_step_id: self.next_step_id.read().clone(),
+            next_step_id,
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -25911,6 +25915,27 @@ mod tests {
             5,
             "a mark below the restored steps must not hand back a used id"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snapshot_waiting_on_the_step_id_marks_does_not_hold_the_steps_lock() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let allocator_holds_marks = cm.next_step_id.write();
+
+        std::thread::scope(|scope| {
+            let snapshot = scope.spawn(|| cm.snapshot_state().unwrap());
+            // Bounded in the direction that can only hide a regression, never fake one.
+            for _ in 0..200_000 {
+                assert!(
+                    cm.steps.try_write().is_some(),
+                    "a snapshot parked on the marks must not hold `steps`, which the allocator takes next"
+                );
+                std::thread::yield_now();
+            }
+            drop(allocator_holds_marks);
+            snapshot.join().unwrap();
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
