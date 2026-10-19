@@ -1,5 +1,5 @@
-# Copyright Advanced Micro Devices, Inc.
-# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Pre-commit security gate: fast, PR-side security scanners that run on
 # every pull request. Scanner selection and policy are defined by the pinned

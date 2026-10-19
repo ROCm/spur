@@ -1,5 +1,5 @@
-# Copyright Advanced Micro Devices, Inc.
-# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
 # gitleaks.toml
 # Reference: https://github.com/gitleaks/gitleaks/blob/master/config/gitleaks.toml
