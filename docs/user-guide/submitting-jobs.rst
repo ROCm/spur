@@ -76,7 +76,7 @@ A Sample Batch Script
    #SBATCH --error=train-%j.err
 
    echo "Job $SLURM_JOB_ID on $SLURM_JOB_NODELIST"
-   echo "GPUs: $ROCR_VISIBLE_DEVICES"
+   echo "GPUs: $SPUR_JOB_GPUS"
    srun python train.py --epochs 100
 
 Submit it. ``spur submit`` and ``sbatch`` are equivalent:

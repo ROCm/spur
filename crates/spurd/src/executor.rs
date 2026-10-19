@@ -731,6 +731,9 @@ async fn spawn_job_process(
         for (key, value) in &plan.env {
             env.insert(key.clone(), value.clone());
         }
+        if let Some(ranks) = dri_rocr(cfg, &env, nix::unistd::geteuid().is_root()) {
+            env.insert(DRI_ROCR_ENV.into(), ranks);
+        }
     }
 
     // Environment-based CPU/thread limiting — works even without cgroups.
@@ -2597,12 +2600,55 @@ fn build_namespace_wrapper(
             "{stash_dri}",
             "{mount_and_restore_dri}",
             "fi\n",
+            "{dri_rocr}\n",
             "{final_exec}",
         ),
         stash_dri = stash_dri,
         mount_and_restore_dri = mount_and_restore_dri,
+        dri_rocr = DRI_ROCR_BASH,
         final_exec = final_exec,
     )
+}
+
+/// Carries the ranked `ROCR_VISIBLE_DEVICES` into the job's namespaces, where
+/// `DRI_ROCR_BASH` applies it only if /dev/dri there is the tmpfs.
+const DRI_ROCR_ENV: &str = "_SPUR_DRI_ROCR";
+
+/// Runs inside the job's mount namespace, as bash or sh. The tmpfs mount is
+/// best-effort, so the rank applies only where it really hides the other GPUs.
+pub(crate) const DRI_ROCR_BASH: &str =
+    "if [ -n \"${_SPUR_DRI_ROCR-}\" ] && mountpoint -q /dev/dri; \
+     then export ROCR_VISIBLE_DEVICES=\"$_SPUR_DRI_ROCR\"; fi; unset _SPUR_DRI_ROCR";
+
+/// The ranked `ROCR_VISIBLE_DEVICES` for a launch that runs in a job's own
+/// mount namespace, new or joined. A container stages its devices differently.
+fn dri_rocr(cfg: &JobLaunchConfig, env: &HashMap<String, String>, is_root: bool) -> Option<String> {
+    let plan = cfg.host_device_plan.as_ref()?;
+    let enters_job_namespaces = cfg.container.is_none()
+        && (would_use_namespaces(cfg, is_root) || cfg.joins_parent_namespaces);
+    let rocr = env
+        .get("ROCR_VISIBLE_DEVICES")
+        .filter(|_| enters_job_namespaces)?;
+    Some(isolated_rocr_visible_devices(rocr, &plan.gpu_ids))
+}
+
+/// `ROCR_VISIBLE_DEVICES` as ROCr reads it behind the /dev/dri tmpfs. ROCr
+/// numbers only the GPUs it can open, in node order, so a staged GPU id becomes
+/// its rank among the staged ones. Any other token names what it named before.
+fn isolated_rocr_visible_devices(rocr: &str, staged_gpu_ids: &[u32]) -> String {
+    let mut staged = staged_gpu_ids.to_vec();
+    staged.sort_unstable();
+    rocr.split(',')
+        .map(|token| {
+            token
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .and_then(|id| staged.binary_search(&id).ok())
+                .map_or_else(|| token.to_string(), |rank| rank.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
@@ -3959,6 +4005,129 @@ mod tests {
 
         assert!(wrapper.contains("renderD128"));
         assert!(!wrapper.contains("nvidia"));
+    }
+
+    /// ROCr numbers only the GPUs it can open, so behind the /dev/dri tmpfs a
+    /// node-wide index names nothing: a job on GPU 2 alone must see index 0.
+    #[test]
+    fn rocr_visible_devices_become_ranks_of_the_staged_gpus() {
+        assert_eq!(isolated_rocr_visible_devices("2", &[2]), "0");
+        assert_eq!(isolated_rocr_visible_devices("2,5", &[5, 2]), "0,1");
+        assert_eq!(isolated_rocr_visible_devices("6,5", &[4, 5, 6, 7]), "2,1");
+    }
+
+    /// A `--gpu-bind=map_gpu` id outside the allocation is not staged; ROCr
+    /// must still get the id the user asked for, not a rank of something else.
+    #[test]
+    fn rocr_tokens_that_are_not_staged_stay_unchanged() {
+        assert_eq!(isolated_rocr_visible_devices("7", &[0]), "7");
+        assert_eq!(isolated_rocr_visible_devices("5,7", &[5]), "0,7");
+        assert_eq!(isolated_rocr_visible_devices("-1", &[2]), "-1");
+        assert_eq!(isolated_rocr_visible_devices("2", &[]), "2");
+    }
+
+    fn gpu_launch_cfg(joins_parent_namespaces: bool) -> JobLaunchConfig {
+        JobLaunchConfig {
+            joins_parent_namespaces,
+            host_device_plan: Some(spur_devices::inject::HostInjectionPlan {
+                gpu_ids: vec![4, 5],
+                ..Default::default()
+            }),
+            ..launch_cfg_for_paths(1, "n", "u", "node")
+        }
+    }
+
+    #[test]
+    fn dri_rocr_is_set_for_launches_in_the_job_mount_namespace() {
+        let env = HashMap::from([("ROCR_VISIBLE_DEVICES".to_string(), "5".to_string())]);
+        let fresh = gpu_launch_cfg(false);
+        assert_eq!(dri_rocr(&fresh, &env, true).as_deref(), Some("1"));
+        let joined = gpu_launch_cfg(true);
+        assert_eq!(dri_rocr(&joined, &env, true).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn dri_rocr_is_not_set_where_dri_is_not_the_job_tmpfs() {
+        let env = HashMap::from([("ROCR_VISIBLE_DEVICES".to_string(), "5".to_string())]);
+        assert_eq!(dri_rocr(&gpu_launch_cfg(false), &env, false), None);
+
+        let pmix = JobLaunchConfig {
+            pmix_multi_task: true,
+            ..gpu_launch_cfg(false)
+        };
+        assert_eq!(dri_rocr(&pmix, &env, true), None);
+
+        let container = JobLaunchConfig {
+            container: Some(ContainerLaunchConfig {
+                config: crate::container::ContainerConfig {
+                    image: "test.sqsh".into(),
+                    mounts: Vec::new(),
+                    workdir: None,
+                    name: None,
+                    readonly: false,
+                    mount_home: false,
+                    remap_root: false,
+                    gpu_devices: vec![4, 5],
+                    environment: HashMap::new(),
+                    container_env: HashMap::new(),
+                    entrypoint: None,
+                    uid: 1000,
+                    gid: 1000,
+                    username: "u".into(),
+                    home_dir: "/home/u".into(),
+                    device_plan: None,
+                },
+                rootfs: PathBuf::from("/tmp/rootfs"),
+            }),
+            ..gpu_launch_cfg(false)
+        };
+        assert_eq!(dri_rocr(&container, &env, true), None);
+        assert_eq!(
+            dri_rocr(&gpu_launch_cfg(false), &HashMap::new(), true),
+            None
+        );
+    }
+
+    /// Runs `DRI_ROCR_BASH` in `shell` with a `mountpoint` stub that answers
+    /// `dri_is_mounted`, and returns ROCR and whether the carrier is gone.
+    fn run_dri_rocr(shell: &str, dri_is_mounted: bool) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("mountpoint");
+        let status = if dri_is_mounted { 0 } else { 1 };
+        std::fs::write(&stub, format!("#!/bin/sh\nexit {status}\n")).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(format!(
+                "{DRI_ROCR_BASH}; echo \"$ROCR_VISIBLE_DEVICES ${{_SPUR_DRI_ROCR-gone}}\""
+            ))
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+            .env("ROCR_VISIBLE_DEVICES", "4,5")
+            .env(DRI_ROCR_ENV, "0,1")
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn dri_rocr_applies_only_when_dri_is_a_mount() {
+        for shell in ["bash", "sh"] {
+            assert_eq!(run_dri_rocr(shell, true), "0,1 gone", "{shell}");
+            assert_eq!(run_dri_rocr(shell, false), "4,5 gone", "{shell}");
+        }
+    }
+
+    #[test]
+    fn test_namespace_wrapper_applies_dri_rocr_before_the_job_runs() {
+        let script = PathBuf::from("/work/.spur_job_3.sh");
+        let paths = vec!["/dev/dri/renderD145".into()];
+        let wrapper = build_namespace_wrapper(1000, 1000, &paths, &script);
+        let mount = wrapper.find("mount -t tmpfs tmpfs /dev/dri").unwrap();
+        let apply = wrapper.find(DRI_ROCR_BASH).expect("no rank step");
+        let exec = wrapper.find("exec setpriv").unwrap();
+        assert!(mount < apply && apply < exec, "{wrapper}");
     }
 
     /// A bulk `cp -a /dev/dri/.` recreates every host node with `mknod(2)`, which the

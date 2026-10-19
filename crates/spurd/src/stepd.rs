@@ -3480,6 +3480,7 @@ mod tests {
             env: HashMap::from([("ROCR_VISIBLE_DEVICES".into(), "3,7".into())]),
             visible_devices: vec!["/dev/dri/renderD128".into()],
             device_paths: vec!["/dev/dri/renderD128".into()],
+            gpu_ids: vec![3, 7],
         });
         let restored: StepdLaunchSpec =
             serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
@@ -3492,6 +3493,10 @@ mod tests {
                 .as_ref()
                 .and_then(|plan| plan.env.get("ROCR_VISIBLE_DEVICES")),
             Some(&"3,7".to_string())
+        );
+        assert_eq!(
+            config.host_device_plan.map(|plan| plan.gpu_ids),
+            Some(vec![3, 7])
         );
     }
 
