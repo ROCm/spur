@@ -160,8 +160,8 @@ pub struct RunAdmission {
     pub allocation: AdmittedResources,
     #[serde(default)]
     pub state: RunState,
-    /// Agent wall clock. The only age a run whose launch aborted before any
-    /// expiry was set will ever have, so it is what makes such a run collectable.
+    /// Stable across retries so a live hook's completion still names its owner.
+    /// Also supplies the age when a launch aborted before recording an expiry.
     #[serde(default)]
     pub created_at_unix_ms: u64,
     #[serde(default)]
@@ -230,6 +230,10 @@ impl RunAdmission {
         self.state == RunState::Cleaned
             || self.cancelled_by_controller
             || self.controller_ack.release_raft_index.is_some()
+    }
+
+    fn has_in_flight_hook(&self) -> bool {
+        self.prolog.is_in_flight() || self.cleanup.epilog.is_in_flight()
     }
 
     /// When this run stops being interesting if nothing else ever happens to it.
@@ -435,8 +439,7 @@ impl AdmittedRun {
     fn collectable(&self, now_unix_ms: u64, retention_ms: u64) -> bool {
         if self.run.conflict_hold.is_some()
             || self.run.fence_is_live(now_unix_ms)
-            || self.run.prolog.is_in_flight()
-            || self.run.cleanup.epilog.is_in_flight()
+            || self.run.has_in_flight_hook()
             || (self.run.max_launch_expiry_unix_ms > 0
                 && now_unix_ms <= self.run.max_launch_expiry_unix_ms)
         {
@@ -543,8 +546,8 @@ impl LaunchFences {
         reject_before_unix_ms: u64,
         admitted_digest: Option<&str>,
     ) -> Option<LaunchRefusal> {
-        // Both sides are controller-stamped, so a jump in the agent's clock cannot
-        // un-fence a stopped run -- though `fence_run` clamps what it stores.
+        // Both sides are controller-stamped, so an agent clock jump cannot
+        // weaken the ordering fence.
         if reject_before_unix_ms > 0
             && self.issued_at_unix_ms > 0
             && self.issued_at_unix_ms <= reject_before_unix_ms
@@ -715,10 +718,13 @@ impl AdmissionStore {
         run_key: RunKey,
         step_id: StepId,
     ) -> io::Result<bool> {
+        let (participants, rejected) = self.participants(run_key)?;
+        if !rejected.is_empty() {
+            return Ok(false);
+        }
         if let Some(owner) = run.lifecycle_owner_step {
             return Ok(owner == step_id);
         }
-        let (participants, _) = self.participants(run_key)?;
         Ok(match participants.as_slice() {
             [] => true,
             [only] => only.step_id == step_id,
@@ -842,15 +848,15 @@ impl AdmissionStore {
     /// default and this tree holds the environment a run was admitted with.
     pub(crate) fn prepare_run_dir(&self, run: RunKey) -> io::Result<PathBuf> {
         let dir = self.run_dir(run)?;
-        create_private_dir_all(self.state_dir())?;
-        create_private_dir_all(&self.root)?;
-        create_private_dir_all(&dir)?;
+        create_durable_private_dir(self.state_dir())?;
+        create_durable_private_dir(&self.root)?;
+        create_durable_private_dir(&dir)?;
         Ok(dir)
     }
 
     fn prepare_participants_dir(&self, run: RunKey) -> io::Result<PathBuf> {
         let dir = self.prepare_run_dir(run)?.join(PARTICIPANTS_DIR);
-        create_private_dir_all(&dir)?;
+        create_durable_private_dir(&dir)?;
         Ok(dir)
     }
 
@@ -875,9 +881,7 @@ impl AdmissionStore {
                 if self.replaceable_run(&existing, run.created_at_unix_ms)? {
                     fs::remove_dir_all(self.run_dir(key)?)?;
                 } else {
-                    // created_at stays this call's own stamp (not existing's):
-                    // a stale remove_run_if_created_at from an earlier attempt's
-                    // dropped guard must not match a retry's now-current record.
+                    run.created_at_unix_ms = existing.created_at_unix_ms;
                     run.reject_before_unix_ms = run
                         .reject_before_unix_ms
                         .max(existing.reject_before_unix_ms);
@@ -1099,10 +1103,7 @@ impl AdmissionStore {
         let mut dirs = Vec::new();
         for entry in entries {
             let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_dir() || kind.is_symlink() {
-                dirs.push(entry.path());
-            }
+            dirs.push(entry.path());
         }
         dirs.sort();
         Ok(dirs)
@@ -1200,7 +1201,7 @@ impl AdmissionStore {
             run.conflict_hold = None;
             // Settling a hook still in flight is the teardown's to do, never an
             // acknowledgement's: the controller cannot see whose hook is still running.
-            if !run.cleanup.epilog.is_in_flight() {
+            if !run.has_in_flight_hook() {
                 run.state = RunState::Cleaned;
             }
             self.admit_run_locked(&run)?;
@@ -1251,6 +1252,17 @@ impl AdmissionStore {
         let mut settled = 0;
         let mut failure = None;
         for admitted in loaded.runs {
+            let Some(run_key) = admitted.run.key() else {
+                continue;
+            };
+            let run_dir = self.run_dir(run_key)?;
+            if loaded
+                .rejected
+                .iter()
+                .any(|entry| entry.path.starts_with(&run_dir))
+            {
+                continue;
+            }
             let in_flight_slots: Vec<HookSlot> = HookSlot::ALL
                 .into_iter()
                 .filter(|slot| slot.get(&admitted.run).is_in_flight())
@@ -1258,9 +1270,6 @@ impl AdmissionStore {
             if in_flight_slots.is_empty() || !owner_is_gone(&admitted) {
                 continue;
             }
-            let Some(run_key) = admitted.run.key() else {
-                continue;
-            };
             for slot in in_flight_slots {
                 // One unwritable record must not leave every other run's hook in
                 // flight: nothing runs this again, so the rest would strand.
@@ -1286,12 +1295,15 @@ impl AdmissionStore {
         owner_is_gone: &impl Fn(&AdmittedRun) -> bool,
     ) -> io::Result<bool> {
         self.with_run_lock(run_key, || {
-            let (admitted, _) = match self.load_admitted(run_key) {
+            let (admitted, rejected) = match self.load_admitted(run_key) {
                 Ok(pair) => pair,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
-            if !slot.get(&admitted.run).is_in_flight() || !owner_is_gone(&admitted) {
+            if !rejected.is_empty()
+                || !slot.get(&admitted.run).is_in_flight()
+                || !owner_is_gone(&admitted)
+            {
                 return Ok(false);
             }
             let mut run = admitted.run;
@@ -1370,10 +1382,6 @@ impl AdmissionStore {
     /// must still take even on a recycled key, same as the no-record case below.
     pub fn fence_run(&self, run_key: RunKey, reject_before_unix_ms: u64) -> io::Result<u64> {
         let attempt = addressable_attempt(run_key)?;
-        // Agent clock against a controller cutoff: running ahead leaves the strand
-        // it prevents, behind can lower a cutoff past a launch that should fence.
-        let reject_before_unix_ms =
-            reject_before_unix_ms.min(now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS));
         self.with_run_lock(run_key, || {
             let mut run = match self.load_run(run_key) {
                 Ok(run) => run,
@@ -1411,7 +1419,7 @@ impl AdmissionStore {
     }
 
     /// Whether this run's allocation may now be released: the owner step only, its
-    /// completion acknowledged, and, per the record, no epilog still in flight.
+    /// completion acknowledged, and, per the record, no hook still in flight.
     pub fn release_is_due(
         &self,
         run_key: RunKey,
@@ -1430,7 +1438,7 @@ impl AdmissionStore {
             if !self.step_answers_for_run(&run, run_key, step_id)? {
                 return Ok(None);
             }
-            if run.cleanup.epilog.is_in_flight() {
+            if run.has_in_flight_hook() {
                 return Ok(None);
             }
             Ok(match run.controller_ack.release_raft_index {
@@ -1454,14 +1462,16 @@ impl AdmissionStore {
                 }
                 Err(error) => return Err(error),
             };
-            if run.state != RunState::Cleaned || run.cleanup.epilog.is_in_flight() {
+            if run.state != RunState::Cleaned || run.has_in_flight_hook() {
+                return Ok(SettlePermit::NotQuiescent);
+            }
+            let (participants, rejected) = self.participants(run_key)?;
+            if !rejected.is_empty() {
                 return Ok(SettlePermit::NotQuiescent);
             }
             let step_id = match run.lifecycle_owner_step {
                 Some(step_id) => step_id,
-                None => self
-                    .participants(run_key)?
-                    .0
+                None => participants
                     .first()
                     .map(|participant| participant.step_id)
                     .unwrap_or(spur_core::step::STEP_BATCH),
@@ -1752,6 +1762,32 @@ impl AdmissionStore {
     }
 }
 
+fn create_durable_private_dir(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    match fs::metadata(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_durable_private_dir(parent)?
+        }
+        Err(error) => return Err(error),
+    }
+    create_private_dir_all(path)?;
+    // Also sync existing entries: a concurrent creator or failed earlier write
+    // may have left the directory visible without durably publishing it.
+    for ancestor in path.ancestors() {
+        let ancestor = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        fs::File::open(ancestor)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn open_private_at(parent: &fs::File, name: &str, directory: bool) -> io::Result<fs::File> {
     use nix::fcntl::{openat, OFlag};
     use nix::sys::stat::Mode;
@@ -1891,6 +1927,209 @@ mod tests {
     }
 
     #[test]
+    fn readmission_preserves_the_live_hook_owners_completion_token() {
+        for slot in HookSlot::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&dir);
+            store.admit_run(&run_with(7, 1, 1_000)).unwrap();
+            store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+            store
+                .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+                .unwrap();
+            let record = |state| match slot {
+                HookSlot::Prolog => store.record_prolog(key(7, 1), 1_000, state),
+                HookSlot::Epilog => store.record_epilog(key(7, 1), 1_000, state),
+            };
+            assert!(record(HookState::Running).unwrap());
+
+            store.admit_run(&run_with(7, 1, 2_000)).unwrap();
+
+            assert_eq!(store.load_run(key(7, 1)).unwrap().created_at_unix_ms, 1_000);
+            assert!(record(HookState::Succeeded).unwrap());
+            assert!(store
+                .release_is_due(key(7, 1), STEP_BATCH)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn incomplete_participants_cannot_establish_run_ownership() {
+        for (owner, sibling) in [(None, None), (None, Some(3)), (Some(STEP_BATCH), None)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&dir);
+            let mut run = run_with(7, 1, 1_000);
+            run.lifecycle_owner_step = owner;
+            run.state = RunState::Cleaned;
+            store.admit_run(&run).unwrap();
+            store
+                .admit_participant(&ParticipantAdmission::new(
+                    7,
+                    1,
+                    STEP_BATCH,
+                    "n1",
+                    Default::default(),
+                ))
+                .unwrap();
+            if let Some(step) = sibling {
+                store
+                    .admit_participant(&ParticipantAdmission::new(
+                        7,
+                        1,
+                        step,
+                        "n1",
+                        Default::default(),
+                    ))
+                    .unwrap();
+            }
+            let parent = store.participants_dir(key(7, 1)).unwrap();
+            publish_private(&parent, &format!("{STEP_BATCH}.json"), b"{").unwrap();
+
+            for step in [STEP_BATCH, STEP_INTERACTIVE, 3] {
+                assert!(!store.record_controller_ack(key(7, 1), step, 42).unwrap());
+                assert!(!store
+                    .record_acknowledged_completion(key(7, 1), step, 42)
+                    .unwrap());
+                assert!(store.release_is_due(key(7, 1), step).unwrap().is_none());
+            }
+            assert_eq!(
+                store.settle_permit(key(7, 1)).unwrap(),
+                SettlePermit::NotQuiescent
+            );
+        }
+    }
+
+    #[test]
+    fn owner_loss_never_discards_unreadable_participant_evidence() {
+        for corrupt_before_scan in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&dir);
+            let mut run = run_with(7, 1, 1_000);
+            run.prolog = HookState::Running;
+            run.cleanup.epilog = HookState::Running;
+            store.admit_run(&run).unwrap();
+            store
+                .admit_participant(&ParticipantAdmission::new(
+                    7,
+                    1,
+                    STEP_BATCH,
+                    "n1",
+                    Default::default(),
+                ))
+                .unwrap();
+            let parent = store.participants_dir(key(7, 1)).unwrap();
+            let corrupt = || publish_private(&parent, &format!("{STEP_BATCH}.json"), b"{").unwrap();
+            if corrupt_before_scan {
+                corrupt();
+            }
+            let settled = store
+                .settle_hooks_whose_owner_is_gone(|admitted| {
+                    corrupt();
+                    admitted.recorded_supervisors().next().is_none()
+                })
+                .unwrap();
+
+            assert_eq!(settled, 0);
+            let after = store.load_run(key(7, 1)).unwrap();
+            assert_eq!(after.prolog, HookState::Running);
+            assert_eq!(after.cleanup.epilog, HookState::Running);
+        }
+    }
+
+    #[test]
+    fn a_running_prolog_vetoes_acknowledged_cleanup_and_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1_000)).unwrap();
+        store
+            .record_prolog(key(7, 1), 1_000, HookState::Running)
+            .unwrap();
+
+        assert!(store
+            .record_acknowledged_completion(key(7, 1), STEP_BATCH, 42)
+            .unwrap());
+        assert_eq!(store.load_run(key(7, 1)).unwrap().state, RunState::Admitted);
+        assert!(store
+            .release_is_due(key(7, 1), STEP_BATCH)
+            .unwrap()
+            .is_none());
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+        assert_eq!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::NotQuiescent
+        );
+
+        store
+            .record_prolog(key(7, 1), 1_000, HookState::Succeeded)
+            .unwrap();
+        assert!(store
+            .release_is_due(key(7, 1), STEP_BATCH)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::Due(STEP_BATCH)
+        );
+    }
+
+    #[test]
+    fn unexpected_run_path_types_make_the_inventory_incomplete() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        for fifo in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&dir);
+            create_durable_private_dir(store.root()).unwrap();
+            let path = store.run_dir(key(7, 1)).unwrap();
+            if fifo {
+                mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+            } else {
+                publish_private(store.root(), "7.1", b"broken directory").unwrap();
+            }
+
+            assert_eq!(store.load_all().unwrap().rejected.len(), 1);
+            assert!(!store.ledger_cut("session").inventory_complete);
+            assert_eq!(store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(), 0);
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
+    fn admission_creates_a_missing_state_directory_hierarchy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("parent/state");
+        let store = AdmissionStore::new(&state, "n1");
+        let run = run_with(7, 1, 1_000);
+        store.admit_run(&run).unwrap();
+        store
+            .admit_participant(&ParticipantAdmission::new(
+                7,
+                1,
+                STEP_BATCH,
+                "n1",
+                Default::default(),
+            ))
+            .unwrap();
+
+        assert_eq!(store.load_run(key(7, 1)).unwrap(), run);
+        for path in [
+            state.parent().unwrap().to_path_buf(),
+            state,
+            store.root().to_path_buf(),
+            store.run_dir(key(7, 1)).unwrap(),
+            store.participants_dir(key(7, 1)).unwrap(),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
     fn an_old_active_key_preserves_its_fence_hooks_and_hold_on_readmission() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
@@ -1916,7 +2155,7 @@ mod tests {
         assert_eq!(after.prolog, original.prolog);
         assert_eq!(after.cleanup, original.cleanup);
         assert_eq!(after.conflict_hold, original.conflict_hold);
-        assert_eq!(after.created_at_unix_ms, 150_001);
+        assert_eq!(after.created_at_unix_ms, original.created_at_unix_ms);
     }
 
     #[test]
@@ -2844,23 +3083,18 @@ mod tests {
     }
 
     #[test]
-    fn a_fence_past_every_launch_it_could_cover_is_clamped() {
-        // A cutoff the clock never reaches fences the run for good, and the
-        // phantom record it creates has no other writer to lift it.
+    fn a_controller_fence_is_preserved_independently_of_the_agent_clock() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        let far_future = now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS * 1000);
-
-        let applied = store.fence_run(key(7, 1), far_future).unwrap();
-        assert!(
-            applied < far_future,
-            "a skewed cutoff must not be taken verbatim"
-        );
-        assert!(
-            applied <= now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS),
-            "a cutoff past the last launch it could cover never ages out"
-        );
+        let applied = store.fence_run(key(7, 1), u64::MAX - 1).unwrap();
+        assert_eq!(applied, u64::MAX - 1);
         assert_eq!(store.reject_before(key(7, 1)), Some(applied));
+        let launch = LaunchFences {
+            issued_at_unix_ms: u64::MAX - 2,
+            expires_at_unix_ms: u64::MAX,
+            command_digest: "command".into(),
+        };
+        assert_eq!(launch.check(1, applied, None), Some(LaunchRefusal::Fenced));
     }
 
     #[test]
@@ -4157,10 +4391,14 @@ mod tests {
     }
 
     #[test]
-    fn record_prolog_refuses_a_stale_admission_timestamp() {
+    fn record_prolog_refuses_a_replaced_run_timestamp() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        let mut old = run_with(7, 1, 1);
+        old.state = RunState::Cleaned;
+        old.slice_released = true;
+        old.controller_ack.release_raft_index = Some(42);
+        store.admit_run(&old).unwrap();
 
         let recycled_created_at = 1 + LAUNCH_LIFETIME_MS + 1;
         store
@@ -4178,10 +4416,14 @@ mod tests {
     }
 
     #[test]
-    fn record_epilog_refuses_a_stale_admission_timestamp() {
+    fn record_epilog_refuses_a_replaced_run_timestamp() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
-        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        let mut old = run_with(7, 1, 1);
+        old.state = RunState::Cleaned;
+        old.slice_released = true;
+        old.controller_ack.release_raft_index = Some(42);
+        store.admit_run(&old).unwrap();
 
         let recycled_created_at = 1 + LAUNCH_LIFETIME_MS + 1;
         store
