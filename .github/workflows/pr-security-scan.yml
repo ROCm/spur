@@ -9,7 +9,7 @@
 # which are public. Same-repo PRs also get the baseline's findings comment.
 # See nightly-security-scan.yml for the full-repository scan.
 
-name: Security scan (PR)
+name: Security
 
 on:
   pull_request:
@@ -24,8 +24,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  security:
-    name: Security scan
+  baseline:
     # A reusable workflow cannot grant itself more than its caller does.
     permissions:
       actions: read
