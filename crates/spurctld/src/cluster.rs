@@ -247,6 +247,68 @@ const MAX_JOB_SPEC_SIZE: usize = 4 * 1024 * 1024;
 /// an unbounded wait can wedge its caller; on timeout the write may still commit.
 const PROPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+type PendingWrite =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<ClientResponse, String>> + Send>>;
+
+/// `propose` gave up waiting, but the write is still in flight and may yet apply.
+pub struct OutcomeUnknown {
+    limit: std::time::Duration,
+    write: parking_lot::Mutex<Option<PendingWrite>>,
+}
+
+impl OutcomeUnknown {
+    /// Runs `then` if the write applies after all, so its agent-side follow-up is not lost.
+    pub fn on_late_apply<F, Fut>(&self, then: F)
+    where
+        F: FnOnce(ClientResponse) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let Some(write) = self.write.lock().take() else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Ok(resp) = write.await {
+                then(resp).await;
+            }
+        });
+    }
+}
+
+impl std::fmt::Display for OutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "raft propose timed out after {:?}; outcome unknown",
+            self.limit
+        )
+    }
+}
+
+impl std::fmt::Debug for OutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutcomeUnknown")
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for OutcomeUnknown {}
+
+/// A requeue whose write may still apply; `killed` is the run to cancel if it does.
+#[derive(Debug)]
+pub struct LateRequeue {
+    pub killed: Option<Job>,
+    pub write: OutcomeUnknown,
+}
+
+impl std::fmt::Display for LateRequeue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write.fmt(f)
+    }
+}
+
+impl std::error::Error for LateRequeue {}
+
 /// A `std::io::Write` that only tallies byte counts and discards the data. Used
 /// to measure a value's serialized size without allocating the serialized bytes.
 #[derive(Default)]
@@ -701,6 +763,8 @@ pub struct RequeueOutcome {
     pub requeued: u32,
     pub killed: Vec<Job>,
     pub skipped: Vec<String>,
+    /// Array tasks whose requeue may still apply; also listed in `skipped`.
+    pub late: Vec<LateRequeue>,
 }
 
 /// Held for the length of one node's `k8s remove-nodes`; see `ClusterManager::begin_k0s_removal`.
@@ -1640,15 +1704,14 @@ impl ClusterManager {
                 RequeueOutcome {
                     requeued: 1,
                     killed: killed.into_iter().collect(),
-                    skipped: Vec::new(),
+                    ..Default::default()
                 }
             } else {
                 // Raced to a non-requeuable state after the pre-check; report it
                 // honestly rather than claiming success.
                 RequeueOutcome {
-                    requeued: 0,
-                    killed: Vec::new(),
                     skipped: vec![format!("job {id}: state changed before requeue")],
+                    ..Default::default()
                 }
             });
         }
@@ -1666,7 +1729,12 @@ impl ClusterManager {
                 Ok((false, _)) => outcome
                     .skipped
                     .push(format!("job {id}: state changed before requeue")),
-                Err(e) => outcome.skipped.push(format!("job {id}: {e}")),
+                Err(e) => {
+                    outcome.skipped.push(format!("job {id}: {e}"));
+                    if let Ok(late) = e.downcast::<LateRequeue>() {
+                        outcome.late.push(late);
+                    }
+                }
             }
         }
         if outcome.requeued == 0 && outcome.skipped.len() == total {
@@ -1732,13 +1800,22 @@ impl ClusterManager {
             _ => None,
         };
 
-        let resp = self.propose(WalOperation::JobUserRequeue {
-            job_id,
-            hold,
-            begin_time,
-            by: (!actor.user.is_empty()).then(|| actor.clone()),
-            at: None,
-        })?;
+        let resp = self
+            .propose(WalOperation::JobUserRequeue {
+                job_id,
+                hold,
+                begin_time,
+                by: (!actor.user.is_empty()).then(|| actor.clone()),
+                at: None,
+            })
+            .map_err(|e| match e.downcast::<OutcomeUnknown>() {
+                Ok(write) => LateRequeue {
+                    killed: snapshot.clone(),
+                    write,
+                }
+                .into(),
+                Err(e) => e,
+            })?;
         // Fires accounting-end + epilog for the finalized run (live path only;
         // an already-terminal job emits no finalized entry here).
         self.run_all_finalized_side_effects(&resp);
@@ -2469,7 +2546,7 @@ impl ClusterManager {
         self.react_to_health_job_finalized(finalized.job_id, finalized.state, finalized.exit_code);
     }
 
-    fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
+    pub(crate) fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
         for f in &resp.jobs_finalized {
             self.run_job_finalized_side_effects(f);
         }
@@ -6286,13 +6363,23 @@ impl ClusterManager {
             .clone()
             .expect("raft must be set before propose is called");
         let limit = self.propose_timeout;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { tokio::time::timeout(limit, raft.client_write(op)).await })
-        })
-        .map_err(|_| anyhow::anyhow!("raft propose timed out after {limit:?}; outcome unknown"))?
-        .map(|res| res.data)
-        .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
+        let mut write: PendingWrite = Box::pin(async move {
+            raft.client_write(op)
+                .await
+                .map(|res| res.data)
+                .map_err(|e| e.to_string())
+        });
+        let waited = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(tokio::time::timeout(limit, &mut write))
+        });
+        match waited {
+            Ok(res) => res.map_err(|e| anyhow::anyhow!("raft propose failed: {e}")),
+            Err(_) => Err(OutcomeUnknown {
+                limit,
+                write: parking_lot::Mutex::new(Some(write)),
+            }
+            .into()),
+        }
     }
 
     /// Return a finished job's per-node slice to each node it held, skipping any
@@ -9727,6 +9814,67 @@ fn expand_job_specs(spec: JobSpec, parent_job_id: JobId) -> anyhow::Result<Vec<J
 }
 
 #[cfg(test)]
+pub(crate) mod gated {
+    use std::sync::Arc;
+
+    use spur_core::config::SlurmConfig;
+    use spur_core::wal::WalOperation;
+    use tempfile::TempDir;
+
+    use super::{ClusterManager, OutcomeUnknown};
+    use crate::raft::test_support::ApplyGate;
+    use crate::raft::{ClientResponse, StateMachineApply};
+
+    struct GatedApplier {
+        inner: Arc<ClusterManager>,
+        gate: Arc<ApplyGate>,
+    }
+
+    impl StateMachineApply for GatedApplier {
+        fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+            self.gate.wait_open();
+            self.inner.apply_operation(op)
+        }
+        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+            StateMachineApply::snapshot_state(&*self.inner)
+        }
+        fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+            StateMachineApply::restore_from_snapshot(&*self.inner, data)
+        }
+    }
+
+    /// A single-node cluster whose applies can be held, with a short propose timeout.
+    pub(crate) async fn cluster(
+        dir: &TempDir,
+        config: SlurmConfig,
+    ) -> (Arc<ClusterManager>, Arc<ApplyGate>) {
+        let mut cm = ClusterManager::new(config, dir.path()).unwrap();
+        cm.propose_timeout = std::time::Duration::from_millis(200);
+        let cm = Arc::new(cm);
+        let gate = Arc::new(ApplyGate::default());
+        let applier = Arc::new(GatedApplier {
+            inner: cm.clone(),
+            gate: gate.clone(),
+        });
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), applier)
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+        (cm, gate)
+    }
+
+    pub(crate) fn late(err: &anyhow::Error) -> Option<&OutcomeUnknown> {
+        err.downcast_ref::<OutcomeUnknown>()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -10291,57 +10439,94 @@ mod tests {
         });
     }
 
-    struct GatedApplier {
-        inner: Arc<ClusterManager>,
-        gate: Arc<crate::raft::test_support::ApplyGate>,
-    }
-
-    impl StateMachineApply for GatedApplier {
-        fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
-            self.gate.wait_open();
-            self.inner.apply_operation(op)
-        }
-        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
-            StateMachineApply::snapshot_state(&*self.inner)
-        }
-        fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
-            StateMachineApply::restore_from_snapshot(&*self.inner, data)
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn propose_returns_an_error_when_the_write_is_never_applied() {
+    async fn propose_hands_off_a_write_that_is_not_applied_in_time() {
         let dir = TempDir::new().unwrap();
-        let mut cm = ClusterManager::new(test_config(), dir.path()).unwrap();
-        cm.propose_timeout = std::time::Duration::from_millis(200);
-        let cm = Arc::new(cm);
-        let gate = Arc::new(crate::raft::test_support::ApplyGate::default());
-        let applier = Arc::new(GatedApplier {
-            inner: cm.clone(),
-            gate: gate.clone(),
-        });
-        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), applier)
-            .await
-            .unwrap();
-        handle
-            .raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .metrics(|m| m.current_leader == Some(1), "leader elected")
-            .await
-            .expect("single-node raft did not self-elect within 5s");
-        cm.set_raft(handle.raft);
+        let (cm, gate) = gated::cluster(&dir, test_config()).await;
         register_node(&cm, "n1", 4, 1024);
 
         let closed = gate.close();
         let err = try_register_node(&cm, "n2", 4, 1024)
-            .expect_err("a write that is never applied must not block its caller");
-        assert!(err.to_string().contains("timed out"), "{err}");
+            .expect_err("a write that is not applied in time must not block its caller");
+        assert!(err.to_string().contains("outcome unknown"), "{err}");
 
-        // A timeout is an unknown outcome, not a failure: the write still lands.
         drop(closed);
         wait_for("n2 applied after the gate opens", || {
             cm.get_node("n2").is_some()
         });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_preempt_requeue_still_reaches_its_follow_up() {
+        let dir = TempDir::new().unwrap();
+        let (cm, gate) = gated::cluster(&dir, test_config()).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "victim", "worker1");
+
+        let closed = gate.close();
+        let err = cm
+            .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
+            .expect_err("the requeue cannot apply while the gate is closed");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        gated::late(&err)
+            .expect("a timed-out preemption hands off its write")
+            .on_late_apply(move |resp| async move {
+                let _ = tx.send(resp);
+            });
+
+        drop(closed);
+        let resp = rx.await.expect("the follow-up runs once the write applies");
+        assert!(resp
+            .jobs_finalized
+            .iter()
+            .any(|f| f.job_id == job_id && f.state == JobState::Preempted));
+        settle(&cm, job_id, JobState::Pending);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_user_requeue_keeps_the_run_it_must_cancel() {
+        let dir = TempDir::new().unwrap();
+        let (cm, gate) = gated::cluster(&dir, test_config()).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "requeued", "worker1");
+        let running = cm.get_job(job_id).unwrap();
+
+        let closed = gate.close();
+        let err = cm
+            .requeue_job_by_user(job_id, "", true, false)
+            .expect_err("the requeue cannot apply while the gate is closed");
+        let late = err
+            .downcast_ref::<LateRequeue>()
+            .expect("a timed-out requeue carries the run to cancel");
+        let killed = late.killed.as_ref().expect("the job was running");
+        assert_eq!(killed.run_attempt, running.run_attempt);
+        assert_eq!(killed.allocated_nodes, running.allocated_nodes);
+
+        drop(closed);
+        settle(&cm, job_id, JobState::Pending);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_suspend_still_reaches_its_follow_up() {
+        let dir = TempDir::new().unwrap();
+        let (cm, gate) = gated::cluster(&dir, test_config()).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "suspended", "worker1");
+
+        let closed = gate.close();
+        let err = cm
+            .suspend_job_for(job_id, "", true)
+            .expect_err("the suspend cannot apply while the gate is closed");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        gated::late(&err)
+            .expect("a timed-out suspend hands off its write")
+            .on_late_apply(move |_| async move {
+                let _ = tx.send(());
+            });
+
+        drop(closed);
+        rx.await.expect("the follow-up runs once the write applies");
+        settle(&cm, job_id, JobState::Suspended);
     }
 
     fn health_check(program: &str, interval_secs: u64) -> HealthCheck {

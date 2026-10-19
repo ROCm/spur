@@ -1297,6 +1297,16 @@ pub(crate) async fn try_preempt(
                     evicted_so_far.push(candidate.job_id);
                 }
                 Err(e) => {
+                    let follow_up = if *mode == spur_core::partition::PreemptMode::Suspend {
+                        VictimFollowUp::Suspend(Box::new((*candidate).clone()))
+                    } else {
+                        VictimFollowUp::Cancel {
+                            job_id: candidate.job_id,
+                            run_attempt: candidate.run_attempt,
+                            nodes: candidate.allocated_nodes.clone(),
+                        }
+                    };
+                    follow_late_preemption(cluster, &e, follow_up);
                     // A victim gone since the snapshot already released its node, so
                     // the set still holds. Any other failure leaves it held, with
                     // `evicted_so_far` already gone and the rest of the set abandoned.
@@ -1517,6 +1527,15 @@ async fn reclaim_for_unplaced(
                     freed.extend(victim.nodes.iter().cloned());
                 }
                 Err(e) => {
+                    follow_late_preemption(
+                        cluster,
+                        &e,
+                        VictimFollowUp::Cancel {
+                            job_id: victim.job_id,
+                            run_attempt: victim.run_attempt,
+                            nodes: victim.nodes.clone(),
+                        },
+                    );
                     warn!(job_id = victim.job_id, error = %e, "failed to reclaim borrowed job");
                 }
             }
@@ -3235,6 +3254,39 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             }
         }
     }
+}
+
+/// What a preemption owes the victim's agents once its write applies.
+enum VictimFollowUp {
+    Cancel {
+        job_id: spur_core::job::JobId,
+        run_attempt: u32,
+        nodes: Vec<String>,
+    },
+    Suspend(Box<spur_core::job::Job>),
+}
+
+/// Carries out a preemption whose write applied only after `propose` gave up waiting.
+fn follow_late_preemption(
+    cluster: &Arc<ClusterManager>,
+    err: &anyhow::Error,
+    then: VictimFollowUp,
+) {
+    let Some(late) = err.downcast_ref::<crate::cluster::OutcomeUnknown>() else {
+        return;
+    };
+    let cluster = cluster.clone();
+    late.on_late_apply(move |resp| async move {
+        cluster.run_all_finalized_side_effects(&resp);
+        match then {
+            VictimFollowUp::Cancel {
+                job_id,
+                run_attempt,
+                nodes,
+            } => cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, 0).await,
+            VictimFollowUp::Suspend(job) => send_suspend_to_agents(&cluster, &job, false).await,
+        }
+    });
 }
 
 /// Send CancelJob RPC to all agents for a job with a specific signal.
@@ -5329,6 +5381,51 @@ mod tests {
             wait_for(&format!("job {job_id} -> {expected:?}"), || {
                 cm.get_job(job_id).is_some_and(|j| j.state == expected)
             });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_preemption_that_applies_late_still_cancels_the_victim() {
+            use spur_core::job::JobState;
+            use spur_core::partition::PreemptMode;
+
+            let dir = TempDir::new().unwrap();
+            let (cm, gate) = crate::cluster::gated::cluster(&dir, test_config()).await;
+            let (addr, cancel_calls) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            let spec = JobSpec {
+                name: "victim".into(),
+                user: "testuser".into(),
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec);
+            let alloc = ResourceAllocations::with_scalar(1, 0);
+            let per_node = HashMap::from([("n1".to_string(), alloc.clone())]);
+            cm.start_job(job_id, vec!["n1".into()], alloc, per_node)
+                .unwrap();
+            settle(&cm, job_id, JobState::Running);
+            let victim = cm.get_job(job_id).unwrap();
+
+            let closed = gate.close();
+            let err = cm
+                .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
+                .expect_err("the requeue cannot apply while the gate is closed");
+            follow_late_preemption(
+                &cm,
+                &err,
+                VictimFollowUp::Cancel {
+                    job_id,
+                    run_attempt: victim.run_attempt,
+                    nodes: victim.allocated_nodes.clone(),
+                },
+            );
+            assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
+
+            drop(closed);
+            wait_for("victim cancelled once the requeue applies", || {
+                cancel_calls.load(Ordering::SeqCst) == 1
+            });
+            settle(&cm, job_id, JobState::Pending);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
