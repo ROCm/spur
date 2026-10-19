@@ -358,32 +358,3 @@ jobs:
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
-
-  trivy-dockerfile-scan:
-    name: Trivy Dockerfile scan
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Scan Dockerfile for misconfigurations
-        id: scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          version: v0.74.0
-          scan-type: config
-          scan-ref: Dockerfile
-          format: sarif
-          output: trivy-config.sarif
-          severity: CRITICAL,HIGH
-          limit-severities-for-sarif: true
-          exit-code: "1"
-
-      - name: Upload SARIF to GitHub Security
-        if: always() && steps.scan.outcome != 'skipped' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
-        with:
-          sarif_file: trivy-config.sarif
-          category: trivy-config

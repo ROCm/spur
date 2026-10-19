@@ -38,3 +38,40 @@ jobs:
       gitleaks_config_path: .github/scan_tools_configs/gitleaks.toml
       trivy_config_path: .github/scan_tools_configs/trivy.yml
       zizmor_config_path: .github/scan_tools_configs/zizmor.yml
+
+  # The baseline's PR-time trivy only runs when a lockfile, manifest or
+  # Dockerfile changes, so a PR that weakens examples/k8s would pass.
+  manifests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Scan Kubernetes manifests and Dockerfiles for misconfigurations
+        id: scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.74.0
+          scan-type: config
+          scan-ref: .
+          trivy-config: .github/scan_tools_configs/trivy.yml
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-manifests.sarif
+          severity: CRITICAL,HIGH
+          limit-severities-for-sarif: true
+          exit-code: "1"
+
+      - name: Upload SARIF to code scanning
+        # Fork PRs get a read-only token; the scan above still gates them.
+        if: >-
+          always() && steps.scan.outcome != 'skipped' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          sarif_file: trivy-manifests.sarif
+          category: trivy-manifests
