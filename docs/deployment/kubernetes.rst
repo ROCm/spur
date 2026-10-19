@@ -205,6 +205,24 @@ work. Authentication mirrors the cluster ``[auth] mode``:
 
 See the commented ``--auth-mode`` / ``SPUR_JWT_KEY`` lines in ``examples/k8s/operator.yaml``.
 
+Operator service account
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The operator's cluster-wide permissions are bound to its own ServiceAccount,
+``spur-operator``, defined in ``examples/k8s/rbac.yaml``. Only the operator
+Deployment uses this account. ``spurctld`` and ``spurd`` never use a pod token
+to call the Kubernetes API, so their pods run with
+``automountServiceAccountToken: false``.
+
+Older versions of ``rbac.yaml`` bound these permissions to the ``default``
+ServiceAccount in the ``spur`` namespace, which every pod there (including
+``spurctld``) uses unless it names another. To upgrade, apply the new
+``rbac.yaml``, then ``operator.yaml``, ``spurctld.yaml`` and ``spurd.yaml``. The
+binding moves to ``spur-operator``. The running operator loses its permissions
+as soon as ``rbac.yaml`` is applied, until its replacement pod is ready.
+Applying ``spurctld.yaml`` and ``spurd.yaml`` changes their pod templates, so
+each controller pod and node agent restarts in turn.
+
 Enforcing account quotas
 ~~~~~~~~~~~~~~~~~~~~~~~~
 

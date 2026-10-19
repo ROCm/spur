@@ -29,6 +29,7 @@ spec:
       labels:
         app: spur-k8s-operator
     spec:
+      serviceAccountName: spur-operator
       containers:
         - name: operator
           image: spur:latest

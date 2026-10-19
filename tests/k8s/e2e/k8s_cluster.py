@@ -423,6 +423,8 @@ class ClusterFixture:
                     rbac_api.delete_cluster_role(name)
                 elif kind == "ClusterRoleBinding":
                     rbac_api.delete_cluster_role_binding(name)
+                elif kind == "ServiceAccount":
+                    self.core_v1.delete_namespaced_service_account(name, self.namespace)
             except ApiException as exc:
                 if not _is_not_found(exc):
                     raise
