@@ -2939,7 +2939,28 @@ pub fn publish_private(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()
         let _ = fs::remove_file(&temporary_path);
         return Err(error);
     }
+    #[cfg(test)]
+    if FAIL_PUBLICATION_SYNC.with(|fail| fail.get()) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
     fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_PUBLICATION_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_failed_publication_sync<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FAIL_PUBLICATION_SYNC.with(|fail| fail.set(self.0));
+        }
+    }
+    let _restore = Restore(FAIL_PUBLICATION_SYNC.with(|fail| fail.replace(true)));
+    body()
 }
 
 pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {

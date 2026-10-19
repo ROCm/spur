@@ -867,8 +867,8 @@ impl AdmissionStore {
         self.with_run_lock(key, || self.admit_run_locked(run))
     }
 
-    /// The merge-and-write body of `admit_run`, for a caller that already
-    /// holds this run's lock -- so it neither deadlocks on nor re-pays for it.
+    /// Even an unchanged retry must publish: a prior rename may have succeeded
+    /// while its directory sync failed, leaving visible but unconfirmed state.
     fn admit_run_locked(&self, run: &RunAdmission) -> io::Result<()> {
         let key = run.key().ok_or_else(|| unaddressable(run.job_id))?;
         let mut run = run.clone();
@@ -920,7 +920,9 @@ impl AdmissionStore {
                     }
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.require_empty_run_dir(key)?
+            }
             Err(error) => return Err(error),
         }
         let dir = self.prepare_run_dir(key)?;
@@ -943,6 +945,20 @@ impl AdmissionStore {
             participants,
         };
         Ok(rejected.is_empty() && admitted.collectable(readmitted_at, 0))
+    }
+
+    fn require_empty_run_dir(&self, run: RunKey) -> io::Result<()> {
+        let mut entries = match fs::read_dir(self.run_dir(run)?) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if entries.next().transpose()?.is_some() {
+            return Err(invalid(format!(
+                "missing authority for {run} with retained admission evidence"
+            )));
+        }
+        Ok(())
     }
 
     /// The write fsyncs twice. Callers hold locks every other job RPC needs, so
@@ -1159,16 +1175,12 @@ impl AdmissionStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
-            let already_cleaned = run.state == RunState::Cleaned;
             // Owner-loss is resolve_supervised_epilogs's call to make, on real
             // liveness evidence -- never this function's, first mark or not.
             let epilog = match (epilog, run.cleanup.epilog) {
                 (EpilogOwed::Yes, HookState::NotStarted) => HookState::Pending,
                 (_, recorded) => recorded,
             };
-            if already_cleaned && run.cleanup.epilog == epilog {
-                return Ok(true);
-            }
             run.state = RunState::Cleaned;
             run.cleanup.epilog = epilog;
             self.admit_run_locked(&run)?;
@@ -1367,6 +1379,7 @@ impl AdmissionStore {
                 return Ok(HoldOutcome::AlreadyReleased);
             }
             if run.conflict_hold.is_some() {
+                self.admit_run_locked(&run)?;
                 return Ok(HoldOutcome::AlreadyHeld);
             }
             run.conflict_hold = Some(ConflictHold {
@@ -1401,12 +1414,9 @@ impl AdmissionStore {
                 }
                 Err(error) => return Err(error),
             };
-            if reject_before_unix_ms <= run.reject_before_unix_ms {
-                return Ok(run.reject_before_unix_ms);
-            }
-            run.reject_before_unix_ms = reject_before_unix_ms;
+            run.reject_before_unix_ms = run.reject_before_unix_ms.max(reject_before_unix_ms);
             self.admit_run_locked(&run)?;
-            Ok(reject_before_unix_ms)
+            Ok(run.reject_before_unix_ms)
         })
     }
 
@@ -1497,9 +1507,6 @@ impl AdmissionStore {
             if run.created_at_unix_ms != caller_created_at_unix_ms {
                 return Ok(false);
             }
-            if run.cleanup.epilog == state {
-                return Ok(true);
-            }
             run.cleanup.epilog = state;
             self.admit_run_locked(&run)?;
             Ok(true)
@@ -1522,9 +1529,6 @@ impl AdmissionStore {
             };
             if run.created_at_unix_ms != caller_created_at_unix_ms {
                 return Ok(false);
-            }
-            if run.prolog == state {
-                return Ok(true);
             }
             run.prolog = state;
             self.admit_run_locked(&run)?;
@@ -1593,9 +1597,6 @@ impl AdmissionStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
-            if run.cancelled_by_controller {
-                return Ok(true);
-            }
             run.cancelled_by_controller = true;
             self.admit_run_locked(&run)?;
             Ok(true)
@@ -1611,9 +1612,6 @@ impl AdmissionStore {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
-            if run.slice_released {
-                return Ok(true);
-            }
             run.slice_released = true;
             self.admit_run_locked(&run)?;
             Ok(true)
@@ -1924,6 +1922,76 @@ mod tests {
             },
             created_at,
         )
+    }
+
+    #[test]
+    fn durable_retry_repeats_an_unconfirmed_publication() {
+        for operation in [
+            "fence",
+            "prolog",
+            "epilog",
+            "cleaned",
+            "cancelled",
+            "released",
+            "hold",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&dir);
+            store.admit_run(&run_with(7, 1, 1_000)).unwrap();
+            let write = || match operation {
+                "fence" => store.fence_run(key(7, 1), 5_000).map(|_| ()),
+                "prolog" => store
+                    .record_prolog(key(7, 1), 1_000, HookState::Running)
+                    .map(|_| ()),
+                "epilog" => store
+                    .record_epilog(key(7, 1), 1_000, HookState::Running)
+                    .map(|_| ()),
+                "cleaned" => store
+                    .mark_run_cleaned(key(7, 1), EpilogOwed::No)
+                    .map(|_| ()),
+                "cancelled" => store.mark_controller_cancelled(key(7, 1)).map(|_| ()),
+                "released" => store.record_slice_released(key(7, 1)).map(|_| ()),
+                "hold" => store
+                    .take_conflict_hold(key(7, 1), "unknown owner")
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            crate::stepd::with_failed_publication_sync(|| {
+                assert!(write().is_err(), "{operation}: first publication must fail");
+                assert!(
+                    write().is_err(),
+                    "{operation}: a retry must not acknowledge an unsynced write"
+                );
+            });
+            write().unwrap();
+        }
+    }
+
+    #[test]
+    fn durable_admission_cannot_invent_authority_for_orphan_participants() {
+        for fence in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&dir);
+            let run = run_with(7, 1, 1_000);
+            store.admit_run(&run).unwrap();
+            let mut participant =
+                ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", run.allocation.clone());
+            participant.lifecycle = ParticipantLifecycle::Running;
+            store.admit_participant(&participant).unwrap();
+            let run_path = store.run_dir(key(7, 1)).unwrap().join(RUN_FILE);
+            fs::remove_file(&run_path).unwrap();
+            assert!(!store.ledger_cut("session").inventory_complete);
+
+            let result = if fence {
+                store.fence_run(key(7, 1), 5_000).map(|_| ())
+            } else {
+                store.admit_run(&run_with(7, 1, 2_000))
+            };
+            assert!(result.is_err());
+            assert!(!run_path.exists());
+            assert!(!store.ledger_cut("session").inventory_complete);
+            assert_eq!(store.participants(key(7, 1)).unwrap().0, vec![participant]);
+        }
     }
 
     #[test]
