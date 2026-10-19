@@ -25816,6 +25816,7 @@ mod tests {
             state: JobState::Cancelled,
             unreported_nodes: Vec::new(),
             cancel: None,
+            at: None,
         });
         assert_eq!(cm.allocate_step_id(1), 0);
 
