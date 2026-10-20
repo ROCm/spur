@@ -660,6 +660,15 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    With those policy settings in place, a pending job that cannot find free
    capacity can preempt an eligible lower-QOS job holding the capacity it needs.
 
+   A node freed by a preemption is held for the job that triggered it: while the
+   victim drains and for the cycle it finally frees the node, the preemptor is
+   placed at the front of the pending queue so the backfill scheduler reserves
+   that node for it. A different pending job with a higher effective priority
+   (for instance, a larger fair-share) but no right to evict the victim cannot
+   take the node the preemption just freed. Eviction eligibility is decided on
+   QOS rank alone (allow-list plus ``priority``); fair-share and age order the
+   rest of the queue but neither authorizes nor redirects a preemption.
+
 .. note::
 
    Backfill protection for a large multi-node job (holding a node against

@@ -310,6 +310,10 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
         cluster.evict_expired_terminal_jobs();
+        // Age preempt-freed-node earmarks by one pass before they are read for
+        // hoisting below, so each earmark survives a fixed number of real
+        // scheduling passes rather than a wall-clock window.
+        cluster.tick_preempt_freed_earmarks();
 
         // Submit due node health checks as exclusive whole-node jobs and enforce
         // the starvation drain/resume. Runs leader-only, alongside the other
@@ -1496,7 +1500,7 @@ async fn reclaim_for_unplaced(
             // configures. Suspend never releases the allocation, which is the one
             // thing reclaim needs, and cancel destroys work the run had no claim to
             // lose when requeue preserves it at no cost to the reclaimer.
-            match cluster.preempt_job_with_provenance(
+            match cluster.reclaim_job_with_provenance(
                 victim.job_id,
                 spur_core::partition::PreemptMode::Requeue,
                 Some(reclaimer.job_id),
@@ -1642,7 +1646,7 @@ fn satisfiable_victim_set(
 }
 
 /// True when `candidate` occupies a node the pending job could target.
-fn preempt_overlaps_pending_nodes(
+pub(crate) fn preempt_overlaps_pending_nodes(
     pending: &spur_core::job::Job,
     candidate: &spur_core::job::Job,
     nodes: &[spur_core::node::Node],

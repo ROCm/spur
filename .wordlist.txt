@@ -57,6 +57,7 @@ oversubscription
 preempt
 preemption
 preemptable
+preemptor
 prolog
 epilog
 QoS
