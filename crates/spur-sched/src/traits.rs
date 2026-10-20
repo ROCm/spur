@@ -27,6 +27,7 @@ pub struct ClusterState<'a> {
     pub reservations: &'a [Reservation],
     /// Fabric topology (switch hierarchy). None if topology is not configured.
     pub topology: Option<&'a TopologyTree>,
+    pub fabric: Option<&'a FabricSchedulingContext>,
     /// Node name -> real time its last currently-running job is expected to
     /// end. Absent entries fall back to a conservative placeholder.
     pub busy_until: &'a HashMap<String, DateTime<Utc>>,
@@ -42,4 +43,32 @@ pub trait Scheduler: Send + Sync {
 
     /// Name of this scheduler plugin.
     fn name(&self) -> &str;
+}
+
+/// Rebuilt from the complete live inventory each scheduling cycle.
+pub struct FabricSchedulingContext {
+    pub view: spur_core::fabric::FabricView,
+    pub single_block_partitions: Vec<String>,
+}
+
+impl FabricSchedulingContext {
+    pub fn requires_binding(&self, job: &Job, partitions: &[Partition]) -> bool {
+        let policy_applies = if job.spec.partition.is_none() {
+            partitions
+                .iter()
+                .any(|p| p.is_default && self.single_block_partitions.contains(&p.name))
+        } else {
+            spur_core::partition::requested_partition_names(job.spec.partition.as_deref()).any(
+                |name| {
+                    self.single_block_partitions
+                        .iter()
+                        .any(|policy| policy == name)
+                },
+            )
+        };
+        policy_applies
+            && (job.spec.exclusive
+                || spur_core::gpu_request::resolve_gpu_demand(&job.spec)
+                    .is_ok_and(|d| !d.is_none()))
+    }
 }

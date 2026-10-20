@@ -19,6 +19,7 @@ message ResourceSet {
   repeated GpuResource gpus = 3;
   map<string, uint64> generic = 4;  // licenses, etc.
   uint64 generation = 5;  // bumped by the agent on each topology rebuild
+  uint32 fabric_binding_version = 6; // highest enforced binding version; zero is unsupported
 }
 
 message AllocatedDevice {
@@ -35,6 +36,7 @@ message ResourceAllocations {
   uint64 memory_mb = 2;
   map<string, DeviceAllocations> devices = 3;
   uint64 generation = 4;  // node inventory generation this allocation was made under
+  FabricBinding fabric_binding = 5;
 }
 
 message GpuResource {
@@ -122,6 +124,15 @@ message FabricBlock {
   repeated string issues = 6;
 }
 
+message FabricBinding {
+  uint32 version = 1;
+  FabricBlockKey key = 2;
+  repeated string active_endpoints = 3;
+  repeated FabricMember members = 4;
+  string node = 5;
+  uint64 inventory_generation = 6;
+}
+
 message UnresolvedFabricDevice {
   FabricDeviceKey device = 1;
   string issue = 2;
@@ -131,6 +142,7 @@ message GetFabricTopologyResponse {
   string namespace = 1;
   repeated FabricBlock blocks = 2;
   repeated UnresolvedFabricDevice unresolved = 3;
+  repeated string single_block_partitions = 4;
 }
 
 enum GpuLinkType {
@@ -406,6 +418,7 @@ message JobInfo {
   string suspended_by = 85;
   string last_requeue = 86;
   string last_requeue_by = 87;
+  map<string, FabricBinding> fabric_bindings = 88;
 }
 
 message NodeInfo {

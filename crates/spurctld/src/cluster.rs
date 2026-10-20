@@ -2248,6 +2248,74 @@ impl ClusterManager {
         )
     }
 
+    pub(crate) fn validate_fabric_placement(
+        &self,
+        job: &Job,
+        node_names: &[String],
+        allocations: &HashMap<String, ResourceAllocations>,
+    ) -> anyhow::Result<()> {
+        let config = self.config();
+        let required = config
+            .topology
+            .as_ref()
+            .and_then(|t| t.external.as_ref())
+            .is_some_and(|external| {
+                spur_sched::traits::FabricSchedulingContext {
+                    view: spur_core::fabric::FabricView {
+                        single_block_partitions: vec![],
+                        namespace: config.cluster_name.clone(),
+                        blocks: vec![],
+                        unresolved: vec![],
+                    },
+                    single_block_partitions: external.single_block_partitions.clone(),
+                }
+                .requires_binding(job, &self.get_partitions())
+            });
+        if !required
+            && allocations
+                .values()
+                .all(|allocation| allocation.fabric_binding.is_none())
+        {
+            return Ok(());
+        }
+        let view = self.fabric_view(Utc::now());
+        let mut key = None;
+        for name in node_names {
+            let allocation = allocations
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("missing fabric allocation for {name}"))?;
+            let binding = allocation.fabric_binding.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "single-block policy requires an enforced fabric binding for {name}"
+                )
+            })?;
+            if key.is_some_and(|key| key != &binding.key) {
+                anyhow::bail!("allocation crosses fabric blocks");
+            }
+            key = Some(&binding.key);
+            let block = view
+                .blocks
+                .iter()
+                .find(|block| block.key == binding.key && block.issues.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("fabric block is no longer consistent"))?;
+            if block.active_endpoints != binding.active_endpoints {
+                anyhow::bail!("fabric membership changed before dispatch");
+            }
+            let node = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("fabric node disappeared"))?;
+            binding
+                .validate(
+                    &config.cluster_name,
+                    name,
+                    &node.total_resources,
+                    allocation,
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
     /// Charge a placement in Raft before dispatching, so a leader change
     /// mid-dispatch finds it charged rather than free. Returns the run epoch.
     pub fn reserve_placement(
@@ -2268,6 +2336,10 @@ impl ClusterManager {
                 );
             }
         }
+        let job = self
+            .get_job(job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
+        self.validate_fabric_placement(&job, &node_names, &per_node_alloc)?;
         let run_attempt = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -3715,12 +3787,19 @@ impl ClusterManager {
 
     pub fn fabric_view(&self, now: DateTime<Utc>) -> spur_core::fabric::FabricView {
         let config = self.config();
-        spur_core::fabric::FabricView::from_nodes(
+        let mut view = spur_core::fabric::FabricView::from_nodes(
             &config.cluster_name,
             &self.get_nodes(),
             now,
             config.controller.heartbeat_timeout_secs.unwrap_or(90),
-        )
+        );
+        view.single_block_partitions = config
+            .topology
+            .as_ref()
+            .and_then(|t| t.external.as_ref())
+            .map(|e| e.single_block_partitions.clone())
+            .unwrap_or_default();
+        view
     }
 
     /// Nodes eligible for new placement this tick: all nodes minus those on a
@@ -6053,6 +6132,20 @@ impl ClusterManager {
     /// Get all reservations.
     pub fn get_reservations(&self) -> Vec<Reservation> {
         self.reservations.read().clone()
+    }
+
+    pub fn annotate_fabric_pending(&self, ids: &[JobId]) {
+        let mut jobs = self.jobs.write();
+        for id in ids {
+            if let Some(job) = jobs.get_mut(id) {
+                if job.state == JobState::Pending
+                    && !job.pending_reason.is_scheduling_hold()
+                    && !job.reason_explains_begin_hold(Utc::now())
+                {
+                    job.set_pending_reason_desc(PendingReason::Resources, "FabricUnavailable: no consistent block with capable agents satisfies the request; inspect topology show");
+                }
+            }
+        }
     }
 
     /// Update pending_reason for jobs the scheduler couldn't schedule.
@@ -12876,6 +12969,7 @@ mod tests {
         // Bug reproduction: the stale positional ids match no live stable_id, so
         // both real GPUs read free.
         let want_two_gpus = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 0,
             memory_mb: 0,
             gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
@@ -17367,6 +17461,7 @@ mod tests {
         // The guard site in update_pending_reasons. An empty cluster_state would
         // otherwise force Resources/NodeDown.
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -17405,6 +17500,7 @@ mod tests {
         assert!(cm.get_job(job_id).unwrap().is_begin_held(Utc::now()));
 
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -18164,6 +18260,7 @@ mod tests {
             jobs.get_mut(&job_id).unwrap().pending_reason = PendingReason::DeadLine;
         }
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -18195,6 +18292,7 @@ mod tests {
         node.alloc_resources = scalar_alloc(4, 8000);
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18212,6 +18310,7 @@ mod tests {
         down.state = NodeState::Down;
         let nodes = vec![down];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18241,6 +18340,7 @@ mod tests {
         node.k0s_role = Some(K0sRole::Worker);
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18261,6 +18361,7 @@ mod tests {
         busy.state = NodeState::Mixed;
         let nodes = vec![busy];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18299,6 +18400,7 @@ mod tests {
         let n2 = cm.get_node("n2").unwrap();
         let nodes = vec![n1, n2];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18334,6 +18436,7 @@ mod tests {
             cm.get_node("n3").unwrap(),
         ];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18373,6 +18476,7 @@ mod tests {
             cm.get_node("n4").unwrap(),
         ];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18423,6 +18527,7 @@ mod tests {
             owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18473,6 +18578,7 @@ mod tests {
             owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18504,6 +18610,7 @@ mod tests {
 
         let nodes = vec![cm.get_node("n1").unwrap(), cm.get_node("n2").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18532,6 +18639,7 @@ mod tests {
         // Node has no features.
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18709,6 +18817,7 @@ mod tests {
 
         // An empty cluster forces a real wait reason, which must win.
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -22852,6 +22961,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -23186,6 +23296,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -23265,6 +23376,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -25913,6 +26025,7 @@ mod tests {
         let job = submit_and_wait(&cm, basic_spec("post-teardown"));
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
