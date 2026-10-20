@@ -1376,6 +1376,10 @@ pub struct NotificationConfig {
     pub smtp_command: Option<String>,
     /// From address for notification emails, e.g., "spur@cluster.local".
     pub from_address: Option<String>,
+    /// Admin address that gets a copy of every PREEMPTION_WASTED mail, with the
+    /// user's running total. Sent through `smtp_command`; off when unset.
+    #[serde(default)]
+    pub admin_mail: Option<String>,
 }
 
 /// Cluster-wide burst-buffer capacity, modeled like a single consumable pool

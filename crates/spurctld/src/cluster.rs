@@ -5827,20 +5827,25 @@ impl ClusterManager {
         }
 
         // SMTP email notification via sendmail-compatible command
+        let user = spec.user.clone();
+        let to = spec.mail_user.as_deref().unwrap_or(&user).to_string();
+        let subject = format!("Spur Job {}: {}", job_id, event);
+        let mut body = format!("Job ID: {}\nEvent: {}\nUser: {}\n", job_id, event, user);
+        if let Some(detail) = detail {
+            body.push_str(&format!("Detail: {detail}\n"));
+        }
+        self.send_mail(&to, &subject, &body);
+    }
+
+    /// Mail through `notifications.smtp_command`; nothing when it is unset.
+    fn send_mail(&self, to: &str, subject: &str, body: &str) {
+        let config = self.config();
         if let Some(ref smtp_cmd) = config.notifications.smtp_command {
             let from = config
                 .notifications
                 .from_address
                 .as_deref()
                 .unwrap_or("spur@localhost");
-            let user = spec.user.clone();
-            let mail_user = spec.mail_user.clone();
-            let to = mail_user.as_deref().unwrap_or(&user).to_string();
-            let subject = format!("Spur Job {}: {}", job_id, event);
-            let mut body = format!("Job ID: {}\nEvent: {}\nUser: {}\n", job_id, event, user);
-            if let Some(detail) = detail {
-                body.push_str(&format!("Detail: {detail}\n"));
-            }
             let email = format!(
                 "From: {}\nTo: {}\nSubject: {}\n\n{}",
                 from, to, subject, body
@@ -6338,6 +6343,19 @@ impl ClusterManager {
                     w.detail, w.user
                 );
                 self.send_notification(w.job_id, "PREEMPTION_WASTED", Some(&detail), &spec);
+            }
+            // Spur reports; admins decide. The copy lets them see a user whose
+            // count keeps growing without watching sdiag or the logs.
+            if let Some(admin) = self.config().notifications.admin_mail.clone() {
+                let subject = format!(
+                    "Spur: {} wasted a preemption ({user_total} in total)",
+                    w.user
+                );
+                let body = format!(
+                    "Job ID: {}\nEvent: PREEMPTION_WASTED\nUser: {}\nUser total: {user_total}\nDetail: {}\n",
+                    w.job_id, w.user, w.detail
+                );
+                self.send_mail(&admin, &subject, &body);
             }
         }
     }
@@ -13403,7 +13421,19 @@ mod tests {
         JobId,
         JobId,
     ) {
-        let cm = test_cluster(dir).await;
+        preempted_for_pending_with(dir, test_config()).await
+    }
+
+    async fn preempted_for_pending_with(
+        dir: &TempDir,
+        config: SlurmConfig,
+    ) -> (
+        Arc<ClusterManager>,
+        Arc<crate::sched_stats::SchedStatsCollector>,
+        JobId,
+        JobId,
+    ) {
+        let cm = test_cluster_with_config(dir, config).await;
         let stats = Arc::new(crate::sched_stats::SchedStatsCollector::new("backfill"));
         cm.set_sched_stats(stats.clone());
         register_node(&cm, "worker1", 8, 16000);
@@ -13504,6 +13534,54 @@ mod tests {
             .as_deref()
             .is_some_and(|d| d.contains("ended CANCELLED before starting")));
         assert_eq!(stats.snapshot().preemptions_wasted, 1);
+    }
+
+    fn wasted_preemption_mail_config(outbox: &std::path::Path, admin: Option<&str>) -> SlurmConfig {
+        let mut config = test_config();
+        config.notifications.smtp_command = Some(format!("cat >> {}", outbox.display()));
+        config.notifications.admin_mail = admin.map(str::to_string);
+        config
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_mail_gets_a_copy_of_a_wasted_preemption_with_the_users_total() {
+        let dir = TempDir::new().unwrap();
+        let outbox = dir.path().join("outbox");
+        let config = wasted_preemption_mail_config(&outbox, Some("hpc-admins@example.com"));
+        let (cm, _stats, _victim, preemptor) = preempted_for_pending_with(&dir, config).await;
+
+        cm.cancel_job(preemptor, "testuser").unwrap();
+        settle(&cm, preemptor, JobState::Cancelled);
+
+        let read = || std::fs::read_to_string(&outbox).unwrap_or_default();
+        wait_for("admin copy sent", || {
+            read().contains("To: hpc-admins@example.com")
+        });
+        let mail = read();
+        assert!(mail.contains("Subject: Spur: testuser wasted a preemption (1 in total)"));
+        assert!(mail.contains(&format!("Job ID: {preemptor}\nEvent: PREEMPTION_WASTED")));
+        assert!(mail.contains("User total: 1"));
+        // The owner still gets their own mail.
+        wait_for("owner mail sent", || read().contains("To: testuser"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_admin_copy_of_a_wasted_preemption_when_admin_mail_is_unset() {
+        let dir = TempDir::new().unwrap();
+        let outbox = dir.path().join("outbox");
+        let config = wasted_preemption_mail_config(&outbox, None);
+        let (cm, _stats, _victim, preemptor) = preempted_for_pending_with(&dir, config).await;
+
+        cm.cancel_job(preemptor, "testuser").unwrap();
+        settle(&cm, preemptor, JobState::Cancelled);
+
+        let read = || std::fs::read_to_string(&outbox).unwrap_or_default();
+        wait_for("owner mail sent", || read().contains("PREEMPTION_WASTED"));
+        assert_eq!(
+            read().matches("Subject:").count(),
+            1,
+            "only the owner's mail"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

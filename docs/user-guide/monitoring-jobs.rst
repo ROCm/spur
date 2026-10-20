@@ -804,9 +804,13 @@ tally per user, across all their jobs. ``sdiag`` lists it under "Preemptions
 wasted by user", most first, with each user's latest occurrence; the
 notification carries the user's running total. The tally is kept in replicated
 controller state, so it survives restarts and failover, and ``sdiag --reset``
-does not clear it. Nothing is blocked: this is a report, so owners and
-administrators can find jobs that keep evicting others without running.
-Suspend-mode preemption is not tracked, because the suspended job keeps its
+does not clear it. If ``notifications.admin_mail`` is set, that address gets a
+copy of each notification with the user's running total.
+
+Spur reports; administrators decide. A wasted preemption never blocks, delays
+or lowers the priority of a job or a user. A burst of failed launches is often
+someone in a hurry, not abuse, so administrators follow up with a repeat
+offender in person. Suspend-mode preemption is not tracked, because the suspended job keeps its
 allocation.
 
 Borrowed runs and reclaim

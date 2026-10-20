@@ -2456,6 +2456,12 @@ Job-event notification transports.
      - string
      - none
      - From address, e.g. ``"spur@cluster.local"``.
+   * - ``admin_mail``
+     - string
+     - none
+     - Address that gets a copy of every ``PREEMPTION_WASTED`` mail, with the
+       user's running total. Sent through ``smtp_command``. Unset: no copy.
+       Spur only reports; no automatic penalty follows from the count.
 
 ``[power]``
 -----------
