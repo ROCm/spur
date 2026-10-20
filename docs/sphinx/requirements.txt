@@ -27,7 +27,7 @@ bracex==3.0.1
     # via wcmatch
 breathe==4.36.0
     # via rocm-docs-core
-certifi==2026.7.22
+certifi==2026.10.19
     # via requests
 cffi==2.1.0
     # via
