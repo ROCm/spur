@@ -111,6 +111,10 @@ pub struct ClientResponse {
     /// refused as stale instead of actually transitioning the job.
     #[serde(default)]
     pub state_change_applied: bool,
+    /// Pending jobs that left their preemption claim unused in this apply, for
+    /// the leader to count and report once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preemptions_wasted: Vec<spur_core::job::WastedPreemption>,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

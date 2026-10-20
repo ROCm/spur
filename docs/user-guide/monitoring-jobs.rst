@@ -775,6 +775,33 @@ fields:
   release; jobs preempted by an earlier release show ``N/A`` even though they
   were preempted.
 
+Unused preemptions
+~~~~~~~~~~~~~~~~~~
+
+Spur also tracks the other side: a pending job that had running jobs preempted
+(cancel or requeue mode) to make room for it, and then did not use the nodes they
+freed. The preemption counts as wasted when the job next leaves the pending
+state without running on any of those nodes:
+
+* it started on other nodes;
+* its launch failed and it went back to pending;
+* it ended (for example, cancelled) before starting.
+
+``scontrol show job`` on the preempting job then shows:
+
+.. code-block:: text
+
+   WastedPreemptions=1 LastWastedPreemption="preempted job(s) 812 on node3, but its launch failed"
+
+``WastedPreemptions`` counts the evicted jobs over the job's lifetime; the line is
+omitted while it is zero. Each occurrence is also logged as a warning by the
+controller, adds to the ``Preemptions wasted`` counter in ``sdiag``, and sends a
+``PREEMPTION_WASTED`` notification when the job's ``--mail-type`` includes
+``FAIL`` or ``ALL``. Nothing is blocked: this is a report, so owners and
+administrators can find jobs that keep evicting others without running.
+Suspend-mode preemption is not tracked, because the suspended job keeps its
+allocation.
+
 Borrowed runs and reclaim
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 

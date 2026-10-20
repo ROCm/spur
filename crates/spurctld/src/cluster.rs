@@ -22,8 +22,9 @@ use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
-    effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
-    PendingReason, PreemptHold, TransitionOutcome, DEFAULT_PRIORITY,
+    effective_gpus, effective_memory_mb, ClaimOutcome, Job, JobId, JobSpec, JobState,
+    NodeCompleteError, PendingReason, PreemptHold, TransitionOutcome, WastedPreemption,
+    DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -2146,7 +2147,7 @@ impl ClusterManager {
             .iter()
             .any(|t| t == "BEGIN" || t == "ALL")
         {
-            self.send_notification(job_id, "BEGIN", &spec_for_notify);
+            self.send_notification(job_id, "BEGIN", None, &spec_for_notify);
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
@@ -2767,10 +2768,10 @@ impl ClusterManager {
                 JobState::Failed | JobState::Timeout | JobState::NodeFail | JobState::Deadline
             );
             if is_success && spec.mail_type.iter().any(|t| t == "END" || t == "ALL") {
-                self.send_notification(job_id, "END", &spec);
+                self.send_notification(job_id, "END", None, &spec);
             }
             if is_failure && spec.mail_type.iter().any(|t| t == "FAIL" || t == "ALL") {
-                self.send_notification(job_id, "FAIL", &spec);
+                self.send_notification(job_id, "FAIL", None, &spec);
             }
         }
 
@@ -5755,7 +5756,7 @@ impl ClusterManager {
     /// Send a job event notification via webhook (if configured).
     ///
     /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
-    fn send_notification(&self, job_id: JobId, event: &str, spec: &JobSpec) {
+    fn send_notification(&self, job_id: JobId, event: &str, detail: Option<&str>, spec: &JobSpec) {
         let config = self.config();
         let webhook_url = config.notifications.webhook_url.clone();
         if let Some(url) = webhook_url {
@@ -5763,14 +5764,18 @@ impl ClusterManager {
             let user = spec.user.clone();
             let mail_user = spec.mail_user.clone();
             let job_name = spec.name.clone();
+            let detail = detail.map(str::to_string);
             tokio::spawn(async move {
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "job_id": job_id,
                     "event": event,
                     "job_name": job_name,
                     "user": user,
                     "mail_user": mail_user,
                 });
+                if let Some(detail) = detail {
+                    payload["detail"] = detail.into();
+                }
                 let payload_str = payload.to_string();
                 match tokio::process::Command::new("curl")
                     .args([
@@ -5818,7 +5823,10 @@ impl ClusterManager {
             let mail_user = spec.mail_user.clone();
             let to = mail_user.as_deref().unwrap_or(&user).to_string();
             let subject = format!("Spur Job {}: {}", job_id, event);
-            let body = format!("Job ID: {}\nEvent: {}\nUser: {}\n", job_id, event, user);
+            let mut body = format!("Job ID: {}\nEvent: {}\nUser: {}\n", job_id, event, user);
+            if let Some(detail) = detail {
+                body.push_str(&format!("Detail: {detail}\n"));
+            }
             let email = format!(
                 "From: {}\nTo: {}\nSubject: {}\n\n{}",
                 from, to, subject, body
@@ -6288,6 +6296,25 @@ impl ClusterManager {
         })
         .map(|res| res.data)
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
+        .inspect(|resp| self.report_wasted_preemptions(&resp.preemptions_wasted))
+    }
+
+    /// Count and warn about preemptions a job left unused. Runs only here on
+    /// the leader, so each is reported once rather than per replica or replay.
+    fn report_wasted_preemptions(&self, wasted: &[WastedPreemption]) {
+        for w in wasted {
+            if let Some(stats) = self.sched_stats.get() {
+                stats.record_preemptions_wasted(w.victims.len() as u64);
+            }
+            let spec = self.jobs.read().get(&w.job_id).map(|j| j.spec.clone());
+            let user = spec.as_ref().map_or("", |s| s.user.as_str());
+            warn!(job_id = w.job_id, user, victims = ?w.victims, "wasted preemption: {}", w.detail);
+            if let Some(spec) = spec {
+                if spec.mail_type.iter().any(|t| t == "FAIL" || t == "ALL") {
+                    self.send_notification(w.job_id, "PREEMPTION_WASTED", Some(&w.detail), &spec);
+                }
+            }
+        }
     }
 
     /// Return a finished job's per-node slice to each node it held, skipping any
@@ -6508,22 +6535,24 @@ impl ClusterManager {
     }
 
     /// Hold `victim_nodes`, which `victim` was preempted off, for the
-    /// still-pending preemptor and its QOS. Called with `jobs` and `nodes`
+    /// still-pending preemptor and its QOS, and record them on the preemptor so
+    /// its start can be checked against them. Called with `jobs` and `nodes`
     /// already locked, so the lock order is jobs, nodes, holds.
     fn note_preempt_hold(
         &self,
-        jobs: &HashMap<JobId, Job>,
+        jobs: &mut HashMap<JobId, Job>,
         preempted_by: Option<JobId>,
         victim: JobId,
         victim_nodes: &[String],
         at: DateTime<Utc>,
     ) {
-        let Some(preemptor) = preempted_by.and_then(|id| jobs.get(&id)) else {
+        let Some(preemptor) = preempted_by.and_then(|id| jobs.get_mut(&id)) else {
             return;
         };
         if preemptor.state != JobState::Pending {
             return;
         }
+        preemptor.add_preempt_claim(victim, victim_nodes);
         let mut holds = self.preempt_holds.write();
         for node in victim_nodes {
             holds.insert(
@@ -6625,6 +6654,15 @@ impl ClusterManager {
                     response.state_change_applied = outcome == TransitionOutcome::Applied;
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Running {
                         job.start_time = Some(at.unwrap_or(timestamp));
+                        let started_on = job.allocated_nodes.clone();
+                        response
+                            .preemptions_wasted
+                            .extend(job.settle_preempt_claim(ClaimOutcome::Started(&started_on)));
+                    }
+                    if outcome == TransitionOutcome::Applied && new_state.is_terminal() {
+                        response
+                            .preemptions_wasted
+                            .extend(job.settle_preempt_claim(ClaimOutcome::Ended(*new_state)));
                     }
                     // Gated on a real transition so a replay doesn't re-wipe
                     // fields or double-count requeue_count.
@@ -6671,6 +6709,9 @@ impl ClusterManager {
                 if *run_attempt != 0 && job.run_attempt != 0 && *run_attempt < job.run_attempt {
                     return ClientResponse::default();
                 }
+                response
+                    .preemptions_wasted
+                    .extend(job.settle_preempt_claim(ClaimOutcome::LaunchFailed));
                 // A reservation charged by `reserve_placement` before dispatch may
                 // still be held here (a caller backing off a job that never
                 // reserved one has nothing charged to free); free it before the
@@ -6767,7 +6808,7 @@ impl ClusterManager {
                     &[],
                     *job_id,
                 );
-                self.note_preempt_hold(&jobs, *preempted_by, *job_id, &freed_nodes, timestamp);
+                self.note_preempt_hold(&mut jobs, *preempted_by, *job_id, &freed_nodes, timestamp);
                 drop(jobs);
                 drop(nodes);
                 // Fire accounting for the terminated run as PREEMPTED, even
@@ -6906,7 +6947,7 @@ impl ClusterManager {
                         }
                         let victim_nodes = job.allocated_nodes.clone();
                         self.note_preempt_hold(
-                            &jobs,
+                            &mut jobs,
                             *preempted_by,
                             *job_id,
                             &victim_nodes,
@@ -6952,7 +6993,7 @@ impl ClusterManager {
                         }
                     }
                 }
-                self.note_preempt_hold(&jobs, *preempted_by, *job_id, &freed_nodes, timestamp);
+                self.note_preempt_hold(&mut jobs, *preempted_by, *job_id, &freed_nodes, timestamp);
                 drop(jobs);
                 drop(nodes);
                 self.complete_job_steps(job_id, -1, timestamp);
@@ -7020,6 +7061,11 @@ impl ClusterManager {
                     None,
                 ) {
                     response.jobs_finalized.push(fin);
+                    if let Some(job) = jobs.get_mut(job_id) {
+                        response
+                            .preemptions_wasted
+                            .extend(job.settle_preempt_claim(ClaimOutcome::LaunchFailed));
+                    }
                 }
             }
             WalOperation::JobLaunchFailureDetail { job_id, detail } => {
@@ -7312,6 +7358,9 @@ impl ClusterManager {
                             job.end_of_run_state(*state),
                             *exit_code,
                         ));
+                        response
+                            .preemptions_wasted
+                            .extend(job.settle_preempt_claim(ClaimOutcome::Ended(*state)));
                     }
                     released = state.is_terminal();
                     // Suspended -> terminal: fold the final suspended interval in
@@ -13301,6 +13350,172 @@ mod tests {
             2,
             "both preemptions counted as finalized"
         );
+    }
+
+    /// A cluster with two idle nodes and a stats collector, where a job running
+    /// on worker1 was requeue-preempted for a job that is still pending.
+    async fn preempted_for_pending(
+        dir: &TempDir,
+    ) -> (
+        Arc<ClusterManager>,
+        Arc<crate::sched_stats::SchedStatsCollector>,
+        JobId,
+        JobId,
+    ) {
+        let cm = test_cluster(dir).await;
+        let stats = Arc::new(crate::sched_stats::SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+        let victim = run_job_on(&cm, "victim", "worker1");
+        let preemptor = submit_and_wait(&cm, basic_spec("preemptor"));
+        cm.preempt_job_with_provenance(victim, PreemptMode::Requeue, Some(preemptor), None)
+            .unwrap();
+        settle(&cm, victim, JobState::Pending);
+        (cm, stats, victim, preemptor)
+    }
+
+    fn start_on(cm: &ClusterManager, job_id: JobId, node: &str) {
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec![node.into()],
+            resources.clone(),
+            per_node_for(&[node], resources),
+        )
+        .unwrap();
+        settle(cm, job_id, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemptor_starting_on_the_freed_node_wastes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (cm, stats, victim, preemptor) = preempted_for_pending(&dir).await;
+        let claim = cm
+            .get_job(preemptor)
+            .unwrap()
+            .preempt_claim
+            .expect("claim recorded");
+        assert_eq!(claim.victims, vec![victim]);
+        assert_eq!(claim.nodes, vec!["worker1".to_string()]);
+
+        start_on(&cm, preemptor, "worker1");
+
+        let job = cm.get_job(preemptor).unwrap();
+        assert!(job.preempt_claim.is_none());
+        assert_eq!(job.preemptions_wasted, 0);
+        assert_eq!(stats.snapshot().preemptions_wasted, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemptor_starting_elsewhere_counts_a_wasted_preemption() {
+        let dir = TempDir::new().unwrap();
+        let (cm, stats, victim, preemptor) = preempted_for_pending(&dir).await;
+
+        start_on(&cm, preemptor, "worker2");
+
+        let job = cm.get_job(preemptor).unwrap();
+        assert!(job.preempt_claim.is_none());
+        assert_eq!(job.preemptions_wasted, 1);
+        assert_eq!(
+            job.last_wasted_preemption.as_deref(),
+            Some(
+                format!("preempted job(s) {victim} on worker1, but it started on worker2 instead")
+                    .as_str()
+            )
+        );
+        assert_eq!(stats.snapshot().preemptions_wasted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemptor_launch_failure_counts_a_wasted_preemption() {
+        let dir = TempDir::new().unwrap();
+        let (cm, stats, _victim, preemptor) = preempted_for_pending(&dir).await;
+
+        cm.backoff_pending_job_after_dispatch_failure(preemptor, 1)
+            .unwrap();
+        wait_for("backoff applied", || {
+            cm.get_job(preemptor)
+                .is_some_and(|j| j.preempt_claim.is_none())
+        });
+
+        let job = cm.get_job(preemptor).unwrap();
+        assert_eq!(job.preemptions_wasted, 1);
+        assert!(job
+            .last_wasted_preemption
+            .as_deref()
+            .is_some_and(|d| d.ends_with("its launch failed")));
+        assert_eq!(stats.snapshot().preemptions_wasted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemptor_cancelled_while_pending_counts_a_wasted_preemption() {
+        let dir = TempDir::new().unwrap();
+        let (cm, stats, _victim, preemptor) = preempted_for_pending(&dir).await;
+
+        cm.cancel_job(preemptor, "testuser").unwrap();
+        settle(&cm, preemptor, JobState::Cancelled);
+
+        let job = cm.get_job(preemptor).unwrap();
+        assert_eq!(job.preemptions_wasted, 1);
+        assert!(job
+            .last_wasted_preemption
+            .as_deref()
+            .is_some_and(|d| d.contains("ended CANCELLED before starting")));
+        assert_eq!(stats.snapshot().preemptions_wasted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_mode_preemption_claims_the_victims_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let victim = run_job_on(&cm, "victim", "worker1");
+        let preemptor = submit_and_wait(&cm, basic_spec("preemptor"));
+
+        cm.preempt_job_with_provenance(victim, PreemptMode::Cancel, Some(preemptor), None)
+            .unwrap();
+
+        // Claimed as soon as the victim is killed, while it still drains.
+        let claim = cm
+            .get_job(preemptor)
+            .unwrap()
+            .preempt_claim
+            .expect("claim recorded");
+        assert_eq!(claim.victims, vec![victim]);
+        assert_eq!(claim.nodes, vec!["worker1".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasted_preemptions_are_counted_by_the_leader_not_on_apply() {
+        let dir = TempDir::new().unwrap();
+        let (cm, stats, victim, preemptor) = preempted_for_pending(&dir).await;
+
+        // A follower or a replay applies the entry without proposing it: the
+        // job records the waste, but only the proposing leader counts it.
+        let resp = cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: preemptor,
+            begin_time: Utc::now(),
+            spare_requeue_budget: true,
+            run_attempt: 0,
+            at_max_requeue: false,
+        });
+        assert_eq!(resp.preemptions_wasted.len(), 1);
+        assert_eq!(resp.preemptions_wasted[0].job_id, preemptor);
+        assert_eq!(resp.preemptions_wasted[0].victims, vec![victim]);
+        assert_eq!(cm.get_job(preemptor).unwrap().preemptions_wasted, 1);
+        assert_eq!(stats.snapshot().preemptions_wasted, 0);
+
+        // Re-applying finds the claim already settled.
+        let replay = cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: preemptor,
+            begin_time: Utc::now(),
+            spare_requeue_budget: true,
+            run_attempt: 0,
+            at_max_requeue: false,
+        });
+        assert!(replay.preemptions_wasted.is_empty());
+        assert_eq!(cm.get_job(preemptor).unwrap().preemptions_wasted, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

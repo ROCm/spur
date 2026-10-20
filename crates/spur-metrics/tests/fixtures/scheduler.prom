@@ -31,6 +31,9 @@ spur_scheduler_jobs_finalized_total 28
 # HELP spur_scheduler_jobs_preempted Jobs preempted (cancel or requeue mode) since reset; suspend-mode preemptions are excluded.
 # TYPE spur_scheduler_jobs_preempted counter
 spur_scheduler_jobs_preempted_total 5
+# HELP spur_scheduler_preemptions_wasted Jobs preempted for a pending job that then started elsewhere, failed to launch, or ended before starting.
+# TYPE spur_scheduler_preemptions_wasted counter
+spur_scheduler_preemptions_wasted_total 1
 # HELP spur_scheduler_exit_end Cycles that considered every pending job.
 # TYPE spur_scheduler_exit_end counter
 spur_scheduler_exit_end_total 8

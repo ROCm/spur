@@ -5027,6 +5027,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         preempted_by: job.preempted_by.unwrap_or(0),
         preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
         preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
+        preemptions_wasted: job.preemptions_wasted,
+        last_wasted_preemption: job.last_wasted_preemption.clone().unwrap_or_default(),
         req_nodelist: job.spec.nodelist.clone().unwrap_or_default(),
         exc_nodelist: job.spec.exclude.clone().unwrap_or_default(),
         features: job.spec.constraint.clone().unwrap_or_default(),

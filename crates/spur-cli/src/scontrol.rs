@@ -2182,6 +2182,13 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
             },
         );
     }
+    if job.preemptions_wasted > 0 {
+        let _ = writeln!(
+            out,
+            "   WastedPreemptions={} LastWastedPreemption=\"{}\"",
+            job.preemptions_wasted, job.last_wasted_preemption
+        );
+    }
     let _ = writeln!(out);
     out
 }
@@ -2218,6 +2225,20 @@ mod tests {
         };
         assert_eq!(actor_line(&failure).as_deref(), Some("LastRequeue=Failure"));
         assert_eq!(actor_line(&spur_proto::proto::JobInfo::default()), None);
+    }
+
+    #[test]
+    fn show_job_reports_wasted_preemptions_only_when_there_are_some() {
+        let job = spur_proto::proto::JobInfo {
+            preemptions_wasted: 2,
+            last_wasted_preemption: "preempted job(s) 7 on n1, but its launch failed".into(),
+            ..Default::default()
+        };
+        assert!(format_job_detail(&job).contains(
+            "   WastedPreemptions=2 LastWastedPreemption=\"preempted job(s) 7 on n1, but its launch failed\""
+        ));
+        let none = format_job_detail(&spur_proto::proto::JobInfo::default());
+        assert!(!none.contains("WastedPreemptions"));
     }
 
     fn pending_pinned_job() -> spur_proto::proto::JobInfo {

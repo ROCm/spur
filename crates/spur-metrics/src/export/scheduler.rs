@@ -98,6 +98,12 @@ pub fn register_scheduler(registry: &mut Registry, snap: &SchedStatsSnapshot) {
     );
     register_counter(
         registry,
+        "spur_scheduler_preemptions_wasted",
+        "Jobs preempted for a pending job that then started elsewhere, failed to launch, or ended before starting",
+        snap.preemptions_wasted,
+    );
+    register_counter(
+        registry,
         "spur_scheduler_exit_end",
         "Cycles that considered every pending job",
         snap.exit_end,
@@ -131,6 +137,7 @@ mod tests {
             jobs_started: 30,
             jobs_finalized: 28,
             jobs_preempted: 5,
+            preemptions_wasted: 1,
             jobs_started_last_cycle: 3,
             exit_end: 8,
             exit_max_depth: 2,
@@ -159,6 +166,11 @@ mod tests {
         assert!(body.contains("spur_scheduler_exit_end_total 8"));
         assert!(body.contains("spur_scheduler_exit_max_depth_total 2"));
         assert!(body.contains("spur_scheduler_jobs_preempted_total 5"));
+        assert!(body.contains("spur_scheduler_preemptions_wasted_total 1"));
+        assert_eq!(
+            metric_type(&body, "spur_scheduler_preemptions_wasted"),
+            "counter"
+        );
         assert_eq!(
             metric_type(&body, "spur_scheduler_jobs_preempted"),
             "counter"

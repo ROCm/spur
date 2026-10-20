@@ -27,6 +27,7 @@ pub struct SchedStatsCollector {
     jobs_started: AtomicU64,
     jobs_finalized: AtomicU64,
     jobs_preempted: AtomicU64,
+    preemptions_wasted: AtomicU64,
     exit_end: AtomicU64,
     exit_max_depth: AtomicU64,
 }
@@ -40,6 +41,7 @@ impl SchedStatsCollector {
             jobs_started: AtomicU64::new(0),
             jobs_finalized: AtomicU64::new(0),
             jobs_preempted: AtomicU64::new(0),
+            preemptions_wasted: AtomicU64::new(0),
             exit_end: AtomicU64::new(0),
             exit_max_depth: AtomicU64::new(0),
         }
@@ -91,6 +93,13 @@ impl SchedStatsCollector {
         self.jobs_preempted.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count jobs preempted for a pending job that then didn't use their nodes.
+    pub fn record_preemptions_wasted(&self, count: u64) {
+        if count > 0 {
+            self.preemptions_wasted.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
     pub fn snapshot(&self) -> SchedStatsSnapshot {
         let accum = self.cycle.lock();
         SchedStatsSnapshot {
@@ -104,6 +113,7 @@ impl SchedStatsCollector {
             jobs_started: self.jobs_started.load(Ordering::Relaxed),
             jobs_finalized: self.jobs_finalized.load(Ordering::Relaxed),
             jobs_preempted: self.jobs_preempted.load(Ordering::Relaxed),
+            preemptions_wasted: self.preemptions_wasted.load(Ordering::Relaxed),
             jobs_started_last_cycle: accum.jobs_started_last_cycle,
             exit_end: self.exit_end.load(Ordering::Relaxed),
             exit_max_depth: self.exit_max_depth.load(Ordering::Relaxed),
@@ -116,6 +126,7 @@ impl SchedStatsCollector {
         self.jobs_started.store(0, Ordering::Relaxed);
         self.jobs_finalized.store(0, Ordering::Relaxed);
         self.jobs_preempted.store(0, Ordering::Relaxed);
+        self.preemptions_wasted.store(0, Ordering::Relaxed);
         self.exit_end.store(0, Ordering::Relaxed);
         self.exit_max_depth.store(0, Ordering::Relaxed);
     }
@@ -181,6 +192,17 @@ mod tests {
         stats.reset();
         assert_eq!(stats.snapshot().jobs_preempted, 0);
         assert_eq!(stats.snapshot().plugin, "backfill");
+    }
+
+    #[test]
+    fn wasted_preemptions_accumulate_and_reset() {
+        let stats = SchedStatsCollector::new("backfill");
+        stats.record_preemptions_wasted(2);
+        stats.record_preemptions_wasted(0);
+        stats.record_preemptions_wasted(1);
+        assert_eq!(stats.snapshot().preemptions_wasted, 3);
+        stats.reset();
+        assert_eq!(stats.snapshot().preemptions_wasted, 0);
     }
 
     #[test]

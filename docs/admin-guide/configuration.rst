@@ -2445,7 +2445,9 @@ Job-event notification transports.
    * - ``webhook_url``
      - string
      - none
-     - URL to POST job-event notifications to.
+     - URL to POST job-event notifications to. The JSON body carries ``job_id``,
+       ``event``, ``job_name``, ``user`` and ``mail_user``, plus ``detail`` for
+       events that explain themselves, such as ``PREEMPTION_WASTED``.
    * - ``smtp_command``
      - string
      - none

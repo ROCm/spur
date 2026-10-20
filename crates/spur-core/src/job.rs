@@ -789,6 +789,30 @@ impl PreemptHold {
     }
 }
 
+/// Jobs preempted to make room for a still-pending job, and the nodes they
+/// freed, kept to tell whether the job then used them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreemptClaim {
+    pub victims: Vec<JobId>,
+    pub nodes: Vec<String>,
+}
+
+/// How a job that others were preempted for left the pending state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome<'a> {
+    Started(&'a [String]),
+    LaunchFailed,
+    Ended(JobState),
+}
+
+/// Preemptions whose job never used the nodes they freed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WastedPreemption {
+    pub job_id: JobId,
+    pub victims: Vec<JobId>,
+    pub detail: String,
+}
+
 /// Internal job record held by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -935,6 +959,17 @@ pub struct Job {
     /// the preemption. `None` for plain priority-based preemption.
     #[serde(default)]
     pub preempt_qos: Option<String>,
+    /// Open while this job is pending and others were preempted for it: what
+    /// they freed, to tell whether it used them. Settled when it leaves pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt_claim: Option<PreemptClaim>,
+    /// Jobs preempted for this one that it then did not use: it started on
+    /// other nodes, its launch failed, or it ended before starting.
+    #[serde(default)]
+    pub preemptions_wasted: u32,
+    /// What happened to the most recent wasted preemption, for `scontrol show job`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_wasted_preemption: Option<String>,
 
     /// This run started on spare capacity the job's QOS group node quota did not
     /// cover (idle-fill). A stamped job is borrowed: it is held outside every
@@ -1016,6 +1051,9 @@ impl Job {
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,
+            preempt_claim: None,
+            preemptions_wasted: 0,
+            last_wasted_preemption: None,
             idle_fill: false,
             preferred_nodes: HashSet::new(),
             last_sched_eval: None,
@@ -1369,6 +1407,50 @@ pub enum TransitionOutcome {
 }
 
 impl Job {
+    /// Record that `victim` was preempted off `nodes` to make room for this job.
+    pub fn add_preempt_claim(&mut self, victim: JobId, nodes: &[String]) {
+        let claim = self.preempt_claim.get_or_insert_with(|| PreemptClaim {
+            victims: Vec::new(),
+            nodes: Vec::new(),
+        });
+        if !claim.victims.contains(&victim) {
+            claim.victims.push(victim);
+        }
+        for node in nodes {
+            if !claim.nodes.contains(node) {
+                claim.nodes.push(node.clone());
+            }
+        }
+    }
+
+    /// Close the open preemption claim. Starting on any node it freed uses it;
+    /// starting elsewhere, a failed launch, or ending first wastes it, which is
+    /// counted and returned.
+    pub fn settle_preempt_claim(&mut self, outcome: ClaimOutcome<'_>) -> Option<WastedPreemption> {
+        let claim = self.preempt_claim.take()?;
+        let what_happened = match outcome {
+            ClaimOutcome::Started(on) if on.iter().any(|n| claim.nodes.contains(n)) => return None,
+            ClaimOutcome::Started(on) => format!("it started on {} instead", on.join(",")),
+            ClaimOutcome::LaunchFailed => "its launch failed".to_string(),
+            ClaimOutcome::Ended(state) => format!("it ended {state} before starting"),
+        };
+        let victims: Vec<String> = claim.victims.iter().map(|v| v.to_string()).collect();
+        let detail = format!(
+            "preempted job(s) {} on {}, but {what_happened}",
+            victims.join(","),
+            claim.nodes.join(",")
+        );
+        self.preemptions_wasted = self
+            .preemptions_wasted
+            .saturating_add(claim.victims.len() as u32);
+        self.last_wasted_preemption = Some(detail.clone());
+        Some(WastedPreemption {
+            job_id: self.job_id,
+            victims: claim.victims,
+            detail,
+        })
+    }
+
     /// True while a future `begin_time` defers this job's start, whether it came
     /// from `--begin`, a preemption requeue, or a launch-failure backoff.
     pub fn is_begin_held(&self, now: DateTime<Utc>) -> bool {
@@ -1585,6 +1667,87 @@ mod tests {
         assert!(held.is_active(held.at + chrono::Duration::seconds(119), 120));
         assert!(!held.is_active(held.at + chrono::Duration::seconds(120), 120));
         assert!(!held.is_active(held.at, 0), "0 disables the hold");
+    }
+
+    fn nodes(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn starting_on_a_freed_node_uses_the_claim() {
+        let mut job = make_job();
+        job.add_preempt_claim(7, &nodes(&["n1", "n2"]));
+        assert_eq!(
+            job.settle_preempt_claim(ClaimOutcome::Started(&nodes(&["n2", "n3"]))),
+            None
+        );
+        assert!(job.preempt_claim.is_none());
+        assert_eq!(job.preemptions_wasted, 0);
+        assert!(job.last_wasted_preemption.is_none());
+    }
+
+    #[test]
+    fn starting_elsewhere_wastes_every_victim() {
+        let mut job = make_job();
+        job.add_preempt_claim(7, &nodes(&["n1"]));
+        job.add_preempt_claim(8, &nodes(&["n1"]));
+        let wasted = job
+            .settle_preempt_claim(ClaimOutcome::Started(&nodes(&["n3"])))
+            .expect("wasted");
+        assert_eq!(wasted.victims, vec![7, 8]);
+        assert_eq!(
+            wasted.detail,
+            "preempted job(s) 7,8 on n1, but it started on n3 instead"
+        );
+        assert_eq!(job.preemptions_wasted, 2);
+        assert_eq!(
+            job.last_wasted_preemption.as_deref(),
+            Some(wasted.detail.as_str())
+        );
+    }
+
+    #[test]
+    fn failed_launch_and_early_end_waste_the_claim_and_accumulate() {
+        let mut job = make_job();
+        job.add_preempt_claim(7, &nodes(&["n1"]));
+        let first = job
+            .settle_preempt_claim(ClaimOutcome::LaunchFailed)
+            .expect("wasted");
+        assert!(
+            first.detail.ends_with("its launch failed"),
+            "{}",
+            first.detail
+        );
+
+        job.add_preempt_claim(9, &nodes(&["n1"]));
+        let second = job
+            .settle_preempt_claim(ClaimOutcome::Ended(JobState::Cancelled))
+            .expect("wasted");
+        assert!(
+            second.detail.contains("ended CANCELLED"),
+            "{}",
+            second.detail
+        );
+        assert_eq!(job.preemptions_wasted, 2);
+    }
+
+    #[test]
+    fn settling_without_a_claim_is_a_no_op() {
+        let mut job = make_job();
+        assert_eq!(job.settle_preempt_claim(ClaimOutcome::LaunchFailed), None);
+        assert_eq!(job.preemptions_wasted, 0);
+    }
+
+    #[test]
+    fn job_without_claim_fields_deserializes() {
+        let mut value = serde_json::to_value(make_job()).expect("serialize");
+        let obj = value.as_object_mut().expect("object");
+        obj.remove("preempt_claim");
+        obj.remove("preemptions_wasted");
+        obj.remove("last_wasted_preemption");
+        let job: Job = serde_json::from_value(value).expect("old record loads");
+        assert!(job.preempt_claim.is_none());
+        assert_eq!(job.preemptions_wasted, 0);
     }
 
     #[test]
