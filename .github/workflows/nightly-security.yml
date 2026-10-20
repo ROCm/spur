@@ -3,7 +3,8 @@
 #
 # Nightly security scan: scans the whole repository and the shipped image
 # and pushes SARIF findings to the repository's code-scanning Security tab.
-# Complements `security.yml`, which scans only what changed in a PR.
+# Complements `security.yml`, which scans on PRs and pushes to main; this
+# catches new findings in unchanged code, such as newly published CVEs.
 
 name: Nightly Security
 
