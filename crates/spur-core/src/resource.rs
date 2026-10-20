@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
+pub use spur_devices::topology::DeviceTopology;
 use std::collections::HashMap;
 
 /// GPU interconnect type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GpuLinkType {
     PCIe,
     XGMI,
@@ -13,7 +14,7 @@ pub enum GpuLinkType {
 }
 
 /// A single GPU resource.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GpuResource {
     pub device_id: u32,
     pub gpu_type: String,
@@ -26,6 +27,8 @@ pub struct GpuResource {
     /// keys on it.
     #[serde(default)]
     pub stable_id: u64,
+    #[serde(default)]
+    pub topology: Option<DeviceTopology>,
 }
 
 /// A set of compute resources (node-level inventory).
@@ -210,13 +213,13 @@ impl ResourceSet {
     /// Identity of the schedulable set, independent of `generation`. Two ticks
     /// with an equal fingerprint observed the same topology, so a debounce can
     /// tell "same change seen twice" from "two different partial reads".
-    pub fn schedulable_fingerprint(&self) -> (u32, u64, Vec<u64>, Vec<(String, u64)>) {
-        let mut gpu_ids: Vec<u64> = self.gpus.iter().map(|g| g.stable_id).collect();
-        gpu_ids.sort_unstable();
+    pub fn schedulable_fingerprint(&self) -> (u32, u64, Vec<GpuResource>, Vec<(String, u64)>) {
+        let mut gpus = self.gpus.clone();
+        gpus.sort();
         let mut generic: Vec<(String, u64)> =
             self.generic.iter().map(|(k, v)| (k.clone(), *v)).collect();
         generic.sort();
-        (self.cpus, self.memory_mb, gpu_ids, generic)
+        (self.cpus, self.memory_mb, gpus, generic)
     }
 
     /// Clamp this detected inventory to operator caps. `cpus_cap`/`memory_cap_mb`
@@ -475,6 +478,47 @@ pub fn build_node_allocation(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_inventory_json_deserializes_without_topology() {
+        let old = r#"{"cpus":8,"memory_mb":1024,"gpus":[{"device_id":0,"gpu_type":"amdgpu","memory_mb":4096,"peer_gpus":[],"link_type":"PCIe","stable_id":128}],"generic":{},"generation":7}"#;
+        let inventory: super::ResourceSet = serde_json::from_str(old).unwrap();
+        assert!(inventory.gpus[0].topology.is_none());
+        assert_eq!(inventory.generation, 7);
+        assert_eq!(inventory.gpus[0].stable_id, 128);
+    }
+
+    #[test]
+    fn inventory_fingerprint_tracks_membership_and_gpu_properties() {
+        use spur_devices::topology::{DeviceTopology, FabricObservation, ObservationStatus};
+        let mut a = sample_inventory();
+        a.gpus[0].topology = Some(DeviceTopology {
+            fabric: Some(FabricObservation {
+                status: ObservationStatus::Observed,
+                fabric_domain_id: Some("15".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut b = a.clone();
+        b.generation += 1;
+        assert_eq!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
+        b.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap()
+            .fabric_domain_id = Some("16".into());
+        assert_ne!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
+        b = a.clone();
+        b.gpus[0].memory_mb += 1;
+        assert_ne!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
+        b = a.clone();
+        b.gpus.reverse();
+        assert_eq!(a.schedulable_fingerprint(), b.schedulable_fingerprint());
+    }
+
     use super::*;
 
     fn sample_inventory() -> ResourceSet {
@@ -488,6 +532,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![1],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -496,6 +541,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![0],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 1,
                 },
             ],
@@ -580,6 +626,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 0,
             }],
             generic: HashMap::new(),
@@ -605,6 +652,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 0,
             }],
             generic: HashMap::new(),
@@ -620,6 +668,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -628,6 +677,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
             ],
@@ -679,6 +729,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 128,
                 },
                 GpuResource {
@@ -687,6 +738,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 129,
                 },
             ],
@@ -716,6 +768,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 0,
             }],
             generic: HashMap::new(),
@@ -738,6 +791,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -746,6 +800,7 @@ mod tests {
                     memory_mb: 192_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 1,
                 },
                 GpuResource {
@@ -754,6 +809,7 @@ mod tests {
                     memory_mb: 80_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    topology: None,
                     stable_id: 2,
                 },
                 GpuResource {
@@ -762,6 +818,7 @@ mod tests {
                     memory_mb: 80_000,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    topology: None,
                     stable_id: 3,
                 },
             ],
@@ -778,6 +835,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -786,6 +844,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::NVLink,
+                    topology: None,
                     stable_id: 0,
                 },
             ],
@@ -827,6 +886,7 @@ mod accounting_tests {
             memory_mb: 65536,
             peer_gpus: Vec::new(),
             link_type: GpuLinkType::XGMI,
+            topology: None,
             stable_id: device_id as u64,
         }
     }
@@ -991,6 +1051,7 @@ mod accounting_tests {
                     memory_mb: 196_608,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 128,
                 },
                 GpuResource {
@@ -999,6 +1060,7 @@ mod accounting_tests {
                     memory_mb: 196_608,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 129,
                 },
             ],
@@ -1060,6 +1122,7 @@ mod accounting_tests {
                     memory_mb: 0,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -1068,6 +1131,7 @@ mod accounting_tests {
                     memory_mb: 0,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 0,
                 },
                 GpuResource {
@@ -1076,6 +1140,7 @@ mod accounting_tests {
                     memory_mb: 0,
                     peer_gpus: Vec::new(),
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 129,
                 },
             ],
@@ -1100,6 +1165,7 @@ mod accounting_tests {
                 memory_mb: 0,
                 peer_gpus: Vec::new(),
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 128,
             }],
             generic: HashMap::new(),
@@ -1117,6 +1183,7 @@ mod accounting_tests {
                 memory_mb: 0,
                 peer_gpus: Vec::new(),
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 0,
             }],
             generic: HashMap::new(),

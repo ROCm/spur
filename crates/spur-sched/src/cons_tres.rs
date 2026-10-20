@@ -631,6 +631,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: device_id as u64,
             })
             .collect();
@@ -1192,6 +1193,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: s,
                 })
                 .collect(),
@@ -1225,6 +1227,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: s,
                 })
                 .collect(),
@@ -1298,6 +1301,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 128,
             },
             GpuResource {
@@ -1306,6 +1310,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 129,
             },
             GpuResource {
@@ -1314,6 +1319,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: 130,
             },
         ];

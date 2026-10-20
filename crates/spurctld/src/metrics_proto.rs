@@ -170,6 +170,7 @@ mod tests {
                 memory_mb: 0,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: i as u64,
             });
         }
