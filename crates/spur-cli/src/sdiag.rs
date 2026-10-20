@@ -221,7 +221,7 @@ fn print_node_statistics(metrics: &NodeMetrics) {
 }
 
 fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         String::new(),
         "Scheduler Statistics:".to_string(),
         format!("  Plugin              : {}", stats.plugin),
@@ -236,10 +236,26 @@ fn scheduler_statistics_lines(stats: &SchedStats) -> Vec<String> {
         format!("  Jobs started        : {}", stats.jobs_started),
         format!("  Jobs finalized      : {}", stats.jobs_finalized),
         format!("  Jobs preempted      : {}", stats.jobs_preempted),
+        format!("  Preemptions wasted  : {}", stats.preemptions_wasted),
         format!("  Jobs started (last) : {}", stats.jobs_started_last_cycle),
         format!("  Exit end of queue   : {}", stats.exit_end),
         format!("  Exit max depth      : {}", stats.exit_max_depth),
-    ]
+    ];
+
+    // Lifetime figures from replicated state, so not cleared by --reset.
+    if !stats.preemptions_wasted_by_user.is_empty() {
+        lines.push(String::new());
+        lines.push("Preemptions wasted by user (lifetime, not reset):".to_string());
+        let mut users: Vec<_> = stats.preemptions_wasted_by_user.iter().collect();
+        users.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.user.cmp(&b.user)));
+        for u in users {
+            lines.push(format!(
+                "  {:16} count:{:6}  last: job {}, {}",
+                u.user, u.count, u.last_job_id, u.last_detail
+            ));
+        }
+    }
+    lines
 }
 
 fn print_scheduler_statistics(stats: &SchedStats) {
@@ -281,7 +297,7 @@ fn print_rpc_statistics(stats: &RpcStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spur_proto::proto::JobState;
+    use spur_proto::proto::{JobState, UserPreemptionsWasted};
 
     #[test]
     fn job_count_reads_proto_entries() {
@@ -377,9 +393,11 @@ mod tests {
             jobs_started: 8,
             jobs_finalized: 7,
             jobs_preempted: 3,
+            preemptions_wasted: 1,
             jobs_started_last_cycle: 2,
             exit_end: 4,
             exit_max_depth: 1,
+            preemptions_wasted_by_user: Vec::new(),
         };
         let lines = scheduler_statistics_lines(&stats);
         assert!(lines.iter().any(|l| l.contains("Plugin")));
@@ -387,9 +405,39 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("Cycle total (us)")));
         assert!(lines.iter().any(|l| l.contains("Schedule total (us)")));
         assert!(lines.iter().any(|l| l.contains("Jobs preempted      : 3")));
+        assert!(lines.iter().any(|l| l.contains("Preemptions wasted  : 1")));
         assert!(lines.iter().any(|l| l.contains("Jobs started (last) : 2")));
         assert!(lines.iter().any(|l| l.contains("Exit end of queue   : 4")));
         assert!(lines.iter().any(|l| l.contains("Exit max depth      : 1")));
+    }
+
+    #[test]
+    fn scheduler_statistics_lines_list_wasted_preemptions_by_user_most_first() {
+        let user = |user: &str, count, last_job_id| UserPreemptionsWasted {
+            user: user.into(),
+            count,
+            last_job_id,
+            last_detail: "preempted job(s) 7 on n1, but its launch failed".into(),
+        };
+        let stats = SchedStats {
+            preemptions_wasted_by_user: vec![user("alice", 1, 10), user("bob", 4, 22)],
+            ..Default::default()
+        };
+        let lines = scheduler_statistics_lines(&stats);
+        let header = lines
+            .iter()
+            .position(|l| l == "Preemptions wasted by user (lifetime, not reset):")
+            .expect("by-user section");
+        assert!(
+            lines[header + 1].starts_with("  bob"),
+            "{}",
+            lines[header + 1]
+        );
+        assert!(lines[header + 1].contains("count:     4  last: job 22, preempted job(s) 7"));
+        assert!(lines[header + 2].starts_with("  alice"));
+        assert!(!scheduler_statistics_lines(&SchedStats::default())
+            .iter()
+            .any(|l| l.contains("by user")));
     }
 
     #[test]

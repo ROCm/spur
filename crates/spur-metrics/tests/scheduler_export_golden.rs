@@ -69,6 +69,7 @@ fn sample_snapshot() -> SchedStatsSnapshot {
         jobs_started: 30,
         jobs_finalized: 28,
         jobs_preempted: 5,
+        preemptions_wasted: 1,
         jobs_started_last_cycle: 3,
         exit_end: 8,
         exit_max_depth: 2,

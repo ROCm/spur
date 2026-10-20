@@ -659,6 +659,14 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
+    /// Seconds a node freed by a preemption stays held for the job it was freed
+    /// for and the other jobs in that job's QOS, counted from when the victim
+    /// released it. Jobs outside the QOS can't be placed there meanwhile. The
+    /// hold ends when a job starts on the node, normally within a pass or two.
+    /// The window only bounds how long a node can idle when no such job starts.
+    /// `0` disables it.
+    #[serde(default = "default_preempt_hold_secs")]
+    pub preempt_hold_secs: u32,
     /// Master switch for idle-fill scheduling. `false` (default) means no
     /// behavior change anywhere: an over-quota job never borrows spare capacity.
     #[serde(default)]
@@ -708,6 +716,9 @@ fn default_max_user_priority() -> u32 {
 fn default_idle_fill_exempt_secs() -> u32 {
     60
 }
+fn default_preempt_hold_secs() -> u32 {
+    120
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -724,6 +735,7 @@ impl Default for SchedulerConfig {
             max_user_priority: default_max_user_priority(),
             preempt_type: PreemptType::None,
             preempt_exempt_time: 0,
+            preempt_hold_secs: default_preempt_hold_secs(),
             idle_fill_enabled: false,
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
             idle_fill_max_borrow_factor: 0.0,
@@ -1364,6 +1376,10 @@ pub struct NotificationConfig {
     pub smtp_command: Option<String>,
     /// From address for notification emails, e.g., "spur@cluster.local".
     pub from_address: Option<String>,
+    /// Admin address that gets a copy of every PREEMPTION_WASTED mail, with the
+    /// user's running total. Sent through `smtp_command`; off when unset.
+    #[serde(default)]
+    pub admin_mail: Option<String>,
 }
 
 /// Cluster-wide burst-buffer capacity, modeled like a single consumable pool

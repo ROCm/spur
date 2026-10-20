@@ -2239,9 +2239,11 @@ impl SlurmController for ControllerService {
             return self.forward_to_leader(request).await;
         }
 
-        Ok(Response::new(crate::metrics_proto::sched_stats_to_proto(
-            &self.sched_stats.snapshot(),
-        )))
+        let mut stats = crate::metrics_proto::sched_stats_to_proto(&self.sched_stats.snapshot());
+        stats.preemptions_wasted_by_user = crate::metrics_proto::user_preemptions_wasted_to_proto(
+            self.cluster.wasted_preemptions_by_user(),
+        );
+        Ok(Response::new(stats))
     }
 
     async fn get_assoc_mgr_info(
@@ -5027,6 +5029,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         preempted_by: job.preempted_by.unwrap_or(0),
         preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
         preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
+        preemptions_wasted: job.preemptions_wasted,
+        last_wasted_preemption: job.last_wasted_preemption.clone().unwrap_or_default(),
         req_nodelist: job.spec.nodelist.clone().unwrap_or_default(),
         exc_nodelist: job.spec.exclude.clone().unwrap_or_default(),
         features: job.spec.constraint.clone().unwrap_or_default(),

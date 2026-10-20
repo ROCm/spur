@@ -775,6 +775,44 @@ fields:
   release; jobs preempted by an earlier release show ``N/A`` even though they
   were preempted.
 
+Unused preemptions
+~~~~~~~~~~~~~~~~~~
+
+Spur also tracks the other side: a pending job that had running jobs preempted
+(cancel or requeue mode) to make room for it, and then did not use the nodes they
+freed. The preemption counts as wasted when the job next leaves the pending
+state without running on any of those nodes:
+
+* it started on other nodes;
+* its launch failed and it went back to pending;
+* it ended (for example, cancelled) before starting.
+
+``scontrol show job`` on the preempting job then shows:
+
+.. code-block:: text
+
+   WastedPreemptions=1 LastWastedPreemption="preempted job(s) 812 on node3, but its launch failed"
+
+``WastedPreemptions`` counts the evicted jobs over the job's lifetime; the line is
+omitted while it is zero. Each occurrence is also logged as a warning by the
+controller, adds to the ``Preemptions wasted`` counter in ``sdiag``, and sends a
+``PREEMPTION_WASTED`` notification to the job's owner (``--mail-user``, or
+the submitting user) whatever ``--mail-type`` is set to.
+
+A resubmitted job gets a new job ID, so the controller also keeps a lifetime
+tally per user, across all their jobs. ``sdiag`` lists it under "Preemptions
+wasted by user", most first, with each user's latest occurrence; the
+notification carries the user's running total. The tally is kept in replicated
+controller state, so it survives restarts and failover, and ``sdiag --reset``
+does not clear it. If ``notifications.admin_mail`` is set, that address gets a
+copy of each notification with the user's running total.
+
+Spur reports; administrators decide. A wasted preemption never blocks, delays
+or lowers the priority of a job or a user. A burst of failed launches is often
+someone in a hurry, not abuse, so administrators follow up with a repeat
+offender in person. Suspend-mode preemption is not tracked, because the suspended job keeps its
+allocation.
+
 Borrowed runs and reclaim
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 

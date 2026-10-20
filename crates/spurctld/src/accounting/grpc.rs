@@ -489,6 +489,8 @@ impl SlurmAccounting for AccountingService {
                 suspended_by: String::new(),
                 last_requeue: String::new(),
                 last_requeue_by: String::new(),
+                preemptions_wasted: 0,
+                last_wasted_preemption: String::new(),
                 // Kept exhaustive so a new JobInfo field forces a decision here;
                 // the accounting store has no requested-placement columns.
                 req_nodelist: String::new(),

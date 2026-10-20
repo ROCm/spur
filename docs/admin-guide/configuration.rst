@@ -590,6 +590,20 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
        Mirrors Slurm's ``PreemptExemptTime``. Does not apply to idle-fill reclaim,
        which uses ``idle_fill_exempt_secs`` instead.
+   * - ``preempt_hold_secs``
+     - integer
+     - ``120``
+     - Live
+     - Seconds a node freed by a preemption stays held for the job it was freed
+       for and the other jobs in that job's QOS, counted from when the victim
+       released it (a cancelled victim may drain in ``COMPLETING`` first). The
+       QOS keeps the hold, so a job its owner cancels and resubmits under a new
+       ID still gets the node. While held, no job outside the QOS is placed on
+       the node, backfilled onto it, or preempts for it. The hold ends when a job
+       starts on the node, normally within a pass or two. It holds nothing while
+       no job in the QOS can be scheduled (held, or waiting on a dependency).
+       The window only bounds how long a node can sit idle when no such job
+       starts. ``0`` turns the hold off.
    * - ``idle_fill_enabled``
      - boolean
      - ``false``
@@ -2431,7 +2445,9 @@ Job-event notification transports.
    * - ``webhook_url``
      - string
      - none
-     - URL to POST job-event notifications to.
+     - URL to POST job-event notifications to. The JSON body carries ``job_id``,
+       ``event``, ``job_name``, ``user`` and ``mail_user``, plus ``detail`` for
+       events that explain themselves, such as ``PREEMPTION_WASTED``.
    * - ``smtp_command``
      - string
      - none
@@ -2440,6 +2456,12 @@ Job-event notification transports.
      - string
      - none
      - From address, e.g. ``"spur@cluster.local"``.
+   * - ``admin_mail``
+     - string
+     - none
+     - Address that gets a copy of every ``PREEMPTION_WASTED`` mail, with the
+       user's running total. Sent through ``smtp_command``. Unset: no copy.
+       Spur only reports; no automatic penalty follows from the count.
 
 ``[power]``
 -----------
