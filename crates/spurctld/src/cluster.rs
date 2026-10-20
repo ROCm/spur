@@ -7247,6 +7247,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let already_deallocated;
+                let preempted_for;
                 if let Some(job) = jobs.get_mut(job_id) {
                     // is_finalized (incl. Preempted): a stale/replayed complete
                     // is a silent no-op, not a rejected-transition warning.
@@ -7283,6 +7284,7 @@ impl ClusterManager {
                         ));
                         job.preempt_claim = None;
                     }
+                    preempted_for = job.preempted_by.filter(|_| state.is_terminal());
                     // Suspended -> terminal: fold the final suspended interval in
                     // and clear suspended_at so it never lingers on a terminal job.
                     job.end_suspension(timestamp);
@@ -7306,6 +7308,11 @@ impl ClusterManager {
                     &already_deallocated,
                     *job_id,
                 );
+                // A preempted victim that drained in Completing frees its nodes
+                // only now, so the hold for its preemptor runs from here.
+                if let Some(preemptor) = preempted_for.and_then(|id| jobs.get_mut(&id)) {
+                    preemptor.renew_preempt_claim(*job_id, timestamp);
+                }
                 drop(jobs);
                 drop(nodes);
                 self.complete_job_steps(job_id, *exit_code, timestamp);
@@ -19354,6 +19361,105 @@ mod tests {
             0,
             "burst job's allocation must be freed after preemption"
         );
+    }
+
+    /// The jobs the next scheduler pass would start, staged and placed the way
+    /// `scheduler_loop::run` does.
+    fn next_pass_starts(cm: &Arc<ClusterManager>) -> Vec<JobId> {
+        use spur_sched::traits::Scheduler;
+        let (pending, idle_fill) = cm.pending_jobs_with_idle_fill_candidates();
+        let staged = crate::scheduler_loop::stage_pass_jobs(
+            pending,
+            idle_fill,
+            Utc::now(),
+            cm.config().scheduler.preempt_hold_secs,
+        );
+        let nodes = cm.get_nodes();
+        let partitions = cm.get_partitions();
+        let reservations = cm.get_reservations();
+        let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+            busy_until: &busy_until,
+        };
+        spur_sched::backfill::BackfillScheduler::new(100)
+            .schedule(&staged, &state)
+            .into_iter()
+            .map(|a| a.job_id)
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_node_freed_by_a_preemption_goes_to_the_preemptor_not_an_older_lower_qos_job() {
+        // try_preempt ranks by QOS, but the pass places by effective priority
+        // (QOS base x age x ...). An old lower-QOS job can outrank the
+        // preemptor there, take the freed node, and leave the preemptor to
+        // evict again.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.qos_cache().insert(Qos {
+            name: "burst".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "batch".into(),
+            priority: 1000,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "primus".into(),
+            priority: 2000,
+            preempt: vec!["burst".into()],
+            ..Default::default()
+        });
+        let whole_node = |name: &str, qos: &str| {
+            let mut spec = basic_spec(name);
+            spec.qos = Some(qos.into());
+            spec.cpus_per_task = 8;
+            spec
+        };
+
+        let victim = submit_and_wait(&cm, whole_node("victim", "burst"));
+        let res = scalar_alloc(8, 16000);
+        cm.start_job(
+            victim,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, victim, JobState::Running);
+
+        // Base 2000, aged a week: effective 4000, above the preemptor's 3000.
+        let older = submit_and_wait(&cm, whole_node("older", "batch"));
+        cm.jobs.write().get_mut(&older).unwrap().submit_time =
+            Utc::now() - chrono::Duration::days(7);
+        let preemptor = submit_and_wait(&cm, whole_node("preemptor", "primus"));
+
+        let pending = cm.pending_jobs();
+        assert_eq!(
+            pending.iter().map(|j| j.job_id).collect::<Vec<_>>(),
+            vec![older, preemptor],
+            "the pass ranks the older job first"
+        );
+        let pending_refs: Vec<&Job> = pending.iter().collect();
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &pending_refs,
+            &cm.config().scheduler,
+        )
+        .await;
+        report_nodes_released(&cm, victim);
+        settle(&cm, victim, JobState::Cancelled);
+
+        assert_eq!(next_pass_starts(&cm), vec![preemptor]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -592,14 +592,17 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        which uses ``idle_fill_exempt_secs`` instead.
    * - ``preempt_hold_secs``
      - integer
-     - ``600``
+     - ``120``
      - Live
      - Seconds the nodes freed by a preemption stay held for the job they were
-       freed for, counted from the latest preemption for it. While held, no other
+       freed for, counted from when the latest victim released its nodes (a
+       cancelled victim may drain in ``COMPLETING`` first). While held, no other
        job is placed on them, backfilled onto them, or preempts for them. The hold
-       ends early when that job starts, fails to launch, or ends, and it holds
-       nothing while the job can't be scheduled (held, or waiting on a
-       dependency). ``0`` turns the hold off.
+       normally ends within a pass or two, when that job starts; it also ends when
+       the job fails to launch or ends. It holds nothing while the job can't be
+       scheduled (held, or waiting on a dependency). The window only bounds how
+       long a node can sit idle when the job doesn't start. ``0`` turns the hold
+       off.
    * - ``idle_fill_enabled``
      - boolean
      - ``false``

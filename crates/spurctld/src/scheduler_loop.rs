@@ -212,7 +212,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // Classify once, apply reasons, and stage only candidates admitted by
         // that classification. Run before the empty-check so reasons stay fresh
         // even with nothing schedulable.
-        let (mut pending, idle_fill_candidates) = cluster.pending_jobs_with_idle_fill_candidates();
+        let (pending, idle_fill_candidates) = cluster.pending_jobs_with_idle_fill_candidates();
         if pending.is_empty() && idle_fill_candidates.is_empty() {
             // Nothing pending means nothing can be planned either.
             cluster.set_planned_reservations(HashMap::new());
@@ -243,12 +243,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // from an in-quota job — that is how the future-slot reservation is suppressed
         // (D15). These are clones; the stored job is stamped only if it actually
         // starts, through the `borrowed` flag threaded into the dispatch below.
-        pending.extend(idle_fill_candidates.into_iter().map(|mut job| {
-            job.idle_fill = true;
-            job
-        }));
-        hold_preempted_nodes(
-            &mut pending,
+        let pending = stage_pass_jobs(
+            pending,
+            idle_fill_candidates,
             Utc::now(),
             cluster.config().scheduler.preempt_hold_secs,
         );
@@ -431,6 +428,23 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             hit_depth_limit,
         );
     }
+}
+
+/// One pass's jobs in placement order: the pending jobs, then the idle-fill
+/// borrow candidates stamped as such, with the nodes freed by a preemption held
+/// for the job they were freed for.
+pub(crate) fn stage_pass_jobs(
+    mut pending: Vec<spur_core::job::Job>,
+    idle_fill_candidates: Vec<spur_core::job::Job>,
+    now: DateTime<Utc>,
+    hold_secs: u32,
+) -> Vec<spur_core::job::Job> {
+    pending.extend(idle_fill_candidates.into_iter().map(|mut job| {
+        job.idle_fill = true;
+        job
+    }));
+    hold_preempted_nodes(&mut pending, now, hold_secs);
+    pending
 }
 
 /// Hold the nodes freed by a preemption for the pending job they were freed for:

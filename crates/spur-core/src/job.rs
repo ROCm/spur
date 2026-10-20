@@ -1376,6 +1376,16 @@ impl Job {
         }
     }
 
+    /// Restart the hold from `at` when `victim`, preempted for this job, has
+    /// only now released its nodes (it drained in Completing first).
+    pub fn renew_preempt_claim(&mut self, victim: JobId, at: DateTime<Utc>) {
+        if let Some(claim) = self.preempt_claim.as_mut() {
+            if claim.victims.contains(&victim) {
+                claim.at = claim.at.max(at);
+            }
+        }
+    }
+
     /// Nodes held for this job at `now`: those its open claim freed, until
     /// `hold_secs` after the latest preemption. `0` disables the hold.
     pub fn held_nodes(&self, now: DateTime<Utc>, hold_secs: u32) -> &[String] {
@@ -1597,6 +1607,24 @@ mod tests {
             .held_nodes(t0 + chrono::Duration::seconds(600), 600)
             .is_empty());
         assert!(job.held_nodes(t0, 0).is_empty(), "0 disables the hold");
+    }
+
+    #[test]
+    fn a_victim_releasing_its_nodes_late_restarts_the_hold() {
+        let t0 = Utc::now();
+        let later = t0 + chrono::Duration::seconds(300);
+        let mut job = make_job();
+        job.add_preempt_claim(7, &nodes(&["n1"]), t0);
+
+        job.renew_preempt_claim(9, later);
+        assert_eq!(job.preempt_claim.as_ref().unwrap().at, t0, "not its victim");
+
+        job.renew_preempt_claim(7, later);
+        assert_eq!(job.preempt_claim.as_ref().unwrap().at, later);
+        assert_eq!(
+            job.held_nodes(later + chrono::Duration::seconds(119), 120),
+            ["n1"]
+        );
     }
 
     #[test]

@@ -660,9 +660,11 @@ pub struct SchedulerConfig {
     #[serde(default)]
     pub preempt_exempt_time: u32,
     /// Seconds the nodes freed by a preemption stay held for the job they were
-    /// freed for, counted from the latest preemption made for it. Other jobs
-    /// can't be placed there meanwhile. The hold ends early once that job
-    /// starts, fails to launch or ends. `0` disables it.
+    /// freed for, counted from when the latest victim released its nodes. Other
+    /// jobs can't be placed there meanwhile. The hold normally ends within a
+    /// pass or two, when that job starts; it also ends if the job fails to
+    /// launch or ends. The window only bounds how long a node can idle when the
+    /// job doesn't start. `0` disables it.
     #[serde(default = "default_preempt_hold_secs")]
     pub preempt_hold_secs: u32,
     /// Master switch for idle-fill scheduling. `false` (default) means no
@@ -715,7 +717,7 @@ fn default_idle_fill_exempt_secs() -> u32 {
     60
 }
 fn default_preempt_hold_secs() -> u32 {
-    600
+    120
 }
 
 impl Default for SchedulerConfig {
