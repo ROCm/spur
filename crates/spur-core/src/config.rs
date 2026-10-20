@@ -2089,6 +2089,26 @@ impl SlurmConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(external) = self
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.external.as_ref())
+        {
+            for name in &external.single_block_partitions {
+                if name.trim().is_empty()
+                    || !self
+                        .partitions
+                        .iter()
+                        .any(|partition| partition.name == *name)
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "topology.external.single_block_partitions".into(),
+                        value: format!("unknown partition {name:?}"),
+                    });
+                }
+            }
+        }
+
         if self.cluster_name.is_empty() {
             return Err(ConfigError::MissingField("cluster_name".into()));
         }
@@ -5039,5 +5059,31 @@ memlock = "inherit"
             config.rlimits.memlock_limit().unwrap(),
             MemlockLimit::Inherit
         );
+    }
+}
+
+#[cfg(test)]
+mod fabric_policy_tests {
+    use super::*;
+
+    #[test]
+    fn fabric_policy_requires_existing_partition_names() {
+        assert!(SlurmConfig::load_from_str(
+            r#"cluster_name = "test"
+[topology.external]
+single_block_partitions = ["typo"]
+"#
+        )
+        .is_err());
+        let config = SlurmConfig::load_from_str(
+            r#"cluster_name = "test"
+[[partitions]]
+name = "rack"
+nodes = "ALL"
+[topology.external]
+single_block_partitions = ["rack"]
+"#,
+        );
+        assert!(config.is_ok(), "{config:?}");
     }
 }

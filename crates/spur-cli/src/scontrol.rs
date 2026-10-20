@@ -731,7 +731,10 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     println!("   Gres={}", gpu_types.join(","));
                 }
                 if let Some(resources) = total {
-                    println!("   InventoryGeneration={}", resources.generation);
+                    println!(
+                        "   InventoryGeneration={} FabricBindingVersion={}",
+                        resources.generation, resources.fabric_binding_version
+                    );
                     for gpu in &resources.gpus {
                         print!("{}", format_gpu_topology(gpu));
                     }
@@ -1431,11 +1434,12 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                         anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
                     })?);
                 }
+                "exclusivetopo" => bail!("ExclusiveTopo is not supported"),
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
-                | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket"
-                | "jobdefaults" | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
+                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser" | "lln"
+                | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults" | "defmempernode"
+                | "maxmempernode" | "qos" | "tres" => {}
                 other => eprintln!("scontrol create partition: unknown key '{}'", other),
             }
         }
@@ -1834,10 +1838,11 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                     || value == "1"
                     || value.eq_ignore_ascii_case("true");
             }
+            "exclusivetopo" => bail!("ExclusiveTopo is not supported"),
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
             | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
-            | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults"
+            | "lln" | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults"
             | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
             _ => bail!("scontrol update: update of this parameter is not supported: '{param}'"),
         }
@@ -2187,6 +2192,23 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     if !job.comment.is_empty() {
         let _ = writeln!(out, "   Comment={}", job.comment);
     }
+    let mut bindings: Vec<_> = job.fabric_bindings.iter().collect();
+    bindings.sort_by_key(|(node, _)| *node);
+    for (node, binding) in bindings {
+        if let Some(key) = &binding.key {
+            let ids: Vec<_> = binding
+                .members
+                .iter()
+                .filter_map(|member| {
+                    member
+                        .device
+                        .as_ref()
+                        .map(|device| device.stable_id.to_string())
+                })
+                .collect();
+            let _ = writeln!(out, "   FabricNode={} Namespace={} PhysicalDomain={} FabricDomain={} Generation={} StableIds=[{}]", node, key.namespace, key.physical_domain, key.fabric_domain, binding.inventory_generation, ids.join(","));
+        }
+    }
     let _ = writeln!(out, "   UserId={} Account={}", job.user, job.account);
     let _ = writeln!(out, "   Partition={} QOS={}", job.partition, job.qos);
     let _ = writeln!(
@@ -2381,6 +2403,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn unsupported_topology_exclusivity_fails_before_connecting() {
+        for params in [
+            vec!["PartitionName=rack".into(), "ExclusiveTopo=yes".into()],
+            vec!["ExclusiveTopo=no".into(), "PartitionName=rack".into()],
+        ] {
+            let error = parse_and_create_partition("not-a-controller", &params)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ExclusiveTopo is not supported"));
+            let error = parse_and_update_partition("not-a-controller", &params)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("ExclusiveTopo is not supported"));
+        }
+    }
 
     #[test]
     fn show_job_names_who_suspended_or_requeued_it() {

@@ -388,7 +388,17 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let cycle_start = Instant::now();
 
         let busy_until = running_jobs_busy_until(&cluster);
+        let fabric = cluster
+            .config()
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.external.as_ref())
+            .map(|external| spur_sched::traits::FabricSchedulingContext {
+                view: cluster.fabric_view(chrono::Utc::now()),
+                single_block_partitions: external.single_block_partitions.clone(),
+            });
         let cluster_state = ClusterState {
+            fabric: fabric.as_ref(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -448,8 +458,17 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // This helps users distinguish "waiting for higher-priority jobs" vs
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
+                cluster.annotate_fabric_pending(&scheduler.fabric_unavailable_jobs());
             }
 
+            let unscheduled: Vec<_> = unscheduled
+                .into_iter()
+                .filter(|job| {
+                    !fabric
+                        .as_ref()
+                        .is_some_and(|context| context.requires_binding(job, &partitions))
+                })
+                .collect();
             {
                 // Deliberately outside the `unscheduled` guard: that list excludes
                 // borrow candidates, so gating reclaim on it made rule (B) reachable
@@ -470,6 +489,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         .iter()
                         .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
                         .filter(|j| !reclaim_in_flight.contains_key(&j.job_id))
+                        .filter(|job| {
+                            !fabric
+                                .as_ref()
+                                .is_some_and(|context| context.requires_binding(job, &partitions))
+                        })
                         .collect();
                     let (freed, freed_for) = reclaim_for_unplaced(
                         &cluster,
@@ -3970,6 +3994,7 @@ mod tests {
 
     fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {
         ResourceSet {
+            fabric_binding_version: 0,
             cpus,
             memory_mb,
             gpus,
@@ -4130,6 +4155,7 @@ mod tests {
         let mut gen_a = HashMap::new();
         gen_a.insert("license:fluent".to_string(), 5u64);
         let total_a = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![],
@@ -4140,6 +4166,7 @@ mod tests {
         let mut gen_b = HashMap::new();
         gen_b.insert("license:fluent".to_string(), 3u64);
         let total_b = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![],

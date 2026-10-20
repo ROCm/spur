@@ -153,6 +153,8 @@ impl From<StepdMemlock> for spur_core::config::MemlockLimit {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepdJobResources {
     #[serde(default)]
+    pub fabric_binding: Option<spur_core::fabric_binding::FabricBinding>,
+    #[serde(default)]
     pub cpus: u32,
     #[serde(default)]
     pub memory_mb: u64,
@@ -219,6 +221,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             has_user_namespace: false,
             has_mount_namespace: false,
             resources: StepdJobResources {
+                fabric_binding: None,
                 cpus: config.cpus,
                 memory_mb: config.memory_mb,
                 gpu_devices: config.gpu_devices.clone(),

@@ -435,6 +435,7 @@ impl SlurmAccounting for AccountingService {
         let jobs = records
             .iter()
             .map(|r| JobInfo {
+                fabric_bindings: Default::default(),
                 job_id: r.job_id,
                 name: r.name.clone(),
                 user: r.user_name.clone(),

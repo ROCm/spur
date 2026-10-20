@@ -1321,6 +1321,7 @@ mod tests {
     fn rs_with_gpus(n: usize) -> spur_core::resource::ResourceSet {
         use spur_core::resource::{GpuLinkType, GpuResource};
         spur_core::resource::ResourceSet {
+            fabric_binding_version: 0,
             cpus: 8,
             memory_mb: 1024,
             gpus: (0..n as u32)

@@ -74,6 +74,7 @@ fn resources(cpus: u32, memory_mb: u64, gpu_count: u32) -> ResourceSet {
         });
     }
     ResourceSet {
+        fabric_binding_version: 0,
         cpus,
         memory_mb,
         gpus,

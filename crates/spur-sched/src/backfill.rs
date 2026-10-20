@@ -44,6 +44,7 @@ pub type PlannedJobStarts = HashMap<JobId, (Vec<String>, chrono::DateTime<Utc>)>
 /// Why the backfill pass did not start a job now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnplacedKind {
+    FabricUnavailable,
     /// A sibling component of the heterogeneous job has no suitable nodes.
     HetGroupIncomplete,
     /// Nothing in the partition satisfies the request (resources, features,
@@ -63,6 +64,7 @@ enum UnplacedKind {
 impl UnplacedKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::FabricUnavailable => "fabric_unavailable",
             Self::HetGroupIncomplete => "het_group_incomplete",
             Self::NoSuitableNodes => "no_suitable_nodes",
             Self::RequestedNodesUnavailable => "requested_nodes_unavailable",
@@ -114,6 +116,14 @@ impl BackfillScheduler {
             report_unplaced: false,
             ..Self::new(self.max_jobs)
         }
+    }
+
+    pub fn fabric_unavailable_jobs(&self) -> Vec<JobId> {
+        self.last_outcome
+            .iter()
+            .filter(|(_, outcome)| outcome.kind == UnplacedKind::FabricUnavailable)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Discard the logged-outcome memory so the next cycle re-reports every
@@ -378,28 +388,233 @@ impl BackfillScheduler {
     }
 }
 
-impl Scheduler for BackfillScheduler {
-    fn schedule(&mut self, pending: &[Job], cluster: &ClusterState) -> Vec<Assignment> {
-        let now = Utc::now();
-        self.init_timelines(cluster.nodes);
-
-        // Add current allocations to timelines. Real per-node end times (from
-        // busy_until) replace the flat placeholder wherever known.
-        for (i, node) in cluster.nodes.iter().enumerate() {
-            if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
-                let free_at = cluster
-                    .busy_until
-                    .get(&node.name)
-                    .copied()
-                    .unwrap_or(now + Duration::hours(24));
-                self.timelines[i].reserve(now, free_at, node.alloc_resources.clone());
+impl BackfillScheduler {
+    fn plan_fabric_job(
+        &self,
+        job: &Job,
+        cluster: &ClusterState,
+        context: &crate::traits::FabricSchedulingContext,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<(Assignment, chrono::DateTime<Utc>)> {
+        use spur_core::fabric_binding::{FabricBinding, FABRIC_BINDING_VERSION};
+        use std::collections::BTreeSet;
+        if job.het_job_id.is_some() || job.het_group.is_some() {
+            return None;
+        }
+        let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
+        let gpu_type = resolve_gpu_demand(&job.spec)
+            .ok()?
+            .gpu_type()
+            .map(str::to_string);
+        let mut best: Option<(Assignment, chrono::DateTime<Utc>)> = None;
+        for block in context
+            .view
+            .blocks
+            .iter()
+            .filter(|block| block.issues.is_empty())
+        {
+            let mut nodes = cluster.nodes.to_vec();
+            for node in &mut nodes {
+                let ids: BTreeSet<_> = block
+                    .members
+                    .iter()
+                    .filter(|member| member.device.node == node.name)
+                    .map(|member| member.device.stable_id)
+                    .collect();
+                let original_count = node.total_resources.gpus.len();
+                node.total_resources
+                    .gpus
+                    .retain(|gpu| ids.contains(&gpu.stable_id));
+                if ids.is_empty()
+                    || node.total_resources.fabric_binding_version < FABRIC_BINDING_VERSION
+                    || (job.spec.exclusive && node.total_resources.gpus.len() != original_count)
+                {
+                    node.state = spur_core::node::NodeState::Down;
+                }
             }
-            debug!(
-                node = %node.name,
-                alloc_cpus = node.alloc_resources.cpus,
-                alloc_gpus = node.alloc_resources.total_device_count("gpu"),
-                "node allocation state"
-            );
+            let projected = ClusterState {
+                nodes: &nodes,
+                partitions: cluster.partitions,
+                reservations: cluster.reservations,
+                topology: cluster.topology,
+                fabric: None,
+                busy_until: cluster.busy_until,
+            };
+            let mut floor = now;
+            loop {
+                let mut trial = Self {
+                    timelines: self.timelines.clone(),
+                    max_jobs: 1,
+                    last_outcome: HashMap::new(),
+                };
+                for (timeline, node) in trial.timelines.iter_mut().zip(&nodes) {
+                    timeline.total = node.total_resources.clone();
+                    let ids: BTreeSet<_> = node
+                        .total_resources
+                        .gpus
+                        .iter()
+                        .map(|gpu| gpu.stable_id)
+                        .collect();
+                    for interval in &mut timeline.intervals {
+                        if let Some(devices) = interval.resources.devices.get_mut("gpu") {
+                            devices.retain(|device| ids.contains(&device.device_id));
+                        }
+                    }
+                }
+                let immediate =
+                    trial.schedule_jobs(std::slice::from_ref(job), &projected, floor, false);
+                let mut start = None;
+                let mut allocations = HashMap::new();
+                for timeline in &trial.timelines {
+                    if let Some(interval) = timeline
+                        .intervals
+                        .iter()
+                        .find(|interval| interval.job_id == Some(job.job_id))
+                    {
+                        start = Some(interval.start);
+                        allocations.insert(timeline.node_name.clone(), interval.resources.clone());
+                    }
+                }
+                let Some(start) = start else {
+                    break;
+                };
+                if (job.idle_fill && start > now)
+                    || best.as_ref().is_some_and(|(_, at)| *at <= start)
+                {
+                    break;
+                }
+                let mut retry_at = None;
+                let mut valid = true;
+                for (index, node) in nodes.iter().enumerate() {
+                    let Some(allocation) = allocations.get_mut(&node.name) else {
+                        continue;
+                    };
+                    let overlapping: Vec<_> = self.timelines[index]
+                        .intervals
+                        .iter()
+                        .filter(|interval| {
+                            interval.start < start + duration && interval.end > start
+                        })
+                        .collect();
+                    let unavailable: BTreeSet<_> = overlapping
+                        .iter()
+                        .flat_map(|interval| interval.resources.device_ids("gpu"))
+                        .collect();
+                    let wanted = allocation.total_device_count("gpu") as usize;
+                    let available: Vec<_> = node
+                        .total_resources
+                        .gpus
+                        .iter()
+                        .filter(|gpu| {
+                            !unavailable.contains(&gpu.stable_id)
+                                && (job.spec.exclusive
+                                    || gpu_type
+                                        .as_deref()
+                                        .is_none_or(|kind| kind == "any" || gpu.gpu_type == kind))
+                        })
+                        .map(|gpu| spur_core::resource::AllocatedDevice::injectable(gpu.stable_id))
+                        .take(wanted)
+                        .collect();
+                    if available.len() < wanted {
+                        valid = false;
+                        if let Some(end) = overlapping
+                            .iter()
+                            .map(|interval| interval.end)
+                            .filter(|end| *end > start)
+                            .min()
+                        {
+                            retry_at = Some(
+                                retry_at.map_or(end, |prior: chrono::DateTime<Utc>| prior.min(end)),
+                            );
+                        }
+                        continue;
+                    }
+                    if wanted > 0 {
+                        allocation.devices.insert("gpu".into(), available);
+                    }
+                    let Ok(binding) = FabricBinding::for_allocation(block, &node.name, allocation)
+                    else {
+                        valid = false;
+                        continue;
+                    };
+                    if binding
+                        .validate(
+                            &context.view.namespace,
+                            &node.name,
+                            &node.total_resources,
+                            allocation,
+                        )
+                        .is_err()
+                    {
+                        valid = false;
+                        continue;
+                    }
+                    allocation.fabric_binding = Some(binding);
+                }
+                if valid {
+                    let node_names = immediate
+                        .into_iter()
+                        .next()
+                        .map(|a| a.nodes)
+                        .unwrap_or_else(|| {
+                            nodes
+                                .iter()
+                                .filter(|node| allocations.contains_key(&node.name))
+                                .map(|node| node.name.clone())
+                                .collect()
+                        });
+                    best = Some((
+                        Assignment {
+                            job_id: job.job_id,
+                            nodes: node_names,
+                            per_node_alloc: allocations,
+                        },
+                        start,
+                    ));
+                    break;
+                }
+                let Some(next) = retry_at else {
+                    break;
+                };
+                if next <= floor || next >= now + Duration::days(365) {
+                    break;
+                }
+                floor = next;
+            }
+        }
+        best
+    }
+}
+
+impl BackfillScheduler {
+    fn schedule_jobs(
+        &mut self,
+        pending: &[Job],
+        cluster: &ClusterState,
+        now: chrono::DateTime<Utc>,
+        initialize: bool,
+    ) -> Vec<Assignment> {
+        if initialize {
+            self.init_timelines(cluster.nodes);
+
+            // Add current allocations to timelines. Real per-node end times (from
+            // busy_until) replace the flat placeholder wherever known.
+            for (i, node) in cluster.nodes.iter().enumerate() {
+                if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
+                    let free_at = cluster
+                        .busy_until
+                        .get(&node.name)
+                        .copied()
+                        .unwrap_or(now + Duration::hours(24));
+                    self.timelines[i].reserve(now, free_at, node.alloc_resources.clone());
+                }
+                debug!(
+                    node = %node.name,
+                    alloc_cpus = node.alloc_resources.cpus,
+                    alloc_gpus = node.alloc_resources.total_device_count("gpu"),
+                    "node allocation state"
+                );
+            }
         }
 
         // Identify het job groups: collect sets of jobs linked by het_job_id.
@@ -419,6 +634,14 @@ impl Scheduler for BackfillScheduler {
 
         // Pre-check het groups: if any component can't find suitable nodes, skip all
         for indices in het_groups.values() {
+            if indices.iter().any(|index| {
+                cluster.fabric.is_some_and(|context| {
+                    context.requires_binding(&pending[*index], cluster.partitions)
+                })
+            }) {
+                skip_indices.extend(indices.iter().copied());
+                continue;
+            }
             if indices.len() <= 1 {
                 continue; // Single-component "het" job, treat normally
             }
@@ -454,6 +677,38 @@ impl Scheduler for BackfillScheduler {
             // Skip jobs that are part of an unschedulable het group
             if skip_indices.contains(&job_idx) {
                 note(UnplacedKind::HetGroupIncomplete, 0, None);
+                continue;
+            }
+            if let Some(context) = cluster
+                .fabric
+                .filter(|context| context.requires_binding(job, cluster.partitions))
+            {
+                match self.plan_fabric_job(job, cluster, context, now) {
+                    Some((assignment, start)) => {
+                        let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
+                        for (node, allocation) in &assignment.per_node_alloc {
+                            if let Some(index) = cluster.nodes.iter().position(|n| n.name == *node)
+                            {
+                                self.timelines[index].reserve_for_job(
+                                    start,
+                                    start + duration,
+                                    allocation.clone(),
+                                    Some(job.job_id),
+                                );
+                            }
+                        }
+                        if start <= now {
+                            assignments.push(assignment);
+                        } else {
+                            note(
+                                UnplacedKind::FutureSlotReserved,
+                                assignment.nodes.len(),
+                                Some(start),
+                            );
+                        }
+                    }
+                    None => note(UnplacedKind::FabricUnavailable, 0, None),
+                }
                 continue;
             }
             let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.reservations);
@@ -744,8 +999,16 @@ impl Scheduler for BackfillScheduler {
             }
         }
 
-        self.log_unplaced(unplaced);
+        if initialize {
+            self.log_unplaced(unplaced);
+        }
         assignments
+    }
+}
+
+impl Scheduler for BackfillScheduler {
+    fn schedule(&mut self, pending: &[Job], cluster: &ClusterState) -> Vec<Assignment> {
+        self.schedule_jobs(pending, cluster, Utc::now(), true)
     }
 
     fn name(&self) -> &str {
@@ -793,6 +1056,7 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
     }
 
     ResourceSet {
+        fabric_binding_version: 0,
         cpus,
         memory_mb: memory,
         gpus: Vec::new(),
@@ -923,6 +1187,7 @@ mod tests {
         job.spec.nodelist = Some("nosuchnode".into());
 
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -946,6 +1211,7 @@ mod tests {
         }];
 
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -969,6 +1235,7 @@ mod tests {
             ..Default::default()
         }];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1106,6 +1373,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node001".to_string(), Utc::now() + Duration::minutes(90));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -1139,6 +1407,7 @@ mod tests {
 
         let pending = vec![make_job(1, 2, 32)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1163,6 +1432,7 @@ mod tests {
 
         let pending = vec![make_job(1, 2, 32), make_job(2, 2, 32)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1200,6 +1470,7 @@ mod tests {
             },
         );
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1248,6 +1519,7 @@ mod tests {
             },
         );
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1306,6 +1578,7 @@ mod tests {
             },
         );
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1348,6 +1621,7 @@ mod tests {
             None,
         )];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1424,6 +1698,7 @@ mod tests {
 
         let pending = vec![make_gpu_job(1, 4), make_gpu_job(2, 4)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1494,6 +1769,7 @@ mod tests {
         }];
         let pending = vec![total_gpu_job(1, 4, 8)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1518,6 +1794,7 @@ mod tests {
         }];
         let pending = vec![total_gpu_job(1, 2, 5)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1546,6 +1823,7 @@ mod tests {
         }];
         let pending = vec![total_gpu_job(1, 4, 8)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1569,6 +1847,7 @@ mod tests {
         }];
         let pending = vec![total_gpu_job(1, 2, 6)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1606,6 +1885,7 @@ mod tests {
             },
         )];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1649,6 +1929,7 @@ mod tests {
             },
         )];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1675,6 +1956,7 @@ mod tests {
         // Request 4 nodes but only 2 available
         let pending = vec![make_job(1, 4, 32)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1705,6 +1987,7 @@ mod tests {
         small.spec.time_limit = Some(Duration::days(30));
 
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1739,6 +2022,7 @@ mod tests {
         let small = make_job(2, 1, 1); // default 1h, ends long before the big job's window.
 
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1783,6 +2067,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -1819,6 +2104,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -1866,6 +2152,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -1914,6 +2201,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -1971,6 +2259,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), now + Duration::minutes(120));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2007,6 +2296,7 @@ mod tests {
         busy_until.insert("node001".to_string(), Utc::now() + Duration::minutes(30));
 
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2046,6 +2336,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2077,6 +2368,7 @@ mod tests {
         }];
         let busy_until = std::collections::HashMap::new();
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2109,6 +2401,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2168,6 +2461,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 1, Some("node001"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2191,6 +2485,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 2, Some("node001,node002"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2216,6 +2511,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2245,6 +2541,7 @@ mod tests {
             None,
         )];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2273,6 +2570,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2315,6 +2613,7 @@ mod tests {
         job.spec.topology = Some("tree".into());
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2342,6 +2641,7 @@ mod tests {
         job.spec.num_tasks = 6;
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2365,6 +2665,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2393,6 +2694,7 @@ mod tests {
         job.spec.constraint = Some("mi300x".into());
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2424,6 +2726,7 @@ mod tests {
             None,
         )];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2455,6 +2758,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2492,6 +2796,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2515,6 +2820,7 @@ mod tests {
         // "nodeXXX" does not exist in the cluster
         let pending = vec![make_job_with_nodelist(1, 1, Some("nodeXXX"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2538,6 +2844,7 @@ mod tests {
         // Exclude node001 and node002 → only node003 and node004 remain
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node001,node002"))];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2571,6 +2878,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2599,6 +2907,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2626,6 +2935,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2649,6 +2959,7 @@ mod tests {
         // Exclude both → 2-node job can't schedule
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node001,node002"))];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2671,6 +2982,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 2, Some("node[001-002]"), None)];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2696,6 +3008,7 @@ mod tests {
 
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node[001-002]"))];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2739,6 +3052,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2774,6 +3088,7 @@ mod tests {
 
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2821,6 +3136,7 @@ mod tests {
 
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2855,6 +3171,7 @@ mod tests {
 
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2893,6 +3210,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2918,6 +3236,7 @@ mod tests {
         }];
         let pending: Vec<Job> = (1..=8).map(|id| make_job(id, 1, 1)).collect();
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2954,6 +3273,7 @@ mod tests {
         for id in 1..=8 {
             let pending = vec![make_job(id, 1, 1)];
             let cluster = ClusterState {
+                fabric: None,
                 busy_until: &std::collections::HashMap::new(),
                 nodes: &nodes,
                 partitions: &partitions,
@@ -2995,6 +3315,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3043,6 +3364,7 @@ mod tests {
         let job = make_job(1, 1, 1);
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3078,6 +3400,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3113,6 +3436,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3150,6 +3474,7 @@ mod tests {
         let job = make_job(1, 1, 1);
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3189,6 +3514,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3236,6 +3562,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), now + Duration::minutes(120));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -3292,6 +3619,7 @@ mod tests {
         let mut busy_until = std::collections::HashMap::new();
         busy_until.insert("node002".to_string(), now + Duration::minutes(120));
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -3465,3 +3793,6 @@ mod tests {
         assert_eq!(request.memory_mb, 2048);
     }
 }
+
+#[cfg(test)]
+mod fabric_tests;

@@ -113,7 +113,7 @@ impl NodeReporter {
     pub fn new(
         hostname: String,
         controller_addr: String,
-        resources: ResourceSet,
+        mut resources: ResourceSet,
         node_address: spur_net::NodeAddress,
         labels: HashMap<String, String>,
         join_token: String,
@@ -122,6 +122,11 @@ impl NodeReporter {
         held_jobs: Arc<dyn HeldJobs>,
         timeouts: ReporterTimeouts,
     ) -> Self {
+        if resources.fabric_binding_version > 0 && resources.generation == 0 {
+            // Zero denotes legacy inventory. A fresh boot epoch also fences
+            // bindings retained by supervisors from a previous agent instance.
+            resources.generation = ((uuid::Uuid::new_v4().as_u128() as u64) >> 1).max(1);
+        }
         Self {
             hostname,
             controller_addr,
@@ -278,7 +283,8 @@ impl NodeReporter {
         let changed = cur.cpus != fresh.cpus
             || cur.memory_mb != fresh.memory_mb
             || cur.gpus != fresh.gpus
-            || cur.generic != fresh.generic;
+            || cur.generic != fresh.generic
+            || cur.fabric_binding_version != fresh.fabric_binding_version;
         *cur = fresh;
         changed
     }
@@ -489,7 +495,7 @@ pub enum RefreshAction {
 }
 
 /// Fingerprint of a schedulable set, used to debounce on inventory identity.
-pub type InventoryFingerprint = (u32, u64, Vec<GpuResource>, Vec<(String, u64)>);
+pub type InventoryFingerprint = (u32, u64, Vec<GpuResource>, Vec<(String, u64)>, u32);
 
 /// Debounced per-tick decision. A non-`Unchanged` delta acts only when it
 /// repeats AND the fresh inventory identity matches the previous tick's, so two
@@ -568,6 +574,7 @@ pub fn classify(
         && old.memory_mb == new.memory_mb
         && old.gpus == new.gpus
         && old.generic == new.generic
+        && old.fabric_binding_version == new.fabric_binding_version
     {
         return InventoryDelta::Unchanged;
     }
@@ -667,6 +674,7 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         generic: generic_from_registry(registry),
         // Bumped by the periodic refresh task on topology rebuild, not here.
         generation: 0,
+        fabric_binding_version: spur_core::fabric_binding::FABRIC_BINDING_VERSION,
     }
 }
 
@@ -855,6 +863,10 @@ pub fn allocations_to_proto(
             })
             .collect::<HashMap<_, _>>(),
         generation: r.generation,
+        fabric_binding: r
+            .fabric_binding
+            .as_ref()
+            .map(spur_core::fabric_binding::to_proto),
     }
 }
 
@@ -884,6 +896,7 @@ pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
             .collect(),
         generic: r.generic.clone(),
         generation: r.generation,
+        fabric_binding_version: r.fabric_binding_version,
     }
 }
 
@@ -1533,6 +1546,7 @@ mod tests {
             stable_id: s,
         };
         let rs = |gpus: Vec<GpuResource>| ResourceSet {
+            fabric_binding_version: 0,
             cpus: 8,
             memory_mb: 1024,
             gpus,
@@ -1580,6 +1594,7 @@ mod tests {
 
     fn rset(cpus: u32, generation: u64, gpus: Vec<GpuResource>) -> ResourceSet {
         ResourceSet {
+            fabric_binding_version: 0,
             cpus,
             memory_mb: 1024,
             gpus,
@@ -1753,8 +1768,31 @@ mod tests {
     }
 
     #[test]
+    fn fabric_capable_initial_inventory_has_a_nonzero_boot_generation() {
+        let reporter = test_reporter(ResourceSet {
+            fabric_binding_version: 1,
+            ..Default::default()
+        });
+        let generation = reporter.snapshot_resources().generation;
+        assert!(generation > 0 && generation < (1u64 << 63));
+        let explicit = test_reporter(ResourceSet {
+            fabric_binding_version: 1,
+            generation: 7,
+            ..Default::default()
+        });
+        assert_eq!(explicit.snapshot_resources().generation, 7);
+        assert_eq!(
+            test_reporter(ResourceSet::default())
+                .snapshot_resources()
+                .generation,
+            0
+        );
+    }
+
+    #[test]
     fn update_resources_reports_change_ignoring_generation() {
         let base = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 4,
             memory_mb: 512,
             gpus: vec![],
@@ -1779,6 +1817,7 @@ mod tests {
             1024,
             gpu_ids.iter().map(|&id| gpu(id as u32, id)).collect(),
             Vec::new(),
+            0,
         )
     }
 
