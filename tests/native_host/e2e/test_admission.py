@@ -5,7 +5,6 @@
 E2E tests for node admission.
 """
 
-import contextlib
 import time
 
 from cluster import wait_until
@@ -17,10 +16,12 @@ def _wait_registered(cluster, timeout=30):
         nodes = cluster.sinfo_nodes()
         return nodes if all(name in nodes for name in cluster.node_names) else None
 
-    # On timeout, fall through so the assertion names the missing node.
-    with contextlib.suppress(TimeoutError):
+    try:
         return wait_until(registered, timeout_s=timeout, interval_s=2,
                           desc="all nodes registering", tolerate=(Exception,))
+    except TimeoutError:
+        # Fall through so the assertion below names the missing node.
+        pass
     nodes = cluster.sinfo_nodes()
     for name in cluster.node_names:
         assert name in nodes, f"node {name} not registered within {timeout}s"

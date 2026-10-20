@@ -139,8 +139,8 @@ class SshNode:
 
         With *timeout* (seconds), the channel is closed at the deadline and the
         exit code is -1, with whatever output arrived until then."""
-        # Running shell commands on the test VMs is the harness's job; callers
-        # shlex-quote anything that is not a fixed string.
+        # Running shell commands on the disposable test VMs is the harness's job;
+        # inputs come from harness constants and test fixtures.
         _, stdout, stderr = self.client.exec_command(cmd)  # nosec B601
         if timeout is not None:
             deadline = time.time() + timeout
@@ -751,10 +751,9 @@ class SpurCluster:
         """Apply *manifest* with k0s kubectl and assert kubectl accepted it.
 
         Runs on *node_index*, or on the first control plane by default. The
-        manifest is written under remote_dir, which is unique per run and
-        removed at teardown, so concurrent runs cannot collide on it. It goes
-        through a file because a heredoc piped through the SSH channel does not
-        survive as real stdin, so kubectl would get empty input."""
+        manifest is written under remote_dir, which is unique per cluster, so
+        concurrent runs cannot collide on it. It goes through a file because
+        the sudo prefix may already use stdin for the password (sudo -S)."""
         if node_index is None:
             cp_nodes = self.k8s_control_planes()
             node_index = self.node_names.index(cp_nodes[0]) if cp_nodes else 0
@@ -1254,7 +1253,7 @@ class SpurCluster:
         time.sleep(1)
         self._start_controller()
         wait_until(
-            lambda: all(n in self.sinfo_nodes() for n in self.node_names),
+            lambda: set(self.node_names) <= self.sinfo_nodes().keys(),
             timeout_s=60, interval_s=2,
             desc="controller recovery after restart", tolerate=(Exception,),
         )
@@ -1862,7 +1861,7 @@ def wait_until(predicate, timeout_s: int, interval_s: int = 3,
         except tolerate as error:
             last_error = error
         time.sleep(interval_s)
-    raise TimeoutError(f"{desc} not met within {timeout_s}s") from last_error
+    raise TimeoutError(f"timed out after {timeout_s}s waiting for: {desc}") from last_error
 
 
 def wait_node_state(cluster: "SpurCluster", node_name: str, target_states,

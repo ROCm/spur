@@ -141,7 +141,7 @@ def remote_bin_dir(ssh_nodes, tmp_path_factory):
         return
 
     session_tmp = tmp_path_factory.getbasetemp()
-    # Lives on the disposable test VMs and is unique per pytest session.
+    # Lives on the disposable test VMs and is removed at session end.
     remote_path = f"/tmp/spur-e2e-bin-{session_tmp.name}"  # nosec B108
 
     yield remote_path
@@ -426,7 +426,7 @@ def gpu_pmix_cluster(request, ssh_nodes, remote_bin_dir):
         ssh_nodes,
         remote_bin_dir,
         agent_as_root=as_root,
-        config_overrides={"mpi": {"plugin_dir": plugin_dir, }},
+        config_overrides={"mpi": {"plugin_dir": plugin_dir}},
     )
     yield c
     c.teardown()
