@@ -796,8 +796,8 @@ state without running on any of those nodes:
 ``WastedPreemptions`` counts the evicted jobs over the job's lifetime; the line is
 omitted while it is zero. Each occurrence is also logged as a warning by the
 controller, adds to the ``Preemptions wasted`` counter in ``sdiag``, and sends a
-``PREEMPTION_WASTED`` notification when the job's ``--mail-type`` includes
-``FAIL`` or ``ALL``. Nothing is blocked: this is a report, so owners and
+``PREEMPTION_WASTED`` notification to the job's owner (``--mail-user``, or
+the submitting user) whatever ``--mail-type`` is set to. Nothing is blocked: this is a report, so owners and
 administrators can find jobs that keep evicting others without running.
 Suspend-mode preemption is not tracked, because the suspended job keeps its
 allocation.

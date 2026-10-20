@@ -199,8 +199,8 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--mail-type``
      -
      - Email events: ``BEGIN``, ``END``, ``FAIL``, ``ALL`` (comma-separated).
-       ``FAIL`` and ``ALL`` also report preemptions the job did not use; see
-       :doc:`monitoring-jobs`.
+       Preemptions the job did not use are always reported, whatever this is
+       set to; see :doc:`monitoring-jobs`.
    * - ``--mail-user``
      -
      - Address for job email.

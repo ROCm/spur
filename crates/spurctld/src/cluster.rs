@@ -6309,10 +6309,10 @@ impl ClusterManager {
             let spec = self.jobs.read().get(&w.job_id).map(|j| j.spec.clone());
             let user = spec.as_ref().map_or("", |s| s.user.as_str());
             warn!(job_id = w.job_id, user, victims = ?w.victims, "wasted preemption: {}", w.detail);
+            // Sent regardless of --mail-type: the owner needs to know their job
+            // cost others their work, whether or not they asked for job mail.
             if let Some(spec) = spec {
-                if spec.mail_type.iter().any(|t| t == "FAIL" || t == "ALL") {
-                    self.send_notification(w.job_id, "PREEMPTION_WASTED", Some(&w.detail), &spec);
-                }
+                self.send_notification(w.job_id, "PREEMPTION_WASTED", Some(&w.detail), &spec);
             }
         }
     }
