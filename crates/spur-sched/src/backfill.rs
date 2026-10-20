@@ -661,7 +661,7 @@ impl BackfillScheduler {
         let mut unplaced: HashMap<JobId, Unplaced> = HashMap::new();
         let limit = pending.len().min(self.max_jobs);
 
-        for (job_idx, job) in pending.iter().enumerate().take(limit) {
+        'jobs: for (job_idx, job) in pending.iter().enumerate().take(limit) {
             let mut note = |kind: UnplacedKind, candidates: usize, planned_start| {
                 unplaced.insert(
                     job.job_id,
@@ -881,6 +881,7 @@ impl BackfillScheduler {
             // once shifted forward to match the slowest node in the set.
             let mut earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap_or(now);
             let common_horizon = now + chrono::Duration::days(365);
+            let mut per_node_alloc = HashMap::new();
             loop {
                 let next = assigned_nodes
                     .iter()
@@ -905,30 +906,37 @@ impl BackfillScheduler {
                 // computed (more accurate) value.
                 let converged = next == earliest;
                 earliest = next;
-                if converged || earliest >= common_horizon {
+                if !converged && earliest < common_horizon {
+                    continue;
+                }
+                if !heterogeneous {
                     break;
+                }
+                if let Some(allocations) =
+                    self.plan_per_node_alloc(job, &demand, &assigned_nodes, cluster.nodes, earliest)
+                {
+                    per_node_alloc = allocations;
+                    break;
+                }
+
+                // Per-node timing floors can fit before the full GPU total or
+                // uneven CPU share does. Recheck after the next resource release.
+                let next_release = assigned_nodes
+                    .iter()
+                    .flat_map(|(ni, _)| &self.timelines[*ni].intervals)
+                    .map(|interval| interval.end)
+                    .filter(|end| *end > earliest && *end < common_horizon)
+                    .min();
+                match next_release {
+                    Some(release) => earliest = release,
+                    None => {
+                        note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
+                        continue 'jobs;
+                    }
                 }
             }
 
-            let mut per_node_alloc = HashMap::new();
-            if heterogeneous {
-                // Non-uniform per-node CPU or GPU counts: resolve concrete
-                // per-node allocations against free capacity at the job's
-                // actual (possibly future) start time, same as the uniform path.
-                match self.plan_per_node_alloc(
-                    job,
-                    &demand,
-                    &assigned_nodes,
-                    cluster.nodes,
-                    earliest,
-                ) {
-                    Some(allocs) => per_node_alloc = allocs,
-                    None => {
-                        note(UnplacedKind::NoCapacityAtStart, assigned_nodes.len(), None);
-                        continue;
-                    }
-                }
-            } else {
+            if !heterogeneous {
                 for (ni, _) in &assigned_nodes {
                     let node = &cluster.nodes[*ni];
                     let node_alloc = if job.spec.exclusive {

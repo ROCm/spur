@@ -165,6 +165,15 @@ the same rule. Ordinary GPU quantity and type options continue to apply to
 batch, interactive allocations, and standalone runs. ``--topology`` remains a
 locality hint and cannot disable this requirement.
 
+Partition names have no built-in rack meaning: ``rack`` is the existing partition
+named in this policy. When no partition is supplied through the CLI, environment,
+or batch directives, Spur selects the partition marked ``default = true``. If no
+partition is marked default, it selects the first partition in the controller's
+list. There is no automatic fallback to ordinary GPU placement when a constrained
+job cannot fit. To keep ordinary GPU scheduling as the default, mark a partition
+outside ``single_block_partitions`` as default and select ``-p rack`` for jobs
+that require containment.
+
 Bare ``--exclusive`` retains whole-node allocation semantics. Under this policy,
 every GPU reserved on an exclusive node must belong to the same chosen block;
 a node spanning multiple blocks cannot satisfy an exclusive request. CPU-only
