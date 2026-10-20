@@ -73,6 +73,97 @@ fn should_sweep_orphaned_placements(
     }
 }
 
+/// Floor for the stall threshold; see `stall_threshold` for what raises it.
+const MIN_STALL_THRESHOLD: Duration = Duration::from_secs(300);
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Long enough to cover an idle tick and one PMIx dispatch (prepare plus launch)
+/// that runs to its deadline, so a slow but moving loop is not reported as stalled.
+fn stall_threshold(interval: Duration, dispatch_deadline: Option<Duration>) -> Duration {
+    let dispatch = dispatch_deadline.map_or(Duration::ZERO, |d| d * 2 + STALL_CHECK_INTERVAL);
+    MIN_STALL_THRESHOLD.max(interval * 2).max(dispatch)
+}
+
+/// A node that leads by its own account but cannot confirm it is not making
+/// progress, even though its loop keeps waking.
+fn wake_is_progress(confirmed_leader: bool, believes_leader: bool) -> bool {
+    confirmed_leader || !believes_leader
+}
+
+/// Last time the scheduler loop made progress: a wake that was not blocked on
+/// leadership, or an assignment it moved past.
+#[derive(Clone)]
+struct ProgressMark(Arc<parking_lot::Mutex<Instant>>);
+
+impl Default for ProgressMark {
+    fn default() -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(Instant::now())))
+    }
+}
+
+impl ProgressMark {
+    fn mark(&self) {
+        *self.0.lock() = Instant::now();
+    }
+
+    fn last(&self) -> Instant {
+        *self.0.lock()
+    }
+}
+
+/// Rate-limits stall reports to one per threshold window.
+#[derive(Default)]
+struct StallReporter {
+    last_report: Option<Instant>,
+}
+
+impl StallReporter {
+    /// Returns how long the loop has been stalled when a report is due.
+    fn observe(
+        &mut self,
+        last_progress: Instant,
+        now: Instant,
+        is_leader: bool,
+        threshold: Duration,
+    ) -> Option<Duration> {
+        let stalled_for = now.saturating_duration_since(last_progress);
+        if stalled_for < threshold {
+            return None;
+        }
+        let recently_reported = self
+            .last_report
+            .is_some_and(|at| now.saturating_duration_since(at) < threshold);
+        if !is_leader || recently_reported {
+            return None;
+        }
+        self.last_report = Some(now);
+        Some(stalled_for)
+    }
+}
+
+async fn watch_scheduler_progress(
+    cluster: Arc<ClusterManager>,
+    raft: Arc<RaftHandle>,
+    progress: ProgressMark,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(STALL_CHECK_INTERVAL);
+    let mut reporter = StallReporter::default();
+    loop {
+        ticker.tick().await;
+        let threshold = stall_threshold(interval, dispatch_deadline(&cluster));
+        let Some(stalled_for) =
+            reporter.observe(progress.last(), Instant::now(), raft.is_leader(), threshold)
+        else {
+            continue;
+        };
+        error!(
+            stalled_secs = stalled_for.as_secs(),
+            "scheduler loop has made no progress; jobs may not be getting scheduled"
+        );
+    }
+}
+
 /// Drop everything a former leader may no longer speak for.
 pub(crate) fn relinquish_leadership(
     cluster: &Arc<ClusterManager>,
@@ -115,6 +206,19 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let startup_config = cluster.config();
     let interval_secs = startup_config.scheduler.interval_secs.max(1) as u64;
     let max_jobs = startup_config.scheduler.max_jobs_per_cycle as usize;
+    let progress = ProgressMark::default();
+    let watcher_cluster = cluster.clone();
+    let watcher_raft = raft.clone();
+    let watcher_progress = progress.clone();
+    tokio::spawn(async move {
+        watch_scheduler_progress(
+            watcher_cluster,
+            watcher_raft,
+            watcher_progress,
+            Duration::from_secs(interval_secs),
+        )
+        .await;
+    });
 
     let mut scheduler = BackfillScheduler::new(max_jobs);
 
@@ -173,9 +277,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             _ = interval.tick() => {}
         }
 
-        let is_leader = raft.is_leader();
-
-        if !is_leader {
+        // Consensus-backed: a restart can briefly restore a stale-term leadership.
+        let confirmed = raft.ensure_leader().await;
+        if wake_is_progress(confirmed, raft.is_leader()) {
+            progress.mark();
+        }
+        if !confirmed {
             // A former leader must not keep serving planned-reservation info
             // from before it lost leadership.
             relinquish_leadership(&cluster, &mut scheduler);
@@ -404,13 +511,26 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         let mut jobs_started_cycle = 0u64;
-        for assignment in assignments {
+        let total_assignments = assignments.len();
+        for (done, assignment) in assignments.into_iter().enumerate() {
             // `Assignment` carries no tier information, but this loop appended the
             // candidates, so results are tagged by job-ID membership rather than by
             // changing the scheduler's signature (§5.2).
             let borrowed = borrow_ids.contains(&assignment.job_id);
-            if process_assignment(cluster.clone(), assignment, borrowed).await {
+            let started = process_assignment(cluster.clone(), assignment, borrowed).await;
+            progress.mark();
+            if started {
                 jobs_started_cycle += 1;
+                continue;
+            }
+            // openraft never steps down on lost quorum, so re-confirm before the
+            // next assignment's prolog and placement write.
+            if !raft.ensure_leader().await {
+                info!(
+                    skipped = total_assignments - done - 1,
+                    "leadership not confirmed mid-pass; leaving the remaining assignments"
+                );
+                break;
             }
         }
 
@@ -1177,6 +1297,16 @@ pub(crate) async fn try_preempt(
                     evicted_so_far.push(candidate.job_id);
                 }
                 Err(e) => {
+                    let follow_up = if *mode == spur_core::partition::PreemptMode::Suspend {
+                        VictimFollowUp::Suspend(Box::new((*candidate).clone()))
+                    } else {
+                        VictimFollowUp::Cancel {
+                            job_id: candidate.job_id,
+                            run_attempt: candidate.run_attempt,
+                            nodes: candidate.allocated_nodes.clone(),
+                        }
+                    };
+                    follow_late_preemption(cluster, &e, follow_up);
                     // A victim gone since the snapshot already released its node, so
                     // the set still holds. Any other failure leaves it held, with
                     // `evicted_so_far` already gone and the rest of the set abandoned.
@@ -1397,6 +1527,15 @@ async fn reclaim_for_unplaced(
                     freed.extend(victim.nodes.iter().cloned());
                 }
                 Err(e) => {
+                    follow_late_preemption(
+                        cluster,
+                        &e,
+                        VictimFollowUp::Cancel {
+                            job_id: victim.job_id,
+                            run_attempt: victim.run_attempt,
+                            nodes: victim.nodes.clone(),
+                        },
+                    );
                     warn!(job_id = victim.job_id, error = %e, "failed to reclaim borrowed job");
                 }
             }
@@ -2719,7 +2858,7 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
     loop {
         interval.tick().await;
 
-        if !raft.is_leader() {
+        if !raft.ensure_leader().await {
             continue;
         }
 
@@ -2828,6 +2967,11 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
             was_leader = false;
             continue;
         }
+        // A failed confirmation only skips this tick; resetting the timers on it
+        // would hand every idle allocation a fresh grace window.
+        if !raft.ensure_leader().await {
+            continue;
+        }
 
         if !was_leader {
             // (Re)gained leadership: drop stale timers so the reap check below
@@ -2925,7 +3069,7 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
     loop {
         interval.tick().await;
 
-        if !raft.is_leader() {
+        if !raft.ensure_leader().await {
             continue;
         }
 
@@ -3060,7 +3204,7 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     loop {
         interval.tick().await;
 
-        if !raft.is_leader() {
+        if !raft.ensure_leader().await {
             continue;
         }
 
@@ -3110,6 +3254,91 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             }
         }
     }
+}
+
+/// What a preemption owes the victim's agents once its write applies.
+enum VictimFollowUp {
+    Cancel {
+        job_id: spur_core::job::JobId,
+        run_attempt: u32,
+        nodes: Vec<String>,
+    },
+    Suspend(Box<spur_core::job::Job>),
+}
+
+/// Carries out a preemption whose write applied only after `propose` gave up waiting.
+fn follow_late_preemption(
+    cluster: &Arc<ClusterManager>,
+    err: &anyhow::Error,
+    then: VictimFollowUp,
+) {
+    let Some(late) = err.downcast_ref::<crate::cluster::OutcomeUnknown>() else {
+        return;
+    };
+    let cluster = cluster.clone();
+    late.on_late_apply(move |resp| async move {
+        cluster.run_all_finalized_side_effects(&resp);
+        match then {
+            VictimFollowUp::Cancel {
+                job_id,
+                run_attempt,
+                nodes,
+            } => cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, 0).await,
+            VictimFollowUp::Suspend(job) => send_suspend_to_agents(&cluster, &job, false).await,
+        }
+    });
+}
+
+/// Cancels the old run of an admin requeue whose write applied after its RPC gave up.
+pub(crate) fn follow_late_requeue(
+    cluster: &Arc<ClusterManager>,
+    late: &crate::cluster::LateRequeue,
+) {
+    let Some(killed) = late.killed.clone() else {
+        return;
+    };
+    let cluster = cluster.clone();
+    late.write.on_late_apply(move |resp| async move {
+        finish_late_requeue(&cluster, &killed, &resp).await;
+    });
+}
+
+/// The job may already be running again by now, so the cancel goes to the old attempt only.
+async fn finish_late_requeue(
+    cluster: &Arc<ClusterManager>,
+    killed: &spur_core::job::Job,
+    resp: &crate::raft::ClientResponse,
+) {
+    cluster.run_all_finalized_side_effects(resp);
+    if !resp
+        .jobs_finalized
+        .iter()
+        .any(|f| f.job_id == killed.job_id)
+    {
+        return;
+    }
+    cluster.scheduler_notify.notify_one();
+    send_cancel_to_agents(cluster, killed, 0).await;
+}
+
+/// Sends the signal of a suspend or resume whose write applied late, if the job is still in `want`.
+pub(crate) fn follow_late_suspend(
+    cluster: &Arc<ClusterManager>,
+    err: &anyhow::Error,
+    job_id: spur_core::job::JobId,
+    want: spur_core::job::JobState,
+) {
+    let Some(late) = err.downcast_ref::<crate::cluster::OutcomeUnknown>() else {
+        return;
+    };
+    let cluster = cluster.clone();
+    late.on_late_apply(move |_| async move {
+        let Some(job) = cluster.get_job(job_id).filter(|j| j.state == want) else {
+            return;
+        };
+        let resume = want == spur_core::job::JobState::Running;
+        send_suspend_to_agents(&cluster, &job, resume).await;
+    });
 }
 
 /// Send CancelJob RPC to all agents for a job with a specific signal.
@@ -3423,6 +3652,65 @@ mod tests {
         ResourceAllocations, ResourceSet,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn stall_reporter_reports_a_stalled_leader_once_per_window() {
+        let threshold = Duration::from_secs(300);
+        let mark = Instant::now();
+        let stalled = mark + threshold;
+        let mut reporter = StallReporter::default();
+
+        assert_eq!(reporter.observe(mark, mark, true, threshold), None);
+        assert_eq!(
+            reporter.observe(mark, stalled, true, threshold),
+            Some(threshold)
+        );
+        assert_eq!(
+            reporter.observe(mark, stalled + Duration::from_secs(1), true, threshold),
+            None,
+            "already reported within this window"
+        );
+        let next_window = stalled + threshold;
+        assert_eq!(
+            reporter.observe(mark, next_window, true, threshold),
+            Some(next_window - mark)
+        );
+    }
+
+    #[test]
+    fn stall_reporter_stays_quiet_on_a_follower() {
+        let threshold = Duration::from_secs(300);
+        let mark = Instant::now();
+        let mut reporter = StallReporter::default();
+        assert_eq!(
+            reporter.observe(mark, mark + threshold * 3, false, threshold),
+            None
+        );
+    }
+
+    #[test]
+    fn stall_threshold_outlasts_an_idle_tick_and_a_full_dispatch() {
+        let secs = Duration::from_secs;
+        assert_eq!(stall_threshold(secs(1), None), MIN_STALL_THRESHOLD);
+        assert_eq!(stall_threshold(secs(600), None), secs(1200));
+        assert_eq!(
+            stall_threshold(secs(1), Some(secs(300))),
+            secs(600) + STALL_CHECK_INTERVAL
+        );
+    }
+
+    #[test]
+    fn unconfirmed_leadership_is_not_progress() {
+        assert!(wake_is_progress(true, true));
+        assert!(
+            wake_is_progress(false, false),
+            "a follower has nothing to do"
+        );
+        assert!(
+            !wake_is_progress(false, true),
+            "a leader that cannot confirm itself schedules nothing"
+        );
+    }
 
     fn job_with_spec(mut spec: JobSpec) -> Job {
         spec.cpus_per_task = spec.cpus_per_task.max(1);
@@ -4535,6 +4823,8 @@ mod tests {
             /// start_job fails, standing in for a node that confirmed its
             /// launch but could not then release the workload.
             reject_start: bool,
+            cancelled_attempts: Arc<std::sync::Mutex<Vec<u32>>>,
+            suspend_calls: Arc<AtomicU32>,
         }
 
         #[tonic::async_trait]
@@ -4634,11 +4924,15 @@ mod tests {
 
             async fn cancel_job(
                 &self,
-                _request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
+                request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
             ) -> Result<tonic::Response<()>, tonic::Status> {
                 if !self.cancel_delay.is_zero() {
                     tokio::time::sleep(self.cancel_delay).await;
                 }
+                self.cancelled_attempts
+                    .lock()
+                    .unwrap()
+                    .push(request.get_ref().run_attempt);
                 self.cancel_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(()))
             }
@@ -4647,6 +4941,7 @@ mod tests {
                 &self,
                 _request: tonic::Request<spur_proto::proto::AgentSuspendJobRequest>,
             ) -> Result<tonic::Response<()>, tonic::Status> {
+                self.suspend_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(()))
             }
 
@@ -4901,6 +5196,8 @@ mod tests {
                 fanout_calls: capture.then(|| fanout_calls.clone()),
                 reject_start: false,
                 cancel_delay,
+                cancelled_attempts: Default::default(),
+                suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4929,6 +5226,8 @@ mod tests {
                 fanout_calls: None,
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
+                cancelled_attempts: Default::default(),
+                suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4957,6 +5256,8 @@ mod tests {
                 fanout_calls: None,
                 reject_start: true,
                 cancel_delay: Duration::ZERO,
+                cancelled_attempts: Default::default(),
+                suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -4967,6 +5268,40 @@ mod tests {
                     .await;
             });
             (addr, cancel_calls)
+        }
+
+        /// Mock agent that records the run attempt of each cancel and counts suspend/resume calls.
+        async fn spawn_mock_agent_recording() -> (
+            std::net::SocketAddr,
+            Arc<std::sync::Mutex<Vec<u32>>>,
+            Arc<AtomicU32>,
+        ) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let cancelled_attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let suspend_calls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                cancelled_attempts: cancelled_attempts.clone(),
+                suspend_calls: suspend_calls.clone(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, cancelled_attempts, suspend_calls)
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted,
@@ -5145,6 +5480,150 @@ mod tests {
             wait_for(&format!("job {job_id} -> {expected:?}"), || {
                 cm.get_job(job_id).is_some_and(|j| j.state == expected)
             });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_preemption_that_applies_late_still_cancels_the_victim() {
+            use spur_core::job::JobState;
+            use spur_core::partition::PreemptMode;
+
+            let dir = TempDir::new().unwrap();
+            let (cm, gate) = crate::cluster::gated::cluster(&dir, test_config()).await;
+            let (addr, cancel_calls) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            let spec = JobSpec {
+                name: "victim".into(),
+                user: "testuser".into(),
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec);
+            let alloc = ResourceAllocations::with_scalar(1, 0);
+            let per_node = HashMap::from([("n1".to_string(), alloc.clone())]);
+            cm.start_job(job_id, vec!["n1".into()], alloc, per_node)
+                .unwrap();
+            settle(&cm, job_id, JobState::Running);
+            let victim = cm.get_job(job_id).unwrap();
+
+            let closed = gate.close();
+            let err = cm
+                .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
+                .expect_err("the requeue cannot apply while the gate is closed");
+            follow_late_preemption(
+                &cm,
+                &err,
+                VictimFollowUp::Cancel {
+                    job_id,
+                    run_attempt: victim.run_attempt,
+                    nodes: victim.allocated_nodes.clone(),
+                },
+            );
+            assert_eq!(cancel_calls.load(Ordering::SeqCst), 0);
+
+            drop(closed);
+            wait_for("victim cancelled once the requeue applies", || {
+                cancel_calls.load(Ordering::SeqCst) == 1
+            });
+            settle(&cm, job_id, JobState::Pending);
+        }
+
+        fn run_on(cm: &ClusterManager, name: &str, node: &str) -> spur_core::job::Job {
+            let spec = JobSpec {
+                name: name.into(),
+                user: "testuser".into(),
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(cm, spec);
+            start_on(cm, job_id, node);
+            cm.get_job(job_id).unwrap()
+        }
+
+        fn start_on(cm: &ClusterManager, job_id: spur_core::job::JobId, node: &str) {
+            let alloc = ResourceAllocations::with_scalar(1, 0);
+            let per_node = HashMap::from([(node.to_string(), alloc.clone())]);
+            cm.start_job(job_id, vec![node.into()], alloc, per_node)
+                .unwrap();
+            settle(cm, job_id, spur_core::job::JobState::Running);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_requeue_that_applies_late_still_cancels_the_old_run() {
+            let dir = TempDir::new().unwrap();
+            let (cm, gate) = crate::cluster::gated::cluster(&dir, test_config()).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "requeued", "n1");
+
+            let closed = gate.close();
+            let err = cm
+                .requeue_job_by_user(job.job_id, "", true, false)
+                .expect_err("the requeue cannot apply while the gate is closed");
+            let late = err
+                .downcast_ref::<crate::cluster::LateRequeue>()
+                .expect("a timed-out requeue hands off its write");
+            follow_late_requeue(&cm, late);
+            assert!(cancelled.lock().unwrap().is_empty());
+
+            drop(closed);
+            wait_for("old run cancelled once the requeue applies", || {
+                *cancelled.lock().unwrap() == [job.run_attempt]
+            });
+            settle(&cm, job.job_id, spur_core::job::JobState::Pending);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_late_requeue_cancels_the_old_run_even_after_the_job_runs_again() {
+            let dir = TempDir::new().unwrap();
+            let (cm, gate) = crate::cluster::gated::cluster(&dir, test_config()).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "requeued", "n1");
+
+            let closed = gate.close();
+            let err = cm
+                .requeue_job_by_user(job.job_id, "", true, false)
+                .expect_err("the requeue cannot apply while the gate is closed");
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            err.downcast_ref::<crate::cluster::LateRequeue>()
+                .expect("a timed-out requeue hands off its write")
+                .write
+                .on_late_apply(move |resp| async move {
+                    let _ = tx.send(resp);
+                });
+            drop(closed);
+            let resp = rx.await.expect("the requeue applies once the gate opens");
+
+            start_on(&cm, job.job_id, "n1");
+            assert_ne!(cm.get_job(job.job_id).unwrap().run_attempt, job.run_attempt);
+            finish_late_requeue(&cm, &job, &resp).await;
+            wait_for("only the old run is cancelled", || {
+                *cancelled.lock().unwrap() == [job.run_attempt]
+            });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_suspend_that_applies_late_still_signals_the_agent() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let (cm, gate) = crate::cluster::gated::cluster(&dir, test_config()).await;
+            let (addr, _, suspend_calls) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "suspended", "n1");
+
+            let closed = gate.close();
+            let err = cm
+                .suspend_job_for(job.job_id, "", true)
+                .expect_err("the suspend cannot apply while the gate is closed");
+            follow_late_suspend(&cm, &err, job.job_id, JobState::Suspended);
+            assert_eq!(suspend_calls.load(Ordering::SeqCst), 0);
+
+            drop(closed);
+            wait_for("agent told to suspend once the write applies", || {
+                suspend_calls.load(Ordering::SeqCst) == 1
+            });
+            settle(&cm, job.job_id, JobState::Suspended);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

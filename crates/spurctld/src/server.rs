@@ -1717,9 +1717,18 @@ impl SlurmController for ControllerService {
             user: req.user.clone(),
             uid: trusted_uid(__identity.as_ref()),
         };
-        self.cluster
-            .suspend_job_by(job_id, actor, self.caller_is_operator(__identity.as_ref()))
-            .map_err(cluster_err_to_precondition_status)?;
+        if let Err(e) =
+            self.cluster
+                .suspend_job_by(job_id, actor, self.caller_is_operator(__identity.as_ref()))
+        {
+            crate::scheduler_loop::follow_late_suspend(
+                &self.cluster,
+                &e,
+                job_id,
+                spur_core::job::JobState::Suspended,
+            );
+            return Err(cluster_err_to_precondition_status(e));
+        }
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
             crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, false).await;
@@ -1747,13 +1756,19 @@ impl SlurmController for ControllerService {
             .cluster
             .get_job(job_id)
             .ok_or_else(|| Status::not_found(format!("job {job_id} not found")))?;
-        self.cluster
-            .resume_job_for(
+        if let Err(e) = self.cluster.resume_job_for(
+            job_id,
+            &req.user,
+            self.caller_is_operator(__identity.as_ref()),
+        ) {
+            crate::scheduler_loop::follow_late_suspend(
+                &self.cluster,
+                &e,
                 job_id,
-                &req.user,
-                self.caller_is_operator(__identity.as_ref()),
-            )
-            .map_err(cluster_err_to_precondition_status)?;
+                spur_core::job::JobState::Running,
+            );
+            return Err(cluster_err_to_precondition_status(e));
+        }
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
             crate::scheduler_loop::send_suspend_to_agents(&cluster, &job, true).await;
@@ -1877,7 +1892,22 @@ impl SlurmController for ControllerService {
                 caller_is_admin,
                 req.hold,
             )
-            .map_err(cluster_err_to_precondition_status)?;
+            .map_err(|e| {
+                if let Some(late) = e.downcast_ref::<crate::cluster::LateRequeue>() {
+                    crate::scheduler_loop::follow_late_requeue(&self.cluster, late);
+                }
+                cluster_err_to_precondition_status(e)
+            })?;
+        for late in &outcome.late {
+            crate::scheduler_loop::follow_late_requeue(&self.cluster, late);
+        }
+        if outcome.requeued == 0 && !outcome.late.is_empty() {
+            return Err(Status::unavailable(format!(
+                "no tasks of array {} were requeued: {}",
+                req.job_id,
+                outcome.skipped.join("; ")
+            )));
+        }
 
         // Kill the old processes for jobs that were Running/Suspended; the
         // requeue already freed their allocations and re-pended them.
@@ -5590,6 +5620,13 @@ fn cluster_err_to_precondition_status(err: anyhow::Error) -> Status {
     if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
         return Status::permission_denied(err.to_string());
     }
+    if err
+        .downcast_ref::<crate::cluster::OutcomeUnknown>()
+        .is_some()
+        || err.downcast_ref::<crate::cluster::LateRequeue>().is_some()
+    {
+        return Status::unavailable(err.to_string());
+    }
     Status::failed_precondition(err.to_string())
 }
 
@@ -5599,6 +5636,7 @@ fn cancel_err_to_status(err: CancelError) -> Status {
         CancelError::NotFound(_) => Code::NotFound,
         CancelError::AlreadyTerminal { .. } => Code::FailedPrecondition,
         CancelError::NotOwner(_) => Code::PermissionDenied,
+        CancelError::Internal(e) if e.is::<crate::cluster::OutcomeUnknown>() => Code::Unavailable,
         CancelError::Internal(_) => Code::Internal,
     };
     Status::new(code, message)
@@ -11327,6 +11365,28 @@ mod tests {
             assert_eq!(status.code(), want_code, "{message}");
             assert_eq!(status.message(), message);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancel_whose_write_times_out_is_unavailable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (cm, gate) = crate::cluster::gated::cluster(&dir, step_test_config()).await;
+        let job_id = cm
+            .submit_job(spur_core::job::JobSpec {
+                name: "pending".into(),
+                user: "alice".into(),
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .job_id;
+
+        let closed = gate.close();
+        let err = cm
+            .cancel_job(job_id, "alice")
+            .expect_err("the cancel cannot apply while the gate is closed");
+        assert_eq!(cancel_err_to_status(err).code(), Code::Unavailable);
+        drop(closed);
     }
 
     #[test]
