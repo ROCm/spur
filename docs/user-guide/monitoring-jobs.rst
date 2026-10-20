@@ -797,7 +797,14 @@ state without running on any of those nodes:
 omitted while it is zero. Each occurrence is also logged as a warning by the
 controller, adds to the ``Preemptions wasted`` counter in ``sdiag``, and sends a
 ``PREEMPTION_WASTED`` notification to the job's owner (``--mail-user``, or
-the submitting user) whatever ``--mail-type`` is set to. Nothing is blocked: this is a report, so owners and
+the submitting user) whatever ``--mail-type`` is set to.
+
+A resubmitted job gets a new job ID, so the controller also keeps a lifetime
+tally per user, across all their jobs. ``sdiag`` lists it under "Preemptions
+wasted by user", most first, with each user's latest occurrence; the
+notification carries the user's running total. The tally is kept in replicated
+controller state, so it survives restarts and failover, and ``sdiag --reset``
+does not clear it. Nothing is blocked: this is a report, so owners and
 administrators can find jobs that keep evicting others without running.
 Suspend-mode preemption is not tracked, because the suspended job keeps its
 allocation.

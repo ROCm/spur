@@ -3,7 +3,7 @@
 
 //! Conversion between controller metrics snapshots and gRPC messages.
 
-use spur_core::job::JobState;
+use spur_core::job::{JobState, UserWastedPreemptions};
 use spur_core::node::NodeState;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
@@ -11,7 +11,7 @@ use spur_metrics::RpcStatsSnapshot;
 use spur_metrics::SchedStatsSnapshot;
 use spur_proto::proto::{
     JobMetrics, JobStateCount, NodeMetrics, NodeMetricsEntry, NodeStateCount, RpcOperationStats,
-    RpcStats, SchedStats,
+    RpcStats, SchedStats, UserPreemptionsWasted,
 };
 
 pub fn rpc_stats_to_proto(snap: &RpcStatsSnapshot) -> RpcStats {
@@ -47,7 +47,23 @@ pub fn sched_stats_to_proto(snap: &SchedStatsSnapshot) -> SchedStats {
         jobs_started_last_cycle: snap.jobs_started_last_cycle,
         exit_end: snap.exit_end,
         exit_max_depth: snap.exit_max_depth,
+        // Not a collector counter: the caller fills it from cluster state.
+        preemptions_wasted_by_user: Vec::new(),
     }
+}
+
+pub fn user_preemptions_wasted_to_proto(
+    by_user: Vec<(String, UserWastedPreemptions)>,
+) -> Vec<UserPreemptionsWasted> {
+    by_user
+        .into_iter()
+        .map(|(user, tally)| UserPreemptionsWasted {
+            user,
+            count: tally.count,
+            last_job_id: tally.last_job_id,
+            last_detail: tally.last_detail,
+        })
+        .collect()
 }
 
 pub fn job_metrics_to_proto(snap: &JobMetricsSnapshot) -> JobMetrics {

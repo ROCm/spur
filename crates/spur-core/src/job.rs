@@ -809,8 +809,29 @@ pub enum ClaimOutcome<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WastedPreemption {
     pub job_id: JobId,
+    /// Owner of `job_id`, so the waste can be tallied per user: an agent that
+    /// resubmits gets a new job ID each time, but the same user.
+    #[serde(default)]
+    pub user: String,
     pub victims: Vec<JobId>,
     pub detail: String,
+}
+
+/// A user's lifetime tally of wasted preemptions, across all their jobs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserWastedPreemptions {
+    /// Jobs evicted for this user's jobs that then went unused.
+    pub count: u64,
+    pub last_job_id: JobId,
+    pub last_detail: String,
+}
+
+impl UserWastedPreemptions {
+    pub fn add(&mut self, wasted: &WastedPreemption) {
+        self.count = self.count.saturating_add(wasted.victims.len() as u64);
+        self.last_job_id = wasted.job_id;
+        self.last_detail = wasted.detail.clone();
+    }
 }
 
 /// Internal job record held by the controller.
@@ -1446,6 +1467,7 @@ impl Job {
         self.last_wasted_preemption = Some(detail.clone());
         Some(WastedPreemption {
             job_id: self.job_id,
+            user: self.spec.user.clone(),
             victims: claim.victims,
             detail,
         })
@@ -1695,6 +1717,7 @@ mod tests {
             .settle_preempt_claim(ClaimOutcome::Started(&nodes(&["n3"])))
             .expect("wasted");
         assert_eq!(wasted.victims, vec![7, 8]);
+        assert_eq!(wasted.user, "alice");
         assert_eq!(
             wasted.detail,
             "preempted job(s) 7,8 on n1, but it started on n3 instead"
@@ -1729,6 +1752,26 @@ mod tests {
             second.detail
         );
         assert_eq!(job.preemptions_wasted, 2);
+    }
+
+    #[test]
+    fn user_tally_sums_victims_across_jobs_and_keeps_the_latest() {
+        let mut tally = UserWastedPreemptions::default();
+        tally.add(&WastedPreemption {
+            job_id: 1,
+            user: "alice".into(),
+            victims: vec![7, 8],
+            detail: "first".into(),
+        });
+        tally.add(&WastedPreemption {
+            job_id: 2,
+            user: "alice".into(),
+            victims: vec![9],
+            detail: "second".into(),
+        });
+        assert_eq!(tally.count, 3);
+        assert_eq!(tally.last_job_id, 2);
+        assert_eq!(tally.last_detail, "second");
     }
 
     #[test]

@@ -23,8 +23,8 @@ use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, ClaimOutcome, Job, JobId, JobSpec, JobState,
-    NodeCompleteError, PendingReason, PreemptHold, TransitionOutcome, WastedPreemption,
-    DEFAULT_PRIORITY,
+    NodeCompleteError, PendingReason, PreemptHold, TransitionOutcome, UserWastedPreemptions,
+    WastedPreemption, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -434,6 +434,10 @@ pub struct ClusterManager {
     /// first-writer-wins. Runtime-only, never persisted.
     config_seeded_partitions: RwLock<HashSet<String>>,
     next_job_id: AtomicU32,
+    /// Lifetime wasted-preemption tally per user. Replicated (updated in apply,
+    /// carried in snapshots) because job records are evicted once finished and
+    /// a resubmitted job gets a new ID, so only the user ties repeats together.
+    wasted_preemptions_by_user: RwLock<BTreeMap<String, UserWastedPreemptions>>,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
     /// Configured cluster-wide license totals (immutable; from config). Current
@@ -756,6 +760,7 @@ impl ClusterManager {
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(first_job_id),
+            wasted_preemptions_by_user: RwLock::new(BTreeMap::new()),
             license_pool: RwLock::new(license_pool),
             preempt_holds: RwLock::new(BTreeMap::new()),
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
@@ -1286,6 +1291,15 @@ impl ClusterManager {
     }
 
     /// Get a job by ID.
+    /// Lifetime wasted-preemption tally per user, sorted by user name.
+    pub fn wasted_preemptions_by_user(&self) -> Vec<(String, UserWastedPreemptions)> {
+        self.wasted_preemptions_by_user
+            .read()
+            .iter()
+            .map(|(user, tally)| (user.clone(), tally.clone()))
+            .collect()
+    }
+
     pub fn get_job(&self, job_id: JobId) -> Option<Job> {
         self.jobs.read().get(&job_id).cloned()
     }
@@ -6306,13 +6320,24 @@ impl ClusterManager {
             if let Some(stats) = self.sched_stats.get() {
                 stats.record_preemptions_wasted(w.victims.len() as u64);
             }
-            let spec = self.jobs.read().get(&w.job_id).map(|j| j.spec.clone());
-            let user = spec.as_ref().map_or("", |s| s.user.as_str());
-            warn!(job_id = w.job_id, user, victims = ?w.victims, "wasted preemption: {}", w.detail);
+            let user_total = self
+                .wasted_preemptions_by_user
+                .read()
+                .get(&w.user)
+                .map_or(0, |t| t.count);
+            warn!(
+                job_id = w.job_id, user = %w.user, user_total, victims = ?w.victims,
+                "wasted preemption: {}", w.detail
+            );
             // Sent regardless of --mail-type: the owner needs to know their job
             // cost others their work, whether or not they asked for job mail.
+            let spec = self.jobs.read().get(&w.job_id).map(|j| j.spec.clone());
             if let Some(spec) = spec {
-                self.send_notification(w.job_id, "PREEMPTION_WASTED", Some(&w.detail), &spec);
+                let detail = format!(
+                    "{}. Jobs submitted as {} have wasted {user_total} preemption(s) in total.",
+                    w.detail, w.user
+                );
+                self.send_notification(w.job_id, "PREEMPTION_WASTED", Some(&detail), &spec);
             }
         }
     }
@@ -6591,6 +6616,17 @@ impl ClusterManager {
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
     fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+        let response = self.apply_operation_to_jobs(op);
+        if !response.preemptions_wasted.is_empty() {
+            let mut by_user = self.wasted_preemptions_by_user.write();
+            for w in &response.preemptions_wasted {
+                by_user.entry(w.user.clone()).or_default().add(w);
+            }
+        }
+        response
+    }
+
+    fn apply_operation_to_jobs(&self, op: &WalOperation) -> ClientResponse {
         let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
@@ -8063,6 +8099,9 @@ struct ClusterSnapshot {
     /// Runtime state like the jobs: a restored replica must hold the same nodes.
     #[serde(default)]
     preempt_holds: BTreeMap<String, PreemptHold>,
+    /// Per-user wasted-preemption tally; absent in older snapshots (→ empty).
+    #[serde(default)]
+    wasted_preemptions_by_user: BTreeMap<String, UserWastedPreemptions>,
 }
 
 impl ClusterManager {
@@ -8146,6 +8185,7 @@ impl StateMachineApply for ClusterManager {
             k0s: self.k0s.read().clone(),
             next_job_id: self.next_job_id.load(Ordering::Relaxed),
             preempt_holds: self.preempt_holds.read().clone(),
+            wasted_preemptions_by_user: self.wasted_preemptions_by_user.read().clone(),
         };
         serde_json::to_vec(&snap).map_err(Into::into)
     }
@@ -8221,6 +8261,7 @@ impl StateMachineApply for ClusterManager {
         // (NOT config-derived like license_pool/burst_buffer) — restore them.
         *self.k0s.write() = snap.k0s;
         *self.preempt_holds.write() = snap.preempt_holds;
+        *self.wasted_preemptions_by_user.write() = snap.wasted_preemptions_by_user;
 
         // Must stay inside the `jobs` write guard: a reader seeing the cleared
         // map with this watermark would treat every live job as reclaimable.
@@ -13516,6 +13557,54 @@ mod tests {
         });
         assert!(replay.preemptions_wasted.is_empty());
         assert_eq!(cm.get_job(preemptor).unwrap().preemptions_wasted, 1);
+        // The per-user tally is replicated state: recorded on apply, once.
+        let by_user = cm.wasted_preemptions_by_user();
+        assert_eq!(by_user.len(), 1);
+        assert_eq!(by_user[0].0, "testuser");
+        assert_eq!(by_user[0].1.count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasted_preemptions_add_up_per_user_across_jobs_and_survive_a_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let (cm, _stats, _victim, first) = preempted_for_pending(&dir).await;
+        cm.cancel_job(first, "testuser").unwrap();
+        settle(&cm, first, JobState::Cancelled);
+
+        // A resubmission is a new job ID under the same user.
+        let victim2 = run_job_on(&cm, "victim-2", "worker2");
+        let second = submit_and_wait(&cm, basic_spec("preemptor-resubmitted"));
+        cm.preempt_job_with_provenance(victim2, PreemptMode::Requeue, Some(second), None)
+            .unwrap();
+        settle(&cm, victim2, JobState::Pending);
+        cm.cancel_job(second, "testuser").unwrap();
+        settle(&cm, second, JobState::Cancelled);
+
+        assert_eq!(cm.get_job(second).unwrap().preemptions_wasted, 1);
+        let by_user = cm.wasted_preemptions_by_user();
+        assert_eq!(by_user.len(), 1);
+        let (user, tally) = &by_user[0];
+        assert_eq!(user, "testuser");
+        assert_eq!(tally.count, 2);
+        assert_eq!(tally.last_job_id, second);
+        assert!(tally
+            .last_detail
+            .contains("ended CANCELLED before starting"));
+
+        let data = cm.snapshot_state().unwrap();
+        let dst = TempDir::new().unwrap();
+        let cm2 = test_cluster(&dst).await;
+        cm2.restore_from_snapshot(&data).unwrap();
+        assert_eq!(cm2.wasted_preemptions_by_user(), by_user);
+
+        // A snapshot from before the tally existed restores to an empty one.
+        let mut old: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("wasted_preemptions_by_user");
+        cm2.restore_from_snapshot(&serde_json::to_vec(&old).unwrap())
+            .unwrap();
+        assert!(cm2.wasted_preemptions_by_user().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30077,6 +30166,7 @@ mod tests {
             k0s: spur_core::k0s::K0sClusterState::default(),
             next_job_id: 0,
             preempt_holds: BTreeMap::new(),
+            wasted_preemptions_by_user: BTreeMap::new(),
         };
         let bytes = serde_json::to_vec(&snap).unwrap();
         cm.restore_from_snapshot(&bytes).unwrap();

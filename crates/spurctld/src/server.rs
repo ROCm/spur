@@ -2239,9 +2239,11 @@ impl SlurmController for ControllerService {
             return self.forward_to_leader(request).await;
         }
 
-        Ok(Response::new(crate::metrics_proto::sched_stats_to_proto(
-            &self.sched_stats.snapshot(),
-        )))
+        let mut stats = crate::metrics_proto::sched_stats_to_proto(&self.sched_stats.snapshot());
+        stats.preemptions_wasted_by_user = crate::metrics_proto::user_preemptions_wasted_to_proto(
+            self.cluster.wasted_preemptions_by_user(),
+        );
+        Ok(Response::new(stats))
     }
 
     async fn get_assoc_mgr_info(

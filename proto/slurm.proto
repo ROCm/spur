@@ -820,6 +820,17 @@ message SchedStats {
   // Jobs preempted for a pending job that then started elsewhere, failed to
   // launch, or ended before starting.
   uint64 preemptions_wasted = 16;
+  // Lifetime tally per user, kept in replicated state: unlike the counters
+  // above it survives restarts and is not cleared by ResetDiagStats.
+  repeated UserPreemptionsWasted preemptions_wasted_by_user = 17;
+}
+
+message UserPreemptionsWasted {
+  string user = 1;
+  // Jobs evicted for this user's jobs that then went unused.
+  uint64 count = 2;
+  uint32 last_job_id = 3;
+  string last_detail = 4;
 }
 
 // What one user holds under a scope, beside the caps governing that user. Counts
