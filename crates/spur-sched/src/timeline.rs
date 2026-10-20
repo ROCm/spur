@@ -249,6 +249,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: spur_core::resource::GpuLinkType::PCIe,
+                topology: None,
                 stable_id: i as u64,
             })
             .collect();
@@ -343,6 +344,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -373,6 +375,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),
@@ -651,6 +654,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::PCIe,
+                    topology: None,
                     stable_id: i as u64,
                 })
                 .collect(),

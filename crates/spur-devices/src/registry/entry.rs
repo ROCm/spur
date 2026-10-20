@@ -35,6 +35,7 @@ pub struct DeviceEntry {
     pub shared_edits: ContainerEdits,
     pub device_paths: Vec<String>,
     pub stable_id: u64,
+    pub topology: Option<crate::topology::DeviceTopology>,
 }
 
 impl DeviceEntry {
@@ -83,6 +84,7 @@ pub fn from_cdi(cached: &CachedDevice) -> DeviceEntry {
         device_edits,
         shared_edits,
         device_paths,
+        topology: meta.topology,
         stable_id: meta.stable_id.unwrap_or(0),
     }
 }
@@ -206,6 +208,7 @@ mod tests {
             device_edits: ContainerEdits::default(),
             shared_edits: ContainerEdits::default(),
             device_paths: Vec::new(),
+            topology: None,
             stable_id: 0,
         }
     }

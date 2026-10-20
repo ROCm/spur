@@ -798,6 +798,7 @@ fn placeholder_gpus(count: u32, gpu_type: Option<&str>) -> Vec<spur_core::resour
             memory_mb: 0,
             peer_gpus: Vec::new(),
             link_type: spur_core::resource::GpuLinkType::PCIe,
+            topology: None,
             stable_id: 0,
         })
         .collect()
@@ -1345,6 +1346,7 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: i as u64,
             })
             .collect();

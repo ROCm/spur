@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use crate::topology::{DeviceTopology, FabricObservation, ObservationIssueKind};
 use crate::types::LinkType;
 
 pub const PREFIX: &str = "spur.amd.com/";
@@ -30,6 +31,8 @@ pub const MEMORY_PARTITION: &str = "spur.amd.com/memory-partition";
 pub const UNIQUE_ID: &str = "spur.amd.com/unique-id";
 
 pub const RENDER_MINOR: &str = "spur.amd.com/render-minor";
+
+pub const TOPOLOGY: &str = "spur.amd.com/topology";
 
 pub const STABLE_ID: &str = "spur.amd.com/stable-id";
 
@@ -91,6 +94,7 @@ pub struct DeviceMetadata {
     pub unique_id: Option<String>,
     pub render_minor: Option<u32>,
     pub stable_id: Option<u64>,
+    pub topology: Option<DeviceTopology>,
 }
 
 impl DeviceMetadata {
@@ -114,6 +118,7 @@ impl DeviceMetadata {
             memory_partition: annotations.get(MEMORY_PARTITION).cloned(),
             unique_id: annotations.get(UNIQUE_ID).cloned(),
             render_minor: annotations.get(RENDER_MINOR).and_then(|s| s.parse().ok()),
+            topology: annotations.get(TOPOLOGY).map(|value| parse_topology(value)),
             stable_id: annotations.get(STABLE_ID).and_then(|s| s.parse().ok()),
         }
     }
@@ -165,7 +170,30 @@ impl DeviceMetadata {
         if let Some(sid) = self.stable_id {
             ann.insert(STABLE_ID.into(), sid.to_string());
         }
+        if let Some(topology) = &self.topology {
+            match serde_json::to_string(topology) {
+                Ok(value) => {
+                    ann.insert(TOPOLOGY.into(), value);
+                }
+                Err(error) => tracing::warn!(%error, "cannot serialize device topology"),
+            }
+        }
         ann
+    }
+}
+
+fn parse_topology(value: &str) -> DeviceTopology {
+    let kind = if value.len() > 64 * 1024 {
+        ObservationIssueKind::TooLarge
+    } else {
+        match serde_json::from_str(value) {
+            Ok(topology) => return topology,
+            Err(_) => ObservationIssueKind::Malformed,
+        }
+    };
+    DeviceTopology {
+        fabric: Some(FabricObservation::unavailable("cdi", "topology", kind)),
+        ..Default::default()
     }
 }
 
@@ -202,6 +230,25 @@ fn format_cores(cores: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn invalid_topology_annotation_is_reported_and_legacy_absence_is_preserved() {
+        let meta = super::DeviceMetadata::from_annotations(
+            &[(super::TOPOLOGY.into(), "bad-json".into())].into(),
+        );
+        let fabric = meta.topology.unwrap().fabric.unwrap();
+        assert_eq!(
+            fabric.status,
+            crate::topology::ObservationStatus::Unavailable
+        );
+        assert_eq!(
+            fabric.issues[0].kind,
+            crate::topology::ObservationIssueKind::Malformed
+        );
+        assert!(super::DeviceMetadata::from_annotations(&Default::default())
+            .topology
+            .is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -286,6 +333,7 @@ mod tests {
             memory_partition: Some("NPS4".into()),
             unique_id: Some("0123456789abcdef".into()),
             render_minor: Some(129),
+            topology: None,
             stable_id: Some(0x0500_0001),
         };
 
@@ -333,6 +381,7 @@ mod tests {
             memory_partition: None,
             unique_id: None,
             render_minor: Some(129),
+            topology: None,
             stable_id: None,
         };
         let ann = meta.to_annotations();

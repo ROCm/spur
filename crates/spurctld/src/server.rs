@@ -4909,6 +4909,7 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
                     2 => spur_core::resource::GpuLinkType::NVLink,
                     _ => spur_core::resource::GpuLinkType::PCIe,
                 },
+                topology: g.topology.map(spur_core::device_topology::from_proto),
                 stable_id: g.stable_id,
             })
             .collect(),
@@ -5469,6 +5470,10 @@ pub(crate) fn resource_to_proto(
                         spur_proto::proto::GpuLinkType::GpuLinkPcie as i32
                     }
                 },
+                topology: g
+                    .topology
+                    .as_ref()
+                    .map(spur_core::device_topology::to_proto),
                 stable_id: g.stable_id,
             })
             .collect(),
@@ -5858,7 +5863,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_set_proto_round_trip_preserves_stable_id_and_generation() {
+    fn resource_set_proto_round_trip_preserves_stable_id_generation_and_topology() {
         use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
         let rs = ResourceSet {
             cpus: 8,
@@ -5869,6 +5874,16 @@ mod tests {
                 memory_mb: 196_608,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: Some(spur_core::resource::DeviceTopology {
+                    pci_bdf: Some("0001:04:00.0".into()),
+                    fabric: Some(spur_core::device_topology::FabricObservation {
+                        source: "amd-ualink".into(),
+                        status: spur_core::device_topology::ObservationStatus::Observed,
+                        fabric_domain_id: Some("15".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 stable_id: 129,
             }],
             generic: Default::default(),
@@ -5878,6 +5893,7 @@ mod tests {
         assert_eq!(back.generation, 42);
         assert_eq!(back.gpus[0].stable_id, 129);
         assert_eq!(back.gpus[0].device_id, 1);
+        assert_eq!(back, rs);
     }
 
     #[test]

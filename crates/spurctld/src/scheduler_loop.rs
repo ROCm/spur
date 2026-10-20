@@ -3879,6 +3879,7 @@ mod tests {
             memory_mb: 192_000,
             peer_gpus: vec![],
             link_type: GpuLinkType::PCIe,
+            topology: None,
             stable_id: device_id as u64,
         }
     }

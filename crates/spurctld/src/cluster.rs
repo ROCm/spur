@@ -12793,6 +12793,7 @@ mod tests {
             memory_mb: 0,
             peer_gpus: vec![],
             link_type: spur_core::resource::GpuLinkType::XGMI,
+            topology: None,
             stable_id,
         }
     }

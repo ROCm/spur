@@ -72,10 +72,13 @@ impl CdiCache {
             warn!("CDI spec loading errors:\n{}", errors);
         }
 
-        if cache.is_empty() && auto_detect {
-            cache.add_specs(&crate::cdi::discovery::discover_to_cdi());
-        } else if auto_detect {
-            warn!("on-disk CDI specs found; auto_detect ignored");
+        if auto_detect {
+            let live = crate::cdi::discovery::discover_to_cdi();
+            if cache.is_empty() {
+                cache.add_specs(&live);
+            } else {
+                cache.refresh_topology(&live);
+            }
         }
 
         info!(
@@ -85,6 +88,56 @@ impl CdiCache {
         );
 
         cache
+    }
+
+    fn refresh_topology(&mut self, live: &[CdiSpec]) {
+        use crate::cdi::annotations::{DeviceMetadata, TOPOLOGY};
+        use crate::topology::{DeviceTopology, FabricObservation, ObservationIssueKind};
+
+        let live_devices: HashMap<_, _> = live
+            .iter()
+            .filter(|spec| spec.kind == "amd.com/gpu")
+            .flat_map(|spec| &spec.devices)
+            .filter_map(|device| {
+                let metadata = DeviceMetadata::from_annotations(&device.annotations);
+                Some((
+                    render_path(device)?,
+                    (metadata.topology?, metadata.stable_id),
+                ))
+            })
+            .collect();
+        for cached in self
+            .devices
+            .values_mut()
+            .filter(|cached| cached.kind == "amd.com/gpu")
+        {
+            let meta = DeviceMetadata::from_annotations(&cached.device.annotations);
+            let observed = render_path(&cached.device).and_then(|path| live_devices.get(path));
+            // Keep administrator-provided injection edits, but never freeze fabric
+            // membership at the time an on-disk CDI spec was generated.
+            let topology = observed
+                .filter(|(topology, stable_id)| {
+                    (meta.pci_bdf.is_none() || meta.pci_bdf == topology.pci_bdf)
+                        && (meta.stable_id.filter(|&id| id != 0).is_none()
+                            || meta.stable_id == *stable_id)
+                })
+                .map(|(topology, _)| topology.clone())
+                .unwrap_or_else(|| DeviceTopology {
+                    pci_bdf: meta.pci_bdf,
+                    fabric: Some(FabricObservation::unavailable(
+                        "amd-ualink",
+                        "device",
+                        ObservationIssueKind::Unavailable,
+                    )),
+                    ..Default::default()
+                });
+            match serde_json::to_string(&topology) {
+                Ok(value) => {
+                    cached.device.annotations.insert(TOPOLOGY.into(), value);
+                }
+                Err(error) => warn!(%error, "cannot serialize live device topology"),
+            }
+        }
     }
 
     pub fn add_specs(&mut self, specs: &[CdiSpec]) {
@@ -222,6 +275,19 @@ impl CdiCache {
     }
 }
 
+fn render_path(device: &CdiDevice) -> Option<&str> {
+    device
+        .container_edits
+        .as_ref()?
+        .device_nodes
+        .iter()
+        .map(|node| node.effective_host_path())
+        .find(|path| {
+            path.strip_prefix("/dev/dri/renderD")
+                .is_some_and(|minor| !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
 impl Default for CdiCache {
     fn default() -> Self {
         Self::new()
@@ -238,6 +304,92 @@ fn is_cdi_spec_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn render_path_reuse_cannot_attach_fabric_to_a_different_device_identity() {
+        use crate::cdi::annotations::DeviceMetadata;
+        use crate::topology::{DeviceTopology, FabricObservation, ObservationStatus};
+        let mut spec = make_amd_spec(&["0"]);
+        let mut metadata = DeviceMetadata::from_annotations(&Default::default());
+        metadata.stable_id = Some(128);
+        metadata.topology = Some(DeviceTopology {
+            fabric: Some(FabricObservation {
+                status: ObservationStatus::Observed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        spec.devices[0].annotations = metadata.to_annotations();
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec.clone()]);
+        metadata.stable_id = Some(129);
+        spec.devices[0].annotations = metadata.to_annotations();
+        cache.refresh_topology(&[spec]);
+        let metadata = DeviceMetadata::from_annotations(
+            &cache
+                .get_device("amd.com/gpu=0")
+                .unwrap()
+                .device
+                .annotations,
+        );
+        assert_eq!(metadata.stable_id, Some(128));
+        assert_eq!(
+            metadata.topology.unwrap().fabric.unwrap().status,
+            ObservationStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn live_topology_overlays_static_cdi_without_changing_injection() {
+        use crate::cdi::annotations::{DeviceMetadata, TOPOLOGY};
+        use crate::topology::{DeviceTopology, FabricObservation, ObservationStatus};
+        let mut spec = make_amd_spec(&["0"]);
+        let mut meta = DeviceMetadata::from_annotations(&spec.devices[0].annotations);
+        meta.topology = Some(DeviceTopology {
+            fabric: Some(FabricObservation {
+                source: "amd-ualink".into(),
+                status: ObservationStatus::Observed,
+                fabric_domain_id: Some("15".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        spec.devices[0].annotations = meta.to_annotations();
+        let original_edits = serde_json::to_value(&spec.devices[0].container_edits).unwrap();
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec.clone()]);
+        meta.topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap()
+            .fabric_domain_id = Some("16".into());
+        spec.devices[0].annotations = meta.to_annotations();
+        spec.devices[0].name = "renamed".into();
+        cache.refresh_topology(&[spec]);
+        let device = cache.get_device("amd.com/gpu=0").unwrap();
+        assert_eq!(
+            DeviceMetadata::from_annotations(&device.device.annotations).topology,
+            meta.topology
+        );
+        assert_eq!(
+            serde_json::to_value(&device.device.container_edits).unwrap(),
+            original_edits
+        );
+        assert!(device.device.annotations.contains_key(TOPOLOGY));
+        cache.refresh_topology(&[]);
+        let meta = DeviceMetadata::from_annotations(
+            &cache
+                .get_device("amd.com/gpu=0")
+                .unwrap()
+                .device
+                .annotations,
+        );
+        let observation = meta.topology.unwrap().fabric.unwrap();
+        assert_eq!(observation.status, ObservationStatus::Unavailable);
+        assert!(observation.fabric_domain_id.is_none());
+    }
+
     use super::*;
     use crate::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
 

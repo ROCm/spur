@@ -44,6 +44,55 @@ message GpuResource {
   repeated uint32 peer_gpus = 4;
   GpuLinkType link_type = 5;
   uint64 stable_id = 6;   // BDF(domain:bus:dev.func) + partition rank; stable per-logical-device identity
+  DeviceTopology topology = 7;
+}
+
+// Optional observations; none of these fields assert authoritative fabric health.
+message DeviceTopology {
+  optional string pci_bdf = 1;
+  optional uint32 numa_node = 2;
+  optional string pci_root = 3;
+  optional uint64 vram_bytes = 4;
+  FabricObservation fabric = 5;
+}
+
+message FabricObservation {
+  string source = 1;
+  ObservationStatus status = 2;
+  optional string physical_domain_id = 3;
+  optional string fabric_domain_id = 4;
+  optional string endpoint_id = 5;
+  optional uint32 physical_capacity = 6;
+  optional uint32 fabric_capacity = 7;
+  repeated string active_endpoints = 8;
+  repeated string local_endpoints = 9;
+  optional string endpoint_state = 10;
+  optional string transport = 11;
+  repeated ObservationIssue issues = 12;
+}
+
+enum ObservationStatus {
+  OBSERVATION_UNKNOWN = 0;
+  OBSERVATION_OBSERVED = 1;
+  OBSERVATION_INCOMPLETE = 2;
+  OBSERVATION_INCONSISTENT = 3;
+  OBSERVATION_UNAVAILABLE = 4;
+}
+
+message ObservationIssue {
+  string field = 1;
+  ObservationIssueKind kind = 2;
+}
+
+enum ObservationIssueKind {
+  OBSERVATION_ISSUE_UNKNOWN = 0;
+  OBSERVATION_ISSUE_MISSING = 1;
+  OBSERVATION_ISSUE_UNREADABLE = 2;
+  OBSERVATION_ISSUE_MALFORMED = 3;
+  OBSERVATION_ISSUE_TOO_LARGE = 4;
+  OBSERVATION_ISSUE_CONFLICT = 5;
+  OBSERVATION_ISSUE_CHANGED = 6;
+  OBSERVATION_ISSUE_UNAVAILABLE = 7;
 }
 
 enum GpuLinkType {

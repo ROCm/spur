@@ -976,14 +976,17 @@ fn spawn_inventory_refresh(
 
             let old = reporter.snapshot_resources();
 
-            // Refuse to converge a full-GPU dropout: a zeroed scan is more likely
-            // a loader read error than a real GPU-less node.
-            if is_suspect_gpu_dropout(&old, &fresh) {
+            // A failed scan cannot safely remove capacity, but old fabric
+            // observations must no longer appear current.
+            let suspect_dropout = is_suspect_gpu_dropout(&old, &fresh);
+            if suspect_dropout {
                 warn!(
                     old_gpus = old.gpus.len(),
-                    "discovery returned zero GPUs where some were present; ignoring suspect scan"
+                    "discovery returned zero GPUs; retaining capacity with unavailable fabric observations"
                 );
-                continue;
+                fresh = old.clone();
+                fresh.generation = old.generation + 1;
+                reporter::mark_fabric_unavailable(&mut fresh);
             }
 
             let held: std::collections::HashSet<u64> = {
@@ -1009,7 +1012,9 @@ fn spawn_inventory_refresh(
                     match change {
                         CapacityChange::Applied => {
                             let commit = converge(&reporter, &fresh, &delta, &mut last_delta).await;
-                            publish_registry(&registry, candidate, commit).await;
+                            if !suspect_dropout {
+                                publish_registry(&registry, candidate, commit).await;
+                            }
                         }
                         // A concurrent allocation grabbed a device that the fresh
                         // read dropped; leave capacity untouched and re-detect.
@@ -1081,8 +1086,8 @@ async fn converge(
 }
 
 /// A >0 -> 0 GPU discovery is a suspect scan: KFD/CDI loaders turn a read/parse
-/// error into an empty registry, indistinguishable from a GPU-less node. Refuse
-/// to auto-converge a full-GPU dropout; a real loss is a fault, not a partition.
+/// error into an empty registry, indistinguishable from a GPU-less node. Retain
+/// capacity and invalidate observations until a nonempty scan recovers.
 fn is_suspect_gpu_dropout(
     old: &spur_core::resource::ResourceSet,
     fresh: &spur_core::resource::ResourceSet,
@@ -1325,6 +1330,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 128 + i as u64,
                 })
                 .collect(),
