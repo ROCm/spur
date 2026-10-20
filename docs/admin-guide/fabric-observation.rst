@@ -43,8 +43,8 @@ Identity and capacity
 
 ``PhysicalDomain`` identifies a physical pod; ``FabricDomain`` is a vPod ID
 scoped to that physical pod. Equal vPod numbers on different physical pods do
-not imply connectivity. A future controller block view must also scope domain
-identities by an administrative namespace. PCI host bridge names and GPU
+not imply connectivity. The controller scopes domain
+identities by the configured ``cluster_name`` administrative namespace. PCI host bridge names and GPU
 stable IDs are local to the Spur node.
 
 Capacities and membership count physical fabric endpoints. Logical GPU
@@ -95,7 +95,52 @@ model as JSON in the ``spur.amd.com/topology`` annotation. An invalid annotation
 is reported as unavailable rather than silently disappearing. This annotation
 is an inventory transport, not a validated controller static-import API.
 
-Controller block assembly, policy configuration, static import/validation,
+Policy configuration, runtime static import,
 typed GPU predicates, mandatory containment, and pre-launch fabric binding
 validation are subsequent implementation stages. No new job flags are accepted
 for those unimplemented guarantees.
+
+Controller block inspection
+---------------------------
+
+The controller assembles blocks from explicit GPU membership on each query. Node
+ordering, rack size, and the legacy ``topology.plugin = "block"`` setting do not
+create fabric membership. A block key consists of the cluster namespace,
+physical domain, and fabric domain. Members retain node names, stable logical
+GPU IDs, physical endpoint IDs, and inventory generations.
+
+.. code-block:: console
+
+   spur control topology show
+   scontrol show topology
+   scontrol topology show --json
+   scontrol topology export > fabric.json
+   scontrol topology validate fabric.json
+
+``show`` includes invalid blocks and GPUs whose membership cannot be resolved.
+Diagnostics cover disagreement between nodes, endpoints claimed by multiple
+blocks or physical devices, missing registered endpoints, unavailable nodes,
+and missing or expired heartbeats. The controller's configured heartbeat timeout
+applies (90 seconds by default). A current heartbeat only establishes agent
+liveness; it does not establish when the external fabric last changed.
+
+``Membership=consistent`` means the registered reports agree and cover the
+reported active endpoints. It does not establish fabric health, available job
+capacity, isolation, or a scheduling guarantee. Multiple logical GPU partitions
+may share a physical endpoint when they report the same node and PCI identity.
+
+``export`` prints a version 1 JSON candidate membership document only when every
+GPU has resolved membership and every block is consistent. The document contains
+scoped block keys and exact node/stable-ID pairs. It deliberately contains no
+health or availability claims. ``validate`` resolves all declared blocks and
+devices against current controller inventory, rejecting duplicates, unknown
+identities, namespace mismatches, changed membership, and invalid live blocks.
+Unknown JSON fields and unsupported versions are errors; input is limited to
+8 MiB. A document can describe a subset of blocks, but each declared block must
+contain its complete registered membership.
+
+Validation is read-only. It does not install the document, change membership,
+reserve resources, or freeze a fabric configuration. Automatic discovery remains
+the default; no administrator-generated intermediate file is required. Runtime
+static input and enforced placement will use the same membership-resolution
+contract in a subsequent implementation stage.

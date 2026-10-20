@@ -805,6 +805,7 @@ mod tests {
         update_job(pb::UpdateJobRequest) -> ();
         requeue_job(pb::RequeueJobRequest) -> pb::RequeueJobResponse;
         get_node(pb::GetNodeRequest) -> pb::NodeInfo;
+        get_fabric_topology(()) -> pb::GetFabricTopologyResponse;
         update_node(pb::UpdateNodeRequest) -> ();
         drain_node(pb::DrainNodeRequest) -> pb::DrainNodeResponse;
         deregister_node(pb::DeregisterNodeRequest) -> pb::DeregisterNodeResponse;

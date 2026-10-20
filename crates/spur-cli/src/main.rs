@@ -8,6 +8,7 @@ mod env_defaults;
 mod exec;
 mod exit_fmt;
 mod export_env;
+mod fabric_cli;
 mod format_engine;
 mod image;
 mod interactive;

@@ -2065,6 +2065,25 @@ impl SlurmController for ControllerService {
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
     }
 
+    async fn get_fabric_topology(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<GetFabricTopologyResponse>, Status> {
+        let forward = self.prepare_read(&request);
+        let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
+        if let Some(resp) = self
+            .forward_read(meta, forward.then_some(()), identity, path)
+            .await
+        {
+            return Ok(resp);
+        }
+        Ok(Response::new(
+            (&self.cluster.fabric_view(Utc::now())).into(),
+        ))
+    }
+
     async fn get_node(
         &self,
         request: Request<GetNodeRequest>,
@@ -10530,6 +10549,70 @@ mod tests {
             .await
             .expect_err("a bound non-admin must not become root by request field");
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fabric_topology_rpc_tracks_registered_membership_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for (generation, domain) in [(1, "7"), (2, "8")] {
+            let mut request = Request::new(RegisterAgentRequest {
+                hostname: "fabric-node".into(),
+                address: "192.0.2.1".into(),
+                port: 6818,
+                resources: Some(spur_proto::proto::ResourceSet {
+                    cpus: 4,
+                    generation,
+                    gpus: vec![spur_proto::proto::GpuResource {
+                        stable_id: 42,
+                        topology: Some(spur_proto::proto::DeviceTopology {
+                            pci_bdf: Some("0001:04:00.0".into()),
+                            fabric: Some(spur_proto::proto::FabricObservation {
+                                source: "test".into(),
+                                status: spur_proto::proto::ObservationStatus::ObservationObserved
+                                    as i32,
+                                physical_domain_id: Some("rack-a".into()),
+                                fabric_domain_id: Some(domain.into()),
+                                endpoint_id: Some("1".into()),
+                                physical_capacity: Some(8),
+                                fabric_capacity: Some(1),
+                                active_endpoints: vec!["1".into()],
+                                local_endpoints: vec!["1".into()],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            request.extensions_mut().insert(viewer("admin", true));
+            svc.register_agent(request).await.unwrap();
+            let result = svc
+                .get_fabric_topology(Request::new(()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(result.namespace, "test");
+            assert_eq!(result.blocks.len(), 1);
+            assert_eq!(result.blocks[0].key.as_ref().unwrap().fabric_domain, domain);
+            assert_eq!(result.blocks[0].members[0].inventory_generation, generation);
+            assert_eq!(
+                result.blocks[0].members[0]
+                    .device
+                    .as_ref()
+                    .unwrap()
+                    .stable_id,
+                42
+            );
+            assert!(
+                result.blocks[0].issues.is_empty(),
+                "{:?}",
+                result.blocks[0].issues
+            );
+        }
     }
 
     async fn register_plain_node(svc: &ControllerService, name: &str, port: u16) {

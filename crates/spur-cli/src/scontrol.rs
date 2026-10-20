@@ -29,6 +29,11 @@ pub struct ScontrolArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ScontrolCommand {
+    /// Inspect and validate read-only fabric membership
+    Topology {
+        #[command(subcommand)]
+        command: crate::fabric_cli::TopologyCommand,
+    },
     /// Show detailed information
     Show {
         /// Entity type: job, node, partition, reservation, assoc_mgr, federation,
@@ -320,6 +325,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<ScontrolArgs>(&args);
 
     match args.command {
+        ScontrolCommand::Topology { command } => {
+            crate::fabric_cli::run(&args.controller, command).await
+        }
         ScontrolCommand::Show { entity, name } => {
             let env = job_nodelist_env(|v| std::env::var(v).ok());
             if let Some(out) = show_hostlist(&entity, name.as_deref(), env.as_deref()) {
@@ -629,6 +637,16 @@ fn show_hostlist(
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
     let entity = entity.to_lowercase();
+    if entity == "topology" {
+        if name.is_some() {
+            bail!("show topology does not accept a name; use topology show");
+        }
+        return crate::fabric_cli::run(
+            controller,
+            crate::fabric_cli::TopologyCommand::Show { json: false },
+        )
+        .await;
+    }
     // Parsed before connecting so a malformed id surfaces its own error, not a connect failure.
     let job_ids = match entity.as_str() {
         "job" | "jobs" => parse_show_job_ids(name)?,

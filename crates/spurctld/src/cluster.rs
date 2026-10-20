@@ -3739,6 +3739,16 @@ impl ClusterManager {
         self.nodes.read().values().cloned().collect()
     }
 
+    pub fn fabric_view(&self, now: DateTime<Utc>) -> spur_core::fabric::FabricView {
+        let config = self.config();
+        spur_core::fabric::FabricView::from_nodes(
+            &config.cluster_name,
+            &self.get_nodes(),
+            now,
+            config.controller.heartbeat_timeout_secs.unwrap_or(90),
+        )
+    }
+
     /// Nodes eligible for new placement this tick: all nodes minus those on a
     /// dispatch cooldown, except a cooling node pinned by a pending job's
     /// `--nodelist` (its only option). Exclusion is resource-agnostic by design.

@@ -380,6 +380,7 @@ mock_controller_impl! {
         requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
+        get_fabric_topology(()) -> proto::GetFabricTopologyResponse;
         create_partition(proto::CreatePartitionRequest) -> ();
         update_partition(proto::UpdatePartitionRequest) -> ();
         delete_partition(proto::DeletePartitionRequest) -> ();
