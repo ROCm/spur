@@ -712,6 +712,12 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         .collect();
                     println!("   Gres={}", gpu_types.join(","));
                 }
+                if let Some(resources) = total {
+                    println!("   InventoryGeneration={}", resources.generation);
+                    for gpu in &resources.gpus {
+                        print!("{}", format_gpu_topology(gpu));
+                    }
+                }
                 println!("   Arch={} OS={}", node.arch, node.os);
                 if !node.labels.is_empty() {
                     let mut label_str: Vec<String> = node
@@ -1167,6 +1173,75 @@ fn state_name(state: i32) -> &'static str {
     spur_core::job::JobState::from_proto_i32(state)
         .map(|s| s.display())
         .unwrap_or("UNKNOWN")
+}
+
+fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
+    use spur_proto::proto::{ObservationIssueKind, ObservationStatus};
+    let Some(topology) = &gpu.topology else {
+        return String::new();
+    };
+    let text = |value: Option<&str>| value.unwrap_or("unknown").escape_debug().to_string();
+    let mut output = format!(
+        "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={}\n",
+        gpu.device_id,
+        gpu.stable_id,
+        text(topology.pci_bdf.as_deref()),
+        text(topology.pci_root.as_deref()),
+        topology
+            .numa_node
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        topology
+            .vram_bytes
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+    );
+    let Some(fabric) = &topology.fabric else {
+        return output;
+    };
+    let status = match ObservationStatus::try_from(fabric.status) {
+        Ok(ObservationStatus::ObservationObserved) => "observed",
+        Ok(ObservationStatus::ObservationIncomplete) => "incomplete",
+        Ok(ObservationStatus::ObservationInconsistent) => "inconsistent",
+        Ok(ObservationStatus::ObservationUnavailable) => "unavailable",
+        _ => "unknown",
+    };
+    output.push_str(&format!(
+        "      FabricSource={} Observation={} PhysicalDomain={} FabricDomain={} Endpoint={} EndpointState={} Transport={}\n",
+        text(Some(&fabric.source)), status, text(fabric.physical_domain_id.as_deref()),
+        text(fabric.fabric_domain_id.as_deref()), text(fabric.endpoint_id.as_deref()),
+        text(fabric.endpoint_state.as_deref()), text(fabric.transport.as_deref()),
+    ));
+    output.push_str(&format!(
+        "      PhysicalCapacity={} FabricCapacity={} ActiveEndpoints=[{}] LocalEndpoints=[{}]\n",
+        fabric
+            .physical_capacity
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        fabric
+            .fabric_capacity
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        text(Some(&fabric.active_endpoints.join(","))),
+        text(Some(&fabric.local_endpoints.join(","))),
+    ));
+    if !fabric.issues.is_empty() {
+        let issues: Vec<_> = fabric
+            .issues
+            .iter()
+            .map(|issue| {
+                let kind = match ObservationIssueKind::try_from(issue.kind) {
+                    Ok(ObservationIssueKind::ObservationIssueMissing) => "missing",
+                    Ok(ObservationIssueKind::ObservationIssueUnreadable) => "unreadable",
+                    Ok(ObservationIssueKind::ObservationIssueMalformed) => "malformed",
+                    Ok(ObservationIssueKind::ObservationIssueTooLarge) => "too_large",
+                    Ok(ObservationIssueKind::ObservationIssueConflict) => "conflict",
+                    Ok(ObservationIssueKind::ObservationIssueChanged) => "changed",
+                    Ok(ObservationIssueKind::ObservationIssueUnavailable) => "unavailable",
+                    _ => "unknown",
+                };
+                format!("{}:{kind}", text(Some(&issue.field)))
+            })
+            .collect();
+        output.push_str(&format!("      ObservationIssues={}\n", issues.join(",")));
+    }
+    output
 }
 
 fn node_state_name(state: i32) -> &'static str {
@@ -2254,6 +2329,39 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpu_topology_detail_exposes_membership_and_incomplete_observations() {
+        use spur_proto::proto::*;
+        let gpu = GpuResource {
+            stable_id: 128,
+            topology: Some(DeviceTopology {
+                pci_bdf: Some("0001:04:00.0".into()),
+                vram_bytes: Some(309_237_645_312),
+                fabric: Some(FabricObservation {
+                    source: "amd-ualink".into(),
+                    status: ObservationStatus::ObservationIncomplete as i32,
+                    physical_domain_id: Some("synthetic-pod".into()),
+                    active_endpoints: vec!["60".into(), "61".into()],
+                    issues: vec![ObservationIssue {
+                        field: "vpod_id".into(),
+                        kind: ObservationIssueKind::ObservationIssueMissing as i32,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let detail = super::format_gpu_topology(&gpu);
+        assert!(detail.contains("PCI=0001:04:00.0"));
+        assert!(detail.contains("NUMA=unknown VRAMBytes=309237645312"));
+        assert!(detail
+            .contains("Observation=incomplete PhysicalDomain=synthetic-pod FabricDomain=unknown"));
+        assert!(detail.contains("ActiveEndpoints=[60,61]"));
+        assert!(detail.contains("ObservationIssues=vpod_id:missing"));
+        assert!(super::format_gpu_topology(&GpuResource::default()).is_empty());
+    }
+
     use super::*;
 
     #[test]

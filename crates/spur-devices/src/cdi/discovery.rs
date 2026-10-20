@@ -12,6 +12,7 @@ use crate::cdi::annotations::{self, DeviceMetadata};
 use crate::cdi::spec::{
     CdiDevice, CdiSpec, ContainerEdits, DeviceNode, Mount, GENERATED_CDI_VERSION,
 };
+use crate::topology::DeviceTopology;
 use crate::types::LinkType;
 
 const AMD_CDI_KIND: &str = "amd.com/gpu";
@@ -57,7 +58,7 @@ struct KfdGpuNode {
     hive_id: u64,
     unique_id: u64,
     num_xcc: u32,
-    vram_bytes: u64,
+    vram_bytes: Option<u64>,
     gfx_target_version: u32,
     io_links: Vec<KfdIoLink>,
 }
@@ -172,11 +173,9 @@ fn is_amd_gpu_node(props: &HashMap<String, String>) -> bool {
     cpu_cores == 0 && simd_count > 0 && vendor_id == KFD_AMD_VENDOR_ID
 }
 
-fn read_vram_bytes(node_path: &Path) -> u64 {
+fn read_vram_bytes(node_path: &Path) -> Option<u64> {
     let mem_banks_dir = node_path.join("mem_banks");
-    let Ok(entries) = std::fs::read_dir(&mem_banks_dir) else {
-        return 0;
-    };
+    let entries = std::fs::read_dir(&mem_banks_dir).ok()?;
 
     for entry in entries.flatten() {
         let props_path = entry.path().join("properties");
@@ -188,14 +187,11 @@ fn read_vram_bytes(node_path: &Path) -> u64 {
             .and_then(|s| parse_u64(s))
             .unwrap_or(0);
         if heap_type == VRAM_HEAP_TYPE {
-            return props
-                .get("size_in_bytes")
-                .and_then(|s| parse_u64(s))
-                .unwrap_or(0);
+            return props.get("size_in_bytes").and_then(|s| parse_u64(s));
         }
     }
 
-    0
+    None
 }
 
 fn read_io_links(node_path: &Path) -> Vec<KfdIoLink> {
@@ -324,6 +320,7 @@ struct DiscoveredGpu {
     device_index: u32,
     render_minor: u32,
     stable_id: u64,
+    topology: Option<DeviceTopology>,
     card_id: Option<u32>,
     gpu_type: String,
     memory_mb: u64,
@@ -354,6 +351,7 @@ impl DiscoveredGpu {
             memory_partition: self.memory_partition.clone(),
             unique_id: self.unique_id.clone(),
             render_minor: Some(self.render_minor),
+            topology: self.topology.clone(),
             stable_id: Some(self.stable_id),
         };
 
@@ -469,7 +467,7 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
 
     let partition_index_by_render_minor = partition_indices_by_bdf(&kfd_nodes);
 
-    kfd_nodes
+    let mut gpus: Vec<_> = kfd_nodes
         .iter()
         .enumerate()
         .map(|(index, node)| {
@@ -484,7 +482,7 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
             } else {
                 "amdgpu".into()
             };
-            let memory_mb = node.vram_bytes / (1024 * 1024);
+            let memory_mb = node.vram_bytes.unwrap_or(0) / (1024 * 1024);
             let numa_node = read_numa_node(&device_path);
             let pci_bdf = Some(bdf_from_location_id(node.location_id, node.domain));
             let link_type = if node.hive_id != 0 || has_xgmi_link(&node.io_links) {
@@ -527,6 +525,13 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
                 card_id,
                 gpu_type,
                 memory_mb,
+                topology: Some(DeviceTopology {
+                    pci_bdf: pci_bdf.clone(),
+                    numa_node,
+                    pci_root: crate::ualink::pci_root(&device_path),
+                    vram_bytes: node.vram_bytes,
+                    fabric: crate::ualink::observe(&device_path),
+                }),
                 numa_node,
                 pci_bdf,
                 link_type,
@@ -536,7 +541,14 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
                 unique_id,
             }
         })
-        .collect()
+        .collect();
+    crate::ualink::validate_local(
+        &mut gpus
+            .iter_mut()
+            .filter_map(|gpu| gpu.topology.as_mut())
+            .collect::<Vec<_>>(),
+    );
+    gpus
 }
 
 fn build_link_weights(
@@ -678,6 +690,22 @@ fn stat_device_node(path: &str) -> Option<DeviceStat> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vram_observation_distinguishes_missing_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(super::read_vram_bytes(dir.path()), None);
+        let bank = dir.path().join("mem_banks/0");
+        std::fs::create_dir_all(&bank).unwrap();
+        std::fs::write(bank.join("properties"), "heap_type 1\nsize_in_bytes 0\n").unwrap();
+        assert_eq!(super::read_vram_bytes(dir.path()), Some(0));
+        std::fs::write(
+            bank.join("properties"),
+            "heap_type 1\nsize_in_bytes invalid\n",
+        )
+        .unwrap();
+        assert_eq!(super::read_vram_bytes(dir.path()), None);
+    }
+
     use super::*;
     use std::fs;
 
@@ -754,7 +782,7 @@ mod tests {
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].render_minor, 128);
         assert_eq!(gpus[1].render_minor, 136);
-        assert_eq!(gpus[0].vram_bytes, 206_141_652_992);
+        assert_eq!(gpus[0].vram_bytes, Some(206_141_652_992));
         assert_eq!(gpus[0].io_links.len(), 1);
         assert_eq!(gpus[0].io_links[0].node_to, 3);
         assert!(has_xgmi_link(&gpus[0].io_links));
@@ -806,7 +834,7 @@ mod tests {
                 hive_id: 1,
                 unique_id: 1,
                 num_xcc: 4,
-                vram_bytes: 0,
+                vram_bytes: Some(0),
                 gfx_target_version: 0,
                 io_links: vec![KfdIoLink {
                     node_to: 3,
@@ -824,7 +852,7 @@ mod tests {
                 hive_id: 1,
                 unique_id: 2,
                 num_xcc: 4,
-                vram_bytes: 0,
+                vram_bytes: Some(0),
                 gfx_target_version: 0,
                 io_links: vec![KfdIoLink {
                     node_to: 2,
@@ -877,6 +905,7 @@ mod tests {
         let gpu = DiscoveredGpu {
             device_index: 3,
             render_minor: 131,
+            topology: None,
             stable_id: encode_stable_id(0xc100, 0, 0),
             card_id: Some(4),
             gpu_type: "mi300x".into(),
@@ -933,6 +962,7 @@ mod tests {
         let gpu = DiscoveredGpu {
             device_index: 0,
             render_minor: 128,
+            topology: None,
             stable_id: 0,
             card_id: None,
             gpu_type: "mi300x".into(),
@@ -973,7 +1003,7 @@ mod tests {
             hive_id: 0,
             unique_id: 0,
             num_xcc: 4,
-            vram_bytes: 0,
+            vram_bytes: Some(0),
             gfx_target_version: 0,
             io_links: Vec::new(),
         }
@@ -1155,7 +1185,7 @@ mod tests {
             detect_amd_gpu_type_from_id(kfd_nodes[0].device_id),
             "mi308x"
         );
-        assert_eq!(kfd_nodes[0].vram_bytes / (1024 * 1024), 196592);
+        assert_eq!(kfd_nodes[0].vram_bytes.unwrap() / (1024 * 1024), 196592);
         assert_eq!(
             bdf_from_location_id(kfd_nodes[0].location_id, kfd_nodes[0].domain),
             "0000:05:00.0"

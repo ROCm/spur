@@ -1884,6 +1884,8 @@ converges to hardware changes without an agent restart — see
      - bool
      - ``true``
      - Discover GPUs from AMD KFD sysfs when the CDI cache is empty (AMD only).
+       Also refresh topology for matching AMD devices in on-disk CDI specs;
+       see :doc:`fabric-observation`.
    * - ``cdi_spec_dirs``
      - [string]
      - ``[]``
@@ -1928,11 +1930,12 @@ converges to the new device count without restarting ``spurd``.
 
 .. note::
 
-   Convergence only sees changes on the AMD KFD auto-detect path
-   (``auto_detect = true``). On nodes provisioned with static on-disk CDI specs
-   (``cdi_spec_dirs``), re-discovery re-reads the same spec files each tick, so
-   the reported inventory only changes if those specs are regenerated out of
-   band.
+   With ``auto_detect = true``, matching AMD devices receive live topology
+   observations even when on-disk CDI specs supply their injection edits.
+   Device selection and other static CDI metadata still require regenerating
+   those specs. With ``auto_detect = false``, all CDI metadata is re-read from
+   disk and changes only when the specs change. See :doc:`fabric-observation`
+   for the read-only fabric observation contract and its scheduling limits.
 
 ``[isolation]``
 ---------------
