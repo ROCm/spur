@@ -6503,6 +6503,22 @@ impl ClusterManager {
         }
     }
 
+    /// Record on a still-pending preemptor that `victim` was evicted off
+    /// `victim_nodes` for it, so the scheduler holds those nodes for it.
+    fn note_preempt_claim(
+        jobs: &mut HashMap<JobId, Job>,
+        preempted_by: Option<JobId>,
+        victim: JobId,
+        victim_nodes: &[String],
+        at: DateTime<Utc>,
+    ) {
+        if let Some(preemptor) = preempted_by.and_then(|id| jobs.get_mut(&id)) {
+            if preemptor.state == JobState::Pending {
+                preemptor.add_preempt_claim(victim, victim_nodes, at);
+            }
+        }
+    }
+
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
     fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
@@ -6570,6 +6586,12 @@ impl ClusterManager {
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Running {
                         job.start_time = Some(at.unwrap_or(timestamp));
                     }
+                    // Leaving pending ends the hold on nodes freed for it.
+                    if outcome == TransitionOutcome::Applied
+                        && (*new_state == JobState::Running || new_state.is_terminal())
+                    {
+                        job.preempt_claim = None;
+                    }
                     // Gated on a real transition so a replay doesn't re-wipe
                     // fields or double-count requeue_count.
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Pending {
@@ -6615,6 +6637,8 @@ impl ClusterManager {
                 if *run_attempt != 0 && job.run_attempt != 0 && *run_attempt < job.run_attempt {
                     return ClientResponse::default();
                 }
+                // Its launch failed, so it isn't about to use the nodes held for it.
+                job.preempt_claim = None;
                 // A reservation charged by `reserve_placement` before dispatch may
                 // still be held here (a caller backing off a job that never
                 // reserved one has nothing charged to free); free it before the
@@ -6710,6 +6734,13 @@ impl ClusterManager {
                     &per_node_map,
                     &[],
                     *job_id,
+                );
+                Self::note_preempt_claim(
+                    &mut jobs,
+                    *preempted_by,
+                    *job_id,
+                    &freed_nodes,
+                    timestamp,
                 );
                 drop(jobs);
                 drop(nodes);
@@ -6847,6 +6878,14 @@ impl ClusterManager {
                             warn!(job_id = *job_id, error = %e, "invalid preempt-cancel transition to Completing");
                             return ClientResponse::default();
                         }
+                        let victim_nodes = job.allocated_nodes.clone();
+                        Self::note_preempt_claim(
+                            &mut jobs,
+                            *preempted_by,
+                            *job_id,
+                            &victim_nodes,
+                            timestamp,
+                        );
                         return ClientResponse::default();
                     }
 
@@ -6887,6 +6926,13 @@ impl ClusterManager {
                         }
                     }
                 }
+                Self::note_preempt_claim(
+                    &mut jobs,
+                    *preempted_by,
+                    *job_id,
+                    &freed_nodes,
+                    timestamp,
+                );
                 drop(jobs);
                 drop(nodes);
                 self.complete_job_steps(job_id, -1, timestamp);
@@ -6954,6 +7000,9 @@ impl ClusterManager {
                     None,
                 ) {
                     response.jobs_finalized.push(fin);
+                    if let Some(job) = jobs.get_mut(job_id) {
+                        job.preempt_claim = None;
+                    }
                 }
             }
             WalOperation::JobLaunchFailureDetail { job_id, detail } => {
@@ -7232,6 +7281,7 @@ impl ClusterManager {
                             job.end_of_run_state(*state),
                             *exit_code,
                         ));
+                        job.preempt_claim = None;
                     }
                     // Suspended -> terminal: fold the final suspended interval in
                     // and clear suspended_at so it never lingers on a terminal job.
@@ -14961,6 +15011,78 @@ mod tests {
             fin.reason_detail.as_deref(),
             Some(format!("preempted by job {}", job_id + 1).as_str())
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemption_holds_the_freed_node_for_the_pending_preemptor_until_its_launch_fails() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let victim = run_job_on(&cm, "victim", "worker1");
+        let preemptor = submit_and_wait(&cm, basic_spec("preemptor"));
+        let at = Utc::now();
+
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: victim,
+            begin_time: at,
+            preempted_by: Some(preemptor),
+            preempt_qos: None,
+            at: None,
+        });
+
+        let claim = cm.get_job(preemptor).unwrap().preempt_claim.unwrap();
+        assert_eq!(claim.victims, vec![victim]);
+        assert_eq!(claim.nodes, vec!["worker1".to_string()]);
+
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: preemptor,
+            begin_time: at,
+            spare_requeue_budget: true,
+            run_attempt: 0,
+            at_max_requeue: false,
+        });
+        assert!(cm.get_job(preemptor).unwrap().preempt_claim.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemption_hold_ends_when_the_preemptor_starts_and_is_never_set_on_a_running_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        register_node(&cm, "worker2", 8, 16000);
+        let victim = run_job_on(&cm, "victim", "worker1");
+        let preemptor = submit_and_wait(&cm, basic_spec("preemptor"));
+
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: victim,
+            begin_time: Utc::now(),
+            preempted_by: Some(preemptor),
+            preempt_qos: None,
+            at: None,
+        });
+        assert!(cm.get_job(preemptor).unwrap().preempt_claim.is_some());
+
+        let resources = scalar_alloc(2, 4000);
+        cm.start_job(
+            preemptor,
+            vec!["worker1".into()],
+            resources.clone(),
+            per_node_for(&["worker1"], resources),
+        )
+        .unwrap();
+        settle(&cm, preemptor, JobState::Running);
+        assert!(cm.get_job(preemptor).unwrap().preempt_claim.is_none());
+
+        // A preemption naming a job that already runs claims nothing for it.
+        let other = run_job_on(&cm, "other", "worker2");
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: other,
+            begin_time: Utc::now(),
+            preempted_by: Some(preemptor),
+            preempt_qos: None,
+            at: None,
+        });
+        assert!(cm.get_job(preemptor).unwrap().preempt_claim.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

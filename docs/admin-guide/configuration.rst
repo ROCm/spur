@@ -590,6 +590,16 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
        Mirrors Slurm's ``PreemptExemptTime``. Does not apply to idle-fill reclaim,
        which uses ``idle_fill_exempt_secs`` instead.
+   * - ``preempt_hold_secs``
+     - integer
+     - ``600``
+     - Live
+     - Seconds the nodes freed by a preemption stay held for the job they were
+       freed for, counted from the latest preemption for it. While held, no other
+       job is placed on them, backfilled onto them, or preempts for them. The hold
+       ends early when that job starts, fails to launch, or ends, and it holds
+       nothing while the job can't be scheduled (held, or waiting on a
+       dependency). ``0`` turns the hold off.
    * - ``idle_fill_enabled``
      - boolean
      - ``false``

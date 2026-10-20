@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -247,6 +247,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             job.idle_fill = true;
             job
         }));
+        hold_preempted_nodes(
+            &mut pending,
+            Utc::now(),
+            cluster.config().scheduler.preempt_hold_secs,
+        );
         if pending.is_empty() {
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
@@ -393,8 +398,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
                 // Federation: forward still-unschedulable jobs to peer clusters.
                 if !cluster.config().federation.clusters.is_empty() {
-                    let jobs_to_fwd: Vec<spur_core::job::Job> =
-                        unscheduled.iter().map(|j| (*j).clone()).collect();
+                    // The stored jobs, not this pass's copies, whose exclude
+                    // lists may carry nodes held for a local preemptor.
+                    let jobs_to_fwd: Vec<spur_core::job::Job> = unscheduled
+                        .iter()
+                        .map(|j| cluster.get_job(j.job_id).unwrap_or_else(|| (*j).clone()))
+                        .collect();
                     let fed_cluster = cluster.clone();
                     tokio::spawn(async move {
                         forward_to_federation(&fed_cluster, &jobs_to_fwd).await;
@@ -421,6 +430,48 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             jobs_started_cycle,
             hit_depth_limit,
         );
+    }
+}
+
+/// Hold the nodes freed by a preemption for the pending job they were freed for:
+/// every other job in this pass gets them added to its exclude list, so neither
+/// placement, backfill planning nor `try_preempt` hands them to someone else.
+/// Only the pass's copies change; the stored jobs keep their own `--exclude`.
+/// A preemptor that isn't in the pass (held, waiting on a dependency) holds
+/// nothing, so its nodes don't sit idle while it can't run.
+fn hold_preempted_nodes(pending: &mut [spur_core::job::Job], now: DateTime<Utc>, hold_secs: u32) {
+    let held: BTreeMap<&str, spur_core::job::JobId> = pending
+        .iter()
+        .flat_map(|j| {
+            j.held_nodes(now, hold_secs)
+                .iter()
+                .map(move |n| (n.as_str(), j.job_id))
+        })
+        .collect();
+    if held.is_empty() {
+        return;
+    }
+    let held: Vec<(String, spur_core::job::JobId)> = held
+        .into_iter()
+        .map(|(n, id)| (n.to_string(), id))
+        .collect();
+    for job in pending.iter_mut() {
+        let mut exclude: Vec<String> = job
+            .spec
+            .exclude
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(spur_sched::node_match::expand_hostlist_or_split)
+            .unwrap_or_default();
+        let before = exclude.len();
+        for (node, holder) in &held {
+            if *holder != job.job_id && !exclude.contains(node) {
+                exclude.push(node.clone());
+            }
+        }
+        if exclude.len() > before {
+            job.spec.exclude = Some(exclude.join(","));
+        }
     }
 }
 
@@ -3440,6 +3491,53 @@ mod tests {
         job.start_time = Some(start);
         job.allocated_nodes = vec![node.to_string()];
         job
+    }
+
+    fn pending_with_id(id: spur_core::job::JobId, exclude: Option<&str>) -> Job {
+        let mut job = job_with_spec(JobSpec {
+            exclude: exclude.map(str::to_string),
+            ..Default::default()
+        });
+        job.job_id = id;
+        job
+    }
+
+    #[test]
+    fn nodes_freed_by_a_preemption_are_excluded_for_every_other_job_in_the_pass() {
+        let now = Utc::now();
+        let mut holder = pending_with_id(10, None);
+        holder.add_preempt_claim(7, &["node3".to_string(), "node4".to_string()], now);
+        let mut pass = vec![
+            holder,
+            pending_with_id(11, None),
+            pending_with_id(12, Some("node[1-2]")),
+            pending_with_id(13, Some("node3")),
+        ];
+
+        hold_preempted_nodes(&mut pass, now, 600);
+
+        assert_eq!(pass[0].spec.exclude, None, "the holder keeps its nodes");
+        assert_eq!(pass[1].spec.exclude.as_deref(), Some("node3,node4"));
+        assert_eq!(
+            pass[2].spec.exclude.as_deref(),
+            Some("node1,node2,node3,node4")
+        );
+        assert_eq!(pass[3].spec.exclude.as_deref(), Some("node3,node4"));
+    }
+
+    #[test]
+    fn a_hold_past_its_window_or_disabled_excludes_nothing() {
+        let then = Utc::now() - chrono::Duration::seconds(601);
+        let mut holder = pending_with_id(10, None);
+        holder.add_preempt_claim(7, &["node3".to_string()], then);
+        let mut pass = vec![holder, pending_with_id(11, Some("node9"))];
+
+        hold_preempted_nodes(&mut pass, Utc::now(), 600);
+        assert_eq!(pass[1].spec.exclude.as_deref(), Some("node9"));
+
+        pass[0].add_preempt_claim(8, &["node3".to_string()], Utc::now());
+        hold_preempted_nodes(&mut pass, Utc::now(), 0);
+        assert_eq!(pass[1].spec.exclude.as_deref(), Some("node9"));
     }
 
     #[test]
