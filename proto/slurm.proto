@@ -95,6 +95,44 @@ enum ObservationIssueKind {
   OBSERVATION_ISSUE_UNAVAILABLE = 7;
 }
 
+// Derived from the current controller inventory; no fabric mutation or health claim.
+message FabricBlockKey {
+  string namespace = 1;
+  string physical_domain = 2;
+  string fabric_domain = 3;
+}
+
+message FabricDeviceKey {
+  string node = 1;
+  uint64 stable_id = 2;
+}
+
+message FabricMember {
+  FabricDeviceKey device = 1;
+  string endpoint = 2;
+  uint64 inventory_generation = 3;
+}
+
+message FabricBlock {
+  FabricBlockKey key = 1;
+  repeated FabricMember members = 2;
+  repeated string active_endpoints = 3;
+  optional uint32 physical_capacity = 4;
+  optional uint32 fabric_capacity = 5;
+  repeated string issues = 6;
+}
+
+message UnresolvedFabricDevice {
+  FabricDeviceKey device = 1;
+  string issue = 2;
+}
+
+message GetFabricTopologyResponse {
+  string namespace = 1;
+  repeated FabricBlock blocks = 2;
+  repeated UnresolvedFabricDevice unresolved = 3;
+}
+
 enum GpuLinkType {
   GPU_LINK_PCIE = 0;
   GPU_LINK_XGMI = 1;
@@ -463,6 +501,7 @@ service SlurmController {
 
   // Node management
   rpc GetNodes(GetNodesRequest) returns (GetNodesResponse);
+  rpc GetFabricTopology(google.protobuf.Empty) returns (GetFabricTopologyResponse);
   rpc GetNode(GetNodeRequest) returns (NodeInfo);
   rpc UpdateNode(UpdateNodeRequest) returns (google.protobuf.Empty);
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
