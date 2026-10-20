@@ -762,14 +762,31 @@ pub struct NodeCompletion {
     pub signal: i32,
 }
 
-/// Jobs preempted to make room for a still-pending job, and the nodes they
-/// freed. While it is open, the scheduler holds those nodes for that job.
+/// A node freed by a preemption, held for the job it was freed for and for the
+/// other jobs in that job's QOS: the QOS earned the node by its right to
+/// preempt, so a job its owner resubmits under a new ID keeps the hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PreemptClaim {
-    pub victims: Vec<JobId>,
-    pub nodes: Vec<String>,
-    /// When the most recent victim was preempted; the hold runs from here.
+pub struct PreemptHold {
+    /// The pending job the victim was preempted for.
+    pub job_id: JobId,
+    /// That job's QOS. `None` holds the node for `job_id` alone.
+    pub qos: Option<String>,
+    /// The job preempted off the node.
+    pub victim: JobId,
+    /// When the victim released the node; the hold runs from here.
     pub at: DateTime<Utc>,
+}
+
+impl PreemptHold {
+    /// Whether `job` may use the held node.
+    pub fn admits(&self, job: &Job) -> bool {
+        job.job_id == self.job_id || (self.qos.is_some() && job.spec.qos == self.qos)
+    }
+
+    /// Whether the hold still applies at `now`. `0` disables the hold.
+    pub fn is_active(&self, now: DateTime<Utc>, hold_secs: u32) -> bool {
+        hold_secs > 0 && now < self.at + chrono::Duration::seconds(i64::from(hold_secs))
+    }
 }
 
 /// Internal job record held by the controller.
@@ -918,10 +935,6 @@ pub struct Job {
     /// the preemption. `None` for plain priority-based preemption.
     #[serde(default)]
     pub preempt_qos: Option<String>,
-    /// Open while this job is pending and others were preempted for it; the
-    /// nodes they freed are held for it. Released when it leaves pending.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preempt_claim: Option<PreemptClaim>,
 
     /// This run started on spare capacity the job's QOS group node quota did not
     /// cover (idle-fill). A stamped job is borrowed: it is held outside every
@@ -1003,7 +1016,6 @@ impl Job {
             preempted_by: None,
             preempt_mode: None,
             preempt_qos: None,
-            preempt_claim: None,
             idle_fill: false,
             preferred_nodes: HashSet::new(),
             last_sched_eval: None,
@@ -1357,49 +1369,6 @@ pub enum TransitionOutcome {
 }
 
 impl Job {
-    /// Record that `victim` was preempted off `nodes`, at `at`, to make room
-    /// for this job.
-    pub fn add_preempt_claim(&mut self, victim: JobId, nodes: &[String], at: DateTime<Utc>) {
-        let claim = self.preempt_claim.get_or_insert_with(|| PreemptClaim {
-            victims: Vec::new(),
-            nodes: Vec::new(),
-            at,
-        });
-        claim.at = claim.at.max(at);
-        if !claim.victims.contains(&victim) {
-            claim.victims.push(victim);
-        }
-        for node in nodes {
-            if !claim.nodes.contains(node) {
-                claim.nodes.push(node.clone());
-            }
-        }
-    }
-
-    /// Restart the hold from `at` when `victim`, preempted for this job, has
-    /// only now released its nodes (it drained in Completing first).
-    pub fn renew_preempt_claim(&mut self, victim: JobId, at: DateTime<Utc>) {
-        if let Some(claim) = self.preempt_claim.as_mut() {
-            if claim.victims.contains(&victim) {
-                claim.at = claim.at.max(at);
-            }
-        }
-    }
-
-    /// Nodes held for this job at `now`: those its open claim freed, until
-    /// `hold_secs` after the latest preemption. `0` disables the hold.
-    pub fn held_nodes(&self, now: DateTime<Utc>, hold_secs: u32) -> &[String] {
-        match &self.preempt_claim {
-            Some(claim)
-                if hold_secs > 0
-                    && now < claim.at + chrono::Duration::seconds(i64::from(hold_secs)) =>
-            {
-                &claim.nodes
-            }
-            _ => &[],
-        }
-    }
-
     /// True while a future `begin_time` defers this job's start, whether it came
     /// from `--begin`, a preemption requeue, or a launch-failure backoff.
     pub fn is_begin_held(&self, now: DateTime<Utc>) -> bool {
@@ -1575,67 +1544,47 @@ mod tests {
         )
     }
 
-    fn nodes(names: &[&str]) -> Vec<String> {
-        names.iter().map(|n| n.to_string()).collect()
+    fn hold(qos: Option<&str>) -> PreemptHold {
+        PreemptHold {
+            job_id: 5,
+            qos: qos.map(str::to_string),
+            victim: 7,
+            at: Utc::now(),
+        }
+    }
+
+    fn job_in(job_id: JobId, qos: Option<&str>) -> Job {
+        let mut job = make_job();
+        job.job_id = job_id;
+        job.spec.qos = qos.map(str::to_string);
+        job
     }
 
     #[test]
-    fn preempt_claim_merges_victims_and_nodes_and_keeps_the_latest_time() {
-        let t0 = Utc::now();
-        let mut job = make_job();
-        job.add_preempt_claim(7, &nodes(&["n1"]), t0);
-        job.add_preempt_claim(8, &nodes(&["n1", "n2"]), t0 + chrono::Duration::seconds(5));
-        job.add_preempt_claim(7, &nodes(&["n2"]), t0);
-        let claim = job.preempt_claim.clone().expect("claim");
-        assert_eq!(claim.victims, vec![7, 8]);
-        assert_eq!(claim.nodes, nodes(&["n1", "n2"]));
-        assert_eq!(claim.at, t0 + chrono::Duration::seconds(5));
-    }
-
-    #[test]
-    fn held_nodes_last_for_the_hold_window_after_the_latest_preemption() {
-        let t0 = Utc::now();
-        let mut job = make_job();
-        assert!(job.held_nodes(t0, 600).is_empty(), "no claim, nothing held");
-
-        job.add_preempt_claim(7, &nodes(&["n1"]), t0);
-        assert_eq!(
-            job.held_nodes(t0 + chrono::Duration::seconds(599), 600),
-            ["n1"]
+    fn a_hold_admits_its_job_and_the_other_jobs_in_its_qos() {
+        let held = hold(Some("primus"));
+        assert!(held.admits(&job_in(5, Some("primus"))));
+        assert!(
+            held.admits(&job_in(6, Some("primus"))),
+            "a resubmitted job in the QOS"
         );
-        assert!(job
-            .held_nodes(t0 + chrono::Duration::seconds(600), 600)
-            .is_empty());
-        assert!(job.held_nodes(t0, 0).is_empty(), "0 disables the hold");
+        assert!(!held.admits(&job_in(6, Some("batch"))));
+        assert!(!held.admits(&job_in(6, None)));
     }
 
     #[test]
-    fn a_victim_releasing_its_nodes_late_restarts_the_hold() {
-        let t0 = Utc::now();
-        let later = t0 + chrono::Duration::seconds(300);
-        let mut job = make_job();
-        job.add_preempt_claim(7, &nodes(&["n1"]), t0);
-
-        job.renew_preempt_claim(9, later);
-        assert_eq!(job.preempt_claim.as_ref().unwrap().at, t0, "not its victim");
-
-        job.renew_preempt_claim(7, later);
-        assert_eq!(job.preempt_claim.as_ref().unwrap().at, later);
-        assert_eq!(
-            job.held_nodes(later + chrono::Duration::seconds(119), 120),
-            ["n1"]
-        );
+    fn a_hold_without_a_qos_admits_only_its_job() {
+        let held = hold(None);
+        assert!(held.admits(&job_in(5, None)));
+        assert!(!held.admits(&job_in(6, None)));
     }
 
     #[test]
-    fn job_without_preempt_claim_deserializes() {
-        let mut value = serde_json::to_value(make_job()).expect("serialize");
-        value
-            .as_object_mut()
-            .expect("object")
-            .remove("preempt_claim");
-        let job: Job = serde_json::from_value(value).expect("old record loads");
-        assert!(job.preempt_claim.is_none());
+    fn a_hold_lasts_for_the_window_after_the_node_is_released() {
+        let held = hold(Some("primus"));
+        assert!(held.is_active(held.at + chrono::Duration::seconds(119), 120));
+        assert!(!held.is_active(held.at + chrono::Duration::seconds(120), 120));
+        assert!(!held.is_active(held.at, 0), "0 disables the hold");
     }
 
     #[test]

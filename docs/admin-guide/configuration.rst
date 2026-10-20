@@ -594,15 +594,16 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - integer
      - ``120``
      - Live
-     - Seconds the nodes freed by a preemption stay held for the job they were
-       freed for, counted from when the latest victim released its nodes (a
-       cancelled victim may drain in ``COMPLETING`` first). While held, no other
-       job is placed on them, backfilled onto them, or preempts for them. The hold
-       normally ends within a pass or two, when that job starts; it also ends when
-       the job fails to launch or ends. It holds nothing while the job can't be
-       scheduled (held, or waiting on a dependency). The window only bounds how
-       long a node can sit idle when the job doesn't start. ``0`` turns the hold
-       off.
+     - Seconds a node freed by a preemption stays held for the job it was freed
+       for and the other jobs in that job's QOS, counted from when the victim
+       released it (a cancelled victim may drain in ``COMPLETING`` first). The
+       QOS keeps the hold, so a job its owner cancels and resubmits under a new
+       ID still gets the node. While held, no job outside the QOS is placed on
+       the node, backfilled onto it, or preempts for it. The hold ends when a job
+       starts on the node, normally within a pass or two. It holds nothing while
+       no job in the QOS can be scheduled (held, or waiting on a dependency).
+       The window only bounds how long a node can sit idle when no such job
+       starts. ``0`` turns the hold off.
    * - ``idle_fill_enabled``
      - boolean
      - ``false``

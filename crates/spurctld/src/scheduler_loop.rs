@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -246,6 +246,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let pending = stage_pass_jobs(
             pending,
             idle_fill_candidates,
+            &cluster.preempt_holds(),
             Utc::now(),
             cluster.config().scheduler.preempt_hold_secs,
         );
@@ -432,10 +433,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
 /// One pass's jobs in placement order: the pending jobs, then the idle-fill
 /// borrow candidates stamped as such, with the nodes freed by a preemption held
-/// for the job they were freed for.
+/// for the job and QOS they were freed for.
 pub(crate) fn stage_pass_jobs(
     mut pending: Vec<spur_core::job::Job>,
     idle_fill_candidates: Vec<spur_core::job::Job>,
+    holds: &[(String, spur_core::job::PreemptHold)],
     now: DateTime<Utc>,
     hold_secs: u32,
 ) -> Vec<spur_core::job::Job> {
@@ -443,32 +445,31 @@ pub(crate) fn stage_pass_jobs(
         job.idle_fill = true;
         job
     }));
-    hold_preempted_nodes(&mut pending, now, hold_secs);
+    hold_preempted_nodes(&mut pending, holds, now, hold_secs);
     pending
 }
 
-/// Hold the nodes freed by a preemption for the pending job they were freed for:
-/// every other job in this pass gets them added to its exclude list, so neither
-/// placement, backfill planning nor `try_preempt` hands them to someone else.
-/// Only the pass's copies change; the stored jobs keep their own `--exclude`.
-/// A preemptor that isn't in the pass (held, waiting on a dependency) holds
-/// nothing, so its nodes don't sit idle while it can't run.
-fn hold_preempted_nodes(pending: &mut [spur_core::job::Job], now: DateTime<Utc>, hold_secs: u32) {
-    let held: BTreeMap<&str, spur_core::job::JobId> = pending
+/// Hold the nodes freed by a preemption for the job they were freed for and the
+/// other jobs in its QOS: every job a hold doesn't admit gets the node added to
+/// its exclude list, so neither placement, backfill planning nor `try_preempt`
+/// hands it to someone else. Only the pass's copies change; the stored jobs
+/// keep their own `--exclude`. A hold with no admitted job in the pass (all
+/// held, or waiting on a dependency) holds nothing, so the node doesn't sit
+/// idle while no one it is held for can run.
+fn hold_preempted_nodes(
+    pending: &mut [spur_core::job::Job],
+    holds: &[(String, spur_core::job::PreemptHold)],
+    now: DateTime<Utc>,
+    hold_secs: u32,
+) {
+    let active: Vec<&(String, spur_core::job::PreemptHold)> = holds
         .iter()
-        .flat_map(|j| {
-            j.held_nodes(now, hold_secs)
-                .iter()
-                .map(move |n| (n.as_str(), j.job_id))
-        })
+        .filter(|(_, hold)| hold.is_active(now, hold_secs))
+        .filter(|(_, hold)| pending.iter().any(|j| hold.admits(j)))
         .collect();
-    if held.is_empty() {
+    if active.is_empty() {
         return;
     }
-    let held: Vec<(String, spur_core::job::JobId)> = held
-        .into_iter()
-        .map(|(n, id)| (n.to_string(), id))
-        .collect();
     for job in pending.iter_mut() {
         let mut exclude: Vec<String> = job
             .spec
@@ -478,8 +479,8 @@ fn hold_preempted_nodes(pending: &mut [spur_core::job::Job], now: DateTime<Utc>,
             .map(spur_sched::node_match::expand_hostlist_or_split)
             .unwrap_or_default();
         let before = exclude.len();
-        for (node, holder) in &held {
-            if *holder != job.job_id && !exclude.contains(node) {
+        for (node, hold) in &active {
+            if !hold.admits(job) && !exclude.contains(node) {
                 exclude.push(node.clone());
             }
         }
@@ -3516,42 +3517,94 @@ mod tests {
         job
     }
 
-    #[test]
-    fn nodes_freed_by_a_preemption_are_excluded_for_every_other_job_in_the_pass() {
-        let now = Utc::now();
-        let mut holder = pending_with_id(10, None);
-        holder.add_preempt_claim(7, &["node3".to_string(), "node4".to_string()], now);
-        let mut pass = vec![
-            holder,
-            pending_with_id(11, None),
-            pending_with_id(12, Some("node[1-2]")),
-            pending_with_id(13, Some("node3")),
-        ];
+    fn in_qos(mut job: Job, qos: &str) -> Job {
+        job.spec.qos = Some(qos.to_string());
+        job
+    }
 
-        hold_preempted_nodes(&mut pass, now, 600);
-
-        assert_eq!(pass[0].spec.exclude, None, "the holder keeps its nodes");
-        assert_eq!(pass[1].spec.exclude.as_deref(), Some("node3,node4"));
-        assert_eq!(
-            pass[2].spec.exclude.as_deref(),
-            Some("node1,node2,node3,node4")
-        );
-        assert_eq!(pass[3].spec.exclude.as_deref(), Some("node3,node4"));
+    fn holds_for(
+        job_id: spur_core::job::JobId,
+        qos: Option<&str>,
+        nodes: &[&str],
+        at: DateTime<Utc>,
+    ) -> Vec<(String, spur_core::job::PreemptHold)> {
+        nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    spur_core::job::PreemptHold {
+                        job_id,
+                        qos: qos.map(str::to_string),
+                        victim: 7,
+                        at,
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn a_hold_past_its_window_or_disabled_excludes_nothing() {
-        let then = Utc::now() - chrono::Duration::seconds(601);
-        let mut holder = pending_with_id(10, None);
-        holder.add_preempt_claim(7, &["node3".to_string()], then);
-        let mut pass = vec![holder, pending_with_id(11, Some("node9"))];
+    fn nodes_freed_by_a_preemption_are_excluded_for_every_job_outside_the_holders_qos() {
+        let now = Utc::now();
+        let holds = holds_for(10, Some("primus"), &["node3", "node4"], now);
+        let mut pass = vec![
+            in_qos(pending_with_id(10, None), "primus"),
+            in_qos(pending_with_id(14, None), "primus"),
+            pending_with_id(11, None),
+            in_qos(pending_with_id(12, Some("node[1-2]")), "batch"),
+            pending_with_id(13, Some("node3")),
+        ];
 
-        hold_preempted_nodes(&mut pass, Utc::now(), 600);
+        hold_preempted_nodes(&mut pass, &holds, now, 120);
+
+        assert_eq!(pass[0].spec.exclude, None, "the holder keeps its nodes");
+        assert_eq!(pass[1].spec.exclude, None, "so does its QOS");
+        assert_eq!(pass[2].spec.exclude.as_deref(), Some("node3,node4"));
+        assert_eq!(
+            pass[3].spec.exclude.as_deref(),
+            Some("node1,node2,node3,node4")
+        );
+        assert_eq!(pass[4].spec.exclude.as_deref(), Some("node3,node4"));
+    }
+
+    #[test]
+    fn a_hold_without_a_qos_admits_only_its_job() {
+        let now = Utc::now();
+        let holds = holds_for(10, None, &["node3"], now);
+        let mut pass = vec![pending_with_id(10, None), pending_with_id(11, None)];
+
+        hold_preempted_nodes(&mut pass, &holds, now, 120);
+
+        assert_eq!(pass[0].spec.exclude, None);
+        assert_eq!(pass[1].spec.exclude.as_deref(), Some("node3"));
+    }
+
+    #[test]
+    fn a_hold_past_its_window_disabled_or_with_no_admitted_job_excludes_nothing() {
+        let now = Utc::now();
+        let stale = holds_for(
+            10,
+            Some("primus"),
+            &["node3"],
+            now - chrono::Duration::seconds(121),
+        );
+        let fresh = holds_for(10, Some("primus"), &["node3"], now);
+        let mut pass = vec![
+            in_qos(pending_with_id(10, None), "primus"),
+            pending_with_id(11, Some("node9")),
+        ];
+
+        hold_preempted_nodes(&mut pass, &stale, now, 120);
         assert_eq!(pass[1].spec.exclude.as_deref(), Some("node9"));
 
-        pass[0].add_preempt_claim(8, &["node3".to_string()], Utc::now());
-        hold_preempted_nodes(&mut pass, Utc::now(), 0);
+        hold_preempted_nodes(&mut pass, &fresh, now, 0);
         assert_eq!(pass[1].spec.exclude.as_deref(), Some("node9"));
+
+        // No job in the holder's QOS is in the pass, so the node isn't idled.
+        let mut others = vec![pending_with_id(11, Some("node9"))];
+        hold_preempted_nodes(&mut others, &fresh, now, 120);
+        assert_eq!(others[0].spec.exclude.as_deref(), Some("node9"));
     }
 
     #[test]

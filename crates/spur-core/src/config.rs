@@ -659,12 +659,12 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
-    /// Seconds the nodes freed by a preemption stay held for the job they were
-    /// freed for, counted from when the latest victim released its nodes. Other
-    /// jobs can't be placed there meanwhile. The hold normally ends within a
-    /// pass or two, when that job starts; it also ends if the job fails to
-    /// launch or ends. The window only bounds how long a node can idle when the
-    /// job doesn't start. `0` disables it.
+    /// Seconds a node freed by a preemption stays held for the job it was freed
+    /// for and the other jobs in that job's QOS, counted from when the victim
+    /// released it. Jobs outside the QOS can't be placed there meanwhile. The
+    /// hold ends when a job starts on the node, normally within a pass or two.
+    /// The window only bounds how long a node can idle when no such job starts.
+    /// `0` disables it.
     #[serde(default = "default_preempt_hold_secs")]
     pub preempt_hold_secs: u32,
     /// Master switch for idle-fill scheduling. `false` (default) means no
