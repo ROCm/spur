@@ -6538,6 +6538,18 @@ impl ClusterManager {
         }
     }
 
+    /// A preempted victim that drained in Completing frees its nodes only when
+    /// they report (JobNodeComplete) or it is force-completed (JobComplete), so
+    /// the hold on those nodes runs from then, not from the preemption.
+    fn restart_preempt_hold_window(&self, victim: JobId, nodes: &[String], at: DateTime<Utc>) {
+        let mut holds = self.preempt_holds.write();
+        for node in nodes {
+            if let Some(hold) = holds.get_mut(node).filter(|h| h.victim == victim) {
+                hold.at = hold.at.max(at);
+            }
+        }
+    }
+
     /// Nodes held for a preemptor and its QOS, for the scheduler pass.
     pub fn preempt_holds(&self) -> Vec<(String, PreemptHold)> {
         self.preempt_holds
@@ -7139,6 +7151,11 @@ impl ClusterManager {
                                     node.state = NodeState::Drain;
                                 }
                             }
+                            self.restart_preempt_hold_window(
+                                *job_id,
+                                std::slice::from_ref(node_name),
+                                timestamp,
+                            );
                         }
                     }
 
@@ -7320,15 +7337,8 @@ impl ClusterManager {
                     &already_deallocated,
                     *job_id,
                 );
-                // A preempted victim that drained in Completing frees its nodes
-                // only now, so the hold on them runs from here.
                 if released {
-                    let mut holds = self.preempt_holds.write();
-                    for node in &freed_nodes {
-                        if let Some(hold) = holds.get_mut(node).filter(|h| h.victim == *job_id) {
-                            hold.at = hold.at.max(timestamp);
-                        }
-                    }
+                    self.restart_preempt_hold_window(*job_id, &freed_nodes, timestamp);
                 }
                 drop(jobs);
                 drop(nodes);
@@ -19438,6 +19448,17 @@ mod tests {
     async fn preempt_with_an_older_lower_qos_job_waiting(
         cm: &Arc<ClusterManager>,
     ) -> (JobId, JobId) {
+        let (victim, older, preemptor) = preempt_and_leave_the_victim_draining(cm).await;
+        report_nodes_released(cm, victim);
+        settle(cm, victim, JobState::Cancelled);
+        (older, preemptor)
+    }
+
+    /// The preemption has applied; the cancelled victim still drains in
+    /// Completing and has not released n1.
+    async fn preempt_and_leave_the_victim_draining(
+        cm: &Arc<ClusterManager>,
+    ) -> (JobId, JobId, JobId) {
         register_node(cm, "n1", 8, 16000);
         cm.qos_cache().insert(Qos {
             name: "burst".into(),
@@ -19487,9 +19508,7 @@ mod tests {
             &cm.config().scheduler,
         )
         .await;
-        report_nodes_released(cm, victim);
-        settle(cm, victim, JobState::Cancelled);
-        (older, preemptor)
+        (victim, older, preemptor)
     }
 
     fn whole_node_spec(name: &str, qos: &str) -> JobSpec {
@@ -19505,6 +19524,30 @@ mod tests {
         let cm = test_cluster_with_config(&dir, preempting_config()).await;
         let (_older, preemptor) = preempt_with_an_older_lower_qos_job_waiting(&cm).await;
         assert_eq!(next_pass_starts(&cm), vec![preemptor]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_hold_window_starts_when_the_victims_node_reports_free() {
+        // A cancelled victim drains in Completing and frees n1 through its
+        // node's completion report (JobNodeComplete), not through JobComplete.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        let (victim, _older, _preemptor) = preempt_and_leave_the_victim_draining(&cm).await;
+        let hold_at = |cm: &ClusterManager| {
+            cm.preempt_holds()
+                .into_iter()
+                .find(|(node, _)| node == "n1")
+                .map(|(_, hold)| hold.at)
+                .expect("n1 is held for the preemptor")
+        };
+        let at_preemption = hold_at(&cm);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        report_nodes_released(&cm, victim);
+        settle(&cm, victim, JobState::Cancelled);
+        assert!(
+            hold_at(&cm) > at_preemption,
+            "the hold runs from the node release, not from the preemption"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
