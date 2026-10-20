@@ -25,7 +25,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  # Every push to main should finish its scan, not be superseded.
+  # A running push scan always finishes. A queued one may be replaced by a
+  # newer push, whose full scan covers everything the replaced one would.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
