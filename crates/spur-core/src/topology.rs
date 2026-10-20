@@ -308,6 +308,8 @@ pub struct SwitchConfig {
 /// Top-level topology configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyConfig {
+    #[serde(default)]
+    pub external: Option<ExternalFabricConfig>,
     /// Plugin type: "tree", "block", or "none".
     #[serde(default = "default_topo_plugin")]
     pub plugin: String,
@@ -318,6 +320,14 @@ pub struct TopologyConfig {
     pub block_size: Option<usize>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalFabricConfig {
+    /// GPU jobs requesting any listed partition must stay within one observed block.
+    #[serde(default)]
+    pub single_block_partitions: Vec<String>,
+}
+
 fn default_topo_plugin() -> String {
     "none".into()
 }
@@ -325,6 +335,7 @@ fn default_topo_plugin() -> String {
 impl Default for TopologyConfig {
     fn default() -> Self {
         Self {
+            external: None,
             plugin: "none".into(),
             switches: Vec::new(),
             block_size: None,
@@ -448,5 +459,28 @@ mod tests {
             Some("fabric0")
         );
         assert!(tree.switches.get("fabric0").unwrap().parent.is_none());
+    }
+}
+
+#[cfg(test)]
+mod external_config_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_topology_json_omits_external_policy() {
+        let config: TopologyConfig =
+            serde_json::from_str(r#"{"plugin":"none","switches":[],"block_size":null}"#).unwrap();
+        assert!(config.external.is_none());
+    }
+
+    #[test]
+    fn external_policy_is_explicit_in_toml() {
+        let config: TopologyConfig =
+            toml::from_str("[external]\nsingle_block_partitions = [\"rack\"]\n").unwrap();
+        assert_eq!(config.external.unwrap().single_block_partitions, ["rack"]);
+        assert!(toml::from_str::<TopologyConfig>(
+            "[external]\nsingle_block_partition = [\"rack\"]\n"
+        )
+        .is_err());
     }
 }

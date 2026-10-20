@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use spur_devices::topology::{FabricObservation, ObservationStatus};
+pub use spur_devices::topology::{FabricObservation, ObservationStatus};
 
 use crate::node::Node;
 
@@ -53,6 +53,8 @@ pub struct UnresolvedFabricDevice {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FabricView {
+    #[serde(default)]
+    pub single_block_partitions: Vec<String>,
     pub namespace: String,
     pub blocks: Vec<FabricBlock>,
     pub unresolved: Vec<UnresolvedFabricDevice>,
@@ -173,6 +175,7 @@ impl FabricView {
         }
         unresolved.sort_by(|a, b| a.device.cmp(&b.device).then(a.issue.cmp(&b.issue)));
         Self {
+            single_block_partitions: Vec::new(),
             namespace: namespace.into(),
             blocks,
             unresolved,
@@ -434,6 +437,7 @@ impl From<&FabricView> for spur_proto::proto::GetFabricTopologyResponse {
             stable_id: key.stable_id,
         };
         Self {
+            single_block_partitions: view.single_block_partitions.clone(),
             namespace: view.namespace.clone(),
             blocks: view
                 .blocks
@@ -524,6 +528,7 @@ impl TryFrom<spur_proto::proto::GetFabricTopologyResponse> for FabricView {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
+            single_block_partitions: view.single_block_partitions,
             namespace: view.namespace,
             blocks,
             unresolved,

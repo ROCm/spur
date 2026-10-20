@@ -43,6 +43,8 @@ pub struct ResourceSet {
     /// for a different logical device is caught by a generation mismatch.
     #[serde(default)]
     pub generation: u64,
+    #[serde(default)]
+    pub fabric_binding_version: u32,
 }
 
 /// Tracks consumed resources (per-node or per-job allocation accounting).
@@ -57,6 +59,8 @@ pub struct ResourceAllocations {
     /// inventory, so a repartition between schedule and launch is caught.
     #[serde(default)]
     pub generation: u64,
+    #[serde(default)]
+    pub fabric_binding: Option<crate::fabric_binding::FabricBinding>,
 }
 
 /// A single allocated device entry.
@@ -213,13 +217,19 @@ impl ResourceSet {
     /// Identity of the schedulable set, independent of `generation`. Two ticks
     /// with an equal fingerprint observed the same topology, so a debounce can
     /// tell "same change seen twice" from "two different partial reads".
-    pub fn schedulable_fingerprint(&self) -> (u32, u64, Vec<GpuResource>, Vec<(String, u64)>) {
+    pub fn schedulable_fingerprint(&self) -> (u32, u64, Vec<GpuResource>, Vec<(String, u64)>, u32) {
         let mut gpus = self.gpus.clone();
         gpus.sort();
         let mut generic: Vec<(String, u64)> =
             self.generic.iter().map(|(k, v)| (k.clone(), *v)).collect();
         generic.sort();
-        (self.cpus, self.memory_mb, gpus, generic)
+        (
+            self.cpus,
+            self.memory_mb,
+            gpus,
+            generic,
+            self.fabric_binding_version,
+        )
     }
 
     /// Clamp this detected inventory to operator caps. `cpus_cap`/`memory_cap_mb`
@@ -248,6 +258,7 @@ impl ResourceSet {
             gpus: self.gpus.clone(),
             generic: self.generic.clone(),
             generation: self.generation,
+            fabric_binding_version: self.fabric_binding_version,
         }
     }
 
@@ -523,6 +534,7 @@ mod tests {
 
     fn sample_inventory() -> ResourceSet {
         ResourceSet {
+            fabric_binding_version: 0,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -618,6 +630,7 @@ mod tests {
     fn test_can_satisfy() {
         let avail = sample_inventory();
         let req = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 32,
             memory_mb: 128_000,
             gpus: vec![GpuResource {
@@ -644,6 +657,7 @@ mod tests {
             .insert("gpu".into(), vec![AllocatedDevice::injectable(0)]);
 
         let req_one = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 1,
             memory_mb: 1,
             gpus: vec![GpuResource {
@@ -720,6 +734,7 @@ mod tests {
     #[test]
     fn available_device_ids_returns_stable_ids_not_positional() {
         let inventory = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -760,6 +775,7 @@ mod tests {
     fn test_build_node_allocation() {
         let inventory = sample_inventory();
         let request = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 8,
             memory_mb: 16_000,
             gpus: vec![GpuResource {
@@ -782,6 +798,7 @@ mod tests {
     #[test]
     fn test_build_node_allocation_multi_type() {
         let inventory = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -826,6 +843,7 @@ mod tests {
             generation: 0,
         };
         let request = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 8,
             memory_mb: 16_000,
             gpus: vec![
@@ -893,6 +911,7 @@ mod accounting_tests {
 
     fn inventory() -> ResourceSet {
         ResourceSet {
+            fabric_binding_version: 0,
             cpus: 64,
             memory_mb: 131_072,
             gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi210")],
@@ -1023,6 +1042,7 @@ mod accounting_tests {
     #[test]
     fn build_exclusive_allocation_omits_absent_gpus_and_zero_counts() {
         let inv = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 8,
             memory_mb: 1024,
             gpus: Vec::new(),
@@ -1042,6 +1062,7 @@ mod accounting_tests {
     #[test]
     fn build_exclusive_allocation_emits_stable_ids_not_positional() {
         let inv = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 16,
             memory_mb: 1024,
             gpus: vec![
@@ -1113,6 +1134,7 @@ mod accounting_tests {
     #[test]
     fn backfill_stable_ids_fills_legacy_zeros_only() {
         let mut inv = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 0,
             memory_mb: 0,
             gpus: vec![
@@ -1157,6 +1179,7 @@ mod accounting_tests {
     #[test]
     fn feasibility_subtracts_held_gpu_by_stable_id() {
         let inv = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 8,
             memory_mb: 1024,
             gpus: vec![GpuResource {
@@ -1175,6 +1198,7 @@ mod accounting_tests {
         assert_eq!(allocated.allocated_count("gpu", Some("mi300x"), &inv), 1);
 
         let req = ResourceSet {
+            fabric_binding_version: 0,
             cpus: 1,
             memory_mb: 1,
             gpus: vec![GpuResource {

@@ -254,6 +254,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -321,6 +322,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -385,6 +387,7 @@ mod tests {
 
         let pending = vec![job];
         let cluster = ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,

@@ -166,6 +166,7 @@ mod tests {
             });
         }
         ResourceSet {
+            fabric_binding_version: 0,
             cpus,
             memory_mb,
             gpus,

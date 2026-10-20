@@ -85,6 +85,11 @@ fn format_view(view: &FabricView) -> String {
         view.blocks.len(),
         view.unresolved.len()
     );
+    let _ = writeln!(
+        out,
+        "SingleBlockPartitions=[{}]",
+        view.single_block_partitions.join(",")
+    );
     for block in &view.blocks {
         let _ = writeln!(
             out,
@@ -154,6 +159,7 @@ mod tests {
     #[test]
     fn formats_scoped_members_and_failures() {
         let view = FabricView {
+            single_block_partitions: vec![],
             namespace: "test".into(),
             unresolved: Vec::new(),
             blocks: vec![FabricBlock {

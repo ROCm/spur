@@ -7,16 +7,16 @@ AMD UALink attributes during local device discovery and inventory refresh.
 No intermediate inventory file or AFM credentials are required on the agent.
 Discovery performs no fabric configuration writes.
 
-This release reports observations. It does **not** enforce single-vPod job
-placement, reserve a whole topology block, or verify AFM readiness. Existing
-GPU scheduling policy remains in effect. Do not use an observed vPod as a
-job containment or security guarantee.
+Observation is enabled independently of scheduling policy. Administrators can
+opt GPU partitions into single-block placement as described below. This mode
+uses membership configured by the external manager; it neither reserves a
+whole topology block nor verifies AFM readiness or fabric isolation.
 
 Inspecting a node
 -----------------
 
 Use ``scontrol show node <node>`` (or ``spur control show node <node>``).
-The response includes ``InventoryGeneration`` and, for GPUs with topology
+The response includes ``InventoryGeneration``, ``FabricBindingVersion``, and, for GPUs with topology
 metadata, full PCI BDF, node-local PCI host bridge, NUMA locality, exact VRAM
 bytes, and fabric observations. For example:
 
@@ -95,10 +95,9 @@ model as JSON in the ``spur.amd.com/topology`` annotation. An invalid annotation
 is reported as unavailable rather than silently disappearing. This annotation
 is an inventory transport, not a validated controller static-import API.
 
-Policy configuration, runtime static import,
-typed GPU predicates, mandatory containment, and pre-launch fabric binding
-validation are subsequent implementation stages. No new job flags are accepted
-for those unimplemented guarantees.
+Typed GPU predicates, runtime static import, segments, topology exclusivity,
+and authoritative fabric health are separate capabilities and are not enabled
+by these observations. No job flags are added for those capabilities.
 
 Controller block inspection
 ---------------------------
@@ -142,5 +141,73 @@ contain its complete registered membership.
 Validation is read-only. It does not install the document, change membership,
 reserve resources, or freeze a fabric configuration. Automatic discovery remains
 the default; no administrator-generated intermediate file is required. Runtime
-static input and enforced placement will use the same membership-resolution
-contract in a subsequent implementation stage.
+static import is not enabled by exporting or validating a document.
+
+Single-block placement policy
+-----------------------------
+
+Upgrade every controller before enabling this configuration. Upgrade agents on
+the participating nodes and verify ``FabricBindingVersion=1`` in node inspection;
+older agents report zero and cannot satisfy this policy. Add the following to
+the controller's existing TOML configuration, using existing partition names:
+
+.. code-block:: toml
+
+   [topology.external]
+   single_block_partitions = ["rack"]
+
+The controller reads this policy and rebuilds membership on each scheduling
+cycle. Reconfiguration updates the policy without rebuilding a fixed rack list.
+``topology show`` includes ``SingleBlockPartitions``. A GPU job requesting any
+listed partition, including one in a comma-separated partition list, must bind
+its selected GPUs within one consistent block. The default partition follows
+the same rule. Ordinary GPU quantity and type options continue to apply to
+batch, interactive allocations, and standalone runs. ``--topology`` remains a
+locality hint and cannot disable this requirement.
+
+Bare ``--exclusive`` retains whole-node allocation semantics. Under this policy,
+every GPU reserved on an exclusive node must belong to the same chosen block;
+a node spanning multiple blocks cannot satisfy an exclusive request. CPU-only
+jobs without node exclusivity do not require a fabric binding. ``ExclusiveTopo``
+is rejected by partition create/update commands because whole-block exclusivity
+is not implemented.
+
+For each job, the scheduler considers complete, consistent blocks whose candidate
+nodes advertise binding enforcement. It filters each node's inventory to that
+block's exact GPU IDs and runs the existing resource and backfill solver. It
+chooses the earliest feasible start, breaking block ties by scoped block key.
+Node lists, GPU types and quantities, CPU/memory requirements, and reservations
+still apply. Selected GPU IDs must remain free throughout the proposed interval.
+Future shadow reservations hold those same concrete resources so shorter jobs
+can fill gaps without consuming them at the reserved start.
+
+The controller validates the selected block again before recording the placement.
+Each per-node allocation persists its block key, active endpoints, exact logical
+GPU membership, binding version, and inventory generation. ``scontrol show job``
+displays the resulting per-node fabric binding. A failed search reports
+``FabricUnavailable`` in the pending reason description.
+
+The agent checks the binding under its allocation lock before admitting the
+resources. AMD UALink bindings also reread the allowlisted attributes of the bound
+PCI devices. Missing observations, changed domains/endpoints, a changed inventory
+generation, or an unsupported binding version reject the launch. Other discovery
+sources use their current typed inventory for binding checks. No device or fabric
+configuration is written. A supervisor retains the parent binding across an
+agent restart, and numbered/interactive steps validate it before executing;
+they cannot acquire devices outside the parent allocation. Capable agents start
+with a nonzero random inventory epoch, fencing bindings from an earlier agent
+instance. An inventory change or agent restart requires requeuing a stale
+allocation before new steps can launch.
+
+This is a snapshot-based placement contract. An external manager can still
+change a fabric after preflight or while a job is running; operators must
+coordinate such changes with running allocations. Observed membership is not
+an assertion of fabric readiness, bandwidth, security isolation, or an atomic
+fabric lease.
+
+Heterogeneous job groups are left pending under this policy until group-wide
+binding is supported. Policy-constrained jobs do not trigger automatic preemption,
+idle-fill reclamation, or federation forwarding, whose current selection paths
+do not carry fabric requirements. Ordinary backfill, including future resource
+reservations, remains available. Segments, whole-block exclusivity, and runtime
+static import remain future extensions.
