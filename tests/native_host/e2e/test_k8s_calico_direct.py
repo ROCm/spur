@@ -16,7 +16,7 @@ import re
 
 import pytest
 
-from wg_cluster import wait_until
+from cluster import wait_until
 
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 

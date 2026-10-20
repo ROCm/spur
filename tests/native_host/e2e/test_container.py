@@ -159,7 +159,7 @@ class TestContainerSingleNode:
         state = wait_job(cluster, job_id, timeout=60)
         diag = cluster.debug_job(job_id)
         assert state in ("CD", "GONE"), (
-            f"/dev/shm test failed (1=write failed, 2=not mounted), state={state}\n{diag}"
+            f"/dev/shm test failed (1=write failed, 2=not mounted), state={state}\n{diag}"  # nosec B108
         )
 
     def test_container_pid_namespace(self, container_cluster):

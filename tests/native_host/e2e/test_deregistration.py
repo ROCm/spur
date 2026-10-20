@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from cluster import parse_job_id, job_state
+from cluster import parse_job_id, job_state, wait_node_gone, wait_node_state
 
 
 def _wait_job_terminal(cluster, job_id, timeout=120):
@@ -32,37 +32,6 @@ def _wait_job_terminal(cluster, job_id, timeout=120):
     raise TimeoutError(
         f"Job {job_id} did not reach terminal state within {timeout}s (last: {last})"
     )
-
-
-def _wait_node_state(cluster, node_name, target_states, timeout=60):
-    """Poll sinfo until a node reaches one of the target states."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            state = cluster.sinfo_nodes().get(node_name)
-            if state is not None:
-                for target in target_states:
-                    if state.startswith(target):
-                        return state
-        except Exception:
-            pass
-        time.sleep(2)
-    raise TimeoutError(
-        f"Node {node_name} did not reach {target_states} within {timeout}s"
-    )
-
-
-def _wait_node_gone(cluster, node_name, timeout=60):
-    """Poll sinfo until a node disappears."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            if node_name not in cluster.sinfo_nodes():
-                return
-        except Exception:
-            pass
-        time.sleep(2)
-    raise TimeoutError(f"Node {node_name} still visible after {timeout}s")
 
 
 def _kill_agent(cluster, node_index):
@@ -91,7 +60,7 @@ class TestDrainAndRemove:
         node0 = cluster.node_names[0]
 
         cluster.cli(["spur", "node", "drain", node0, "--reason", "maintenance"])
-        _wait_node_state(cluster, node0, ["drain"])
+        wait_node_state(cluster, node0, ["drain"])
 
         out = cluster.sinfo()
         assert "drain" in out.lower()
@@ -109,7 +78,7 @@ class TestDrainAndRemove:
         assert state == "CD", f"expected COMPLETED, got {state}"
 
         cluster.cli(["spur", "node", "remove", node0])
-        _wait_node_gone(cluster, node0)
+        wait_node_gone(cluster, node0)
 
 
 class TestForcedEviction:
@@ -141,7 +110,7 @@ class TestForcedEviction:
 
         state = _wait_job_terminal(cluster, job_id)
         assert state == "NF", f"expected NODE_FAIL, got {state}"
-        _wait_node_gone(cluster, node0)
+        wait_node_gone(cluster, node0)
 
     def test_remove_blocked_by_running_jobs(self, multi_node_cluster):
         cluster = multi_node_cluster
@@ -179,7 +148,7 @@ class TestAgentSelfDeregistration:
         node1 = cluster.node_names[1]
 
         _sigterm_agent(cluster, 1)
-        _wait_node_state(cluster, node1, ["down"], timeout=30)
+        wait_node_state(cluster, node1, ["down"], timeout=30)
         assert node1 in cluster.sinfo_nodes()
         reasons = cluster.cli(["sinfo", "-R"])
         assert "agent shutdown" in reasons and node1 in reasons, reasons
@@ -198,7 +167,7 @@ class TestAgentSelfDeregistration:
         assert cluster.sinfo_nodes().get(node1, "").startswith("down")
 
         cluster.restart_agent(1)
-        _wait_node_state(cluster, node1, ["idle"], timeout=90)
+        wait_node_state(cluster, node1, ["idle"], timeout=90)
 
 
 class TestDownNodeFailsJobs:

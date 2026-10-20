@@ -9,25 +9,7 @@ The multi_node_cluster fixture validates this and skips if insufficient.
 
 import time
 
-from cluster import parse_job_id, job_state, wait_job, wait_job_state
-
-
-def _wait_node_state(cluster, node_name, target_states, timeout=60):
-    """Poll sinfo until a node reaches one of the target states."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            state = cluster.sinfo_nodes().get(node_name)
-            if state is not None:
-                for target in target_states:
-                    if state.startswith(target):
-                        return state
-        except Exception:
-            pass
-        time.sleep(2)
-    raise TimeoutError(
-        f"Node {node_name} did not reach {target_states} within {timeout}s"
-    )
+from cluster import parse_job_id, job_state, wait_job, wait_job_state, wait_node_state
 
 
 class TestMultiNodeDispatch:
@@ -344,10 +326,10 @@ class TestMultiNodeStateUpdate:
                          "State=DRAIN", "Reason=e2e-multi")
 
         for name in [n0, n1]:
-            _wait_node_state(cluster, name, ["drain"])
+            wait_node_state(cluster, name, ["drain"])
 
         cluster.scontrol("update", f"NodeName={hostlist}",
                          "State=RESUME")
 
         for name in [n0, n1]:
-            _wait_node_state(cluster, name, ["idle"])
+            wait_node_state(cluster, name, ["idle"])

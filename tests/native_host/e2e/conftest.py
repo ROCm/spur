@@ -141,7 +141,8 @@ def remote_bin_dir(ssh_nodes, tmp_path_factory):
         return
 
     session_tmp = tmp_path_factory.getbasetemp()
-    remote_path = f"/tmp/spur-e2e-bin-{session_tmp.name}"
+    # Lives on the disposable test VMs and is unique per pytest session.
+    remote_path = f"/tmp/spur-e2e-bin-{session_tmp.name}"  # nosec B108
 
     yield remote_path
 
@@ -289,7 +290,7 @@ def k8s_multicp_cluster(ssh_nodes, remote_bin_dir):
         c.k8s_down(reset=True)
         c.wait_k8s_phase("down", timeout=180)
     except Exception:
-        pass
+        logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
 
 
@@ -319,7 +320,7 @@ def k8s_calico_direct_cluster(ssh_nodes, remote_bin_dir):
         c.k8s_down(reset=True)
         c.wait_k8s_phase("down", timeout=180)
     except Exception:
-        pass
+        logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
     _reset_k0s_all_nodes(c)
 
@@ -425,7 +426,7 @@ def gpu_pmix_cluster(request, ssh_nodes, remote_bin_dir):
         ssh_nodes,
         remote_bin_dir,
         agent_as_root=as_root,
-        config_overrides={"mpi": {"plugin_dir": plugin_dir, "pmix_tmpdir": "/tmp/spur-pmix"}},
+        config_overrides={"mpi": {"plugin_dir": plugin_dir, }},
     )
     yield c
     c.teardown()
@@ -488,7 +489,6 @@ def mpi_multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     mpi_cfg = {
         "mpi": {
             "plugin_dir": plugin_dir,
-            "pmix_tmpdir": "/tmp/spur-pmix",
         }
     }
     overrides = cluster_config_overrides or {}
@@ -519,7 +519,6 @@ def mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     mpi_cfg = {
         "mpi": {
             "plugin_dir": plugin_dir,
-            "pmix_tmpdir": "/tmp/spur-pmix",
         }
     }
     overrides = cluster_config_overrides or {}
@@ -704,7 +703,7 @@ def _teardown_wg_k0s(c):
         c.k8s_down(reset=True)
         c.wait_k8s_phase("down", timeout=120)
     except Exception:
-        pass
+        logger.warning("k8s_down failed; forcing per-node k0s reset", exc_info=True)
     # Kill spurctld/spurd BEFORE the manual k0s reset: k8s_down(reset=True) kicks
     # off an async reconcile that stops the k0s components itself, so if the
     # daemons are still alive while _reset_k0s_all_nodes runs its `k0s reset`/

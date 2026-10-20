@@ -110,7 +110,7 @@ class TestStepCgroupNames:
 # Task hooks are node hooks read at agent start; the hardened validator refuses a
 # hook that is not an absolute path owned by root and not group/world-writable, so
 # the scripts are placed at a fixed path and chowned to root before the cluster starts.
-_HOOK_DIR = "/tmp/spur-e2e-taskhook"
+_HOOK_DIR = "/tmp/spur-e2e-taskhook"  # nosec B108
 _PROLOG = f"{_HOOK_DIR}/task_prolog.sh"
 _EPILOG = f"{_HOOK_DIR}/task_epilog.sh"
 _PROLOG_MARKER = f"{_HOOK_DIR}/prolog.marker"

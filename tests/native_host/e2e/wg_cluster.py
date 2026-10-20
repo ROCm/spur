@@ -13,11 +13,10 @@ drive the base cluster directly; tests that only need the raw mesh use this.
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass
 
 # cluster.py lives in native_host/e2e, which pytest.ini puts on pythonpath.
-from cluster import SshNode
+from cluster import SshNode, wait_until
 
 # Test mesh CIDR. Not the product default (10.44.0.0/16): that overlaps the CI
 # runner underlay, which routes the underlay into spur0 and stalls k0s/calico.
@@ -320,14 +319,3 @@ def wg_available(node: SshNode, sudo_prefix: str) -> tuple[bool, str]:
     if "KMOD" in probe or "USERSPACE" in probe:
         return True, ""
     return False, "no WireGuard kernel module and no wireguard-go userspace fallback"
-
-
-def wait_until(predicate, timeout_s: int, interval_s: int = 3,
-               desc: str = "condition") -> None:
-    """Poll *predicate* until true or raise TimeoutError."""
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise TimeoutError(f"{desc} not met within {timeout_s}s")

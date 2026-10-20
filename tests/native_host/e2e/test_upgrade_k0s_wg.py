@@ -37,8 +37,8 @@ from pathlib import Path
 
 import pytest
 
-from cluster import BINARIES
-from wg_cluster import WG_IFACE, WgMesh, wait_until
+from cluster import BINARIES, wait_until
+from wg_cluster import WG_IFACE, WgMesh
 
 logger = logging.getLogger(__name__)
 
@@ -140,16 +140,7 @@ def _deploy_canary(c, name: str, replicas: int) -> None:
         "      restartPolicy: Always\n"
         "      terminationGracePeriodSeconds: 0\n"
     )
-    cp_nodes = c.k8s_control_planes()
-    cp_idx = c.node_names.index(cp_nodes[0]) if cp_nodes else 0
-    remote_path = f"/tmp/{name}-deploy.yaml"
-    c.nodes[cp_idx].write_file(remote_path, manifest)
-    out = c.nodes[cp_idx].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for deployment {name} did not succeed:\n{out}"
-    )
+    c.k8s_apply(manifest, f"{name}-deploy", f"deployment {name}")
 
 
 def _wait_deployment_ready(c, name: str, timeout: int = 300) -> None:
@@ -224,16 +215,7 @@ def _schedule_new_pod(c, name: str, timeout: int = 180) -> None:
         "    command: ['sh','-c','echo POST_UPGRADE_OK && sleep 30']\n"
         "  restartPolicy: Never\n"
     )
-    cp_nodes = c.k8s_control_planes()
-    cp_idx = c.node_names.index(cp_nodes[0]) if cp_nodes else 0
-    remote_path = f"/tmp/{name}.yaml"
-    c.nodes[cp_idx].write_file(remote_path, manifest)
-    out = c.nodes[cp_idx].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for pod {name} did not succeed:\n{out}"
-    )
+    c.k8s_apply(manifest, name, f"pod {name}")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -482,14 +464,7 @@ def _launch_pinned_pod(c, cp_index: int, name: str, node_name: str) -> str:
         "    command: ['sh','-c','sleep 3600']\n"
         "  restartPolicy: Never\n"
     )
-    remote_path = f"/tmp/{name}.yaml"
-    c.nodes[cp_index].write_file(remote_path, manifest)
-    out = c.nodes[cp_index].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for pod {name} failed:\n{out}"
-    )
+    c.k8s_apply(manifest, name, f"pod {name}", node_index=cp_index)
     return name
 
 
@@ -510,14 +485,7 @@ def _launch_httpd_pod(c, cp_index: int, name: str, node_name: str,
         "    ports:\n    - containerPort: 80\n"
         "  restartPolicy: Never\n"
     )
-    remote_path = f"/tmp/{name}.yaml"
-    c.nodes[cp_index].write_file(remote_path, manifest)
-    out = c.nodes[cp_index].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for httpd pod {name} failed:\n{out}"
-    )
+    c.k8s_apply(manifest, name, f"httpd pod {name}", node_index=cp_index)
     return name
 
 
@@ -543,14 +511,7 @@ def _expose_clusterip(c, cp_index: int, pod: str, svc: str,
         f"  selector:\n    app: {pod}\n"
         f"  ports:\n  - port: {port}\n    targetPort: {port}\n"
     )
-    remote_path = f"/tmp/{svc}-svc.yaml"
-    c.nodes[cp_index].write_file(remote_path, manifest)
-    out = c.nodes[cp_index].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for service {svc} failed:\n{out}"
-    )
+    c.k8s_apply(manifest, f"{svc}-svc", f"service {svc}", node_index=cp_index)
 
     def read_cip() -> str:
         cip = _kubectl(

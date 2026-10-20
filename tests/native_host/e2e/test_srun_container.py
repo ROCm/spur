@@ -26,7 +26,6 @@ separately because they are reached by genuinely different setups:
 """
 
 import shlex
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -60,39 +59,11 @@ def _build_marked_image(tmp_path: Path, cluster) -> str:
     rootfs = tmp_path / "rootfs"
     local_img = tmp_path / "step-test-container.sqsh"
 
-    build_script = f"""set -e
-R='{rootfs}'
-mkdir -p "$R/bin" "$R/usr/bin" "$R/lib" "$R/lib64" \
-  "$R/etc" "$R/dev" "$R/proc" "$R/sys" "$R/tmp" \
-  "$R/run" "$R/home" "$R/mnt"
-for b in bash cat echo sleep hostname id stat ls touch pwd env grep awk; do
-  src=$(which "$b" 2>/dev/null) || continue
-  [ -f "$src" ] && cp "$src" "$R/usr/bin/"
-done
-ln -sf /usr/bin/bash "$R/bin/bash"
-ln -sf /usr/bin/bash "$R/bin/sh"
-for f in "$R/usr/bin/"*; do
-  ldd "$f" 2>/dev/null | grep '=>' | awk '{{print $3}}' | while read -r lib; do
-    [ -f "$lib" ] || continue
-    dir=$(dirname "$lib")
-    mkdir -p "$R$dir"
-    cp -n "$lib" "$R$lib" 2>/dev/null || true
-  done
-done
-for nsslib in libnss_dns.so.2 libnss_files.so.2 libresolv.so.2; do
-  src="/lib/x86_64-linux-gnu/$nsslib"
-  [ -f "$src" ] && mkdir -p "$R/lib/x86_64-linux-gnu" && cp -n "$src" "$R/lib/x86_64-linux-gnu/" 2>/dev/null || true
-done
-[ -f /lib64/ld-linux-x86-64.so.2 ] && cp -n /lib64/ld-linux-x86-64.so.2 "$R/lib64/" 2>/dev/null || true
-for f in /etc/passwd /etc/group /etc/nsswitch.conf; do
-  [ -f "$f" ] && cp "$f" "$R/etc/"
-done
-echo '{MARKER_CONTENT}' > "$R{MARKER_PATH}"
-mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
-"""
-    result = subprocess.run(["sh", "-c", build_script], capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"mksquashfs failed: {result.stderr}")
+    cluster.build_test_rootfs(
+        rootfs,
+        extra=f"""echo '{MARKER_CONTENT}' > "$R{MARKER_PATH}"
+mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1""",
+    )
 
     for node in cluster.nodes:
         node.upload(str(local_img), remote_path)
@@ -207,7 +178,7 @@ class TestSrunContainerStepNewRootfs:
             "pwd",
         ])
         assert code == 0, f"srun --container-workdir failed (exit {code}):\n{out}"
-        assert "/tmp" in out.strip(), f"expected workdir /tmp, got:\n{out}"
+        assert "/tmp" in out.strip(), f"expected workdir /tmp, got:\n{out}"  # nosec B108
 
     def test_mount_home(self, step_container_cluster):
         """--container-mount-home makes the job user's home available inside the

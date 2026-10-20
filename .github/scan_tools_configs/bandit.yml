@@ -19,3 +19,10 @@ exclude_dirs:
   - build
   - dist
   - node_modules
+
+# pytest reports failures through bare asserts, so B101 is noise under tests.
+# The leading */ also matches the baseline's .scan-target/ checkout prefix.
+assert_used:
+  skips:
+    - "*/tests/*"
+    - "tests/*"
