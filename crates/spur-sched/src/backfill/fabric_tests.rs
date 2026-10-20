@@ -82,6 +82,14 @@ fn job(id: u32, node_count: u32, gpus: u32) -> Job {
 }
 
 fn run(nodes: &[Node], jobs: &[Job]) -> (BackfillScheduler, Vec<Assignment>) {
+    run_with_policy(nodes, jobs, true)
+}
+
+fn run_with_policy(
+    nodes: &[Node],
+    jobs: &[Job],
+    enforce: bool,
+) -> (BackfillScheduler, Vec<Assignment>) {
     let partitions = [Partition {
         name: "rack".into(),
         is_default: true,
@@ -108,7 +116,7 @@ fn run(nodes: &[Node], jobs: &[Job]) -> (BackfillScheduler, Vec<Assignment>) {
         partitions: &partitions,
         reservations: &[],
         topology: None,
-        fabric: Some(&context),
+        fabric: enforce.then_some(&context),
         busy_until: &busy,
     };
     let mut scheduler = BackfillScheduler::new(100);
@@ -231,4 +239,72 @@ fn required_nodelist_and_node_exclusivity_are_preserved() {
     let allocation = assignments[0].per_node_alloc.values().next().unwrap();
     assert_eq!(allocation.cpus, 8);
     assert_eq!(allocation.total_device_count("gpu"), 2);
+}
+
+#[test]
+fn partial_gpu_occupancy_still_reserves_total_demand_after_release() {
+    let mut nodes = nodes(2);
+    for node in &mut nodes {
+        node.state = NodeState::Mixed;
+        node.alloc_resources = ResourceAllocations {
+            cpus: 1,
+            devices: [("gpu".into(), vec![AllocatedDevice::injectable(42)])].into(),
+            ..Default::default()
+        };
+    }
+    for enforce in [false, true] {
+        let (scheduler, assignments) =
+            run_with_policy(&nodes, &[job(1, 2, 4), job(2, 1, 1)], enforce);
+        assert_eq!(
+            assignments.iter().map(|a| a.job_id).collect::<Vec<_>>(),
+            [2]
+        );
+        for timeline in &scheduler.timelines {
+            let reserved = timeline
+                .intervals
+                .iter()
+                .find(|i| i.job_id == Some(1))
+                .expect("total GPU demand must hold a future slot");
+            assert_eq!(reserved.start, now() + Duration::seconds(60));
+            assert_eq!(reserved.resources.device_ids("gpu"), [42, 43]);
+        }
+    }
+}
+
+#[test]
+fn future_total_gpu_reservation_routes_long_job_to_another_block() {
+    let mut nodes = nodes(4);
+    for node in &mut nodes[..2] {
+        node.state = NodeState::Mixed;
+        node.alloc_resources = ResourceAllocations {
+            cpus: 1,
+            devices: [("gpu".into(), vec![AllocatedDevice::injectable(42)])].into(),
+            ..Default::default()
+        };
+    }
+    let mut reserved = job(1, 2, 4);
+    reserved.spec.nodelist = Some("n0,n1".into());
+    let mut long = job(2, 2, 2);
+    long.spec.time_limit = Some(Duration::seconds(90));
+    let (scheduler, assignments) = run(&nodes, &[reserved, long]);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].job_id, 2);
+    assert_eq!(assignments[0].nodes, ["n2", "n3"]);
+    let planned: Vec<_> = scheduler
+        .timelines
+        .iter()
+        .flat_map(|t| {
+            t.intervals
+                .iter()
+                .filter(|i| i.job_id == Some(1))
+                .map(|i| (t.node_name.as_str(), i.start))
+        })
+        .collect();
+    assert_eq!(
+        planned,
+        [
+            ("n0", now() + Duration::seconds(60)),
+            ("n1", now() + Duration::seconds(60)),
+        ]
+    );
 }
