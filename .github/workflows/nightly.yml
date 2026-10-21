@@ -72,9 +72,10 @@ jobs:
 
       - name: Package binaries
         if: steps.check.outputs.skip != 'true'
+        env:
+          DATE: ${{ steps.meta.outputs.date }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
-          DATE="${{ steps.meta.outputs.date }}"
-          SHORT_SHA="${{ steps.meta.outputs.short_sha }}"
           DIST="spur-nightly-${DATE}-${SHORT_SHA}-linux-amd64"
 
           mkdir -p "${DIST}/bin"
