@@ -1412,6 +1412,7 @@ address = "http://peer-a:6817"
 
         let total = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256000,
             gpus: vec![],
@@ -1421,6 +1422,7 @@ address = "http://peer-a:6817"
         let alloc = ResourceAllocations::with_scalar(60, 200000);
         let required = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 32,
             memory_mb: 128000,
             gpus: vec![],

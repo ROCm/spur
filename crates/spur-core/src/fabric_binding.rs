@@ -10,6 +10,7 @@ use crate::fabric::{FabricBlock, FabricBlockKey, FabricMember};
 use crate::resource::{ResourceAllocations, ResourceSet};
 
 pub const FABRIC_BINDING_VERSION: u32 = 1;
+pub const FILE_BINDING_VERSION: u32 = 2;
 
 /// The controller's exact per-node selection, retained for dispatch and steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +21,10 @@ pub struct FabricBinding {
     pub key: FabricBlockKey,
     pub active_endpoints: Vec<String>,
     pub members: Vec<FabricMember>,
+    #[serde(default)]
+    pub file_revision: Option<String>,
+    #[serde(default)]
+    pub observed_key: Option<FabricBlockKey>,
 }
 
 impl FabricBinding {
@@ -44,7 +49,13 @@ impl FabricBinding {
         Ok(Self {
             node: node.into(),
             inventory_generation: allocation.generation,
-            version: FABRIC_BINDING_VERSION,
+            version: if block.file_revision.is_some() {
+                FILE_BINDING_VERSION
+            } else {
+                FABRIC_BINDING_VERSION
+            },
+            file_revision: block.file_revision.clone(),
+            observed_key: block.observed_key.clone(),
             key: block.key.clone(),
             active_endpoints: block.active_endpoints.clone(),
             members,
@@ -58,8 +69,12 @@ impl FabricBinding {
         inventory: &ResourceSet,
         allocation: &ResourceAllocations,
     ) -> Result<(), String> {
-        if self.version != FABRIC_BINDING_VERSION || inventory.fabric_binding_version < self.version
-        {
+        let expected_version = if self.file_revision.is_some() {
+            FILE_BINDING_VERSION
+        } else {
+            FABRIC_BINDING_VERSION
+        };
+        if self.version != expected_version || inventory.fabric_binding_version < self.version {
             return Err("unsupported fabric binding version".into());
         }
         if self.key.namespace != namespace
@@ -74,6 +89,23 @@ impl FabricBinding {
         }
         if allocation.generation == 0 || allocation.generation != inventory.generation {
             return Err("stale fabric binding inventory generation".into());
+        }
+        if let Some(revision) = &self.file_revision {
+            if revision.len() != 64
+                || !revision.bytes().all(|b| b.is_ascii_hexdigit())
+                || inventory.block_file_revision.as_ref() != Some(revision)
+            {
+                return Err("stale or invalid block file revision".into());
+            }
+        } else if self.observed_key.is_some() {
+            return Err("native binding cannot override its observed key".into());
+        }
+        let observed_key = self.observed_key.as_ref().unwrap_or(&self.key);
+        if observed_key.namespace != namespace
+            || observed_key.physical_domain != self.key.physical_domain
+            || observed_key.fabric_domain.is_empty()
+        {
+            return Err("invalid observed block scope".into());
         }
         let active: BTreeSet<_> = self.active_endpoints.iter().collect();
         if active.is_empty() || active.len() != self.active_endpoints.len() {
@@ -105,6 +137,20 @@ impl FabricBinding {
             if matches.next().is_some() {
                 return Err("fabric binding GPU identity is ambiguous".into());
             }
+            if self.file_revision.is_some() && self.observed_key.is_none() {
+                if gpu
+                    .topology
+                    .as_ref()
+                    .and_then(|t| t.fabric.as_ref())
+                    .is_some()
+                    || member.endpoint
+                        != crate::block_file::declared_endpoint(node, member.device.stable_id)
+                    || !active.contains(&member.endpoint)
+                {
+                    return Err("declared membership no longer matches local inventory".into());
+                }
+                continue;
+            }
             let observation = gpu
                 .topology
                 .as_ref()
@@ -112,8 +158,8 @@ impl FabricBinding {
                 .ok_or("fabric observation is missing")?;
             if observation.status != ObservationStatus::Observed
                 || !observation.issues.is_empty()
-                || observation.physical_domain_id.as_ref() != Some(&self.key.physical_domain)
-                || observation.fabric_domain_id.as_ref() != Some(&self.key.fabric_domain)
+                || observation.physical_domain_id.as_ref() != Some(&observed_key.physical_domain)
+                || observation.fabric_domain_id.as_ref() != Some(&observed_key.fabric_domain)
                 || observation.endpoint_id.as_ref() != Some(&member.endpoint)
                 || !active.contains(&member.endpoint)
                 || !observation.local_endpoints.contains(&member.endpoint)
@@ -132,6 +178,15 @@ pub fn to_proto(binding: &FabricBinding) -> spur_proto::proto::FabricBinding {
         version: binding.version,
         node: binding.node.clone(),
         inventory_generation: binding.inventory_generation,
+        file_revision: binding.file_revision.clone(),
+        observed_key: binding
+            .observed_key
+            .as_ref()
+            .map(|k| proto::FabricBlockKey {
+                namespace: k.namespace.clone(),
+                physical_domain: k.physical_domain.clone(),
+                fabric_domain: k.fabric_domain.clone(),
+            }),
         key: Some(proto::FabricBlockKey {
             namespace: binding.key.namespace.clone(),
             physical_domain: binding.key.physical_domain.clone(),
@@ -160,6 +215,12 @@ pub fn from_proto(binding: spur_proto::proto::FabricBinding) -> FabricBinding {
         version: binding.version,
         node: binding.node.clone(),
         inventory_generation: binding.inventory_generation,
+        file_revision: binding.file_revision,
+        observed_key: binding.observed_key.map(|k| FabricBlockKey {
+            namespace: k.namespace,
+            physical_domain: k.physical_domain,
+            fabric_domain: k.fabric_domain,
+        }),
         key: FabricBlockKey {
             namespace: key.namespace,
             physical_domain: key.physical_domain,
@@ -195,6 +256,7 @@ mod tests {
         let inventory = ResourceSet {
             generation: 7,
             fabric_binding_version: 1,
+            block_file_revision: None,
             gpus: vec![GpuResource {
                 device_id: 0,
                 stable_id: 42,
@@ -224,6 +286,8 @@ mod tests {
             ..Default::default()
         };
         let block = FabricBlock {
+            file_revision: None,
+            observed_key: None,
             key: FabricBlockKey {
                 namespace: "test".into(),
                 physical_domain: "rack-a".into(),
@@ -274,6 +338,16 @@ mod tests {
             serde_json::from_str(r#"{"cpus":4,"memory_mb":1024,"devices":{},"generation":7}"#)
                 .unwrap();
         assert_eq!(inventory.fabric_binding_version, 0);
+        assert!(inventory.block_file_revision.is_none());
+        assert!(allocation.fabric_binding.is_none());
+        let binding: FabricBinding = serde_json::from_str(r#"{"version":1,"node":"n1","inventory_generation":7,"key":{"namespace":"test","physical_domain":"rack-a","fabric_domain":"7"},"active_endpoints":["1"],"members":[{"device":{"node":"n1","stable_id":42},"endpoint":"1","inventory_generation":7}]}"#).unwrap();
+        assert!(binding.file_revision.is_none());
+        assert!(binding.observed_key.is_none());
+        let (_, inventory, allocation) = fixture();
+        binding
+            .validate("test", "n1", &inventory, &allocation)
+            .unwrap();
+
         assert!(allocation.fabric_binding.is_none());
     }
 

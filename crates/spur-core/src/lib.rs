@@ -7,6 +7,7 @@ pub mod admission;
 pub mod array;
 pub mod audit_metrics;
 pub mod auth;
+pub mod block_file;
 pub mod burst_buffer;
 pub mod config;
 pub mod dependency;

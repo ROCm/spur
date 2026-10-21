@@ -3995,6 +3995,7 @@ mod tests {
     fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {
         ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus,
             memory_mb,
             gpus,
@@ -4156,6 +4157,7 @@ mod tests {
         gen_a.insert("license:fluent".to_string(), 5u64);
         let total_a = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![],
@@ -4167,6 +4169,7 @@ mod tests {
         gen_b.insert("license:fluent".to_string(), 3u64);
         let total_b = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![],

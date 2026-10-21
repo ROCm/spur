@@ -1065,6 +1065,7 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
 
     ResourceSet {
         fabric_binding_version: 0,
+        block_file_revision: None,
         cpus,
         memory_mb: memory,
         gpus: Vec::new(),

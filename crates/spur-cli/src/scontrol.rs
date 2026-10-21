@@ -735,6 +735,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         "   InventoryGeneration={} FabricBindingVersion={}",
                         resources.generation, resources.fabric_binding_version
                     );
+                    if let Some(revision) = &resources.block_file_revision {
+                        println!("   BlockFileRevision={revision}");
+                    }
                     for gpu in &resources.gpus {
                         print!("{}", format_gpu_topology(gpu));
                     }
@@ -2206,6 +2209,13 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
                         .map(|device| device.stable_id.to_string())
                 })
                 .collect();
+            if let Some(revision) = &binding.file_revision {
+                let _ = writeln!(
+                    out,
+                    "   BlockFileRevision={} BindingVersion={}",
+                    revision, binding.version
+                );
+            }
             let _ = writeln!(out, "   FabricNode={} Namespace={} PhysicalDomain={} FabricDomain={} Generation={} StableIds=[{}]", node, key.namespace, key.physical_domain, key.fabric_domain, binding.inventory_generation, ids.join(","));
         }
     }
