@@ -5,6 +5,9 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # Wait a week before adopting newly released crate versions.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "chore"
       prefix-development: "chore"
