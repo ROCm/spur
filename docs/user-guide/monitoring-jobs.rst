@@ -1205,10 +1205,16 @@ updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``
 ``Reason=``.
 
 ``ExcNodeList=`` takes a hostlist expression and replaces the job's excluded
-nodes, the list ``sbatch -x`` sets; an empty value clears it. It applies only
+nodes, the list ``sbatch -x`` sets; an empty or blank value clears it, and an
+expression that does not parse (``node[07-08``) is refused. It applies only
 while the job is pending and not yet being started on nodes the scheduler has
-already reserved for it, and the next scheduling pass honors it. Use it to keep
-queued jobs off a node you have just found to be bad.
+already reserved for it; a job that has left that window is refused with
+``FAILED_PRECONDITION``. Once accepted, the exclusion is recorded in the
+controller's replicated log, so it survives a controller restart or a change of
+leader, and the job is never started on an excluded node. Use it to keep queued
+jobs off a node you have just found to be bad. In a cluster with several
+controllers, finish upgrading all of them before using it: a controller from an
+earlier release cannot read that log entry.
 
 The whole request is rejected, with a non-zero exit and nothing changed, if any
 key is unknown or belongs to the other kind of update (``State=`` on a job,

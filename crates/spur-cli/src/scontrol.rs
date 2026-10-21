@@ -1703,6 +1703,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
         let Some((key, value)) = param.split_once('=') else {
             bail!("scontrol update: invalid input: '{param}'");
         };
+        let invalid = || anyhow::anyhow!("scontrol update: invalid value for {key}=: '{value}'");
         match key.to_lowercase().as_str() {
             "partitionname" => name = value.into(),
             "nodes" => nodes = Some(value.into()),
@@ -1716,17 +1717,19 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                     clear_max_nodes = true;
                     max_nodes = None;
                 } else {
-                    max_nodes = value.parse().ok();
+                    max_nodes = Some(value.parse().map_err(|_| invalid())?);
                     clear_max_nodes = false;
                 }
             }
-            "minnodes" => min_nodes = value.parse().ok(),
+            "minnodes" => min_nodes = Some(value.parse().map_err(|_| invalid())?),
             "allowaccounts" => allow_accounts = Some(value.into()),
             "allowgroups" => allow_groups = Some(value.into()),
             "denyaccounts" => deny_accounts = Some(value.into()),
             "denyqos" => deny_qos = Some(value.into()),
             "allowqos" => allow_qos = Some(value.into()),
-            "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().ok(),
+            "prioritytier" | "priorityjobfactor" => {
+                priority_tier = Some(value.parse().map_err(|_| invalid())?)
+            }
             "preemptmode" => preempt_mode = Some(value.to_uppercase()),
             "preemptexempttime" => {
                 preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
@@ -3277,5 +3280,27 @@ mod tests {
             err.to_string().contains("not supported: 'Bogus=1'"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_partition_update_with_a_malformed_number_fails_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        for (bad, key) in [
+            (vec!["MaxNodes=abc"], "MaxNodes"),
+            (vec!["MaxNodes=UNLIMITED", "MaxNodes=abc"], "MaxNodes"),
+            (vec!["MinNodes=two"], "MinNodes"),
+            (vec!["PriorityTier=high"], "PriorityTier"),
+        ] {
+            let mut args = vec!["PartitionName=gpu", "MaxTime=12:00:00"];
+            args.extend(bad);
+            let err = parse_and_update(&format!("http://{addr}"), &p(&args))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("invalid value for {key}=")),
+                "{err}"
+            );
+        }
     }
 }

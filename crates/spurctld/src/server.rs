@@ -1857,7 +1857,7 @@ impl SlurmController for ControllerService {
                 req.qos,
                 req.exclude,
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(update_job_err_to_status)?;
 
         Ok(Response::new(()))
     }
@@ -5616,6 +5616,16 @@ fn resolve_max_nodes_update(max_nodes_value: Option<u32>, clear_flag: bool) -> (
     let clear = clear_flag || max_nodes_value == Some(0);
     let max_nodes = if clear { None } else { max_nodes_value };
     (max_nodes, clear)
+}
+
+fn update_job_err_to_status(err: anyhow::Error) -> Status {
+    match err.downcast_ref::<crate::cluster::JobUpdateRefusal>() {
+        Some(crate::cluster::JobUpdateRefusal::InvalidArgument(m)) => Status::invalid_argument(m),
+        Some(crate::cluster::JobUpdateRefusal::FailedPrecondition(m)) => {
+            Status::failed_precondition(m)
+        }
+        None => Status::internal(err.to_string()),
+    }
 }
 
 fn cluster_err_to_precondition_status(err: anyhow::Error) -> Status {
@@ -11333,6 +11343,25 @@ mod tests {
             assert_eq!(status.code(), want_code);
             let agent_retryable = spur_proto::controller_rpc_retryable(&status);
             assert_eq!(retry, agent_retryable, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn update_job_refusals_are_caller_errors_and_the_rest_internal() {
+        use crate::cluster::JobUpdateRefusal;
+        let cases = [
+            (
+                anyhow::Error::from(JobUpdateRefusal::FailedPrecondition("not pending".into())),
+                Code::FailedPrecondition,
+            ),
+            (
+                anyhow::Error::from(JobUpdateRefusal::InvalidArgument("bad list".into())),
+                Code::InvalidArgument,
+            ),
+            (anyhow::anyhow!("raft write failed"), Code::Internal),
+        ];
+        for (err, code) in cases {
+            assert_eq!(update_job_err_to_status(err).code(), code);
         }
     }
 
