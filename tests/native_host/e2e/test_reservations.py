@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from cluster import parse_job_id, wait_job, wait_job_state
+from cluster import job_state, parse_job_id, wait_job, wait_job_state
 
 
 class TestReservations:
@@ -653,3 +653,59 @@ class TestReservationServerGate:
             assert name in cluster.scontrol("show", "reservation")
         finally:
             cluster.cli_as_user("root", ["scontrol", "delete-reservation", name])
+
+
+class TestScancelReservationFilter:
+    """`scancel --reservation` drains a reservation's jobs, mirroring squeue -R."""
+
+    def test_scancel_cancels_only_jobs_in_the_reservation(self, cluster):
+        node = cluster.node_names[0]
+        submit_user = cluster.nodes[0].user
+        res_name = f"res-scancel-{int(time.time())}"
+        try:
+            create_out = cluster.cli_as_user(
+                "root",
+                [
+                    "scontrol",
+                    "create-reservation",
+                    f"--name={res_name}",
+                    "--start-time=now",
+                    "--duration=60",
+                    f"--nodes={node}",
+                    f"--users={submit_user}",
+                    "--flags=no_hold_jobs",
+                ],
+            )
+            assert "created" in create_out.lower(), create_out
+
+            script = cluster.write_file("scancel-res.sh", "#!/bin/bash\nsleep 300\n")
+            in_res = parse_job_id(
+                cluster.sbatch(
+                    ["-N", "1", f"--reservation={res_name}", "-w", node, "-t", "5", script]
+                )
+            )
+            # A job outside the reservation must survive the reservation-scoped cancel.
+            out_res = parse_job_id(
+                cluster.sbatch(["-N", "1", "-w", node, "-t", "5", script])
+            )
+            assert in_res is not None and out_res is not None
+
+            # Target by reservation only; no job IDs. The filter is the selection.
+            cancel_out = cluster.cli(["scancel", f"--reservation={res_name}"])
+            assert "error" not in cancel_out.lower(), cancel_out
+
+            in_state = wait_job(cluster, in_res, timeout=60)
+            assert in_state in ("CA", "CANCELLED", "GONE"), (
+                f"reserved job should be cancelled, got {in_state}"
+            )
+
+            # The unreserved job is still pending/running, not collateral damage.
+            out_state = job_state(cluster.squeue_all(), out_res)
+            assert out_state in ("R", "PD"), (
+                f"job outside the reservation must not be cancelled, got {out_state}"
+            )
+        finally:
+            cluster.cli_as_user("root", ["scontrol", "delete-reservation", res_name])
+            for jid in (locals().get("in_res"), locals().get("out_res")):
+                if jid is not None:
+                    cluster.cli(["scancel", str(jid)])
