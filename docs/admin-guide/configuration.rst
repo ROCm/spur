@@ -2674,14 +2674,19 @@ See :doc:`/deployment/managed-kubernetes` for provisioning a Spur-owned cluster.
    (string, e.g. ``"http://peer-ctrl:6817"``). Defaults to no peers.
 
 ``[topology]``
-   **Reload: Restart.** Optional switch-hierarchy configuration for locality-aware
+   **Reload: Live.** Optional block/tree configuration for locality-aware
    scheduling.
    ``plugin`` (string, default ``"none"``) selects the model: ``"tree"`` for a
-   switch hierarchy, ``"block"`` for fixed-size blocks, or ``"none"`` to disable.
+   switch hierarchy, ``"block"`` for flat groups, or ``"none"`` to disable.
    In tree mode, each ``[[topology.switches]]`` entry has ``name`` (string),
    ``nodes`` (hostlist pattern for a leaf switch), and ``switches`` (comma-separated
-   child switch names for an aggregation switch). In block mode, ``block_size``
-   (integer) sets the number of nodes per block. Defaults to no topology.
+   child switch names for an aggregation switch). Automatic native discovery or
+   the optional block file supplies whole-node leaves in block mode, and in tree
+   mode when no explicit switches are configured. Membership is refreshed each
+   scheduling cycle. In block mode without a membership source, ``block_size``
+   (integer, default ``18``) sets the number of nodes per block. It is not used to
+   infer vPods. Defaults to no topology. See :doc:`fabric-observation` for locality
+   options and the separate partition constraint that requires one block.
 
 ``[burst_buffer]``
    **Reload: Live.** Burst-buffer capacity. ``total_gb`` (integer, default ``0``)
