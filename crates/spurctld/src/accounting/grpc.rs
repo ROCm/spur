@@ -859,6 +859,8 @@ impl SlurmAccounting for AccountingService {
                 max_wall_minutes: limit_to_wire(r.max_wall_min),
                 max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
+                partition: r.partition.unwrap_or_default(),
+                fairshare: r.fairshare_weight.unwrap_or(1).max(0) as u32,
             })
             .collect();
 

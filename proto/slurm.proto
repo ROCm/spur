@@ -1710,6 +1710,12 @@ message UserInfo {
   uint32 max_wall_minutes = 10;
   string max_tres_per_job = 11;
   string grp_tres = 12;
+  // Partition the association is scoped to, empty when it applies to all
+  // partitions. Populated for `sacctmgr show association`.
+  string partition = 13;
+  // Fairshare weight of the association's account. Populated for
+  // `sacctmgr show association`; defaults to 1 when unset.
+  uint32 fairshare = 14;
 }
 
 // Add or modify a QOS (proto3 presence: unset = leave unchanged on modify, set =

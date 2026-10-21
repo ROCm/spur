@@ -1020,12 +1020,29 @@ async fn show(
             Ok(())
         }
         "association" | "associations" => {
+            let (account_filter, user_filter) = list_user_filters(&p);
+
+            let mut client = connect(addr).await?;
+            let resp = client
+                .list_users(ListUsersRequest {
+                    account: account_filter,
+                    user: user_filter,
+                })
+                .await
+                .context("ListUsers RPC failed")?;
+
+            let users = resp.into_inner().users;
+
             if style.shows_header() {
                 println!(
                     "{:<15} {:<20} {:<15} {:<10} {:<10}",
                     "User", "Account", "Partition", "Share", "Default"
                 );
                 println!("{}", "-".repeat(70));
+            }
+
+            for u in &users {
+                println!("{}", format_association_row(u));
             }
             Ok(())
         }
@@ -1295,6 +1312,16 @@ fn format_user_row(u: &UserInfo) -> String {
     )
 }
 
+/// One `sacctmgr show association` row. Share is the association's fairshare
+/// weight; Default is its default QOS (empty when none is pinned). Partition is
+/// blank for an all-partitions association.
+fn format_association_row(u: &UserInfo) -> String {
+    format!(
+        "{:<15} {:<20} {:<15} {:<10} {:<10}",
+        u.name, u.account, u.partition, u.fairshare, u.default_qos,
+    )
+}
+
 fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
     match spec {
         'N' => a.name.clone(),
@@ -1513,6 +1540,37 @@ mod tests {
     }
 
     #[test]
+    fn association_row_renders_user_account_share_and_default() {
+        let u = UserInfo {
+            name: "amd".into(),
+            account: "carbonara".into(),
+            partition: String::new(),
+            fairshare: 1,
+            default_qos: "blocked".into(),
+            allowed_qos: "blocked".into(),
+            ..Default::default()
+        };
+        let row = format_association_row(&u);
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cols, vec!["amd", "carbonara", "1", "blocked"]);
+        // Partition column is blank (all-partitions association) and so collapses out.
+    }
+
+    #[test]
+    fn association_row_shows_partition_when_scoped() {
+        let u = UserInfo {
+            name: "amd".into(),
+            account: "aac".into(),
+            partition: "gpu".into(),
+            fairshare: 4,
+            default_qos: "normal".into(),
+            ..Default::default()
+        };
+        let row = format_association_row(&u);
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cols, vec!["amd", "aac", "gpu", "4", "normal"]);
+    }
+
     #[test]
     fn reject_unknown_keys_flags_dropped_field() {
         // A field the command doesn't read must error, not be silently dropped
