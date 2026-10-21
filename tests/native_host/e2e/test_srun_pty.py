@@ -305,6 +305,18 @@ class TestSrunPtyStepSupervision:
             f"the job's own placeholder must not carry the real command:\n{job_info}"
         )
 
+    def test_standalone_pty_srun_survives_a_command_that_exits_immediately(self, cluster):
+        # Smoke test: a command that may be gone before the agent first asks for
+        # its pid must still hand its terminal back.
+        failures = []
+        for attempt in range(4):
+            code, out = cluster.srun_with_exit([
+                "-N", "1", "-t", "0:02", "--pty", "bash", "-c", "exit 0",
+            ])
+            if code != 0 or "did not report a pid" in out:
+                failures.append((attempt, code, out))
+        assert not failures, f"fast-exit pty sessions failed: {failures}"
+
     def test_standalone_pty_srun_job_completes_cleanly(self, cluster):
         # A standalone --pty session used to always leave the job CANCELLED in
         # sacct/scontrol, even on a clean exit — assert the real outcome lands.

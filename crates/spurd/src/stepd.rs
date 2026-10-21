@@ -278,6 +278,7 @@ impl StepdLaunchSpec {
 }
 
 const DESCRIPTOR_FILE: &str = "descriptor.json";
+const RUNTIME_SOCKET_NAME: &str = "runtime.sock";
 /// Custody socket for an interactive session's pty master. Separate from the
 /// control socket because ancillary data cannot cross a buffered reader.
 pub const PTY_CUSTODY_SOCKET_NAME: &str = "ptyfd.sock";
@@ -675,6 +676,34 @@ const START_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 /// both get seen instead of losing on pure delivery order.
 const GATE_DECISION_SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// How long an exited terminal's supervisor waits for spurd to take the pty
+/// master, so an agent that never comes cannot pin the supervisor forever.
+const PTY_HANDOFF_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Keeps an exited terminal's supervisor serving until spurd takes the pty master,
+/// the step is torn down, or the grace elapses. Its exit is recorded only after that.
+pub struct PtyHandoff {
+    claimed: AtomicBool,
+    grace: std::time::Duration,
+}
+
+impl PtyHandoff {
+    pub fn new(grace: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            claimed: AtomicBool::new(false),
+            grace,
+        })
+    }
+
+    fn mark_claimed(&self) {
+        self.claimed.store(true, Ordering::Release);
+    }
+
+    fn is_claimed(&self) -> bool {
+        self.claimed.load(Ordering::Acquire)
+    }
+}
+
 // A Stepd supervises exactly one step's process tree; PTY/srun steps get
 // their own separate Stepd in follow-up work, not a slot in this one.
 
@@ -686,6 +715,7 @@ pub struct Stepd {
     snapshot: Arc<Mutex<StepdSnapshot>>,
     teardown_started: AtomicBool,
     launch_gate: Mutex<()>,
+    pty_handoff: std::sync::OnceLock<Arc<PtyHandoff>>,
     // Base environment for work landing in a follow-up PR.
     #[allow(dead_code)]
     environment: std::collections::HashMap<String, String>,
@@ -730,12 +760,27 @@ impl Stepd {
             })),
             teardown_started: AtomicBool::new(false),
             launch_gate: Mutex::new(()),
+            pty_handoff: std::sync::OnceLock::new(),
             environment,
         }
     }
 
     pub async fn snapshot(&self) -> StepdSnapshot {
         self.snapshot.lock().await.clone()
+    }
+
+    pub fn await_pty_handoff(&self, handoff: Arc<PtyHandoff>) {
+        let installed = self.pty_handoff.set(handoff).is_ok();
+        debug_assert!(installed, "a supervisor awaits at most one pty handoff");
+    }
+
+    fn may_exit(&self, exited_for: std::time::Duration) -> bool {
+        let Some(handoff) = self.pty_handoff.get() else {
+            return true;
+        };
+        handoff.is_claimed()
+            || self.teardown_started.load(Ordering::Acquire)
+            || exited_for >= handoff.grace
     }
 
     pub async fn adopt_cgroup(&self, cgroup_path: Option<PathBuf>) {
@@ -858,6 +903,12 @@ pub struct StepdDescriptor {
     pub step_id: spur_core::step::StepId,
     pub pid: u32,
     pub process_start_ticks: u64,
+    /// Proves ownership while the launcher is live but the child has not bound
+    /// runtime.sock yet; a socket probe cannot protect that pre-bind interval.
+    #[serde(default)]
+    pub launcher_pid: u32,
+    #[serde(default)]
+    pub launcher_start_ticks: u64,
     pub socket_path: PathBuf,
     pub cgroup_path: PathBuf,
     #[serde(default)]
@@ -922,6 +973,8 @@ impl StepdDescriptor {
             step_id,
             pid,
             process_start_ticks,
+            launcher_pid: 0,
+            launcher_start_ticks: 0,
             socket_path,
             cgroup_path,
             capability: uuid::Uuid::new_v4().to_string(),
@@ -942,6 +995,21 @@ impl StepdDescriptor {
             cred_kid: String::new(),
             cred_digest: String::new(),
         }
+    }
+
+    /// Published before the supervisor exists, so it names the launcher rather
+    /// than a supervisor: nothing may signal it or adopt it as one.
+    pub(crate) fn is_provisional(&self) -> bool {
+        self.pid == 0
+    }
+
+    /// Stamps this agent's identity on a descriptor published before the spawn,
+    /// so its liveness answers for the session until the supervisor takes over.
+    pub(crate) fn mark_provisional(&mut self) {
+        self.pid = 0;
+        self.process_start_ticks = 0;
+        self.launcher_pid = std::process::id();
+        self.launcher_start_ticks = process_start_ticks(self.launcher_pid).unwrap_or(0);
     }
 }
 
@@ -1478,15 +1546,36 @@ async fn try_notify_agent(
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
+/// Only a terminal's own supervisor has an agent coming to take its pty master.
+fn awaits_pty_handoff(step_id: spur_core::step::StepId, deposited: bool) -> bool {
+    deposited && step_id == spur_core::step::STEP_INTERACTIVE
+}
+
+/// Replies to a reclaim, and only a master that was actually sent counts as claimed.
+async fn hand_back_pty(
+    raw: std::os::fd::RawFd,
+    reply: u8,
+    session_id: u32,
+    fds: Vec<std::os::fd::OwnedFd>,
+    handoff: &PtyHandoff,
+) -> io::Result<()> {
+    bounded_custody_reply(raw, custody_payload(reply, session_id), fds).await?;
+    if reply == CUSTODY_FOUND {
+        handoff.mark_claimed();
+    }
+    Ok(())
+}
+
 /// Holds each open terminal's pty master for this job. Keyed per shell, since a
 /// job can have several at once, and retained after a hand-back so the terminal
 /// still outlives however many agents come and go.
-async fn serve_pty_custody(listener: UnixListener) {
+async fn serve_pty_custody(listener: UnixListener, handoff: Arc<PtyHandoff>) {
     use std::os::fd::AsRawFd;
     let held: std::sync::Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>> =
         std::sync::Arc::new(Mutex::new(HashMap::new()));
     while let Ok((stream, _)) = listener.accept().await {
         let held = held.clone();
+        let handoff = handoff.clone();
         tokio::spawn(async move {
             let Ok(stream) = stream.into_std() else {
                 return;
@@ -1540,9 +1629,7 @@ async fn serve_pty_custody(listener: UnixListener) {
                         None => (CUSTODY_ABSENT, 0, Vec::new()),
                     };
                     drop(custody);
-                    if let Err(error) =
-                        bounded_custody_reply(raw, custody_payload(reply, id), fds).await
-                    {
+                    if let Err(error) = hand_back_pty(raw, reply, id, fds, &handoff).await {
                         tracing::warn!(%error, "failed to hand back an orphaned pty");
                     }
                 }
@@ -1562,9 +1649,7 @@ async fn serve_pty_custody(listener: UnixListener) {
                         None => (CUSTODY_ABSENT, Vec::new()),
                     };
                     drop(custody);
-                    if let Err(error) =
-                        bounded_custody_reply(raw, custody_payload(reply, session_id), fds).await
-                    {
+                    if let Err(error) = hand_back_pty(raw, reply, session_id, fds, &handoff).await {
                         tracing::warn!(session_id, %error, "failed to hand back a pty master");
                     }
                 }
@@ -1836,6 +1921,7 @@ pub async fn run_supervisor(
     session: Arc<Stepd>,
 ) -> io::Result<()> {
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut exited_at: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
             // A job can exit before the agent's first connect lands. Serve the
@@ -1856,7 +1942,10 @@ pub async fn run_supervisor(
             _ = poll_interval.tick() => {
                 session.poll_completion().await?;
                 if !session.snapshot().await.active {
-                    return Ok(());
+                    let exited_for = exited_at.get_or_insert_with(tokio::time::Instant::now).elapsed();
+                    if session.may_exit(exited_for) {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -2012,6 +2101,54 @@ fn apply_multi_rank_pmix(
     })
 }
 
+/// Whether a failed probe proves nobody is listening. Any other failure may be
+/// a live supervisor this process merely cannot reach.
+fn probe_proves_unserved(error: io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
+}
+
+/// Whether anything answers on the session's control socket. Fail-closed: only
+/// a refused or absent socket proves no supervisor is bound to it.
+pub(crate) fn session_socket_is_served(session_dir: &Path) -> bool {
+    match std::os::unix::net::UnixStream::connect(session_dir.join(RUNTIME_SOCKET_NAME)) {
+        Ok(_) => true,
+        Err(error) => !probe_proves_unserved(error),
+    }
+}
+
+/// Binds the control socket, unlinking a stale path only once the probe proves
+/// nobody is serving it: taking a live peer's path would steal its identity.
+pub(crate) fn bind_runtime_socket(socket_path: &Path) -> io::Result<UnixListener> {
+    match UnixListener::bind(socket_path) {
+        Ok(listener) => return Ok(listener),
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+        Err(error) => return Err(error),
+    }
+    let unserved = std::os::unix::net::UnixStream::connect(socket_path)
+        .err()
+        .is_some_and(probe_proves_unserved);
+    if !unserved {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("{} may still be served", socket_path.display()),
+        ));
+    }
+    rebind_unserved_socket(socket_path)
+}
+
+/// Replaces a socket the probe proved unserved. One already unlinked by someone
+/// else is no failure — the bind is what that leaves us free to retry.
+fn rebind_unserved_socket(socket_path: &Path) -> io::Result<UnixListener> {
+    match fs::remove_file(socket_path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    UnixListener::bind(socket_path)
+}
+
 const STEPD_USAGE: &str = "usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>\n\n\
      Per-step supervisor. spurd spawns this; it is not meant to be run by hand.";
 
@@ -2037,12 +2174,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let step_id = launch_spec.step_id;
     let store = StepdStore::new(state_dir);
     let agent_socket = store.agent_socket();
-    let session_dir = store.session_dir(job_id, run_attempt, step_id);
+    let session_dir = store.prepare_session_dir(job_id, run_attempt, step_id)?;
     let obligations = store.obligations(job_id, run_attempt, step_id);
-    let socket_path = session_dir.join("runtime.sock");
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
+    // Bound before the descriptor is published: a losing duplicate must fail
+    // here, while the running supervisor's identity is still on disk.
+    let socket_path = session_dir.join(RUNTIME_SOCKET_NAME);
+    let listener = bind_runtime_socket(&socket_path)?;
     let pid = std::process::id();
     let mut descriptor = StepdDescriptor::new(
         job_id,
@@ -2069,17 +2206,17 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
     store.publish(&descriptor)?;
-    let listener = UnixListener::bind(&socket_path)?;
     // Custody of an interactive session's pty master outlives the agent that
     // created it, so the terminal survives a restart and can be picked back up.
     let custody_path = session_dir.join(PTY_CUSTODY_SOCKET_NAME);
+    let pty_handoff = PtyHandoff::new(PTY_HANDOFF_GRACE);
     let _ = std::fs::remove_file(&custody_path);
     if let Ok(custody) = UnixListener::bind(&custody_path) {
         let _ = std::fs::set_permissions(
             &custody_path,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         );
-        tokio::spawn(serve_pty_custody(custody));
+        tokio::spawn(serve_pty_custody(custody, pty_handoff.clone()));
     }
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let stderr_path = launch_spec.stderr_path.clone();
@@ -2193,11 +2330,14 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // Self-deposit: the agent's interactive-session handler reclaims this by
     // pid over the same custody protocol an agent restart already uses, so a
     // fresh attach and a post-restart reattach both just reclaim a master.
+    let mut deposited = false;
     if let Some(master) = pty_master.as_ref() {
-        if let Err(error) =
-            deposit_pty_master(&session_dir, workload_pid, std::os::fd::AsFd::as_fd(master)).await
+        match deposit_pty_master(&session_dir, workload_pid, std::os::fd::AsFd::as_fd(master)).await
         {
-            tracing::warn!(job_id, %error, "failed to deposit this step's own pty master");
+            Ok(()) => deposited = true,
+            Err(error) => {
+                tracing::warn!(job_id, %error, "failed to deposit this step's own pty master");
+            }
         }
     }
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
@@ -2221,6 +2361,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         runtime_environment,
     ));
     session.adopt_cgroup(launched_cgroup).await;
+    if awaits_pty_handoff(step_id, deposited) {
+        session.await_pty_handoff(pty_handoff);
+    }
     let capability = descriptor.capability.clone();
     // An allocation's supervisor never launches, so it holds no cgroup of its
     // own — but the agent made one and recorded it, and it still has to go.
@@ -2488,6 +2631,72 @@ impl StepdStore {
         run_attempt: u32,
         step_id: spur_core::step::StepId,
     ) -> io::Result<PathBuf> {
+        self.prepare_session_root()?;
+        let session_dir = self.session_dir(job_id, run_attempt, step_id);
+        create_private_dir(&session_dir)?;
+        Ok(session_dir)
+    }
+
+    /// Takes exclusive ownership of a session directory for one launch; sharing
+    /// an owned one is refused. Refusals carry no errno (that reads as a node fault).
+    pub fn claim_session_dir(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<PathBuf> {
+        self.prepare_session_root()?;
+        let session_dir = self.session_dir(job_id, run_attempt, step_id);
+        match create_session_dir(&session_dir) {
+            Ok(()) => return Ok(session_dir),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        self.reclaim_session_dir(&session_dir, job_id, run_attempt, step_id)?;
+        create_session_dir(&session_dir).map_err(|error| session_conflict_error(error, step_id))?;
+        Ok(session_dir)
+    }
+
+    fn reclaim_session_dir(
+        &self,
+        session_dir: &Path,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<()> {
+        let owned = format!("{job_id}.{run_attempt}.{step_id} is already owned");
+        // An unreadable descriptor may belong to a live supervisor from another
+        // version, so reclaim requires both descriptor and socket checks.
+        match self.load_descriptor(session_dir) {
+            Ok(existing) if !matches!(stepd_liveness(&existing), Ok(StepdLiveness::Stale)) => {
+                return Err(session_conflict(owned));
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(session_conflict(owned));
+            }
+            Ok(_) | Err(_) => {}
+        }
+        // A supervisor binds its socket before it publishes itself, so an absent
+        // descriptor alone would license unlinking a live peer's socket.
+        if session_socket_is_served(session_dir) {
+            return Err(session_conflict(owned));
+        }
+        // Reusing the directory would graft the new run onto the old run's
+        // obligation log, so its exit would be replayed as this run's.
+        if !matches!(self.observed_exit(job_id, run_attempt, step_id), Ok(None)) {
+            return Err(session_conflict(format!(
+                "an exit is already recorded for {job_id}.{run_attempt}.{step_id}"
+            )));
+        }
+        match fs::remove_dir_all(session_dir) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                Err(session_conflict_error(error, step_id))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn prepare_session_root(&self) -> io::Result<()> {
         let state_dir = self.root.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2502,10 +2711,7 @@ impl StepdStore {
                 fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
             }
         }
-        create_private_dir(&self.root)?;
-        let session_dir = self.session_dir(job_id, run_attempt, step_id);
-        create_private_dir(&session_dir)?;
-        Ok(session_dir)
+        create_private_dir(&self.root)
     }
 
     pub fn publish(&self, descriptor: &StepdDescriptor) -> io::Result<()> {
@@ -2871,6 +3077,31 @@ impl StepdStore {
     }
 }
 
+fn session_conflict(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::AlreadyExists, message)
+}
+
+/// Strips the errno off a directory race so it cannot be mistaken for the
+/// spool fault that condemns the node; a real fs fault keeps its errno.
+fn session_conflict_error(error: io::Error, step_id: spur_core::step::StepId) -> io::Error {
+    match error.raw_os_error() {
+        Some(libc::EEXIST) | Some(libc::ENOTEMPTY) | Some(libc::EBUSY) => {
+            session_conflict(format!("step {step_id}'s session directory is contended"))
+        }
+        _ => error,
+    }
+}
+
+/// Creates `path` and nothing else — an existing directory is reported as
+/// `AlreadyExists` rather than adopted.
+#[cfg(unix)]
+fn create_session_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
 #[cfg(unix)]
 fn create_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -2945,6 +3176,17 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
 }
 
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
+    // No supervisor has published itself yet, so the agent that claimed the
+    // session is the one still answering for it.
+    if descriptor.is_provisional() {
+        let held = descriptor.launcher_pid != 0
+            && process_is_live(descriptor.launcher_pid, descriptor.launcher_start_ticks);
+        return Ok(if held {
+            StepdLiveness::Live
+        } else {
+            StepdLiveness::Stale
+        });
+    }
     match process_start_ticks(descriptor.pid) {
         // A zombie's start ticks still match (the kernel keeps them until
         // reaped), but it has already exited and released everything —
@@ -3183,6 +3425,259 @@ mod tests {
             PathBuf::from("/run/spur/runtime.sock"),
             PathBuf::from("/sys/fs/cgroup/spur/test"),
         )
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_directory_a_live_supervisor_owns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let first = store
+            .claim_session_dir(9, 1, step_id)
+            .expect("the first launch claims the session");
+        let mut live = descriptor(9, 1, std::process::id());
+        live.socket_path = first.join("runtime.sock");
+        store.publish(&live).expect("publish descriptor");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("a second launch must not share the live session");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            store
+                .load_descriptor(&first)
+                .expect("descriptor survives")
+                .pid,
+            live.pid,
+            "the refused launch must leave the live session's identity intact"
+        );
+    }
+
+    #[test]
+    fn claim_session_dir_reclaims_a_directory_whose_supervisor_is_gone() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let first = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        let mut dead = descriptor(9, 1, 0);
+        dead.pid = u32::MAX;
+        dead.socket_path = first.join("runtime.sock");
+        store.publish(&dead).expect("publish descriptor");
+        fs::write(first.join("launch.json"), b"stale").expect("stale launch spec");
+
+        let reclaimed = store
+            .claim_session_dir(9, 1, step_id)
+            .expect("a session with no live owner is reclaimable");
+
+        assert_eq!(reclaimed, first);
+        assert!(
+            !reclaimed.join("launch.json").exists(),
+            "reclaiming must not leave the previous launch's records behind"
+        );
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_session_whose_socket_is_still_served() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        // The window a supervisor spends bound but not yet published: nothing
+        // names an owner except the socket itself.
+        let first = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        let _served = std::os::unix::net::UnixListener::bind(first.join(RUNTIME_SOCKET_NAME))
+            .expect("bind the session socket");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("a served socket must not be unlinked out from under its peer");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(first.join(RUNTIME_SOCKET_NAME).exists());
+    }
+
+    #[test]
+    fn a_provisional_descriptor_reads_live_while_its_launcher_runs() {
+        let mut provisional = descriptor(9, 1, 0);
+        provisional.mark_provisional();
+
+        assert!(matches!(
+            stepd_liveness(&provisional),
+            Ok(StepdLiveness::Live)
+        ));
+
+        // A launcher that is gone leaves nothing holding the session.
+        provisional.launcher_pid = u32::MAX;
+        assert!(matches!(
+            stepd_liveness(&provisional),
+            Ok(StepdLiveness::Stale)
+        ));
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_session_a_live_launcher_still_holds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let first = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        let mut provisional = descriptor(9, 1, 0);
+        provisional.socket_path = first.join(RUNTIME_SOCKET_NAME);
+        provisional.mark_provisional();
+        store.publish(&provisional).expect("publish provisional");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("a launch still in flight owns the session");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_session_that_already_recorded_an_exit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        store.claim_session_dir(9, 1, step_id).expect("first claim");
+        store
+            .obligations(9, 1, step_id)
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 3,
+                signal: 0,
+            })
+            .expect("append exit observed");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("a recorded exit must not be grafted onto a new run");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            store.observed_exit(9, 1, step_id).expect("observed exit"),
+            Some((3, 0))
+        );
+    }
+
+    #[test]
+    fn claim_session_dir_refuses_a_session_whose_descriptor_it_cannot_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let first = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        fs::write(first.join(DESCRIPTOR_FILE), b"not json").expect("unreadable descriptor");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("an unreadable descriptor still names an owner");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn a_refused_claim_never_reads_as_a_node_fault() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step_id = spur_core::step::STEP_BATCH;
+
+        let session = store.claim_session_dir(9, 1, step_id).expect("first claim");
+        let mut live = descriptor(9, 1, std::process::id());
+        live.socket_path = session.join("runtime.sock");
+        store.publish(&live).expect("publish descriptor");
+
+        let error = store
+            .claim_session_dir(9, 1, step_id)
+            .expect_err("the duplicate is refused");
+
+        // An errno here is classified as a spool fault and drains the node.
+        assert_eq!(
+            error.raw_os_error(),
+            None,
+            "a contended session must not look like a failing disk"
+        );
+    }
+
+    #[test]
+    fn a_contended_session_directory_never_reads_as_a_node_fault() {
+        let busy = io::Error::from_raw_os_error(libc::EEXIST);
+        assert_eq!(session_conflict_error(busy, 3).raw_os_error(), None);
+
+        let not_empty = io::Error::from_raw_os_error(libc::ENOTEMPTY);
+        assert_eq!(session_conflict_error(not_empty, 3).raw_os_error(), None);
+
+        // A real spool fault must keep its errno so the node is condemned.
+        let no_space = io::Error::from_raw_os_error(libc::ENOSPC);
+        assert_eq!(
+            session_conflict_error(no_space, 3).raw_os_error(),
+            Some(libc::ENOSPC)
+        );
+    }
+
+    #[test]
+    fn only_a_refused_or_absent_peer_licenses_unlinking_a_socket() {
+        assert!(probe_proves_unserved(io::Error::from_raw_os_error(
+            libc::ECONNREFUSED
+        )));
+        assert!(probe_proves_unserved(io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+
+        // Unreachable for some other reason: a live supervisor may still own it.
+        for errno in [libc::EACCES, libc::EPERM, libc::EMFILE, libc::ETIMEDOUT] {
+            assert!(
+                !probe_proves_unserved(io::Error::from_raw_os_error(errno)),
+                "errno {errno} does not prove the socket is unserved"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_session_dir_separates_attempts_and_steps() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+
+        let batch = store
+            .claim_session_dir(9, 1, spur_core::step::STEP_BATCH)
+            .expect("batch step");
+        let next_attempt = store
+            .claim_session_dir(9, 2, spur_core::step::STEP_BATCH)
+            .expect("next attempt");
+        let numbered = store.claim_session_dir(9, 1, 0).expect("numbered step");
+
+        assert_ne!(batch, next_attempt);
+        assert_ne!(batch, numbered);
+    }
+
+    #[tokio::test]
+    async fn bind_runtime_socket_refuses_a_path_a_live_peer_is_serving() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        let _held = bind_runtime_socket(&socket_path).expect("the first bind wins");
+
+        let error = bind_runtime_socket(&socket_path)
+            .expect_err("a second supervisor must not take over a served socket");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn bind_runtime_socket_replaces_a_socket_nobody_is_serving() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        drop(bind_runtime_socket(&socket_path).expect("the first bind wins"));
+
+        bind_runtime_socket(&socket_path).expect("a stale socket file must not wedge a relaunch");
+    }
+
+    #[tokio::test]
+    async fn rebinding_tolerates_a_socket_already_unlinked_under_it() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+
+        // Stands in for a third party unlinking between the failed bind and the
+        // probe; a plain retry would have succeeded, so this must not fail.
+        rebind_unserved_socket(&socket_path).expect("an absent path must not fail the rebind");
     }
 
     fn descriptor_for_step(
@@ -4997,6 +5492,290 @@ mod tests {
             !epilog_failed,
             "a terminal placeholder must leave the node epilog to the step owning the job"
         );
+    }
+
+    struct ExitedTerminal {
+        _dir: tempfile::TempDir,
+        descriptor: StepdDescriptor,
+        handoff: Arc<PtyHandoff>,
+        supervisor: tokio::task::JoinHandle<io::Result<()>>,
+        pid: u32,
+    }
+
+    /// A real supervisor over a terminal whose short-lived command exits on its own.
+    async fn supervise_an_exited_terminal(grace: std::time::Duration) -> ExitedTerminal {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let descriptor = StepdDescriptor::new(
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            0,
+            0,
+            socket_path,
+            PathBuf::new(),
+        );
+        let child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived workload");
+        let pid = child.id().expect("pid");
+        let session = Arc::new(Stepd::new(
+            RunningJob::Managed { child },
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+        ));
+        let handoff = PtyHandoff::new(grace);
+        session.await_pty_handoff(handoff.clone());
+        let supervisor = tokio::spawn(run_supervisor(listener, descriptor.clone(), session));
+        ExitedTerminal {
+            _dir: dir,
+            descriptor,
+            handoff,
+            supervisor,
+            pid,
+        }
+    }
+
+    async fn wait_until_reported_exited(descriptor: &StepdDescriptor) {
+        loop {
+            let snapshot = query_state(descriptor, "agent".into())
+                .await
+                .expect("query while the supervisor is serving");
+            if !snapshot.active {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exited_terminal_keeps_answering_until_its_pty_is_claimed() {
+        let terminal = supervise_an_exited_terminal(std::time::Duration::from_secs(3600)).await;
+        wait_until_reported_exited(&terminal.descriptor).await;
+
+        let after = query_state(&terminal.descriptor, "agent".into())
+            .await
+            .expect("an exited terminal's supervisor must still answer");
+        assert!(!after.active);
+        assert_eq!(after.job_pid, terminal.pid as i32);
+        assert!(!terminal.supervisor.is_finished());
+
+        terminal.handoff.mark_claimed();
+        terminal
+            .supervisor
+            .await
+            .expect("supervisor task")
+            .expect("supervisor exits once the pty is claimed");
+    }
+
+    #[tokio::test]
+    async fn an_exited_terminal_does_not_outlive_an_agent_that_never_claims_it() {
+        let terminal = supervise_an_exited_terminal(std::time::Duration::ZERO).await;
+        terminal
+            .supervisor
+            .await
+            .expect("supervisor task")
+            .expect("supervisor exits once the grace elapses");
+    }
+
+    #[tokio::test]
+    async fn an_exited_terminal_exits_at_once_when_torn_down() {
+        let terminal = supervise_an_exited_terminal(std::time::Duration::from_secs(3600)).await;
+        wait_until_reported_exited(&terminal.descriptor).await;
+        shutdown_allocation(&terminal.descriptor, "agent".into())
+            .await
+            .expect("teardown request");
+        terminal
+            .supervisor
+            .await
+            .expect("supervisor task")
+            .expect("supervisor exits on teardown");
+    }
+
+    async fn wait_until_claimed(handoff: &PtyHandoff) {
+        while !handoff.is_claimed() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn session_awaiting_handoff(grace: std::time::Duration) -> (Stepd, Arc<PtyHandoff>) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("3600")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn workload");
+        let session = Stepd::new(
+            RunningJob::Managed { child },
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+        );
+        let handoff = PtyHandoff::new(grace);
+        session.await_pty_handoff(handoff.clone());
+        (session, handoff)
+    }
+
+    #[tokio::test]
+    async fn an_unclaimed_terminal_may_not_exit_inside_the_grace() {
+        let (session, _handoff) =
+            session_awaiting_handoff(std::time::Duration::from_secs(10)).await;
+        assert!(!session.may_exit(std::time::Duration::from_secs(9)));
+    }
+
+    #[tokio::test]
+    async fn a_claimed_terminal_may_exit_at_once() {
+        let (session, handoff) = session_awaiting_handoff(std::time::Duration::from_secs(10)).await;
+        handoff.mark_claimed();
+        assert!(session.may_exit(std::time::Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn an_unclaimed_terminal_may_exit_once_the_grace_elapses() {
+        let (session, _handoff) =
+            session_awaiting_handoff(std::time::Duration::from_secs(10)).await;
+        assert!(session.may_exit(std::time::Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_being_torn_down_may_exit_without_waiting_for_a_claim() {
+        let (session, _handoff) =
+            session_awaiting_handoff(std::time::Duration::from_secs(10)).await;
+        session.begin_teardown().await;
+        assert!(session.may_exit(std::time::Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn a_supervisor_with_no_pending_handoff_exits_with_its_workload() {
+        let child = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawn workload");
+        let session = Stepd::new(
+            RunningJob::Managed { child },
+            7,
+            1,
+            spur_core::step::STEP_BATCH,
+        );
+        assert!(session.may_exit(std::time::Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn reclaiming_a_deposited_pty_master_releases_the_supervisor_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = UnixListener::bind(dir.path().join(PTY_CUSTODY_SOCKET_NAME)).expect("bind");
+        let handoff = PtyHandoff::new(std::time::Duration::from_secs(3600));
+        tokio::spawn(serve_pty_custody(listener, handoff.clone()));
+        let master = std::fs::File::open("/dev/null").expect("open a stand-in descriptor");
+
+        deposit_pty_master(dir.path(), 55, std::os::fd::AsFd::as_fd(&master))
+            .await
+            .expect("deposit");
+
+        let claimed = loop {
+            if let Some(fd) = reclaim_pty_master(dir.path(), 55).await.expect("reclaim") {
+                break fd;
+            }
+            tokio::task::yield_now().await;
+        };
+        drop(claimed);
+        wait_until_claimed(&handoff).await;
+    }
+
+    #[tokio::test]
+    async fn reclaiming_any_orphaned_pty_releases_the_supervisor_hold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = UnixListener::bind(dir.path().join(PTY_CUSTODY_SOCKET_NAME)).expect("bind");
+        let handoff = PtyHandoff::new(std::time::Duration::from_secs(3600));
+        tokio::spawn(serve_pty_custody(listener, handoff.clone()));
+        let master = std::fs::File::open("/dev/null").expect("open a stand-in descriptor");
+
+        deposit_pty_master(dir.path(), 55, std::os::fd::AsFd::as_fd(&master))
+            .await
+            .expect("deposit");
+        let (id, claimed) = loop {
+            if let Some(found) = reclaim_orphaned_pty(dir.path()).await.expect("reclaim") {
+                break found;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(id, 55);
+        drop(claimed);
+        wait_until_claimed(&handoff).await;
+    }
+
+    fn custody_pair() -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    ) {
+        std::os::unix::net::UnixStream::pair().expect("socket pair")
+    }
+
+    #[tokio::test]
+    async fn handing_back_a_master_marks_it_claimed() {
+        use std::os::fd::AsRawFd;
+        let (server, client) = custody_pair();
+        let handoff = PtyHandoff::new(std::time::Duration::from_secs(10));
+        let master = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("open"));
+
+        hand_back_pty(
+            server.as_raw_fd(),
+            CUSTODY_FOUND,
+            55,
+            vec![master],
+            &handoff,
+        )
+        .await
+        .expect("hand back");
+
+        assert!(handoff.is_claimed());
+        let (payload, fds) = recv_custody(client.as_raw_fd()).expect("receive");
+        assert_eq!(parse_custody_payload(&payload), Some((CUSTODY_FOUND, 55)));
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_absent_reply_does_not_mark_the_pty_claimed() {
+        use std::os::fd::AsRawFd;
+        let (server, _client) = custody_pair();
+        let handoff = PtyHandoff::new(std::time::Duration::from_secs(10));
+
+        hand_back_pty(server.as_raw_fd(), CUSTODY_ABSENT, 0, Vec::new(), &handoff)
+            .await
+            .expect("hand back");
+
+        assert!(!handoff.is_claimed());
+    }
+
+    #[tokio::test]
+    async fn a_master_that_could_not_be_sent_is_not_marked_claimed() {
+        use std::os::fd::AsRawFd;
+        let (server, client) = custody_pair();
+        drop(client);
+        let handoff = PtyHandoff::new(std::time::Duration::from_secs(10));
+        let master = std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").expect("open"));
+
+        let sent = hand_back_pty(
+            server.as_raw_fd(),
+            CUSTODY_FOUND,
+            55,
+            vec![master],
+            &handoff,
+        )
+        .await;
+
+        assert!(sent.is_err());
+        assert!(!handoff.is_claimed());
+    }
+
+    #[test]
+    fn only_a_deposited_terminal_awaits_a_handoff() {
+        use spur_core::step::{STEP_BATCH, STEP_EXTERN, STEP_INTERACTIVE};
+        assert!(awaits_pty_handoff(STEP_INTERACTIVE, true));
+        assert!(!awaits_pty_handoff(STEP_INTERACTIVE, false));
+        assert!(!awaits_pty_handoff(STEP_BATCH, true));
+        assert!(!awaits_pty_handoff(STEP_EXTERN, true));
+        assert!(!awaits_pty_handoff(3, true));
     }
 
     fn gate_descriptor() -> StepdDescriptor {
