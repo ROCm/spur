@@ -3775,7 +3775,10 @@ impl ClusterManager {
             Some(q) => {
                 let q = q.trim().to_string();
                 if q.is_empty() {
-                    anyhow::bail!("cannot clear a job's QOS");
+                    return Err(JobUpdateRefusal::InvalidArgument(
+                        "cannot clear a job's QOS".into(),
+                    )
+                    .into());
                 }
                 if self.qos_cache.get(&q).is_none() {
                     let hint = if self.qos_cache.is_loaded() {
@@ -3783,7 +3786,10 @@ impl ClusterManager {
                     } else {
                         QOS_ACCOUNTING_HINT
                     };
-                    anyhow::bail!("QOS '{q}' does not exist{hint}");
+                    return Err(JobUpdateRefusal::InvalidArgument(format!(
+                        "QOS '{q}' does not exist{hint}"
+                    ))
+                    .into());
                 }
                 // Treat account="" as unset so we authorize against the
                 // job's existing account, rather than erroring on a blank
@@ -3795,7 +3801,7 @@ impl ClusterManager {
                 if let Some(acct) = effective_account {
                     self.association_cache
                         .check_qos_authorized(&job_user, acct, &q)
-                        .map_err(anyhow::Error::msg)?;
+                        .map_err(JobUpdateRefusal::InvalidArgument)?;
                 }
                 Some(q)
             }
@@ -26728,6 +26734,10 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("QOS 'ghost' does not exist"));
         assert!(!err.to_string().contains("accounting may not be enabled"));
+        assert!(matches!(
+            err.downcast_ref::<JobUpdateRefusal>(),
+            Some(JobUpdateRefusal::InvalidArgument(_))
+        ));
         assert_eq!(cm.get_job(id).unwrap().spec.qos, None);
 
         // Empty QOS (clear-to-limitless) rejected.
@@ -26819,6 +26829,10 @@ mod tests {
         assert!(err
             .to_string()
             .contains("QOS 'other-teams-qos' is not permitted"));
+        assert!(matches!(
+            err.downcast_ref::<JobUpdateRefusal>(),
+            Some(JobUpdateRefusal::InvalidArgument(_))
+        ));
         assert_eq!(
             cm.get_job(id).unwrap().spec.qos.as_deref(),
             Some("highprio"),
