@@ -1714,8 +1714,10 @@ message UserInfo {
   // partitions. Populated for `sacctmgr show association`.
   string partition = 13;
   // Fairshare weight of the association's account. Populated for
-  // `sacctmgr show association`; defaults to 1 when unset.
-  uint32 fairshare = 14;
+  // `sacctmgr show association`. optional so a controller that predates this
+  // field is distinguishable from one that reports an explicit weight of 0:
+  // absent renders blank, a present 0 renders "0".
+  optional uint32 fairshare = 14;
 }
 
 // Add or modify a QOS (proto3 presence: unset = leave unchanged on modify, set =
