@@ -318,7 +318,7 @@ Show associations
 ~~~~~~~~~~~~~~~~~~
 
 ``show association`` lists each ``(user, account)`` association as its own row,
-the association-centric view of the same data ``show user`` presents user-first.
+an association-first view of the same data ``show user`` presents user-first.
 Filter by ``account=`` and/or ``user=``.
 
 .. code-block:: bash
