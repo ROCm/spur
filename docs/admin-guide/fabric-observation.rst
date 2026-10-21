@@ -287,7 +287,7 @@ is responsible for ensuring its declaration reflects the configured system.
 This does not add fabric programming or manager credentials to Spur.
 
 Creating and validating a candidate
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 An administrator can write the records directly. When automatic discovery
 already produces whole-node groups, it can provide an initial candidate:
