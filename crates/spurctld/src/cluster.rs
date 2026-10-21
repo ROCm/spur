@@ -7723,6 +7723,11 @@ impl ClusterManager {
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.state = *new_state;
+                    // Service-state requests may wait behind allocation changes in Raft.
+                    // Derive the committed state from the allocations present at apply.
+                    if new_state.is_up() {
+                        node.update_state_from_alloc();
+                    }
                     node.state_reason = reason.clone();
                     node.reason_uid = *reason_uid;
                     node.reason_time = *reason_time;
@@ -8287,6 +8292,10 @@ impl StateMachineApply for ClusterManager {
             // so reconcile_partitions doesn't clamp a zero inventory into scheduling.
             if node.detected_resources == ResourceSet::default() {
                 node.detected_resources = node.total_resources.clone();
+            }
+            // Older controllers could persist an Idle node with live allocations.
+            if node.state.is_up() {
+                node.update_state_from_alloc();
             }
             nodes.insert(node.name.clone(), node);
         }
@@ -27642,6 +27651,139 @@ mod tests {
                 .is_some_and(|n| n.state != NodeState::Down)
         });
         assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Allocated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_busy_node_derives_state_from_live_allocations() {
+        for (cpus, expected) in [
+            (0, NodeState::Mixed),
+            (2, NodeState::Mixed),
+            (8, NodeState::Allocated),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_gpu_node(&cm, "n1", vec![gpu_resource(0, 42)]);
+            let id = submit_and_wait(&cm, basic_spec("busy-resume"));
+            let mut alloc = scalar_alloc(cpus, 4000);
+            alloc.add(&ResourceAllocations::from_device_ids("gpu", &[42]));
+            cm.start_job(
+                id,
+                vec!["n1".into()],
+                alloc.clone(),
+                per_node_for(&["n1"], alloc),
+            )
+            .unwrap();
+            cm.update_node_state(
+                "n1",
+                NodeState::Drain,
+                Some("maintenance".into()),
+                Some(1000),
+            )
+            .unwrap();
+            assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Draining);
+
+            cm.update_node_state("n1", NodeState::Idle, None, None)
+                .unwrap();
+            assert!(cm.update_heartbeat("n1", 0, 4000));
+            cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+
+            let node = cm.get_node("n1").unwrap();
+            assert_eq!(node.state, expected);
+            assert_eq!(node.alloc_resources.cpus, cpus);
+            assert_eq!(node.alloc_resources.device_ids("gpu"), vec![42]);
+            assert!(!node.admin_locked);
+            assert!(node.state_reason.is_none());
+            assert!(node.reason_uid.is_none());
+            assert!(node.reason_time.is_none());
+            assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+            assert_eq!(
+                cm.node_metrics().by_state[NodeState::Idle.to_proto_i32() as usize],
+                0
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_restore_repairs_stale_service_states_and_preserves_holds() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for (name, cpus, stored, expected) in [
+            ("full", 4, NodeState::Idle, NodeState::Allocated),
+            ("partial", 2, NodeState::Idle, NodeState::Mixed),
+            ("empty", 0, NodeState::Allocated, NodeState::Idle),
+            ("down", 4, NodeState::Down, NodeState::Down),
+            ("draining", 4, NodeState::Draining, NodeState::Draining),
+            ("drain", 0, NodeState::Drain, NodeState::Drain),
+            ("error", 2, NodeState::Error, NodeState::Error),
+            ("suspended", 2, NodeState::Suspended, NodeState::Suspended),
+            ("unknown", 0, NodeState::Unknown, NodeState::Unknown),
+        ] {
+            register_node(&cm, name, 4, 8000);
+            if cpus > 0 {
+                let id = submit_and_wait(&cm, basic_spec(name));
+                let alloc = scalar_alloc(cpus, 4000);
+                cm.start_job(
+                    id,
+                    vec![name.into()],
+                    alloc.clone(),
+                    per_node_for(&[name], alloc),
+                )
+                .unwrap();
+            }
+            cm.nodes.write().get_mut(name).unwrap().state = stored;
+            let snapshot = cm.snapshot_state().unwrap();
+            let restored_dir = TempDir::new().unwrap();
+            let restored = ClusterManager::new(test_config(), restored_dir.path()).unwrap();
+            restored.restore_from_snapshot(&snapshot).unwrap();
+            let node = restored.get_node(name).unwrap();
+            assert_eq!(node.state, expected, "{name}");
+            assert_eq!(node.alloc_resources.cpus, cpus, "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_state_wal_uses_allocations_at_apply_time() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("allocation-race"));
+        let pending_resume = WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Drain,
+            new_state: NodeState::Idle,
+            reason: None,
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        };
+        let alloc = scalar_alloc(4, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        cm.apply_operation(&pending_resume);
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Allocated);
+
+        cm.complete_job(id, 0, JobState::Completed).unwrap();
+        for requested in [NodeState::Idle, NodeState::Mixed, NodeState::Allocated] {
+            let late_recovery = WalOperation::NodeStateChange {
+                name: "n1".into(),
+                old_state: NodeState::Down,
+                new_state: requested,
+                reason: None,
+                admin_locked: false,
+                reason_uid: None,
+                reason_time: None,
+                at: None,
+            };
+            cm.apply_operation(&late_recovery);
+            assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Idle);
+            assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
