@@ -1593,8 +1593,8 @@ Resuming a node with ``scontrol update NodeName=<node> State=RESUME`` (or
 its current allocations: ``ALLOCATED`` when all CPUs are allocated, ``MIXED``
 when some CPUs or devices are allocated, and ``IDLE`` when neither is allocated.
 Running jobs keep their allocations and continue executing. Controller startup
-also reconciles these service states in restored snapshots; unavailable and
-administratively held states are preserved.
+also reconciles these service states in restored snapshots after applying the
+current resource caps; unavailable and administratively held states are preserved.
 
 ``[network]``
 -------------
