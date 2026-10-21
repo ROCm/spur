@@ -86,7 +86,11 @@ Older agents and saved inventories omit it. New agents send typed
 node/resource responses preserve them. Unknown wire status values map to
 ``unknown``. Existing allocated device identities remain accounted for during
 inventory changes, while missing devices' old fabric observations become
-unavailable.
+unavailable. A full discovery dropout also marks retained declaration-only GPUs
+unavailable, even if they previously had no native topology metadata. During
+partial loss, a missing held GPU retains its accounting identity with an
+unavailable marker. These markers participate in inventory refresh and disable
+affected block placement; identity retention does not establish device presence.
 
 The shared model uses vendor-neutral physical/fabric domain references,
 endpoint IDs, locality, capacity, observation status, and diagnostics.
@@ -300,7 +304,9 @@ multiple groups, or unresolved GPUs on an included node. Review and validate
 the output before installation. It contains no inferred topology hierarchy.
 
 ``validate --format block`` checks syntax locally, then resolves membership
-against the controller's current live inventory through a read-only RPC. It
+against the controller's current live inventory through a read-only RPC. The
+original bounded text is sent unchanged, so expansion of a compact hostlist
+does not inflate the validation request beyond the file-size limit. Validation
 does not require the candidate revision to be deployed to agents, so it can
 be used before installation. Missing nodes, stale agents, missing GPUs, or
 conflicting native membership are reported as errors. Success does not test
