@@ -8,9 +8,6 @@ on:
 
 permissions: {}
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   release-please:
     name: Release PR and tag
@@ -30,53 +27,11 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # Cargo.lock is bumped by release-please-config.json, so this job never
+      # checks out or builds the release branch.
       - name: Run release-please
-        id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-
-      # The `simple` release type only bumps Cargo.toml + CHANGELOG.md. CI builds with
-      # --locked, so Cargo.lock must be re-synced on the release PR or the build fails.
-      - name: Resolve release PR branch
-        id: pr
-        if: ${{ steps.release.outputs.pr }}
-        env:
-          PR_JSON: ${{ steps.release.outputs.pr }}
-        run: echo "branch=$(jq -r .headBranchName <<<"$PR_JSON")" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout release PR branch
-        if: ${{ steps.release.outputs.pr }}
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.pr.outputs.branch }}
-          token: ${{ steps.app-token.outputs.token }}
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        if: ${{ steps.release.outputs.pr }}
-        run: rustup show
-
-      - name: Sync Cargo.lock with bumped workspace version
-        if: ${{ steps.release.outputs.pr }}
-        run: |
-          cargo update --workspace
-          if git diff --quiet -- Cargo.lock; then
-            echo "Cargo.lock already in sync."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock
-          git commit -m "chore: sync Cargo.lock"
-
-      - name: Push Cargo.lock update
-        if: ${{ steps.release.outputs.pr }}
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          PR_BRANCH: ${{ steps.pr.outputs.branch }}
-        run: |
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            "HEAD:${PR_BRANCH}"
