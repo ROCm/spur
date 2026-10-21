@@ -3578,6 +3578,7 @@ pub struct AgentService {
     cred_keys: Option<Arc<spur_core::native_jwks::Ed25519VerifyKeySet>>,
     launch_acceptance: Arc<spur_core::native_exec::LaunchAcceptance>,
     auth_policy: spur_core::config::AuthConfig,
+    block_file: Option<std::path::PathBuf>,
 }
 
 impl AgentService {
@@ -3714,6 +3715,7 @@ impl AgentService {
             cred_keys: None,
             launch_acceptance: Arc::new(spur_core::native_exec::LaunchAcceptance::new()),
             auth_policy: spur_core::config::AuthConfig::default(),
+            block_file: None,
         }
     }
 
@@ -3747,6 +3749,10 @@ impl AgentService {
             self.cluster_id = native.cluster_id.clone();
             self.cred_keys = native.cred_keys.clone();
         }
+    }
+
+    pub fn set_block_file(&mut self, path: Option<std::path::PathBuf>) {
+        self.block_file = path;
     }
 
     pub fn apply_auth_policy(&mut self, auth: &spur_core::config::AuthConfig) {
@@ -5158,11 +5164,15 @@ fn refresh_bound_fabric(
         let Some(topology) = &mut gpu.topology else {
             continue;
         };
-        if topology
+        let refresh_native = topology
             .fabric
             .as_ref()
-            .is_none_or(|fabric| fabric.source != "amd-ualink")
-        {
+            .is_some_and(|f| f.source == "amd-ualink");
+        let check_new_observation = binding.file_revision.is_some()
+            && binding.observed_key.is_none()
+            && topology.fabric.is_none()
+            && topology.pci_bdf.is_some();
+        if !refresh_native && !check_new_observation {
             continue;
         }
         let bdf = topology
@@ -9133,6 +9143,32 @@ impl AgentService {
                 })
                 .unwrap_or_default(),
         );
+        if let Some(revision) = &binding.file_revision {
+            let path = self.block_file.as_deref().ok_or_else(|| {
+                Status::failed_precondition("block file is not configured on this agent")
+            })?;
+            let file = spur_core::block_file::BlockFile::read(path)
+                .map_err(Status::failed_precondition)?;
+            if &file.revision != revision
+                || !file.contains(&binding.key.fabric_domain, &self.reporter.hostname)
+            {
+                return Err(Status::failed_precondition(
+                    "block file revision or node membership changed",
+                ));
+            }
+            if binding.observed_key.is_none()
+                && binding.active_endpoints.iter().any(|endpoint| {
+                    endpoint.rsplit_once('/').is_none_or(|(node, id)| {
+                        !file.contains(&binding.key.fabric_domain, node)
+                            || id.parse::<u64>().is_err()
+                    })
+                })
+            {
+                return Err(Status::failed_precondition(
+                    "declared endpoint outside the block file",
+                ));
+            }
+        }
         refresh_bound_fabric(&mut inventory, &binding, std::path::Path::new("/sys"))?;
         if !self.cluster_id.is_empty() && self.cluster_id != binding.key.namespace {
             return Err(Status::failed_precondition(
@@ -16845,6 +16881,8 @@ mod tests {
         });
         reporter.update_resources(inventory);
         let block = FabricBlock {
+            file_revision: None,
+            observed_key: None,
             key: FabricBlockKey {
                 namespace: "test".into(),
                 physical_domain: "rack-a".into(),
@@ -16926,6 +16964,61 @@ mod tests {
         tracked.gpu_devices = vec![42];
         tracked.fabric_binding = Some(binding);
         assert!(service.check_tracked_fabric(&tracked).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_bindings_reread_membership_before_allocation_and_steps() {
+        let (mut service, mut binding, mut allocation) = fabric_dispatch_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topology.conf");
+        let text = "BlockName=a Nodes=test-node";
+        std::fs::write(&path, text).unwrap();
+        let file = spur_core::block_file::BlockFile::read(&path).unwrap();
+        let mut live = service.reporter.snapshot_resources();
+        live.fabric_binding_version = 2;
+        live.block_file_revision = Some(file.revision.clone());
+        service.reporter.update_resources(live);
+        binding.version = 2;
+        binding.file_revision = Some(file.revision);
+        binding.observed_key = Some(binding.key.clone());
+        binding.key.fabric_domain = "a".into();
+        allocation.fabric_binding = Some(spur_core::fabric_binding::to_proto(&binding));
+        assert!(service
+            .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .is_err());
+        service.set_block_file(Some(path.clone()));
+        service
+            .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .unwrap();
+        service.allocation.lock().await.release_job(501);
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.gpu_devices = vec![42];
+        tracked.fabric_binding = Some(binding);
+        std::fs::write(&path, "# reordered\nNodes=test-node BlockName=a\n").unwrap();
+        service.check_tracked_fabric(&tracked).unwrap();
+        for replacement in [Some("BlockName=b Nodes=test-node"), Some("bad input"), None] {
+            if let Some(text) = replacement {
+                std::fs::write(&path, text).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            assert!(service.check_tracked_fabric(&tracked).is_err());
+            let error = service
+                .allocate_local_resources(502, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(service
+                .allocation
+                .lock()
+                .await
+                .allocated_gpu_ids()
+                .is_empty());
+        }
+        std::fs::write(&path, text).unwrap();
+        service.check_tracked_fabric(&tracked).unwrap();
     }
 
     #[tokio::test]
@@ -17134,6 +17227,7 @@ mod tests {
             "http://localhost:6817".into(),
             ResourceSet {
                 fabric_binding_version: 0,
+                block_file_revision: None,
                 cpus: 4,
                 memory_mb: 8192,
                 gpus: vec![spur_core::resource::GpuResource {
@@ -18547,6 +18641,7 @@ mod tests {
             get_nodes(spur_proto::proto::GetNodesRequest) -> spur_proto::proto::GetNodesResponse;
             get_node(spur_proto::proto::GetNodeRequest) -> spur_proto::proto::NodeInfo;
         get_fabric_topology(()) -> spur_proto::proto::GetFabricTopologyResponse;
+        validate_block_file(spur_proto::proto::ValidateBlockFileRequest) -> spur_proto::proto::GetFabricTopologyResponse;
             update_node(spur_proto::proto::UpdateNodeRequest) -> ();
             deregister_node(spur_proto::proto::DeregisterNodeRequest) -> spur_proto::proto::DeregisterNodeResponse;
             deregister_agent(spur_proto::proto::DeregisterAgentRequest) -> ();

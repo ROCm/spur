@@ -158,6 +158,7 @@ mod tests {
             "n1".into(),
             ResourceSet {
                 fabric_binding_version: 0,
+                block_file_revision: None,
                 cpus: 8,
                 memory_mb: 16384,
                 gpus: Vec::new(),

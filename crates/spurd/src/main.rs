@@ -512,10 +512,16 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(Mutex::new(registry));
 
     // Discover local resources (CPU/memory from sysfs, GPUs from device registry)
-    let resources = {
+    let mut resources = {
         let reg = registry.lock().await;
         reporter::discover_resources(&reg)
     };
+    let block_file = config
+        .as_ref()
+        .and_then(|c| c.topology.as_ref())
+        .and_then(|t| t.external.as_ref())
+        .and_then(|e| e.block_file.clone());
+    reporter::refresh_block_file(&mut resources, block_file.as_deref());
     info!(
         cpus = resources.cpus,
         memory_mb = resources.memory_mb,
@@ -656,6 +662,7 @@ async fn main() -> anyhow::Result<()> {
     .with_runtime_state_dir(stepd_state_dir.clone());
     if let Some(config) = config.as_ref() {
         agent_service.apply_auth_policy(&config.auth);
+        agent_service.set_block_file(block_file.clone());
     }
     // Give the reporter the live allocation so heartbeats carry each held job's
     // translated GPU stable_ids. Wired before the replay below records adopted
@@ -989,6 +996,12 @@ fn spawn_inventory_refresh(
                 reporter::mark_fabric_unavailable(&mut fresh);
             }
 
+            let block_path = config
+                .as_ref()
+                .and_then(|c| c.topology.as_ref())
+                .and_then(|t| t.external.as_ref())
+                .and_then(|e| e.block_file.as_deref());
+            reporter::refresh_block_file(&mut fresh, block_path);
             let held: std::collections::HashSet<u64> = {
                 let a = allocation.lock().await;
                 a.allocated_gpu_ids().into_iter().collect()
@@ -1322,6 +1335,7 @@ mod tests {
         use spur_core::resource::{GpuLinkType, GpuResource};
         spur_core::resource::ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: (0..n as u32)

@@ -43,6 +43,10 @@ pub struct FabricBlock {
     /// Empty means complete, consistent, and backed by live registered nodes;
     /// it does not establish authoritative fabric health or launch safety.
     pub issues: Vec<String>,
+    #[serde(default)]
+    pub file_revision: Option<String>,
+    #[serde(default)]
+    pub observed_key: Option<FabricBlockKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +331,8 @@ fn assemble_block(
             None
         },
         issues: issues.into_iter().map(str::to_string).collect(),
+        file_revision: None,
+        observed_key: None,
     }
 }
 
@@ -461,6 +467,12 @@ impl From<&FabricView> for spur_proto::proto::GetFabricTopologyResponse {
                     physical_capacity: block.physical_capacity,
                     fabric_capacity: block.fabric_capacity,
                     issues: block.issues.clone(),
+                    file_revision: block.file_revision.clone(),
+                    observed_key: block.observed_key.as_ref().map(|k| proto::FabricBlockKey {
+                        namespace: k.namespace.clone(),
+                        physical_domain: k.physical_domain.clone(),
+                        fabric_domain: k.fabric_domain.clone(),
+                    }),
                 })
                 .collect(),
             unresolved: view
@@ -514,6 +526,12 @@ impl TryFrom<spur_proto::proto::GetFabricTopologyResponse> for FabricView {
                     physical_capacity: block.physical_capacity,
                     fabric_capacity: block.fabric_capacity,
                     issues: block.issues,
+                    file_revision: block.file_revision,
+                    observed_key: block.observed_key.map(|k| FabricBlockKey {
+                        namespace: k.namespace,
+                        physical_domain: k.physical_domain,
+                        fabric_domain: k.fabric_domain,
+                    }),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

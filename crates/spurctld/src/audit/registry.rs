@@ -123,6 +123,7 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         | "GetJob"
         | "GetNodes"
         | "GetFabricTopology"
+        | "ValidateBlockFile"
         | "GetNode"
         | "GetPartitions"
         | "GetJobSteps"

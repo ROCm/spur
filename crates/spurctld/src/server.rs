@@ -1966,6 +1966,34 @@ impl SlurmController for ControllerService {
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
     }
 
+    async fn validate_block_file(
+        &self,
+        request: Request<ValidateBlockFileRequest>,
+    ) -> Result<Response<GetFabricTopologyResponse>, Status> {
+        let forward = self.prepare_read(&request);
+        let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
+        let req = request.into_inner();
+        let file = spur_core::block_file::BlockFile::parse(&req.content)
+            .map_err(Status::invalid_argument)?;
+        if let Some(resp) = self
+            .forward_read(meta, forward.then_some(req), identity, path)
+            .await
+        {
+            return Ok(resp);
+        }
+        let config = self.cluster.config();
+        let view = file.view(
+            &config.cluster_name,
+            &self.cluster.get_nodes(),
+            chrono::Utc::now(),
+            config.controller.heartbeat_timeout_secs.unwrap_or(90),
+            false,
+        );
+        Ok(Response::new((&view).into()))
+    }
+
     async fn get_fabric_topology(
         &self,
         request: Request<()>,
@@ -4955,6 +4983,7 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
         generic: r.generic,
         generation: r.generation,
         fabric_binding_version: r.fabric_binding_version,
+        block_file_revision: r.block_file_revision.clone(),
     };
     rs.backfill_stable_ids();
     rs
@@ -5535,6 +5564,7 @@ pub(crate) fn resource_to_proto(
         generic: r.generic.clone(),
         generation: r.generation,
         fabric_binding_version: r.fabric_binding_version,
+        block_file_revision: r.block_file_revision.clone(),
     }
 }
 
@@ -5923,6 +5953,7 @@ mod tests {
         use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
         let rs = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: vec![GpuResource {
@@ -10316,6 +10347,7 @@ mod tests {
                 cpus: 4,
                 generation,
                 fabric_binding_version: 1,
+                block_file_revision: None,
                 gpus: vec![spur_proto::proto::GpuResource {
                     stable_id: 42,
                     topology: Some(spur_proto::proto::DeviceTopology {
@@ -10346,12 +10378,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_file_validation_rpc_is_read_only_and_reports_membership_issues() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, step_test_config()).await;
+        register_test_fabric_node(&svc, 1, "7").await;
+        let candidate = |text: &str| {
+            Request::new(ValidateBlockFileRequest {
+                content: text.into(),
+            })
+        };
+        let view = svc
+            .validate_block_file(candidate("BlockName=a Nodes=fabric-node"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            view.blocks[0].issues.is_empty(),
+            "{:?}",
+            view.blocks[0].issues
+        );
+        assert!(view.blocks[0].file_revision.is_some());
+        assert!(view.blocks[0].observed_key.is_some());
+        assert!(svc.cluster.fabric_view(Utc::now()).blocks[0]
+            .file_revision
+            .is_none());
+        let invalid = svc
+            .validate_block_file(candidate("BlockName=a Nodes=missing"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!invalid.blocks[0].issues.is_empty());
+        let error = svc
+            .validate_block_file(candidate("BlockSizes=2"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fabric_placement_is_validated_before_raft_charges_resources() {
         use spur_core::fabric_binding::FabricBinding;
         let dir = tempfile::TempDir::new().unwrap();
         let mut config = step_test_config();
         config.topology = Some(spur_core::topology::TopologyConfig {
             external: Some(spur_core::topology::ExternalFabricConfig {
+                block_file: None,
+                loaded_block_file: None,
                 single_block_partitions: vec!["default".into()],
             }),
             ..Default::default()

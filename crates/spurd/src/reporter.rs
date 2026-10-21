@@ -284,7 +284,8 @@ impl NodeReporter {
             || cur.memory_mb != fresh.memory_mb
             || cur.gpus != fresh.gpus
             || cur.generic != fresh.generic
-            || cur.fabric_binding_version != fresh.fabric_binding_version;
+            || cur.fabric_binding_version != fresh.fabric_binding_version
+            || cur.block_file_revision != fresh.block_file_revision;
         *cur = fresh;
         changed
     }
@@ -495,7 +496,7 @@ pub enum RefreshAction {
 }
 
 /// Fingerprint of a schedulable set, used to debounce on inventory identity.
-pub type InventoryFingerprint = (u32, u64, Vec<GpuResource>, Vec<(String, u64)>, u32);
+pub type InventoryFingerprint = spur_core::resource::InventoryFingerprint;
 
 /// Debounced per-tick decision. A non-`Unchanged` delta acts only when it
 /// repeats AND the fresh inventory identity matches the previous tick's, so two
@@ -575,6 +576,7 @@ pub fn classify(
         && old.gpus == new.gpus
         && old.generic == new.generic
         && old.fabric_binding_version == new.fabric_binding_version
+        && old.block_file_revision == new.block_file_revision
     {
         return InventoryDelta::Unchanged;
     }
@@ -674,8 +676,20 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         generic: generic_from_registry(registry),
         // Bumped by the periodic refresh task on topology rebuild, not here.
         generation: 0,
-        fabric_binding_version: spur_core::fabric_binding::FABRIC_BINDING_VERSION,
+        fabric_binding_version: spur_core::fabric_binding::FILE_BINDING_VERSION,
+        block_file_revision: None,
     }
+}
+
+pub fn refresh_block_file(resources: &mut ResourceSet, path: Option<&std::path::Path>) {
+    resources.block_file_revision =
+        path.and_then(|path| match spur_core::block_file::BlockFile::read(path) {
+            Ok(file) => Some(file.revision),
+            Err(error) => {
+                warn!(%error, "block file unavailable; declared block placement disabled");
+                None
+            }
+        });
 }
 
 fn build_peer_gpus(links: Option<&[i32]>, gpu_device_ids: &[u32]) -> Vec<u32> {
@@ -897,6 +911,7 @@ pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
         generic: r.generic.clone(),
         generation: r.generation,
         fabric_binding_version: r.fabric_binding_version,
+        block_file_revision: r.block_file_revision.clone(),
     }
 }
 
@@ -1547,6 +1562,7 @@ mod tests {
         };
         let rs = |gpus: Vec<GpuResource>| ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus,
@@ -1595,6 +1611,7 @@ mod tests {
     fn rset(cpus: u32, generation: u64, gpus: Vec<GpuResource>) -> ResourceSet {
         ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus,
             memory_mb: 1024,
             gpus,
@@ -1771,12 +1788,14 @@ mod tests {
     fn fabric_capable_initial_inventory_has_a_nonzero_boot_generation() {
         let reporter = test_reporter(ResourceSet {
             fabric_binding_version: 1,
+            block_file_revision: None,
             ..Default::default()
         });
         let generation = reporter.snapshot_resources().generation;
         assert!(generation > 0 && generation < (1u64 << 63));
         let explicit = test_reporter(ResourceSet {
             fabric_binding_version: 1,
+            block_file_revision: None,
             generation: 7,
             ..Default::default()
         });
@@ -1793,6 +1812,7 @@ mod tests {
     fn update_resources_reports_change_ignoring_generation() {
         let base = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 4,
             memory_mb: 512,
             gpus: vec![],
@@ -1818,6 +1838,7 @@ mod tests {
             gpu_ids.iter().map(|&id| gpu(id as u32, id)).collect(),
             Vec::new(),
             0,
+            None,
         )
     }
 

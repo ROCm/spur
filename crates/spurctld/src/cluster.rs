@@ -854,10 +854,13 @@ impl ClusterManager {
     }
 
     pub fn new_with_config_path(
-        config: SlurmConfig,
+        mut config: SlurmConfig,
         _state_dir: &Path,
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        if let Some(external) = config.topology.as_mut().and_then(|t| t.external.as_mut()) {
+            external.load_block_file().map_err(anyhow::Error::msg)?;
+        }
         let partitions = config.build_partitions();
         let config_seeded_partitions: HashSet<String> =
             partitions.iter().map(|p| p.name.clone()).collect();
@@ -2298,7 +2301,14 @@ impl ClusterManager {
                 .iter()
                 .find(|block| block.key == binding.key && block.issues.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("fabric block is no longer consistent"))?;
-            if block.active_endpoints != binding.active_endpoints {
+            if block.active_endpoints != binding.active_endpoints
+                || block.file_revision != binding.file_revision
+                || block.observed_key != binding.observed_key
+                || binding
+                    .members
+                    .iter()
+                    .any(|member| !block.members.contains(member))
+            {
                 anyhow::bail!("fabric membership changed before dispatch");
             }
             let node = self
@@ -3787,12 +3797,22 @@ impl ClusterManager {
 
     pub fn fabric_view(&self, now: DateTime<Utc>) -> spur_core::fabric::FabricView {
         let config = self.config();
-        let mut view = spur_core::fabric::FabricView::from_nodes(
-            &config.cluster_name,
-            &self.get_nodes(),
-            now,
-            config.controller.heartbeat_timeout_secs.unwrap_or(90),
-        );
+        let nodes = self.get_nodes();
+        let timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
+        let definition = config
+            .topology
+            .as_ref()
+            .and_then(|t| t.external.as_ref())
+            .and_then(|e| e.loaded_block_file.as_ref());
+        let mut view = match definition {
+            Some(file) => file.view(&config.cluster_name, &nodes, now, timeout, true),
+            None => spur_core::fabric::FabricView::from_nodes(
+                &config.cluster_name,
+                &nodes,
+                now,
+                timeout,
+            ),
+        };
         view.single_block_partitions = config
             .topology
             .as_ref()
@@ -5613,7 +5633,30 @@ impl ClusterManager {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
-        let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        let mut new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        if let Some(external) = new_config
+            .topology
+            .as_mut()
+            .and_then(|t| t.external.as_mut())
+        {
+            external.load_block_file().map_err(anyhow::Error::msg)?;
+            if let Some(file) = &external.loaded_block_file {
+                let view = file.view(
+                    &new_config.cluster_name,
+                    &self.get_nodes(),
+                    Utc::now(),
+                    new_config.controller.heartbeat_timeout_secs.unwrap_or(90),
+                    false,
+                );
+                if let Some(block) = view.blocks.iter().find(|b| !b.issues.is_empty()) {
+                    anyhow::bail!(
+                        "invalid block file membership for {}: {}",
+                        block.key.fabric_domain,
+                        block.issues.join(",")
+                    );
+                }
+            }
+        }
         new_config.auth.check_private_data()?;
         if let Some(warning) = new_config.auth.private_data_warning() {
             warn!("{warning}");
@@ -10889,6 +10932,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_block_reload_preserves_config_and_partitions() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=worker1").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "gpu"
+nodes = "ALL"
+"#,
+            block_path
+        );
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf).await;
+        let revision = cm
+            .config()
+            .topology
+            .as_ref()
+            .unwrap()
+            .external
+            .as_ref()
+            .unwrap()
+            .loaded_block_file
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        assert_eq!(cm.fabric_view(Utc::now()).blocks[0].key.fabric_domain, "a");
+        for invalid in ["BlockName=b Nodes=missing", "BlockName=broken"] {
+            std::fs::write(&block_path, invalid).unwrap();
+            std::fs::write(
+                &conf_path,
+                conf.replace(r#"name = "gpu""#, r#"name = "changed""#),
+            )
+            .unwrap();
+            assert!(cm.reconfigure().is_err());
+            assert_eq!(
+                cm.config()
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .external
+                    .as_ref()
+                    .unwrap()
+                    .loaded_block_file
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                revision
+            );
+            assert!(cm.get_partitions().iter().any(|p| p.name == "gpu"));
+            assert!(!cm.get_partitions().iter().any(|p| p.name == "changed"));
+        }
+        assert!(ClusterManager::new(
+            spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap(),
+            dir.path()
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn reconfigure_reloads_scheduler_tunables_live() {
         let dir = TempDir::new().unwrap();
         let (cm, conf_path) = test_cluster_with_conf_file(
@@ -12970,6 +13075,7 @@ mod tests {
         // both real GPUs read free.
         let want_two_gpus = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 0,
             memory_mb: 0,
             gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],

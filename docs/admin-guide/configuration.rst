@@ -2708,3 +2708,13 @@ See Also
 - :doc:`accounting`
 - :doc:`/deployment/ansible`
 - :doc:`/deployment/native-host`
+
+External fabric block source
+----------------------------
+
+``[topology.external] single_block_partitions`` lists partitions whose GPU jobs
+must fit within one consistent block. The optional ``block_file`` absolute path
+selects administrator/operator whole-node definitions using
+``BlockName=... Nodes=...`` records. Omit it for automatic native discovery.
+See :doc:`fabric-observation` for the supported syntax, controller and agent
+installation, revision fencing, reconfiguration, and scheduling examples.

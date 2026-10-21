@@ -134,6 +134,7 @@ mod tests {
             name.into(),
             ResourceSet {
                 fabric_binding_version: 0,
+                block_file_revision: None,
                 cpus,
                 memory_mb,
                 gpus: Vec::new(),

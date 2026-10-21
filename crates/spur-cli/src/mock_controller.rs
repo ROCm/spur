@@ -381,6 +381,7 @@ mock_controller_impl! {
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
         get_fabric_topology(()) -> proto::GetFabricTopologyResponse;
+        validate_block_file(proto::ValidateBlockFileRequest) -> proto::GetFabricTopologyResponse;
         create_partition(proto::CreatePartitionRequest) -> ();
         update_partition(proto::UpdatePartitionRequest) -> ();
         delete_partition(proto::DeletePartitionRequest) -> ();

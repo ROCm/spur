@@ -45,7 +45,18 @@ pub struct ResourceSet {
     pub generation: u64,
     #[serde(default)]
     pub fabric_binding_version: u32,
+    #[serde(default)]
+    pub block_file_revision: Option<String>,
 }
+
+pub type InventoryFingerprint = (
+    u32,
+    u64,
+    Vec<GpuResource>,
+    Vec<(String, u64)>,
+    u32,
+    Option<String>,
+);
 
 /// Tracks consumed resources (per-node or per-job allocation accounting).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -216,7 +227,7 @@ impl ResourceSet {
     /// Identity of the schedulable set, independent of `generation`. Two ticks
     /// with an equal fingerprint observed the same topology, so a debounce can
     /// tell "same change seen twice" from "two different partial reads".
-    pub fn schedulable_fingerprint(&self) -> (u32, u64, Vec<GpuResource>, Vec<(String, u64)>, u32) {
+    pub fn schedulable_fingerprint(&self) -> InventoryFingerprint {
         let mut gpus = self.gpus.clone();
         gpus.sort();
         let mut generic: Vec<(String, u64)> =
@@ -228,6 +239,7 @@ impl ResourceSet {
             gpus,
             generic,
             self.fabric_binding_version,
+            self.block_file_revision.clone(),
         )
     }
 
@@ -258,6 +270,7 @@ impl ResourceSet {
             generic: self.generic.clone(),
             generation: self.generation,
             fabric_binding_version: self.fabric_binding_version,
+            block_file_revision: self.block_file_revision.clone(),
         }
     }
 
@@ -534,6 +547,7 @@ mod tests {
     fn sample_inventory() -> ResourceSet {
         ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -630,6 +644,7 @@ mod tests {
         let avail = sample_inventory();
         let req = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 32,
             memory_mb: 128_000,
             gpus: vec![GpuResource {
@@ -657,6 +672,7 @@ mod tests {
 
         let req_one = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 1,
             memory_mb: 1,
             gpus: vec![GpuResource {
@@ -734,6 +750,7 @@ mod tests {
     fn available_device_ids_returns_stable_ids_not_positional() {
         let inventory = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -775,6 +792,7 @@ mod tests {
         let inventory = sample_inventory();
         let request = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 16_000,
             gpus: vec![GpuResource {
@@ -798,6 +816,7 @@ mod tests {
     fn test_build_node_allocation_multi_type() {
         let inventory = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![
@@ -843,6 +862,7 @@ mod tests {
         };
         let request = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 16_000,
             gpus: vec![
@@ -911,6 +931,7 @@ mod accounting_tests {
     fn inventory() -> ResourceSet {
         ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 131_072,
             gpus: vec![gpu(0, "mi300x"), gpu(1, "mi300x"), gpu(2, "mi210")],
@@ -1042,6 +1063,7 @@ mod accounting_tests {
     fn build_exclusive_allocation_omits_absent_gpus_and_zero_counts() {
         let inv = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: Vec::new(),
@@ -1062,6 +1084,7 @@ mod accounting_tests {
     fn build_exclusive_allocation_emits_stable_ids_not_positional() {
         let inv = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 16,
             memory_mb: 1024,
             gpus: vec![
@@ -1134,6 +1157,7 @@ mod accounting_tests {
     fn backfill_stable_ids_fills_legacy_zeros_only() {
         let mut inv = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 0,
             memory_mb: 0,
             gpus: vec![
@@ -1179,6 +1203,7 @@ mod accounting_tests {
     fn feasibility_subtracts_held_gpu_by_stable_id() {
         let inv = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: vec![GpuResource {
@@ -1198,6 +1223,7 @@ mod accounting_tests {
 
         let req = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 1,
             memory_mb: 1,
             gpus: vec![GpuResource {

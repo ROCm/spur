@@ -2097,6 +2097,16 @@ impl SlurmConfig {
             .as_ref()
             .and_then(|topology| topology.external.as_ref())
         {
+            if external
+                .block_file
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "topology.external.block_file".into(),
+                    value: "requires an absolute file path".into(),
+                });
+            }
             for name in &external.single_block_partitions {
                 if name.trim().is_empty()
                     || !self

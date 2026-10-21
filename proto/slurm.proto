@@ -20,6 +20,7 @@ message ResourceSet {
   map<string, uint64> generic = 4;  // licenses, etc.
   uint64 generation = 5;  // bumped by the agent on each topology rebuild
   uint32 fabric_binding_version = 6; // highest enforced binding version; zero is unsupported
+  optional string block_file_revision = 7;
 }
 
 message AllocatedDevice {
@@ -122,6 +123,8 @@ message FabricBlock {
   optional uint32 physical_capacity = 4;
   optional uint32 fabric_capacity = 5;
   repeated string issues = 6;
+  optional string file_revision = 7;
+  FabricBlockKey observed_key = 8;
 }
 
 message FabricBinding {
@@ -131,6 +134,12 @@ message FabricBinding {
   repeated FabricMember members = 4;
   string node = 5;
   uint64 inventory_generation = 6;
+  optional string file_revision = 7;
+  FabricBlockKey observed_key = 8;
+}
+
+message ValidateBlockFileRequest {
+  string content = 1;
 }
 
 message UnresolvedFabricDevice {
@@ -515,6 +524,7 @@ service SlurmController {
   // Node management
   rpc GetNodes(GetNodesRequest) returns (GetNodesResponse);
   rpc GetFabricTopology(google.protobuf.Empty) returns (GetFabricTopologyResponse);
+  rpc ValidateBlockFile(ValidateBlockFileRequest) returns (GetFabricTopologyResponse);
   rpc GetNode(GetNodeRequest) returns (NodeInfo);
   rpc UpdateNode(UpdateNodeRequest) returns (google.protobuf.Empty);
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
