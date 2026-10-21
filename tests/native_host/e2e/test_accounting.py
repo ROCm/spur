@@ -1750,3 +1750,18 @@ class TestAuditReadAuthorization:
         assert "requires cluster operator or administrator" in denied.lower(), (
             f"an identified non-admin must be refused: {denied}"
         )
+class TestSacctmgrHelpFields:
+    """`sacctmgr --help` must name the valid key=value fields per entity instead
+    of forcing a trial-and-error probe."""
+
+    def test_add_help_lists_fields(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.sacctmgr(["add", "account", "--help"])
+        assert "Fields (key=value)" in out, f"help lists no fields: {out}"
+        assert "fairshare" in out, f"account fields missing fairshare: {out}"
+
+    def test_show_help_lists_filters(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.sacctmgr(["show", "--help"])
+        assert "Filters (key=value)" in out, f"show help lists no filters: {out}"
+        assert "association" in out, f"show help omits association entity: {out}"

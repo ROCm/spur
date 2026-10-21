@@ -58,9 +58,33 @@ impl SacctmgrArgs {
     }
 }
 
+/// `key=value` fields `add`/`modify` accept, listed per entity so `--help`
+/// names them instead of forcing a trial-and-error probe. The entity is a
+/// positional arg, so clap renders one help page for all entities; this block
+/// documents every entity's fields in that one page.
+const WRITE_FIELDS_HELP: &str = "\
+Fields (key=value), by entity:
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres
+  user      name, account, defaultaccount, adminlevel, defaultqos, qos,
+            maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
+  qos       name, description, priority, preemptmode, preempt, preemptexempttime,
+            idlefillpreemptable, usagefactor, maxjobsperuser, maxwall, maxtresperjob,
+            maxsubmitjobsperuser, maxsubmitjobsperaccount, grpsubmit, maxtresperuser,
+            grptres, grpwall, flags";
+
+/// `key=value` filters `show` accepts, per entity.
+const SHOW_FIELDS_HELP: &str = "\
+Filters (key=value), by entity:
+  account       name, format
+  user          account, user, format
+  qos           name, format
+  association   (no filters; lists all associations)
+  txn           action, actor, format";
+
 #[derive(Subcommand, Debug)]
 pub enum SacctmgrCommand {
     /// Add entities
+    #[command(after_help = WRITE_FIELDS_HELP)]
     Add {
         /// Entity type: account, user, qos
         entity: String,
@@ -68,6 +92,7 @@ pub enum SacctmgrCommand {
         params: Vec<String>,
     },
     /// Delete entities
+    #[command(after_help = WRITE_FIELDS_HELP)]
     Delete {
         /// Entity type: account, user, qos
         entity: String,
@@ -75,6 +100,7 @@ pub enum SacctmgrCommand {
         params: Vec<String>,
     },
     /// Modify entities
+    #[command(after_help = WRITE_FIELDS_HELP)]
     Modify {
         /// Entity type: account, user, qos
         entity: String,
@@ -82,6 +108,7 @@ pub enum SacctmgrCommand {
         params: Vec<String>,
     },
     /// List/show entities
+    #[command(after_help = SHOW_FIELDS_HELP)]
     Show {
         /// Entity type: account, user, qos, association
         entity: String,
@@ -89,6 +116,7 @@ pub enum SacctmgrCommand {
         params: Vec<String>,
     },
     /// List entities (alias for show)
+    #[command(after_help = SHOW_FIELDS_HELP)]
     List { entity: String, params: Vec<String> },
 }
 
@@ -1456,6 +1484,35 @@ mod tests {
         assert!(build_add_user_request(&p).is_ok());
     }
 
+    /// Every field named in `--help` must be a key the handler actually accepts,
+    /// so the help text never advertises a field that `reject_unknown_keys` then
+    /// bounces. Guards against the help block and the `*_KEYS` allowlists drifting.
+    #[test]
+    fn write_fields_help_only_names_accepted_keys() {
+        let mut accepted: Vec<&str> = Vec::new();
+        accepted.extend_from_slice(ACCOUNT_KEYS);
+        accepted.extend_from_slice(USER_KEYS);
+        accepted.extend_from_slice(QOS_KEYS);
+
+        // Skip the "Fields (key=value), by entity:" header line; each remaining
+        // line is "  <entity>  field, field, ...". Both the entity-name first
+        // column (account/user/qos) and the fields after it are accepted keys,
+        // so every whitespace/comma-separated token must be in the allowlist.
+        for line in WRITE_FIELDS_HELP.lines().skip(1) {
+            for token in line.split(|c: char| c.is_whitespace() || c == ',') {
+                let field = token.trim();
+                if field.is_empty() {
+                    continue;
+                }
+                assert!(
+                    accepted.contains(&field),
+                    "--help advertises field '{field}' that no entity accepts",
+                );
+            }
+        }
+    }
+
+    #[test]
     #[test]
     fn reject_unknown_keys_flags_dropped_field() {
         // A field the command doesn't read must error, not be silently dropped
