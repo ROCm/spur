@@ -1459,7 +1459,8 @@ pub async fn list_users(
             u.name, u.account, u.admin_level, u.default_account,
             a.default_qos, a.allowed_qos,
             a.max_running_jobs, a.max_submit_jobs, a.grp_submit_jobs,
-            a.max_wall_min, a.max_tres_per_job, a.grp_tres
+            a.max_wall_min, a.max_tres_per_job, a.grp_tres,
+            a.partition_name, a.fairshare_weight
         FROM users u
         LEFT JOIN associations a
             ON a.user_name = u.name AND a.account = u.account
@@ -1489,6 +1490,8 @@ pub async fn list_users(
             max_wall_min: r.get("max_wall_min"),
             max_tres_per_job: r.get("max_tres_per_job"),
             grp_tres: r.get("grp_tres"),
+            partition: r.get("partition_name"),
+            fairshare_weight: r.get("fairshare_weight"),
         })
         .collect())
 }
@@ -1507,6 +1510,8 @@ pub struct UserRecord {
     pub max_wall_min: Option<i32>,
     pub max_tres_per_job: Option<String>,
     pub grp_tres: Option<String>,
+    pub partition: Option<String>,
+    pub fairshare_weight: Option<i32>,
 }
 
 /// List every user-account association's resource limits, one row per

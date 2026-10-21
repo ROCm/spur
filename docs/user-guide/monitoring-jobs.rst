@@ -1174,16 +1174,21 @@ Controlling Jobs
 
    scancel 1024 1025
    spur cancel -u alice -p gpu --state PENDING
+   scancel --reservation maint
    scancel --signal SIGTERM 2048
 
 Filter flags include ``--user``/``-u``, ``--partition``/``-p``, ``--state``/``-t``
-(only ``PD`` or ``R``), ``--name``/``-n``, ``--account``/``-A``, and
+(only ``PD`` or ``R``), ``--name``/``-n``, ``--account``/``-A``,
+``--reservation``/``-R`` (drain a reservation's jobs, mirroring ``squeue -R``), and
 ``--signal``/``-s`` (``KILL``/9, ``TERM``/15, ``INT``/2, and others). You must
-supply job IDs or at least one of ``--user``, ``--name``, ``--partition``, or
-``--account``; ``--state`` alone only narrows a selection. Without ``--user``, a
-filter matches every user's jobs you can see, as in Slurm, and each one you do not
-own is refused. In filter mode, jobs already in a terminal state are silently
-skipped. ``scancel`` exits ``1`` and reports on ``stderr`` if any cancel or signal is
+supply job IDs or at least one of ``--user``, ``--name``, ``--partition``,
+``--account``, or ``--reservation``; ``--state`` alone only narrows a selection.
+Without ``--user``, a filter matches every user's jobs you can see, as in Slurm,
+and each one you do not own is refused — so ``--reservation`` (or ``--account``,
+``--partition``) can span other users' jobs, with authorization applied to each
+cancellation. A filter given an empty value (e.g. ``--reservation=`` from an unset
+variable) is rejected rather than treated as "match everything". In filter mode,
+jobs already in a terminal state are silently skipped. ``scancel`` exits ``1`` and reports on ``stderr`` if any cancel or signal is
 refused. A job that is already finished or unknown does not fail a plain cancel
 (or ``-s KILL``) and is not reported. With another signal it fails, and
 ``--quiet``/``-Q`` hides the report but not the exit status.

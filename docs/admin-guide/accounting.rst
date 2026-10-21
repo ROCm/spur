@@ -314,6 +314,32 @@ cell.
    alice   ml        None   ml            highprio,normal  highprio
    carol   ml        None   ml                                       4        8                     1440     cpu=64
 
+Show associations
+~~~~~~~~~~~~~~~~~~
+
+``show association`` lists each ``(user, account)`` association as its own row,
+an association-first view of the same data ``show user`` presents user-first.
+Filter by ``account=`` and/or ``user=``.
+
+.. code-block:: bash
+
+   sacctmgr show association account=ml user=alice
+
+The columns are ``User``, ``Account``, ``Partition``, ``Share`` (this
+``(user, account)`` association's own fairshare weight, stored on the
+association and distinct from the account's weight — changing the account's
+weight does not change it), and ``Default`` (the association's default QOS).
+``Partition`` is blank for an all-partitions association. ``Share`` is blank only
+when the controller does not report a weight (an older controller predating the
+column); a stored weight of ``0`` renders ``0``.
+
+.. code-block:: text
+
+   User            Account              Partition       Share      Default
+   ----------------------------------------------------------------------
+   alice           ml                                   1          highprio
+   carol           ml                                   1
+
 User keys
 ~~~~~~~~~
 

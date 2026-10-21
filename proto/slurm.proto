@@ -1711,6 +1711,15 @@ message UserInfo {
   uint32 max_wall_minutes = 10;
   string max_tres_per_job = 11;
   string grp_tres = 12;
+  // Partition the association is scoped to, empty when it applies to all
+  // partitions. Populated for `sacctmgr show association`.
+  string partition = 13;
+  // Fairshare weight of this (user, account) association — read from
+  // associations.fairshare_weight, which is distinct from the account's own
+  // weight. Populated for `sacctmgr show association`. optional so a controller
+  // that predates this field is distinguishable from one that reports an
+  // explicit weight of 0: absent renders blank, a present 0 renders "0".
+  optional uint32 fairshare = 14;
 }
 
 // Add or modify a QOS (proto3 presence: unset = leave unchanged on modify, set =

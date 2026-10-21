@@ -1738,3 +1738,70 @@ class TestAuditReadAuthorization:
         assert "requires cluster operator or administrator" in denied.lower(), (
             f"an identified non-admin must be refused: {denied}"
         )
+
+
+class TestShowAssociation:
+    """`sacctmgr show association` must render the association rows that exist,
+    not an empty table under the header."""
+
+    def test_show_association_lists_existing_rows(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["-i", "add", "account", "name=carbonara"])
+        c.sacctmgr(["-i", "add", "account", "name=aac"])
+        c.sacctmgr(["-i", "add", "qos", "name=blocked"])
+        c.sacctmgr(["-i", "add", "qos", "name=normal"])
+        c.sacctmgr(
+            ["-i", "add", "user", "name=amd", "account=carbonara",
+             "defaultqos=blocked", "qos=blocked"]
+        )
+        c.sacctmgr(
+            ["-i", "add", "user", "name=amd", "account=aac",
+             "defaultqos=normal", "qos=normal"]
+        )
+
+        out = c.sacctmgr(["show", "association"])
+
+        # The header alone is not enough: the bug was a header with no rows.
+        assert "User" in out and "Account" in out, f"missing header: {out}"
+        data_lines = [
+            ln for ln in out.splitlines()
+            if "amd" in ln and ("carbonara" in ln or "aac" in ln)
+        ]
+        assert len(data_lines) == 2, (
+            f"expected both associations to be listed, got:\n{out}"
+        )
+        # The Default column carries each association's default QOS.
+        joined = "\n".join(data_lines)
+        assert "blocked" in joined and "normal" in joined, (
+            f"association rows must carry their default QOS:\n{out}"
+        )
+
+    def test_show_association_filters_by_user(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["-i", "add", "account", "name=physics"])
+        c.sacctmgr(["-i", "add", "user", "name=alice", "account=physics"])
+        c.sacctmgr(["-i", "add", "user", "name=bob", "account=physics"])
+
+        only_alice = c.sacctmgr(["show", "association", "user=alice"])
+        rows = [ln for ln in only_alice.splitlines() if "physics" in ln]
+        assert any("alice" in ln for ln in rows), f"alice missing: {only_alice}"
+        assert not any("bob" in ln for ln in rows), (
+            f"user=alice filter must exclude bob: {only_alice}"
+        )
+
+
+class TestSacctmgrHelpFields:
+    """`sacctmgr --help` must name the valid key=value fields per entity instead
+    of forcing a trial-and-error probe."""
+
+    def test_add_help_lists_fields(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.sacctmgr(["add", "account", "--help"])
+        assert "Fields (key=value)" in out, f"help lists no fields: {out}"
+        assert "fairshare" in out, f"account fields missing fairshare: {out}"
+
+    def test_show_help_lists_filters(self, accounting_cluster):
+        c = accounting_cluster
+        out = c.sacctmgr(["show", "--help"])
+        assert "Filters (key=value)" in out, f"show help lists no filters: {out}"
+        assert "association" in out, f"show help omits association entity: {out}"

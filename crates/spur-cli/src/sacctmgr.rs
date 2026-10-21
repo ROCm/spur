@@ -58,9 +58,70 @@ impl SacctmgrArgs {
     }
 }
 
+/// Per-request deadline for sacctmgr read RPCs, so a stalled server handler on a
+/// healthy connection surfaces as a timeout instead of hanging indefinitely.
+const SACCTMGR_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `key=value` fields `add` accepts, listed per entity so `--help` names them
+/// instead of forcing a trial-and-error probe. The entity is a positional arg,
+/// so clap renders one help page for all entities; this block documents every
+/// entity's fields in that one page.
+const ADD_FIELDS_HELP: &str = "\
+Fields (key=value), by entity:
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres
+  user      name, account, defaultaccount, adminlevel, defaultqos, qos,
+            maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
+  qos       name, description, priority, preemptmode, preempt, preemptexempttime,
+            idlefillpreemptable, usagefactor, maxjobsperuser, maxwall, maxtresperjob,
+            maxsubmitjobsperuser, maxsubmitjobsperaccount, grpsubmit, maxtresperuser,
+            grptres, grpwall, flags";
+
+/// `key=value` fields `modify` accepts. Same as `add` plus the clearing
+/// operations that only make sense against an existing record:
+/// `clearpreemptexempttime=1` resets the QOS exemption to NULL (inherit from
+/// partition/global), distinct from `preemptexempttime=0` (explicitly
+/// immediately-preemptable).
+const MODIFY_FIELDS_HELP: &str = "\
+Fields (key=value), by entity:
+  account   name, description, organization, parent, fairshare, maxrunningjobs, grptres
+  user      name, account, defaultaccount, adminlevel, defaultqos, qos,
+            maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
+  qos       name, description, priority, preemptmode, preempt, preemptexempttime,
+            clearpreemptexempttime, idlefillpreemptable, usagefactor, maxjobsperuser,
+            maxwall, maxtresperjob, maxsubmitjobsperuser, maxsubmitjobsperaccount,
+            grpsubmit, maxtresperuser, grptres, grpwall, flags
+
+Note: clearpreemptexempttime=1 clears a QOS preempt-exempt override back to NULL
+(inherit from partition/global); a bare clearpreemptexempttime does nothing.
+This differs from preemptexempttime=0, which sets an explicit zero exemption.";
+
+/// `key=value` selectors `delete` accepts, per entity. Distinct from the write
+/// fields: delete only *selects* what to remove, and advertising a write field
+/// here (e.g. `defaultaccount`) is dangerous — it is silently ignored, so a
+/// `delete user name=alice defaultaccount=physics` removes every association of
+/// alice, not just the physics one. `account=` is the real association selector.
+const DELETE_FIELDS_HELP: &str = "\
+Selectors (key=value), by entity:
+  account   name
+  user      name, account (omit account to delete the user from every account)
+  qos       name";
+
+/// `key=value` filters `show` accepts, per entity. Mirrors what each handler
+/// actually honors: account honors only `format`; qos honors `name` and
+/// `format`; user and association honor the `account`/`user` filters but render
+/// a fixed-width table (no `format`).
+const SHOW_FIELDS_HELP: &str = "\
+Filters (key=value), by entity:
+  account       format
+  user          account, user
+  qos           name, format
+  association   account, user
+  txn           action, actor, format";
+
 #[derive(Subcommand, Debug)]
 pub enum SacctmgrCommand {
     /// Add entities
+    #[command(after_help = ADD_FIELDS_HELP)]
     Add {
         /// Entity type: account, user, qos
         entity: String,
@@ -68,13 +129,15 @@ pub enum SacctmgrCommand {
         params: Vec<String>,
     },
     /// Delete entities
+    #[command(after_help = DELETE_FIELDS_HELP)]
     Delete {
         /// Entity type: account, user, qos
         entity: String,
-        /// Optional `key=value` pairs (name= or where clause); a global flag may sit anywhere among them.
+        /// `key=value` selectors (see below); a global flag may sit anywhere among them.
         params: Vec<String>,
     },
     /// Modify entities
+    #[command(after_help = MODIFY_FIELDS_HELP)]
     Modify {
         /// Entity type: account, user, qos
         entity: String,
@@ -82,6 +145,7 @@ pub enum SacctmgrCommand {
         params: Vec<String>,
     },
     /// List/show entities
+    #[command(after_help = SHOW_FIELDS_HELP)]
     Show {
         /// Entity type: account, user, qos, association
         entity: String,
@@ -89,6 +153,7 @@ pub enum SacctmgrCommand {
         params: Vec<String>,
     },
     /// List entities (alias for show)
+    #[command(after_help = SHOW_FIELDS_HELP)]
     List { entity: String, params: Vec<String> },
 }
 
@@ -194,6 +259,15 @@ const ACCOUNT_KEYS: &[&str] = &[
     "maxjobs",
     "grptres",
 ];
+
+/// Selectors `delete account` / `delete qos` accept: the entity name only.
+const DELETE_NAME_ONLY_KEYS: &[&str] = &["name", "account", "qos"];
+
+/// Selectors `delete user` accepts: the user name and an optional association
+/// account. A write field such as `defaultaccount` is NOT here — delete silently
+/// ignores it, which widens the removal to every association, so it must be
+/// rejected rather than advertised.
+const DELETE_USER_KEYS: &[&str] = &["name", "user", "account"];
 
 /// Reject keys the command does not understand, so a mistyped or unsupported
 /// field errors loudly instead of being silently dropped (a dropped limit
@@ -626,6 +700,7 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
 
     match entity.to_lowercase().as_str() {
         "account" => {
+            reject_unknown_keys(&p, DELETE_NAME_ONLY_KEYS)?;
             let name = p
                 .get("name")
                 .or_else(|| p.get("account"))
@@ -642,6 +717,7 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "user" => {
+            reject_unknown_keys(&p, DELETE_USER_KEYS)?;
             let name = p
                 .get("name")
                 .or_else(|| p.get("user"))
@@ -671,6 +747,7 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
             }
         }
         "qos" => {
+            reject_unknown_keys(&p, DELETE_NAME_ONLY_KEYS)?;
             let name = p
                 .get("name")
                 .or_else(|| p.get("qos"))
@@ -992,12 +1069,44 @@ async fn show(
             Ok(())
         }
         "association" | "associations" => {
+            let (account_filter, user_filter) = list_user_filters(&p);
+
+            let mut client = connect(addr).await?;
+            // Bound the call: connect/keepalive timeouts do not cap a stalled
+            // handler on a healthy transport (e.g. a server blocked on a DB
+            // lock), so set a per-request deadline. The grpc-timeout header also
+            // lets the server abort its own work. See AGENTS.md (no unbounded RPCs).
+            let mut request = tonic::Request::new(ListUsersRequest {
+                account: account_filter,
+                user: user_filter,
+            });
+            request.set_timeout(SACCTMGR_RPC_TIMEOUT);
+            let resp = client
+                .list_users(request)
+                .await
+                .context("ListUsers RPC failed")?;
+
+            let users = resp.into_inner().users;
+
             if style.shows_header() {
                 println!(
                     "{:<15} {:<20} {:<15} {:<10} {:<10}",
                     "User", "Account", "Partition", "Share", "Default"
                 );
                 println!("{}", "-".repeat(70));
+            }
+
+            for u in &users {
+                println!(
+                    "{}",
+                    format_association_row(
+                        &u.name,
+                        &u.account,
+                        &u.partition,
+                        u.fairshare,
+                        &u.default_qos,
+                    )
+                );
             }
             Ok(())
         }
@@ -1267,6 +1376,24 @@ fn format_user_row(u: &UserInfo) -> String {
     )
 }
 
+/// One `sacctmgr show association` row. Share is the association's fairshare
+/// weight; Default is its default QOS (empty when none is pinned). Partition is
+/// blank for an all-partitions association. Takes the columns as plain values
+/// rather than the whole `UserInfo` so the row builder stays decoupled from the
+/// RPC type. `share` is `None` when the controller does not report a weight (an
+/// older controller predating the field) — rendered blank rather than a
+/// misleading `0`; a real stored 0 arrives as `Some(0)` and renders "0".
+fn format_association_row(
+    user: &str,
+    account: &str,
+    partition: &str,
+    share: Option<u32>,
+    default_qos: &str,
+) -> String {
+    let share = share.map(|w| w.to_string()).unwrap_or_default();
+    format!("{user:<15} {account:<20} {partition:<15} {share:<10} {default_qos:<10}",)
+}
+
 fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
     match spec {
         'N' => a.name.clone(),
@@ -1454,6 +1581,182 @@ mod tests {
             "defaultqos=highprio".into(),
         ]);
         assert!(build_add_user_request(&p).is_ok());
+    }
+
+    /// Parse a per-entity help block ("  <entity>  f1, f2, ...\n            f3")
+    /// into (entity, fields). A non-indented line starts a new entity (its first
+    /// word); a deeper-indented line continues the previous one. The field table
+    /// runs from the header to the first blank line, so a trailing free-form
+    /// paragraph (e.g. a "Note:" after a blank line) is not parsed. Parenthetical
+    /// prose is dropped so a note like "(omit account ...)" is not a field.
+    fn parse_entity_help(help: &str) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for line in help.lines().skip(1) {
+            // The table ends at the first blank line; anything after is prose.
+            if line.trim().is_empty() {
+                break;
+            }
+            // Strip any parenthetical prose before tokenizing.
+            let cleaned = {
+                let mut s = String::new();
+                let mut depth = 0;
+                for c in line.trim().chars() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth = (depth - 1).max(0),
+                        _ if depth == 0 => s.push(c),
+                        _ => {}
+                    }
+                }
+                s
+            };
+            let mut tokens: Vec<String> = cleaned
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            let indented =
+                line.starts_with("    ") && line.chars().take_while(|c| *c == ' ').count() >= 6;
+            if indented {
+                if let Some(last) = out.last_mut() {
+                    last.1.extend(tokens);
+                }
+            } else {
+                let entity = tokens.remove(0);
+                out.push((entity, tokens));
+            }
+        }
+        out
+    }
+
+    fn keys_for(entity: &str) -> &'static [&'static str] {
+        match entity {
+            "account" => ACCOUNT_KEYS,
+            "user" => USER_KEYS,
+            "qos" => QOS_KEYS,
+            other => panic!("help names an unknown entity '{other}'"),
+        }
+    }
+
+    /// Every field named under an entity in add/modify `--help` must be a key
+    /// THAT entity's handler accepts — checked per entity, so a field advertised
+    /// under the wrong entity is caught, not masked by pooling all keys together.
+    #[test]
+    fn add_and_modify_help_only_name_each_entitys_accepted_keys() {
+        for help in [ADD_FIELDS_HELP, MODIFY_FIELDS_HELP] {
+            for (entity, fields) in parse_entity_help(help) {
+                let accepted = keys_for(&entity);
+                for field in fields {
+                    assert!(
+                        accepted.contains(&field.as_str()),
+                        "{entity} help advertises '{field}', which {entity} does not accept",
+                    );
+                }
+            }
+        }
+    }
+
+    /// `clearpreemptexempttime` is a modify-only clearing operation; it must be
+    /// advertised by modify help and absent from add help.
+    #[test]
+    fn modify_help_advertises_clear_preempt_exempt_but_add_does_not() {
+        assert!(MODIFY_FIELDS_HELP.contains("clearpreemptexempttime"));
+        assert!(!ADD_FIELDS_HELP.contains("clearpreemptexempttime"));
+    }
+
+    /// show help must match what each handler actually filters on: account
+    /// honors only `format`; qos honors `name` (filter_qos_by_name) and `format`;
+    /// user and association honor `account`/`user`. Guards against advertising a
+    /// filter the handler ignores (e.g. account `name=`) or hiding one it honors
+    /// (qos `name`, the association filters).
+    #[test]
+    fn show_help_matches_each_handlers_real_filters() {
+        let entities = parse_entity_help(SHOW_FIELDS_HELP);
+        let fields_of = |name: &str| -> Vec<String> {
+            entities
+                .iter()
+                .find(|(e, _)| e == name)
+                .map(|(_, f)| f.clone())
+                .unwrap_or_default()
+        };
+
+        // account ignores name=, so help must not claim it; format is all it honors.
+        assert_eq!(fields_of("account"), vec!["format"]);
+        // qos honors both name= and format=.
+        assert_eq!(fields_of("qos"), vec!["name", "format"]);
+        // association honors account/user filters (list_user_filters) — these
+        // must be advertised, and the old "no filters" wording is gone.
+        let assoc = fields_of("association");
+        assert!(assoc.contains(&"account".to_string()));
+        assert!(assoc.contains(&"user".to_string()));
+        assert!(!SHOW_FIELDS_HELP.contains("no filters"));
+    }
+
+    #[test]
+    fn association_row_renders_user_account_share_and_default() {
+        // Partition is blank (all-partitions association) and so collapses out.
+        let row = format_association_row("amd", "carbonara", "", Some(1), "blocked");
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cols, vec!["amd", "carbonara", "1", "blocked"]);
+    }
+
+    #[test]
+    fn association_row_share_blank_when_absent_but_zero_when_present() {
+        // An older controller omits the weight (None) -> blank, not a misleading 0.
+        let absent = format_association_row("amd", "aac", "", None, "normal");
+        assert_eq!(
+            absent.split_whitespace().collect::<Vec<_>>(),
+            vec!["amd", "aac", "normal"],
+            "absent share must collapse out (blank), leaving no Share column value"
+        );
+        // A real stored 0 is distinct and renders "0".
+        let zero = format_association_row("amd", "aac", "", Some(0), "normal");
+        assert_eq!(
+            zero.split_whitespace().collect::<Vec<_>>(),
+            vec!["amd", "aac", "0", "normal"]
+        );
+    }
+
+    #[test]
+    fn association_row_shows_partition_when_scoped() {
+        let row = format_association_row("amd", "aac", "gpu", Some(4), "normal");
+        let cols: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cols, vec!["amd", "aac", "gpu", "4", "normal"]);
+    }
+
+    #[test]
+    fn delete_user_rejects_a_write_field_that_would_widen_the_removal() {
+        // `delete user name=alice defaultaccount=physics` silently ignores
+        // defaultaccount and removes every association; it must error instead.
+        let p = parse_params(&["name=alice".into(), "defaultaccount=physics".into()]);
+        let err = reject_unknown_keys(&p, DELETE_USER_KEYS).unwrap_err();
+        assert!(err.to_string().contains("unknown field 'defaultaccount'"));
+    }
+
+    #[test]
+    fn delete_user_accepts_name_and_account_selectors() {
+        let p = parse_params(&["name=alice".into(), "account=physics".into()]);
+        assert!(reject_unknown_keys(&p, DELETE_USER_KEYS).is_ok());
+    }
+
+    #[test]
+    fn delete_help_does_not_advertise_the_dangerous_write_fields() {
+        // The whole point of a separate delete reference: it must NOT list write
+        // fields that delete ignores (defaultaccount, qos, limits), which would
+        // lead a user into an all-association removal.
+        for ignored in ["defaultaccount", "adminlevel", "maxrunningjobs", "grptres"] {
+            assert!(
+                !DELETE_FIELDS_HELP.contains(ignored),
+                "delete help must not advertise the ignored write field '{ignored}'",
+            );
+        }
+        // It must still name the real selectors.
+        assert!(DELETE_FIELDS_HELP.contains("name"));
+        assert!(DELETE_FIELDS_HELP.contains("account"));
     }
 
     #[test]

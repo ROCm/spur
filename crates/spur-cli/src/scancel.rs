@@ -32,6 +32,10 @@ pub struct ScancelArgs {
     #[arg(short = 'A', long)]
     pub account: Option<String>,
 
+    /// Cancel jobs in this reservation
+    #[arg(short = 'R', long)]
+    pub reservation: Option<String>,
+
     /// Signal to send (default: SIGKILL / cancel)
     #[arg(short = 's', long)]
     pub signal: Option<String>,
@@ -67,6 +71,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if !has_selection(&args) {
         bail!("scancel: no job IDs or filters specified");
     }
+    reject_empty_filters(&args)?;
 
     let signal = parse_signal(args.signal.as_deref())?;
 
@@ -113,7 +118,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 name: args.name.clone().unwrap_or_default(),
                 nodes: Vec::new(),
                 qos: String::new(),
-                reservation: String::new(),
+                reservation: args.reservation.clone().unwrap_or_default(),
             })
             .await
             .context("failed to get jobs")?;
@@ -199,15 +204,41 @@ fn has_selection(args: &ScancelArgs) -> bool {
         || args.name.is_some()
         || args.partition.is_some()
         || args.account.is_some()
+        || args.reservation.is_some()
+}
+
+/// Reject a filter flag given an empty value. An empty filter string reaches the
+/// server as "no filter for this field", so `scancel --reservation=` (e.g. from an
+/// unset shell variable) would silently widen the selection to every cancellable
+/// job instead of a reservation's — and the non-`-u` filters also drop the
+/// caller-only scope. Fail before any network I/O rather than cancel broadly.
+fn reject_empty_filters(args: &ScancelArgs) -> Result<()> {
+    for (flag, value) in [
+        ("--reservation", &args.reservation),
+        ("--account", &args.account),
+        ("--partition", &args.partition),
+        ("--name", &args.name),
+        ("--user", &args.user),
+    ] {
+        if value.as_deref() == Some("") {
+            bail!("scancel: {flag} requires a non-empty value");
+        }
+    }
+    Ok(())
 }
 
 /// The `user` filter for get_jobs. `-u` wins; otherwise scope to the caller only
-/// when no other selector was named, so `scancel -A acct` spans the whole account
-/// instead of silently narrowing to self. The server still authorizes each cancel.
+/// when no other selector was named, so `scancel -A acct` (or `-R res`) spans the
+/// whole account/reservation instead of silently narrowing to self. The server
+/// still authorizes each cancel.
 fn filter_user(args: &ScancelArgs, requester: &str) -> String {
     match &args.user {
         Some(user) => user.clone(),
-        None if args.partition.is_some() || args.account.is_some() || args.name.is_some() => {
+        None if args.partition.is_some()
+            || args.account.is_some()
+            || args.name.is_some()
+            || args.reservation.is_some() =>
+        {
             String::new()
         }
         None => requester.to_string(),
@@ -291,6 +322,7 @@ mod tests {
             vec!["-n", "myjob"],
             vec!["-p", "default"],
             vec!["-A", "acct"],
+            vec!["-R", "maint"],
         ] {
             assert!(
                 has_selection(&parse(&args)),
@@ -323,6 +355,51 @@ mod tests {
         assert_eq!(filter_user(&parse(&["-A", "gpu"]), "bob"), "");
         assert_eq!(filter_user(&parse(&["-p", "batch"]), "bob"), "");
         assert_eq!(filter_user(&parse(&["-n", "train"]), "bob"), "");
+        assert_eq!(filter_user(&parse(&["-R", "maint"]), "bob"), "");
+    }
+
+    #[test]
+    fn reservation_filter_is_forwarded_to_get_jobs() {
+        let args = parse(&["-R", "maint"]);
+        assert_eq!(args.reservation.as_deref(), Some("maint"));
+        assert_eq!(
+            parse(&["--reservation", "maint"]).reservation.as_deref(),
+            Some("maint")
+        );
+    }
+
+    #[test]
+    fn empty_reservation_is_rejected_before_any_request() {
+        // `--reservation=` reaches the server as "no reservation filter" and drops
+        // the caller-only scope, so it must fail rather than cancel broadly.
+        let err = reject_empty_filters(&parse(&["--reservation="])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "scancel: --reservation requires a non-empty value"
+        );
+    }
+
+    #[test]
+    fn every_empty_filter_value_is_rejected() {
+        for flag in [
+            "--reservation",
+            "--account",
+            "--partition",
+            "--name",
+            "--user",
+        ] {
+            let err = reject_empty_filters(&parse(&[&format!("{flag}=")])).unwrap_err();
+            assert!(
+                err.to_string().contains(flag),
+                "{flag}= should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_empty_filters_pass_validation() {
+        assert!(reject_empty_filters(&parse(&["-R", "maint"])).is_ok());
+        assert!(reject_empty_filters(&parse(&["123"])).is_ok());
     }
 
     #[test]

@@ -859,6 +859,11 @@ impl SlurmAccounting for AccountingService {
                 max_wall_minutes: limit_to_wire(r.max_wall_min),
                 max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
                 grp_tres: r.grp_tres.unwrap_or_default(),
+                partition: r.partition.unwrap_or_default(),
+                // Present when the association carries a weight; absent (None)
+                // only when the LEFT JOIN found no association row. A real
+                // stored weight — including 0 — is sent as-is, not defaulted.
+                fairshare: r.fairshare_weight.map(|w| w.max(0) as u32),
             })
             .collect();
 

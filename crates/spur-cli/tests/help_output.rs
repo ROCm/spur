@@ -43,6 +43,45 @@ fn subcommand_help_goes_to_stdout_with_exit_zero() {
     }
 }
 
+/// `sacctmgr add/modify/show --help` must name the valid `key=value` fields,
+/// otherwise the only way to discover them is to submit a bad one and read the
+/// error. Regression test for the help text being byte-identical for every
+/// entity and listing no fields.
+#[test]
+fn sacctmgr_help_lists_key_value_fields() {
+    let write_cases = [
+        (&["sacctmgr", "add", "account", "--help"][..], "fairshare"),
+        (&["sacctmgr", "modify", "qos", "--help"][..], "preemptmode"),
+        (&["sacctmgr", "add", "user", "--help"][..], "defaultqos"),
+    ];
+    for (args, field) in write_cases {
+        let out = Command::new(spur_bin())
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn spur {args:?}: {e}"));
+        assert!(out.status.success(), "spur {args:?} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("Fields (key=value)"),
+            "spur {args:?} --help missing field reference:\n{stdout}",
+        );
+        assert!(
+            stdout.contains(field),
+            "spur {args:?} --help should name '{field}':\n{stdout}",
+        );
+    }
+
+    let out = Command::new(spur_bin())
+        .args(["sacctmgr", "show", "qos", "--help"])
+        .output()
+        .expect("failed to spawn spur sacctmgr show qos --help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Filters (key=value)") && stdout.contains("association"),
+        "sacctmgr show --help should list per-entity filters:\n{stdout}",
+    );
+}
+
 /// A genuine parse error must still fail: message on stderr, non-zero exit.
 #[test]
 fn subcommand_parse_error_fails_on_stderr() {
