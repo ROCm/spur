@@ -71,6 +71,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if !has_selection(&args) {
         bail!("scancel: no job IDs or filters specified");
     }
+    reject_empty_filters(&args)?;
 
     let signal = parse_signal(args.signal.as_deref())?;
 
@@ -204,6 +205,26 @@ fn has_selection(args: &ScancelArgs) -> bool {
         || args.partition.is_some()
         || args.account.is_some()
         || args.reservation.is_some()
+}
+
+/// Reject a filter flag given an empty value. An empty filter string reaches the
+/// server as "no filter for this field", so `scancel --reservation=` (e.g. from an
+/// unset shell variable) would silently widen the selection to every cancellable
+/// job instead of a reservation's — and the non-`-u` filters also drop the
+/// caller-only scope. Fail before any network I/O rather than cancel broadly.
+fn reject_empty_filters(args: &ScancelArgs) -> Result<()> {
+    for (flag, value) in [
+        ("--reservation", &args.reservation),
+        ("--account", &args.account),
+        ("--partition", &args.partition),
+        ("--name", &args.name),
+        ("--user", &args.user),
+    ] {
+        if value.as_deref() == Some("") {
+            bail!("scancel: {flag} requires a non-empty value");
+        }
+    }
+    Ok(())
 }
 
 /// The `user` filter for get_jobs. `-u` wins; otherwise scope to the caller only
@@ -345,6 +366,40 @@ mod tests {
             parse(&["--reservation", "maint"]).reservation.as_deref(),
             Some("maint")
         );
+    }
+
+    #[test]
+    fn empty_reservation_is_rejected_before_any_request() {
+        // `--reservation=` reaches the server as "no reservation filter" and drops
+        // the caller-only scope, so it must fail rather than cancel broadly.
+        let err = reject_empty_filters(&parse(&["--reservation="])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "scancel: --reservation requires a non-empty value"
+        );
+    }
+
+    #[test]
+    fn every_empty_filter_value_is_rejected() {
+        for flag in [
+            "--reservation",
+            "--account",
+            "--partition",
+            "--name",
+            "--user",
+        ] {
+            let err = reject_empty_filters(&parse(&[&format!("{flag}=")])).unwrap_err();
+            assert!(
+                err.to_string().contains(flag),
+                "{flag}= should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_empty_filters_pass_validation() {
+        assert!(reject_empty_filters(&parse(&["-R", "maint"])).is_ok());
+        assert!(reject_empty_filters(&parse(&["123"])).is_ok());
     }
 
     #[test]
