@@ -547,6 +547,10 @@ pub struct JobSpec {
     // Flags
     pub requeue: bool,
     pub exclusive: bool,
+    /// Internal jobs (recovery, health) that must dispatch to nodes regardless
+    /// of their admin_locked / drain state.
+    #[serde(default)]
+    pub system_override: bool,
     pub hold: bool,
     pub interactive: bool,
     /// Standalone srun: reserve nodes without a batch script; user command
@@ -656,6 +660,7 @@ impl Default for JobSpec {
             array_max_concurrent: None,
             requeue: false,
             exclusive: false,
+            system_override: false,
             hold: false,
             interactive: false,
             srun_job: false,

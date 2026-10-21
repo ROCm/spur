@@ -19,13 +19,17 @@ use spur_core::accounting::{
     AccountLimits, PerUserCaps, Qos, ScopeLimitUsage, TresRecord, TresType, UserLimitUsage,
 };
 use spur_core::burst_buffer::BbStageState;
-use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
+use spur_core::config::{EnforcePartLimits, HealthCheck, RecoveryConfig, SlurmConfig};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
     PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
 };
-use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
+use spur_core::node::{
+    DrainOrigin, Node, NodeEvent, NodeSource, NodeState, RECOVERY_ATTEMPT_KEY,
+    RECOVERY_DISPATCH_END_KEY, RECOVERY_DISPATCH_GEN_KEY, RECOVERY_LABEL_PREFIX,
+    RECOVERY_PHASE_KEY,
+};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
 use spur_core::qos::{
     check_qos_limits_with_grp_node_charge, check_qos_standalone_limits, check_qos_submit_limits,
@@ -578,6 +582,10 @@ const HEALTH_FORCE_DRAIN_PREFIX: &str = "health-check(pending): ";
 /// exactly like Slurm's failed `HealthCheckProgram`. It never auto-resumes.
 const HEALTH_FAIL_DRAIN_PREFIX: &str = "health-check(failed): ";
 
+pub(crate) const RECOVERY_JOB_PREFIX: &str = "_spur-recovery.";
+const RECOVERY_FAIL_REASON_PREFIX: &str = "auto-recovery exhausted";
+const RECOVERY_PERMANENT_FAILURE_EXIT_CODE: i32 = 42;
+
 /// The node a health-check job targets, parsed from its reserved name
 /// (`{HEALTH_JOB_PREFIX}{idx}.{node}`). `None` for any non-health name.
 fn health_job_target_node(name: &str) -> Option<&str> {
@@ -908,6 +916,11 @@ impl ClusterManager {
         if spec.name.starts_with(HEALTH_JOB_PREFIX) {
             return Err(SubmitError::invalid(format!(
                 "job name may not start with the reserved prefix '{HEALTH_JOB_PREFIX}'"
+            )));
+        }
+        if spec.name.starts_with(RECOVERY_JOB_PREFIX) {
+            return Err(SubmitError::invalid(format!(
+                "job name may not start with the reserved prefix '{RECOVERY_JOB_PREFIX}'"
             )));
         }
 
@@ -2551,6 +2564,11 @@ impl ClusterManager {
         self.run_epilog_slurmctld(finalized.job_id);
         self.notify_job_finished(finalized);
         self.react_to_health_job_finalized(finalized.job_id, finalized.state, finalized.exit_code);
+        self.react_to_recovery_job_finalized(
+            finalized.job_id,
+            finalized.state,
+            finalized.exit_code,
+        );
     }
 
     pub(crate) fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
@@ -2634,7 +2652,9 @@ impl ClusterManager {
                             "{HEALTH_FORCE_DRAIN_PREFIX}running overdue check {}",
                             check.program
                         );
-                        if let Err(e) = self.drain_node(&node.name, Some(reason), None) {
+                        if let Err(e) =
+                            self.drain_node(&node.name, Some(reason), None, DrainOrigin::System)
+                        {
                             warn!(node = %node.name, error = %e, "failed to drain node for health check");
                         }
                     }
@@ -2799,7 +2819,7 @@ impl ClusterManager {
         if failed {
             let reason =
                 format!("{HEALTH_FAIL_DRAIN_PREFIX}{program} failed ({state:?}, exit {exit_code})");
-            if let Err(e) = self.drain_node(&node, Some(reason), None) {
+            if let Err(e) = self.drain_node(&node, Some(reason), None, DrainOrigin::System) {
                 warn!(node = %node, error = %e, "failed to drain node after failing health check");
             }
         }
@@ -2807,11 +2827,398 @@ impl ClusterManager {
         // was already resumed by the pass before the check could run.
     }
 
+    // ------------------------------------------------------------------
+    // Auto-recovery reconciler
+    // ------------------------------------------------------------------
+
+    pub fn run_node_recovery_pass(&self) {
+        let config = self.config();
+        if !config.recovery.is_enabled() {
+            return;
+        }
+
+        let nodes = self.get_nodes();
+        let cap = config.recovery.concurrency_cap(nodes.len());
+        let mut active_count = self.recovery_active_count();
+
+        for node in &nodes {
+            if !matches!(node.state, NodeState::Drain | NodeState::Down) {
+                continue;
+            }
+            if node.drain_origin != DrainOrigin::System {
+                continue;
+            }
+            if !node.has_recovery_labels() {
+                continue;
+            }
+            if self.has_active_recovery_job(&node.name) {
+                continue;
+            }
+
+            // Failover-safe: a prior leader wrote dispatch-gen but may not have submitted the job
+            if node.labels.contains_key(RECOVERY_DISPATCH_GEN_KEY)
+                && !self.recovery_job_exists_any_state(&node.name)
+            {
+                let _ = self.propose(WalOperation::NodeLabelsUpdate {
+                    name: node.name.clone(),
+                    set: HashMap::new(),
+                    remove: vec![RECOVERY_DISPATCH_GEN_KEY.to_string()],
+                });
+                continue;
+            }
+
+            // Reboot-timeout window: node is Down, recently dispatched
+            if node.state == NodeState::Down {
+                if let Some(end_ts) = node.labels.get(RECOVERY_DISPATCH_END_KEY) {
+                    if let Ok(end) = end_ts.parse::<chrono::DateTime<chrono::Utc>>() {
+                        let elapsed = chrono::Utc::now() - end;
+                        if elapsed
+                            < chrono::Duration::seconds(config.recovery.reboot_timeout_secs as i64)
+                        {
+                            continue;
+                        }
+                        // Window expired — count as failed attempt
+                        self.increment_recovery_attempt(&node.name, node.recovery_attempt());
+                        continue;
+                    }
+                }
+            }
+
+            // Max attempts check
+            let attempt = node.recovery_attempt();
+            if attempt >= config.recovery.max_attempts {
+                let reason = format!(
+                    "{} ({}/{}): {}",
+                    RECOVERY_FAIL_REASON_PREFIX,
+                    attempt,
+                    config.recovery.max_attempts,
+                    node.state_reason.as_deref().unwrap_or("unknown")
+                );
+                let _ = self.update_recovery_exhausted(&node.name, &reason);
+                continue;
+            }
+
+            // Concurrency cap
+            if cap != 0 && active_count >= cap {
+                warn!(node = %node.name, cap, "recovery concurrency cap reached");
+                continue;
+            }
+
+            // Dispatch: atomically set dispatch-gen, increment attempt, then submit job
+            let gen = attempt + 1;
+            let _ = self.propose(WalOperation::NodeLabelsUpdate {
+                name: node.name.clone(),
+                set: HashMap::from([
+                    (RECOVERY_DISPATCH_GEN_KEY.to_string(), gen.to_string()),
+                    (RECOVERY_ATTEMPT_KEY.to_string(), gen.to_string()),
+                ]),
+                remove: vec![RECOVERY_DISPATCH_END_KEY.to_string()],
+            });
+
+            match self.submit_recovery_job(&config.recovery, node) {
+                Ok(_) => {
+                    active_count += 1;
+                }
+                Err(e) => {
+                    warn!(node = %node.name, error = %e, "failed to submit recovery job");
+                }
+            }
+        }
+    }
+
+    fn submit_recovery_job(&self, config: &RecoveryConfig, node: &Node) -> anyhow::Result<JobId> {
+        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+
+        let mut env = HashMap::new();
+        env.insert("SPUR_NODE_NAME".into(), node.name.clone());
+        env.insert(
+            "SPUR_DRAIN_REASON".into(),
+            node.state_reason.clone().unwrap_or_default(),
+        );
+        env.insert(
+            "SPUR_RECOVERY_ATTEMPT".into(),
+            node.recovery_attempt().saturating_add(1).to_string(),
+        );
+        env.insert(
+            "SPUR_RECOVERY_MAX_ATTEMPTS".into(),
+            config.max_attempts.to_string(),
+        );
+        env.insert(
+            "SPUR_RECOVERY_PHASE".into(),
+            node.labels
+                .get(RECOVERY_PHASE_KEY)
+                .cloned()
+                .unwrap_or_default(),
+        );
+
+        for (k, v) in &node.labels {
+            if let Some(suffix) = k.strip_prefix(RECOVERY_LABEL_PREFIX) {
+                let env_key = format!(
+                    "SPUR_RECOVERY_{}",
+                    suffix.to_uppercase().replace(['-', '.', '/'], "_")
+                );
+                env.insert(env_key, v.clone());
+            }
+        }
+
+        let spec = JobSpec {
+            name: format!("{RECOVERY_JOB_PREFIX}{}", node.name),
+            user: config.user.clone(),
+            uid: config.uid,
+            gid: config.gid,
+            partition: node.partitions.first().cloned(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            exclusive: true,
+            system_override: true,
+            nodelist: Some(node.name.clone()),
+            argv: vec![config.program.clone()],
+            time_limit: Some(chrono::Duration::seconds(config.timeout_secs.max(1) as i64)),
+            environment: env,
+            ..Default::default()
+        };
+
+        self.propose(WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(spec),
+        })?;
+        self.scheduler_notify.notify_one();
+        info!(job_id, node = %node.name, program = %config.program, "submitted recovery job");
+        Ok(job_id)
+    }
+
+    fn react_to_recovery_job_finalized(&self, job_id: JobId, state: JobState, exit_code: i32) {
+        let Some(job) = self.get_job(job_id) else {
+            return;
+        };
+        let Some(node_name) = job.spec.name.strip_prefix(RECOVERY_JOB_PREFIX) else {
+            return;
+        };
+        let node_name = node_name.to_string();
+
+        let Some(node) = self.get_node(&node_name) else {
+            return;
+        };
+
+        // Record dispatch-end timestamp (Raft-replicated)
+        let _ = self.propose(WalOperation::NodeLabelsUpdate {
+            name: node_name.clone(),
+            set: HashMap::from([(
+                RECOVERY_DISPATCH_END_KEY.to_string(),
+                chrono::Utc::now().to_rfc3339(),
+            )]),
+            remove: vec![RECOVERY_DISPATCH_GEN_KEY.to_string()],
+        });
+
+        let has_labels = node.has_recovery_labels();
+
+        match (state, exit_code, has_labels) {
+            (JobState::Completed, 0, true) => {
+                info!(node = %node_name, "recovery phase complete, will redispatch");
+            }
+            (JobState::Completed, 0, false) => {
+                info!(node = %node_name, "recovery complete, node returned to service");
+            }
+            (_, RECOVERY_PERMANENT_FAILURE_EXIT_CODE, _) => {
+                let attempt = node.recovery_attempt();
+                let config = self.config();
+                let reason = format!(
+                    "{} ({}/{}, permanent): {}",
+                    RECOVERY_FAIL_REASON_PREFIX,
+                    attempt,
+                    config.recovery.max_attempts,
+                    node.state_reason.as_deref().unwrap_or("unknown")
+                );
+                let _ = self.update_recovery_exhausted(&node_name, &reason);
+            }
+            (JobState::NodeFail, _, true) => {
+                info!(node = %node_name, "recovery job NodeFail with labels — expected reboot/reprovision");
+            }
+            (JobState::NodeFail, _, false) => {
+                warn!(node = %node_name, "recovery job NodeFail without labels — counting as failed");
+                self.increment_recovery_attempt(&node_name, node.recovery_attempt());
+            }
+            _ => {
+                warn!(node = %node_name, ?state, exit_code, "recovery job failed");
+                self.increment_recovery_attempt(&node_name, node.recovery_attempt());
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Recovery helpers
+    // ------------------------------------------------------------------
+
+    fn has_active_recovery_job(&self, node_name: &str) -> bool {
+        let expected = format!("{RECOVERY_JOB_PREFIX}{node_name}");
+        self.jobs.read().values().any(|j| {
+            j.spec.name == expected
+                && matches!(
+                    j.state,
+                    JobState::Pending
+                        | JobState::Running
+                        | JobState::Completing
+                        | JobState::Suspended
+                )
+        })
+    }
+
+    fn recovery_job_exists_any_state(&self, node_name: &str) -> bool {
+        let expected = format!("{RECOVERY_JOB_PREFIX}{node_name}");
+        self.jobs.read().values().any(|j| j.spec.name == expected)
+    }
+
+    fn find_recovery_job(&self, node_name: &str) -> Option<JobId> {
+        let expected = format!("{RECOVERY_JOB_PREFIX}{node_name}");
+        self.jobs
+            .read()
+            .values()
+            .find(|j| {
+                j.spec.name == expected
+                    && matches!(
+                        j.state,
+                        JobState::Pending | JobState::Running | JobState::Completing
+                    )
+            })
+            .map(|j| j.job_id)
+    }
+
+    fn recovery_active_count(&self) -> usize {
+        self.jobs
+            .read()
+            .values()
+            .filter(|j| {
+                j.spec.name.starts_with(RECOVERY_JOB_PREFIX)
+                    && matches!(
+                        j.state,
+                        JobState::Pending | JobState::Running | JobState::Completing
+                    )
+            })
+            .count()
+    }
+
+    fn increment_recovery_attempt(&self, name: &str, current: u32) {
+        let _ = self.propose(WalOperation::NodeLabelsUpdate {
+            name: name.to_string(),
+            set: HashMap::from([(RECOVERY_ATTEMPT_KEY.to_string(), (current + 1).to_string())]),
+            remove: vec![RECOVERY_DISPATCH_END_KEY.to_string()],
+        });
+    }
+
+    fn update_recovery_exhausted(&self, name: &str, reason: &str) -> anyhow::Result<()> {
+        if let Some(node) = self.get_node(name) {
+            self.propose(WalOperation::NodeStateChange {
+                name: name.to_string(),
+                old_state: node.state,
+                new_state: node.state,
+                reason: Some(reason.to_string()),
+                admin_locked: true,
+                drain_origin: DrainOrigin::System,
+                reason_uid: None,
+                reason_time: Some(chrono::Utc::now()),
+                at: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Admin recovery trigger / abort
+    // ------------------------------------------------------------------
+
+    pub fn trigger_recovery(&self, name: &str) -> anyhow::Result<()> {
+        let node = self
+            .get_node(name)
+            .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
+
+        anyhow::ensure!(
+            matches!(node.state, NodeState::Drain | NodeState::Down),
+            "node '{}' is in state {}, not Drain or Down",
+            name,
+            node.state
+        );
+
+        self.propose(WalOperation::NodeStateChange {
+            name: name.to_string(),
+            old_state: node.state,
+            new_state: node.state,
+            reason: node.state_reason.clone(),
+            admin_locked: true,
+            drain_origin: DrainOrigin::System,
+            reason_uid: node.reason_uid,
+            reason_time: node.reason_time,
+            at: None,
+        })?;
+
+        let remove: Vec<String> = node
+            .labels
+            .keys()
+            .filter(|k| k.starts_with(RECOVERY_LABEL_PREFIX))
+            .cloned()
+            .collect();
+
+        self.propose(WalOperation::NodeLabelsUpdate {
+            name: name.to_string(),
+            set: HashMap::from([(RECOVERY_PHASE_KEY.to_string(), String::new())]),
+            remove,
+        })?;
+
+        info!(node = %name, "recovery triggered by admin");
+        Ok(())
+    }
+
+    pub fn abort_recovery(&self, name: &str) -> anyhow::Result<()> {
+        let node = self
+            .get_node(name)
+            .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
+
+        if let Some(job_id) = self.find_recovery_job(&node.name) {
+            let _ = self.cancel_job_for(job_id, Canceller::system(), true);
+        }
+
+        self.propose(WalOperation::NodeStateChange {
+            name: name.to_string(),
+            old_state: node.state,
+            new_state: node.state,
+            reason: node.state_reason.clone(),
+            admin_locked: true,
+            drain_origin: DrainOrigin::Admin,
+            reason_uid: node.reason_uid,
+            reason_time: node.reason_time,
+            at: None,
+        })?;
+
+        let remove: Vec<String> = node
+            .labels
+            .keys()
+            .filter(|k| k.starts_with(RECOVERY_LABEL_PREFIX))
+            .cloned()
+            .collect();
+
+        if !remove.is_empty() {
+            self.propose(WalOperation::NodeLabelsUpdate {
+                name: name.to_string(),
+                set: HashMap::new(),
+                remove,
+            })?;
+        }
+
+        info!(node = %name, "recovery aborted by admin");
+        Ok(())
+    }
+
     fn run_epilog_slurmctld(&self, job_id: JobId) {
         let Some(epilog_ctld) = self.config().hooks.epilog_slurmctld.clone() else {
             return;
         };
         let job = self.get_job(job_id);
+        if job
+            .as_ref()
+            .is_some_and(|j| j.spec.name.starts_with(RECOVERY_JOB_PREFIX))
+        {
+            return;
+        }
         let ctx = spur_core::hooks::HookContext {
             job_id,
             work_dir: job
@@ -3265,6 +3672,7 @@ impl ClusterManager {
                     .labels
                     .keys()
                     .filter(|k| !new_labels.contains_key(*k))
+                    .filter(|k| !k.starts_with(RECOVERY_LABEL_PREFIX))
                     .cloned()
                     .collect();
                 self.propose(WalOperation::NodeLabelsUpdate {
@@ -3871,6 +4279,7 @@ impl ClusterManager {
             new_state: effective_state,
             reason,
             admin_locked,
+            drain_origin: DrainOrigin::Admin,
             reason_uid,
             reason_time,
             at: None,
@@ -4106,6 +4515,7 @@ impl ClusterManager {
                         new_state: NodeState::Down,
                         reason,
                         admin_locked,
+                        drain_origin: DrainOrigin::System,
                         reason_uid,
                         reason_time,
                         at: None,
@@ -4142,6 +4552,7 @@ impl ClusterManager {
                         new_state: recovered_state,
                         reason,
                         admin_locked,
+                        drain_origin: DrainOrigin::System,
                         reason_uid,
                         reason_time,
                         at: None,
@@ -4161,6 +4572,7 @@ impl ClusterManager {
         name: &str,
         reason: Option<String>,
         reason_uid: Option<u32>,
+        drain_origin: DrainOrigin,
     ) -> anyhow::Result<(NodeState, u32)> {
         let (old_state, running_count) = {
             // Lock order is jobs before nodes, matching apply_operation. Taking
@@ -4197,11 +4609,26 @@ impl ClusterManager {
             new_state: target_state,
             reason,
             admin_locked: true,
+            drain_origin,
             reason_uid,
             reason_time,
             at: None,
         })?;
         info!(node = %name, state = %target_state, "node drain requested");
+
+        if drain_origin == DrainOrigin::System {
+            let config = self.config();
+            if config.recovery.is_enabled() && config.recovery.triggers_on_drain() {
+                if let Err(e) = self.propose(WalOperation::NodeLabelsUpdate {
+                    name: name.to_string(),
+                    set: HashMap::from([(RECOVERY_PHASE_KEY.to_string(), String::new())]),
+                    remove: vec![],
+                }) {
+                    warn!(node = %name, error = %e, "failed to seed recovery labels");
+                }
+            }
+        }
+
         Ok((target_state, running_count))
     }
 
@@ -4253,6 +4680,7 @@ impl ClusterManager {
             new_state: NodeState::Down,
             reason,
             admin_locked,
+            drain_origin: DrainOrigin::System,
             reason_uid,
             reason_time,
             at: None,
@@ -7578,6 +8006,7 @@ impl ClusterManager {
                 new_state,
                 reason,
                 admin_locked,
+                drain_origin,
                 reason_uid,
                 reason_time,
                 ..
@@ -7588,6 +8017,7 @@ impl ClusterManager {
                     node.reason_uid = *reason_uid;
                     node.reason_time = *reason_time;
                     node.admin_locked = *admin_locked;
+                    node.drain_origin = *drain_origin;
                     // A Down node has no live heartbeat. Register and update
                     // stamp one during replay too, and a fresh stamp would
                     // recover the node at the next health tick with no agent.
@@ -9979,6 +10409,7 @@ mod tests {
             mpi: Default::default(),
             health: Default::default(),
             spurd: Default::default(),
+            recovery: Default::default(),
         }
     }
 
@@ -11315,6 +11746,7 @@ mod tests {
             reason_uid: None,
             reason_time: None,
             at: None,
+            drain_origin: DrainOrigin::default(),
         });
         assert!(
             !cm.get_job(id).unwrap().holds_a_placement(),
@@ -11596,6 +12028,227 @@ mod tests {
             1,
             "max_unavailable=1 must cap health activity at one node"
         );
+    }
+
+    // ── Auto-recovery tests ──────────────────────────────────────────────
+
+    fn config_with_recovery(program: &str, max_attempts: u32) -> SlurmConfig {
+        let mut config = test_config();
+        config.recovery.program = program.to_string();
+        config.recovery.max_attempts = max_attempts;
+        config.recovery.timeout_secs = 30;
+        config
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_dispatched_on_system_drained_node_with_labels() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config_with_recovery("/bin/true", 3)).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.drain_node("n1", Some("gpu fault".into()), None, DrainOrigin::System)
+            .unwrap();
+        wait_for("recovery label seeded", || {
+            cm.get_node("n1").unwrap().has_recovery_labels()
+        });
+
+        cm.run_node_recovery_pass();
+
+        wait_for("recovery job submitted", || {
+            cm.get_jobs(&JobFilter::default())
+                .iter()
+                .any(|j| j.spec.name.starts_with(RECOVERY_JOB_PREFIX))
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_not_dispatched_on_admin_drained_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config_with_recovery("/bin/true", 3)).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.drain_node("n1", Some("maintenance".into()), None, DrainOrigin::Admin)
+            .unwrap();
+        cm.run_node_recovery_pass();
+
+        let recovery_jobs: Vec<_> = cm
+            .get_jobs(&JobFilter::default())
+            .into_iter()
+            .filter(|j| j.spec.name.starts_with(RECOVERY_JOB_PREFIX))
+            .collect();
+        assert!(
+            recovery_jobs.is_empty(),
+            "admin drain must not trigger recovery"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_not_dispatched_without_labels() {
+        let dir = TempDir::new().unwrap();
+        let mut config = config_with_recovery("/bin/true", 3);
+        config.recovery.trigger_on = vec![];
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        // System drain with trigger_on=[] does not seed labels
+        cm.drain_node("n1", Some("test".into()), None, DrainOrigin::System)
+            .unwrap();
+        assert!(!cm.get_node("n1").unwrap().has_recovery_labels());
+
+        cm.run_node_recovery_pass();
+
+        let recovery_jobs: Vec<_> = cm
+            .get_jobs(&JobFilter::default())
+            .into_iter()
+            .filter(|j| j.spec.name.starts_with(RECOVERY_JOB_PREFIX))
+            .collect();
+        assert!(recovery_jobs.is_empty(), "no labels = no recovery dispatch");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_attempt_exhaustion_updates_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config_with_recovery("/bin/false", 1)).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.drain_node("n1", Some("gpu fault".into()), None, DrainOrigin::System)
+            .unwrap();
+        wait_for("recovery label seeded", || {
+            cm.get_node("n1").unwrap().has_recovery_labels()
+        });
+
+        // Set attempt to max
+        cm.propose(WalOperation::NodeLabelsUpdate {
+            name: "n1".into(),
+            set: HashMap::from([(RECOVERY_ATTEMPT_KEY.to_string(), "1".to_string())]),
+            remove: vec![],
+        })
+        .unwrap();
+        wait_for("attempt label applied", || {
+            cm.get_node("n1").unwrap().recovery_attempt() == 1
+        });
+
+        cm.run_node_recovery_pass();
+
+        wait_for("exhaustion reason set", || {
+            cm.get_node("n1")
+                .unwrap()
+                .state_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("auto-recovery exhausted"))
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_rejects_reserved_recovery_name() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let spec = basic_spec("_spur-recovery.n1");
+        let err = cm.submit_job(spec).unwrap_err();
+        let SubmitError::InvalidArgument(msg) = &err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(msg.contains(RECOVERY_JOB_PREFIX), "got: {msg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_node_labels_preserves_recovery_labels() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        // Controller sets a recovery label
+        cm.propose(WalOperation::NodeLabelsUpdate {
+            name: "n1".into(),
+            set: HashMap::from([(RECOVERY_PHASE_KEY.to_string(), "verify".to_string())]),
+            remove: vec![],
+        })
+        .unwrap();
+        wait_for("label applied", || {
+            cm.get_node("n1")
+                .unwrap()
+                .labels
+                .contains_key(RECOVERY_PHASE_KEY)
+        });
+
+        // Re-register without the recovery label (simulates reboot)
+        cm.register_node(
+            "n1".into(),
+            "n1".into(),
+            spur_core::resource::ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
+
+        // Recovery label must survive the re-registration
+        wait_for("recovery label preserved", || {
+            cm.get_node("n1")
+                .unwrap()
+                .labels
+                .contains_key(RECOVERY_PHASE_KEY)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trigger_recovery_reclassifies_admin_drain() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config_with_recovery("/bin/true", 3)).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.drain_node("n1", Some("maintenance".into()), None, DrainOrigin::Admin)
+            .unwrap();
+        assert_eq!(cm.get_node("n1").unwrap().drain_origin, DrainOrigin::Admin);
+
+        cm.trigger_recovery("n1").unwrap();
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.drain_origin, DrainOrigin::System);
+        assert!(node.has_recovery_labels());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_recovery_reclassifies_to_admin() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config_with_recovery("/bin/true", 3)).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.drain_node("n1", Some("gpu fault".into()), None, DrainOrigin::System)
+            .unwrap();
+        wait_for("recovery label seeded", || {
+            cm.get_node("n1").unwrap().has_recovery_labels()
+        });
+
+        cm.abort_recovery("n1").unwrap();
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.drain_origin, DrainOrigin::Admin);
+        assert!(!node.has_recovery_labels());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_origin_roundtrips_through_wal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.drain_node("n1", Some("test".into()), None, DrainOrigin::System)
+            .unwrap();
+        wait_for("drain applied", || {
+            matches!(cm.get_node("n1").unwrap().state, NodeState::Drain)
+        });
+
+        assert_eq!(cm.get_node("n1").unwrap().drain_origin, DrainOrigin::System);
     }
 
     // A `Barrier` forces both callers to start at the same instant, so this races for real on
@@ -13117,6 +13770,7 @@ mod tests {
             new_state: NodeState::Drain,
             reason: Some("maintenance".into()),
             admin_locked: true,
+            drain_origin: DrainOrigin::Admin,
             reason_uid: None,
             reason_time: None,
             at: None,
@@ -15128,6 +15782,7 @@ mod tests {
             reason_uid: None,
             reason_time: None,
             at: None,
+            drain_origin: DrainOrigin::default(),
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -15154,6 +15809,7 @@ mod tests {
             reason_uid: Some(0),
             reason_time: Some(Utc::now()),
             at: None,
+            drain_origin: DrainOrigin::default(),
         });
 
         assert_eq!(
@@ -15201,6 +15857,7 @@ mod tests {
             reason_uid: None,
             reason_time: None,
             at: None,
+            drain_origin: DrainOrigin::default(),
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -16672,7 +17329,12 @@ mod tests {
         let job_id = run_job_on(&cm, "spool-fault", "worker1");
 
         let (state, _) = cm
-            .drain_node("worker1", Some("launch failed: ENOSPC".into()), None)
+            .drain_node(
+                "worker1",
+                Some("launch failed: ENOSPC".into()),
+                None,
+                DrainOrigin::System,
+            )
             .unwrap();
         assert_eq!(state, NodeState::Draining, "the job still holds the node");
 
@@ -24368,6 +25030,7 @@ mod tests {
             reason_uid: None,
             reason_time: None,
             at: None,
+            drain_origin: DrainOrigin::default(),
         });
 
         settle(&cm, job_id, JobState::Cancelled);
@@ -24392,6 +25055,7 @@ mod tests {
             reason_uid: None,
             reason_time: None,
             at: None,
+            drain_origin: DrainOrigin::default(),
         });
 
         assert_eq!(resp.jobs_finalized.len(), 1);
@@ -29921,6 +30585,7 @@ mod tests {
             new_state: NodeState::Down,
             reason: Some("heartbeat timeout".into()),
             admin_locked: false,
+            drain_origin: DrainOrigin::System,
             reason_uid: None,
             reason_time: None,
             at: None,
@@ -29967,6 +30632,7 @@ mod tests {
             reason_uid: None,
             reason_time: None,
             at: None,
+            drain_origin: DrainOrigin::default(),
         });
         // Nothing to finalize: the job never left Pending, so there's no
         // terminal transition to report — only a charge to free.
@@ -29994,6 +30660,7 @@ mod tests {
             new_state: NodeState::Down,
             reason: None,
             admin_locked: false,
+            drain_origin: DrainOrigin::Admin,
             reason_uid: None,
             reason_time: None,
             at: None,
@@ -30047,7 +30714,7 @@ mod tests {
         let id = submit_and_wait(&cm, basic_spec("drain-job"));
         start_job_on(&cm, id, "n1");
 
-        cm.drain_node("n1", Some("maintenance".into()), None)
+        cm.drain_node("n1", Some("maintenance".into()), None, DrainOrigin::Admin)
             .unwrap();
         wait_for("n1 draining", || {
             cm.get_node("n1")
@@ -30066,7 +30733,7 @@ mod tests {
 
         register_node(&cm, "n1", 4, 8000);
 
-        cm.drain_node("n1", None, None).unwrap();
+        cm.drain_node("n1", None, None, DrainOrigin::Admin).unwrap();
         wait_for("n1 drain", || {
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Drain)
@@ -30237,6 +30904,7 @@ mod tests {
             new_state: NodeState::Down,
             reason: Some("agent shutdown".into()),
             admin_locked: false,
+            drain_origin: DrainOrigin::System,
             reason_uid: Some(0),
             reason_time: Some(Utc::now()),
             at: None,
@@ -30301,7 +30969,7 @@ mod tests {
         let id = submit_and_wait(&cm, basic_spec("drain-job"));
         start_job_on(&cm, id, "n1");
 
-        cm.drain_node("n1", None, None).unwrap();
+        cm.drain_node("n1", None, None, DrainOrigin::Admin).unwrap();
         wait_for("n1 draining", || {
             cm.get_node("n1")
                 .is_some_and(|n| n.state == NodeState::Draining)

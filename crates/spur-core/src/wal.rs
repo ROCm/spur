@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
-use crate::node::{NodeSource, NodeState};
+use crate::node::{DrainOrigin, NodeSource, NodeState};
 use crate::partition::Partition;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
@@ -315,6 +315,8 @@ pub enum WalOperation {
         /// running, which `reason_time` does not (it is only set for some changes).
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        drain_origin: DrainOrigin,
     },
     NodeLabelsUpdate {
         name: String,
@@ -1501,6 +1503,41 @@ mod deregistration_wal_tests {
                 assert_eq!(job_ids, vec![7, 42]);
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn wal_node_state_change_without_drain_origin_deserializes_as_admin() {
+        let json = r#"{"NodeStateChange":{"name":"n1","old_state":"IDLE","new_state":"DRAIN","reason":"test","admin_locked":true}}"#;
+        let op: WalOperation = serde_json::from_str(json).unwrap();
+        match op {
+            WalOperation::NodeStateChange { drain_origin, .. } => {
+                assert_eq!(drain_origin, crate::node::DrainOrigin::Admin);
+            }
+            _ => panic!("expected NodeStateChange"),
+        }
+    }
+
+    #[test]
+    fn wal_node_state_change_with_drain_origin_roundtrips() {
+        let op = WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Drain,
+            reason: Some("test".into()),
+            admin_locked: true,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+            drain_origin: crate::node::DrainOrigin::System,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let deser: WalOperation = serde_json::from_str(&json).unwrap();
+        match deser {
+            WalOperation::NodeStateChange { drain_origin, .. } => {
+                assert_eq!(drain_origin, crate::node::DrainOrigin::System);
+            }
+            _ => panic!("expected NodeStateChange"),
         }
     }
 }
