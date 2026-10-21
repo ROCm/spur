@@ -117,7 +117,7 @@ Pod security
 ``spurctld`` and ``spur-k8s-operator`` run under a restricted security context in
 ``examples/k8s/``. Both pods:
 
-- run as the image's non-root ``spur`` user (UID and GID ``1001``), with
+- run as the image's non-root ``spur`` user (UID and GID ``10001``), with
   ``runAsNonRoot: true``;
 - use the ``RuntimeDefault`` seccomp profile;
 - drop all Linux capabilities and disallow privilege escalation;
@@ -132,6 +132,26 @@ volume claim. ``runAsUser`` and ``runAsGroup`` must match the user that owns the
 files in the image, so change them (and ``fsGroup`` on ``spurctld``) if you build
 an image with a different user. If you add a component that writes outside
 ``/tmp`` or the ``--state-dir`` volume, mount a volume for that path.
+
+.. warning::
+
+   The image user moved from UID/GID ``1001`` to ``10001`` to stay clear of
+   real host accounts. Whether an existing ``spool`` PVC migrates on upgrade
+   depends on the storage backend:
+
+   - Storage that honors ``fsGroup`` (most CSI drivers, e.g. EBS or Ceph RBD)
+     re-groups the volume to the new ``fsGroup`` on the next mount
+     (``fsGroupChangePolicy: OnRootMismatch``), so controller state carries
+     over with no action.
+   - Storage that ignores ``fsGroup`` (``hostPath``, ``local``, local-path
+     provisioners, NFS without fsGroup support) does not re-group the volume.
+     ``spurctld`` then reads the old Raft log but cannot write to it, which
+     wedges the controller. Before upgrading, chown the state on each
+     controller's node (``chown -R 10001:10001 <pv-path>/raft``), or recreate
+     the controllers on fresh volumes if losing state is acceptable.
+
+   Any hook script you mount into ``spurctld`` must be owned by root or UID
+   ``10001``, or the controller rejects it.
 
 ``spurd`` in ``examples/k8s/spurd.yaml`` stays privileged with ``hostPID``,
 because it launches jobs on the host and manages host devices such as GPUs.

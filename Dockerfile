@@ -106,7 +106,9 @@ COPY --from=builder /build/target/release/spur-k8s-operator /usr/local/bin/
 # spur_mpi_pmix.so only when BUILD_MPI_PLUGIN=1; empty dir otherwise (see builder stage).
 COPY --from=builder /dist/lib/spur/ /lib/spur/
 
-RUN groupadd --gid 1001 spur && useradd --uid 1001 --gid spur --no-create-home --shell /usr/sbin/nologin spur
+# UID/GID 10001 stays above the range distributions assign to real host users,
+# so a job mapped into the container cannot land on an existing host account.
+RUN groupadd --gid 10001 spur && useradd --uid 10001 --gid spur --no-create-home --shell /usr/sbin/nologin spur
 USER spur
 
 # Multi-binary image: Kubernetes manifests set the container command per workload.
