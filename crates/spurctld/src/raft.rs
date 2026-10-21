@@ -115,6 +115,10 @@ pub struct ClientResponse {
     /// refused as stale instead of actually transitioning the job.
     #[serde(default)]
     pub state_change_applied: bool,
+    /// False when a `JobExcludeUpdate` found the job no longer Pending or already
+    /// holding a placement, and left its exclusion unchanged.
+    #[serde(default)]
+    pub exclude_applied: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

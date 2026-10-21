@@ -152,6 +152,12 @@ pub enum WalOperation {
         #[serde(default)]
         run_attempt: Option<u32>,
     },
+    /// Replace a pending job's excluded nodes (`None` clears). Applied only while the
+    /// job is Pending with no placement charged, so replay reaches the same answer.
+    JobExcludeUpdate {
+        job_id: JobId,
+        exclude: Option<String>,
+    },
     /// Back off a job that failed dispatch before ever leaving Pending, where
     /// `JobStateChange`'s transition-gated backoff can't apply. NoOp on replay
     /// if the job has since left Pending.
@@ -585,6 +591,7 @@ impl WalOperation {
             | Self::JobStepComplete { .. }
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
+            | Self::JobExcludeUpdate { .. }
             | Self::JobDispatchBackoff { .. }
             | Self::JobPreemptCancel { .. }
             | Self::JobLaunchFailureDetail { .. }
@@ -632,6 +639,7 @@ impl WalOperation {
             | Self::JobStepComplete { .. }
             | Self::JobStepCreate { .. }
             | Self::JobPriorityChange { .. }
+            | Self::JobExcludeUpdate { .. }
             | Self::JobDispatchBackoff { .. }
             | Self::JobPreemptCancel { .. }
             | Self::JobLaunchFailureDetail { .. }
@@ -669,6 +677,24 @@ mod job_state_change_wal_tests {
     fn grp_wall_reason_has_a_frozen_wire_name() {
         let json = serde_json::to_string(&PendingReason::QosGrpWallLimit).unwrap();
         assert_eq!(json, "\"QosGrpWallLimit\"");
+    }
+
+    #[test]
+    fn job_exclude_update_has_a_frozen_wire_form() {
+        let op = WalOperation::JobExcludeUpdate {
+            job_id: 7,
+            exclude: Some("n[1-2]".into()),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert_eq!(
+            json,
+            r#"{"JobExcludeUpdate":{"job_id":7,"exclude":"n[1-2]"}}"#
+        );
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            WalOperation::JobExcludeUpdate { job_id: 7, exclude: Some(ref e) } if e == "n[1-2]"
+        ));
     }
 
     #[test]

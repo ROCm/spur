@@ -1487,91 +1487,143 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
         return parse_and_update_partition(controller, params).await;
     }
 
-    let mut job_id: Option<u32> = None;
-    let mut priority: Option<u32> = None;
-    let mut time_limit: Option<String> = None;
-    let mut partition: Option<String> = None;
-    let mut account: Option<String> = None;
-    let mut comment: Option<String> = None;
-    let mut qos: Option<String> = None;
+    match parse_update(params)? {
+        UpdateTarget::Nodes {
+            pattern,
+            state,
+            reason,
+        } => update_nodes(controller, &pattern, state, reason).await,
+        UpdateTarget::Job(mut req) => {
+            req.user = crate::interactive::current_user()?;
+            send_job_update(controller, req).await
+        }
+    }
+}
 
-    // Node update fields
+/// A job or node `scontrol update`, fully validated before anything is sent.
+#[derive(Debug, PartialEq)]
+enum UpdateTarget {
+    Nodes {
+        pattern: String,
+        state: Option<i32>,
+        reason: Option<String>,
+    },
+    Job(spur_proto::proto::UpdateJobRequest),
+}
+
+/// Like Slurm, one unknown key or malformed value aborts the whole request, so a
+/// caller never gets exit 0 for a change that was not made.
+fn parse_update(params: &[String]) -> Result<UpdateTarget> {
+    let mut job_id: Option<u32> = None;
+    let mut req = spur_proto::proto::UpdateJobRequest::default();
     let mut node_name: Option<String> = None;
-    let mut node_state: Option<String> = None;
+    let mut node_state: Option<i32> = None;
     let mut node_reason: Option<String> = None;
+    let mut first_job_param: Option<&String> = None;
+    let mut first_node_only_param: Option<&String> = None;
 
     for param in params {
-        if let Some((key, value)) = param.split_once('=') {
-            match key.to_lowercase().as_str() {
-                "jobid" | "job" => job_id = value.parse().ok(),
-                "priority" => priority = value.parse().ok(),
-                "timelimit" | "time_limit" => time_limit = Some(value.into()),
-                "partition" => partition = Some(value.into()),
-                "account" => account = Some(value.into()),
-                "comment" => comment = Some(value.into()),
-                "qos" => qos = Some(value.into()),
-                "nodename" | "node" => node_name = Some(value.into()),
-                "state" => node_state = Some(value.into()),
-                "reason" => node_reason = Some(value.into()),
-                other => eprintln!("scontrol: unknown update key '{}'", other),
+        let Some((key, value)) = param.split_once('=') else {
+            bail!("scontrol update: invalid input: '{param}'");
+        };
+        let invalid = || anyhow::anyhow!("scontrol update: invalid value for {key}=: '{value}'");
+        let key_lower = key.to_lowercase();
+        match key_lower.as_str() {
+            "state" | "reason" => first_node_only_param = first_node_only_param.or(Some(param)),
+            "nodename" | "node" => {}
+            _ => first_job_param = first_job_param.or(Some(param)),
+        }
+        match key_lower.as_str() {
+            "jobid" | "job" => job_id = Some(value.parse().map_err(|_| invalid())?),
+            "priority" => req.priority = Some(value.parse().map_err(|_| invalid())?),
+            "timelimit" | "time_limit" => {
+                if ["unlimited", "infinite"].contains(&value.trim().to_lowercase().as_str()) {
+                    bail!(
+                        "scontrol update: {key}={value} is not supported; give an explicit limit"
+                    );
+                }
+                let minutes = spur_core::config::parse_time_minutes(value).ok_or_else(invalid)?;
+                req.time_limit = Some(prost_types::Duration {
+                    seconds: minutes as i64 * 60,
+                    nanos: 0,
+                });
             }
+            "partition" => req.partition = Some(value.into()),
+            "account" => req.account = Some(value.into()),
+            "comment" => req.comment = Some(value.into()),
+            "qos" => req.qos = Some(value.into()),
+            "excnodelist" | "excludednodes" => req.exclude = Some(value.into()),
+            "nodename" | "node" => node_name = Some(value.into()),
+            "state" => node_state = Some(parse_node_state(value)?),
+            "reason" => node_reason = Some(value.into()),
+            _ => bail!("scontrol update: update of this parameter is not supported: '{param}'"),
         }
     }
 
-    // Node update takes priority if NodeName is specified
-    if let Some(node_pattern) = node_name {
-        let proto_state = node_state.as_deref().map(parse_node_state).transpose()?;
-
-        let channel = crate::authclient::connect(controller)
-            .await
-            .context("failed to connect to spurctld")?;
-        let mut client = spur_proto::controller_client(channel);
-
-        let names = resolve_node_names(&mut client, &node_pattern).await?;
-        let mut failed: Vec<String> = Vec::new();
-        for name in &names {
-            if let Err(e) = update_node(&mut client, name, proto_state, node_reason.clone()).await {
-                eprintln!("error: {name}: {e}");
-                failed.push(name.clone());
-            }
+    if let Some(pattern) = node_name {
+        if let Some(param) = first_job_param {
+            bail!("scontrol update: '{param}' cannot be combined with NodeName=");
         }
-        if !failed.is_empty() {
-            bail!(
-                "failed on {} of {} node(s): {}",
-                failed.len(),
-                names.len(),
-                failed.join(", ")
-            );
-        }
-        return Ok(());
+        return Ok(UpdateTarget::Nodes {
+            pattern,
+            state: node_state,
+            reason: node_reason,
+        });
     }
 
-    let jid = job_id.ok_or_else(|| {
+    if let Some(param) = first_node_only_param {
+        bail!("scontrol update: '{param}' applies only to NodeName= updates");
+    }
+    req.job_id = job_id.ok_or_else(|| {
         anyhow::anyhow!("scontrol update: JobId=, NodeName=, or PartitionName= required")
     })?;
+    if !job_update_has_changes(&req) {
+        bail!(
+            "scontrol update: no changes specified for job {}",
+            req.job_id
+        );
+    }
+    Ok(UpdateTarget::Job(req))
+}
 
-    let tl = time_limit.as_ref().and_then(|t| {
-        spur_core::config::parse_time_minutes(t).map(|m| prost_types::Duration {
-            seconds: m as i64 * 60,
-            nanos: 0,
-        })
-    });
+fn job_update_has_changes(req: &spur_proto::proto::UpdateJobRequest) -> bool {
+    req.priority.is_some()
+        || req.time_limit.is_some()
+        || req.partition.is_some()
+        || req.account.is_some()
+        || req.comment.is_some()
+        || req.qos.is_some()
+        || req.exclude.is_some()
+}
 
-    send_job_update(
-        controller,
-        spur_proto::proto::UpdateJobRequest {
-            job_id: jid,
-            priority,
-            time_limit: tl,
-            partition,
-            account,
-            comment,
-            qos,
-            user: crate::interactive::current_user()?,
-            ..Default::default()
-        },
-    )
-    .await
+async fn update_nodes(
+    controller: &str,
+    pattern: &str,
+    state: Option<i32>,
+    reason: Option<String>,
+) -> Result<()> {
+    let channel = crate::authclient::connect(controller)
+        .await
+        .context("failed to connect to spurctld")?;
+    let mut client = spur_proto::controller_client(channel);
+
+    let names = resolve_node_names(&mut client, pattern).await?;
+    let mut failed: Vec<String> = Vec::new();
+    for name in &names {
+        if let Err(e) = update_node(&mut client, name, state, reason.clone()).await {
+            eprintln!("error: {name}: {e}");
+            failed.push(name.clone());
+        }
+    }
+    if !failed.is_empty() {
+        bail!(
+            "failed on {} of {} node(s): {}",
+            failed.len(),
+            names.len(),
+            failed.join(", ")
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn is_all_node_pattern(pattern: &str) -> bool {
@@ -1648,49 +1700,53 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     let mut clear_preempt_exempt_time = false;
 
     for param in params {
-        if let Some((key, value)) = param.split_once('=') {
-            match key.to_lowercase().as_str() {
-                "partitionname" => name = value.into(),
-                "nodes" => nodes = Some(value.into()),
-                "state" => state = Some(value.to_uppercase()),
-                "default" => is_default = Some(value.eq_ignore_ascii_case("yes")),
-                "maxtime" => max_time = Some(value.into()),
-                "defaulttime" => default_time = Some(value.into()),
-                "maxnodes" => {
-                    // Last key wins: a later numeric value must undo an earlier clear.
-                    if value.eq_ignore_ascii_case("UNLIMITED") || value == "0" {
-                        clear_max_nodes = true;
-                        max_nodes = None;
-                    } else {
-                        max_nodes = value.parse().ok();
-                        clear_max_nodes = false;
-                    }
+        let Some((key, value)) = param.split_once('=') else {
+            bail!("scontrol update: invalid input: '{param}'");
+        };
+        let invalid = || anyhow::anyhow!("scontrol update: invalid value for {key}=: '{value}'");
+        match key.to_lowercase().as_str() {
+            "partitionname" => name = value.into(),
+            "nodes" => nodes = Some(value.into()),
+            "state" => state = Some(value.to_uppercase()),
+            "default" => is_default = Some(value.eq_ignore_ascii_case("yes")),
+            "maxtime" => max_time = Some(value.into()),
+            "defaulttime" => default_time = Some(value.into()),
+            "maxnodes" => {
+                // Last key wins: a later numeric value must undo an earlier clear.
+                if value.eq_ignore_ascii_case("UNLIMITED") || value == "0" {
+                    clear_max_nodes = true;
+                    max_nodes = None;
+                } else {
+                    max_nodes = Some(value.parse().map_err(|_| invalid())?);
+                    clear_max_nodes = false;
                 }
-                "minnodes" => min_nodes = value.parse().ok(),
-                "allowaccounts" => allow_accounts = Some(value.into()),
-                "allowgroups" => allow_groups = Some(value.into()),
-                "denyaccounts" => deny_accounts = Some(value.into()),
-                "denyqos" => deny_qos = Some(value.into()),
-                "allowqos" => allow_qos = Some(value.into()),
-                "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().ok(),
-                "preemptmode" => preempt_mode = Some(value.to_uppercase()),
-                "preemptexempttime" => {
-                    preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
-                        anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
-                    })?);
-                }
-                "clearpreemptexempttime" => {
-                    clear_preempt_exempt_time = value.eq_ignore_ascii_case("yes")
-                        || value == "1"
-                        || value.eq_ignore_ascii_case("true");
-                }
-                // silently ignore Slurm-only keys
-                "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
-                | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket"
-                | "jobdefaults" | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
-                other => eprintln!("scontrol update partition: unknown key '{}'", other),
             }
+            "minnodes" => min_nodes = Some(value.parse().map_err(|_| invalid())?),
+            "allowaccounts" => allow_accounts = Some(value.into()),
+            "allowgroups" => allow_groups = Some(value.into()),
+            "denyaccounts" => deny_accounts = Some(value.into()),
+            "denyqos" => deny_qos = Some(value.into()),
+            "allowqos" => allow_qos = Some(value.into()),
+            "prioritytier" | "priorityjobfactor" => {
+                priority_tier = Some(value.parse().map_err(|_| invalid())?)
+            }
+            "preemptmode" => preempt_mode = Some(value.to_uppercase()),
+            "preemptexempttime" => {
+                preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
+                    anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
+                })?);
+            }
+            "clearpreemptexempttime" => {
+                clear_preempt_exempt_time = value.eq_ignore_ascii_case("yes")
+                    || value == "1"
+                    || value.eq_ignore_ascii_case("true");
+            }
+            // silently ignore Slurm-only keys
+            "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
+            | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
+            | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults"
+            | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
+            _ => bail!("scontrol update: update of this parameter is not supported: '{param}'"),
         }
     }
 
@@ -3097,5 +3153,154 @@ mod tests {
     fn job_nodelist_env_none_when_all_unset_or_blank() {
         assert_eq!(job_nodelist_env(|_| None), None);
         assert_eq!(job_nodelist_env(|_| Some(String::new())), None);
+    }
+
+    fn job_update(args: &[&str]) -> spur_proto::proto::UpdateJobRequest {
+        match parse_update(&p(args)).unwrap() {
+            UpdateTarget::Job(req) => req,
+            other => panic!("expected a job update, got {other:?}"),
+        }
+    }
+
+    fn update_error(args: &[&str]) -> String {
+        parse_update(&p(args)).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn excluded_nodes_and_slurms_exc_node_list_both_replace_the_exclusion() {
+        let req = job_update(&["JobId=101", "ExcludedNodes=node07"]);
+        assert_eq!(req.job_id, 101);
+        assert_eq!(req.exclude.as_deref(), Some("node07"));
+
+        let req = job_update(&["jobid=101", "excnodelist=node[01-03]"]);
+        assert_eq!(req.exclude.as_deref(), Some("node[01-03]"));
+    }
+
+    #[test]
+    fn an_empty_exclusion_is_sent_so_the_controller_clears_it() {
+        assert_eq!(
+            job_update(&["JobId=101", "ExcludedNodes="])
+                .exclude
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_rejects_the_whole_update_even_beside_a_valid_one() {
+        let err = update_error(&["JobId=101", "TimeLimit=10", "Bogus=1"]);
+        assert!(err.contains("not supported: 'Bogus=1'"), "{err}");
+    }
+
+    #[test]
+    fn a_token_without_an_equals_sign_is_rejected() {
+        let err = update_error(&["job", "101", "TimeLimit=10"]);
+        assert!(err.contains("invalid input: 'job'"), "{err}");
+    }
+
+    #[test]
+    fn a_job_update_that_changes_nothing_is_rejected() {
+        let err = update_error(&["JobId=101"]);
+        assert!(err.contains("no changes specified for job 101"), "{err}");
+    }
+
+    #[test]
+    fn malformed_values_are_rejected_instead_of_dropped() {
+        for (args, key) in [
+            (["JobId=abc", "Priority=5"], "JobId"),
+            (["JobId=101", "Priority=high"], "Priority"),
+            (["JobId=101", "TimeLimit=soon"], "TimeLimit"),
+        ] {
+            let err = update_error(&args);
+            assert!(err.contains(&format!("invalid value for {key}=")), "{err}");
+        }
+        let err = update_error(&["JobId=101", "TimeLimit=UNLIMITED"]);
+        assert!(err.contains("not supported"), "{err}");
+    }
+
+    #[test]
+    fn existing_job_keys_still_parse() {
+        let req = job_update(&[
+            "JobId=7",
+            "Priority=100",
+            "TimeLimit=2:00:00",
+            "Partition=gpu",
+            "Account=a",
+            "Comment=c",
+            "QOS=high",
+        ]);
+        assert_eq!(req.priority, Some(100));
+        assert_eq!(req.time_limit.map(|d| d.seconds), Some(7200));
+        assert_eq!(req.partition.as_deref(), Some("gpu"));
+        assert_eq!(req.account.as_deref(), Some("a"));
+        assert_eq!(req.comment.as_deref(), Some("c"));
+        assert_eq!(req.qos.as_deref(), Some("high"));
+        assert_eq!(req.exclude, None);
+    }
+
+    #[test]
+    fn node_updates_parse_and_reject_unknown_keys() {
+        assert_eq!(
+            parse_update(&p(&["NodeName=n[1-2]", "State=drain", "Reason=hw"])).unwrap(),
+            UpdateTarget::Nodes {
+                pattern: "n[1-2]".into(),
+                state: Some(spur_proto::proto::NodeState::NodeDrain as i32),
+                reason: Some("hw".into()),
+            }
+        );
+        let err = update_error(&["NodeName=n1", "State=drain", "Weight=5"]);
+        assert!(err.contains("not supported: 'Weight=5'"), "{err}");
+    }
+
+    #[test]
+    fn keys_for_the_other_kind_of_update_are_rejected_not_dropped() {
+        let err = update_error(&["JobId=101", "TimeLimit=10", "State=drain"]);
+        assert!(
+            err.contains("'State=drain' applies only to NodeName="),
+            "{err}"
+        );
+
+        let err = update_error(&["NodeName=n1", "State=drain", "TimeLimit=10"]);
+        assert!(
+            err.contains("'TimeLimit=10' cannot be combined with NodeName="),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partition_update_with_an_unknown_key_fails_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        let err = parse_and_update(
+            &format!("http://{addr}"),
+            &p(&["PartitionName=gpu", "MaxTime=60", "Bogus=1"]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not supported: 'Bogus=1'"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partition_update_with_a_malformed_number_fails_before_connecting() {
+        let addr = crate::mock_controller::unreachable_addr().await;
+        for (bad, key) in [
+            (vec!["MaxNodes=abc"], "MaxNodes"),
+            (vec!["MaxNodes=UNLIMITED", "MaxNodes=abc"], "MaxNodes"),
+            (vec!["MinNodes=two"], "MinNodes"),
+            (vec!["PriorityTier=high"], "PriorityTier"),
+        ] {
+            let mut args = vec!["PartitionName=gpu", "MaxTime=12:00:00"];
+            args.extend(bad);
+            let err = parse_and_update(&format!("http://{addr}"), &p(&args))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("invalid value for {key}=")),
+                "{err}"
+            );
+        }
     }
 }
