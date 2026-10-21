@@ -8293,10 +8293,6 @@ impl StateMachineApply for ClusterManager {
             if node.detected_resources == ResourceSet::default() {
                 node.detected_resources = node.total_resources.clone();
             }
-            // Older controllers could persist an Idle node with live allocations.
-            if node.state.is_up() {
-                node.update_state_from_alloc();
-            }
             nodes.insert(node.name.clone(), node);
         }
         self.k0s_role_counts
@@ -8373,6 +8369,12 @@ impl StateMachineApply for ClusterManager {
         // Re-evaluate partition membership and NodeConfig policy
         // for all nodes against the current config.
         self.reconcile_partitions(&mut nodes);
+        // Snapshot service states may reflect different CPU caps than the current config.
+        for node in nodes.values_mut() {
+            if node.state.is_up() {
+                node.update_state_from_alloc();
+            }
+        }
 
         info!(
             jobs = jobs.len(),
@@ -27738,6 +27740,69 @@ mod tests {
             let node = restored.get_node(name).unwrap();
             assert_eq!(node.state, expected, "{name}");
             assert_eq!(node.alloc_resources.cpus, cpus, "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_restore_derives_service_states_after_cpu_cap_changes() {
+        let dir = TempDir::new().unwrap();
+        let cm =
+            test_cluster_with_config(&dir, config_with_nodes(vec![node_cfg("n1", 4, 0, 0)])).await;
+        register_node(&cm, "n1", 8, 8000);
+        let id = submit_and_wait(&cm, basic_spec("snapshot-cap-change"));
+        let alloc = scalar_alloc(4, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc.clone()),
+        )
+        .unwrap();
+        assert_eq!(cm.get_node("n1").unwrap().total_resources.cpus, 4);
+
+        for stored in NodeState::ALL {
+            cm.nodes.write().get_mut("n1").unwrap().state = stored;
+            let snapshot = cm.snapshot_state().unwrap();
+            for (case, config, capacity) in [
+                ("removed", test_config(), 8),
+                (
+                    "uncapped",
+                    config_with_nodes(vec![node_cfg("n1", 0, 0, 0)]),
+                    8,
+                ),
+                (
+                    "raised",
+                    config_with_nodes(vec![node_cfg("n1", 8, 0, 0)]),
+                    8,
+                ),
+                (
+                    "lowered",
+                    config_with_nodes(vec![node_cfg("n1", 2, 0, 0)]),
+                    2,
+                ),
+            ] {
+                let restored_dir = TempDir::new().unwrap();
+                let restored = ClusterManager::new(config, restored_dir.path()).unwrap();
+                restored.restore_from_snapshot(&snapshot).unwrap();
+                let node = restored.get_node("n1").unwrap();
+                let expected = if !stored.is_up() {
+                    stored
+                } else if capacity > alloc.cpus {
+                    NodeState::Mixed
+                } else {
+                    NodeState::Allocated
+                };
+                assert_eq!(node.state, expected, "{case}: {stored:?}");
+                assert_eq!(node.total_resources.cpus, capacity, "{case}");
+                assert_eq!(node.detected_resources.cpus, 8, "{case}");
+                assert_eq!(node.alloc_resources, alloc, "{case}");
+                assert_eq!(
+                    node.is_schedulable(),
+                    expected == NodeState::Mixed,
+                    "{case}: {stored:?}"
+                );
+                assert_eq!(restored.get_job(id).unwrap().state, JobState::Running);
+            }
         }
     }
 
