@@ -16,7 +16,7 @@ Inspecting a node
 -----------------
 
 Use ``scontrol show node <node>`` (or ``spur control show node <node>``).
-The response includes ``InventoryGeneration``, ``FabricBindingVersion``, and, for GPUs with topology
+The response includes ``InventoryGeneration``, ``FabricBindingVersion``, ``BlockFileRevision``, and, for GPUs with topology
 metadata, full PCI BDF, node-local PCI host bridge, NUMA locality, exact VRAM
 bytes, and fabric observations. For example:
 
@@ -95,7 +95,7 @@ model as JSON in the ``spur.amd.com/topology`` annotation. An invalid annotation
 is reported as unavailable rather than silently disappearing. This annotation
 is an inventory transport, not a validated controller static-import API.
 
-Typed GPU predicates, runtime static import, segments, topology exclusivity,
+Typed GPU predicates, per-device static import, segments, topology exclusivity,
 and authoritative fabric health are separate capabilities and are not enabled
 by these observations. No job flags are added for those capabilities.
 
@@ -140,14 +140,14 @@ contain its complete registered membership.
 
 Validation is read-only. It does not install the document, change membership,
 reserve resources, or freeze a fabric configuration. Automatic discovery remains
-the default; no administrator-generated intermediate file is required. Runtime
-static import is not enabled by exporting or validating a document.
+the default; no administrator-generated intermediate file is required. Installing an optional whole-node definition file is a separate operation,
+described below.
 
 Single-block placement policy
 -----------------------------
 
 Upgrade every controller before enabling this configuration. Upgrade agents on
-the participating nodes and verify ``FabricBindingVersion=1`` in node inspection;
+the participating nodes and verify ``FabricBindingVersion`` is at least 1 in node inspection;
 older agents report zero and cannot satisfy this policy. Add the following to
 the controller's existing TOML configuration, using existing partition names:
 
@@ -218,5 +218,173 @@ Heterogeneous job groups are left pending under this policy until group-wide
 binding is supported. Policy-constrained jobs do not trigger automatic preemption,
 idle-fill reclamation, or federation forwarding, whose current selection paths
 do not carry fabric requirements. Ordinary backfill, including future resource
-reservations, remains available. Segments, whole-block exclusivity, and runtime
-static import remain future extensions.
+reservations, remains available. Segments, whole-block exclusivity, and per-device static import remain future
+extensions.
+
+Optional administrator or operator block file
+---------------------------------------------
+
+For a rack system whose placement groups are maintained by an administrator or
+external operator, set ``block_file`` alongside the partition policy:
+
+.. code-block:: toml
+
+   [topology.external]
+   single_block_partitions = ["gpu"]
+   block_file = "/etc/spur/topology.conf"
+
+This selects file-defined blocks for the controller. Omitting ``block_file``
+keeps automatic discovery. The filename has no special meaning; an absolute
+path is required. Install the same configuration setting and file on every
+participating agent and controller. Agents must advertise
+``FabricBindingVersion`` of at least 2. All nodes can remain in one partition:
+``single_block_partitions`` selects which partitions require containment, and
+the file defines the placement boundaries within that candidate node pool.
+Ordinary partitions retain their existing scheduling behavior.
+
+The file is text, with one record per block:
+
+.. code-block:: text
+
+   # Two groups in one rack system
+   BlockName=group-a Nodes=node[01-02]
+   BlockName=group-b Nodes=node[03-04]
+
+Each record requires ``BlockName`` and ``Nodes``. Field names are case
+insensitive; field order is arbitrary. Node lists support bracket ranges and
+comma-separated names. ``#`` begins a comment and a trailing backslash joins
+lines. Block names use letters, digits, underscores, dots, and hyphens, with a
+maximum of 128 bytes. Node names use the same characters, with a maximum of
+255 bytes. Files are limited to 1 MiB and 65,536 declared nodes. Duplicate
+fields, block names, or node memberships are errors.
+
+This is a deliberately small subset of the block record format. ``BlockSizes``
+and other fields are rejected: higher-level aggregation is not implemented,
+and each declared block is a hard placement boundary. A node can belong to
+only one declared block. The record covers all currently registered GPUs on
+each named node; it cannot describe separate groups within a node. GPU counts,
+types, identities, free resources, and health are never taken from this file.
+Nodes omitted from the file cannot supply GPUs to constrained jobs, but remain
+available to ordinary scheduling.
+
+If the selected GPUs have native fabric observations, the entire declared
+block must resolve to one complete, consistent native block. A file can
+subdivide a native block by whole nodes. It cannot merge distinct observed
+vPods or override incomplete or contradictory observations. If only some GPUs
+have observations, missing observations make the declared block unavailable.
+Native endpoint coverage still applies, including native members outside a
+subdivision.
+
+If none of a declared block's GPUs reports native membership, the file is an
+explicit administrator declaration. This path is vendor neutral. Spur enforces
+node membership and exact live GPU identities without asserting connectivity,
+bandwidth, fabric health, or external-manager readiness. An external operator
+is responsible for ensuring its declaration reflects the configured system.
+This does not add fabric programming or manager credentials to Spur.
+
+Creating and validating a candidate
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An administrator can write the records directly. When automatic discovery
+already produces whole-node groups, it can provide an initial candidate:
+
+.. code-block:: console
+
+   spur control topology export --format block > topology.conf.candidate
+   spur control topology validate --format block topology.conf.candidate
+
+``export --format block`` prints deterministic ``BlockName``/``Nodes`` records.
+It preserves names for file-defined groups and generates names such as
+``block0`` for automatic groups. It rejects invalid groups, a node shared by
+multiple groups, or unresolved GPUs on an included node. Review and validate
+the output before installation. It contains no inferred topology hierarchy.
+
+``validate --format block`` checks syntax locally, then resolves membership
+against the controller's current live inventory through a read-only RPC. It
+does not require the candidate revision to be deployed to agents, so it can
+be used before installation. Missing nodes, stale agents, missing GPUs, or
+conflicting native membership are reported as errors. Success does not test
+fabric connectivity or install the file. Plain ``export`` and ``validate``
+retain the existing JSON format; JSON manifests are inspection/validation
+artifacts and are not accepted as ``block_file`` input.
+
+Deployment and updates
+~~~~~~~~~~~~~~~~~~~~~~
+
+For first activation, upgrade all controllers and participating agents, install
+the validated file at the configured path, and restart agents to load the new
+``block_file`` setting. Reconfigure or restart the controller to enable the
+setting. A controller can start before nodes register; affected blocks remain
+unavailable until complete live inventory and matching revisions arrive.
+Reconfigure requires every candidate block to resolve against current
+inventory, so wait for registration before using it for activation.
+
+For later membership changes:
+
+#. Generate a complete candidate and run ``topology validate --format block``.
+#. Coordinate with running allocations. Membership changes invalidate old
+   bindings for new steps; requeue affected allocations as appropriate.
+#. Atomically replace the file on participating agents and controllers. Use a
+   temporary file in the same directory followed by rename; keep the directory
+   readable by the daemon and writable only by the administrator/operator.
+#. Run ``spur control reconfigure`` on the controller. It parses and validates
+   the complete candidate before changing partitions or the active config.
+#. Inspect ``spur control topology show`` and ``spur control show node NODE``.
+   Resume constrained submissions once the desired blocks have no issues and
+   the participating agents report the expected revision.
+
+There is no automatic controller filesystem watch. Agents reread the file
+through the existing inventory refresh/debounce loop and directly before
+admission and new steps. The controller retains a parsed immutable snapshot
+until reconfigure/restart. A malformed or missing candidate causes reconfigure
+to fail while preserving the previous configuration. A missing, malformed, or
+different agent file fences that agent's declared block; another valid block
+can still schedule. Restore the matching file and wait for inventory refresh
+to make the affected block available again.
+
+Revisions hash normalized block names and expanded node memberships. Comments,
+whitespace, field order, and record order do not change the revision. Membership
+or block-name changes do. During rollout, revision differences deliberately
+make affected placement unavailable; there is no fallback to automatic groups.
+The revision covers the whole file, so even an edit to another record fences
+allocations using an older revision. Plan updates as a coordinated operation.
+Step dispatch is not an atomic multi-node barrier: during partial rollout, a
+step may start on nodes that still validate the old binding while another node
+rejects it. Quiesce affected allocations before changing membership.
+Existing running processes are not moved or killed by a file update. A stale
+parent allocation must be requeued before it can start further steps; restoring
+the old file may still leave a newer inventory generation that fences it.
+
+High-availability deployments follow the existing controller configuration
+model: ``reconfigure`` applies on the active leader, and does not replicate
+file contents or local configuration to followers. Deploy matching files and
+configuration to every controller and restart followers with that configuration
+before relying on failover. This feature adds no distributed file rollout or
+atomic fabric lease.
+
+Scheduling and inspection
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+File blocks use the same backfill algorithm and exact-device admission checks
+as automatic blocks. Earliest feasible start wins; block-key order breaks ties.
+A smaller job may share a block when its CPUs, memory, and GPUs are free. A job
+cannot combine two blocks even if their summed free GPUs meet its request.
+``--exclusive`` still reserves whole nodes, not a whole block.
+
+For four nodes with four GPUs each and the two records above:
+
+.. code-block:: console
+
+   spur submit -p gpu -N 2 -n 2 --gpus 6 -t 00:10:00 --wrap 'sleep 300'
+   spur submit -p gpu -N 2 -n 2 --gpus 6 -t 00:10:00 --wrap 'sleep 300'
+   spur submit -p gpu -N 4 -n 4 --gpus 12 -t 00:10:00 --wrap 'sleep 300'
+   spur control topology show
+   spur control show job JOB_ID
+
+The first two jobs can use different eight-GPU blocks. The twelve-GPU job stays
+pending because it cannot fit within either block. Omitting ``-p`` uses the
+configured default partition and that partition's containment policy.
+``topology show`` includes ``Source=file``, ``Revision``, and
+``NativeObservation``. Job inspection includes ``BlockFileRevision`` and
+``BindingVersion=2`` alongside exact per-node GPU bindings. No new job
+ID environment variable or submission flag is required.

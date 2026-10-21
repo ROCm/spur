@@ -1184,6 +1184,7 @@ mod tests {
     fn update_capacity_grows_and_preserves_live_allocation() {
         let mk = |ids: &[(u32, u64)]| ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: ids
@@ -1219,6 +1220,7 @@ mod tests {
     fn update_capacity_reports_lost_allocated_device_without_applying() {
         let mk = |ids: &[(u32, u64)]| ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: ids
@@ -1327,6 +1329,7 @@ mod tests {
         ];
         let rs = ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus,

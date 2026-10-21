@@ -326,6 +326,21 @@ pub struct ExternalFabricConfig {
     /// GPU jobs requesting any listed partition must stay within one observed block.
     #[serde(default)]
     pub single_block_partitions: Vec<String>,
+    #[serde(default)]
+    pub block_file: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    pub loaded_block_file: Option<crate::block_file::BlockFile>,
+}
+
+impl ExternalFabricConfig {
+    pub fn load_block_file(&mut self) -> Result<(), String> {
+        self.loaded_block_file = self
+            .block_file
+            .as_deref()
+            .map(crate::block_file::BlockFile::read)
+            .transpose()?;
+        Ok(())
+    }
 }
 
 fn default_topo_plugin() -> String {

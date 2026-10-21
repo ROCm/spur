@@ -24,6 +24,7 @@ fn nodes(count: usize) -> Vec<Node> {
                     memory_mb: 1024,
                     generation: 7,
                     fabric_binding_version: 1,
+                    block_file_revision: None,
                     gpus: (0..2)
                         .map(|local| {
                             let endpoint = (index % 2 * 2 + local).to_string();
@@ -90,18 +91,22 @@ fn run_with_policy(
     jobs: &[Job],
     enforce: bool,
 ) -> (BackfillScheduler, Vec<Assignment>) {
+    let view = FabricView::from_nodes("test", nodes, now(), 90);
+    run_with_view(nodes, jobs, enforce, view)
+}
+
+fn run_with_view(
+    nodes: &[Node],
+    jobs: &[Job],
+    enforce: bool,
+    view: FabricView,
+) -> (BackfillScheduler, Vec<Assignment>) {
     let partitions = [Partition {
         name: "rack".into(),
         is_default: true,
         nodes: "ALL".into(),
         ..Default::default()
     }];
-    let view = FabricView::from_nodes("test", nodes, now(), 90);
-    assert!(
-        view.blocks.iter().all(|block| block.issues.is_empty()),
-        "{:?}",
-        view.blocks
-    );
     let context = FabricSchedulingContext {
         view,
         single_block_partitions: vec!["rack".into()],
@@ -286,25 +291,115 @@ fn future_total_gpu_reservation_routes_long_job_to_another_block() {
     reserved.spec.nodelist = Some("n0,n1".into());
     let mut long = job(2, 2, 2);
     long.spec.time_limit = Some(Duration::seconds(90));
-    let (scheduler, assignments) = run(&nodes, &[reserved, long]);
-    assert_eq!(assignments.len(), 1);
-    assert_eq!(assignments[0].job_id, 2);
-    assert_eq!(assignments[0].nodes, ["n2", "n3"]);
-    let planned: Vec<_> = scheduler
-        .timelines
-        .iter()
-        .flat_map(|t| {
-            t.intervals
-                .iter()
-                .filter(|i| i.job_id == Some(1))
-                .map(|i| (t.node_name.as_str(), i.start))
-        })
-        .collect();
+    let file = spur_core::block_file::BlockFile::parse(
+        "BlockName=a Nodes=n[0-1]\nBlockName=b Nodes=n[2-3]",
+    )
+    .unwrap();
+    for node in &mut nodes {
+        node.total_resources.fabric_binding_version = 2;
+        node.total_resources.block_file_revision = Some(file.revision.clone());
+    }
+    for view in [
+        FabricView::from_nodes("test", &nodes, now(), 90),
+        file.view("test", &nodes, now(), 90, true),
+    ] {
+        let (scheduler, assignments) =
+            run_with_view(&nodes, &[reserved.clone(), long.clone()], true, view);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id, 2);
+        assert_eq!(assignments[0].nodes, ["n2", "n3"]);
+        let planned: Vec<_> = scheduler
+            .timelines
+            .iter()
+            .flat_map(|t| {
+                t.intervals
+                    .iter()
+                    .filter(|i| i.job_id == Some(1))
+                    .map(|i| (t.node_name.as_str(), i.start))
+            })
+            .collect();
+        assert_eq!(
+            planned,
+            [
+                ("n0", now() + Duration::seconds(60)),
+                ("n1", now() + Duration::seconds(60)),
+            ]
+        );
+    }
+}
+
+#[test]
+fn file_blocks_schedule_exact_devices_and_fence_mismatched_agents() {
+    use spur_core::block_file::BlockFile;
+    let file = BlockFile::parse("BlockName=a Nodes=n[0-1]\nBlockName=b Nodes=n[2-3]").unwrap();
+    for native in [false, true] {
+        let mut nodes = nodes(4);
+        for node in &mut nodes {
+            node.total_resources.fabric_binding_version = 2;
+            node.total_resources.block_file_revision = Some(file.revision.clone());
+            if !native {
+                for gpu in &mut node.total_resources.gpus {
+                    gpu.topology = None;
+                }
+            }
+        }
+        let view = file.view("test", &nodes, now(), 90, true);
+        let (_, assignments) =
+            run_with_view(&nodes, &[job(1, 2, 3), job(2, 2, 3)], true, view.clone());
+        assert_eq!(assignments.len(), 2);
+        for (assignment, block) in assignments.iter().zip(["a", "b"]) {
+            for (name, allocation) in &assignment.per_node_alloc {
+                let binding = allocation.fabric_binding.as_ref().unwrap();
+                assert_eq!(binding.version, 2);
+                assert_eq!(binding.key.fabric_domain, block);
+                let node = nodes.iter().find(|n| n.name == *name).unwrap();
+                binding
+                    .validate("test", name, &node.total_resources, allocation)
+                    .unwrap();
+            }
+        }
+        assert!(run_with_view(&nodes, &[job(3, 3, 6)], true, view.clone())
+            .1
+            .is_empty());
+        assert_eq!(
+            run_with_view(&nodes, &[job(3, 3, 6)], false, view).1.len(),
+            1
+        );
+        for mismatch in [false, true] {
+            if mismatch {
+                nodes[0].total_resources.block_file_revision = None;
+            } else {
+                nodes[0].total_resources.fabric_binding_version = 1;
+            }
+            let view = file.view("test", &nodes, now(), 90, true);
+            let (_, assignments) = run_with_view(&nodes, &[job(4, 2, 3)], true, view);
+            assert_eq!(assignments.len(), 1);
+            assert_eq!(assignments[0].nodes, ["n2", "n3"]);
+        }
+    }
+}
+
+#[test]
+fn file_block_ties_use_the_scoped_key_across_physical_domains() {
+    let file = spur_core::block_file::BlockFile::parse(
+        "BlockName=a Nodes=n[2-3]\nBlockName=b Nodes=n[0-1]",
+    )
+    .unwrap();
+    let mut nodes = nodes(4);
+    for node in &mut nodes {
+        node.total_resources.fabric_binding_version = 2;
+        node.total_resources.block_file_revision = Some(file.revision.clone());
+    }
+    let view = file.view("test", &nodes, now(), 90, true);
+    let (_, assignments) = run_with_view(&nodes, &[job(1, 2, 3)], true, view);
+    assert_eq!(assignments[0].nodes, ["n0", "n1"]);
     assert_eq!(
-        planned,
-        [
-            ("n0", now() + Duration::seconds(60)),
-            ("n1", now() + Duration::seconds(60)),
-        ]
+        assignments[0].per_node_alloc["n0"]
+            .fabric_binding
+            .as_ref()
+            .unwrap()
+            .key
+            .fabric_domain,
+        "b"
     );
 }

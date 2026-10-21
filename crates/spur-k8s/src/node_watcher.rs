@@ -299,6 +299,7 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
 
     ResourceSet {
         fabric_binding_version: 0,
+        block_file_revision: None,
         cpus,
         memory_mb,
         gpus,
@@ -731,6 +732,7 @@ mod tests {
             .collect();
         ResourceSet {
             fabric_binding_version: 0,
+            block_file_revision: None,
             cpus,
             memory_mb: mem,
             gpus,
