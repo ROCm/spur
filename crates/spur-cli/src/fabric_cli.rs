@@ -62,17 +62,20 @@ pub async fn run(controller: &str, command: TopologyCommand) -> Result<()> {
         TopologyCommand::Validate {
             file,
             format: TopologyFormat::Block,
-        } => Some(BlockFile::read(file).map_err(anyhow::Error::msg)?),
+        } => Some(
+            BlockFile::read_with_text(file)
+                .map_err(anyhow::Error::msg)?
+                .1,
+        ),
         _ => None,
     };
     let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
     let mut client = spur_proto::controller_client(channel);
-    let response = if let Some(file) = &block_file {
-        let mut request = tonic::Request::new(spur_proto::proto::ValidateBlockFileRequest {
-            content: file.to_text(),
-        });
+    let response = if let Some(content) = block_file {
+        let mut request =
+            tonic::Request::new(spur_proto::proto::ValidateBlockFileRequest { content });
         request.set_timeout(std::time::Duration::from_secs(30));
         client
             .validate_block_file(request)
@@ -336,6 +339,48 @@ mod tests {
                 issue: "missing".into(),
             });
         assert!(export_blocks(&view).is_err());
+    }
+
+    #[tokio::test]
+    async fn block_validation_preserves_bounded_text_across_the_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topology.conf");
+        let text = format!(
+            "# compact range before suffix\nNodes={}[00000-04999]x BlockName=a\n",
+            "n".repeat(240)
+        );
+        std::fs::write(&path, &text).unwrap();
+        let parsed = BlockFile::read(&path).unwrap();
+        assert_eq!(parsed.blocks[0].nodes.len(), 5000);
+        assert!(parsed.to_text().len() > spur_core::block_file::MAX_BLOCK_FILE_BYTES);
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        let controller = format!("http://{addr}");
+        run(
+            &controller,
+            TopologyCommand::Validate {
+                file: path.clone(),
+                format: TopologyFormat::Block,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.block_validation_content(), [text]);
+        for invalid in [
+            "BlockName=a Nodes=n1,n1".to_string(),
+            "#".repeat(spur_core::block_file::MAX_BLOCK_FILE_BYTES + 1),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(run(
+                &controller,
+                TopologyCommand::Validate {
+                    file: path.clone(),
+                    format: TopologyFormat::Block
+                }
+            )
+            .await
+            .is_err());
+            assert_eq!(capture.block_validation_content().len(), 1);
+        }
     }
 
     #[test]

@@ -10762,6 +10762,7 @@ mod tests {
             "n1",
             state.path(),
             StepdLaunchOptions {
+                fabric_binding: None,
                 step_id: 0,
                 allocation_only: false,
                 container_rootfs_mode: None,

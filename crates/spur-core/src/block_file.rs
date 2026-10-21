@@ -31,6 +31,10 @@ pub struct BlockFile {
 
 impl BlockFile {
     pub fn read(path: &Path) -> Result<Self, String> {
+        Self::read_with_text(path).map(|(parsed, _)| parsed)
+    }
+
+    pub fn read_with_text(path: &Path) -> Result<(Self, String), String> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(nix::libc::O_NONBLOCK)
@@ -43,7 +47,8 @@ impl BlockFile {
         file.take(MAX_BLOCK_FILE_BYTES as u64 + 1)
             .read_to_string(&mut text)
             .map_err(|e| format!("cannot read block file: {e}"))?;
-        Self::parse(&text)
+        let parsed = Self::parse(&text)?;
+        Ok((parsed, text))
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {

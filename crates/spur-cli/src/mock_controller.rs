@@ -8,7 +8,8 @@
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every
+//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`, and
+//! `ValidateBlockFile`); every
 //! other RPC reports `unimplemented` so an unexpected call fails loudly instead
 //! of silently returning a default.
 
@@ -58,9 +59,14 @@ pub(crate) struct StepCapture {
     /// `node_addr` handed back from `CreateJobStep`, so a test can point an
     /// interactive step at a mock agent instead of an empty address.
     create_step_node_addr: Arc<Mutex<String>>,
+    block_validation_content: Arc<Mutex<Vec<String>>>,
 }
 
 impl StepCapture {
+    pub(crate) fn block_validation_content(&self) -> Vec<String> {
+        self.block_validation_content.lock().unwrap().clone()
+    }
+
     pub(crate) fn get_job_calls(&self) -> u32 {
         self.get_job_calls.load(Ordering::SeqCst)
     }
@@ -188,6 +194,16 @@ macro_rules! mock_controller_impl {
 
 mock_controller_impl! {
     implemented {
+        async fn validate_block_file(
+            &self,
+            request: tonic::Request<proto::ValidateBlockFileRequest>,
+        ) -> Result<tonic::Response<proto::GetFabricTopologyResponse>, tonic::Status> {
+            let content = request.into_inner().content;
+            self.capture.block_validation_content.lock().unwrap().push(content.clone());
+            spur_core::block_file::BlockFile::parse(&content).map_err(tonic::Status::invalid_argument)?;
+            Ok(tonic::Response::new(proto::GetFabricTopologyResponse { namespace: "test".into(), ..Default::default() }))
+        }
+
         async fn create_job_step(
             &self,
             request: tonic::Request<proto::CreateJobStepRequest>,
@@ -381,7 +397,6 @@ mock_controller_impl! {
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
         get_fabric_topology(()) -> proto::GetFabricTopologyResponse;
-        validate_block_file(proto::ValidateBlockFileRequest) -> proto::GetFabricTopologyResponse;
         create_partition(proto::CreatePartitionRequest) -> ();
         update_partition(proto::UpdatePartitionRequest) -> ();
         delete_partition(proto::DeletePartitionRequest) -> ();
