@@ -18,21 +18,9 @@ from cluster import (
     parse_job_id,
     wait_job,
     wait_job_state,
+    wait_node_gone,
     wait_sacct_row,
 )
-
-
-def _wait_node_gone(cluster, node_name, timeout=60):
-    """Poll sinfo until a node disappears."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            if node_name not in cluster.sinfo_nodes():
-                return
-        except Exception:
-            pass
-        time.sleep(2)
-    raise TimeoutError(f"Node {node_name} still visible after {timeout}s")
 
 
 class TestSacctNodeFailState:
@@ -70,7 +58,7 @@ class TestSacctNodeFailState:
 
         final_state = wait_job(c, job_id, timeout=60)
         assert final_state == "NF", f"expected NODE_FAIL, got {final_state}"
-        _wait_node_gone(c, node0)
+        wait_node_gone(c, node0)
 
         row = wait_sacct_row(c, job_id, "JobID,State")
         assert row.split()[1] == "NODE_FAIL", f"sacct displayed {row!r}, not NODE_FAIL"

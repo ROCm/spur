@@ -9,11 +9,14 @@ reconcile loop drives without k0s actually reaching `active`, exactly like
 test_k8s_scheduling). Full k0s convergence is covered on hardware, not in CI.
 """
 
+import logging
 import re
 import time
 from contextlib import contextmanager
 
 import pytest
+
+logger = logging.getLogger(__name__)
 
 STRAY_UNIT = "/run/systemd/system/k0sworker.service"
 INSTALLED_UNIT = "/etc/systemd/system/k0sworker.service"
@@ -28,7 +31,7 @@ def k8s_enabled_cluster(unstarted_cluster):
     try:
         unstarted_cluster.k8s_down(reset=True)
     except Exception:
-        pass
+        logger.warning("k8s_down during teardown failed", exc_info=True)
 
 
 @pytest.fixture

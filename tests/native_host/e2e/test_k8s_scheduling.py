@@ -9,12 +9,15 @@ k0s role, a job submitted through the real CLI -> gRPC -> scheduler path pends
 with the k8s-reserved reason instead of running on that node.
 """
 
+import logging
 import re
 import time
 
 import pytest
 
 from cluster import parse_job_id, job_state, wait_job
+
+logger = logging.getLogger(__name__)
 
 K8S_RESERVED = "Reserved for Kubernetes cluster"
 
@@ -51,7 +54,7 @@ def k8s_enabled_cluster(unstarted_cluster):
     try:
         unstarted_cluster.k8s_down(reset=True)
     except Exception:
-        pass
+        logger.warning("k8s_down during teardown failed", exc_info=True)
 
 
 class TestK8sSchedulingExclusion:

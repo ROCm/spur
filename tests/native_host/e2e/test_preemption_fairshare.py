@@ -102,8 +102,10 @@ def _seed_usage(cluster, user: str, account: str, cpu_seconds: int) -> None:
     the table's (user_name, account, period_start) primary key and update in
     place instead of inserting duplicate rows.
     """
+    # cluster.psql takes a single SQL string with no bind parameters; string
+    # values go through _sql_str.
     cluster.psql(
-        "INSERT INTO usage "
+        "INSERT INTO usage "  # nosec B608
         "(user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count) "
         f"VALUES ('{_sql_str(user)}', '{_sql_str(account)}', "
         f"date_trunc('day', NOW()), NOW(), {cpu_seconds}, 0, 1) "

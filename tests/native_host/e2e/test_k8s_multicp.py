@@ -81,16 +81,7 @@ def _deploy_canary(c: SpurCluster, name: str, replicas: int) -> None:
         "      restartPolicy: Always\n"
         "      terminationGracePeriodSeconds: 0\n"
     )
-    cp_nodes = c.k8s_control_planes()
-    cp_idx = c.node_names.index(cp_nodes[0]) if cp_nodes else 0
-    remote_path = f"/tmp/{name}-deploy.yaml"
-    c.nodes[cp_idx].write_file(remote_path, manifest)
-    out = c.nodes[cp_idx].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for deployment {name} did not succeed:\n{out}"
-    )
+    c.k8s_apply(manifest, f"{name}-deploy", f"deployment {name}")
 
 
 def _wait_deployment_ready(c: SpurCluster, name: str,

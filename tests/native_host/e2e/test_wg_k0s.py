@@ -21,7 +21,8 @@ import re
 
 import pytest
 
-from wg_cluster import WG_IFACE, wait_until
+from cluster import wait_until
+from wg_cluster import WG_IFACE
 
 # An IPv4 dotted-quad, used to filter kubectl output tokens (pod IPs, ClusterIPs,
 # InternalIPs) so a kubectl error string is never mistaken for an address.
@@ -36,14 +37,6 @@ BUSYBOX_IMAGE = "mirror.gcr.io/library/busybox:1.36"
 def _kubectl(c, cp_index: int, args: str) -> str:
     return c.nodes[cp_index].exec_allow_fail(
         f"{c._sudo_prefix()}k0s kubectl {args}"
-    )
-
-
-def _assert_kubectl_applied(out: str, what: str) -> None:
-    """Assert a `kubectl apply` succeeded, tolerant of the created/configured/
-    unchanged variants kubectl prints depending on prior object state."""
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for {what} did not succeed:\n{out}"
     )
 
 
@@ -94,15 +87,7 @@ def _launch_pinned_pod(c, cp_index: int, name: str, node_name: str) -> str:
         "    command: ['sh','-c','sleep 3600']\n"
         "  restartPolicy: Never\n"
     )
-    # Write the manifest to a remote file (SFTP) and apply it. A heredoc piped
-    # through the SSH channel does not survive as real stdin, so the apply would
-    # otherwise get empty input and create nothing.
-    remote_path = f"/tmp/{name}.yaml"
-    c.nodes[cp_index].write_file(remote_path, manifest)
-    out = c.nodes[cp_index].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    _assert_kubectl_applied(out, f"pod {name}")
+    c.k8s_apply(manifest, name, f"pod {name}", node_index=cp_index)
     return name
 
 
@@ -143,12 +128,7 @@ def _launch_httpd_pod(c, cp_index: int, name: str, node_name: str, body: str) ->
         "    ports:\n    - containerPort: 80\n"
         "  restartPolicy: Never\n"
     )
-    remote_path = f"/tmp/{name}.yaml"
-    c.nodes[cp_index].write_file(remote_path, manifest)
-    out = c.nodes[cp_index].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    _assert_kubectl_applied(out, f"httpd pod {name}")
+    c.k8s_apply(manifest, name, f"httpd pod {name}", node_index=cp_index)
     return name
 
 
@@ -164,12 +144,7 @@ def _expose_clusterip(c, cp_index: int, pod: str, svc: str, port: int = 80) -> s
         f"  selector:\n    app: {pod}\n"
         f"  ports:\n  - port: {port}\n    targetPort: {port}\n"
     )
-    remote_path = f"/tmp/{svc}-svc.yaml"
-    c.nodes[cp_index].write_file(remote_path, manifest)
-    out = c.nodes[cp_index].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    _assert_kubectl_applied(out, f"service {svc}")
+    c.k8s_apply(manifest, f"{svc}-svc", f"service {svc}", node_index=cp_index)
 
     def read_cip() -> str:
         cip = _kubectl(c, cp_index,

@@ -137,16 +137,7 @@ def _deploy_canary(c: SpurCluster, name: str, replicas: int) -> None:
         "      restartPolicy: Always\n"
         "      terminationGracePeriodSeconds: 0\n"
     )
-    cp_nodes = c.k8s_control_planes()
-    cp_idx = c.node_names.index(cp_nodes[0]) if cp_nodes else 0
-    remote_path = f"/tmp/{name}-deploy.yaml"
-    c.nodes[cp_idx].write_file(remote_path, manifest)
-    out = c.nodes[cp_idx].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for deployment {name} did not succeed:\n{out}"
-    )
+    c.k8s_apply(manifest, f"{name}-deploy", f"deployment {name}")
 
 
 def _wait_deployment_ready(c: SpurCluster, name: str,
@@ -227,16 +218,7 @@ def _schedule_new_pod(c: SpurCluster, name: str, timeout: int = 180) -> None:
         "    command: ['sh','-c','echo POST_UPGRADE_OK && sleep 30']\n"
         "  restartPolicy: Never\n"
     )
-    cp_nodes = c.k8s_control_planes()
-    cp_idx = c.node_names.index(cp_nodes[0]) if cp_nodes else 0
-    remote_path = f"/tmp/{name}.yaml"
-    c.nodes[cp_idx].write_file(remote_path, manifest)
-    out = c.nodes[cp_idx].exec_allow_fail(
-        f"{c._sudo_prefix()}k0s kubectl apply -f {remote_path} 2>&1"
-    )
-    assert "created" in out or "configured" in out or "unchanged" in out, (
-        f"kubectl apply for pod {name} did not succeed:\n{out}"
-    )
+    c.k8s_apply(manifest, name, f"pod {name}")
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -455,7 +437,7 @@ def k0s_native_cluster(ssh_nodes, remote_bin_dir):
         c.k8s_down(reset=True)
         c.wait_k8s_phase("down", timeout=180)
     except Exception:
-        pass
+        logger.warning("k8s teardown failed; continuing cluster teardown", exc_info=True)
     c.teardown()
     _reset_k0s_all_nodes(c)
 

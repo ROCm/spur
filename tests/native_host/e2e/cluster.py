@@ -13,7 +13,7 @@ import os
 import re
 import shlex
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import time
 import logging
 from pathlib import Path
@@ -68,7 +68,8 @@ def parse_published_port(inspect_output: str) -> int:
 
 def make_remote_dir() -> str:
     """Generate a unique remote working directory path."""
-    return f"/tmp/spur-e2e-{os.getpid()}-{time.time_ns()}"
+    # Lives on the disposable test VMs, unique per run and removed at teardown.
+    return f"/tmp/spur-e2e-{os.getpid()}-{time.time_ns()}"  # nosec B108
 
 
 def deep_merge(base: dict, overrides: dict) -> dict:
@@ -132,10 +133,22 @@ class SshNode:
             self._sftp = self.client.open_sftp()
         return self._sftp
 
-    def _run(self, cmd: str) -> tuple[int, str, str]:
+    def _run(self, cmd: str, timeout: int | None = None) -> tuple[int, str, str]:
         """Run a command via SSH. Returns (exit_code, stdout, stderr). The one
-        place that drives the channel; higher-level helpers shape the result."""
-        _, stdout, stderr = self.client.exec_command(cmd)
+        place that drives the channel; higher-level helpers shape the result.
+
+        With *timeout* (seconds), the channel is closed at the deadline and the
+        exit code is -1, with whatever output arrived until then."""
+        # Running shell commands on the disposable test VMs is the harness's job;
+        # inputs come from harness constants and test fixtures.
+        _, stdout, stderr = self.client.exec_command(cmd)  # nosec B601
+        if timeout is not None:
+            deadline = time.time() + timeout
+            while not stdout.channel.exit_status_ready():
+                if time.time() > deadline:
+                    stdout.channel.close()
+                    return -1, stdout.read().decode(), stderr.read().decode()
+                time.sleep(1)
         exit_code = stdout.channel.recv_exit_status()
         return exit_code, stdout.read().decode(), stderr.read().decode()
 
@@ -154,9 +167,9 @@ class SshNode:
         _, out, err = self._run(cmd)
         return out + err
 
-    def exec_with_exit(self, cmd: str) -> tuple[int, str]:
+    def exec_with_exit(self, cmd: str, timeout: int | None = None) -> tuple[int, str]:
         """Run a command, returning (exit_code, combined stdout+stderr)."""
-        exit_code, out, err = self._run(cmd)
+        exit_code, out, err = self._run(cmd, timeout=timeout)
         return exit_code, out + err
 
     def upload(self, local_path: str, remote_path: str):
@@ -544,9 +557,7 @@ class SpurCluster:
             shlex.quote(f"{self.bin_dir}/sbatch"),
         ]
         cmd_parts.extend(shlex.quote(a) for a in args)
-        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
-        code = stdout.channel.recv_exit_status()
-        return code, stdout.read().decode() + stderr.read().decode()
+        return self.nodes[0].exec_with_exit(" ".join(cmd_parts))
 
     def srun_with_exit(
         self, args: list[str], *, timeout: int | None = None
@@ -560,16 +571,7 @@ class SpurCluster:
         cmd_parts = self._cli_env_assignments()
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
         cmd_parts.extend(shlex.quote(a) for a in args)
-        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
-        if timeout is not None:
-            deadline = time.time() + timeout
-            while not stdout.channel.exit_status_ready():
-                if time.time() > deadline:
-                    stdout.channel.close()
-                    return -1, stdout.read().decode() + stderr.read().decode()
-                time.sleep(1)
-        code = stdout.channel.recv_exit_status()
-        return code, stdout.read().decode() + stderr.read().decode()
+        return self.nodes[0].exec_with_exit(" ".join(cmd_parts), timeout=timeout)
 
     def srun_in_allocation(
         self,
@@ -595,9 +597,7 @@ class SpurCluster:
         if unset_env:
             unset = " ".join(f"-u {shlex.quote(name)}" for name in unset_env)
             cmd = f"env {unset} {cmd}"
-        _, stdout, stderr = self.nodes[0].client.exec_command(cmd)
-        code = stdout.channel.recv_exit_status()
-        return code, stdout.read().decode() + stderr.read().decode()
+        return self.nodes[0].exec_with_exit(cmd)
 
     def salloc_run(
         self,
@@ -623,10 +623,7 @@ class SpurCluster:
         cmd_parts.append(shlex.quote(f"{self.bin_dir}/spur"))
         cmd_parts.append("salloc")
         cmd_parts.extend(shlex.quote(a) for a in (salloc_args or ["-N", "1", "-t", "0:05"]))
-
-        _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
-        code = stdout.channel.recv_exit_status()
-        return code, stdout.read().decode() + stderr.read().decode()
+        return self.nodes[0].exec_with_exit(" ".join(cmd_parts))
 
     def squeue(self, args: list[str]) -> str:
         return self.cli(["squeue"] + args)
@@ -748,6 +745,28 @@ class SpurCluster:
             if line.startswith("members:"):
                 return line.split(":", 1)[1].strip()
         return ""
+
+    def k8s_apply(self, manifest: str, name: str, what: str,
+                  node_index: int | None = None) -> None:
+        """Apply *manifest* with k0s kubectl and assert kubectl accepted it.
+
+        Runs on *node_index*, or on the first control plane by default. The
+        manifest is written under remote_dir, which is unique per cluster, so
+        concurrent runs cannot collide on it. It goes through a file because
+        the sudo prefix may already use stdin for the password (sudo -S)."""
+        if node_index is None:
+            cp_nodes = self.k8s_control_planes()
+            node_index = self.node_names.index(cp_nodes[0]) if cp_nodes else 0
+        node = self.nodes[node_index]
+        manifest_dir = f"{self.remote_dir}/k8s"
+        path = f"{manifest_dir}/{name}.yaml"
+        node.exec(f"mkdir -p '{manifest_dir}'")
+        node.write_file(path, manifest)
+        out = node.exec_allow_fail(f"{self._sudo_prefix()}k0s kubectl apply -f '{path}' 2>&1")
+        # kubectl prints created, configured or unchanged depending on prior state.
+        assert "created" in out or "configured" in out or "unchanged" in out, (
+            f"kubectl apply for {what} did not succeed:\n{out}"
+        )
 
     def k8s_active_controllers(self) -> list[str]:
         """Node names whose `spur k8s status` row is role=controller/single and active."""
@@ -912,23 +931,16 @@ class SpurCluster:
         """Collect diagnostic info for a failed job."""
         lines = [f"=== DEBUG job {job_id} ==="]
 
-        try:
-            lines.append("scontrol show job:")
-            lines.append(self.scontrol("show", "job", str(job_id)))
-        except Exception:
-            pass
-
-        try:
-            lines.append("sinfo:")
-            lines.append(self.sinfo())
-        except Exception:
-            pass
-
-        try:
-            lines.append("squeue:")
-            lines.append(self.squeue_all())
-        except Exception:
-            pass
+        for label, collect in (
+            ("scontrol show job", lambda: self.scontrol("show", "job", str(job_id))),
+            ("sinfo", self.sinfo),
+            ("squeue", self.squeue_all),
+        ):
+            lines.append(f"{label}:")
+            try:
+                lines.append(collect())
+            except Exception as error:
+                lines.append(f"<{label} failed: {error}>")
 
         ctrl_log = f"{self.log_dir}/spurctld.log"
         log = self.nodes[0].exec_allow_fail(f"tail -30 '{ctrl_log}'")
@@ -949,8 +961,8 @@ class SpurCluster:
                 err = self.read_output_on_any_node(match.group(1))
                 if err.strip():
                     lines.append(f"job stderr ({match.group(1)}):\n{err}")
-        except Exception:
-            pass
+        except Exception as error:
+            lines.append(f"<job stderr unavailable: {error}>")
 
         return "\n".join(lines)
 
@@ -1240,16 +1252,11 @@ class SpurCluster:
         self._pkill(self.nodes[0], f"{self.bin_dir}/spurctld", use_sudo=False)
         time.sleep(1)
         self._start_controller()
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            try:
-                nodes = self.sinfo_nodes()
-                if all(n in nodes for n in self.node_names):
-                    return
-            except Exception:
-                pass
-            time.sleep(2)
-        raise TimeoutError("controller did not recover after restart")
+        wait_until(
+            lambda: set(self.node_names) <= self.sinfo_nodes().keys(),
+            timeout_s=60, interval_s=2,
+            desc="controller recovery after restart", tolerate=(Exception,),
+        )
 
     def spurd_agent_user(self, node_index: int = 0) -> str:
         """Return the user owning the spurd process on a node."""
@@ -1286,7 +1293,7 @@ class SpurCluster:
                     f"(apt install squashfs-tools)"
                 )
 
-    def _build_test_rootfs(self, rootfs: Path, extra: str = "") -> None:
+    def build_test_rootfs(self, rootfs: Path, extra: str = "") -> None:
         """
         Populate *rootfs* locally with a minimal userland: host binaries plus
         the libraries ldd reports for them. *extra* is shell appended to the
@@ -1297,7 +1304,7 @@ R='{rootfs}'
 mkdir -p "$R/bin" "$R/usr/bin" "$R/lib" "$R/lib64" \
   "$R/etc" "$R/dev" "$R/proc" "$R/sys" "$R/tmp" \
   "$R/run" "$R/home" "$R/mnt"
-for b in bash cat echo sleep hostname id df env stat ls wc head tail tr touch mkdir getent; do
+for b in bash cat echo sleep hostname id df env stat ls wc head tail tr touch mkdir getent pwd grep awk; do
   src=$(which "$b" 2>/dev/null) || continue
   [ -f "$src" ] && cp "$src" "$R/usr/bin/"
 done
@@ -1322,8 +1329,9 @@ for f in /etc/passwd /etc/group /etc/nsswitch.conf; do
 done
 {extra}
 """
-        result = subprocess.run(
-            ["sh", "-c", build_script],
+        # The script is built from harness constants and pytest tmp paths only.
+        result = subprocess.run(  # nosec B603
+            ["/bin/sh", "-c", build_script],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
@@ -1337,7 +1345,7 @@ done
         remote_path = f"{self.remote_dir}/test-container.sqsh"
         rootfs = tmp_path / "rootfs"
         local_img = tmp_path / "test-container.sqsh"
-        self._build_test_rootfs(
+        self.build_test_rootfs(
             rootfs,
             extra=f"""mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1""",
         )
@@ -1375,7 +1383,7 @@ done
         rootfs = tmp_path / "import-rootfs"
         local_tar = tmp_path / "import-rootfs.tar.gz"
         payload = f"{self.IMAGE_ONLY_BIN_DIR}/{self.IMAGE_PAYLOAD}"
-        self._build_test_rootfs(rootfs, extra=f"""
+        self.build_test_rootfs(rootfs, extra=f"""
 mkdir -p "$R{self.IMAGE_ONLY_BIN_DIR}"
 cp "$R/usr/bin/echo" "$R{payload}"
 tar -C "$R" -czf '{local_tar}' .
@@ -1762,18 +1770,19 @@ tar -C "$R" -czf '{local_tar}' .
     def wait_ready(self, timeout: int = 120):
         """Poll sinfo until all provisioned nodes appear idle."""
         deadline = time.time() + timeout
+        last_error = None
         while time.time() < deadline:
             try:
                 if self._cluster_is_ready():
                     return
-            except Exception:
-                pass
+            except Exception as error:
+                last_error = error
             time.sleep(2)
         raise TimeoutError(
             f"Cluster not ready after {timeout}s. "
             f"Expected {len(self.node_names)} idle nodes.\n"
             f"sinfo output:\n{self.sinfo()}"
-        )
+        ) from last_error
 
     def _cluster_is_ready(self) -> bool:
         states = self.sinfo_nodes()
@@ -1832,6 +1841,49 @@ def job_state(squeue_output: str, job_id: int) -> str | None:
         state = _TRUNCATED_STATE_CODES.get(fields[state_index], fields[state_index])
         return state if state in _JOB_STATE_CODES else None
     return None
+
+
+def wait_until(predicate, timeout_s: int, interval_s: int = 3,
+               desc: str = "condition",
+               tolerate: tuple[type[Exception], ...] = ()):
+    """Poll *predicate* until it returns a truthy value, and return that value.
+
+    Exceptions of a *tolerate* type count as "not yet", e.g. a CLI call while
+    the controller restarts. The last one is chained to the TimeoutError so a
+    timeout still says why the condition never held."""
+    deadline = time.time() + timeout_s
+    last_error = None
+    while time.time() < deadline:
+        try:
+            result = predicate()
+            if result:
+                return result
+        except tolerate as error:
+            last_error = error
+        time.sleep(interval_s)
+    raise TimeoutError(f"timed out after {timeout_s}s waiting for: {desc}") from last_error
+
+
+def wait_node_state(cluster: "SpurCluster", node_name: str, target_states,
+                    timeout: int = 60) -> str:
+    """Poll sinfo until *node_name* reaches a state starting with one of
+    *target_states*, and return that state."""
+    def reached():
+        state = cluster.sinfo_nodes().get(node_name)
+        if state is not None and state.startswith(tuple(target_states)):
+            return state
+        return None
+
+    return wait_until(reached, timeout_s=timeout, interval_s=2,
+                      desc=f"node {node_name} reaching {target_states}",
+                      tolerate=(Exception,))
+
+
+def wait_node_gone(cluster: "SpurCluster", node_name: str, timeout: int = 60) -> None:
+    """Poll sinfo until *node_name* no longer appears."""
+    wait_until(lambda: node_name not in cluster.sinfo_nodes(),
+               timeout_s=timeout, interval_s=2,
+               desc=f"node {node_name} disappearing", tolerate=(Exception,))
 
 
 def retry_until_qos_ready(submit, timeout: int = 15) -> str:

@@ -7,18 +7,21 @@ E2E tests for node admission.
 
 import time
 
+from cluster import wait_until
+
 
 def _wait_registered(cluster, timeout=30):
     """Poll sinfo until all nodes appear (positive assertion with early exit)."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            nodes = cluster.sinfo_nodes()
-            if all(name in nodes for name in cluster.node_names):
-                return nodes
-        except Exception:
-            pass
-        time.sleep(2)
+    def registered():
+        nodes = cluster.sinfo_nodes()
+        return nodes if all(name in nodes for name in cluster.node_names) else None
+
+    try:
+        return wait_until(registered, timeout_s=timeout, interval_s=2,
+                          desc="all nodes registering", tolerate=(Exception,))
+    except TimeoutError:
+        # Fall through so the assertion below names the missing node.
+        pass
     nodes = cluster.sinfo_nodes()
     for name in cluster.node_names:
         assert name in nodes, f"node {name} not registered within {timeout}s"
