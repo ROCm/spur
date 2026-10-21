@@ -1844,9 +1844,9 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
             "exclusivetopo" => bail!("ExclusiveTopo is not supported"),
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-            | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
-            | "lln" | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults"
-            | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
+            | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser" | "lln"
+            | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults" | "defmempernode"
+            | "maxmempernode" | "qos" | "tres" => {}
             _ => bail!("scontrol update: update of this parameter is not supported: '{param}'"),
         }
     }

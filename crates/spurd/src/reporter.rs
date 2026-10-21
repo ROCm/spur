@@ -597,14 +597,21 @@ fn bdf_anchor(stable_id: u64) -> u64 {
 
 pub fn mark_fabric_unavailable(resources: &mut ResourceSet) {
     for gpu in &mut resources.gpus {
-        if let Some(fabric) = gpu.topology.as_mut().and_then(|t| t.fabric.as_mut()) {
-            *fabric = spur_devices::topology::FabricObservation::unavailable(
-                &fabric.source,
-                "device",
-                spur_devices::topology::ObservationIssueKind::Unavailable,
-            );
-        }
+        mark_gpu_fabric_unavailable(gpu);
     }
+}
+
+fn mark_gpu_fabric_unavailable(gpu: &mut GpuResource) {
+    let topology = gpu.topology.get_or_insert_with(Default::default);
+    let source = topology
+        .fabric
+        .as_ref()
+        .map_or("device-discovery", |fabric| fabric.source.as_str());
+    topology.fabric = Some(spur_devices::topology::FabricObservation::unavailable(
+        source,
+        "device",
+        spur_devices::topology::ObservationIssueKind::Unavailable,
+    ));
 }
 
 /// Converge only the free pool without ever advertising silicon a job holds.
@@ -644,19 +651,10 @@ pub fn reconcile_free_pool(
         if let Some(gpu) = baseline.gpus.iter().find(|g| g.stable_id == id) {
             let mut pinned = gpu.clone();
             // Accounting keeps the held identity; observations describe the current device.
-            pinned.topology = match fresh.gpus.iter().find(|g| g.stable_id == id) {
-                Some(current) => current.topology.clone(),
-                None => gpu.topology.clone().map(|mut topology| {
-                    if let Some(fabric) = &mut topology.fabric {
-                        *fabric = spur_devices::topology::FabricObservation::unavailable(
-                            &fabric.source,
-                            "device",
-                            spur_devices::topology::ObservationIssueKind::Unavailable,
-                        );
-                    }
-                    topology
-                }),
-            };
+            match fresh.gpus.iter().find(|g| g.stable_id == id) {
+                Some(current) => pinned.topology = current.topology.clone(),
+                None => mark_gpu_fabric_unavailable(&mut pinned),
+            }
             reconciled.gpus.push(pinned);
         }
     }
@@ -1040,6 +1038,167 @@ mod tests {
         let previous = unavailable.clone();
         mark_fabric_unavailable(&mut unavailable);
         assert_eq!(previous, unavailable);
+    }
+
+    fn declaration_only_node(
+        with_topology: bool,
+    ) -> (spur_core::block_file::BlockFile, spur_core::node::Node) {
+        let file = spur_core::block_file::BlockFile::parse("BlockName=a Nodes=n0").unwrap();
+        let mut inventory = ResourceSet {
+            cpus: 8,
+            memory_mb: 1024,
+            generation: 7,
+            fabric_binding_version: 2,
+            block_file_revision: Some(file.revision.clone()),
+            gpus: vec![gpu(0, 256), gpu(1, 512)],
+            ..Default::default()
+        };
+        if with_topology {
+            for gpu in &mut inventory.gpus {
+                gpu.topology = Some(spur_core::resource::DeviceTopology {
+                    numa_node: Some(1),
+                    ..Default::default()
+                });
+            }
+        }
+        let mut node = spur_core::node::Node::new("n0".into(), inventory);
+        node.state = spur_core::node::NodeState::Idle;
+        node.last_heartbeat = Some("2023-11-14T22:13:20Z".parse().unwrap());
+        (file, node)
+    }
+
+    fn declaration_only_view(
+        file: &spur_core::block_file::BlockFile,
+        node: &spur_core::node::Node,
+    ) -> spur_core::fabric::FabricView {
+        file.view(
+            "test",
+            std::slice::from_ref(node),
+            node.last_heartbeat.unwrap(),
+            90,
+            true,
+        )
+    }
+
+    #[test]
+    fn declaration_only_full_dropout_invalidates_every_retained_gpu() {
+        for with_topology in [false, true] {
+            let (file, mut node) = declaration_only_node(with_topology);
+            assert!(declaration_only_view(&file, &node).blocks[0]
+                .issues
+                .is_empty());
+            let baseline = node.total_resources.clone();
+            let mut unavailable = baseline.clone();
+            unavailable.generation += 1;
+            mark_fabric_unavailable(&mut unavailable);
+            assert_eq!(
+                classify(&baseline, &unavailable, &Default::default()),
+                InventoryDelta::FreeCapacityChanged
+            );
+            assert_eq!(
+                unavailable
+                    .gpus
+                    .iter()
+                    .map(|g| g.stable_id)
+                    .collect::<Vec<_>>(),
+                [256, 512]
+            );
+            assert_eq!((unavailable.cpus, unavailable.memory_mb), (8, 1024));
+            for gpu in &unavailable.gpus {
+                let topology = gpu.topology.as_ref().unwrap();
+                assert_eq!(
+                    topology.fabric.as_ref().unwrap().status,
+                    spur_devices::topology::ObservationStatus::Unavailable
+                );
+                assert_eq!(topology.numa_node, with_topology.then_some(1));
+            }
+            let fp = unavailable.schedulable_fingerprint();
+            let delta = classify(&baseline, &unavailable, &Default::default());
+            assert_eq!(
+                next_refresh_action(&delta, &fp, &delta, &fp).0,
+                RefreshAction::ApplyCapacity
+            );
+            let repeated = unavailable.clone();
+            mark_fabric_unavailable(&mut unavailable);
+            assert_eq!(repeated, unavailable);
+            node.total_resources = unavailable;
+            assert!(!declaration_only_view(&file, &node).blocks[0]
+                .issues
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn declaration_only_partial_loss_keeps_accounting_but_invalidates_missing_held_gpu() {
+        for with_topology in [false, true] {
+            let (file, mut node) = declaration_only_node(with_topology);
+            let view = declaration_only_view(&file, &node);
+            let baseline = node.total_resources.clone();
+            let allocation = spur_core::resource::ResourceAllocations {
+                generation: baseline.generation,
+                devices: [(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(256)],
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let binding = spur_core::fabric_binding::FabricBinding::for_allocation(
+                &view.blocks[0],
+                "n0",
+                &allocation,
+            )
+            .unwrap();
+            binding
+                .validate("test", "n0", &baseline, &allocation)
+                .unwrap();
+            let held = [256].into_iter().collect();
+            let mut fresh = baseline.clone();
+            fresh.gpus.retain(|g| g.stable_id != 256);
+            assert_eq!(
+                classify(&baseline, &fresh, &held),
+                InventoryDelta::AllocatedDevicesLost
+            );
+            let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
+            assert_ne!(
+                reconciled.schedulable_fingerprint(),
+                baseline.schedulable_fingerprint()
+            );
+            assert_eq!(reconciled.gpus.len(), 2);
+            assert_eq!(
+                reconciled.gpus.iter().find(|g| g.stable_id == 512),
+                baseline.gpus.iter().find(|g| g.stable_id == 512)
+            );
+            let missing = reconciled.gpus.iter().find(|g| g.stable_id == 256).unwrap();
+            assert_eq!(
+                missing
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .fabric
+                    .as_ref()
+                    .unwrap()
+                    .status,
+                spur_devices::topology::ObservationStatus::Unavailable
+            );
+            assert!(binding
+                .validate("test", "n0", &reconciled, &allocation)
+                .is_err());
+            node.total_resources = reconciled;
+            assert!(!declaration_only_view(&file, &node).blocks[0]
+                .issues
+                .is_empty());
+            let repeated = reconcile_free_pool(&fresh, &node.total_resources, &held);
+            assert_eq!(
+                repeated.schedulable_fingerprint(),
+                node.total_resources.schedulable_fingerprint()
+            );
+            let recovered = reconcile_free_pool(&baseline, &node.total_resources, &held);
+            assert_eq!(
+                recovered.schedulable_fingerprint(),
+                baseline.schedulable_fingerprint()
+            );
+        }
     }
 
     #[test]
@@ -1720,22 +1879,23 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_of_a_held_repartition_equals_baseline_fingerprint() {
+    fn reconcile_of_a_held_repartition_stabilizes_after_unavailable_update() {
         use std::collections::HashSet;
-        // Oscillation guard: while a held device (BDF 5) stays held, every fresh
-        // scan that only repartitions its silicon reconciles to the SAME
-        // schedulable set as the baseline. The refresh loop compares fingerprints
-        // and skips the re-register/warn, so repeated ReportLost ticks register at
-        // most once (here: zero, the set is unchanged).
+        // Repeated scans must not re-register an already-unavailable held device.
         let baseline = rset(8, 1, vec![gpu(0, sid(5, 0)), gpu(1, sid(7, 0))]);
         // The held render node vanished, replaced by a CPX slice sid(5,1).
         let fresh = rset(8, 2, vec![gpu(0, sid(5, 1)), gpu(1, sid(7, 0))]);
         let held: HashSet<u64> = [sid(5, 0)].into_iter().collect();
 
         let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
-        assert_eq!(
+        assert_ne!(
             reconciled.schedulable_fingerprint(),
             baseline.schedulable_fingerprint()
+        );
+        let repeated = reconcile_free_pool(&fresh, &reconciled, &held);
+        assert_eq!(
+            repeated.schedulable_fingerprint(),
+            reconciled.schedulable_fingerprint()
         );
     }
 
