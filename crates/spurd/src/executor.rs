@@ -2178,8 +2178,22 @@ fn spool_dir_error(
                 .position(|(dir, _)| is_node_owned_spool(dir, root))
         })
         .unwrap_or(0);
-    let (dir, err) = failures.swap_remove(chosen);
-    let err = anyhow::Error::new(err).context(format!("create job spool dir {}", dir.display()));
+    // Every candidate is named, because the one that decides the classification is
+    // often not the one that blocked: a stray file at the temp fallback reads as a
+    // permission failure on the node-owned root, which sends the reader to the wrong
+    // path entirely.
+    let (dir, err) = failures.remove(chosen);
+    // The chosen candidate goes last and without its errno: its error is the source,
+    // which a `{:#}` render appends right after it.
+    let attempts = failures
+        .iter()
+        .map(|(dir, err)| format!("{}: {err}; ", dir.display()))
+        .collect::<String>();
+    let err = anyhow::Error::new(err).context(format!(
+        "create job spool dir, tried {} candidates: {attempts}{}",
+        failures.len() + 1,
+        dir.display()
+    ));
     classify_spool_error(&dir, owned_root.unwrap_or(&dir), err)
 }
 
@@ -3170,6 +3184,44 @@ mod tests {
         assert!(
             !is_node_fault_io_error(&flattened),
             "an errno in the message text must not be mistaken for a real source"
+        );
+    }
+
+    #[test]
+    fn every_failed_spool_candidate_is_named() {
+        // The candidate that decides the classification is often not the one that
+        // blocked. A stray file at the temp fallback reads as ENOTDIR there while the
+        // owned root reports EACCES, and naming only the owned root sends the reader
+        // to a path that is merely unwritable-by-design on a rootless agent.
+        let err = spool_dir_error(
+            vec![
+                (
+                    owned_spool(),
+                    std::io::Error::from_raw_os_error(libc::EACCES),
+                ),
+                (
+                    fallback_spool(),
+                    std::io::Error::from_raw_os_error(libc::ENOTDIR),
+                ),
+            ],
+            Some(Path::new(SPOOL_ROOT)),
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&owned_spool().display().to_string()),
+            "the owned root must still be named, got: {text}"
+        );
+        assert!(
+            text.contains(&fallback_spool().display().to_string()),
+            "the fallback that actually blocked must be named too, got: {text}"
+        );
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+        let enotdir = std::io::Error::from_raw_os_error(libc::ENOTDIR).to_string();
+        assert!(
+            text.contains(&format!("{}: {enotdir}", fallback_spool().display()))
+                && text.ends_with(&format!("{}: {eacces}", owned_spool().display()))
+                && text.matches(&eacces).count() == 1,
+            "each candidate must carry its own errno once, got: {text}"
         );
     }
 
