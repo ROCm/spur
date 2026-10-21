@@ -30,11 +30,7 @@ on:
     workflows: ["CI"]
     types: [completed]
 
-permissions:
-  statuses: write
-  actions: read
-  contents: read
-  pull-requests: read
+permissions: {}
 
 # Serialize (not cancel) overlapping E2E evaluations for the same branch: native-host/k8s
 # provision real VMs, so cancelling mid-flight risks orphaning them if cleanup steps don't
@@ -58,6 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           sparse-checkout: .github/workflows/e2e.yml
           sparse-checkout-cone-mode: false
 
@@ -142,9 +139,13 @@ jobs:
     needs: mark-skipped
     runs-on: ubuntu-latest
     if: github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
+    permissions:
+      statuses: write
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           sparse-checkout: .github/workflows/e2e.yml
           sparse-checkout-cone-mode: false
 
@@ -175,6 +176,9 @@ jobs:
     runs-on: [self-hosted, spur-e2e, "${{ matrix.pool }}"]
     needs: mark-skipped
     if: github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -393,6 +397,9 @@ jobs:
     runs-on: [self-hosted, spur-e2e, non-gpu]
     needs: mark-skipped
     if: github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
+    permissions:
+      contents: read
+      actions: read
     env:
       SSH_OPTS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
       RUN_DIR: /tmp/spur-e2e-${{ github.run_id }}-k8s
@@ -584,6 +591,8 @@ jobs:
     needs: [native-host, mark-running, mark-skipped]
     if: always() && github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
     runs-on: ubuntu-latest
+    permissions:
+      statuses: write
     env:
       STATUS_CONTEXT: "E2E / native-host"
     steps:
@@ -613,6 +622,8 @@ jobs:
     needs: [k8s, mark-running, mark-skipped]
     if: always() && github.event.workflow_run.conclusion == 'success' && needs.mark-skipped.outputs.draft-skip != 'true'
     runs-on: ubuntu-latest
+    permissions:
+      statuses: write
     env:
       STATUS_CONTEXT: "E2E / k8s"
     steps:
