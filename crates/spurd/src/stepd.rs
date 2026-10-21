@@ -3144,6 +3144,56 @@ fn verify_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Write `name` into `dir` so a reader sees either the previous record or the
+/// whole new one: a torn record on the recovery path reads as corruption.
+pub fn publish_private(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
+    let temporary_path = dir.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temporary = options.open(&temporary_path)?;
+    let write_result = temporary
+        .write_all(contents)
+        .and_then(|()| temporary.sync_all());
+    drop(temporary);
+    // A failure past this point still owns a temp file nobody else created;
+    // a retry loop must not compound it into an unbounded pile of stragglers.
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary_path, dir.join(name)) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    #[cfg(test)]
+    if FAIL_PUBLICATION_SYNC.with(|fail| fail.get()) {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_PUBLICATION_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_failed_publication_sync<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FAIL_PUBLICATION_SYNC.with(|fail| fail.set(self.0));
+        }
+    }
+    let _restore = Restore(FAIL_PUBLICATION_SYNC.with(|fail| fail.replace(true)));
+    body()
+}
+
 pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let (_, fields) = stat

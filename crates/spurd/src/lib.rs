@@ -7,6 +7,7 @@
 //! a runtime isolation boundary; this crate isn't split further, so
 //! spur-stepd still depends on (without invoking) that surface at link time.
 
+pub mod admission;
 pub mod agent_server;
 pub mod auth_middleware;
 pub mod cluster;
