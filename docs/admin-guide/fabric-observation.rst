@@ -107,8 +107,7 @@ Controller block inspection
 ---------------------------
 
 The controller assembles blocks from explicit GPU membership on each query. Node
-ordering, rack size, and the legacy ``topology.plugin = "block"`` setting do not
-create fabric membership. A block key consists of the cluster namespace,
+ordering and rack size do not create fabric membership. A block key consists of the cluster namespace,
 physical domain, and fabric domain. Members retain node names, stable logical
 GPU IDs, physical endpoint IDs, and inventory generations.
 
@@ -147,6 +146,53 @@ reserve resources, or freeze a fabric configuration. Automatic discovery remains
 the default; no administrator-generated intermediate file is required. Installing an optional whole-node definition file is a separate operation,
 described below.
 
+Discovery in block and tree topology
+------------------------------------
+
+Automatic discovery supplies groups to Spur's existing block/tree node topology.
+It does not introduce another topology plugin. To use discovered vPods as blocks:
+
+.. code-block:: toml
+
+   [topology]
+   plugin = "block"
+
+No intermediate file or ``block_size`` is needed. For example, one rack system
+with vPod 15 containing nodes 0/2 and vPod 16 containing nodes 1/3 becomes two
+leaves in the existing topology model. Node names and registration order do not
+change those groups. The optional block file supplies leaves through the same
+path, including vendor-neutral declarations without native observations.
+
+The controller rebuilds the model each scheduling cycle, so node registration,
+membership refresh, and configuration reload update locality without a restart.
+Only consistent whole-node membership becomes a leaf. Nodes with GPUs in several
+blocks or with incomplete/invalid membership have no inferred leaf; they remain
+eligible for ordinary scheduling. Unknown nodes are not grouped together as if
+they shared a block. GPU-level containment still supports exact device membership
+independently of this node-level projection.
+
+``plugin = "tree"`` also accepts these flat leaves when no explicit switches are
+configured. Observations do not establish links between vPods, so the controller
+does not invent parent switches, distances, or bandwidth. An explicit
+``[[topology.switches]]`` hierarchy retains precedence in tree mode. Existing
+block configurations without any native/file membership source retain grouping
+by ``block_size`` (18 by default). An invalid or unavailable membership source
+does not fall back to groups inferred from node count. ``plugin = "none"``
+disables the locality model.
+
+The existing submission options request locality using this model:
+
+.. code-block:: console
+
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --topology block --wrap 'hostname'
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --topology tree --wrap 'hostname'
+
+Both options prefer nearby nodes and permit crossing leaves when needed; neither
+is a hard single-vPod requirement. ``--topology none`` skips the locality hint.
+Omitting the option retains ordinary resource ordering. To require containment,
+also configure the partition policy below and select that partition. All three
+option values obey that policy; a locality option cannot relax it.
+
 Single-block placement policy
 -----------------------------
 
@@ -160,7 +206,10 @@ the controller's existing TOML configuration, using existing partition names:
    [topology.external]
    single_block_partitions = ["rack"]
 
-The controller reads this policy and rebuilds membership on each scheduling
+This is a placement constraint on the discovered or declared blocks, separate
+from a locality preference. It is not a new topology plugin and does not require
+a new job option. It can be combined with ``[topology] plugin = "block"`` or
+``"tree"``. The controller reads this policy and rebuilds membership on each scheduling
 cycle. Reconfiguration updates the policy without rebuilding a fixed rack list.
 ``topology show`` includes ``SingleBlockPartitions``. A GPU job requesting any
 listed partition, including one in a comma-separated partition list, must bind

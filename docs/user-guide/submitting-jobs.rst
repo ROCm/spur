@@ -187,6 +187,10 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--exclusive``
      -
      - Do not share allocated nodes with other jobs. Default off.
+   * - ``--topology``
+     -
+     - Prefer locality with ``block`` or ``tree``; ``none`` skips the hint.
+       The partition's single-block requirement still applies.
    * - ``--hold``
      - ``-H``
      - Submit the job held; it will not start until released. Default off.
@@ -222,6 +226,29 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Block until the job terminates; exit code reflects the job outcome.
        Works with ``--parsable`` (ID printed at submission, then blocks).
        Also accepted as an ``#SBATCH --wait`` directive in scripts.
+
+Topology Locality and Block Containment
+---------------------------------------
+
+When the administrator enables block topology, automatically discovered vPods
+or administrator-declared node groups supply the existing topology model.
+``--topology block`` and ``--topology tree`` use the configured model to prefer
+nearby nodes. These options permit allocations across blocks when needed.
+
+To require all allocated GPUs inside one block, select a partition configured
+with the single-block policy. For example, if ``rack`` has that policy and
+``gpu`` uses ordinary scheduling:
+
+.. code-block:: bash
+
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --topology block train.sh
+   spur submit -p rack -N 2 -n 2 --gpus 6 train.sh
+
+The first job requests a locality preference. The second requires containment
+and stays pending if no single block can fit it. ``--topology none`` cannot
+disable a partition's containment policy. Omitting ``-p`` uses the default
+partition and its policy. Partition names have no built-in topology meaning.
+See :doc:`/admin-guide/fabric-observation` for configuration and inspection.
 
 .. _submit-export:
 

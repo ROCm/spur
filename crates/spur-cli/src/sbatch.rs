@@ -165,7 +165,7 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "spread_job")]
     pub spread_job: bool,
 
-    /// Topology-aware scheduling: "tree" (minimize switch hops) or "block" (keep within rack)
+    /// Prefer topology locality (tree/block); none skips the hint. Partition containment still applies.
     #[arg(long, overrides_with = "topology")]
     pub topology: Option<String>,
 

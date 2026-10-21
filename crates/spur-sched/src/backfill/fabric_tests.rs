@@ -111,6 +111,11 @@ fn run_with_view(
         view,
         single_block_partitions: vec!["rack".into()],
     };
+    let topology = spur_core::topology::TopologyConfig {
+        plugin: "block".into(),
+        ..Default::default()
+    }
+    .build(nodes, &context.view);
     let busy: HashMap<_, _> = nodes
         .iter()
         .filter(|node| node.alloc_resources.has_devices())
@@ -120,13 +125,86 @@ fn run_with_view(
         nodes,
         partitions: &partitions,
         reservations: &[],
-        topology: None,
+        topology: topology.as_ref(),
         fabric: enforce.then_some(&context),
         busy_until: &busy,
     };
     let mut scheduler = BackfillScheduler::new(100);
     let assignments = scheduler.schedule_jobs(jobs, &cluster, now(), true);
     (scheduler, assignments)
+}
+
+#[test]
+fn discovered_blocks_drive_existing_locality_flags_without_partition_policy() {
+    let mut nodes = nodes(4);
+    nodes[1].name = "n2".into();
+    nodes[2].name = "n1".into();
+    for node in &mut nodes {
+        node.weight = match node.name.as_str() {
+            "n0" => 40,
+            "n1" => 30,
+            "n2" => 20,
+            _ => 10,
+        };
+    }
+    for hint in ["block", "tree", "none"] {
+        let mut request = job(1, 2, 3);
+        request.spec.topology = Some(hint.into());
+        let (_, assignments) = run_with_policy(&nodes, &[request], false);
+        assert_eq!(assignments.len(), 1, "{hint}");
+        let expected = if hint == "none" {
+            vec!["n0", "n1"]
+        } else {
+            vec!["n0", "n2"]
+        };
+        assert_eq!(assignments[0].nodes, expected, "{hint}");
+        assert!(assignments[0]
+            .per_node_alloc
+            .values()
+            .all(|alloc| alloc.fabric_binding.is_none()));
+    }
+}
+
+#[test]
+fn locality_flags_allow_spanning_but_cannot_override_single_block_policy() {
+    let nodes = nodes(4);
+    for hint in ["block", "tree", "none"] {
+        let mut request = job(1, 4, 6);
+        request.spec.topology = Some(hint.into());
+        assert_eq!(
+            run_with_policy(&nodes, &[request.clone()], false).1.len(),
+            1,
+            "{hint}"
+        );
+        assert!(run(&nodes, &[request]).1.is_empty(), "{hint}");
+    }
+}
+
+#[test]
+fn live_membership_rebuild_changes_locality_selection() {
+    let mut nodes = nodes(4);
+    let mut request = job(1, 2, 3);
+    request.spec.topology = Some("block".into());
+    let before = run_with_policy(&nodes, &[request.clone()], false).1;
+    assert_eq!(
+        before[0]
+            .nodes
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["n0".into(), "n1".into()].into()
+    );
+    nodes[1].name = "n2".into();
+    nodes[2].name = "n1".into();
+    let after = run_with_policy(&nodes, &[request], false).1;
+    assert_eq!(
+        after[0]
+            .nodes
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["n0".into(), "n2".into()].into()
+    );
 }
 
 #[test]

@@ -222,39 +222,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
     let mut scheduler = BackfillScheduler::new(max_jobs);
 
-    // Build topology tree from config (if configured)
-    let topology = startup_config.topology.as_ref().and_then(|topo_config| {
-        use spur_core::topology::TopologyTree;
-        match topo_config.plugin.as_str() {
-            "tree" => {
-                let tree = TopologyTree::from_switches(&topo_config.switches);
-                info!(
-                    switches = tree.switches.len(),
-                    nodes = tree.node_switch.len(),
-                    "topology/tree loaded"
-                );
-                Some(tree)
-            }
-            "block" => {
-                let block_size = topo_config.block_size.unwrap_or(18);
-                let all_nodes = cluster.get_nodes();
-                let node_names: Vec<String> = all_nodes.iter().map(|n| n.name.clone()).collect();
-                let tree = TopologyTree::from_blocks(&node_names, block_size);
-                info!(
-                    blocks = tree.switches.len(),
-                    block_size, "topology/block loaded"
-                );
-                Some(tree)
-            }
-            _ => None,
-        }
-    });
-
     info!(
         interval_secs,
         max_jobs,
         plugin = scheduler.name(),
-        topology = topology.is_some(),
+        topology = startup_config
+            .topology
+            .as_ref()
+            .map(|config| config.plugin.as_str()),
         "scheduler loop started (event-driven wake enabled)"
     );
 
@@ -388,15 +363,28 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let cycle_start = Instant::now();
 
         let busy_until = running_jobs_busy_until(&cluster);
-        let fabric = cluster
-            .config()
+        let config = cluster.config();
+        let view = config
+            .topology
+            .as_ref()
+            .map(|_| cluster.fabric_view(chrono::Utc::now()));
+        let topology = config
+            .topology
+            .as_ref()
+            .zip(view.as_ref())
+            // Dispatch cooldown must not shift the boundaries of fixed-size blocks.
+            .and_then(|(config, view)| config.build(&cluster.get_nodes(), view));
+        let fabric = config
             .topology
             .as_ref()
             .and_then(|topology| topology.external.as_ref())
-            .map(|external| spur_sched::traits::FabricSchedulingContext {
-                view: cluster.fabric_view(chrono::Utc::now()),
-                single_block_partitions: external.single_block_partitions.clone(),
-            });
+            .zip(view)
+            .map(
+                |(external, view)| spur_sched::traits::FabricSchedulingContext {
+                    view,
+                    single_block_partitions: external.single_block_partitions.clone(),
+                },
+            );
         let cluster_state = ClusterState {
             fabric: fabric.as_ref(),
             nodes: &nodes,
