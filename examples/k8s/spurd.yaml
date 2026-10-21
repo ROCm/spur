@@ -23,7 +23,7 @@ spec:
       hostPID: true
       containers:
         - name: spurd
-          image: spur:latest
+          image: rocm/spur:0.15.0 # x-release-please-version
           command: [spurd]
           args:
             - --controller=spurctld.spur.svc.cluster.local:6817
