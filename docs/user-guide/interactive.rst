@@ -209,6 +209,12 @@ comes back after it is still told the step is unknown. A session that nothing
 can ever settle — one whose supervisor was killed before it recorded an exit —
 is kept for a day and then swept.
 
+If an interactive terminal's command exits before the agent takes its pty
+master, the supervisor keeps serving for up to ten seconds so the agent can
+finish attaching. Taking the master or requesting teardown ends this grace
+early; the supervisor records the exit after the grace ends. This is separate
+from the ten-minute retention of a finished step's recorded result.
+
 One case is not covered: a step given its own ``--container-image``. It ends
 when the agent stops, and leaves its unpacked rootfs behind. A standalone
 ``srun --pty`` that allocates its own job loses the job as well: ``srun``

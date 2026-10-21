@@ -903,8 +903,8 @@ pub struct StepdDescriptor {
     pub step_id: spur_core::step::StepId,
     pub pid: u32,
     pub process_start_ticks: u64,
-    /// The agent that claimed the session, published before the supervisor
-    /// exists so the gap before it publishes itself does not read as unowned.
+    /// Proves ownership while the launcher is live but the child has not bound
+    /// runtime.sock yet; a socket probe cannot protect that pre-bind interval.
     #[serde(default)]
     pub launcher_pid: u32,
     #[serde(default)]
@@ -2665,8 +2665,8 @@ impl StepdStore {
         step_id: spur_core::step::StepId,
     ) -> io::Result<()> {
         let owned = format!("{job_id}.{run_attempt}.{step_id} is already owned");
-        // Only a descriptor's absence proves nobody owns the session: one this
-        // build cannot read may belong to a supervisor that is still running.
+        // An unreadable descriptor may belong to a live supervisor from another
+        // version, so reclaim requires both descriptor and socket checks.
         match self.load_descriptor(session_dir) {
             Ok(existing) if !matches!(stepd_liveness(&existing), Ok(StepdLiveness::Stale)) => {
                 return Err(session_conflict(owned));

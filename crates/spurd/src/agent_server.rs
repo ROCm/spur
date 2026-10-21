@@ -803,8 +803,8 @@ fn unreported_durable_exit(
         .unwrap_or(false)
 }
 
-/// Whether the session directory belongs to a supervisor this launch has no claim
-/// to delete: another live one, or any whose socket is still being served.
+/// Protects another supervisor's descriptor, or a served socket when no
+/// supervisor descriptor is available to establish ownership.
 fn session_dir_has_live_owner(
     store: &crate::stepd::StepdStore,
     session_dir: &std::path::Path,
@@ -3976,21 +3976,15 @@ impl AgentService {
         pmix: Option<crate::stepd::StepdPmix>,
         container_rootfs_mode: Option<crate::container::RootfsMode>,
         step_files: crate::executor::StepOutputFiles,
-        step_key: (u32, u32),
+        admission: StepLaunchAdmission,
         persist_cred: (String, String, String),
     ) -> Result<Option<std::process::ExitStatus>, Status> {
-        let (job_id, step_id) = step_key;
+        let (job_id, _, step_id) = *admission.key();
         let run_attempt = cfg.run_attempt;
+        let step_key = (job_id, step_id);
         // The supervisor opens the spool files itself from the launch spec;
         // holding our own copies would pin the fds for the life of the step.
         drop(step_files);
-
-        let admission = self.admit_step_launch(job_id, run_attempt, step_id).await;
-        if runtime_attempt_already_tracked(&self.stepds, job_id, step_id, run_attempt).await {
-            return Err(Status::already_exists(format!(
-                "step {step_id} of job {job_id} attempt {run_attempt} is already running"
-            )));
-        }
 
         fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
             .await
@@ -6863,6 +6857,9 @@ impl SlurmAgent for AgentService {
             .get(&job_id)
             .map(|tracked| tracked.run_attempt)
             .unwrap_or_default();
+        let admission = self
+            .admit_step_launch(job_id, step_run_attempt, step_id)
+            .await;
 
         // Idempotent retry: if the same step already ran (or is still running)
         // for this run_attempt, return its result instead of relaunching.
@@ -6925,6 +6922,7 @@ impl SlurmAgent for AgentService {
                         step_run_attempt,
                         "step still running; joining existing supervisor"
                     );
+                    drop(admission);
                     return match waiter.await {
                         Ok(outcome) => Ok(Response::new(
                             awaited_step_response(
@@ -7023,6 +7021,11 @@ impl SlurmAgent for AgentService {
                 tracked.run_attempt,
             )
         };
+        if job_attempt != step_run_attempt {
+            return Err(Status::aborted(
+                "job attempt changed while admitting the step",
+            ));
+        }
 
         let job_nodelist = nodelist;
         let step_nodelist = if req.nodelist.trim().is_empty() {
@@ -7500,7 +7503,7 @@ impl SlurmAgent for AgentService {
                 supervised_pmix.take(),
                 supervised_rootfs_mode,
                 step_files,
-                step_key,
+                admission,
                 persist_cred,
             )
             .await?
@@ -15445,6 +15448,191 @@ mod tests {
             .await
             .expect_err("a launch targeting another node must be refused");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn run_command_duplicate_preserves_files_and_tracking_while_launch_is_admitted() {
+        use std::task::{Context, Waker};
+
+        let root = tempfile::tempdir().expect("isolated step files");
+        let svc = test_agent_service(test_reporter())
+            .with_root_override(false)
+            .with_supervised_launch()
+            .with_runtime_state_dir(root.path().join("runtime"))
+            .with_job_spool_roots(vec![root.path().join("spool")]);
+        let (job_id, run_attempt, step_id) = (42, 7, 3);
+        let mut job = TrackedJob::dummy(0);
+        job.run_attempt = run_attempt;
+        job.nodelist = "test-node".into();
+        svc.insert_test_job(job_id, job).await;
+        let admission = svc.admit_step_launch(job_id, run_attempt, step_id).await;
+        let epoch = next_step_epoch();
+        svc.active_steps.lock().await.insert(
+            (job_id, step_id),
+            ActiveStep {
+                epoch,
+                run_attempt,
+                ..Default::default()
+            },
+        );
+
+        let spool = root.path().join("spool/job42");
+        let scripts = root.path().join(".spur_step_42");
+        std::fs::create_dir_all(&spool).unwrap();
+        std::fs::create_dir(&scripts).unwrap();
+        let (user_script, wrapper) = step_scratch_names(0, step_id);
+        let files = [
+            spool.join("step3.out"),
+            spool.join("step3.err"),
+            scripts.join(user_script),
+            scripts.join(wrapper),
+        ];
+        for path in &files {
+            std::fs::write(path, b"original step data").unwrap();
+        }
+
+        let mut duplicate = svc.run_command(Request::new(RunCommandRequest {
+            job_id,
+            step_id,
+            command: vec!["echo".into(), "duplicate".into()],
+            label: true,
+            work_dir: root.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        }));
+        assert!(duplicate
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        for path in &files {
+            assert_eq!(std::fs::read(path).unwrap(), b"original step data");
+        }
+        assert_eq!(
+            svc.active_steps.lock().await[&(job_id, step_id)].epoch,
+            epoch
+        );
+
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            root.path().join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert((job_id, step_id), descriptor);
+        let _waiter = svc
+            .step_completions
+            .register(job_id, run_attempt, step_id)
+            .await;
+        drop(admission);
+
+        let error = duplicate
+            .await
+            .expect_err("the original caller still owns the result");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        for path in &files {
+            assert_eq!(std::fs::read(path).unwrap(), b"original step data");
+        }
+        assert_eq!(
+            svc.active_steps.lock().await[&(job_id, step_id)].epoch,
+            epoch
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_reattach_releases_launch_admission_before_waiting() {
+        use std::task::{Context, Waker};
+
+        let root = tempfile::tempdir().expect("isolated runtime state");
+        let svc = test_agent_service(test_reporter())
+            .with_root_override(false)
+            .with_supervised_launch()
+            .with_runtime_state_dir(root.path().join("runtime"))
+            .with_job_spool_roots(vec![root.path().join("spool")]);
+        let (job_id, run_attempt, step_id) = (42, 7, 3);
+        let mut job = TrackedJob::dummy(0);
+        job.run_attempt = run_attempt;
+        svc.insert_test_job(job_id, job).await;
+        svc.stepds.lock().await.insert(
+            (job_id, step_id),
+            crate::stepd::StepdDescriptor::new(
+                job_id,
+                run_attempt,
+                step_id,
+                0,
+                0,
+                root.path().join("runtime.sock"),
+                std::path::PathBuf::new(),
+            ),
+        );
+        let request = RunCommandRequest {
+            job_id,
+            step_id,
+            command: vec!["true".into()],
+            ..Default::default()
+        };
+        let mut reconnect = svc.run_command(Request::new(request.clone()));
+        assert!(reconnect
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert_eq!(svc.step_completions.parked().await, 1);
+
+        let mut duplicate = svc.run_command(Request::new(request));
+        let result = duplicate
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+        let std::task::Poll::Ready(Err(error)) = result else {
+            panic!("a reconnect must not hold admission while awaiting completion");
+        };
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        svc.step_completions
+            .deregister(job_id, run_attempt, step_id)
+            .await;
+        assert_eq!(reconnect.await.unwrap_err().code(), tonic::Code::Internal);
+        assert!(!root.path().join("spool").exists());
+    }
+
+    #[tokio::test]
+    async fn run_command_releases_admission_if_the_job_attempt_changes() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let root = tempfile::tempdir().expect("isolated step state");
+        let svc = test_agent_service(test_reporter())
+            .with_root_override(false)
+            .with_supervised_launch()
+            .with_runtime_state_dir(root.path().join("runtime"))
+            .with_job_spool_roots(vec![root.path().join("spool")]);
+        let mut job = TrackedJob::dummy(0);
+        job.run_attempt = 7;
+        svc.insert_test_job(42, job).await;
+        let admission = svc.admit_step_launch(42, 7, 3).await;
+        let mut request = svc.run_command(Request::new(RunCommandRequest {
+            job_id: 42,
+            step_id: 3,
+            command: vec!["true".into()],
+            ..Default::default()
+        }));
+        assert!(request
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+
+        svc.running.lock().await.get_mut(&42).unwrap().run_attempt = 8;
+        drop(admission);
+        assert_eq!(request.await.unwrap_err().code(), tonic::Code::Aborted);
+        let next = svc.admit_step_launch(42, 7, 3);
+        assert!(std::pin::pin!(next)
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready());
+        assert!(svc.active_steps.lock().await.is_empty());
+        assert!(!root.path().join("spool").exists());
     }
 
     #[tokio::test]
