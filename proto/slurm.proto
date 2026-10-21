@@ -1713,10 +1713,11 @@ message UserInfo {
   // Partition the association is scoped to, empty when it applies to all
   // partitions. Populated for `sacctmgr show association`.
   string partition = 13;
-  // Fairshare weight of the association's account. Populated for
-  // `sacctmgr show association`. optional so a controller that predates this
-  // field is distinguishable from one that reports an explicit weight of 0:
-  // absent renders blank, a present 0 renders "0".
+  // Fairshare weight of this (user, account) association — read from
+  // associations.fairshare_weight, which is distinct from the account's own
+  // weight. Populated for `sacctmgr show association`. optional so a controller
+  // that predates this field is distinguishable from one that reports an
+  // explicit weight of 0: absent renders blank, a present 0 renders "0".
   optional uint32 fairshare = 14;
 }
 

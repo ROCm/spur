@@ -325,11 +325,13 @@ Filter by ``account=`` and/or ``user=``.
 
    sacctmgr show association account=ml user=alice
 
-The columns are ``User``, ``Account``, ``Partition``, ``Share`` (the account's
-fairshare weight), and ``Default`` (the association's default QOS). ``Partition``
-is blank for an all-partitions association. ``Share`` is blank only when the
-controller does not report a weight (an older controller predating the column); a
-stored weight of ``0`` renders ``0``.
+The columns are ``User``, ``Account``, ``Partition``, ``Share`` (this
+``(user, account)`` association's own fairshare weight, stored on the
+association and distinct from the account's weight — changing the account's
+weight does not change it), and ``Default`` (the association's default QOS).
+``Partition`` is blank for an all-partitions association. ``Share`` is blank only
+when the controller does not report a weight (an older controller predating the
+column); a stored weight of ``0`` renders ``0``.
 
 .. code-block:: text
 

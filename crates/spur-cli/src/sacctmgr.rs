@@ -89,7 +89,11 @@ Fields (key=value), by entity:
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
             clearpreemptexempttime, idlefillpreemptable, usagefactor, maxjobsperuser,
             maxwall, maxtresperjob, maxsubmitjobsperuser, maxsubmitjobsperaccount,
-            grpsubmit, maxtresperuser, grptres, grpwall, flags";
+            grpsubmit, maxtresperuser, grptres, grpwall, flags
+
+Note: clearpreemptexempttime=1 clears a QOS preempt-exempt override back to NULL
+(inherit from partition/global); a bare clearpreemptexempttime does nothing.
+This differs from preemptexempttime=0, which sets an explicit zero exemption.";
 
 /// `key=value` selectors `delete` accepts, per entity. Distinct from the write
 /// fields: delete only *selects* what to remove, and advertising a write field
@@ -103,13 +107,14 @@ Selectors (key=value), by entity:
   qos       name";
 
 /// `key=value` filters `show` accepts, per entity. Mirrors what each handler
-/// actually honors: account/qos honor only `format`; user and association honor
-/// the `account`/`user` filters but render a fixed-width table (no `format`).
+/// actually honors: account honors only `format`; qos honors `name` and
+/// `format`; user and association honor the `account`/`user` filters but render
+/// a fixed-width table (no `format`).
 const SHOW_FIELDS_HELP: &str = "\
 Filters (key=value), by entity:
   account       format
   user          account, user
-  qos           format
+  qos           name, format
   association   account, user
   txn           action, actor, format";
 
@@ -1579,21 +1584,23 @@ mod tests {
     }
 
     /// Parse a per-entity help block ("  <entity>  f1, f2, ...\n            f3")
-    /// into (entity, fields). Continuation lines (no leading entity word) extend
-    /// the previous entity. Prose in parentheses is dropped so a note like
-    /// "(omit account ...)" is not mistaken for a field.
+    /// into (entity, fields). A non-indented line starts a new entity (its first
+    /// word); a deeper-indented line continues the previous one. The field table
+    /// runs from the header to the first blank line, so a trailing free-form
+    /// paragraph (e.g. a "Note:" after a blank line) is not parsed. Parenthetical
+    /// prose is dropped so a note like "(omit account ...)" is not a field.
     fn parse_entity_help(help: &str) -> Vec<(String, Vec<String>)> {
         let mut out: Vec<(String, Vec<String>)> = Vec::new();
         for line in help.lines().skip(1) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+            // The table ends at the first blank line; anything after is prose.
+            if line.trim().is_empty() {
+                break;
             }
             // Strip any parenthetical prose before tokenizing.
             let cleaned = {
                 let mut s = String::new();
                 let mut depth = 0;
-                for c in trimmed.chars() {
+                for c in line.trim().chars() {
                     match c {
                         '(' => depth += 1,
                         ')' => depth = (depth - 1).max(0),
@@ -1603,8 +1610,6 @@ mod tests {
                 }
                 s
             };
-            let starts_new_entity =
-                !line.starts_with("    ") || line.chars().take_while(|c| *c == ' ').count() < 6;
             let mut tokens: Vec<String> = cleaned
                 .split(|c: char| c.is_whitespace() || c == ',')
                 .map(str::trim)
@@ -1614,11 +1619,15 @@ mod tests {
             if tokens.is_empty() {
                 continue;
             }
-            if starts_new_entity {
+            let indented =
+                line.starts_with("    ") && line.chars().take_while(|c| *c == ' ').count() >= 6;
+            if indented {
+                if let Some(last) = out.last_mut() {
+                    last.1.extend(tokens);
+                }
+            } else {
                 let entity = tokens.remove(0);
                 out.push((entity, tokens));
-            } else if let Some(last) = out.last_mut() {
-                last.1.extend(tokens);
             }
         }
         out
@@ -1659,10 +1668,11 @@ mod tests {
         assert!(!ADD_FIELDS_HELP.contains("clearpreemptexempttime"));
     }
 
-    /// show help must match what each handler actually filters on: account/qos
-    /// honor only `format`; user and association honor `account`/`user`. Guards
-    /// against advertising a filter the handler ignores (e.g. account `name=`),
-    /// or hiding one it honors (association filters).
+    /// show help must match what each handler actually filters on: account
+    /// honors only `format`; qos honors `name` (filter_qos_by_name) and `format`;
+    /// user and association honor `account`/`user`. Guards against advertising a
+    /// filter the handler ignores (e.g. account `name=`) or hiding one it honors
+    /// (qos `name`, the association filters).
     #[test]
     fn show_help_matches_each_handlers_real_filters() {
         let entities = parse_entity_help(SHOW_FIELDS_HELP);
@@ -1674,10 +1684,10 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        // account/qos ignore name=, so help must not claim it; format is the
-        // only thing they honor.
+        // account ignores name=, so help must not claim it; format is all it honors.
         assert_eq!(fields_of("account"), vec!["format"]);
-        assert_eq!(fields_of("qos"), vec!["format"]);
+        // qos honors both name= and format=.
+        assert_eq!(fields_of("qos"), vec!["name", "format"]);
         // association honors account/user filters (list_user_filters) — these
         // must be advertised, and the old "no filters" wording is gone.
         let assoc = fields_of("association");
