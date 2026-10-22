@@ -87,7 +87,9 @@ Common flags:
    jobs, or nothing when your site sets ``private_data = ["jobs"]``.
 
 When ``--states`` is omitted the default filter is **PENDING, RUNNING,
-SUSPENDED, COMPLETING**.
+SUSPENDED, COMPLETING, REQUEUED, PREEMPTED**. A deferred retry remains visible
+as ``REQUEUED`` (``RQ``) or ``PREEMPTED`` (``PR``) while the previous run's
+node cleanup finishes, then returns to ``PENDING``.
 
 ``--format``/``-o`` uses ``%[.][-][width]<letter>`` fields. The resolved letters:
 
@@ -263,6 +265,10 @@ those defaults is overridable by passing ``-t``, ``-S``, or ``-o`` explicitly.
      - DEADLINE
      - ``OOM``
      - OUT_OF_MEMORY
+   * - ``RQ``
+     - REQUEUED
+     -
+     -
 
 For a pending job the ``NODELIST(REASON)`` column shows why it is waiting.
 Common reasons include ``Priority`` (waiting its turn), ``Resources`` (waiting

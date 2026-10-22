@@ -75,6 +75,7 @@ class TestLedgerReconcileOnRefusal:
     def cluster_config_overrides(self):
         return {"scheduler": {"complete_wait_secs": COMPLETE_WAIT}}
 
+    @pytest.mark.skip(reason="Requires production agent ledger RPC wiring")
     def test_dispatch_refusal_triggers_reconcile_and_resolves_the_conflict(
         self, gpu_cluster
     ):

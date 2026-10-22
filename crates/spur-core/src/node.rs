@@ -300,6 +300,37 @@ pub fn resolve_wal_node_source(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeStateCondition {
+    pub state: NodeState,
+    pub reason: Option<String>,
+    pub admin_locked: bool,
+    pub reason_uid: Option<u32>,
+    pub reason_time: Option<DateTime<Utc>>,
+}
+
+impl From<&Node> for NodeStateCondition {
+    fn from(node: &Node) -> Self {
+        Self {
+            state: node.state,
+            reason: node.state_reason.clone(),
+            admin_locked: node.admin_locked,
+            reason_uid: node.reason_uid,
+            reason_time: node.reason_time,
+        }
+    }
+}
+
+impl NodeStateCondition {
+    pub fn matches(&self, node: &Node) -> bool {
+        self.state == node.state
+            && self.reason == node.state_reason
+            && self.admin_locked == node.admin_locked
+            && self.reason_uid == node.reason_uid
+            && self.reason_time == node.reason_time
+    }
+}
+
 /// A compute node in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -382,9 +413,8 @@ pub struct Node {
     /// Why this node blocked convergence when the cluster went `degraded` (surfaced in status).
     #[serde(default)]
     pub k0s_last_error: Option<String>,
-    /// The agent asserted state the controller has not yet diffed against Raft.
-    /// Not a `NodeState`, which the WAL and the proto both serialize.
-    #[serde(default)]
+    /// A leader-local scheduling gate must disappear with its owning reconcile task.
+    #[serde(skip)]
     pub reconcile_pending: bool,
     /// Whether this node's agent runs an epilog after a run's tasks exit. False
     /// for an agent that predates the declaration, which then never gates.
@@ -512,18 +542,29 @@ mod tests {
 
     #[test]
     fn an_old_node_record_replays_ungated() {
-        // A pre-upgrade snapshot has no such field; defaulting it to gated would
-        // stall every node in the cluster on upgrade.
-        let mut seed = Node::new("n1".into(), ResourceSet::default());
-        seed.state = NodeState::Idle;
-        let mut value = serde_json::to_value(seed).expect("serialize");
-        value
-            .as_object_mut()
-            .expect("object")
-            .remove("reconcile_pending");
-        let node: Node = serde_json::from_value(value).expect("an older record must still load");
+        let frozen = r#"{
+            "name":"n1", "state":"IDLE", "partitions":[],
+            "total_resources":{"cpus":4,"memory_mb":8192,"gpus":[],"generic":{}},
+            "alloc_resources":{"cpus":0,"memory_mb":0,"devices":{}},
+            "arch":"x86_64", "os":"linux", "cpu_load":0,
+            "free_memory_mb":8192, "port":6818
+        }"#;
+        let node: Node = serde_json::from_str(frozen).expect("an older record must still load");
+        assert!(!node.runs_job_epilog);
         assert!(!node.reconcile_pending);
         assert!(node.is_schedulable());
+    }
+
+    #[test]
+    fn reconcile_task_gate_is_not_restored_from_a_snapshot() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.reconcile_pending = true;
+        node.runs_job_epilog = true;
+        let encoded = serde_json::to_value(node).expect("serialize");
+        assert!(encoded.get("reconcile_pending").is_none());
+        let restored: Node = serde_json::from_value(encoded).expect("deserialize");
+        assert!(!restored.reconcile_pending);
+        assert!(restored.runs_job_epilog);
     }
 
     #[test]

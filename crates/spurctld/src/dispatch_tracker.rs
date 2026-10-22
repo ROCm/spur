@@ -21,7 +21,14 @@ pub(crate) struct DispatchTracker {
 struct TrackerState {
     in_flight: HashMap<String, HashMap<JobId, usize>>,
     watches: HashMap<u64, WatchState>,
+    watch_order: HashMap<String, NodeWatchOrder>,
     next_watch_id: u64,
+}
+
+struct NodeWatchOrder {
+    latest: u64,
+    active: usize,
+    actions: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct WatchState {
@@ -79,9 +86,23 @@ impl DispatchTracker {
                 observed,
             },
         );
+        let order = state
+            .watch_order
+            .entry(node.to_string())
+            .or_insert_with(|| NodeWatchOrder {
+                latest: id,
+                active: 0,
+                actions: Arc::new(tokio::sync::Mutex::new(())),
+            });
+        order.latest = id;
+        order.active += 1;
+        let actions = order.actions.clone();
         DispatchWatch {
-            tracker: self.clone(),
-            id,
+            inner: Arc::new(WatchOwner {
+                tracker: self.clone(),
+                id,
+                actions,
+            }),
         }
     }
 }
@@ -112,36 +133,88 @@ impl Drop for DispatchInFlight {
     }
 }
 
-/// The launches that overlapped one reconcile. Deregisters on drop, so the
-/// tracker holds nothing once the reconcile that opened it has finished.
+/// Pending writes retain the watch so a later pass cannot create a different
+/// action mutex before those writes finish.
+#[derive(Clone)]
 pub(crate) struct DispatchWatch {
+    inner: Arc<WatchOwner>,
+}
+
+struct WatchOwner {
     tracker: Arc<DispatchTracker>,
     id: u64,
+    actions: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DispatchWatch {
+    /// Serializing actions closes the gap between checking cut ownership and
+    /// committing a node hold; ledger requests themselves may still overlap.
+    pub(crate) async fn lock_actions(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.actions.clone().lock_owned().await
+    }
+
+    /// A newer cut request supersedes this pass even after that request ends;
+    /// otherwise its newer conflict hold could be cleared by this older cut.
+    pub(crate) fn is_current(&self) -> bool {
+        let state = self.inner.tracker.state.lock();
+        state.watches.get(&self.inner.id).is_some_and(|watch| {
+            state
+                .watch_order
+                .get(&watch.node)
+                .is_some_and(|order| order.latest == self.inner.id)
+        })
+    }
+
     /// Jobs whose launch to the watched node overlapped this watch. A cut taken
     /// during the watch may predate any of them, so its silence proves nothing.
     pub(crate) fn observed(&self) -> HashSet<JobId> {
-        self.tracker
+        self.inner
+            .tracker
             .state
             .lock()
             .watches
-            .get(&self.id)
+            .get(&self.inner.id)
             .map(|w| w.observed.clone())
             .unwrap_or_default()
     }
 }
 
-impl Drop for DispatchWatch {
+impl Drop for WatchOwner {
     fn drop(&mut self) {
-        self.tracker.state.lock().watches.remove(&self.id);
+        let mut state = self.tracker.state.lock();
+        let Some(watch) = state.watches.remove(&self.id) else {
+            return;
+        };
+        if let Some(order) = state.watch_order.get_mut(&watch.node) {
+            order.active -= 1;
+            if order.active == 0 {
+                state.watch_order.remove(&watch.node);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_superseded_watch_never_regains_authority() {
+        let tracker = Arc::new(DispatchTracker::default());
+        let older = tracker.watch("n1");
+        let other_node = tracker.watch("n2");
+        assert!(older.is_current());
+        let newer = tracker.watch("n1");
+        assert!(!older.is_current());
+        assert!(newer.is_current());
+        assert!(other_node.is_current());
+        drop(newer);
+        assert!(!older.is_current());
+        drop(older);
+        drop(other_node);
+        assert!(tracker.state.lock().watch_order.is_empty());
+        assert!(tracker.watch("n1").is_current());
+    }
 
     #[test]
     fn a_launch_on_the_wire_is_in_flight() {

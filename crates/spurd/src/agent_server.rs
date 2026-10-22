@@ -5236,7 +5236,6 @@ impl SlurmAgent for AgentService {
                         stdout_path: paths.0,
                         stderr_path: paths.1,
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-
                         conflict: None,
                     }));
                 }
@@ -5321,7 +5320,6 @@ impl SlurmAgent for AgentService {
                     stdout_path: paths.0,
                     stderr_path: paths.1,
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-
                     conflict: None,
                 }));
             }
@@ -5736,7 +5734,6 @@ impl SlurmAgent for AgentService {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     failure_kind: LaunchFailureKind::LaunchFailureProlog as i32,
-
                     conflict: None,
                 }));
             }
@@ -5955,7 +5952,6 @@ impl SlurmAgent for AgentService {
                             stdout_path: String::new(),
                             stderr_path: String::new(),
                             failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-
                             conflict: None,
                         }));
                     }
@@ -6018,7 +6014,6 @@ impl SlurmAgent for AgentService {
                         stdout_path: String::new(),
                         stderr_path: String::new(),
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-
                         conflict: None,
                     }));
                 }
@@ -6080,7 +6075,6 @@ impl SlurmAgent for AgentService {
                     stdout_path,
                     stderr_path,
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-
                     conflict: None,
                 }))
             }
@@ -6102,7 +6096,6 @@ impl SlurmAgent for AgentService {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     failure_kind: failure_kind as i32,
-
                     conflict: None,
                 }))
             }
@@ -8964,9 +8957,7 @@ impl HeldRefusal {
                 job_id,
                 run_attempt,
                 cpu_ids: Vec::new(),
-                // Diagnostic only and unconsumed today; truncates a stable_id's
-                // domain bits above 0xFF (the wire field is a fixed u32).
-                gpu_devices: gpu_devices.into_iter().map(|id| id as u32).collect(),
+                gpu_devices,
             }),
         }
     }
@@ -17511,6 +17502,19 @@ mod tests {
                 panic!("expected a refusal naming what the node holds, got {status:?}")
             }
         }
+    }
+
+    #[test]
+    fn conflict_response_preserves_full_gpu_identity_on_the_wire() {
+        use prost::Message;
+
+        let gpu = u64::from(u32::MAX) + 17;
+        let response = HeldRefusal::named(99, 3, vec![gpu]).into_response();
+        let decoded = LaunchJobResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+        let conflict = decoded.conflict.unwrap();
+        assert_eq!(conflict.job_id, 99);
+        assert_eq!(conflict.run_attempt, 3);
+        assert_eq!(conflict.gpu_devices, vec![gpu]);
     }
 
     fn gpu_alloc_request(device_ids: &[u64]) -> ResourceAllocations {
