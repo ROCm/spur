@@ -278,7 +278,7 @@ pub fn setup_rootfs(
 ) -> anyhow::Result<(PathBuf, RootfsMode)> {
     let cdir = container_dir();
     let base_dir = if let Some(name) = name {
-        cdir.join(sanitize_name(name))
+        cdir.join(spur_net::oci::sanitize_name(name))
     } else {
         cdir.join(base)
     };
@@ -1143,57 +1143,6 @@ pub fn container_init(
     Ok(hook_env)
 }
 
-/// Import a Docker/OCI image to squashfs format.
-///
-/// Uses spur-net's native OCI puller — downloads directly from registries
-/// via the Docker Registry HTTP API v2. No dependency on Docker, skopeo,
-/// umoci, or enroot. Only needs mksquashfs (squashfs-tools).
-pub async fn import_image(uri: &str) -> anyhow::Result<PathBuf> {
-    let dir = image_dir();
-    spur_net::pull_image(uri, &dir).await
-}
-
-/// List imported images.
-pub fn list_images() -> Vec<(String, u64)> {
-    let dir = image_dir();
-    if !dir.exists() {
-        return Vec::new();
-    }
-
-    let mut images = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "sqsh") {
-                let name = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                images.push((name, size));
-            }
-        }
-    }
-    images.sort_by(|a, b| a.0.cmp(&b.0));
-    images
-}
-
-/// Remove an imported image.
-pub fn remove_image(name: &str) -> anyhow::Result<()> {
-    let path = image_dir().join(format!("{}.sqsh", spur_net::oci::image_file_stem(name)));
-    if !path.exists() {
-        bail!("image '{}' not found", name);
-    }
-    std::fs::remove_file(&path)?;
-    info!(name, "image removed");
-    Ok(())
-}
-
-/// Sanitize an image name for use as a filename.
-fn sanitize_name(name: &str) -> String {
-    name.replace("docker://", "").replace(['/', ':'], "+")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,34 +1200,6 @@ mod tests {
     fn test_parse_mount_too_many_parts_fails() {
         let err = parse_mount("/a:/b:ro:extra:parts").unwrap_err();
         assert!(err.to_string().contains("invalid mount spec"));
-    }
-
-    // --- Name sanitization ---
-
-    #[test]
-    fn test_sanitize_docker_uri() {
-        assert_eq!(
-            sanitize_name("docker://nvcr.io/nvidia/pytorch:24.01"),
-            "nvcr.io+nvidia+pytorch+24.01"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_simple_name() {
-        assert_eq!(sanitize_name("ubuntu:22.04"), "ubuntu+22.04");
-    }
-
-    #[test]
-    fn test_sanitize_nested_path() {
-        assert_eq!(
-            sanitize_name("registry.example.com/org/image:v1.2.3"),
-            "registry.example.com+org+image+v1.2.3"
-        );
-    }
-
-    #[test]
-    fn test_sanitize_no_tag() {
-        assert_eq!(sanitize_name("alpine"), "alpine");
     }
 
     // --- Image resolution ---
@@ -1758,30 +1679,6 @@ mod tests {
     #[test]
     fn test_drop_privileges_noop_for_root() {
         assert!(drop_privileges(0, 0, &[]).is_ok());
-    }
-
-    // --- Image removal ---
-
-    #[test]
-    fn test_remove_image_not_found() {
-        let err = remove_image("nonexistent-image-that-doesnt-exist").unwrap_err();
-        assert!(
-            err.to_string().contains("not found"),
-            "expected 'not found', got: {}",
-            err
-        );
-    }
-
-    // --- List images (empty) ---
-
-    #[test]
-    fn test_list_images_nonexistent_dir() {
-        // Temporarily override — just test with a known empty path
-        // list_images uses a hardcoded path, so this tests the "dir doesn't exist" case
-        // by checking the function handles it gracefully
-        let images = list_images();
-        // May or may not have images depending on test env, but shouldn't panic
-        let _ = images;
     }
 
     // --- Cleanup ---
