@@ -321,6 +321,8 @@ impl SlurmAccounting for AccountingService {
                 submit_time,
                 start_time,
                 reservation: Some(req.reservation),
+                // RecordJobStartRequest carries no node list.
+                nodelist: String::new(),
                 // The external accounting RPC carries no idle-fill notion; a run
                 // recorded through it is treated as an ordinary one.
                 idle_fill: false,
