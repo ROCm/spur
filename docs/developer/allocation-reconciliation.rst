@@ -51,7 +51,7 @@ does not yet enforce these launch fields; see the deployment boundary below.
 Reconciliation scheduling gates belong to active tasks in one leadership term
 and are not persisted in snapshots. A registration whose Raft outcome is still
 unknown keeps the node gated across term changes until its write resolves;
-competing registrations receive a retryable ``UNAVAILABLE`` response. Job
+competing registrations receive an ``UNAVAILABLE`` response and may retry. Job
 resource ownership and cleanup obligations remain durable in Raft independently
 of these temporary gates.
 An unresolved Raft write that sets or clears a reconciliation hold also retains
@@ -80,7 +80,7 @@ after those resources have been reassigned.
 The fence covers the committed expiry, even when the new controller's clock is
 behind the issuer's. Older reservations without a committed validity window
 retain their speculative cleanup charge when only absence is available; they
-still accept completion or explicit node deregistration.
+still accept completion or explicit node removal.
 A successful ``SettleRun`` for a finalized run also clears that node's controller
 obligation in the same reconciliation pass.
 
@@ -104,9 +104,8 @@ records and supervisor runtime state, but no local admission record. Agent
 admission, ledger reporting, fencing, and settlement enforcement are a separate
 integration step. There is no feature flag that enables that missing wiring.
 That integration must enforce the committed admission window and run cutoff on
-both batch launches and allocation registration. An unstamped legacy request
-cannot supply evidence that a particular cutoff has fenced it.
+both batch launches and allocation registration. A legacy request without
+admission timestamps cannot supply evidence that a particular cutoff has fenced it.
 
-Local admission uses numeric job IDs and run attempts. SPUID identity migration,
-an independent agent state root, and chunked immutable inventory transfer are
-separate work.
+Local admission uses numeric job IDs and run attempts. An independent agent
+state root and chunked immutable inventory transfer are separate work.
