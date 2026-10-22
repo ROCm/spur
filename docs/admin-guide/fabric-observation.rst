@@ -7,10 +7,10 @@ AMD UALink attributes during local device discovery and inventory refresh.
 No intermediate inventory file or AFM credentials are required on the agent.
 Discovery performs no fabric configuration writes.
 
-Observation is enabled independently of scheduling policy. Administrators can
-opt GPU partitions into single-block placement as described below. This mode
-uses membership configured by the external manager; it neither reserves a
-whole topology block nor verifies AFM readiness or fabric isolation.
+Observation is independent of job placement requirements. Jobs can request
+single-block placement using the discovered membership, as described below.
+This neither reserves a whole topology block nor verifies AFM readiness or
+fabric isolation.
 
 Inspecting a node
 -----------------
@@ -190,54 +190,76 @@ The existing submission options request locality using this model:
 Both options prefer nearby nodes and permit crossing leaves when needed; neither
 is a hard single-vPod requirement. ``--topology none`` skips the locality hint.
 Omitting the option retains ordinary resource ordering. To require containment,
-also configure the partition policy below and select that partition. All three
-option values obey that policy; a locality option cannot relax it.
+add the job constraint below. Locality hints cannot relax that requirement.
 
-Single-block placement policy
------------------------------
+Read-only ownership and job placement
+-------------------------------------
 
-Upgrade every controller before enabling this configuration. Upgrade agents on
-the participating nodes and verify ``FabricBindingVersion`` is at least 1 in node inspection;
-older agents report zero and cannot satisfy this policy. Add the following to
-the controller's existing TOML configuration, using existing partition names:
+Declare externally configured fabric ownership on the partition:
 
 .. code-block:: toml
 
-   [topology.external]
-   single_block_partitions = ["rack"]
+   [[partitions]]
+   name = "gpu"
+   nodes = "node[01-04]"
+   default = true
 
-This is a placement constraint on the discovered or declared blocks, separate
-from a locality preference. It is not a new topology plugin and does not require
-a new job option. It can be combined with ``[topology] plugin = "block"`` or
-``"tree"``. The controller reads this policy and rebuilds membership on each scheduling
-cycle. Reconfiguration updates the policy without rebuilding a fixed rack list.
-``topology show`` includes ``SingleBlockPartitions``. A GPU job requesting any
-listed partition, including one in a comma-separated partition list, must bind
-its selected GPUs within one consistent block. The default partition follows
-the same rule. Ordinary GPU quantity and type options continue to apply to
-batch, interactive allocations, and standalone runs. ``--topology`` remains a
-locality hint and cannot disable this requirement.
+   [partitions.fabric]
+   mode = "preconfigured"
 
-Partition names have no built-in rack meaning: ``rack`` is the existing partition
-named in this policy. When no partition is supplied through the CLI, environment,
-or batch directives, Spur selects the partition marked ``default = true``. If no
-partition is marked default, it selects the first partition in the controller's
-list. There is no automatic fallback to ordinary GPU placement when a constrained
-job cannot fit. To keep ordinary GPU scheduling as the default, mark a partition
-outside ``single_block_partitions`` as default and select ``-p rack`` for jobs
-that require containment.
+This mode records that the fabric is managed externally. Spur observes membership;
+it does not create, resize, or delete fabric groups. It does not impose a
+single-block requirement on every GPU job. Managed modes are not implemented
+and are rejected. The mode is persisted with the partition and shown as
+``FabricMode`` by ``spur control show partition``. Administrator commands can
+create or update it using ``--fabric-mode preconfigured`` or ``FabricMode=preconfigured``;
+``FabricMode=none`` clears it. Reconfiguration applies the partition mode in
+``spur.conf``, including clearing it when the fabric section is absent.
 
-Bare ``--exclusive`` retains whole-node allocation semantics. Under this policy,
-every GPU reserved on an exclusive node must belong to the same chosen block;
-a node spanning multiple blocks cannot satisfy an exclusive request. CPU-only
-jobs without node exclusivity do not require a fabric binding. ``ExclusiveTopo``
-is rejected by partition create/update commands because whole-block exclusivity
-is not implemented.
+Request hard containment with an existing constraint option:
 
-For each job, the scheduler considers complete, consistent blocks whose candidate
+.. code-block:: console
+
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --constraint='same(gpu.fabric_domain_id)' --wrap 'hostname'
+   spur alloc -p gpu -N 2 -n 2 --gpus 6 --constraint='same(gpu.vpod_id)'
+   spur run -p gpu -N 2 -n 2 --gpus 6 --constraint='same(gpu.fabric_domain_id)' hostname
+
+``same(gpu.vpod_id)`` is an alias for the vendor-neutral
+``same(gpu.fabric_domain_id)``. Both require all selected GPUs to belong to
+one scoped, observed or declared block. Equal local IDs in different physical
+domains do not satisfy the constraint. The same block inventory supplies the
+existing block/tree topology and exact-GPU placement. No new topology plugin
+or partition-name list is needed.
+
+The supported expression is one of these predicates, optionally joined to node
+features using commas or ``&``, for example
+``fast&same(gpu.fabric_domain_id)``. Other GPU predicates, OR expressions involving
+these predicates, and malformed expressions are rejected. Legacy comma-separated
+node features retain their existing meaning. The constraint requires a GPU
+request or whole-node exclusivity. Upgrade controllers and clients together
+before using this syntax; older controllers do not implement these predicates.
+Agents must advertise ``FabricBindingVersion`` of at least 1 for native membership,
+or 2 for file-defined blocks.
+
+Plain GPU jobs use ordinary scheduling, including when the partition has
+``mode = "preconfigured"``. They can span blocks. With the constraint, a job
+waits if no single block can fit it; there is no automatic fallback.
+``--topology none`` cannot disable the constraint. Omitting ``-p`` selects the
+configured default partition, or the first partition if no default is marked;
+the explicit job constraint keeps the same meaning for either choice and for
+comma-separated partition lists. Partition names have no built-in rack meaning.
+
+Bare ``--exclusive`` retains whole-node allocation semantics. Combined with the
+same-fabric constraint, every GPU reserved on an exclusive node must belong to
+the selected block. ``ExclusiveTopo`` remains unsupported: reserving a node does
+not reserve all nodes in its block. Steps inherit their parent allocation's
+binding. Adding a same-fabric constraint to an existing step is rejected; specify
+it when creating the allocation.
+
+For each constrained job, the scheduler considers complete, consistent blocks whose candidate
 nodes advertise binding enforcement. It filters each node's inventory to that
 block's exact GPU IDs and runs the existing resource and backfill solver. It
-chooses the earliest feasible start, breaking block ties by scoped block key.
+chooses the earliest feasible start, preferring smaller blocks at the same start and then the scoped block key.
 Node lists, GPU types and quantities, CPU/memory requirements, and reservations
 still apply. Selected GPU IDs must remain free throughout the proposed interval.
 Future shadow reservations hold those same concrete resources so shorter jobs
@@ -267,8 +289,8 @@ coordinate such changes with running allocations. Observed membership is not
 an assertion of fabric readiness, bandwidth, security isolation, or an atomic
 fabric lease.
 
-Heterogeneous job groups are left pending under this policy until group-wide
-binding is supported. Policy-constrained jobs do not trigger automatic preemption,
+Heterogeneous job groups with this requirement are left pending until group-wide
+binding is supported. Constrained jobs do not trigger automatic preemption,
 idle-fill reclamation, or federation forwarding, whose current selection paths
 do not carry fabric requirements. Ordinary backfill, including future resource
 reservations, remains available. Segments, whole-block exclusivity, and per-device static import remain future
@@ -278,12 +300,11 @@ Optional administrator or operator block file
 ---------------------------------------------
 
 For a rack system whose placement groups are maintained by an administrator or
-external operator, set ``block_file`` alongside the partition policy:
+external operator, set ``block_file`` as the membership source:
 
 .. code-block:: toml
 
    [topology.external]
-   single_block_partitions = ["gpu"]
    block_file = "/etc/spur/topology.conf"
 
 This selects file-defined blocks for the controller. Omitting ``block_file``
@@ -291,9 +312,8 @@ keeps automatic discovery. The filename has no special meaning; an absolute
 path is required. Install the same configuration setting and file on every
 participating agent and controller. Agents must advertise
 ``FabricBindingVersion`` of at least 2. All nodes can remain in one partition:
-``single_block_partitions`` selects which partitions require containment, and
-the file defines the placement boundaries within that candidate node pool.
-Ordinary partitions retain their existing scheduling behavior.
+the file defines the groups within that candidate node pool. The job constraint
+selects hard containment; plain GPU jobs retain ordinary scheduling.
 
 The file is text, with one record per block:
 
@@ -313,7 +333,7 @@ fields, block names, or node memberships are errors.
 
 This is a deliberately small subset of the block record format. ``BlockSizes``
 and other fields are rejected: higher-level aggregation is not implemented,
-and each declared block is a hard placement boundary. A node can belong to
+and each declared block is a boundary for jobs requesting containment. A node can belong to
 only one declared block. The record covers all currently registered GPUs on
 each named node; it cannot describe separate groups within a node. GPU counts,
 types, identities, free resources, and health are never taken from this file.
@@ -421,8 +441,9 @@ Scheduling and inspection
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
 File blocks use the same backfill algorithm and exact-device admission checks
-as automatic blocks. Earliest feasible start wins; block-key order breaks ties.
-A smaller job may share a block when its CPUs, memory, and GPUs are free. A job
+as automatic blocks. Earliest feasible start wins, then smaller blocks, then
+block-key order.
+A smaller job may share a block when its CPUs, memory, and GPUs are free. A constrained job
 cannot combine two blocks even if their summed free GPUs meet its request.
 ``--exclusive`` still reserves whole nodes, not a whole block.
 
@@ -430,16 +451,16 @@ For four nodes with four GPUs each and the two records above:
 
 .. code-block:: console
 
-   spur submit -p gpu -N 2 -n 2 --gpus 6 -t 00:10:00 --wrap 'sleep 300'
-   spur submit -p gpu -N 2 -n 2 --gpus 6 -t 00:10:00 --wrap 'sleep 300'
-   spur submit -p gpu -N 4 -n 4 --gpus 12 -t 00:10:00 --wrap 'sleep 300'
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --constraint='same(gpu.fabric_domain_id)' -t 00:10:00 --wrap 'sleep 300'
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --constraint='same(gpu.fabric_domain_id)' -t 00:10:00 --wrap 'sleep 300'
+   spur submit -p gpu -N 4 -n 4 --gpus 12 --constraint='same(gpu.fabric_domain_id)' -t 00:10:00 --wrap 'sleep 300'
    spur control topology show
    spur control show job JOB_ID
 
 The first two jobs can use different eight-GPU blocks. The twelve-GPU job stays
 pending because it cannot fit within either block. Omitting ``-p`` uses the
-configured default partition and that partition's containment policy.
+configured default partition; the constraint is independent of that default.
 ``topology show`` includes ``Source=file``, ``Revision``, and
 ``NativeObservation``. Job inspection includes ``BlockFileRevision`` and
-``BindingVersion=2`` alongside exact per-node GPU bindings. No new job
-ID environment variable or submission flag is required.
+``BindingVersion=2`` alongside exact per-node GPU bindings. The constraint uses the existing submission flag; no job ID environment variable
+is required when submitting a new job.

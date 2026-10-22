@@ -427,9 +427,6 @@ impl TopologyConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalFabricConfig {
-    /// GPU jobs requesting any listed partition must stay within one observed block.
-    #[serde(default)]
-    pub single_block_partitions: Vec<String>,
     #[serde(default)]
     pub block_file: Option<std::path::PathBuf>,
     #[serde(skip)]
@@ -593,12 +590,9 @@ mod external_config_tests {
     }
 
     #[test]
-    fn external_policy_is_explicit_in_toml() {
-        let config: TopologyConfig =
-            toml::from_str("[external]\nsingle_block_partitions = [\"rack\"]\n").unwrap();
-        assert_eq!(config.external.unwrap().single_block_partitions, ["rack"]);
+    fn obsolete_partition_list_is_rejected() {
         assert!(toml::from_str::<TopologyConfig>(
-            "[external]\nsingle_block_partition = [\"rack\"]\n"
+            "[external]\nsingle_block_partitions = [\"rack\"]\n"
         )
         .is_err());
     }
@@ -615,7 +609,6 @@ mod discovery_tests {
     fn view() -> FabricView {
         FabricView {
             namespace: "test".into(),
-            single_block_partitions: vec![],
             unresolved: vec![],
             blocks: [("rack-a", "7", ["n0", "n2"]), ("rack-b", "7", ["n1", "n3"])]
                 .into_iter()

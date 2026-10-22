@@ -107,10 +107,7 @@ fn run_with_view(
         nodes: "ALL".into(),
         ..Default::default()
     }];
-    let context = FabricSchedulingContext {
-        view,
-        single_block_partitions: vec!["rack".into()],
-    };
+    let context = FabricSchedulingContext { view };
     let topology = spur_core::topology::TopologyConfig {
         plugin: "block".into(),
         ..Default::default()
@@ -130,12 +127,27 @@ fn run_with_view(
         busy_until: &busy,
     };
     let mut scheduler = BackfillScheduler::new(100);
-    let assignments = scheduler.schedule_jobs(jobs, &cluster, now(), true);
+    let jobs: Vec<_> = jobs
+        .iter()
+        .cloned()
+        .map(|mut job| {
+            if enforce
+                && (job.spec.exclusive || resolve_gpu_demand(&job.spec).is_ok_and(|d| !d.is_none()))
+            {
+                job.spec.constraint = Some(match job.spec.constraint {
+                    Some(features) => format!("{features},same(gpu.fabric_domain_id)"),
+                    None => "same(gpu.fabric_domain_id)".into(),
+                });
+            }
+            job
+        })
+        .collect();
+    let assignments = scheduler.schedule_jobs(&jobs, &cluster, now(), true);
     (scheduler, assignments)
 }
 
 #[test]
-fn discovered_blocks_drive_existing_locality_flags_without_partition_policy() {
+fn discovered_blocks_drive_existing_locality_flags_without_a_hard_requirement() {
     let mut nodes = nodes(4);
     nodes[1].name = "n2".into();
     nodes[2].name = "n1".into();
@@ -166,7 +178,7 @@ fn discovered_blocks_drive_existing_locality_flags_without_partition_policy() {
 }
 
 #[test]
-fn locality_flags_allow_spanning_but_cannot_override_single_block_policy() {
+fn locality_flags_allow_spanning_but_cannot_override_a_hard_requirement() {
     let nodes = nodes(4);
     for hint in ["block", "tree", "none"] {
         let mut request = job(1, 4, 6);
@@ -480,4 +492,75 @@ fn file_block_ties_use_the_scoped_key_across_physical_domains() {
             .fabric_domain,
         "b"
     );
+}
+
+#[test]
+fn explicit_requirements_work_in_one_partition_with_readonly_ownership() {
+    let nodes = nodes(4);
+    let context = FabricSchedulingContext {
+        view: FabricView::from_nodes("test", &nodes, now(), 90),
+    };
+    let topology = spur_core::topology::TopologyTree::from_fabric(&context.view);
+    let parts = [Partition {
+        name: "rack".into(),
+        nodes: "ALL".into(),
+        is_default: true,
+        fabric: spur_core::partition::PartitionFabric::parse("preconfigured").unwrap(),
+        ..Default::default()
+    }];
+    let busy = HashMap::new();
+    let cluster = ClusterState {
+        nodes: &nodes,
+        partitions: &parts,
+        reservations: &[],
+        topology: Some(&topology),
+        fabric: Some(&context),
+        busy_until: &busy,
+    };
+    let plain = job(1, 4, 6);
+    let mut scheduler = BackfillScheduler::new(100);
+    let assignments = scheduler.schedule_jobs(std::slice::from_ref(&plain), &cluster, now(), true);
+    assert_eq!(assignments.len(), 1);
+    assert!(assignments[0]
+        .per_node_alloc
+        .values()
+        .all(|a| a.fabric_binding.is_none()));
+    for field in ["vpod_id", "fabric_domain_id"] {
+        let mut same = plain.clone();
+        same.spec.constraint = Some(format!("same(gpu.{field})"));
+        let mut scheduler = BackfillScheduler::new(100);
+        assert!(scheduler
+            .schedule_jobs(std::slice::from_ref(&same), &cluster, now(), true)
+            .is_empty());
+        same.spec.num_nodes = 2;
+        same.spec.num_tasks = 2;
+        same.spec.gpus = Some(GpuRequest::new(3, None));
+        let assignments =
+            scheduler.schedule_jobs(std::slice::from_ref(&same), &cluster, now(), true);
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0]
+            .per_node_alloc
+            .values()
+            .all(|a| a.fabric_binding.is_some()));
+        let unavailable = ClusterState {
+            fabric: None,
+            ..cluster
+        };
+        assert!(scheduler
+            .schedule_jobs(&[same], &unavailable, now(), true)
+            .is_empty());
+    }
+}
+
+#[test]
+fn same_fabric_prefers_smallest_suitable_block_at_equal_start() {
+    let mut nodes = nodes(3);
+    for gpu in &mut nodes[2].total_resources.gpus {
+        let fabric = gpu.topology.as_mut().unwrap().fabric.as_mut().unwrap();
+        fabric.active_endpoints = vec!["0".into(), "1".into()];
+        fabric.fabric_capacity = Some(2);
+    }
+    let (_, assignments) = run(&nodes, &[job(1, 1, 2)]);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].nodes, ["n2"]);
 }
