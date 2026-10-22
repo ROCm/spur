@@ -73,18 +73,6 @@ impl DeviceRegistry {
         Ok(resolved)
     }
 
-    pub fn gres_inject_actions(&self, gres_name: &str) -> InjectActions {
-        let mut actions = InjectActions::default();
-        for entry in self
-            .devices
-            .iter()
-            .filter(|e| e.is_injectable() && entry_matches_gres_name(e, gres_name))
-        {
-            actions.merge(&entry.inject_actions);
-        }
-        actions
-    }
-
     /// Build host/container injection plans for a job from allocated device IDs.
     pub fn build_job_injection_plans(
         &self,

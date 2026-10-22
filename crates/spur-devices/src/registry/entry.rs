@@ -45,10 +45,6 @@ impl DeviceEntry {
     pub fn is_countable_pool(&self) -> bool {
         self.capability == DeviceCapability::CountablePool
     }
-
-    pub fn is_gres_sourced(&self) -> bool {
-        self.kind == "spur.internal/gres"
-    }
 }
 
 pub fn from_cdi(cached: &CachedDevice) -> DeviceEntry {
