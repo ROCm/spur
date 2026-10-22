@@ -32,8 +32,15 @@ spec:
       serviceAccountName: spur-operator
       containers:
         - name: operator
-          image: spur:latest
+          image: rocm/spur:0.15.0 # x-release-please-version
           command: [spur-k8s-operator]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

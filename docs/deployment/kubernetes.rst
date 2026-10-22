@@ -125,6 +125,10 @@ Pod security
 
 This meets the Kubernetes ``restricted`` Pod Security Standard.
 
+Both pods pin the image to a released tag (``rocm/spur:<version>``) and declare
+CPU and memory requests and limits. The defaults suit a lightly loaded cluster;
+raise them to match your scheduling load.
+
 Each pod gets a small writable ``emptyDir`` at ``/tmp``. ``spurctld`` keeps all
 of its state, including the Raft log, in its ``--state-dir`` (default
 ``/var/spool/spur``), which is mounted from each pod's ``spool`` persistent
@@ -233,6 +237,12 @@ The operator's cluster-wide permissions are bound to its own ServiceAccount,
 Deployment uses this account. ``spurctld`` and ``spurd`` never use a pod token
 to call the Kubernetes API, so their pods run with
 ``automountServiceAccountToken: false``.
+
+The grants are scoped to what the operator does: full management of ``pods``
+(it creates and deletes the pods backing each job) and the job ``Service``\ s,
+read-only ``get`` on ``pods/log`` for streaming, ``watch`` on ``nodes``, and
+full management of ``SpurJob`` resources and ``PodDisruptionBudget``\ s. It
+holds no access to ``configmaps`` or ``secrets``.
 
 Older versions of ``rbac.yaml`` bound these permissions to the ``default``
 ServiceAccount in the ``spur`` namespace, which every pod there (including

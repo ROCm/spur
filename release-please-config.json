@@ -16,7 +16,10 @@
       ],
       "extra-files": [
         { "type": "toml", "path": "Cargo.toml", "jsonpath": "$.workspace.package.version" },
-        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(!@.source)].version" }
+        { "type": "toml", "path": "Cargo.lock", "jsonpath": "$.package[?(!@.source)].version" },
+        { "type": "generic", "path": "examples/k8s/spurctld.yaml" },
+        { "type": "generic", "path": "examples/k8s/operator.yaml" },
+        { "type": "generic", "path": "examples/k8s/spurd.yaml" }
       ]
     }
   }

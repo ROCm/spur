@@ -64,15 +64,14 @@ RUN if [ "$BUILD_MPI_PLUGIN" = "1" ]; then \
             -o "/tmp/pmix-${OPENPMIX_VERSION}.tar.gz" && \
         tar xzf "/tmp/pmix-${OPENPMIX_VERSION}.tar.gz" -C /tmp && \
         rm -f "/tmp/pmix-${OPENPMIX_VERSION}.tar.gz" && \
-        cd "/tmp/pmix-${OPENPMIX_VERSION}" && \
-        ./configure --prefix=/usr/local && \
-        make -j"$(nproc)" && make install && \
+        env -C "/tmp/pmix-${OPENPMIX_VERSION}" ./configure --prefix=/usr/local && \
+        make -C "/tmp/pmix-${OPENPMIX_VERSION}" -j"$(nproc)" && \
+        make -C "/tmp/pmix-${OPENPMIX_VERSION}" install && \
         printf '%s\n' /usr/local/lib /usr/local/lib64 > /etc/ld.so.conf.d/openpmix.conf && \
         ldconfig && \
         rm -rf "/tmp/pmix-${OPENPMIX_VERSION}" && \
         dnf clean all && \
-        cd /build && \
-        PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}" \
+        env -C /build PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}" \
         cargo build --release --locked -p spur-mpi-pmix; \
     fi
 

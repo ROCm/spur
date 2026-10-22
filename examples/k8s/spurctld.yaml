@@ -47,8 +47,15 @@ spec:
           type: RuntimeDefault
       containers:
         - name: spurctld
-          image: spur:latest
+          image: rocm/spur:0.15.0 # x-release-please-version
           command: [spurctld]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -3,3 +3,19 @@
 # The operator creates and deletes the headless Services of multi-pod jobs.
 # Review new networking grants by hand.
 KSV-0056
+
+# KSV-0048 flags create/delete on pods in a Role or ClusterRole. The operator
+# schedules jobs by creating and deleting the pods that back them, so this is
+# inherent to its function. The grant is scoped to pods only, not a wildcard.
+KSV-0048
+
+# DS-0026 flags a Dockerfile without a HEALTHCHECK. The image is multi-binary
+# (spurctld, spurd, operator, CLI); health is defined per workload by the
+# Kubernetes probes in examples/k8s/, not baked into the image.
+DS-0026
+
+# KSV-0125 flags images from registries outside Trivy's hardcoded trusted set.
+# The examples pin the project's own published image (rocm/spur:<version>),
+# which is the trusted source for this deployment. Pinning a versioned tag is
+# the security goal; the registry policy cannot be satisfied for our own image.
+KSV-0125

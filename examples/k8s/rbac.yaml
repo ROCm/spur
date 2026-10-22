@@ -11,8 +11,12 @@ metadata:
 rules:
   # Pod management
   - apiGroups: [""]
-    resources: [pods, pods/status, pods/log]
+    resources: [pods, pods/status]
     verbs: [get, list, watch, create, update, patch, delete]
+  # Streaming job logs only needs read access to the log subresource.
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
   # Service management (headless services for inter-pod networking)
   - apiGroups: [""]
     resources: [services]
@@ -21,10 +25,6 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch]
-  # ConfigMaps
-  - apiGroups: [""]
-    resources: [configmaps]
-    verbs: [get, list, watch, create, update, patch, delete]
   # Events
   - apiGroups: [""]
     resources: [events]
