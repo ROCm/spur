@@ -331,6 +331,53 @@ class TestLiveJobActors:
         c.cli_allow_fail(["scancel", str(job_id)])
 
 
+def _allocated_nodes(cluster, job_id: int) -> str:
+    show = cluster.scontrol("show", "job", str(job_id))
+    # Anchored: ReqNodeList=/ExcNodeList= also contain "NodeList=".
+    m = re.search(r"(?<![A-Za-z])NodeList=(\S+)", show)
+    assert m, f"missing NodeList in scontrol output:\n{show}"
+    return m.group(1)
+
+
+def _wait_sacct_nodelist(cluster, job_id: int, want: str, timeout: int = 60) -> str:
+    """Poll until sacct's NodeList for the job reads *want*; the start record
+    is written asynchronously after the job starts running."""
+    deadline = time.time() + timeout
+    got = ""
+    while time.time() < deadline:
+        got = _sacct_field(cluster.cli, job_id, "NodeList", 60)
+        if got == want:
+            break
+        time.sleep(2)
+    return got
+
+
+class TestSacctNodeList:
+    """sacct reports the nodes a job ran on, and a requeued job's row follows
+    the nodes of its latest run."""
+
+    def test_nodelist_recorded_and_follows_requeue(self, accounting_cluster):
+        c = accounting_cluster
+        c.require_nodes(2)
+        job_id = _submit(c, "acct-nodelist", "sleep 600")
+        try:
+            wait_job_state(c, job_id, "R", timeout=60)
+            first = _allocated_nodes(c, job_id)
+            assert first in c.node_names, first
+            assert _wait_sacct_nodelist(c, job_id, first) == first
+
+            c.scontrol("requeuehold", str(job_id))
+            wait_job_state(c, job_id, "PD", timeout=60)
+            c.scontrol("update", f"JobId={job_id}", f"ExcNodeList={first}")
+            c.scontrol("release", str(job_id))
+            wait_job_state(c, job_id, "R", timeout=90)
+            second = _allocated_nodes(c, job_id)
+            assert second != first, second
+            assert _wait_sacct_nodelist(c, job_id, second) == second
+        finally:
+            c.cli_allow_fail(["scancel", str(job_id)])
+
+
 def _reason(cluster, job_id: int) -> str:
     out = cluster.scontrol("show", "job", str(job_id))
     m = re.search(r"Reason=(\S+)", out)
