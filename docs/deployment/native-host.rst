@@ -595,7 +595,9 @@ a granularity gap *inside* the job rather than a hole between jobs:
        every step in a job still draws on one shared budget. Where the host lets
        the job delegate its controllers, per-step CPU and memory *readings* show
        up in the leaf's ``cpu.stat`` and ``memory.current``; Spur does not yet
-       collect them into step accounting.
+       collect them into step accounting. A per-node sum across the job's steps
+       is exported at ``/metrics/job-resources`` (see
+       :doc:`/user-guide/monitoring-jobs`).
    * - Precise kill-by-step
      - Cancelling one step signals its process tree rather than its cgroup, so a
        step process that leaves that tree (``setsid``) is missed even though the

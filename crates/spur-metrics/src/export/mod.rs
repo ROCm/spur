@@ -14,6 +14,7 @@ pub const CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; cha
 
 pub mod audit;
 pub mod auth;
+pub mod job_resources;
 pub mod jobs;
 pub mod jobs_users_accts;
 pub mod k8s_cluster;

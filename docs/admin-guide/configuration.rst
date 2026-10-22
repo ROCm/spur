@@ -2299,8 +2299,9 @@ OpenMetrics HTTP export from ``spurctld``.
      - bool
      - ``false``
      - Live
-     - Serve the per-job/user/account metrics route. While ``false`` that route
-       returns 404. High cardinality on a busy cluster; enable deliberately.
+     - Serve ``/metrics/jobs-users-accts`` and ``/metrics/job-resources``. While
+       ``false`` those routes return 404. High cardinality on a busy cluster;
+       enable deliberately.
 
 ``[rest_api]``
 --------------

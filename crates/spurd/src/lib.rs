@@ -16,6 +16,7 @@ pub(crate) mod device_cgroup;
 pub mod executor;
 pub mod job_entry;
 pub(crate) mod job_lifecycle;
+pub(crate) mod job_resources;
 pub mod landlock;
 pub mod mpi_plugin;
 pub mod privdrop;
