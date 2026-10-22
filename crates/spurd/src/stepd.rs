@@ -716,9 +716,6 @@ pub struct Stepd {
     teardown_started: AtomicBool,
     launch_gate: Mutex<()>,
     pty_handoff: std::sync::OnceLock<Arc<PtyHandoff>>,
-    // Base environment for work landing in a follow-up PR.
-    #[allow(dead_code)]
-    environment: std::collections::HashMap<String, String>,
 }
 
 impl Stepd {
@@ -727,22 +724,6 @@ impl Stepd {
         job_id: u32,
         run_attempt: u32,
         step_id: spur_core::step::StepId,
-    ) -> Self {
-        Self::with_environment(
-            job,
-            job_id,
-            run_attempt,
-            step_id,
-            std::collections::HashMap::new(),
-        )
-    }
-
-    pub fn with_environment(
-        job: RunningJob,
-        job_id: u32,
-        run_attempt: u32,
-        step_id: spur_core::step::StepId,
-        environment: std::collections::HashMap<String, String>,
     ) -> Self {
         let job_pid = job.pid().unwrap_or(0) as i32;
         Self {
@@ -761,7 +742,6 @@ impl Stepd {
             teardown_started: AtomicBool::new(false),
             launch_gate: Mutex::new(()),
             pty_handoff: std::sync::OnceLock::new(),
-            environment,
         }
     }
 
@@ -2299,7 +2279,6 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             return Err(error);
         }
     };
-    let runtime_environment = launch_spec.environment.clone();
     let (job, launched_cgroup, launched_output, task_environment, pty_master) = if launch_spec
         .allocation_only
     {
@@ -2353,13 +2332,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             tracing::warn!(job_id, %error, "failed to republish the runtime descriptor");
         }
     }
-    let session = Arc::new(Stepd::with_environment(
-        job,
-        job_id,
-        run_attempt,
-        step_id,
-        runtime_environment,
-    ));
+    let session = Arc::new(Stepd::new(job, job_id, run_attempt, step_id));
     session.adopt_cgroup(launched_cgroup).await;
     if awaits_pty_handoff(step_id, deposited) {
         session.await_pty_handoff(pty_handoff);
