@@ -10,6 +10,7 @@ pub mod auth;
 pub mod block_file;
 pub mod burst_buffer;
 pub mod config;
+pub mod constraints;
 pub mod dependency;
 pub mod device_topology;
 pub mod end_reason;

@@ -2731,9 +2731,14 @@ See Also
 External fabric block source
 ----------------------------
 
-``[topology.external] single_block_partitions`` lists partitions whose GPU jobs
-must fit within one consistent block. The optional ``block_file`` absolute path
-selects administrator/operator whole-node definitions using
-``BlockName=... Nodes=...`` records. Omit it for automatic native discovery.
-See :doc:`fabric-observation` for the supported syntax, controller and agent
-installation, revision fencing, reconfiguration, and scheduling examples.
+``[partitions.fabric] mode = "preconfigured"`` declares externally owned,
+read-only fabric membership for a partition. It does not require every GPU job
+to fit one block. Jobs request that outcome with
+``--constraint='same(gpu.fabric_domain_id)'`` (alias ``same(gpu.vpod_id)``).
+Plain GPU jobs retain ordinary placement and may span blocks.
+
+The optional ``[topology.external] block_file`` absolute path selects
+administrator/operator whole-node definitions using ``BlockName=... Nodes=...``
+records. Omit it for automatic native discovery. Both sources feed the existing
+block/tree topology. See :doc:`fabric-observation` for the supported syntax,
+controller and agent installation, revision fencing, reconfiguration, and examples.

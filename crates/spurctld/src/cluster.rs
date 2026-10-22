@@ -1163,6 +1163,8 @@ impl ClusterManager {
         spur_core::gpu_request::resolve_gpu_demand(&spec)
             .map_err(|e| SubmitError::invalid(e.to_string()))?;
 
+        spur_core::constraints::validate(&spec).map_err(SubmitError::invalid)?;
+
         // Reject a node count outside the partition's bounds at submit, matching
         // Slurm, instead of accepting a job that would pend forever.
         self.validate_partition_node_bounds(&spec, &partitions)?;
@@ -2273,22 +2275,8 @@ impl ClusterManager {
         allocations: &HashMap<String, ResourceAllocations>,
     ) -> anyhow::Result<()> {
         let config = self.config();
-        let required = config
-            .topology
-            .as_ref()
-            .and_then(|t| t.external.as_ref())
-            .is_some_and(|external| {
-                spur_sched::traits::FabricSchedulingContext {
-                    view: spur_core::fabric::FabricView {
-                        single_block_partitions: vec![],
-                        namespace: config.cluster_name.clone(),
-                        blocks: vec![],
-                        unresolved: vec![],
-                    },
-                    single_block_partitions: external.single_block_partitions.clone(),
-                }
-                .requires_binding(job, &self.get_partitions())
-            });
+        spur_core::constraints::validate(&job.spec).map_err(anyhow::Error::msg)?;
+        let required = spur_core::constraints::requires_same_fabric(&job.spec);
         if !required
             && allocations
                 .values()
@@ -2304,7 +2292,7 @@ impl ClusterManager {
                 .ok_or_else(|| anyhow::anyhow!("missing fabric allocation for {name}"))?;
             let binding = allocation.fabric_binding.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "single-block policy requires an enforced fabric binding for {name}"
+                    "same-fabric constraint requires an enforced fabric binding for {name}"
                 )
             })?;
             if key.is_some_and(|key| key != &binding.key) {
@@ -3830,7 +3818,7 @@ impl ClusterManager {
             .as_ref()
             .and_then(|t| t.external.as_ref())
             .and_then(|e| e.loaded_block_file.as_ref());
-        let mut view = match definition {
+        match definition {
             Some(file) => file.view(&config.cluster_name, &nodes, now, timeout, true),
             None => spur_core::fabric::FabricView::from_nodes(
                 &config.cluster_name,
@@ -3838,14 +3826,7 @@ impl ClusterManager {
                 now,
                 timeout,
             ),
-        };
-        view.single_block_partitions = config
-            .topology
-            .as_ref()
-            .and_then(|t| t.external.as_ref())
-            .map(|e| e.single_block_partitions.clone())
-            .unwrap_or_default();
-        view
+        }
     }
 
     /// Nodes eligible for new placement this tick: all nodes minus those on a
@@ -5589,6 +5570,7 @@ impl ClusterManager {
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
         preempt_exempt_time: Option<Option<u32>>,
+        fabric_mode: Option<String>,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -5628,6 +5610,9 @@ impl ClusterManager {
             max_nodes.map(Some)
         };
 
+        if let Some(mode) = &fabric_mode {
+            spur_core::partition::PartitionFabric::parse(mode).map_err(PartitionError::invalid)?;
+        }
         self.propose(WalOperation::PartitionUpdate {
             name: name.to_string(),
             nodes,
@@ -5646,6 +5631,7 @@ impl ClusterManager {
             preempt_mode,
             is_default,
             preempt_exempt_time,
+            fabric_mode,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         Ok(())
@@ -5792,6 +5778,7 @@ impl ClusterManager {
                 // Only push a WAL change when TOML explicitly sets the field;
                 // absent means "leave whatever the runtime WAL already has".
                 preempt_exempt_time: part.preempt_exempt_time.map(Some),
+                fabric_mode: Some(part.fabric.as_ref().map_or("", |f| f.mode_str()).into()),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -8407,6 +8394,7 @@ impl ClusterManager {
                 preempt_mode,
                 is_default,
                 preempt_exempt_time,
+                fabric_mode,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -8464,6 +8452,14 @@ impl ClusterManager {
                         }
                         if let Some(def) = is_default {
                             part.is_default = *def;
+                        }
+                        if let Some(mode) = fabric_mode {
+                            match spur_core::partition::PartitionFabric::parse(mode) {
+                                Ok(fabric) => part.fabric = fabric,
+                                Err(error) => {
+                                    warn!(name, %error, "invalid fabric mode in partition update")
+                                }
+                            }
                         }
                         if let Some(et) = preempt_exempt_time {
                             part.preempt_exempt_time = *et;
@@ -10644,6 +10640,7 @@ mod tests {
             scheduler: Default::default(),
             auth: Default::default(),
             partitions: vec![spur_core::config::PartitionConfig {
+                fabric: None,
                 name: "default".into(),
                 default: true,
                 state: "UP".into(),
@@ -12640,6 +12637,7 @@ nodes = "ALL"
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions.push(spur_core::config::PartitionConfig {
+            fabric: None,
             name: "small".into(),
             default: false,
             state: "UP".into(),
@@ -12896,6 +12894,7 @@ nodes = "ALL"
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions.push(spur_core::config::PartitionConfig {
+            fabric: None,
             name: "small".into(),
             default: false,
             state: "UP".into(),
@@ -31733,6 +31732,7 @@ nodes = "ALL"
         let mut cfg = test_config();
         cfg.partitions = vec![
             spur_core::config::PartitionConfig {
+                fabric: None,
                 name: "default".into(),
                 default: true,
                 state: "UP".into(),
@@ -31752,6 +31752,7 @@ nodes = "ALL"
                 preempt_exempt_time: None,
             },
             spur_core::config::PartitionConfig {
+                fabric: None,
                 name: "train".into(),
                 default: false,
                 state: "UP".into(),
@@ -31812,6 +31813,7 @@ nodes = "ALL"
         let dir = TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.partitions = vec![spur_core::config::PartitionConfig {
+            fabric: None,
             name: "inference".into(),
             default: false,
             state: "UP".into(),
@@ -33128,6 +33130,7 @@ nodes = "ALL"
         assert_eq!(gpu.priority_tier, 2);
 
         cm.apply_operation(&WalOperation::PartitionUpdate {
+            fabric_mode: None,
             name: "gpu".into(),
             nodes: None,
             selector: None,
@@ -33251,6 +33254,7 @@ nodes = "ALL"
         let before = cm.get_partitions().len();
 
         cm.apply_operation(&WalOperation::PartitionUpdate {
+            fabric_mode: None,
             name: "does-not-exist".into(),
             nodes: Some("n1".into()),
             selector: None,
@@ -33296,6 +33300,7 @@ nodes = "ALL"
 
         // Make "gpu" the default.
         cm.apply_operation(&WalOperation::PartitionUpdate {
+            fabric_mode: None,
             name: "gpu".into(),
             nodes: None,
             selector: None,

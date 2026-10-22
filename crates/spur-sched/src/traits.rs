@@ -48,27 +48,10 @@ pub trait Scheduler: Send + Sync {
 /// Rebuilt from the complete live inventory each scheduling cycle.
 pub struct FabricSchedulingContext {
     pub view: spur_core::fabric::FabricView,
-    pub single_block_partitions: Vec<String>,
 }
 
 impl FabricSchedulingContext {
-    pub fn requires_binding(&self, job: &Job, partitions: &[Partition]) -> bool {
-        let policy_applies = if job.spec.partition.is_none() {
-            partitions
-                .iter()
-                .any(|p| p.is_default && self.single_block_partitions.contains(&p.name))
-        } else {
-            spur_core::partition::requested_partition_names(job.spec.partition.as_deref()).any(
-                |name| {
-                    self.single_block_partitions
-                        .iter()
-                        .any(|policy| policy == name)
-                },
-            )
-        };
-        policy_applies
-            && (job.spec.exclusive
-                || spur_core::gpu_request::resolve_gpu_demand(&job.spec)
-                    .is_ok_and(|d| !d.is_none()))
+    pub fn requires_binding(&self, job: &Job) -> bool {
+        spur_core::constraints::requires_same_fabric(&job.spec)
     }
 }

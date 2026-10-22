@@ -364,27 +364,12 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         let busy_until = running_jobs_busy_until(&cluster);
         let config = cluster.config();
-        let view = config
-            .topology
-            .as_ref()
-            .map(|_| cluster.fabric_view(chrono::Utc::now()));
+        let view = cluster.fabric_view(chrono::Utc::now());
         let topology = config
             .topology
             .as_ref()
-            .zip(view.as_ref())
-            // Dispatch cooldown must not shift the boundaries of fixed-size blocks.
-            .and_then(|(config, view)| config.build(&cluster.get_nodes(), view));
-        let fabric = config
-            .topology
-            .as_ref()
-            .and_then(|topology| topology.external.as_ref())
-            .zip(view)
-            .map(
-                |(external, view)| spur_sched::traits::FabricSchedulingContext {
-                    view,
-                    single_block_partitions: external.single_block_partitions.clone(),
-                },
-            );
+            .and_then(|config| config.build(&cluster.get_nodes(), &view));
+        let fabric = Some(spur_sched::traits::FabricSchedulingContext { view });
         let cluster_state = ClusterState {
             fabric: fabric.as_ref(),
             nodes: &nodes,
@@ -454,7 +439,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 .filter(|job| {
                     !fabric
                         .as_ref()
-                        .is_some_and(|context| context.requires_binding(job, &partitions))
+                        .is_some_and(|context| context.requires_binding(job))
                 })
                 .collect();
             {
@@ -480,7 +465,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         .filter(|job| {
                             !fabric
                                 .as_ref()
-                                .is_some_and(|context| context.requires_binding(job, &partitions))
+                                .is_some_and(|context| context.requires_binding(job))
                         })
                         .collect();
                     let (freed, freed_for) = reclaim_for_unplaced(
@@ -5456,6 +5441,7 @@ mod tests {
                 scheduler: Default::default(),
                 auth: Default::default(),
                 partitions: vec![spur_core::config::PartitionConfig {
+                    fabric: None,
                     name: "default".into(),
                     default: true,
                     state: "UP".into(),

@@ -956,6 +956,8 @@ impl AuthConfig {
 pub struct PartitionConfig {
     pub name: String,
     #[serde(default)]
+    pub fabric: Option<crate::partition::PartitionFabric>,
+    #[serde(default)]
     pub default: bool,
     #[serde(default = "default_partition_state")]
     pub state: String,
@@ -2104,19 +2106,6 @@ impl SlurmConfig {
                     value: "requires an absolute file path".into(),
                 });
             }
-            for name in &external.single_block_partitions {
-                if name.trim().is_empty()
-                    || !self
-                        .partitions
-                        .iter()
-                        .any(|partition| partition.name == *name)
-                {
-                    return Err(ConfigError::InvalidValue {
-                        field: "topology.external.single_block_partitions".into(),
-                        value: format!("unknown partition {name:?}"),
-                    });
-                }
-            }
         }
 
         if self.cluster_name.is_empty() {
@@ -2606,6 +2595,7 @@ impl SlurmConfig {
         self.partitions
             .iter()
             .map(|pc| Partition {
+                fabric: pc.fabric.clone(),
                 name: pc.name.clone(),
                 state: match pc.state.to_uppercase().as_str() {
                     "UP" => PartitionState::Up,
@@ -5077,23 +5067,33 @@ mod fabric_policy_tests {
     use super::*;
 
     #[test]
-    fn fabric_policy_requires_existing_partition_names() {
-        assert!(SlurmConfig::load_from_str(
-            r#"cluster_name = "test"
-[topology.external]
-single_block_partitions = ["typo"]
-"#
-        )
-        .is_err());
+    fn preconfigured_mode_is_partition_policy() {
         let config = SlurmConfig::load_from_str(
             r#"cluster_name = "test"
 [[partitions]]
-name = "rack"
+name = "gpu"
 nodes = "ALL"
-[topology.external]
-single_block_partitions = ["rack"]
+[partitions.fabric]
+mode = "preconfigured"
 "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.build_partitions()[0]
+                .fabric
+                .as_ref()
+                .unwrap()
+                .mode_str(),
+            "preconfigured"
         );
-        assert!(config.is_ok(), "{config:?}");
+        assert!(SlurmConfig::load_from_str(
+            r#"cluster_name = "test"
+[[partitions]]
+name = "gpu"
+[partitions.fabric]
+mode = "per_job"
+"#
+        )
+        .is_err());
     }
 }

@@ -3244,6 +3244,8 @@ impl SlurmController for ControllerService {
             priority_tier: req.priority_tier,
             preempt_mode,
             preempt_exempt_time: req.preempt_exempt_time,
+            fabric: spur_core::partition::PartitionFabric::parse(&req.fabric_mode)
+                .map_err(Status::invalid_argument)?,
             ..Default::default()
         };
 
@@ -3359,6 +3361,7 @@ impl SlurmController for ControllerService {
                 } else {
                     req.preempt_exempt_time.map(Some)
                 },
+                req.fabric_mode,
             )
             .map_err(partition_rpc_status)?;
 
@@ -5572,6 +5575,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         preempt_mode: spur_core::partition::preempt_mode_str(part.preempt_mode).to_string(),
         priority_tier: part.priority_tier,
         preempt_exempt_time: part.preempt_exempt_time,
+        fabric_mode: part.fabric.as_ref().map_or("", |f| f.mode_str()).into(),
     }
 }
 
@@ -10732,6 +10736,104 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_fabric_mode_rpc_and_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, step_test_config()).await;
+        svc.create_partition(admin_request(CreatePartitionRequest {
+            name: "external".into(),
+            nodes: "ALL".into(),
+            fabric_mode: "preconfigured".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let read = || {
+            svc.cluster
+                .get_partitions()
+                .into_iter()
+                .find(|p| p.name == "external")
+                .unwrap()
+        };
+        assert_eq!(partition_to_proto(&read()).fabric_mode, "preconfigured");
+        let error = svc
+            .update_partition(admin_request(UpdatePartitionRequest {
+                name: "external".into(),
+                fabric_mode: Some("per_job".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(partition_to_proto(&read()).fabric_mode, "preconfigured");
+        svc.update_partition(admin_request(UpdatePartitionRequest {
+            name: "external".into(),
+            fabric_mode: Some(String::new()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert!(read().fabric.is_none());
+        svc.update_partition(admin_request(UpdatePartitionRequest {
+            name: "external".into(),
+            fabric_mode: Some("preconfigured".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let encoded = serde_json::to_string(&read()).unwrap();
+        let restored: spur_core::partition::Partition = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(partition_to_proto(&restored).fabric_mode, "preconfigured");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_fabric_submission_validates_and_preserves_constraint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, step_test_config()).await;
+        for constraint in ["same(gpu.vpod_id)", "same(gpu.fabric_domain_id)"] {
+            let response = svc
+                .submit_job(Request::new(SubmitJobRequest {
+                    spec: Some(JobSpec {
+                        user: "test".into(),
+                        partition: "default".into(),
+                        num_nodes: 1,
+                        num_tasks: 1,
+                        gpus: Some(spur_proto::proto::GpuRequest {
+                            count: 1,
+                            gpu_type: String::new(),
+                        }),
+                        constraint: constraint.into(),
+                        ..Default::default()
+                    }),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let job = svc.cluster.get_job(response.job_id).unwrap();
+            assert_eq!(job.spec.constraint.as_deref(), Some(constraint));
+        }
+        for constraint in ["same(gpu.vpod_id)|fast", "same(gpu.unknown)"] {
+            let error = svc
+                .submit_job(Request::new(SubmitJobRequest {
+                    spec: Some(JobSpec {
+                        user: "test".into(),
+                        partition: "default".into(),
+                        num_nodes: 1,
+                        num_tasks: 1,
+                        gpus: Some(spur_proto::proto::GpuRequest {
+                            count: 1,
+                            gpu_type: String::new(),
+                        }),
+                        constraint: constraint.into(),
+                        ..Default::default()
+                    }),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fabric_placement_is_validated_before_raft_charges_resources() {
         use spur_core::fabric_binding::FabricBinding;
         let dir = tempfile::TempDir::new().unwrap();
@@ -10740,7 +10842,6 @@ mod tests {
             external: Some(spur_core::topology::ExternalFabricConfig {
                 block_file: None,
                 loaded_block_file: None,
-                single_block_partitions: vec!["default".into()],
             }),
             ..Default::default()
         });
@@ -10754,6 +10855,7 @@ mod tests {
                 gid: 1000,
                 partition: Some("default".into()),
                 script: Some("true".into()),
+                constraint: Some("same(gpu.fabric_domain_id)".into()),
                 gpus: Some(spur_core::gpu_request::GpuRequest::new(1, None)),
                 ..Default::default()
             })
