@@ -1077,27 +1077,21 @@ impl<'a> Reader<'a> {
     }
 
     fn u16(&mut self) -> Result<u16, CredentialError> {
-        let mut b = [0u8; 2];
-        b.copy_from_slice(self.take(2)?);
-        Ok(u16::from_be_bytes(b))
+        Ok(u16::from_be_bytes(self.fixed()?))
     }
 
     fn u32(&mut self) -> Result<u32, CredentialError> {
-        let mut b = [0u8; 4];
-        b.copy_from_slice(self.take(4)?);
-        Ok(u32::from_be_bytes(b))
+        Ok(u32::from_be_bytes(self.fixed()?))
     }
 
     fn u64(&mut self) -> Result<u64, CredentialError> {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(self.take(8)?);
-        Ok(u64::from_be_bytes(b))
+        Ok(u64::from_be_bytes(self.fixed()?))
     }
 
     fn fixed<const N: usize>(&mut self) -> Result<[u8; N], CredentialError> {
-        let mut b = [0u8; N];
-        b.copy_from_slice(self.take(N)?);
-        Ok(b)
+        self.take(N)?
+            .try_into()
+            .map_err(|_| CredentialError::Malformed("truncated"))
     }
 
     fn str(&mut self) -> Result<String, CredentialError> {
