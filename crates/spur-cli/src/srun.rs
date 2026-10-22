@@ -94,7 +94,7 @@ pub struct SrunArgs {
     #[arg(long)]
     pub gpu_bind: Option<String>,
 
-    /// Required node features (e.g., "mi300x,nvlink")
+    /// Required node features or same(gpu.fabric_domain_id) for one fabric block
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 
@@ -266,6 +266,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     resolve_srun_env(&matches, &mut args)?;
     args.nodelist = crate::nodelist::resolve(args.nodelist.take(), args.nodefile.take())?;
 
+    validate_step_constraints(
+        args.constraint.as_deref(),
+        args.jobid.is_some()
+            || std::env::var("SPUR_JOB_ID")
+                .ok()
+                .and_then(|id| id.parse::<u32>().ok())
+                .is_some(),
+    )?;
+
     // --jobid routing: two distinct use cases share --jobid.
     //
     // (a) Interactive attach: `srun --jobid=<id> [--overlap] [--pty] [cmd]`
@@ -374,6 +383,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     run_standalone_srun(&args, &hooks, &work_dir, &resolved_mpi, &submit_line).await
+}
+
+fn validate_step_constraints(constraint: Option<&str>, step_mode: bool) -> Result<()> {
+    let constraints =
+        spur_core::constraints::Constraints::parse(constraint).map_err(anyhow::Error::msg)?;
+    if step_mode && constraints.same_fabric {
+        anyhow::bail!("a job step inherits its allocation's fabric binding; specify the same GPU fabric constraint on submit, alloc, or standalone run");
+    }
+    Ok(())
 }
 
 /// Resolve `--mpi` for standalone srun vs step mode inside an allocation.
@@ -2116,6 +2134,16 @@ mod tests {
     fn step_silent_without_unsupported_flags() {
         let args = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse failed");
         assert!(step_unsupported_warnings(&args).is_empty());
+    }
+
+    #[test]
+    fn same_fabric_constraints_are_allocation_only() {
+        for name in ["vpod_id", "fabric_domain_id"] {
+            let constraint = format!("same(gpu.{name})");
+            assert!(validate_step_constraints(Some(&constraint), false).is_ok());
+            assert!(validate_step_constraints(Some(&constraint), true).is_err());
+        }
+        assert!(validate_step_constraints(None, true).is_ok());
     }
 
     /// Parse the way `main_with_args` does, so tests see the same `ArgMatches`

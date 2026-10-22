@@ -375,7 +375,7 @@ impl BackfillScheduler {
 }
 
 impl BackfillScheduler {
-    fn plan_fabric_job(
+    fn plan_block_job(
         &self,
         job: &Job,
         cluster: &ClusterState,
@@ -387,18 +387,32 @@ impl BackfillScheduler {
         if job.het_job_id.is_some() || job.het_group.is_some() {
             return None;
         }
+        let mut block_job = job.clone();
+        block_job.spec.constraint = Some(
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
+                .ok()?
+                .features
+                .join(","),
+        );
         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
         let gpu_type = resolve_gpu_demand(&job.spec)
             .ok()?
             .gpu_type()
             .map(str::to_string);
         let mut best: Option<(Assignment, chrono::DateTime<Utc>)> = None;
-        for block in context
+        let mut blocks: Vec<_> = context
             .view
             .blocks
             .iter()
             .filter(|block| block.issues.is_empty())
-        {
+            .collect();
+        blocks.sort_by(|a, b| {
+            a.members
+                .len()
+                .cmp(&b.members.len())
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        for block in blocks {
             let mut nodes = cluster.nodes.to_vec();
             for node in &mut nodes {
                 let ids: BTreeSet<_> = block
@@ -448,7 +462,7 @@ impl BackfillScheduler {
                     }
                 }
                 let immediate =
-                    trial.schedule_jobs(std::slice::from_ref(job), &projected, floor, false);
+                    trial.schedule_jobs(std::slice::from_ref(&block_job), &projected, floor, false);
                 let mut start = None;
                 let mut allocations = HashMap::new();
                 for timeline in &trial.timelines {
@@ -621,9 +635,9 @@ impl BackfillScheduler {
         // Pre-check het groups: if any component can't find suitable nodes, skip all
         for indices in het_groups.values() {
             if indices.iter().any(|index| {
-                cluster.fabric.is_some_and(|context| {
-                    context.requires_binding(&pending[*index], cluster.partitions)
-                })
+                cluster
+                    .fabric
+                    .is_some_and(|context| context.requires_binding(&pending[*index]))
             }) {
                 skip_indices.extend(indices.iter().copied());
                 continue;
@@ -665,11 +679,18 @@ impl BackfillScheduler {
                 note(UnplacedKind::HetGroupIncomplete, 0, None);
                 continue;
             }
+            if spur_core::constraints::validate(&job.spec).is_err()
+                || (spur_core::constraints::requires_same_fabric(&job.spec)
+                    && cluster.fabric.is_none())
+            {
+                note(UnplacedKind::FabricUnavailable, 0, None);
+                continue;
+            }
             if let Some(context) = cluster
                 .fabric
-                .filter(|context| context.requires_binding(job, cluster.partitions))
+                .filter(|context| context.requires_binding(job))
             {
-                match self.plan_fabric_job(job, cluster, context, now) {
+                match self.plan_block_job(job, cluster, context, now) {
                     Some((assignment, start)) => {
                         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
                         for (node, allocation) in &assignment.per_node_alloc {

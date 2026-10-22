@@ -324,7 +324,6 @@ impl BlockFile {
         unresolved.sort_by(|a, b| a.device.cmp(&b.device));
         FabricView {
             namespace: namespace.into(),
-            single_block_partitions: Vec::new(),
             blocks,
             unresolved,
         }
