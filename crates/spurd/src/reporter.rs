@@ -305,6 +305,8 @@ impl NodeReporter {
             wg_pubkey: self.wg_pubkey(),
             labels,
             join_token: self.join_token.clone(),
+            ledger: None,
+            runs_job_epilog: false,
         };
         let inner = self
             .with_controller(move |mut client| async move { client.register_agent(req).await })
@@ -384,6 +386,7 @@ impl NodeReporter {
                 free_memory_mb: free_mem,
                 running_jobs,
                 node_token: current_token,
+                needs_reconcile: false,
                 wg_pubkey: self.wg_pubkey(),
                 k0s_status: self.k0s_status.get().map(|s| {
                     let (unit_active, restart_count, install_secs) = s.take_for_heartbeat();

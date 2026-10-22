@@ -468,14 +468,16 @@ fn state_name(state: i32) -> String {
         .unwrap_or_else(|| "UNKNOWN".into())
 }
 
-/// Default `squeue` states when `-t` is omitted: PD, R, S, CG (Slurm parity —
-/// suspended jobs remain visible in the default view).
+/// Deferred requeues still owe a future run, so they stay visible while the
+/// previous run's cleanup prevents them from returning to Pending.
 fn default_squeue_states() -> Vec<spur_proto::proto::JobState> {
     vec![
         spur_proto::proto::JobState::JobPending,
         spur_proto::proto::JobState::JobRunning,
         spur_proto::proto::JobState::JobSuspended,
         spur_proto::proto::JobState::JobCompleting,
+        spur_proto::proto::JobState::JobRequeued,
+        spur_proto::proto::JobState::JobPreempted,
     ]
 }
 
@@ -852,13 +854,19 @@ mod tests {
     }
 
     #[test]
-    fn default_squeue_states_includes_completing() {
-        let states = default_squeue_states();
-        assert_eq!(states.len(), 4);
-        assert!(states.contains(&P::JobPending));
-        assert!(states.contains(&P::JobRunning));
-        assert!(states.contains(&P::JobSuspended));
-        assert!(states.contains(&P::JobCompleting));
+    fn default_query_keeps_deferred_requeues_visible() {
+        let plan = plan_from(&["squeue"]);
+        assert_eq!(
+            plan.states,
+            vec![
+                P::JobPending,
+                P::JobRunning,
+                P::JobSuspended,
+                P::JobCompleting,
+                P::JobRequeued,
+                P::JobPreempted,
+            ]
+        );
     }
 
     #[test]

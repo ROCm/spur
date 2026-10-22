@@ -3099,6 +3099,26 @@ mod tests {
     }
 
     #[test]
+    fn a_slower_successor_fences_the_issuers_committed_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let window = spur_core::job::LaunchWindow::new(400_000, 130_000).unwrap();
+        let launch = LaunchFences {
+            issued_at_unix_ms: window.issued_at_unix_ms,
+            expires_at_unix_ms: window.expires_at_unix_ms,
+            command_digest: "command".into(),
+        };
+        assert_eq!(launch.check(112_000, 111_000, None), None);
+        let cutoff = window.fence_cutoff(111_000);
+        store.fence_run(key(7, 1), cutoff).unwrap();
+        assert_eq!(store.reject_before(key(7, 1)), Some(530_000));
+        assert_eq!(
+            launch.check(112_000, store.reject_before(key(7, 1)).unwrap(), None),
+            Some(LaunchRefusal::Fenced),
+        );
+    }
+
+    #[test]
     fn a_launch_past_its_deadline_is_refused() {
         let fences = LaunchFences {
             issued_at_unix_ms: 100,
@@ -4423,6 +4443,36 @@ mod tests {
             HookState::Pending,
             "must not erase a real in-flight epilog debt"
         );
+    }
+
+    #[test]
+    fn a_still_valid_long_window_cannot_resurrect_a_released_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut original = run_with(7, 1, 1);
+        original.max_launch_expiry_unix_ms = 720_001;
+        store.admit_run(&original).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+        store.mark_controller_cancelled(key(7, 1)).unwrap();
+        store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+            .unwrap();
+        store.record_slice_released(key(7, 1)).unwrap();
+
+        store.admit_run(&run_with(7, 1, 120_002)).unwrap();
+        let retained = store.load_run(key(7, 1)).unwrap();
+        assert_eq!(retained.created_at_unix_ms, 1);
+        assert_eq!(retained.max_launch_expiry_unix_ms, 720_001);
+        assert_eq!(retained.state, RunState::Cleaned);
+        assert!(retained.cancelled_by_controller && retained.slice_released);
+        assert_eq!(retained.controller_ack.release_raft_index, Some(42));
+
+        store.admit_run(&run_with(7, 1, 720_002)).unwrap();
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().created_at_unix_ms,
+            720_002
+        );
+        assert_ne!(store.load_run(key(7, 1)).unwrap().state, RunState::Cleaned);
     }
 
     #[test]

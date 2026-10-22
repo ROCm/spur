@@ -5146,6 +5146,33 @@ impl SlurmAgent for AgentService {
         }))
     }
 
+    async fn request_node_ledger(
+        &self,
+        _request: Request<RequestNodeLedgerRequest>,
+    ) -> Result<Response<RequestNodeLedgerResponse>, Status> {
+        Err(Status::unimplemented(
+            "node ledger reconciliation is not yet wired on this agent",
+        ))
+    }
+
+    async fn fence_run(
+        &self,
+        _request: Request<FenceRunRequest>,
+    ) -> Result<Response<FenceRunResponse>, Status> {
+        Err(Status::unimplemented(
+            "run fencing is not yet wired on this agent",
+        ))
+    }
+
+    async fn settle_run(
+        &self,
+        _request: Request<SettleRunRequest>,
+    ) -> Result<Response<SettleRunResponse>, Status> {
+        Err(Status::unimplemented(
+            "run settlement is not yet wired on this agent",
+        ))
+    }
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
@@ -5209,6 +5236,7 @@ impl SlurmAgent for AgentService {
                         stdout_path: paths.0,
                         stderr_path: paths.1,
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                        conflict: None,
                     }));
                 }
                 Err(e) => return Err(map_exec_err(e)),
@@ -5292,6 +5320,7 @@ impl SlurmAgent for AgentService {
                     stdout_path: paths.0,
                     stderr_path: paths.1,
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                    conflict: None,
                 }));
             }
         }
@@ -5633,7 +5662,7 @@ impl SlurmAgent for AgentService {
         // The generation check is performed inside `allocate_local_resources`
         // under the same allocation lock as the allocate, so a refresh publish
         // cannot slip a newer topology between the check and the bind.
-        let (alloc_result, allocated_device_ids) = self
+        let reserved = self
             .allocate_local_resources(
                 job_id,
                 run_attempt,
@@ -5642,7 +5671,17 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
             )
-            .await?;
+            .await;
+        let (alloc_result, allocated_device_ids) = match reserved {
+            Ok(reserved) => reserved,
+            // An ordinary response, not a transport error, so it can carry the
+            // holder the controller's reconcile needs.
+            Err(LaunchRejection::Held(refusal)) => {
+                return Ok(Response::new(refusal.into_response()));
+            }
+            // Nothing this node holds to name; a plain RPC error as before.
+            Err(LaunchRejection::Failed(status)) => return Err(status),
+        };
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
@@ -5695,6 +5734,7 @@ impl SlurmAgent for AgentService {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     failure_kind: LaunchFailureKind::LaunchFailureProlog as i32,
+                    conflict: None,
                 }));
             }
         }
@@ -5912,6 +5952,7 @@ impl SlurmAgent for AgentService {
                             stdout_path: String::new(),
                             stderr_path: String::new(),
                             failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                            conflict: None,
                         }));
                     }
                 }
@@ -5973,6 +6014,7 @@ impl SlurmAgent for AgentService {
                         stdout_path: String::new(),
                         stderr_path: String::new(),
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                        conflict: None,
                     }));
                 }
 
@@ -6033,6 +6075,7 @@ impl SlurmAgent for AgentService {
                     stdout_path,
                     stderr_path,
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                    conflict: None,
                 }))
             }
             Err(e) => {
@@ -6053,6 +6096,7 @@ impl SlurmAgent for AgentService {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     failure_kind: failure_kind as i32,
+                    conflict: None,
                 }))
             }
         }
@@ -8895,6 +8939,74 @@ impl SlurmAgent for AgentService {
     }
 }
 
+/// A refusal the controller can resolve by looking at this node. Carried in a
+/// response, not a transport error, which has nowhere to say any of this.
+#[derive(Debug)]
+pub(crate) struct HeldRefusal {
+    message: String,
+    conflict: Option<LaunchConflict>,
+}
+
+impl HeldRefusal {
+    /// The node can say which job holds the resources, so the controller can
+    /// look that job up and decide which of the two is stale.
+    fn named(job_id: u32, run_attempt: u32, gpu_devices: Vec<u64>) -> Self {
+        Self {
+            message: format!("allocated resources are held on this node by job {job_id}"),
+            conflict: Some(LaunchConflict {
+                job_id,
+                run_attempt,
+                cpu_ids: Vec::new(),
+                gpu_devices,
+            }),
+        }
+    }
+
+    /// The node is holding something it cannot attribute to a job: only a full
+    /// ledger pull can tell the controller what.
+    fn unattributed(detail: &str) -> Self {
+        Self {
+            message: detail.to_string(),
+            conflict: None,
+        }
+    }
+
+    /// Derived from the conflict rather than stored beside it: an overlap the
+    /// controller is told to look up must always carry the job to look up.
+    pub(crate) fn kind(&self) -> LaunchFailureKind {
+        match self.conflict {
+            Some(_) => LaunchFailureKind::LaunchFailureLocalOverlap,
+            None => LaunchFailureKind::LaunchFailureResidualState,
+        }
+    }
+
+    pub(crate) fn into_response(self) -> LaunchJobResponse {
+        let failure_kind = self.kind() as i32;
+        LaunchJobResponse {
+            success: false,
+            error: self.message,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            failure_kind,
+            conflict: self.conflict,
+        }
+    }
+}
+
+/// Why a launch could not reserve its slice: something this node is holding,
+/// which the controller resolves by looking, or an error only it can act on.
+#[derive(Debug)]
+pub(crate) enum LaunchRejection {
+    Held(HeldRefusal),
+    Failed(Status),
+}
+
+impl From<Status> for LaunchRejection {
+    fn from(status: Status) -> Self {
+        Self::Failed(status)
+    }
+}
+
 impl AgentService {
     /// Self-drains this node in the background when `error` condemns it,
     /// without blocking the caller's own failure response on the RPC.
@@ -8997,7 +9109,7 @@ impl AgentService {
         allocated: Option<&ResourceAllocations>,
         cpus: u32,
         memory_mb: u64,
-    ) -> Result<(AllocationResult, Vec<u64>), Status> {
+    ) -> Result<(AllocationResult, Vec<u64>), LaunchRejection> {
         let controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -9010,7 +9122,8 @@ impl AgentService {
                 "job requests {} GPUs (type: {}) but controller sent no device IDs",
                 gres_gpu_count,
                 gres_gpu_type.as_deref().unwrap_or("any"),
-            )));
+            ))
+            .into());
         }
 
         // Hold running across the reclaim (running-then-allocation, as in commit)
@@ -9070,9 +9183,22 @@ impl AgentService {
                             "rejecting dispatch: controller-allocated GPUs already in use in the \
                              local allocation table by a still-running or launching job"
                         );
-                        return Err(Status::resource_exhausted(
-                            "controller-allocated GPUs unavailable on this node",
-                        ));
+                        // Named (arbitrarily, if more than one) so the controller
+                        // can look the holder up rather than guess which is stale.
+                        let holder = alloc
+                            .conflicting_owners(&controller_gpu_ids)
+                            .first()
+                            .copied();
+                        return Err(LaunchRejection::Held(match holder {
+                            Some(job_id) => HeldRefusal::named(
+                                job_id,
+                                alloc.owner_attempt(job_id).unwrap_or(0),
+                                alloc.owner_gpu_ids(job_id),
+                            ),
+                            None => HeldRefusal::unattributed(
+                                "controller-allocated GPUs unavailable on this node",
+                            ),
+                        }));
                     }
                 }
             }
@@ -9086,7 +9212,8 @@ impl AgentService {
                 );
                 return Err(Status::already_exists(format!(
                     "job {job_id} already has a launch in flight on this node"
-                )));
+                ))
+                .into());
             }
             Err(AllocError::Superseded) => {
                 // A newer attempt already reserved/committed this job id; this
@@ -9098,15 +9225,16 @@ impl AgentService {
                 );
                 return Err(Status::failed_precondition(format!(
                     "job {job_id} was superseded by a newer attempt on this node"
-                )));
+                ))
+                .into());
             }
-            // Only a replay of recorded cores can raise this; dispatch derives
-            // its own, so reaching here means the ledger disagrees with the node.
+            // Only a replay of recorded cores can raise this, and this node has
+            // no cheap way to say whose; unattributed is the honest answer.
             Err(AllocError::CpusUnavailable) => {
                 warn!(job_id, "rejecting launch: allocated cores unavailable");
-                return Err(Status::resource_exhausted(
+                return Err(LaunchRejection::Held(HeldRefusal::unattributed(
                     "allocated cores unavailable on this node",
-                ));
+                )));
             }
         };
 
@@ -9122,7 +9250,7 @@ impl AgentService {
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
-    ) -> Result<(AllocationResult, Vec<u64>), Status> {
+    ) -> Result<(AllocationResult, Vec<u64>), LaunchRejection> {
         let (cpus, memory_mb) = resolve_cgroup_budget(allocated, spec, 1);
         self.allocate_local_resources(job_id, 1, spec, allocated, cpus, memory_mb)
             .await
@@ -17301,8 +17429,11 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
-        let err = res.expect_err("must reject: the conflicting GPU owner is still running");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal =
+            held(res.expect_err("must reject: the conflicting GPU owner is still running"));
+        let conflict = refusal.conflict.expect("the holder is nameable");
+        assert_eq!(conflict.job_id, 99);
+        assert_eq!(conflict.gpu_devices, vec![0]);
     }
 
     // A still-launching conflicting owner is a real duplicate: the reclaim must
@@ -17347,8 +17478,14 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
-        let err = res.expect_err("must reject: the conflicting GPU owner is still launching");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal =
+            held(res.expect_err("must reject: the conflicting GPU owner is still launching"));
+        // A launch in flight is a live duplicate, not a claim to adjudicate, so
+        // the node names nobody and the controller looks at the whole ledger.
+        assert_eq!(
+            refusal.kind(),
+            LaunchFailureKind::LaunchFailureResidualState
+        );
 
         // The launching owner must NOT have been reclaimed.
         assert_eq!(
@@ -17356,6 +17493,28 @@ mod tests {
             0,
             "launching owner must be spared"
         );
+    }
+
+    fn held(rejection: LaunchRejection) -> HeldRefusal {
+        match rejection {
+            LaunchRejection::Held(refusal) => refusal,
+            LaunchRejection::Failed(status) => {
+                panic!("expected a refusal naming what the node holds, got {status:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn conflict_response_preserves_full_gpu_identity_on_the_wire() {
+        use prost::Message;
+
+        let gpu = u64::from(u32::MAX) + 17;
+        let response = HeldRefusal::named(99, 3, vec![gpu]).into_response();
+        let decoded = LaunchJobResponse::decode(response.encode_to_vec().as_slice()).unwrap();
+        let conflict = decoded.conflict.unwrap();
+        assert_eq!(conflict.job_id, 99);
+        assert_eq!(conflict.run_attempt, 3);
+        assert_eq!(conflict.gpu_devices, vec![gpu]);
     }
 
     fn gpu_alloc_request(device_ids: &[u64]) -> ResourceAllocations {
@@ -17439,8 +17598,14 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
-        let err = res.expect_err("must reject: GPU 1's owner is still running");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal = held(res.expect_err("must reject: GPU 1's owner is still running"));
+        let conflict = refusal
+            .conflict
+            .expect("the still-running owner is nameable");
+        assert_eq!(
+            conflict.job_id, 99,
+            "job 98 was reclaimed; 99 is left holding it"
+        );
     }
 
     // A registered srun allocation must be committed AND tracked in `running`

@@ -42,9 +42,36 @@ pub enum JobState {
 /// controller maps it to `JobState::OutOfMemory`; low bits keep the real signal.
 pub const OOM_SIGNAL_FLAG: i32 = 0x1000;
 
-/// How long a launch stays admissible. The controller stamps each launch's expiry
-/// with it; the agent keeps a cutoff this long so no launch it refuses outlives it.
+/// Minimum launch validity and the grace retained beyond a run's fence cutoff.
 pub const LAUNCH_LIFETIME_MS: u64 = 120_000;
+
+/// A reservation's immutable admission window must survive controller clock
+/// changes so a successor can fence every launch sent for that attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchWindow {
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+impl LaunchWindow {
+    pub fn new(issued_at_unix_ms: u64, valid_for_ms: u64) -> Option<Self> {
+        if issued_at_unix_ms == 0 || valid_for_ms == 0 {
+            return None;
+        }
+        let expires_at_unix_ms = issued_at_unix_ms.checked_add(valid_for_ms)?;
+        if expires_at_unix_ms == u64::MAX {
+            return None;
+        }
+        Some(Self {
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+        })
+    }
+
+    pub fn fence_cutoff(self, now_unix_ms: u64) -> u64 {
+        now_unix_ms.max(self.expires_at_unix_ms)
+    }
+}
 
 /// Which run of a job something names. Attempts start at 1, so a caller holding
 /// only a job id has to widen deliberately rather than pass a zero.
@@ -128,7 +155,7 @@ impl LedgerDisposition {
         matches!(self, Self::OverButCharged | Self::Unresolved)
     }
 
-    /// Whether a claim the controller has no record of may be answered by
+    /// Whether a claim -- recorded by Raft or not -- may be answered by
     /// settling it. Only a finished teardown proves there is nothing to end first.
     pub fn may_be_settled(self) -> bool {
         matches!(self, Self::OverButCharged)
@@ -864,6 +891,29 @@ pub struct NodeCompletion {
     pub signal: i32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RequeueKind {
+    Failure {
+        count_retry: bool,
+    },
+    Preempt,
+    User {
+        by: Option<crate::end_reason::Actor>,
+    },
+}
+
+/// A committed requeue must survive failover without losing the old run's
+/// allocation while its nodes finish their epilogs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredRequeue {
+    pub kind: RequeueKind,
+    pub ended_state: JobState,
+    pub pending_reason: PendingReason,
+    pub pending_reason_desc: Option<String>,
+    pub priority: Option<u32>,
+    pub begin_time: Option<DateTime<Utc>>,
+}
+
 /// Internal job record held by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -931,6 +981,17 @@ pub struct Job {
     /// Per-node exit codes reported while the job is in Completing.
     #[serde(default)]
     pub node_completions: HashMap<String, NodeCompletion>,
+
+    /// Allocated nodes that run an epilog, recorded when the run starts. The
+    /// node's own report or deregistration clears it before a requeue proceeds.
+    #[serde(default)]
+    pub epilog_gated_nodes: HashSet<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_requeue: Option<DeferredRequeue>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_window: Option<LaunchWindow>,
 
     /// Standalone srun: native step dispatch after allocation registration.
     #[serde(default)]
@@ -1074,6 +1135,9 @@ impl Job {
             het_job_id: None,
             het_group: None,
             node_completions: HashMap::new(),
+            epilog_gated_nodes: HashSet::new(),
+            deferred_requeue: None,
+            launch_window: None,
             time_limit_signaled_at: None,
             cancel_signaled_at: None,
             suspended_at: None,
@@ -1192,6 +1256,13 @@ impl Job {
     /// State to report to accounting for a finished run. A preempt-cancelled
     /// run ends PREEMPTED in `sacct` while its live state is CANCELLED.
     pub fn end_of_run_state(&self, final_state: JobState) -> JobState {
+        let final_state = if final_state == JobState::Requeued {
+            self.deferred_requeue
+                .as_ref()
+                .map_or(final_state, |request| request.ended_state)
+        } else {
+            final_state
+        };
         if self.cancel_signaled_at.is_some() && self.preempt_mode.as_deref() == Some("Cancel") {
             return JobState::Preempted;
         }
@@ -1206,7 +1277,24 @@ impl Job {
     /// Whether this node is still charged for this job. One definition, so the
     /// derived totals and the reconciled set cannot drift apart.
     pub fn is_held_on(&self, node: &str) -> bool {
-        self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
+        self.allocated_nodes.iter().any(|n| n == node)
+            && !self.node_completions.contains_key(node)
+            // A finalized run keeps its slice only where the node still owes an
+            // epilog: the tasks are gone, the hook the node runs after them is not.
+            && (!self.state.is_finalized() || self.epilog_gated_nodes.contains(node))
+    }
+
+    /// Whether this node still owes this run's epilog, so a report is expected
+    /// from it even once the job itself is finalized.
+    pub fn is_epilog_gated_on(&self, node: &str) -> bool {
+        self.epilog_gated_nodes.contains(node)
+    }
+
+    /// Whether a complete cut can discharge this run. Pending reservations may
+    /// still launch; finalized cleanup debt may come from a partial dispatch.
+    pub fn is_confirmed_on(&self, node: &str) -> bool {
+        (self.state.is_active() || (self.state.is_finalized() && self.is_epilog_gated_on(node)))
+            && self.is_held_on(node)
     }
 
     /// Whether a placement is already charged. `reserve_placement` charges while still
@@ -1578,7 +1666,10 @@ impl Job {
     /// resurrect a finished run.
     pub fn requeue_to_pending(&mut self) -> Result<(), JobTransitionError> {
         let ok = self.state.is_terminal()
-            || matches!(self.state, JobState::Running | JobState::Suspended);
+            || matches!(
+                self.state,
+                JobState::Running | JobState::Suspended | JobState::Requeued
+            );
         if !ok {
             return Err(JobTransitionError::Invalid {
                 from: self.state,
@@ -1587,6 +1678,20 @@ impl Job {
         }
         self.state = JobState::Pending;
         self.end_time = None;
+        Ok(())
+    }
+
+    /// Dependencies must keep waiting for a committed retry while its old
+    /// allocation remains charged to epilogs.
+    pub fn begin_requeue(&mut self) -> Result<(), JobTransitionError> {
+        let end_time = self.end_time;
+        // A reserved launch can be abandoned before activation, while a node
+        // that accepted it still owes cleanup.
+        if self.state != JobState::Pending {
+            self.requeue_to_pending()?;
+        }
+        self.state = JobState::Requeued;
+        self.end_time = end_time;
         Ok(())
     }
 
@@ -1608,6 +1713,16 @@ impl Job {
 mod tests {
     use super::*;
 
+    #[test]
+    fn launch_windows_require_a_finite_stamped_interval() {
+        for (issued, duration) in [(0, 120_000), (1, 0), (u64::MAX - 1, 1), (2, u64::MAX)] {
+            assert!(LaunchWindow::new(issued, duration).is_none());
+        }
+        let window = LaunchWindow::new(400_000, 130_000).unwrap();
+        assert_eq!(window.fence_cutoff(111_000), 530_000);
+        assert_eq!(window.fence_cutoff(600_000), 600_000);
+    }
+
     fn make_job() -> Job {
         Job::new(
             1,
@@ -1617,6 +1732,84 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    fn placed_job(state: JobState, gated: &[&str]) -> Job {
+        let mut job = make_job();
+        job.state = state;
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.epilog_gated_nodes = gated.iter().map(|n| (*n).to_string()).collect();
+        job
+    }
+
+    // A snapshot written before the gate existed must still restore: without the
+    // default, a controller replaying one crashes instead of reading it.
+    #[test]
+    fn a_job_recorded_before_the_gate_restores_with_none() {
+        const PRE_GATE_JOB: &str = r#"{"job_id":7,"spec":{"name":"fixture","partition":null,"account":null,"user":"alice","uid":1000,"gid":1000,"num_nodes":1,"num_tasks":1,"tasks_per_node":null,"cpus_per_task":1,"memory_per_node_mb":null,"memory_per_cpu_mb":null,"gres":[],"script":null,"argv":[],"script_args":[],"work_dir":"/home/alice","stdout_path":null,"stderr_path":null,"stdin_path":null,"environment":{},"time_limit":null,"time_min":null,"qos":null,"priority":null,"reservation":null,"dependency":[],"nodelist":null,"exclude":null,"constraint":null,"mpi":null,"distribution":null,"het_group":null,"array_spec":null,"array_job_id":null,"array_task_id":null,"array_max_concurrent":null,"requeue":false,"exclusive":false,"hold":false,"interactive":false,"mail_type":[],"mail_user":null,"comment":null,"wckey":null,"container_image":null,"container_mounts":[],"container_workdir":null,"container_name":null,"container_readonly":false,"container_mount_home":false,"container_env":{},"container_entrypoint":null,"container_remap_root":false,"burst_buffer":null,"begin_time":null,"deadline":null,"spread_job":false,"topology":null,"host_network":false,"privileged":false,"host_ipc":false,"shm_size":null,"extra_resources":{},"open_mode":null},"state":"RUNNING","pending_reason":"None","priority":1000,"submit_time":"2026-01-01T00:00:00Z","allocated_nodes":["n1"],"allocated_resources":{"cpus":2,"memory_mb":1000,"devices":{}}}"#;
+        let restored: Job =
+            serde_json::from_str(PRE_GATE_JOB).expect("a pre-gate job must deserialize");
+        assert!(restored.epilog_gated_nodes.is_empty());
+        assert!(restored.deferred_requeue.is_none());
+        assert!(restored.launch_window.is_none());
+        assert!(restored.is_held_on("n1"));
+    }
+
+    #[test]
+    fn a_finalized_run_keeps_only_the_nodes_that_still_owe_an_epilog() {
+        let job = placed_job(JobState::Cancelled, &["n1"]);
+        assert!(job.is_held_on("n1"), "the epilog is still running there");
+        assert!(
+            !job.is_held_on("n2"),
+            "a node with no epilog to wait for must be released at once"
+        );
+    }
+
+    #[test]
+    fn a_live_run_holds_every_node_it_was_placed_on() {
+        let job = placed_job(JobState::Running, &["n1"]);
+        assert!(job.is_held_on("n1"));
+        assert!(job.is_held_on("n2"), "the gate must not narrow a live run");
+    }
+
+    #[test]
+    fn a_report_ends_the_hold_even_where_the_gate_still_names_the_node() {
+        let mut job = placed_job(JobState::Cancelled, &["n1"]);
+        job.node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 0 });
+        assert!(!job.is_held_on("n1"));
+    }
+
+    #[test]
+    fn the_reconciler_can_see_a_run_finalized_while_a_node_still_owes_its_epilog() {
+        let job = placed_job(JobState::Cancelled, &["n1"]);
+        assert!(
+            job.is_confirmed_on("n1"),
+            "a hold no reconcile pass can reach is a hold with no way out"
+        );
+        assert!(!job.is_confirmed_on("n2"));
+    }
+
+    // A reservation is charged while still Pending, and the gate is written with
+    // it. Reading that as a confirmed launch lets a reconcile pass disown it.
+    #[test]
+    fn a_reservation_still_pending_is_not_confirmed_by_its_gate() {
+        let job = placed_job(JobState::Pending, &["n1"]);
+        assert!(job.is_held_on("n1"), "the reservation holds the slice");
+        assert!(
+            !job.is_confirmed_on("n1"),
+            "no agent has confirmed this launch; the cut cannot disown it"
+        );
+    }
+
+    #[test]
+    fn a_job_with_no_gate_is_held_exactly_as_before() {
+        let running = placed_job(JobState::Running, &[]);
+        let finalized = placed_job(JobState::Completed, &[]);
+        for node in ["n1", "n2"] {
+            assert!(running.is_held_on(node));
+            assert!(!finalized.is_held_on(node));
+        }
     }
 
     #[test]

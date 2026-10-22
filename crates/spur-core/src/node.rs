@@ -300,6 +300,37 @@ pub fn resolve_wal_node_source(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeStateCondition {
+    pub state: NodeState,
+    pub reason: Option<String>,
+    pub admin_locked: bool,
+    pub reason_uid: Option<u32>,
+    pub reason_time: Option<DateTime<Utc>>,
+}
+
+impl From<&Node> for NodeStateCondition {
+    fn from(node: &Node) -> Self {
+        Self {
+            state: node.state,
+            reason: node.state_reason.clone(),
+            admin_locked: node.admin_locked,
+            reason_uid: node.reason_uid,
+            reason_time: node.reason_time,
+        }
+    }
+}
+
+impl NodeStateCondition {
+    pub fn matches(&self, node: &Node) -> bool {
+        self.state == node.state
+            && self.reason == node.state_reason
+            && self.admin_locked == node.admin_locked
+            && self.reason_uid == node.reason_uid
+            && self.reason_time == node.reason_time
+    }
+}
+
 /// A compute node in the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -382,6 +413,13 @@ pub struct Node {
     /// Why this node blocked convergence when the cluster went `degraded` (surfaced in status).
     #[serde(default)]
     pub k0s_last_error: Option<String>,
+    /// A leader-local scheduling gate must disappear with its owning reconcile task.
+    #[serde(skip)]
+    pub reconcile_pending: bool,
+    /// Whether this node's agent runs an epilog after a run's tasks exit. False
+    /// for an agent that predates the declaration, which then never gates.
+    #[serde(default)]
+    pub runs_job_epilog: bool,
 }
 
 fn default_weight() -> u32 {
@@ -426,6 +464,8 @@ impl Node {
             k0s_mesh_ip: None,
             k0s_pod_cidr: None,
             k0s_last_error: None,
+            reconcile_pending: false,
+            runs_job_epilog: false,
         }
     }
 
@@ -448,9 +488,10 @@ impl Node {
         !(self.alloc_resources.cpus >= self.total_resources.cpus && self.total_resources.cpus > 0)
     }
 
-    /// Whether this node can accept new work.
+    /// Whether this node can accept new work. A node whose evidence the
+    /// controller has not reconciled may already hold work it has not declared.
     pub fn is_schedulable(&self) -> bool {
-        self.state.is_available()
+        self.state.is_available() && !self.reconcile_pending
     }
 
     /// Routable comm address (NodeAddr), when registered.
@@ -483,6 +524,48 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_node_awaiting_reconcile_takes_no_work() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.state = NodeState::Idle;
+        assert!(node.is_schedulable());
+
+        // It may already hold work it has not declared; dispatching into that
+        // window double-books it.
+        node.reconcile_pending = true;
+        assert!(!node.is_schedulable());
+
+        node.reconcile_pending = false;
+        assert!(node.is_schedulable());
+    }
+
+    #[test]
+    fn an_old_node_record_replays_ungated() {
+        let frozen = r#"{
+            "name":"n1", "state":"IDLE", "partitions":[],
+            "total_resources":{"cpus":4,"memory_mb":8192,"gpus":[],"generic":{}},
+            "alloc_resources":{"cpus":0,"memory_mb":0,"devices":{}},
+            "arch":"x86_64", "os":"linux", "cpu_load":0,
+            "free_memory_mb":8192, "port":6818
+        }"#;
+        let node: Node = serde_json::from_str(frozen).expect("an older record must still load");
+        assert!(!node.runs_job_epilog);
+        assert!(!node.reconcile_pending);
+        assert!(node.is_schedulable());
+    }
+
+    #[test]
+    fn reconcile_task_gate_is_not_restored_from_a_snapshot() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        node.reconcile_pending = true;
+        node.runs_job_epilog = true;
+        let encoded = serde_json::to_value(node).expect("serialize");
+        assert!(encoded.get("reconcile_pending").is_none());
+        let restored: Node = serde_json::from_value(encoded).expect("deserialize");
+        assert!(!restored.reconcile_pending);
+        assert!(restored.runs_job_epilog);
+    }
 
     #[test]
     fn is_k0s_reserved_tracks_role_assignment() {

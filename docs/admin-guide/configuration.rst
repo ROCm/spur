@@ -321,6 +321,11 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        bounded only by this value. A node that exceeds it is skipped for new
        dispatch for the same span, and is not marked down, so it still
        appears available in ``sinfo`` while being skipped.
+       Independently, a reservation commits a finite admission window of
+       120 seconds plus twice this value for ``LaunchJob`` and
+       ``RegisterJobAllocation``. With ``0`` the RPC wait is unbounded, but
+       admission remains valid for 120 seconds. Agent enforcement of these
+       fields is pending; see :doc:`../developer/allocation-reconciliation`.
 
        Also sets how long a newly elected leader waits before reclaiming a
        placement reserved by a dispatch the previous leader never

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::admission::AdmissionToken;
 use crate::job::{JobId, JobSpec, JobState, PendingReason};
 use crate::k0s::{K0sPhase, K0sRole};
-use crate::node::{NodeSource, NodeState};
+use crate::node::{NodeSource, NodeState, NodeStateCondition};
 use crate::partition::Partition;
 use crate::reservation::Reservation;
 use std::collections::HashMap;
@@ -15,6 +15,11 @@ use crate::resource::{ResourceAllocations, ResourceSet};
 
 fn default_port() -> u16 {
     6818
+}
+
+/// The only eviction an entry from before the reason field could carry.
+fn evicted_after_launch_failure() -> PendingReason {
+    PendingReason::JobLaunchFailure
 }
 
 /// All state-mutating operations that get logged to the Raft log.
@@ -70,6 +75,10 @@ pub enum WalOperation {
         /// `Job` field is what survives snapshot and failover.
         #[serde(default)]
         idle_fill: bool,
+        /// Paired with `at` so replay never derives launch validity from its
+        /// own clock or configuration. Missing on older reservations.
+        #[serde(default)]
+        launch_valid_for_ms: Option<u64>,
         /// Stamped on the leader so a replay dates the run from the dispatch
         /// rather than from its own clock. `None` in pre-upgrade entries.
         #[serde(default)]
@@ -264,9 +273,15 @@ pub enum WalOperation {
     /// job's assigned nodes never received the launch dispatch.
     JobEvict {
         job_id: JobId,
+        #[serde(default)]
+        run_attempt: Option<u32>,
         /// Human-readable bootstrap failure (shown via scontrol / logs).
         #[serde(default)]
         detail: Option<String>,
+        /// Why the run is coming off its nodes. Decides whether the requeue takes
+        /// the launch backoff, so a run that did launch must not claim one.
+        #[serde(default = "evicted_after_launch_failure")]
+        reason: PendingReason,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -293,6 +308,10 @@ pub enum WalOperation {
         labels: HashMap<String, String>,
         #[serde(default)]
         source: NodeSource,
+        /// Whether this node runs an epilog after a run's tasks exit. Absent from
+        /// a pre-declaration entry, which replays as a node that never gates.
+        #[serde(default)]
+        runs_job_epilog: bool,
     },
     NodeUpdate {
         name: String,
@@ -305,9 +324,15 @@ pub enum WalOperation {
         version: String,
         #[serde(default)]
         source: NodeSource,
+        /// Whether this node runs an epilog after a run's tasks exit. `None`
+        /// leaves the recorded answer alone for updates unrelated to registration.
+        #[serde(default)]
+        runs_job_epilog: Option<bool>,
     },
     NodeStateChange {
         name: String,
+        #[serde(default)]
+        expected: Option<NodeStateCondition>,
         old_state: NodeState,
         new_state: NodeState,
         reason: Option<String>,
@@ -564,6 +589,7 @@ impl WalOperation {
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            launch_valid_for_ms: None,
             at: None,
         }
     }
@@ -1122,14 +1148,33 @@ mod tests {
                 srun_step_dispatch,
                 run_attempt,
                 idle_fill,
+                launch_valid_for_ms,
                 ..
             } => {
                 assert_eq!(job_id, 5);
                 assert!(!srun_step_dispatch);
                 assert_eq!(run_attempt, 1);
                 assert!(!idle_fill, "an entry without the field defaults to false");
+                assert!(launch_valid_for_ms.is_none());
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn a_dated_reservation_without_launch_validity_remains_unknown() {
+        let frozen = r#"{"JobStart":{"job_id":7,"nodes":["n1"],"resources":{"cpus":1,"memory_mb":0,"devices":{}},"run_attempt":1,"at":"1970-01-01T00:06:40Z"}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).unwrap();
+        match op {
+            WalOperation::JobStart {
+                at,
+                launch_valid_for_ms,
+                ..
+            } => {
+                assert!(at.is_some());
+                assert!(launch_valid_for_ms.is_none());
+            }
+            _ => panic!("wrong operation"),
         }
     }
 
@@ -1143,6 +1188,7 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt: 2,
             idle_fill: true,
+            launch_valid_for_ms: None,
             at: None,
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1824,7 +1870,9 @@ mod evict_wal_tests {
     fn job_evict_op_round_trips() {
         let op = WalOperation::JobEvict {
             job_id: 9,
+            run_attempt: Some(2),
             detail: Some("PMIx prepare failed".into()),
+            reason: PendingReason::JobLaunchFailure,
             at: None,
         };
         let json = serde_json::to_string(&op).unwrap();
@@ -1848,6 +1896,43 @@ mod evict_wal_tests {
                 assert_eq!(job_id, 42);
                 assert_eq!(detail, "PMIx prepare failed: n1: connect failed");
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // A pre-upgrade entry never named a reason; every one it could carry was a
+    // launch failure, so that is the only default a replay may assume.
+    #[test]
+    fn a_pre_reason_evict_entry_defaults_to_launch_failure() {
+        let frozen = r#"{"JobEvict":{"job_id":9,"detail":"PMIx prepare failed"}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).expect("must deserialize");
+        match op {
+            WalOperation::JobEvict {
+                reason,
+                run_attempt,
+                ..
+            } => {
+                assert_eq!(reason, PendingReason::JobLaunchFailure);
+                assert_eq!(run_attempt, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pre_ledger_node_entries_restore_without_epilog_capability() {
+        let register = r#"{"NodeRegister":{"name":"n1","resources":{"cpus":4,"memory_mb":8192,"gpus":[],"generic":{}},"address":"192.0.2.1"}}"#;
+        let update = r#"{"NodeUpdate":{"name":"n1","resources":{"cpus":4,"memory_mb":8192,"gpus":[],"generic":{}},"address":"192.0.2.1","port":6818,"wg_pubkey":"","version":"0.15.0"}}"#;
+        match serde_json::from_str::<WalOperation>(register).expect("legacy register") {
+            WalOperation::NodeRegister {
+                runs_job_epilog, ..
+            } => assert!(!runs_job_epilog),
+            _ => panic!("wrong variant"),
+        }
+        match serde_json::from_str::<WalOperation>(update).expect("legacy update") {
+            WalOperation::NodeUpdate {
+                runs_job_epilog, ..
+            } => assert_eq!(runs_job_epilog, None),
             _ => panic!("wrong variant"),
         }
     }
@@ -1880,6 +1965,15 @@ mod evict_wal_tests {
                 assert_eq!(restored.name, "hostname");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+    #[test]
+    fn a_node_state_change_before_conditions_remains_unconditional() {
+        let frozen = r#"{"NodeStateChange":{"name":"n1","old_state":"IDLE","new_state":"DRAIN","reason":"maintenance","admin_locked":true,"reason_uid":1000,"reason_time":null}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).expect("old node state change");
+        match op {
+            WalOperation::NodeStateChange { expected, .. } => assert!(expected.is_none()),
+            _ => panic!("wrong operation"),
         }
     }
 }
