@@ -267,6 +267,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     // victim goes first and the dearer one follows a second later anyway. Remember
     // which reclaimer has capacity in flight and leave it alone until it lands.
     let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
+    let mut was_leader = false;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -286,7 +287,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             // A former leader must not keep serving planned-reservation info
             // from before it lost leadership.
             relinquish_leadership(&cluster, &mut scheduler);
+            was_leader = false;
             continue;
+        }
+
+        if !was_leader {
+            // Lossy: a concurrent record_submitted may be wiped. increase() absorbs the reset.
+            cluster.reset_karma_stats();
+            was_leader = true;
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop

@@ -17,6 +17,7 @@ pub mod auth;
 pub mod jobs;
 pub mod jobs_users_accts;
 pub mod k8s_cluster;
+pub mod karma;
 pub mod nodes;
 pub mod partitions;
 pub mod rpc;

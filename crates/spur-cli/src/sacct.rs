@@ -123,6 +123,7 @@ pub fn sacct_header(spec: char) -> &'static str {
         'm' => "PreemptMode",
         'q' => "PreemptQOS",
         'W' => "Borrowed",
+        'G' => "ReqGPUS",
         'r' => "Reason",
         'z' => "ReasonDetail",
         'e' => "EndedBy",
@@ -154,6 +155,7 @@ fn sacct_field_spec(name: &str) -> Option<char> {
         "preemptmode" => Some('m'),
         "preemptqos" => Some('q'),
         "borrowed" => Some('W'),
+        "reqgpus" => Some('G'),
         "reason" => Some('r'),
         "reasondetail" => Some('z'),
         "endedby" => Some('e'),
@@ -304,6 +306,7 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         // Whether the run took borrowed capacity. Same letter as squeue's %W so the
         // two commands agree on how to ask.
         'W' => if job.idle_fill { "yes" } else { "no" }.into(),
+        'G' => job.req_gpus.to_string(),
         'r' => {
             if job.end_reason.is_empty() {
                 "N/A".into()
@@ -508,6 +511,13 @@ mod tests {
     }
 
     #[test]
+    fn reqgpus_resolved() {
+        let mut j = job(0, 0, 0);
+        j.req_gpus = 4;
+        assert_eq!(resolve_sacct_field(&j, 'G'), "4");
+    }
+
+    #[test]
     fn every_named_field_resolves_to_a_header_and_a_value() {
         // A field is only usable when all three registrations agree: the name -> letter
         // lookup, the letter -> header name, and the letter -> value resolver. Half-
@@ -539,6 +549,7 @@ mod tests {
             "reason",
             "reasondetail",
             "endedby",
+            "reqgpus",
         ];
         let job = JobInfo::default();
         for name in names {

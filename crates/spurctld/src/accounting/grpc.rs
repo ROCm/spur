@@ -326,6 +326,7 @@ impl SlurmAccounting for AccountingService {
                 // The external accounting RPC carries no idle-fill notion; a run
                 // recorded through it is treated as an ordinary one.
                 idle_fill: false,
+                time_limit_secs: None,
             },
         )
         .await
@@ -445,7 +446,10 @@ impl SlurmAccounting for AccountingService {
                 submit_time: Some(datetime_to_proto(r.submit_time)),
                 start_time: r.start_time.map(datetime_to_proto),
                 end_time: r.end_time.map(datetime_to_proto),
-                time_limit: None,
+                time_limit: r.time_limit_secs.map(|s| prost_types::Duration {
+                    seconds: s,
+                    nanos: 0,
+                }),
                 run_time: match (r.start_time, r.end_time) {
                     (Some(s), Some(e)) => Some(prost_types::Duration {
                         seconds: (e - s).num_seconds(),
@@ -473,7 +477,7 @@ impl SlurmAccounting for AccountingService {
                 reservation: r.reservation.clone(),
                 comment: String::new(),
                 srun_step_dispatch: false,
-                req_gpus: 0,
+                req_gpus: r.total_gpus as u32,
                 req_gpus_detail: String::new(),
                 preempted_by: r.preempted_by.unwrap_or(0),
                 preempt_mode: r.preempt_mode.clone(),

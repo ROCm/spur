@@ -1,0 +1,85 @@
+# Prometheus recording rules for karma sub-scores and composite.
+# Uses native Spur counters from /metrics/jobs-users-accts (requires
+# metrics.high_cardinality = true). Label key is {username}.
+#
+# Every sub-score is aggregated `by (username)` so all dimensions share
+# the same label set. This handles scrape labels (instance, job) on
+# counter terms and the failover case (one series per leader term).
+# NaN from 0/0 is dropped via `> -Inf` before the `or` fallback.
+
+groups:
+  - name: karma_subscores
+    interval: 30s
+    rules:
+      # --- 1. Reliability (30%) ---
+      - record: karma:reliability
+        expr: |
+          (
+            sum by (username) (increase(spur_karma_jobs_completed_total[30d]))
+            / (
+              sum by (username) (increase(spur_karma_jobs_completed_total[30d]))
+              + sum by (username) (increase(spur_karma_jobs_failed_total[30d]))
+              + sum by (username) (increase(spur_karma_jobs_timeout_total[30d]))
+            )
+          ) > -Inf
+          or max by (username) (spur_karma_jobs_submitted_total * 0 + 1)
+
+      # --- 2. GPU Utilization (30%) ---
+      # Relabeled to {username} and re-aggregated to drop job_user.
+      - record: karma:gpu_utilization
+        expr: |
+          avg by (username) (
+            label_replace(
+              avg by (job_user) (
+                {__name__=~"(amd_)?gpu_gfx_activity", job_user!=""}
+              ) / 100,
+              "username", "$1", "job_user", "(.*)"
+            )
+          )
+
+      # --- 3. Wall Time Accuracy (15%) ---
+      - record: karma:walltime_accuracy
+        expr: |
+          (
+            clamp(
+              sum by (username) (increase(spur_karma_walltime_actual_seconds_total[30d]))
+              / sum by (username) (increase(spur_karma_walltime_requested_seconds_total[30d])),
+              0, 1
+            ) > -Inf
+          ) or max by (username) (spur_karma_jobs_submitted_total * 0 + 1)
+
+      # --- 4. Citizenship (15%) ---
+      - record: karma:citizenship
+        expr: |
+          (
+            clamp_min(
+              1 - (
+                sum by (username) (increase(spur_karma_overflow_borrows_total[30d]))
+                / sum by (username) (increase(spur_karma_jobs_submitted_total[30d]))
+              ),
+              0
+            ) > -Inf
+          ) or max by (username) (spur_karma_jobs_submitted_total * 0 + 1)
+
+      # --- 5. Cancellation Rate (10%) ---
+      - record: karma:cancellation_rate
+        expr: |
+          clamp(
+            (
+              sum by (username) (increase(spur_karma_jobs_cancelled_total[30d]))
+              / sum by (username) (increase(spur_karma_jobs_submitted_total[30d]))
+            ) > -Inf,
+            0, 1
+          ) or max by (username) (spur_karma_jobs_submitted_total * 0)
+
+  - name: karma_composite
+    interval: 30s
+    rules:
+      # All sub-scores are {username} only.
+      - record: karma:score
+        expr: |
+          0.30 * (karma:reliability or max by (username) (spur_karma_jobs_submitted_total * 0 + 1))
+          + 0.30 * (karma:gpu_utilization or max by (username) (spur_karma_jobs_submitted_total * 0 + 0.5))
+          + 0.15 * (karma:walltime_accuracy or max by (username) (spur_karma_jobs_submitted_total * 0 + 1))
+          + 0.15 * (karma:citizenship or max by (username) (spur_karma_jobs_submitted_total * 0 + 1))
+          + 0.10 * (1 - (karma:cancellation_rate or max by (username) (spur_karma_jobs_submitted_total * 0)))
