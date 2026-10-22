@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use spur_core::device::Device;
+use spur_core::job_usage::JobUsage;
 use spur_core::resource::ResourceSet;
 use spur_devices::DeviceRegistry;
 use spur_proto::proto::{
@@ -18,6 +19,8 @@ use spur_proto::proto::{
 use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+use crate::job_resources::JobUsageSampler;
 
 /// Channel dial/keepalive and RPC/failover timeouts a [`NodeReporter`] applies to every
 /// controller connection. A caller with its own config (spurd's `[spurd]` section) should
@@ -136,6 +139,8 @@ pub struct NodeReporter {
     /// Random per process, so the controller can keep a deleted node out until spurd restarts.
     agent_instance: String,
     deleted_logged: std::sync::atomic::AtomicBool,
+    /// Carries each job's disk totals between heartbeats.
+    usage_sampler: std::sync::Mutex<JobUsageSampler>,
     /// Wakes `heartbeat_loop` early, so blocked reserved CPUs under a changed
     /// layout reach the controller at once rather than up to a period late.
     heartbeat_now: tokio::sync::Notify,
@@ -189,6 +194,7 @@ impl NodeReporter {
             fences: RwLock::new(Fences::default()),
             agent_instance: uuid::Uuid::new_v4().simple().to_string(),
             deleted_logged: std::sync::atomic::AtomicBool::new(false),
+            usage_sampler: std::sync::Mutex::new(JobUsageSampler::default()),
             heartbeat_now: tokio::sync::Notify::new(),
         }
     }
@@ -789,7 +795,14 @@ impl NodeReporter {
         self.free_memory_mb.store(free_mem, Ordering::Relaxed);
         let held = self.held_jobs().await;
         let running_jobs_incomplete = held.is_none();
-        let running_jobs = build_running_jobs(held.unwrap_or_default(), &self.held_job_gpu_ids());
+        let held = held.unwrap_or_default();
+        let held_ids: Vec<u32> = held.iter().map(|&(job_id, _)| job_id).collect();
+        let usage = lock_recover(&self.usage_sampler).sample(
+            Path::new(crate::executor::CGROUP_ROOT),
+            Path::new("/proc"),
+            &held_ids,
+        );
+        let running_jobs = build_running_jobs(held, &self.held_job_gpu_ids(), &usage);
         spur_proto::proto::HeartbeatRequest {
             hostname: self.hostname.clone(),
             cpu_load: load,
@@ -870,16 +883,31 @@ async fn next_heartbeat(interval: &mut tokio::time::Interval, wake: &tokio::sync
 
 /// The heartbeat's per-job status list. Each job carries its run and translated GPU
 /// stable_ids, so the controller can reclaim that run and converge its used-view.
+/// Usage fields stay unset for a job with no sample.
 fn build_running_jobs(
     held: Vec<(u32, u32)>,
     gpu_ids: &HashMap<u32, Vec<u64>>,
+    usage: &[JobUsage],
 ) -> Vec<RunningJobStatus> {
+    let usage_by_job: HashMap<u32, &JobUsage> =
+        usage.iter().map(|usage| (usage.job_id, usage)).collect();
     held.into_iter()
-        .map(|(job_id, run_attempt)| RunningJobStatus {
-            job_id,
-            run_attempt,
-            gpu_stable_ids: gpu_ids.get(&job_id).cloned().unwrap_or_default(),
-            ..Default::default()
+        .map(|(job_id, run_attempt)| {
+            let mut status = RunningJobStatus {
+                job_id,
+                run_attempt,
+                gpu_stable_ids: gpu_ids.get(&job_id).cloned().unwrap_or_default(),
+                ..Default::default()
+            };
+            if let Some(usage) = usage_by_job.get(&job_id) {
+                status.cpu_usage_usec = Some(usage.cpu_usage_usec);
+                status.rss_bytes = Some(usage.rss_bytes);
+                status.virtual_bytes = Some(usage.virtual_bytes);
+                status.swap_bytes = Some(usage.swap_bytes);
+                status.disk_read_bytes = Some(usage.disk_read_bytes);
+                status.disk_write_bytes = Some(usage.disk_write_bytes);
+            }
+            status
         })
         .collect()
 }
@@ -2970,7 +2998,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let mut jobs = build_running_jobs(held, &gpu_ids);
+        let mut jobs = build_running_jobs(held, &gpu_ids, &[]);
         jobs.sort_by_key(|j| j.job_id);
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].job_id, 7);
@@ -2985,6 +3013,31 @@ mod tests {
             jobs[1].gpu_stable_ids.is_empty(),
             "a job with no GPUs carries an empty list"
         );
+        assert_eq!(jobs[0].cpu_usage_usec, None);
+    }
+
+    #[test]
+    fn build_running_jobs_copies_cgroup_usage_and_leaves_unsampled_jobs_unset() {
+        let usage = vec![JobUsage {
+            job_id: 7,
+            cpu_usage_usec: 11,
+            rss_bytes: 22,
+            virtual_bytes: 33,
+            swap_bytes: 44,
+            disk_read_bytes: 55,
+            disk_write_bytes: 66,
+        }];
+        let jobs = build_running_jobs(vec![(7, 1), (9, 1)], &HashMap::new(), &usage);
+        let seven = jobs.iter().find(|job| job.job_id == 7).unwrap();
+        assert_eq!(seven.cpu_usage_usec, Some(11));
+        assert_eq!(seven.rss_bytes, Some(22));
+        assert_eq!(seven.virtual_bytes, Some(33));
+        assert_eq!(seven.swap_bytes, Some(44));
+        assert_eq!(seven.disk_read_bytes, Some(55));
+        assert_eq!(seven.disk_write_bytes, Some(66));
+        let nine = jobs.iter().find(|job| job.job_id == 9).unwrap();
+        assert_eq!(nine.cpu_usage_usec, None);
+        assert_eq!(nine.disk_write_bytes, None);
     }
 
     #[test]
