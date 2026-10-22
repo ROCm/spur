@@ -74,6 +74,8 @@ pub struct JobFinalized {
     pub job_id: u32,
     pub state: JobState,
     pub exit_code: i32,
+    #[serde(default)]
+    pub actual_secs: u64,
     /// Computed in apply, so a later entry cannot change it before the
     /// accounting write reads it.
     #[serde(skip)]
@@ -86,11 +88,36 @@ pub struct JobFinalized {
 
 impl JobFinalized {
     pub fn for_job(job: &Job, state: JobState, exit_code: i32) -> Self {
+        let actual_secs = match (job.start_time, job.end_time) {
+            (Some(s), Some(e)) => (e - s).num_seconds().max(0) as u64,
+            _ => 0,
+        };
         let (reason, reason_detail) = job.end_reason(state);
         Self {
             job_id: job.job_id,
             state,
             exit_code,
+            actual_secs,
+            reason,
+            reason_detail,
+            ended_by: job.ended_by(reason).cloned(),
+        }
+    }
+
+    /// Like `for_job` but with a pre-computed elapsed time. Used by requeue
+    /// paths that clear timestamps before constructing the finalized record.
+    pub fn for_job_with_elapsed(
+        job: &Job,
+        state: JobState,
+        exit_code: i32,
+        elapsed_secs: u64,
+    ) -> Self {
+        let (reason, reason_detail) = job.end_reason(state);
+        Self {
+            job_id: job.job_id,
+            state,
+            exit_code,
+            actual_secs: elapsed_secs,
             reason,
             reason_detail,
             ended_by: job.ended_by(reason).cloned(),

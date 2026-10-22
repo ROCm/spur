@@ -181,6 +181,7 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason_detail TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ended_by TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ended_by_uid BIGINT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS time_limit_min INTEGER;
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -308,6 +309,8 @@ pub struct JobStartRecord {
     /// can tell which runs were opportunistic, and read back when the run ends to
     /// decide whether fairshare should be charged for it.
     pub idle_fill: bool,
+    /// Wall-clock time limit the user requested, in minutes. `None` when unlimited.
+    pub time_limit_min: Option<i32>,
 }
 
 /// Record a job start in the database.
@@ -321,8 +324,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill, nodelist)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15, $16)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill, nodelist, time_limit_min)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15, $16, $17)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -343,6 +346,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             end_time = NULL,
             idle_fill = EXCLUDED.idle_fill,
             nodelist = EXCLUDED.nodelist,
+            time_limit_min = EXCLUDED.time_limit_min,
             -- A requeued job starts again on the same row, so provenance from the
             -- run that was evicted must be cleared or the job reads as
             -- `COMPLETED, PreemptMode=Requeue` forever once it finally succeeds.
@@ -373,6 +377,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.reservation.as_deref().unwrap_or_default())
     .bind(rec.idle_fill)
     .bind(&rec.nodelist)
+    .bind(rec.time_limit_min)
     .execute(&mut *conn)
     .await?;
 
@@ -620,6 +625,8 @@ pub struct JobRecord {
     pub preempt_qos: String,
     /// True when the run took borrowed capacity rather than the job's own quota.
     pub idle_fill: bool,
+    pub total_gpus: i32,
+    pub time_limit_min: Option<i32>,
     pub reason: String,
     pub reason_detail: String,
     pub ended_by: String,
@@ -648,8 +655,8 @@ pub async fn get_job_history(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
          submit_time, start_time, end_time, reservation, \
-         preempted_by, preempt_mode, preempt_qos, idle_fill, reason, reason_detail, \
-         ended_by, ended_by_uid \
+         preempted_by, preempt_mode, preempt_qos, idle_fill, total_gpus, time_limit_min, \
+         reason, reason_detail, ended_by, ended_by_uid \
          FROM jobs WHERE 1=1",
     );
 
@@ -712,6 +719,8 @@ pub async fn get_job_history(
             preempt_mode: row.get("preempt_mode"),
             preempt_qos: row.get("preempt_qos"),
             idle_fill: row.get("idle_fill"),
+            total_gpus: row.get("total_gpus"),
+            time_limit_min: row.get("time_limit_min"),
             reason: row.get("reason"),
             reason_detail: row.get("reason_detail"),
             ended_by: row.get("ended_by"),
@@ -1853,6 +1862,7 @@ mod job_history_tests {
                 reservation: Some(reservation.to_string()),
                 nodelist: String::new(),
                 idle_fill: false,
+                time_limit_min: None,
             },
         )
         .await
@@ -1927,6 +1937,7 @@ mod job_history_tests {
                 reservation: Some(String::new()),
                 nodelist: String::new(),
                 idle_fill: false,
+                time_limit_min: None,
             },
         )
         .await?;
@@ -2228,6 +2239,7 @@ mod job_history_tests {
             reservation: None,
             nodelist: nodelist.to_string(),
             idle_fill: false,
+            time_limit_min: None,
         };
         let history = |pool: PgPool| async move {
             get_job_history(
@@ -4244,6 +4256,87 @@ mod job_history_tests {
             .bind(&account)
             .execute(&pool)
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn time_limit_min_round_trips_through_db() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let timed = test_job_id(90);
+        let unlimited = test_job_id(91);
+        delete_jobs(&pool, &[timed, unlimited]).await?;
+        let now = Utc::now();
+
+        let mut conn = pool.acquire().await?;
+        record_job_start(
+            &mut conn,
+            &JobStartRecord {
+                job_id: timed,
+                name: "timed".to_string(),
+                user: "karma-test".to_string(),
+                account: String::new(),
+                partition: String::new(),
+                qos: String::new(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                memory_mb: 0,
+                submit_time: now,
+                start_time: now,
+                reservation: None,
+                idle_fill: false,
+                nodelist: String::new(),
+                total_gpus: 4,
+                time_limit_min: Some(30),
+            },
+        )
+        .await?;
+        drop(conn);
+
+        let mut conn = pool.acquire().await?;
+        record_job_start(
+            &mut conn,
+            &JobStartRecord {
+                job_id: unlimited,
+                name: "unlimited".to_string(),
+                user: "karma-test".to_string(),
+                account: String::new(),
+                partition: String::new(),
+                qos: String::new(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                memory_mb: 0,
+                submit_time: now,
+                start_time: now,
+                reservation: None,
+                idle_fill: false,
+                nodelist: String::new(),
+                total_gpus: 0,
+                time_limit_min: None,
+            },
+        )
+        .await?;
+        drop(conn);
+
+        let records = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                user: Some("karma-test"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let rec_timed = records.iter().find(|r| r.job_id == timed).unwrap();
+        let rec_unlimited = records.iter().find(|r| r.job_id == unlimited).unwrap();
+
+        assert_eq!(rec_timed.time_limit_min, Some(30));
+        assert_eq!(rec_timed.total_gpus, 4);
+        assert_eq!(rec_unlimited.time_limit_min, None);
+        assert_eq!(rec_unlimited.total_gpus, 0);
+
+        delete_jobs(&pool, &[timed, unlimited]).await?;
         Ok(())
     }
 }

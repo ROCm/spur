@@ -22,6 +22,7 @@ subtrees:
               - file: admin-guide/accounting
               - file: admin-guide/idle-fill-scheduling
               - file: admin-guide/dme-integration
+              - file: admin-guide/karma-scoring
       - file: deployment/index
         subtrees:
           - entries:
