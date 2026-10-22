@@ -1183,6 +1183,7 @@ pub fn validate_hello(
     }
 }
 
+#[cfg(test)]
 pub async fn accept_hello(
     listener: &UnixListener,
     descriptor: &StepdDescriptor,
