@@ -470,6 +470,7 @@ fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
 }
 
 impl RunningJob {
+    #[cfg(test)]
     pub fn managed(child: tokio::process::Child) -> Self {
         Self::Managed { child }
     }

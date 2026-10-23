@@ -1300,6 +1300,11 @@ mod tests {
             sanitize_name("docker://nvcr.io/nvidia/pytorch:24.01"),
             "nvcr.io+nvidia+pytorch+24.01"
         );
+        assert_eq!(
+            sanitize_name("registry.example.com/org/image:v1.2.3"),
+            "registry.example.com+org+image+v1.2.3"
+        );
+        assert_eq!(sanitize_name("alpine"), "alpine");
     }
 
     #[test]

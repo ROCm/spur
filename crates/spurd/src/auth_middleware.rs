@@ -48,6 +48,7 @@ pub struct AgentAuthLayer {
 }
 
 impl AgentAuthLayer {
+    #[cfg(test)]
     pub fn new(mode: AuthMode, jwt_key: &str) -> Self {
         Self::from_bearer(BearerAuth::jwt(mode, jwt_key.as_bytes()))
     }
