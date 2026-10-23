@@ -1902,7 +1902,9 @@ pub(crate) fn monitor_recovered_stepds(
 
 const WORKLOAD_DEATH_POLLS: u32 = 20;
 const WORKLOAD_DEATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-const WORKLOAD_PID_POLLS: u32 = 40;
+/// Sized like the other supervisor exchanges rather than a launch's typical
+/// latency: a loaded node can stall the fork well past a second.
+const WORKLOAD_PID_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const WORKLOAD_PID_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// A supervisor that dies before pushing completion leaves no other record, so
@@ -3165,30 +3167,89 @@ fn is_live_workload(snapshot: &crate::stepd::StepdSnapshot) -> bool {
 /// start serving requests until that fork (openpty, container rootfs staging,
 /// priv drop for a fresh container) has finished, so an early query can race
 /// a supervisor that is not listening yet — that is a "not ready", not a
-/// "never will be", so it is retried like a bare `job_pid == 0` rather than
-/// aborting the whole poll on its first attempt.
-async fn supervised_step_workload_pid(descriptor: &crate::stepd::StepdDescriptor) -> Option<u32> {
-    for _ in 0..WORKLOAD_PID_POLLS {
-        match crate::stepd::query_state(descriptor, uuid::Uuid::new_v4().to_string()).await {
-            Ok(snapshot) if snapshot.job_pid > 0 => return Some(snapshot.job_pid as u32),
-            Ok(_) => {}
-            Err(error) => {
-                trace!(
-                    job_id = descriptor.job_id,
-                    step_id = descriptor.step_id,
-                    %error,
-                    "workload pid query did not answer yet; retrying"
-                );
+/// "never will be", so it is retried like a bare `job_pid == 0` until the
+/// supervisor process itself is gone or `WORKLOAD_PID_DEADLINE` passes.
+async fn supervised_step_workload_pid(
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> Result<u32, WorkloadPidUnavailable> {
+    let mut last = WorkloadPidProbe::NeverAnswered;
+    let polled = tokio::time::timeout(WORKLOAD_PID_DEADLINE, async {
+        loop {
+            match crate::stepd::query_state(descriptor, uuid::Uuid::new_v4().to_string()).await {
+                Ok(snapshot) if snapshot.job_pid > 0 => return Ok(snapshot.job_pid as u32),
+                Ok(_) => last = WorkloadPidProbe::NoPidYet,
+                Err(error) => {
+                    if matches!(
+                        crate::stepd::stepd_liveness(descriptor),
+                        Ok(crate::stepd::StepdLiveness::Stale)
+                    ) {
+                        return Err(WorkloadPidUnavailable::SupervisorGone(error));
+                    }
+                    trace!(
+                        job_id = descriptor.job_id,
+                        step_id = descriptor.step_id,
+                        %error,
+                        "workload pid query did not answer yet; retrying"
+                    );
+                    last = WorkloadPidProbe::Failed(error);
+                }
             }
+            tokio::time::sleep(WORKLOAD_PID_POLL_INTERVAL).await;
         }
-        tokio::time::sleep(WORKLOAD_PID_POLL_INTERVAL).await;
-    }
+    })
+    .await;
+    let error = match polled {
+        Ok(Ok(pid)) => return Ok(pid),
+        Ok(Err(error)) => error,
+        Err(_) => WorkloadPidUnavailable::TimedOut(last),
+    };
     warn!(
         job_id = descriptor.job_id,
         step_id = descriptor.step_id,
+        %error,
         "gave up waiting for the supervised step to report a workload pid"
     );
-    None
+    Err(error)
+}
+
+/// What the last workload-pid query saw before the wait was abandoned.
+#[derive(Debug)]
+enum WorkloadPidProbe {
+    NeverAnswered,
+    NoPidYet,
+    Failed(std::io::Error),
+}
+
+#[derive(Debug)]
+enum WorkloadPidUnavailable {
+    SupervisorGone(std::io::Error),
+    TimedOut(WorkloadPidProbe),
+}
+
+impl std::fmt::Display for WorkloadPidUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let deadline = WORKLOAD_PID_DEADLINE.as_secs();
+        match self {
+            Self::SupervisorGone(error) => {
+                write!(f, "its supervisor exited before reporting it ({error})")
+            }
+            Self::TimedOut(WorkloadPidProbe::NeverAnswered) => {
+                write!(f, "its supervisor did not answer within {deadline}s")
+            }
+            Self::TimedOut(WorkloadPidProbe::NoPidYet) => {
+                write!(
+                    f,
+                    "its supervisor still had no workload pid after {deadline}s"
+                )
+            }
+            Self::TimedOut(WorkloadPidProbe::Failed(error)) => {
+                write!(
+                    f,
+                    "its supervisor was unreachable for {deadline}s ({error})"
+                )
+            }
+        }
+    }
 }
 
 async fn run_tokio_step_to_spool(
@@ -4073,7 +4134,7 @@ impl AgentService {
 
         // Record the workload's pid, not the supervisor's, so the existing
         // cancel path signals the step's own tree and leaves its reporter alive.
-        if let Some(pid) = supervised_step_workload_pid(&descriptor).await {
+        if let Ok(pid) = supervised_step_workload_pid(&descriptor).await {
             let cancel_now = {
                 let mut steps = self.active_steps.lock().await;
                 match steps.get_mut(&step_key) {
@@ -8534,27 +8595,32 @@ impl SlurmAgent for AgentService {
                         )
                         .await?;
 
-                    let Some(pid) = supervised_step_workload_pid(&descriptor).await else {
-                        self.abandon_interactive_launch(
-                            init.job_id,
-                            run_attempt,
-                            (init.job_id, init.step_id),
-                            &descriptor,
-                        )
-                        .await;
-                        // A supervisor that never reported a pid either never
-                        // finished launching (recorded no reason) or hit a real
-                        // failure it wrote down before giving up — surface that
-                        // instead of the generic message so a real bug isn't
-                        // misread as a timeout.
-                        let reason = crate::stepd::StepdStore::new(&self.stepd_state_dir)
-                            .recorded_failure(init.job_id, run_attempt, step_id);
-                        return Err(Status::internal(match reason {
-                            Some(reason) => {
-                                format!("terminal workload failed to launch: {reason}")
-                            }
-                            None => "terminal workload did not report a pid in time".to_string(),
-                        }));
+                    let pid = match supervised_step_workload_pid(&descriptor).await {
+                        Ok(pid) => pid,
+                        Err(unavailable) => {
+                            self.abandon_interactive_launch(
+                                init.job_id,
+                                run_attempt,
+                                (init.job_id, init.step_id),
+                                &descriptor,
+                            )
+                            .await;
+                            // A supervisor that never reported a pid either never
+                            // finished launching (recorded no reason) or hit a real
+                            // failure it wrote down before giving up — surface that
+                            // instead of the generic message so a real bug isn't
+                            // misread as a timeout.
+                            let reason = crate::stepd::StepdStore::new(&self.stepd_state_dir)
+                                .recorded_failure(init.job_id, run_attempt, step_id);
+                            return Err(Status::internal(match reason {
+                                Some(reason) => {
+                                    format!("terminal workload failed to launch: {reason}")
+                                }
+                                None => {
+                                    format!("terminal workload did not report a pid: {unavailable}")
+                                }
+                            }));
+                        }
                     };
                     step_epoch = next_step_epoch();
                     self.active_steps.lock().await.insert(
@@ -13030,6 +13096,23 @@ mod tests {
         assert!(!is_live_workload(&workload_snapshot(false, 4242)));
     }
 
+    /// These tests serve the supervisor from the test process, so it is the
+    /// process the liveness check must find alive.
+    fn in_process_supervisor_descriptor(
+        socket_path: std::path::PathBuf,
+    ) -> crate::stepd::StepdDescriptor {
+        let pid = std::process::id();
+        crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("own start ticks"),
+            socket_path,
+            std::path::PathBuf::new(),
+        )
+    }
+
     // Reproduces the gap between the launch gate opening and `run_supervisor`
     // actually starting to accept control connections: `launch_job` (openpty,
     // container rootfs staging, priv drop) runs in between, and nothing serves
@@ -13039,15 +13122,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket_path = dir.path().join("runtime.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
-        let descriptor = crate::stepd::StepdDescriptor::new(
-            7,
-            1,
-            spur_core::step::STEP_INTERACTIVE,
-            0,
-            0,
-            socket_path,
-            std::path::PathBuf::new(),
-        );
+        let descriptor = in_process_supervisor_descriptor(socket_path);
 
         let child = tokio::process::Command::new("sleep")
             .arg("3600")
@@ -13071,16 +13146,16 @@ mod tests {
 
         let found = supervised_step_workload_pid(&descriptor).await;
         assert_eq!(
-            found,
+            found.ok(),
             Some(pid),
-            "a supervisor that starts serving after the polling budget must still be found"
+            "a supervisor that starts serving after a slow launch must still be found"
         );
     }
 
     // A connection hiccup while the supervisor is mid-launch (e.g. a transient
-    // reset before it has bound and started accepting) must not burn the rest
-    // of the polling budget: only the second half of the queries below ever
-    // succeed, so a single failed attempt aborting early would never find it.
+    // reset before it has bound and started accepting) must not end the wait
+    // while the supervisor is still alive: queries only succeed once it binds,
+    // well past the first failed attempt.
     #[tokio::test(start_paused = true)]
     async fn supervised_step_workload_pid_retries_past_a_transient_query_error() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -13088,15 +13163,7 @@ mod tests {
         // Nothing is listening at this path yet, so every connect attempt
         // fails fast with a real `Err` from `query_state` — standing in for a
         // supervisor that isn't reachable on its first few polls.
-        let descriptor = crate::stepd::StepdDescriptor::new(
-            7,
-            1,
-            spur_core::step::STEP_INTERACTIVE,
-            0,
-            0,
-            socket_path.clone(),
-            std::path::PathBuf::new(),
-        );
+        let descriptor = in_process_supervisor_descriptor(socket_path.clone());
 
         let child = tokio::process::Command::new("sleep")
             .arg("3600")
@@ -13114,17 +13181,80 @@ mod tests {
 
         let run_descriptor = descriptor.clone();
         tokio::spawn(async move {
-            // Bind well after polling has already started failing to connect.
-            tokio::time::sleep(WORKLOAD_PID_POLL_INTERVAL * (WORKLOAD_PID_POLLS / 2)).await;
+            // Bind well after polling has already started failing to connect,
+            // and past the one-second budget this wait used to have.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
             let _ = crate::stepd::run_supervisor(listener, run_descriptor, session).await;
         });
 
         let found = supervised_step_workload_pid(&descriptor).await;
         assert_eq!(
-            found,
+            found.ok(),
             Some(pid),
-            "a transient early connect failure must not stop the rest of the poll budget"
+            "a transient early connect failure must not end the wait while the supervisor lives"
+        );
+    }
+
+    // A fast step's supervisor exits with its workload and takes its socket
+    // with it; waiting out the full deadline would only delay the step's result.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_step_workload_pid_stops_once_the_supervisor_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut exited = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived supervisor stand-in");
+        let pid = exited.id();
+        exited.wait().expect("reap stand-in");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+            pid,
+            1,
+            dir.path().join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        let started = tokio::time::Instant::now();
+        let found = supervised_step_workload_pid(&descriptor).await;
+        assert!(
+            matches!(found, Err(WorkloadPidUnavailable::SupervisorGone(_))),
+            "a dead supervisor must end the wait, got {found:?}"
+        );
+        assert!(started.elapsed() < WORKLOAD_PID_DEADLINE);
+    }
+
+    // A supervisor that answers but never has a workload pid (here, one with no
+    // workload at all) must yield a bounded failure rather than hold the RPC open.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_step_workload_pid_gives_up_at_the_deadline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("runtime.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+        let descriptor = in_process_supervisor_descriptor(socket_path);
+        let session = std::sync::Arc::new(crate::stepd::Stepd::new(
+            executor::RunningJob::AllocationOnly,
+            7,
+            1,
+            spur_core::step::STEP_INTERACTIVE,
+        ));
+        let run_descriptor = descriptor.clone();
+        tokio::spawn(crate::stepd::run_supervisor(
+            listener,
+            run_descriptor,
+            session,
+        ));
+
+        let found = supervised_step_workload_pid(&descriptor).await;
+        let Err(error @ WorkloadPidUnavailable::TimedOut(_)) = found else {
+            panic!("a pid-less supervisor must time out, got {found:?}");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{}s", WORKLOAD_PID_DEADLINE.as_secs())),
+            "the error must say how long it waited: {error}"
         );
     }
 
