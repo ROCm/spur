@@ -72,6 +72,8 @@ pub struct ResourceAllocations {
     pub generation: u64,
     #[serde(default)]
     pub fabric_binding: Option<crate::fabric_binding::FabricBinding>,
+    #[serde(default)]
+    pub gpu_binding: Option<crate::gpu_binding::GpuBinding>,
 }
 
 /// A single allocated device entry.
