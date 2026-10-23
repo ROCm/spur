@@ -8023,7 +8023,7 @@ impl ClusterManager {
                 if let Some(node) = nodes.get_mut(name) {
                     node.state = *new_state;
                     // Service-state requests may wait behind allocation changes in Raft.
-                    // Derive the committed state from the allocations present at apply.
+                    // Capacity reflects this controller's resource policy.
                     if new_state.is_up() {
                         node.update_state_from_alloc();
                     }
@@ -8493,39 +8493,41 @@ struct ClusterSnapshot {
 }
 
 impl ClusterManager {
-    /// Apply features/weight from the first matching NodeConfig, reverting to
-    /// node defaults when none matches so stale policy from a previously matching
-    /// entry does not persist.
+    /// Recompute policy from current config so live changes and restored snapshots
+    /// cannot retain stale capacity or service state.
     fn apply_node_config_policy(&self, node: &mut Node) {
-        for nc in self.config().nodes.iter() {
-            if node_config_matches(nc, &node.name, &node.labels) {
-                node.features = nc.features.clone();
-                node.weight = nc.weight;
-                node.total_resources =
-                    node.detected_resources
-                        .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb);
-                // reserved_memory_mb >= detected floors schedulable memory to 0,
-                // making the node unschedulable. When memory_mb is unset this can't
-                // be caught at config load, so surface it rather than let it read as
-                // an unexplained scheduling stall.
-                if node.total_resources.memory_mb == 0 && node.detected_resources.memory_mb > 0 {
-                    warn!(
-                        node = %node.name, detected_mb = node.detected_resources.memory_mb,
-                        cap_mb = nc.memory_mb, reserved_mb = nc.reserved_memory_mb,
-                        "node schedulable memory clamped to 0 by [[nodes]] config; node cannot run jobs"
-                    );
-                }
-                if node.address.is_none() {
-                    if let Some(ref cfg_addr) = nc.address {
-                        node.address = Some(cfg_addr.clone());
-                    }
-                }
-                return;
+        let config = self.config();
+        if let Some(nc) = config
+            .nodes
+            .iter()
+            .find(|nc| node_config_matches(nc, &node.name, &node.labels))
+        {
+            node.features = nc.features.clone();
+            node.weight = nc.weight;
+            node.total_resources =
+                node.detected_resources
+                    .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb);
+            // An unset memory cap prevents config validation from detecting this
+            // scheduling stall until the agent reports its inventory.
+            if node.total_resources.memory_mb == 0 && node.detected_resources.memory_mb > 0 {
+                warn!(
+                    node = %node.name, detected_mb = node.detected_resources.memory_mb,
+                    cap_mb = nc.memory_mb, reserved_mb = nc.reserved_memory_mb,
+                    "node schedulable memory clamped to 0 by [[nodes]] config; node cannot run jobs"
+                );
             }
+            if node.address.is_none() {
+                if let Some(ref cfg_addr) = nc.address {
+                    node.address = Some(cfg_addr.clone());
+                }
+            }
+        } else {
+            node.total_resources = node.detected_resources.clone();
+            node.reset_config_policy();
         }
-        // No matching config: schedulable inventory is the detected inventory.
-        node.total_resources = node.detected_resources.clone();
-        node.reset_config_policy();
+        if node.state.is_up() {
+            node.update_state_from_alloc();
+        }
     }
 
     /// Re-evaluate partition membership and NodeConfig policy (features, weight)
@@ -8675,15 +8677,8 @@ impl StateMachineApply for ClusterManager {
         // map with this watermark would treat every live job as reclaimable.
         self.next_job_id.store(next_id, Ordering::Relaxed);
 
-        // Re-evaluate partition membership and NodeConfig policy
-        // for all nodes against the current config.
+        // Snapshots may carry resource policy from a different controller config.
         self.reconcile_partitions(&mut nodes);
-        // Snapshot service states may reflect different CPU caps than the current config.
-        for node in nodes.values_mut() {
-            if node.state.is_up() {
-                node.update_state_from_alloc();
-            }
-        }
 
         info!(
             jobs = jobs.len(),
@@ -28678,6 +28673,89 @@ mod tests {
                 );
                 assert_eq!(restored.get_job(id).unwrap().state, JobState::Running);
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_derives_service_states_after_cpu_cap_changes() {
+        let base = "cluster_name = \"test\"\n\
+                    [[partitions]]\nname = \"default\"\ndefault = true\nstate = \"UP\"\nnodes = \"ALL\"\n";
+        let capped = format!("{base}[[nodes]]\nnames = \"n1\"\ncpus = 4\n");
+        let dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &capped).await;
+        register_node(&cm, "n1", 8, 8000);
+        let id = submit_and_wait(&cm, basic_spec("live-cap-change"));
+        let alloc = scalar_alloc(4, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc.clone()),
+        )
+        .unwrap();
+
+        for (case, policy, capacity) in [
+            ("removed", "", 8),
+            ("uncapped", "[[nodes]]\nnames = \"n1\"\ncpus = 0\n", 8),
+            ("raised", "[[nodes]]\nnames = \"n1\"\ncpus = 8\n", 8),
+            ("lowered", "[[nodes]]\nnames = \"n1\"\ncpus = 2\n", 2),
+        ] {
+            for stored in NodeState::ALL {
+                std::fs::write(&conf_path, &capped).unwrap();
+                cm.reconfigure().unwrap();
+                {
+                    let mut nodes = cm.nodes.write();
+                    let node = nodes.get_mut("n1").unwrap();
+                    node.state = stored;
+                    node.admin_locked = stored.is_admin_hold();
+                    node.state_reason = Some("preserve reason".into());
+                }
+                std::fs::write(&conf_path, format!("{base}{policy}")).unwrap();
+                cm.reconfigure().unwrap();
+
+                let node = cm.get_node("n1").unwrap();
+                let expected = if !stored.is_up() {
+                    stored
+                } else if capacity > alloc.cpus {
+                    NodeState::Mixed
+                } else {
+                    NodeState::Allocated
+                };
+                assert_eq!(node.state, expected, "{case}: {stored:?}");
+                assert_eq!(node.total_resources.cpus, capacity, "{case}");
+                assert_eq!(node.detected_resources.cpus, 8, "{case}");
+                assert_eq!(node.alloc_resources, alloc, "{case}");
+                assert_eq!(node.admin_locked, stored.is_admin_hold());
+                assert_eq!(node.state_reason.as_deref(), Some("preserve reason"));
+                assert_eq!(node.is_schedulable(), expected == NodeState::Mixed);
+                assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reregistration_derives_service_states_after_inventory_changes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("inventory-change"));
+        let alloc = scalar_alloc(4, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc.clone()),
+        )
+        .unwrap();
+
+        for (capacity, expected) in [(8, NodeState::Mixed), (2, NodeState::Allocated)] {
+            register_node(&cm, "n1", capacity, 8000);
+            let node = cm.get_node("n1").unwrap();
+            assert_eq!(node.state, expected);
+            assert_eq!(node.total_resources.cpus, capacity);
+            assert_eq!(node.alloc_resources, alloc);
+            assert_eq!(node.is_schedulable(), expected == NodeState::Mixed);
+            assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
         }
     }
 

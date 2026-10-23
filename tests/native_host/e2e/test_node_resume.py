@@ -37,6 +37,9 @@ class TestBusyNodeResume:
     @pytest.mark.parametrize("cpus,expected", [(4, "ALLOCATED"), (2, "MIXED")])
     @pytest.mark.parametrize("requested", ["RESUME", "IDLE"])
     def test_resume_preserves_busy_state(self, cluster, cpus, expected, requested):
+        for name in cluster.node_names:
+            if int(_node_fields(cluster, name)["CPUTot"]) < 4:
+                pytest.skip("busy resume coverage requires at least 4 CPUs per node")
         jobs = {}
         try:
             for name in cluster.node_names:
