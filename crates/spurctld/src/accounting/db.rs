@@ -301,6 +301,8 @@ pub struct JobStartRecord {
     pub submit_time: DateTime<Utc>,
     pub start_time: DateTime<Utc>,
     pub reservation: Option<String>,
+    /// Compressed hostlist of the allocated nodes, as `sacct -o NodeList` shows it.
+    pub nodelist: String,
     /// True when this run was borrowed: the job exceeded its QOS group node cap and
     /// ran on capacity nobody with a claim wanted. Reported by `sacct` so operators
     /// can tell which runs were opportunistic, and read back when the run ends to
@@ -319,8 +321,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill, nodelist)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15, $16)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -340,6 +342,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             derived_exit_code = 0,
             end_time = NULL,
             idle_fill = EXCLUDED.idle_fill,
+            nodelist = EXCLUDED.nodelist,
             -- A requeued job starts again on the same row, so provenance from the
             -- run that was evicted must be cleared or the job reads as
             -- `COMPLETED, PreemptMode=Requeue` forever once it finally succeeds.
@@ -369,6 +372,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.start_time)
     .bind(rec.reservation.as_deref().unwrap_or_default())
     .bind(rec.idle_fill)
+    .bind(&rec.nodelist)
     .execute(&mut *conn)
     .await?;
 
@@ -1847,6 +1851,7 @@ mod job_history_tests {
                 submit_time,
                 start_time,
                 reservation: Some(reservation.to_string()),
+                nodelist: String::new(),
                 idle_fill: false,
             },
         )
@@ -1920,6 +1925,7 @@ mod job_history_tests {
                 submit_time: start_time,
                 start_time,
                 reservation: Some(String::new()),
+                nodelist: String::new(),
                 idle_fill: false,
             },
         )
@@ -2195,6 +2201,62 @@ mod job_history_tests {
         assert_eq!(row.get::<String, _>("reason_detail"), "");
         assert_eq!(row.get::<String, _>("ended_by"), "");
         assert_eq!(row.get::<Option<i64>, _>("ended_by_uid"), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn nodelist_is_recorded_and_replaced_when_the_job_restarts() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let id = test_job_id(9);
+        delete_jobs(&pool, &[id]).await.ok();
+        let t0 = Utc::now() - Duration::hours(1);
+        let record = |nodelist: &str| JobStartRecord {
+            job_id: id,
+            name: "nodelist".to_string(),
+            user: format!("spur_nodelist_{}", std::process::id()),
+            account: String::new(),
+            partition: String::new(),
+            qos: String::new(),
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            total_gpus: 0,
+            memory_mb: 0,
+            submit_time: t0,
+            start_time: t0,
+            reservation: None,
+            nodelist: nodelist.to_string(),
+            idle_fill: false,
+        };
+        let history = |pool: PgPool| async move {
+            get_job_history(
+                &pool,
+                &JobHistoryQuery {
+                    user: None,
+                    account: None,
+                    start_after: None,
+                    start_before: None,
+                    states: &[],
+                    job_ids: &[id],
+                    limit: 10,
+                },
+            )
+            .await
+        };
+
+        let mut conn = pool.acquire().await?;
+        record_job_start(&mut conn, &record("node[001-002]")).await?;
+        let first = history(pool.clone()).await?;
+        record_job_start(&mut conn, &record("node[007,010]")).await?;
+        let restarted = history(pool.clone()).await?;
+        drop(conn);
+        delete_jobs(&pool, &[id]).await.ok();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].nodelist, "node[001-002]");
+        assert_eq!(restarted.len(), 1);
+        assert_eq!(restarted[0].nodelist, "node[007,010]");
         Ok(())
     }
 

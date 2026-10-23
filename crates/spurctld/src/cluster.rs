@@ -2251,6 +2251,7 @@ impl ClusterManager {
             );
         }
 
+        let nodelist = spur_core::hostlist::compress(&node_names);
         let node_count = node_names.len().max(1) as u32;
         let per_node = node_names
             .first()
@@ -2307,6 +2308,7 @@ impl ClusterManager {
                 submit_time: submit_time_for_notify,
                 start_time: Utc::now(),
                 reservation: spec_for_notify.reservation.clone(),
+                nodelist,
                 idle_fill,
             });
         }

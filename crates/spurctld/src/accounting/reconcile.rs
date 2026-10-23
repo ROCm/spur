@@ -263,6 +263,7 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
             submit_time: job.submit_time,
             start_time,
             reservation: spec.reservation.clone(),
+            nodelist: spur_core::hostlist::compress(&job.allocated_nodes),
             idle_fill: job.idle_fill,
         },
     )
@@ -744,6 +745,7 @@ mod tests {
                     submit_time: job.submit_time,
                     start_time: job.start_time.unwrap(),
                     reservation: None,
+                    nodelist: String::new(),
                     idle_fill: false,
                 },
             )

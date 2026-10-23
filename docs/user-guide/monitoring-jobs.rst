@@ -444,6 +444,12 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``Borrowed``, ``Reason``, ``ReasonDetail``, and ``EndedBy``. Set a per-field width with
 ``Field%N``, e.g. ``JobName%20``.
 
+``NodeList`` is the compressed hostlist of the nodes the job was allocated, in
+the same form ``squeue`` and ``scontrol show job`` print (``node[01-04]``). It
+is recorded when the job starts, so it stays available after the job leaves
+the controller; a requeued job shows the nodes of its latest run. Jobs that
+started before this release recorded no node list and show it empty.
+
 ``PreemptedBy`` is the job ID of the higher-priority job that caused the
 preemption (``N/A`` when the job was not preempted). ``PreemptMode`` is one of
 ``Requeue``, ``Cancel``, or ``Suspend``. ``PreemptQOS`` is the QOS of that
