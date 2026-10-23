@@ -595,6 +595,21 @@ pub struct ClusterManager {
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
+    /// A node freed by a preempt-cancel, earmarked for the preemptor that freed
+    /// it for a fixed number of scheduling passes. Bridges the one-cycle gap
+    /// between the victim finalizing (which clears the `preempted_by` anchor that
+    /// keeps the preemptor hoisted while the victim drains) and the preemptor
+    /// being placed: for that window the preemptor stays hoisted to the front of
+    /// the pending queue, so backfill reserves the freed node for it before a
+    /// higher-effective-priority bystander is considered.
+    ///
+    /// The budget counts *scheduling passes*, not wall-clock: `tick_preempt_
+    /// freed_earmarks` decrements it once per scheduler loop iteration, so the
+    /// guarantee ("the preemptor gets this many real passes to be placed") holds
+    /// regardless of how long a pass takes. Leader-local and transient, never
+    /// persisted; on failover the earmark is lost and the original one-cycle race
+    /// is possible for that one node — an accepted degradation.
+    preempt_freed_nodes: RwLock<HashMap<String, (JobId, u32)>>,
     /// When each (check index, node name) last completed a check, so the pass
     /// knows when the next one is due. Leader-local and transient (like
     /// `node_dispatch_cooldowns`): reset on failover, which at worst re-runs one
@@ -890,6 +905,7 @@ impl ClusterManager {
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
+            preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
         };
@@ -945,6 +961,131 @@ impl ClusterManager {
         let mut cooldowns = self.node_dispatch_cooldowns.write();
         cooldowns.retain(|_, &mut until| until > now);
         cooldowns.keys().cloned().collect()
+    }
+
+    /// Scheduling passes a freed-node earmark hoists its preemptor for. The
+    /// preemptor is offered the node on the first pass after it frees (when the
+    /// node and the earmark are both visible); the extra pass is slack for a
+    /// cycle in which it could not yet be placed. `tick_preempt_freed_earmarks`
+    /// drops an entry on the pass its budget reaches zero, so a budget of 3
+    /// hoists across two passes.
+    const PREEMPT_FREED_EARMARK_PASSES: u32 = 3;
+
+    /// Record, inside the apply critical section that frees `freed_nodes`, that
+    /// each node is claimed by `preemptor` for the next few scheduling passes.
+    /// Establishing the claim here — atomically with the committed resource
+    /// release, before the jobs/nodes write locks are dropped — closes the window
+    /// where a scheduler pass could see neither a draining victim nor an earmark
+    /// and hand the freed node to a bystander.
+    ///
+    /// The claim only ever keeps its owner hoisted in the pending sort; it does
+    /// not hide the node from any other job. So an earmark on a node the preemptor
+    /// cannot actually use is harmless — the hoist's own `job_requests_node` check
+    /// ignores it and the budget simply expires — and no node-usability filtering
+    /// is needed here.
+    fn record_preempt_freed_nodes(&self, freed_nodes: &[String], preemptor: JobId) {
+        if freed_nodes.is_empty() {
+            return;
+        }
+        let mut earmarks = self.preempt_freed_nodes.write();
+        for node in freed_nodes {
+            earmarks.insert(
+                node.clone(),
+                (preemptor, Self::PREEMPT_FREED_EARMARK_PASSES),
+            );
+        }
+    }
+
+    /// Age freed-node earmarks by one scheduling pass: decrement each budget and
+    /// drop entries whose owner can no longer use the claim. Called once per
+    /// scheduler loop iteration so the budget counts real passes, not wall-clock.
+    /// Keeping the decrement here rather than in the read path means an unrelated
+    /// `classify_pending_jobs` caller (reason updates, burst-buffer staging)
+    /// cannot consume the budget.
+    ///
+    /// An entry is dropped as soon as its owner is not a schedulable pending job
+    /// (placed, cancelled, requeued, or on a scheduling hold such as Held /
+    /// JobHoldMaxRequeue): a claim held for an owner that cannot run would block
+    /// the node for no one's benefit.
+    ///
+    /// The bounded post-drain budget only starts once the preemptor has its full
+    /// allocation: while any victim it preempted is still draining (Completing),
+    /// the earmark is refreshed rather than aged. A multi-node preemptor whose
+    /// victims' nodes free at different times would otherwise spend the whole
+    /// budget on an early-freeing node while still waiting — unplaceable — for a
+    /// later one, letting a bystander take the early node when it expired.
+    ///
+    /// Both lookups (schedulable owner, owner-still-draining) are resolved from a
+    /// single O(jobs) scan built once, so the tick is O(jobs + claims) rather than
+    /// O(jobs x claims). Lock order is `jobs` then `preempt_freed_nodes`, matching
+    /// every other path (the read helper and the `apply_operation` insert), so the
+    /// two locks never deadlock against each other.
+    pub(crate) fn tick_preempt_freed_earmarks(&self) {
+        let jobs = self.jobs.read();
+        let mut earmarks = self.preempt_freed_nodes.write();
+        if earmarks.is_empty() {
+            return;
+        }
+        // One pass over jobs builds both owner indexes: schedulable pending
+        // owners, and owners that still have a victim draining.
+        let mut schedulable_owners: HashSet<JobId> = HashSet::new();
+        let mut owners_still_draining: HashSet<JobId> = HashSet::new();
+        for job in jobs.values() {
+            if job.state == JobState::Pending && !job.pending_reason.is_scheduling_hold() {
+                schedulable_owners.insert(job.job_id);
+            }
+            if job.state == JobState::Completing {
+                if let Some(preemptor) = job.preempted_by {
+                    owners_still_draining.insert(preemptor);
+                }
+            }
+        }
+        earmarks.retain(|_, (preemptor, remaining)| {
+            if !schedulable_owners.contains(preemptor) {
+                return false;
+            }
+            // Hold the node for the preemptor at full budget until it can
+            // actually run; only count down once nothing it preempted is still
+            // draining.
+            if owners_still_draining.contains(preemptor) {
+                *remaining = Self::PREEMPT_FREED_EARMARK_PASSES;
+                return true;
+            }
+            *remaining = remaining.saturating_sub(1);
+            *remaining > 0
+        });
+    }
+
+    /// The live earmarks indexed `preemptor -> freed nodes`, given the caller's
+    /// already-held jobs snapshot. Taking `jobs` as a parameter (rather than
+    /// re-locking) is what keeps `classify_pending_jobs` — which holds the jobs
+    /// read lock for its whole body — from deadlocking against a queued Raft
+    /// writer. Entries whose owner is not a schedulable pending job (placed,
+    /// abandoned, or on a scheduling hold) are filtered out so such an owner
+    /// never hoists; the budget is aged only by `tick_preempt_freed_earmarks`,
+    /// once per pass. Indexed by owner so the hoist builder does O(1) lookups.
+    pub(crate) fn preempt_freed_nodes_by_owner(
+        &self,
+        jobs: &HashMap<JobId, Job>,
+    ) -> HashMap<JobId, Vec<String>> {
+        let earmarks = self.preempt_freed_nodes.read();
+        let mut by_owner: HashMap<JobId, Vec<String>> = HashMap::new();
+        for (node, (preemptor, _)) in earmarks.iter() {
+            let schedulable = jobs.get(preemptor).is_some_and(|j| {
+                j.state == JobState::Pending && !j.pending_reason.is_scheduling_hold()
+            });
+            if schedulable {
+                by_owner.entry(*preemptor).or_default().push(node.clone());
+            }
+        }
+        by_owner
+    }
+
+    /// Raw `node -> (preemptor, remaining)` earmark entries, for tests that need
+    /// to assert whether a node was earmarked regardless of owner state.
+    #[cfg(test)]
+    pub(crate) fn preempt_freed_nodes_raw(&self) -> HashMap<String, (JobId, u32)> {
+        self.preempt_freed_nodes.read().clone()
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -2521,6 +2662,32 @@ impl ClusterManager {
         preempted_by: Option<JobId>,
         preempt_qos: Option<String>,
     ) -> anyhow::Result<PreemptOutcome> {
+        self.preempt_job_inner(job_id, mode, preempted_by, preempt_qos, true)
+    }
+
+    /// `preempt_job_with_provenance` for reclaim: the freed node is *not*
+    /// earmarked for the reclaimer. Reclaim returns borrowed capacity to the
+    /// general pool, where normal tier ordering (in-quota before borrowed) must
+    /// decide the next owner next cycle; earmarking would let a borrowed
+    /// reclaimer jump ahead of an in-quota job for the node it freed.
+    pub fn reclaim_job_with_provenance(
+        &self,
+        job_id: JobId,
+        mode: PreemptMode,
+        reclaimed_by: Option<JobId>,
+        preempt_qos: Option<String>,
+    ) -> anyhow::Result<PreemptOutcome> {
+        self.preempt_job_inner(job_id, mode, reclaimed_by, preempt_qos, false)
+    }
+
+    fn preempt_job_inner(
+        &self,
+        job_id: JobId,
+        mode: PreemptMode,
+        preempted_by: Option<JobId>,
+        preempt_qos: Option<String>,
+        earmark_freed: bool,
+    ) -> anyhow::Result<PreemptOutcome> {
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -2575,12 +2742,15 @@ impl ClusterManager {
                 let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
                 // Honor a later user --begin: compute the max on the leader so
                 // followers apply one verbatim instant (no per-replica clock).
-                let begin_time = self
-                    .jobs
-                    .read()
-                    .get(&job_id)
-                    .and_then(|j| j.spec.begin_time)
-                    .map_or(hold, |user_begin| user_begin.max(hold));
+                let (begin_time, freed_nodes) = {
+                    let jobs = self.jobs.read();
+                    let job = jobs.get(&job_id);
+                    let begin = job
+                        .and_then(|j| j.spec.begin_time)
+                        .map_or(hold, |user_begin| user_begin.max(hold));
+                    let nodes = job.map(|j| j.allocated_nodes.clone()).unwrap_or_default();
+                    (begin, nodes)
+                };
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
                     job_id,
                     begin_time,
@@ -2588,6 +2758,16 @@ impl ClusterManager {
                     preempt_qos,
                     at: None,
                 })?;
+                // Requeue frees the node and moves the victim straight to Pending
+                // (no Completing drain), so only the earmark keeps the node for the
+                // preemptor. Set leader-side: this path runs synchronously inside
+                // the scheduler loop, so no concurrent pass can slip in between the
+                // commit and the earmark. Skipped for reclaim (earmark_freed=false).
+                if earmark_freed {
+                    if let Some(preemptor) = preempted_by {
+                        self.record_preempt_freed_nodes(&freed_nodes, preemptor);
+                    }
+                }
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, hold_secs, "job preempted (requeue)");
                 Ok(PreemptOutcome::Killed)
@@ -4589,11 +4769,67 @@ impl ClusterManager {
         }
         drop(partitions);
 
+        // Victims mid-drain still hold the node they are freeing. Hoisting their
+        // preemptor ahead of a bystander puts it first in the pending list, so
+        // backfill's ordinary ordering reserves that node for it rather than
+        // handing it to whoever sorts highest on effective priority. Scoped to
+        // draining victims (Completing) so suspend-mode evictions, which never
+        // free a node, do not trigger a hoist. The `preempt_freed_nodes` earmarks
+        // extend the hoist across the one cycle after a victim finalizes (clearing
+        // the draining anchor) before the preemptor is placed. The hoist only
+        // affects sort order; it never hides a node from other jobs.
+        //
+        // Both the draining victims and the earmarks are indexed by owner in one
+        // pass so each candidate is an O(1) lookup, making this O(jobs + pending)
+        // plus the node-overlap check for only the few jobs that are actually
+        // preempting — not O(pending x (victims + earmarks)).
+        let hoisted: HashSet<JobId> = {
+            let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
+            for job in jobs.values() {
+                if job.state == JobState::Completing && !job.allocated_nodes.is_empty() {
+                    if let Some(owner) = job.preempted_by {
+                        draining_by_owner.entry(owner).or_default().push(job);
+                    }
+                }
+            }
+            let freed_by_owner = self.preempt_freed_nodes_by_owner(&jobs);
+            if draining_by_owner.is_empty() && freed_by_owner.is_empty() {
+                HashSet::new()
+            } else {
+                let node_list: Vec<Node> = self.nodes.read().values().cloned().collect();
+                candidates
+                    .iter()
+                    .filter(|candidate| {
+                        let id = candidate.job.job_id;
+                        let drains = draining_by_owner.get(&id).is_some_and(|victims| {
+                            victims.iter().any(|victim| {
+                                crate::scheduler_loop::preempt_overlaps_pending_nodes(
+                                    &candidate.job,
+                                    victim,
+                                    &node_list,
+                                )
+                            })
+                        });
+                        let earmarked = freed_by_owner.get(&id).is_some_and(|nodes| {
+                            nodes
+                                .iter()
+                                .any(|node| job_requests_node(&candidate.job, node, &node_list))
+                        });
+                        drains || earmarked
+                    })
+                    .map(|candidate| candidate.job.job_id)
+                    .collect()
+            }
+        };
+
         candidates.sort_by(|a, b| {
             let a_res = reservation::job_has_active_reservation(&a.job, &reservations, now);
             let b_res = reservation::job_has_active_reservation(&b.job, &reservations, now);
+            let a_hoist = hoisted.contains(&a.job.job_id);
+            let b_hoist = hoisted.contains(&b.job.job_id);
             b_res
                 .cmp(&a_res)
+                .then(b_hoist.cmp(&a_hoist))
                 .then(b.job.priority.cmp(&a.job.priority))
                 .then(a.job.job_id.cmp(&b.job.job_id))
         });
@@ -6619,6 +6855,7 @@ impl ClusterManager {
         timestamp: chrono::DateTime<Utc>,
         reason: PendingReason,
         failure: Option<NodeFailure>,
+        freed_for_preemptor: &mut Vec<(JobId, Vec<String>)>,
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
 
@@ -6643,6 +6880,25 @@ impl ClusterManager {
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
 
+        // A preempt-cancel victim finalized here (e.g. a node failed mid-drain)
+        // frees its remaining healthy nodes without passing through
+        // JobNodeComplete/JobComplete, so the earmark that keeps those nodes for
+        // the preemptor must be collected on this path too. Only the not-yet-
+        // reported nodes are freed now, so only those are claimable.
+        if job.preempt_mode.as_deref() == Some("Cancel") {
+            if let Some(preemptor) = job.preempted_by {
+                let newly_freed: Vec<String> = job
+                    .allocated_nodes
+                    .iter()
+                    .filter(|n| !already_deallocated.contains(n))
+                    .cloned()
+                    .collect();
+                if !newly_freed.is_empty() {
+                    freed_for_preemptor.push((preemptor, newly_freed));
+                }
+            }
+        }
+
         Self::deallocate_job_slices(
             nodes,
             &job.allocated_nodes,
@@ -6660,7 +6916,9 @@ impl ClusterManager {
     }
 
     /// Fail all running/completing/suspended jobs on a node, releasing
-    /// allocations on **every** node each job spans.
+    /// allocations on **every** node each job spans. Nodes freed from a
+    /// preempt-cancel victim are collected into `freed_for_preemptor` so the
+    /// caller can earmark them for the preemptor.
     fn evict_jobs_on_node(
         node_name: &str,
         failure: NodeFailure,
@@ -6668,6 +6926,7 @@ impl ClusterManager {
         nodes: &mut HashMap<String, Node>,
         timestamp: chrono::DateTime<Utc>,
         response: &mut ClientResponse,
+        freed_for_preemptor: &mut Vec<(JobId, Vec<String>)>,
     ) {
         let affected: Vec<JobId> = jobs
             .iter()
@@ -6688,6 +6947,7 @@ impl ClusterManager {
                 timestamp,
                 PendingReason::NodeDown,
                 Some(failure.clone()),
+                freed_for_preemptor,
             ) {
                 response.jobs_finalized.push(fin);
             }
@@ -6927,6 +7187,9 @@ impl ClusterManager {
                     &[],
                     *job_id,
                 );
+                // The earmark for a requeue-preemption is set leader-side in
+                // `preempt_job_inner`, not here, so it can be skipped for reclaim
+                // (which must not reserve the freed node for the reclaimer).
                 drop(jobs);
                 drop(nodes);
                 // Fire accounting for the terminated run as PREEMPTED, even
@@ -7161,6 +7424,7 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
+                let mut freed_for_preemptor = Vec::new();
                 if let Some(fin) = Self::evict_job_locked(
                     *job_id,
                     &mut jobs,
@@ -7168,8 +7432,12 @@ impl ClusterManager {
                     timestamp,
                     PendingReason::JobLaunchFailure,
                     None,
+                    &mut freed_for_preemptor,
                 ) {
                     response.jobs_finalized.push(fin);
+                }
+                for (preemptor, freed) in freed_for_preemptor {
+                    self.record_preempt_freed_nodes(&freed, preemptor);
                 }
             }
             WalOperation::JobLaunchFailureDetail { job_id, detail } => {
@@ -7255,6 +7523,11 @@ impl ClusterManager {
                 run_attempt,
                 ..
             } => {
+                // A node a preempt-cancel victim frees here is claimed for its
+                // preemptor in the same critical section that releases it, so no
+                // scheduling pass can slip a bystander onto it before the hoist
+                // predicate or the earmark is visible.
+                let freed_for_preemptor;
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -7274,6 +7547,10 @@ impl ClusterManager {
                     }
 
                     let already_reported = job.node_completions.contains_key(node_name);
+                    freed_for_preemptor = (!already_reported
+                        && job.preempt_mode.as_deref() == Some("Cancel"))
+                    .then_some(job.preempted_by)
+                    .flatten();
                     job.node_completions.insert(
                         node_name.clone(),
                         spur_core::job::NodeCompletion {
@@ -7363,6 +7640,10 @@ impl ClusterManager {
                     }
                 };
 
+                if let Some(preemptor) = freed_for_preemptor {
+                    self.record_preempt_freed_nodes(std::slice::from_ref(node_name), preemptor);
+                }
+
                 if let Some(finalized) = finalized {
                     drop(jobs);
                     drop(nodes);
@@ -7423,6 +7704,11 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let already_deallocated;
+                // A preempt-cancel victim force-finished here (completing-timeout
+                // or force-complete) frees its remaining nodes without ever
+                // reaching JobNodeComplete, so the earmark must also be set on
+                // this path or the forced path leaks the node to a bystander.
+                let freed_for_preemptor;
                 if let Some(job) = jobs.get_mut(job_id) {
                     // is_finalized (incl. Preempted): a stale/replayed complete
                     // is a silent no-op, not a rejected-transition warning.
@@ -7432,6 +7718,9 @@ impl ClusterManager {
                     {
                         return ClientResponse::default();
                     }
+                    freed_for_preemptor = (job.preempt_mode.as_deref() == Some("Cancel"))
+                        .then_some(job.preempted_by)
+                        .flatten();
                     if let Err(e) = job.transition(*state) {
                         warn!(
                             job_id = *job_id,
@@ -7481,6 +7770,14 @@ impl ClusterManager {
                     &already_deallocated,
                     *job_id,
                 );
+                if let Some(preemptor) = freed_for_preemptor {
+                    let newly_freed: Vec<String> = freed_nodes
+                        .iter()
+                        .filter(|n| !already_deallocated.contains(n))
+                        .cloned()
+                        .collect();
+                    self.record_preempt_freed_nodes(&newly_freed, preemptor);
+                }
                 drop(jobs);
                 drop(nodes);
                 self.complete_job_steps(job_id, *exit_code, timestamp);
@@ -7743,6 +8040,7 @@ impl ClusterManager {
                         reason_uid: *reason_uid,
                         removed: false,
                     };
+                    let mut freed_for_preemptor = Vec::new();
                     Self::evict_jobs_on_node(
                         name,
                         failure,
@@ -7750,7 +8048,11 @@ impl ClusterManager {
                         &mut nodes,
                         timestamp,
                         &mut response,
+                        &mut freed_for_preemptor,
                     );
+                    for (preemptor, freed) in freed_for_preemptor {
+                        self.record_preempt_freed_nodes(&freed, preemptor);
+                    }
                 }
             }
             WalOperation::NodeLabelsUpdate { name, set, remove } => {
@@ -7788,6 +8090,7 @@ impl ClusterManager {
                     reason_uid: None,
                     removed: true,
                 };
+                let mut freed_for_preemptor = Vec::new();
                 Self::evict_jobs_on_node(
                     name,
                     failure,
@@ -7795,7 +8098,11 @@ impl ClusterManager {
                     &mut nodes,
                     timestamp,
                     &mut response,
+                    &mut freed_for_preemptor,
                 );
+                for (preemptor, freed) in freed_for_preemptor {
+                    self.record_preempt_freed_nodes(&freed, preemptor);
+                }
                 if let Some(node) = nodes.get(name) {
                     if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
                         warn!(
@@ -8467,6 +8774,23 @@ enum GateOutcome {
     /// so it is tagged `BurstBufferStageIn` on the next cycle. Do not use this
     /// to bypass tagging in any other gate.
     DropUntagged,
+}
+
+/// Whether `node` is a node this pending job could be placed on: named directly
+/// in its `--nodelist`, or part of a partition it requested. Mirrors the
+/// node-overlap scoping of `preempt_overlaps_pending_nodes` for a single node.
+fn job_requests_node(job: &Job, node: &str, nodes: &[Node]) -> bool {
+    if let Some(ref nodelist) = job.spec.nodelist {
+        return nodelist.split(',').map(str::trim).any(|n| n == node);
+    }
+    let partitions: Vec<&str> = requested_partition_names(job.spec.partition.as_deref()).collect();
+    nodes.iter().any(|n| {
+        n.name == node
+            && (partitions.is_empty()
+                || partitions
+                    .iter()
+                    .any(|p| n.partitions.iter().any(|np| np == p)))
+    })
 }
 
 /// Like [`retain_unblocked`], but skips not-yet-eligible candidates and lets
@@ -19622,6 +19946,555 @@ mod tests {
 
         report_nodes_released(&cm, low_id);
         settle(&cm, low_id, JobState::Cancelled);
+    }
+
+    /// Run one scheduling pass the way `scheduler_loop::run` does — pending jobs
+    /// in hoist-aware order, nodes off dispatch cooldown, real busy-until times —
+    /// and return the backfill assignments. Used to assert which job a freed node
+    /// is actually placed on, not merely how the pending list sorts.
+    fn run_one_scheduling_pass(cm: &Arc<ClusterManager>) -> Vec<spur_sched::traits::Assignment> {
+        use spur_sched::backfill::BackfillScheduler;
+        use spur_sched::traits::{ClusterState, Scheduler};
+        let pending = cm.pending_jobs();
+        let nodes = cm.nodes_off_dispatch_cooldown(&pending);
+        let partitions = cm.get_partitions();
+        let reservations = cm.get_reservations();
+        let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
+        let cluster_state = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+            busy_until: &busy_until,
+        };
+        let mut scheduler =
+            BackfillScheduler::new(cm.config().scheduler.max_jobs_per_cycle as usize);
+        scheduler.schedule(&pending, &cluster_state)
+    }
+
+    /// A pending bystander with a lower QOS base than the hunter (6000 vs 11000)
+    /// but a higher effective priority once fair-share and age are folded in
+    /// (~6000 x 3.0 x age). This is the #1095 shape: the bystander wins the
+    /// effective-priority axis but has no claim to the contested capacity.
+    fn submit_bystander(cm: &Arc<ClusterManager>, node: &str) -> JobId {
+        cm.qos_cache().insert(Qos {
+            name: "bystander-qos".into(),
+            priority: 5_000,
+            ..Default::default()
+        });
+        cm.fairshare_cache().set_for_test("bystander-user", "", 3.0);
+        let mut bystander = basic_spec("bystander");
+        bystander.user = "bystander-user".into();
+        bystander.qos = Some("bystander-qos".into());
+        bystander.nodelist = Some(node.into());
+        let bystander_id = submit_and_wait(cm, bystander);
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&bystander_id).unwrap().submit_time =
+                Utc::now() - chrono::Duration::days(6);
+        }
+        bystander_id
+    }
+
+    /// Drive a cancel-mode preemption so the victim is left draining in
+    /// Completing with `preempted_by` set to the hunter. Returns (victim_id,
+    /// hunter_id). The hunter stays pending because the node is still held.
+    async fn preempt_into_drain(
+        cm: &Arc<ClusterManager>,
+        node: &str,
+        victim_qos: &str,
+        hunter_qos: &str,
+    ) -> (JobId, JobId) {
+        let mut victim = basic_spec("victim");
+        victim.qos = Some(victim_qos.into());
+        victim.nodelist = Some(node.into());
+        let victim_id = submit_and_wait(cm, victim);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            victim_id,
+            vec![node.into()],
+            res.clone(),
+            per_node_for(&[node], res),
+        )
+        .unwrap();
+        settle(cm, victim_id, JobState::Running);
+
+        let mut hunter = basic_spec("hunter");
+        hunter.qos = Some(hunter_qos.into());
+        hunter.nodelist = Some(node.into());
+        let hunter_id = submit_and_wait(cm, hunter);
+        let hunter_job = cm.get_job(hunter_id).unwrap();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(
+            cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&hunter_job],
+            &cm.config().scheduler,
+        )
+        .await;
+        settle(cm, victim_id, JobState::Completing);
+        assert_eq!(cm.get_job(victim_id).unwrap().preempted_by, Some(hunter_id));
+        (victim_id, hunter_id)
+    }
+
+    /// The #1095 example: a bystander with a lower QOS base but higher effective
+    /// priority (via fair-share) must not outrank the in-flight preemptor for the
+    /// node the preemptor is freeing. The preemptor is hoisted to the front of
+    /// the pending list so backfill reserves that node for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inflight_preemptor_hoists_ahead_of_higher_effective_priority_bystander() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (_victim_id, hunter_id) = preempt_into_drain(&cm, "n1", "low", "high").await;
+
+        // The bystander has a lower QOS base than the hunter but, through a
+        // fair-share boost and age, a higher effective priority. Without the
+        // hoist it would sort first and claim the freed node.
+        let bystander_id = submit_bystander(&cm, "n1");
+        let pending = cm.pending_jobs();
+        let hunter_pos = pending.iter().position(|j| j.job_id == hunter_id);
+        let bystander_pos = pending.iter().position(|j| j.job_id == bystander_id);
+        assert!(
+            hunter_pos.is_some() && bystander_pos.is_some(),
+            "both pending jobs should be classified"
+        );
+        assert!(
+            hunter_pos < bystander_pos,
+            "the in-flight preemptor must sort ahead of the higher-effective-priority bystander"
+        );
+
+        let bystander_priority = pending
+            .iter()
+            .find(|j| j.job_id == bystander_id)
+            .unwrap()
+            .priority;
+        let hunter_priority = pending
+            .iter()
+            .find(|j| j.job_id == hunter_id)
+            .unwrap()
+            .priority;
+        assert!(
+            bystander_priority > hunter_priority,
+            "the scenario is only meaningful when the bystander outranks the hunter on \
+             effective priority ({bystander_priority} vs {hunter_priority})"
+        );
+    }
+
+    /// The drain gap: the victim is still draining when the preemptor is
+    /// classified, so the hoist persists and the preemptor stays ahead of the
+    /// bystander across the cycles between eviction and the node freeing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inflight_preemptor_stays_hoisted_through_the_drain() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (victim_id, hunter_id) = preempt_into_drain(&cm, "n1", "low", "high").await;
+
+        let bystander_id = submit_bystander(&cm, "n1");
+
+        // Still draining: the victim holds n1, the hoist is active.
+        assert_eq!(cm.get_job(victim_id).unwrap().state, JobState::Completing);
+        let pending = cm.pending_jobs();
+        assert!(
+            pending.iter().position(|j| j.job_id == hunter_id)
+                < pending.iter().position(|j| j.job_id == bystander_id),
+            "while the victim drains, the preemptor must stay hoisted ahead of the bystander"
+        );
+
+        // The freeing moment: the victim reports its node and finalizes, so n1
+        // is now free. A full scheduling pass must hand n1 to the preemptor, not
+        // the bystander. This exercises the one-cycle window of the proposal's
+        // open item [1]: while the victim still drained, the hoist held n1 for
+        // the preemptor via backfill's reservation, so the bystander could not
+        // claim it in the cycle the node frees.
+        report_nodes_released(&cm, victim_id);
+        settle(&cm, victim_id, JobState::Cancelled);
+        let assignments = run_one_scheduling_pass(&cm);
+        let n1_owner = assignments
+            .iter()
+            .find(|a| a.nodes.iter().any(|n| n == "n1"))
+            .map(|a| a.job_id);
+        assert_eq!(
+            n1_owner,
+            Some(hunter_id),
+            "the node freed by the preemption must go to the preemptor, not the bystander"
+        );
+    }
+
+    /// Abandonment: if the preemptor is cancelled mid-drain, the victim's
+    /// `preempted_by` has nothing to anchor the hoist to once it finalizes, so
+    /// the freed node returns to the best current pending claimant — the
+    /// deliberate divergence from #1095's QOS-wide hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_preemption_returns_node_to_best_claimant() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (victim_id, hunter_id) = preempt_into_drain(&cm, "n1", "low", "high").await;
+
+        let bystander_id = submit_bystander(&cm, "n1");
+
+        // Cancel the preemptor, then let the victim finish draining.
+        cm.cancel_job_as_system(hunter_id).unwrap();
+        report_nodes_released(&cm, victim_id);
+        settle(&cm, victim_id, JobState::Cancelled);
+
+        let pending = cm.pending_jobs();
+        assert!(
+            pending.iter().all(|j| j.job_id != hunter_id),
+            "the cancelled preemptor must no longer be pending"
+        );
+        assert_eq!(
+            pending.first().map(|j| j.job_id),
+            Some(bystander_id),
+            "with the preemptor gone, the freed node goes to the best current claimant"
+        );
+    }
+
+    /// The freed-node earmark hoists its preemptor for a fixed number of
+    /// scheduling passes, counted by `tick_preempt_freed_earmarks` (not
+    /// wall-clock), then expires so the node returns to normal ordering. The
+    /// preemptor is kept pending throughout, so the pass budget — not placement
+    /// or cancellation — is the only thing that can end the hoist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn freed_node_earmark_expires_after_a_fixed_number_of_passes() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (victim_id, hunter_id) = preempt_into_drain(&cm, "n1", "low", "high").await;
+        let bystander_id = submit_bystander(&cm, "n1");
+
+        // Free the node: the victim finalizes, so from here only the earmark can
+        // keep the preemptor hoisted. Seeded with PREEMPT_FREED_EARMARK_PASSES.
+        report_nodes_released(&cm, victim_id);
+        settle(&cm, victim_id, JobState::Cancelled);
+
+        let hunter_ahead = |cm: &Arc<ClusterManager>| -> bool {
+            let pending = cm.pending_jobs();
+            pending.iter().position(|j| j.job_id == hunter_id)
+                < pending.iter().position(|j| j.job_id == bystander_id)
+        };
+
+        // The hoist is live for each of PREEMPT_FREED_EARMARK_PASSES passes; the
+        // entry is dropped on the tick that spends the last of its budget.
+        for pass in 1..=ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
+            assert!(
+                hunter_ahead(&cm),
+                "earmark must still hoist the preemptor on pass {pass}"
+            );
+            cm.tick_preempt_freed_earmarks();
+        }
+        assert!(
+            !hunter_ahead(&cm),
+            "after the pass budget is spent the earmark expires and the \
+             higher-effective-priority bystander orders ahead again"
+        );
+    }
+
+    /// Sort ordering: the hoist sits behind an active reservation and ahead of
+    /// effective priority, and two concurrent preemptors order by QOS base.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inflight_eviction_sort_key_ordering() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        // A reserved job on a third node: holds an active reservation, so it must
+        // outrank even a hoisted preemptor regardless of priority.
+        register_node(&cm, "n3", 8, 16000);
+        let now = chrono::Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::minutes(5),
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec!["n3".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        })
+        .unwrap();
+        let mut reserved = basic_spec("reserved");
+        reserved.priority = Some(1);
+        reserved.reservation = Some("r1".into());
+        reserved.nodelist = Some("n3".into());
+        let reserved_id = submit_and_wait(&cm, reserved);
+
+        let (_victim_id, hunter_id) = preempt_into_drain(&cm, "n1", "low", "high").await;
+
+        // A bystander with a higher effective priority than the hunter.
+        let bystander_id = submit_bystander(&cm, "n1");
+
+        let pending = cm.pending_jobs();
+        let pos = |id: JobId| pending.iter().position(|j| j.job_id == id);
+        assert!(
+            pos(reserved_id) < pos(hunter_id),
+            "an active reservation must outrank a hoisted preemptor"
+        );
+        assert!(
+            pos(hunter_id) < pos(bystander_id),
+            "a hoisted preemptor must outrank a higher-effective-priority bystander"
+        );
+    }
+
+    /// Two concurrent preemptors, each draining its own victim on its own node,
+    /// order among themselves by effective priority (QOS base here), so the
+    /// higher-QOS preemptor wins its own freed node first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_preemptors_order_by_qos_base() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        // Two victim QOSes and two hunter QOSes of differing rank.
+        cm.qos_cache().insert(Qos {
+            name: "victim".into(),
+            priority: 100,
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "hunter-hi".into(),
+            priority: 10_000,
+            preempt: vec!["victim".into()],
+            ..Default::default()
+        });
+        cm.qos_cache().insert(Qos {
+            name: "hunter-lo".into(),
+            priority: 5_000,
+            preempt: vec!["victim".into()],
+            ..Default::default()
+        });
+
+        let (_v1, hunter_hi) = preempt_into_drain(&cm, "n1", "victim", "hunter-hi").await;
+        let (_v2, hunter_lo) = preempt_into_drain(&cm, "n2", "victim", "hunter-lo").await;
+
+        let pending = cm.pending_jobs();
+        assert!(
+            pending.iter().position(|j| j.job_id == hunter_hi)
+                < pending.iter().position(|j| j.job_id == hunter_lo),
+            "two concurrent preemptors must order by QOS base (higher first)"
+        );
+    }
+
+    /// Requeue mode frees the node immediately and moves the victim straight to
+    /// Pending — it never drains through Completing — so only the earmark can
+    /// hold the node for the preemptor. A higher-effective-priority bystander
+    /// must still not win the node a requeue-preemption freed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_preemption_earmark_beats_bystander() {
+        let dir = TempDir::new().unwrap();
+        let mut config = preempting_config();
+        config.partitions[0].preempt_mode = "requeue".into();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let mut victim = basic_spec("victim");
+        victim.qos = Some("low".into());
+        victim.nodelist = Some("n1".into());
+        let victim_id = submit_and_wait(&cm, victim);
+        let res = scalar_alloc(8, 16000);
+        cm.start_job(
+            victim_id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, victim_id, JobState::Running);
+
+        let mut hunter = basic_spec("hunter");
+        hunter.qos = Some("high".into());
+        hunter.nodelist = Some("n1".into());
+        let hunter_id = submit_and_wait(&cm, hunter);
+
+        let bystander_id = submit_bystander(&cm, "n1");
+
+        // Requeue-preempt the victim: it frees n1 and returns to Pending at once.
+        let hunter_job = cm.get_job(hunter_id).unwrap();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&hunter_job],
+            &cm.config().scheduler,
+        )
+        .await;
+        // The victim is Pending again (held), n1 is free; the earmark is live.
+        assert_ne!(cm.get_job(victim_id).unwrap().state, JobState::Running);
+
+        let assignments = run_one_scheduling_pass(&cm);
+        let n1_owner = assignments
+            .iter()
+            .find(|a| a.nodes.iter().any(|n| n == "n1"))
+            .map(|a| a.job_id);
+        assert_eq!(
+            n1_owner,
+            Some(hunter_id),
+            "a requeue-freed node must go to the preemptor, not the higher-effective-priority bystander"
+        );
+        let _ = bystander_id;
+    }
+
+    /// A preempt-cancel victim force-completed through the completing-timeout
+    /// path (`JobComplete`) frees its node without ever reaching
+    /// `JobNodeComplete`. The earmark must be set on that path too, so a
+    /// bystander still cannot take the node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_completion_earmark_beats_bystander() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (victim_id, hunter_id) = preempt_into_drain(&cm, "n1", "low", "high").await;
+        let bystander_id = submit_bystander(&cm, "n1");
+
+        // Force-complete the draining victim (completing-timeout path), which
+        // frees n1 without any JobNodeComplete report.
+        cm.complete_job(victim_id, 0, JobState::Cancelled).unwrap();
+        settle(&cm, victim_id, JobState::Cancelled);
+
+        let assignments = run_one_scheduling_pass(&cm);
+        let n1_owner = assignments
+            .iter()
+            .find(|a| a.nodes.iter().any(|n| n == "n1"))
+            .map(|a| a.job_id);
+        assert_eq!(
+            n1_owner,
+            Some(hunter_id),
+            "a force-completed preemption must still earmark the node for its preemptor"
+        );
+        let _ = bystander_id;
+    }
+
+    /// Reclaim returns borrowed capacity to the general pool; it must NOT earmark
+    /// the freed node for the reclaimer, or a borrowed reclaimer would jump ahead
+    /// of an in-quota job for the node. A genuine preemption of the same victim
+    /// DOES earmark — this pins down the one behavioural difference between the
+    /// two paths.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaim_does_not_earmark_but_preemption_does() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        let run_victim_on_n1 = |name: &str| -> JobId {
+            let mut v = basic_spec(name);
+            v.nodelist = Some("n1".into());
+            let id = submit_and_wait(&cm, v);
+            let res = scalar_alloc(8, 16000);
+            cm.start_job(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+            id
+        };
+
+        // Reclaim path: no earmark is recorded for the reclaimer (job 777).
+        let v1 = run_victim_on_n1("borrowed");
+        cm.reclaim_job_with_provenance(v1, PreemptMode::Requeue, Some(777), None)
+            .unwrap();
+        assert!(
+            cm.preempt_freed_nodes_raw().is_empty(),
+            "reclaim must not earmark the freed node for the reclaimer"
+        );
+
+        // Genuine preemption path: the freed node IS earmarked for the preemptor.
+        let v2 = run_victim_on_n1("victim2");
+        cm.preempt_job_with_provenance(v2, PreemptMode::Requeue, Some(888), None)
+            .unwrap();
+        assert_eq!(
+            cm.preempt_freed_nodes_raw().get("n1").map(|(p, _)| *p),
+            Some(888),
+            "a genuine requeue-preemption must earmark the freed node for its preemptor"
+        );
+    }
+
+    /// A preempt-cancel victim whose node is freed by a node failure mid-drain
+    /// (the `evict_job_locked` path) must still earmark its healthy freed nodes
+    /// for the preemptor, so the node-failure path does not reopen the race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_failure_during_drain_earmarks_healthy_node() {
+        let dir = TempDir::new().unwrap();
+        let config = preempting_config();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        // A two-node victim spanning n1+n2.
+        let mut victim = basic_spec("victim");
+        victim.qos = Some("low".into());
+        victim.num_nodes = 2;
+        victim.num_tasks = 2;
+        victim.nodelist = Some("n1,n2".into());
+        let victim_id = submit_and_wait(&cm, victim);
+        let res = scalar_alloc(8, 16000);
+        cm.start_job(
+            victim_id,
+            vec!["n1".into(), "n2".into()],
+            res.clone(),
+            per_node_for(&["n1", "n2"], res),
+        )
+        .unwrap();
+        settle(&cm, victim_id, JobState::Running);
+
+        // A preemptor that evicts the victim (cancel mode): victim drains.
+        let mut hunter = basic_spec("hunter");
+        hunter.qos = Some("high".into());
+        hunter.num_nodes = 2;
+        hunter.num_tasks = 2;
+        hunter.nodelist = Some("n1,n2".into());
+        let hunter_id = submit_and_wait(&cm, hunter);
+        let hunter_job = cm.get_job(hunter_id).unwrap();
+        let partitions = cm.get_partitions();
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &partitions,
+            &cm.get_nodes(),
+            &[&hunter_job],
+            &cm.config().scheduler,
+        )
+        .await;
+        settle(&cm, victim_id, JobState::Completing);
+
+        // n1 goes Down mid-drain: evict finalizes the victim and frees healthy n2
+        // without a JobNodeComplete report. n2 must be earmarked for the hunter.
+        cm.mark_node_down("n1", Some("hw failure".into())).unwrap();
+        settle(&cm, victim_id, JobState::Cancelled);
+
+        let earmarks = cm.preempt_freed_nodes_raw();
+        assert_eq!(
+            earmarks.get("n2").map(|(p, _)| *p),
+            Some(hunter_id),
+            "a node freed from a preempt-cancel victim by node failure must be earmarked for the preemptor"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -31057,6 +31930,7 @@ mod tests {
             Utc::now(),
             PendingReason::NodeDown,
             None,
+            &mut Vec::new(),
         );
         assert!(result.is_none());
     }
@@ -31075,6 +31949,7 @@ mod tests {
             Utc::now(),
             PendingReason::NodeDown,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(fin.job_id, 1);
@@ -31103,6 +31978,7 @@ mod tests {
             Utc::now(),
             PendingReason::NodeDown,
             None,
+            &mut Vec::new(),
         );
 
         assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
@@ -31125,6 +32001,7 @@ mod tests {
             Utc::now(),
             PendingReason::NodeDown,
             None,
+            &mut Vec::new(),
         );
         assert!(result.is_none());
     }
@@ -31148,6 +32025,7 @@ mod tests {
             Utc::now(),
             PendingReason::NodeDown,
             None,
+            &mut Vec::new(),
         );
 
         let job = &jobs[&1];
@@ -31171,6 +32049,7 @@ mod tests {
             Utc::now(),
             PendingReason::NodeDown,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(fin.state, JobState::NodeFail);
@@ -31194,6 +32073,7 @@ mod tests {
             Utc::now(),
             PendingReason::NodeDown,
             None,
+            &mut Vec::new(),
         );
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);
