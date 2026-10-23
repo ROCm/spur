@@ -99,9 +99,9 @@ model as JSON in the ``spur.amd.com/topology`` annotation. An invalid annotation
 is reported as unavailable rather than silently disappearing. This annotation
 is an inventory transport, not a validated controller static-import API.
 
-Typed GPU predicates, per-device static import, segments, topology exclusivity,
-and authoritative fabric health are separate capabilities and are not enabled
-by these observations. No job flags are added for those capabilities.
+Typed GPU predicates use these observations when explicitly requested, as
+described below. Per-device static import, segments, topology exclusivity,
+and authoritative fabric health remain unsupported.
 
 Controller block inspection
 ---------------------------
@@ -231,20 +231,89 @@ domains do not satisfy the constraint. The same block inventory supplies the
 existing block/tree topology and exact-GPU placement. No new topology plugin
 or partition-name list is needed.
 
-The supported expression is one of these predicates, optionally joined to node
-features using commas or ``&``, for example
-``fast&same(gpu.fabric_domain_id)``. Other GPU predicates, OR expressions involving
-these predicates, and malformed expressions are rejected. Legacy comma-separated
-node features retain their existing meaning. The constraint requires a GPU
-request or whole-node exclusivity. Upgrade controllers and clients together
-before using this syntax; older controllers do not implement these predicates.
-Agents must advertise ``FabricBindingVersion`` of at least 1 for native membership,
-or 2 for file-defined blocks.
+Per-GPU property constraints
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The existing ``--constraint`` option also filters the actual allocated GPU
+identities by model, VRAM, physical domain, fabric domain, NUMA node, and PCI
+root. A matching node is insufficient: every selected GPU must match.
+
+.. list-table:: GPU property syntax
+   :header-rows: 1
+   :widths: 30 25 45
+
+   * - Field
+     - Operators
+     - Example
+   * - ``gpu.type`` (alias ``gpu.gpu_type``)
+     - ``= !=``
+     - ``gpu.type=mi300x``
+   * - ``gpu.vram`` (alias ``gpu.vram_bytes``)
+     - ``= != > >= < <=``
+     - ``gpu.vram>=192GiB``
+   * - ``gpu.numa_node_id``
+     - ``= != > >= < <=``
+     - ``gpu.numa_node_id=0``
+   * - ``gpu.pcie_root_id``
+     - ``= !=``
+     - ``gpu.pcie_root_id=pci0001:00``
+   * - ``gpu.physical_domain_id`` (alias ``gpu.physical_pod_id``)
+     - ``= !=``
+     - ``gpu.physical_domain_id=rack-a``
+   * - ``gpu.fabric_domain_id`` (alias ``gpu.vpod_id``)
+     - ``= !=``
+     - ``gpu.fabric_domain_id=15``
+
+VRAM accepts bytes or binary/decimal units such as ``GiB`` and ``GB``; it is a
+per-device capacity filter, not a request to reserve a portion of GPU memory.
+NUMA IDs are integers greater than or equal to zero. Unknown values never satisfy a predicate,
+including ``!=``. String comparisons are exact and case-sensitive. Domain ID
+filters use the ordinary partition and node eligibility rules; there is no
+separate administrator-only domain-pinning policy in this version.
+
+Join predicates and required node features with commas or ``&``. Expressions
+are limited to 4096 bytes and 32 terms. OR and grouping parentheses, apart from
+``same(field)``, are rejected. Legacy feature-only constraints retain their
+comma-separated syntax: ``fast,large`` means both features; ``fast&large`` alone
+retains its previous meaning as one literal feature name.
+
+``same(field)`` requires one value across all selected GPUs for any field in
+the table. NUMA and PCI-root identities are scoped to a node, so identical
+local labels on different nodes do not satisfy a same-NUMA or same-root request.
+The constraint selects GPUs; it does not pin job CPUs or memory to that NUMA
+node. Equality on a fabric-domain ID also requires one scoped block, avoiding
+accidental combinations of repeated local IDs in different racks. A file block
+name does not manufacture a GPU observation: direct domain-ID filters still
+require reported values, while ``same(gpu.fabric_domain_id)`` can use a declared
+block when native membership is absent.
+
+.. code-block:: console
+
+   spur submit -N 1 -n 1 --gpus 2 --constraint='gpu.type=mi300x&gpu.vram>=192GiB&same(gpu.pcie_root_id)' --wrap 'hostname'
+   spur submit -N 2 -n 2 --gpus-per-node 2 --topology block --constraint='gpu.vram>=192GiB&same(gpu.vpod_id)' --wrap 'hostname'
+   spur run -N 1 -n 1 --gpus 2 --constraint='same(gpu.numa_node_id)' hostname
+
+These expressions require a GPU request or whole-node exclusivity. Upgrade
+controllers and clients together before using them. Agents must advertise
+``FabricBindingVersion`` of at least 1 for native membership, 2 for file-defined
+blocks, or 3 for additional GPU property predicates and grouping. Jobs using
+only existing fabric containment retain their older binding requirements.
+
+The controller persists the exact selected GPU identities and property
+snapshots with their inventory generation. Admission, the start gate, and
+steps validate those bindings, including after supervisor recovery. Native
+AMD discovery re-reads the selected devices' KFD and PCI facts before launch;
+other device providers use their reported inventory and generation. Inspection
+with ``spur control show job`` includes ``GpuPropertyNode``, ``Generation``,
+and ``StableIds``. A change invalidates the old allocation for subsequent steps;
+restoring matching values does not authorize silently rebinding that allocation
+across an inventory generation change. This does not terminate GPU processes
+already executing when the hardware changes.
 
 Plain GPU jobs use ordinary scheduling, including when the partition has
-``mode = "preconfigured"``. They can span blocks. With the constraint, a job
-waits if no single block can fit it; there is no automatic fallback.
-``--topology none`` cannot disable the constraint. Omitting ``-p`` selects the
+``mode = "preconfigured"``. They can span blocks. With a same-fabric constraint,
+a job waits if no single block can fit it; there is no automatic fallback.
+``--topology none`` cannot disable that requirement. Omitting ``-p`` selects the
 configured default partition, or the first partition if no default is marked;
 the explicit job constraint keeps the same meaning for either choice and for
 comma-separated partition lists. Partition names have no built-in rack meaning.
@@ -253,12 +322,14 @@ Bare ``--exclusive`` retains whole-node allocation semantics. Combined with the
 same-fabric constraint, every GPU reserved on an exclusive node must belong to
 the selected block. ``ExclusiveTopo`` remains unsupported: reserving a node does
 not reserve all nodes in its block. Steps inherit their parent allocation's
-binding. Adding a same-fabric constraint to an existing step is rejected; specify
+binding. Adding a GPU property constraint to an existing step is rejected; specify
 it when creating the allocation.
 
-For each constrained job, the scheduler considers complete, consistent blocks whose candidate
-nodes advertise binding enforcement. It filters each node's inventory to that
-block's exact GPU IDs and runs the existing resource and backfill solver. It
+For a same-fabric job, the scheduler considers complete, consistent blocks whose
+candidate nodes advertise binding enforcement. It filters each node's inventory
+to that block's exact GPU IDs, applies any additional GPU predicates and grouping,
+and runs the existing resource and backfill solver. A property-only job applies
+the same filters without requiring containment in one fabric block. It
 chooses the earliest feasible start, preferring smaller blocks at the same start and then the scoped block key.
 Node lists, GPU types and quantities, CPU/memory requirements, and reservations
 still apply. Selected GPU IDs must remain free throughout the proposed interval.
@@ -268,8 +339,10 @@ can fill gaps without consuming them at the reserved start.
 The controller validates the selected block again before recording the placement.
 Each per-node allocation persists its block key, active endpoints, exact logical
 GPU membership, binding version, and inventory generation. ``scontrol show job``
-displays the resulting per-node fabric binding. A failed search reports
-``FabricUnavailable`` in the pending reason description.
+displays the resulting per-node fabric binding. A failed same-fabric search
+reports ``FabricUnavailable`` in the pending reason description. A property-only
+request that cannot fit reports ``GpuPropertiesUnavailable``; inspect
+``spur control show node`` for its reported GPU facts.
 
 The agent checks the binding under its allocation lock before admitting the
 resources. AMD UALink bindings also reread the allowlisted attributes of the bound
@@ -337,7 +410,7 @@ and each declared block is a boundary for jobs requesting containment. A node ca
 only one declared block. The record covers all currently registered GPUs on
 each named node; it cannot describe separate groups within a node. GPU counts,
 types, identities, free resources, and health are never taken from this file.
-Nodes omitted from the file cannot supply GPUs to constrained jobs, but remain
+Nodes omitted from the file cannot supply GPUs to same-fabric jobs, but remain
 available to ordinary scheduling.
 
 If the selected GPUs have native fabric observations, the entire declared

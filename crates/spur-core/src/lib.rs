@@ -16,6 +16,7 @@ pub mod device_topology;
 pub mod end_reason;
 pub mod fabric;
 pub mod fabric_binding;
+pub mod gpu_binding;
 pub mod gpu_request;
 pub mod hooks;
 pub mod hostlist;

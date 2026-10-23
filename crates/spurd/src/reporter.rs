@@ -674,7 +674,7 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         generic: generic_from_registry(registry),
         // Bumped by the periodic refresh task on topology rebuild, not here.
         generation: 0,
-        fabric_binding_version: spur_core::fabric_binding::FILE_BINDING_VERSION,
+        fabric_binding_version: spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY,
         block_file_revision: None,
     }
 }
@@ -875,6 +875,7 @@ pub fn allocations_to_proto(
             })
             .collect::<HashMap<_, _>>(),
         generation: r.generation,
+        gpu_binding: r.gpu_binding.as_ref().map(spur_core::gpu_binding::to_proto),
         fabric_binding: r
             .fabric_binding
             .as_ref()

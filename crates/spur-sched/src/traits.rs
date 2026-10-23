@@ -52,6 +52,6 @@ pub struct FabricSchedulingContext {
 
 impl FabricSchedulingContext {
     pub fn requires_binding(&self, job: &Job) -> bool {
-        spur_core::constraints::requires_same_fabric(&job.spec)
+        spur_core::constraints::requires_gpu_properties(&job.spec)
     }
 }

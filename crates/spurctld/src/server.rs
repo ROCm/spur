@@ -2916,11 +2916,9 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        if job
-            .per_node_alloc
-            .values()
-            .any(|allocation| allocation.fabric_binding.is_some())
-        {
+        if job.per_node_alloc.values().any(|allocation| {
+            allocation.fabric_binding.is_some() || allocation.gpu_binding.is_some()
+        }) {
             self.cluster
                 .validate_fabric_placement(&job, &job.allocated_nodes, &job.per_node_alloc)
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -3601,11 +3599,9 @@ impl SlurmController for ControllerService {
                 node: step.nodes.join(","),
             }));
         }
-        if job
-            .per_node_alloc
-            .values()
-            .any(|allocation| allocation.fabric_binding.is_some())
-        {
+        if job.per_node_alloc.values().any(|allocation| {
+            allocation.fabric_binding.is_some() || allocation.gpu_binding.is_some()
+        }) {
             self.cluster
                 .validate_fabric_placement(&job, &job.allocated_nodes, &job.per_node_alloc)
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -5064,6 +5060,16 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
     JobInfo {
+        gpu_bindings: job
+            .per_node_alloc
+            .iter()
+            .filter_map(|(node, alloc)| {
+                alloc
+                    .gpu_binding
+                    .as_ref()
+                    .map(|binding| (node.clone(), spur_core::gpu_binding::to_proto(binding)))
+            })
+            .collect(),
         fabric_bindings: job
             .per_node_alloc
             .iter()
@@ -5497,6 +5503,7 @@ pub(crate) fn allocations_to_proto(
             })
             .collect::<HashMap<_, _>>(),
         generation: r.generation,
+        gpu_binding: r.gpu_binding.as_ref().map(spur_core::gpu_binding::to_proto),
         fabric_binding: r
             .fabric_binding
             .as_ref()
@@ -5530,6 +5537,7 @@ pub(crate) fn proto_to_allocations(
             .collect::<HashMap<_, _>>(),
         generation: r.generation,
         fabric_binding: r.fabric_binding.map(spur_core::fabric_binding::from_proto),
+        gpu_binding: r.gpu_binding.map(spur_core::gpu_binding::from_proto),
     }
 }
 
@@ -6616,6 +6624,7 @@ mod tests {
 
         let res = spur_core::resource::ResourceAllocations {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
@@ -6711,6 +6720,7 @@ mod tests {
 
         let res = spur_core::resource::ResourceAllocations {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
@@ -6903,6 +6913,7 @@ mod tests {
 
         let res = spur_core::resource::ResourceAllocations {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
@@ -7052,6 +7063,7 @@ mod tests {
         });
         let res = spur_core::resource::ResourceAllocations {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),

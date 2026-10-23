@@ -388,8 +388,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 fn validate_step_constraints(constraint: Option<&str>, step_mode: bool) -> Result<()> {
     let constraints =
         spur_core::constraints::Constraints::parse(constraint).map_err(anyhow::Error::msg)?;
-    if step_mode && constraints.same_fabric {
-        anyhow::bail!("a job step inherits its allocation's fabric binding; specify the same GPU fabric constraint on submit, alloc, or standalone run");
+    if step_mode && constraints.has_gpu() {
+        anyhow::bail!("a job step inherits its allocation's GPU binding; specify GPU property constraints on submit, alloc, or standalone run");
     }
     Ok(())
 }

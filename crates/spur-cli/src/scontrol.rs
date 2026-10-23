@@ -1224,7 +1224,7 @@ fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
     };
     let text = |value: Option<&str>| value.unwrap_or("unknown").escape_debug().to_string();
     let mut output = format!(
-        "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={}\n",
+        "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={} GPUType={}\n",
         gpu.device_id,
         gpu.stable_id,
         text(topology.pci_bdf.as_deref()),
@@ -1235,6 +1235,7 @@ fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
         topology
             .vram_bytes
             .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        gpu.gpu_type.escape_debug(),
     );
     let Some(fabric) = &topology.fabric else {
         return output;
@@ -2225,6 +2226,22 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     let _ = writeln!(out, "JobId={} JobName={}", job.job_id, job.name);
     if !job.comment.is_empty() {
         let _ = writeln!(out, "   Comment={}", job.comment);
+    }
+    let mut gpu_bindings: Vec<_> = job.gpu_bindings.iter().collect();
+    gpu_bindings.sort_by_key(|(node, _)| *node);
+    for (node, binding) in gpu_bindings {
+        let ids: Vec<_> = binding
+            .gpus
+            .iter()
+            .map(|g| g.stable_id.to_string())
+            .collect();
+        let _ = writeln!(
+            out,
+            "   GpuPropertyNode={} Generation={} StableIds=[{}]",
+            node,
+            binding.generation,
+            ids.join(",")
+        );
     }
     let mut bindings: Vec<_> = job.fabric_bindings.iter().collect();
     bindings.sort_by_key(|(node, _)| *node);
