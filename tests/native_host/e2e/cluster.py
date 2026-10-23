@@ -864,6 +864,18 @@ class SpurCluster:
             time.sleep(3)
         return last
 
+    def wait_k8s_active_controllers(self, count: int, timeout: int = 120) -> list[str]:
+        """Poll until `count` controllers report active. Status probes each agent live, so
+        rows read `unknown` until agents answer again after a controller or agent restart."""
+        deadline = time.time() + timeout
+        last: list[str] = []
+        while time.time() < deadline:
+            last = self.k8s_active_controllers()
+            if len(last) >= count:
+                return last
+            time.sleep(3)
+        return last
+
     def sacct(self, args: list[str]) -> str:
         return self.cli(["sacct"] + args)
 
