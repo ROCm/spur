@@ -32,10 +32,6 @@ impl GresEntry {
         self.flags.iter().any(|f| f == "count_only")
             || (self.file.is_none() && self.multiple_files.is_none())
     }
-
-    pub fn has_file_spec(&self) -> bool {
-        self.file.is_some() || self.multiple_files.is_some()
-    }
 }
 
 pub fn expand_hostlist(pattern: &str) -> Vec<String> {

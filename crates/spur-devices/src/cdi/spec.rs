@@ -339,26 +339,8 @@ impl CdiSpec {
         Ok(())
     }
 
-    pub fn parse_kind(&self) -> Option<(&str, &str)> {
-        self.kind.split_once('/')
-    }
-
     pub fn qualified_name(&self, device_name: &str) -> String {
         format!("{}={}", self.kind, device_name)
-    }
-
-    pub fn device_node_paths(&self, device_name: &str) -> Vec<String> {
-        let mut paths = Vec::new();
-
-        if let Some(dev) = self.devices.iter().find(|d| d.name == device_name) {
-            if let Some(ref edits) = dev.container_edits {
-                for dn in &edits.device_nodes {
-                    paths.push(dn.effective_host_path().to_owned());
-                }
-            }
-        }
-
-        paths
     }
 }
 
