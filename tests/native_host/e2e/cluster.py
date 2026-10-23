@@ -50,6 +50,15 @@ DOCKER_PORT_INSPECT_FMT = (
     '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}'
 )
 
+# Pinned by digest: the mirror intermittently 404s blobs of a re-pushed tag
+# whose index it still serves stale.
+POSTGRES_IMAGE = (
+    "mirror.gcr.io/library/postgres:16-alpine"
+    "@sha256:f4610795587492cd4fb887c2dc3de301b813278bb6f616992061141b5f15ac36"
+)
+IMAGE_PULL_ATTEMPTS = 4
+IMAGE_PULL_BACKOFF_SECS = 5
+
 
 def log_tail_is_leader(log: str) -> bool:
     """Whether *log* ends in a "become leader" not yet followed by "quit leader".
@@ -64,6 +73,27 @@ def parse_published_port(inspect_output: str) -> int:
     if not port.isdigit():
         raise RuntimeError(f"no published port in docker inspect output: {inspect_output!r}")
     return int(port)
+
+
+def ensure_docker_image(node: "SshNode", image: str):
+    """Pull *image* on *node* unless already present, retrying transient
+    registry failures (blob timeouts, 5xx) that would otherwise fail the
+    whole fixture."""
+    quoted = shlex.quote(image)
+    if node.exec_with_exit(f"docker image inspect {quoted} >/dev/null 2>&1")[0] == 0:
+        return
+    output = ""
+    for attempt in range(1, IMAGE_PULL_ATTEMPTS + 1):
+        code, output = node.exec_with_exit(f"docker pull -q {quoted}")
+        if code == 0:
+            return
+        logger.warning("docker pull %s failed (attempt %d/%d): %s",
+                       image, attempt, IMAGE_PULL_ATTEMPTS, output.strip())
+        if attempt < IMAGE_PULL_ATTEMPTS:
+            time.sleep(IMAGE_PULL_BACKOFF_SECS * attempt)
+    raise RuntimeError(
+        f"docker pull {image} failed on {node.host} after {IMAGE_PULL_ATTEMPTS} attempts:\n{output}"
+    )
 
 
 def make_remote_dir() -> str:
@@ -812,6 +842,18 @@ class SpurCluster:
         while time.time() < deadline:
             last = self.etcd_member_count()
             if last >= count:
+                return last
+            time.sleep(3)
+        return last
+
+    def wait_k8s_active_controllers(self, count: int, timeout: int = 120) -> list[str]:
+        """Poll until `count` controllers report active. Status probes each agent live, so
+        rows read `unknown` until agents answer again after a controller or agent restart."""
+        deadline = time.time() + timeout
+        last: list[str] = []
+        while time.time() < deadline:
+            last = self.k8s_active_controllers()
+            if len(last) >= count:
                 return last
             time.sleep(3)
         return last
@@ -1621,10 +1663,11 @@ tar -C "$R" -czf '{local_tar}' .
             "c=$(docker ps -aq --filter name=spur-e2e-pg-); "
             "[ -n \"$c\" ] && docker rm -f $c || true"
         )
+        ensure_docker_image(node, POSTGRES_IMAGE)
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "
-            f"-p 0:5432 mirror.gcr.io/library/postgres:16-alpine"
+            f"-p 0:5432 {POSTGRES_IMAGE}"
         )
         self._pg_port = parse_published_port(
             node.exec(
