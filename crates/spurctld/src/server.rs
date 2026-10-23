@@ -309,6 +309,56 @@ fn is_agent_connection_loss(status: &Status) -> bool {
     )
 }
 
+async fn replay_completed_step(
+    cluster: &ClusterManager,
+    job: &spur_core::job::Job,
+    step: &spur_core::step::JobStep,
+) -> Result<RunStepResponse, Status> {
+    if step.nodes.is_empty() {
+        return Err(Status::failed_precondition("completed step has no nodes"));
+    }
+
+    let mut agents = Vec::with_capacity(step.nodes.len());
+    for node_name in &step.nodes {
+        if !job.allocated_nodes.contains(node_name) {
+            return Err(Status::failed_precondition(format!(
+                "step node {node_name} is not in the job's current allocation"
+            )));
+        }
+        let node = cluster.get_node(node_name).ok_or_else(|| {
+            Status::unavailable(format!("node {node_name} is not currently registered"))
+        })?;
+        agents.push(node_comm_http_url(&node, node_name)?);
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in agents {
+        let user = job.spec.user.clone();
+        let job_id = step.job_id;
+        let run_attempt = job.run_attempt;
+        let step_id = step.step_id;
+        set.spawn(
+            async move { reawait_step(&agent_addr, job_id, run_attempt, step_id, &user).await },
+        );
+    }
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    while let Some(result) = set.join_next().await {
+        let response = result
+            .map_err(|error| Status::internal(format!("step replay task failed: {error}")))??;
+        stdout.push_str(&response.stdout);
+        stderr.push_str(&response.stderr);
+    }
+
+    Ok(RunStepResponse {
+        exit_code: step.exit_code.unwrap_or(0),
+        stdout,
+        stderr,
+        node: step.nodes.join(","),
+    })
+}
+
 /// A supervised step outlives the agent that launched it, so a lost call is not
 /// a lost step: reconnect and re-park instead of failing work still running.
 async fn reawait_step(
@@ -3525,6 +3575,15 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| {
                 Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
+
+        if matches!(
+            step.state,
+            spur_core::step::StepState::Completed | spur_core::step::StepState::Failed
+        ) {
+            return replay_completed_step(&self.cluster, &job, &step)
+                .await
+                .map(Response::new);
+        }
 
         if step.state.is_terminal() {
             let exit_code = step.exit_code.unwrap_or(0);
@@ -7158,6 +7217,7 @@ mod tests {
 
     struct ProbeAgent {
         active: bool,
+        step_response: Option<spur_proto::proto::RunCommandResponse>,
     }
 
     #[tonic::async_trait]
@@ -7190,7 +7250,10 @@ mod tests {
             &self,
             _request: Request<spur_proto::proto::AwaitStepRequest>,
         ) -> Result<Response<spur_proto::proto::RunCommandResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
+            self.step_response
+                .clone()
+                .map(Response::new)
+                .ok_or_else(|| Status::unimplemented("not used in tests"))
         }
         async fn prepare_pmix(
             &self,
@@ -7319,13 +7382,23 @@ mod tests {
 
     /// Spawn a real `ProbeAgent` gRPC server on an OS-assigned localhost port.
     async fn spawn_probe_agent(active: bool) -> std::net::SocketAddr {
+        spawn_probe_agent_with_step_response(active, None).await
+    }
+
+    async fn spawn_probe_agent_with_step_response(
+        active: bool,
+        step_response: Option<spur_proto::proto::RunCommandResponse>,
+    ) -> std::net::SocketAddr {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let agent = ProbeAgent { active };
+        let agent = ProbeAgent {
+            active,
+            step_response,
+        };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
-                .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
+                .add_service(spur_proto::agent_server(agent))
                 .serve_with_incoming(incoming)
                 .await;
         });
@@ -9803,7 +9876,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_step_rejects_completed_step() {
+    async fn run_step_replays_completed_step_output() {
         use spur_core::resource::ResourceAllocations;
         use spur_core::step::{JobStep, StepState, TaskDistribution};
 
@@ -9811,6 +9884,17 @@ mod tests {
         let svc = test_service(&dir).await;
         let job_id = running_job_owned_by(&svc, "ubuntu").await;
         let allocated_nodes = svc.cluster.get_job(job_id).unwrap().allocated_nodes.clone();
+        let original_stdout = "x".repeat(5 * 1024 * 1024);
+        let agent = spawn_probe_agent_with_step_response(
+            false,
+            Some(spur_proto::proto::RunCommandResponse {
+                exit_code: 7,
+                stdout: original_stdout.clone(),
+                stderr: "original stderr\n".into(),
+            }),
+        )
+        .await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
         svc.cluster
             .create_step(JobStep {
                 job_id,
@@ -9828,7 +9912,7 @@ mod tests {
             })
             .expect("test setup: seed step");
         svc.cluster
-            .record_step_complete(job_id, 0, 0)
+            .record_step_complete(job_id, 0, 7)
             .expect("test setup: complete step");
 
         let resp = svc
@@ -9842,7 +9926,9 @@ mod tests {
             .await
             .expect("a completed step returns the recorded exit code")
             .into_inner();
-        assert_eq!(resp.exit_code, 0, "recorded exit code must be returned");
+        assert_eq!(resp.exit_code, 7, "recorded exit code must be returned");
+        assert_eq!(resp.stdout, original_stdout);
+        assert_eq!(resp.stderr, "original stderr\n");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9887,6 +9973,24 @@ mod tests {
             "unexpected message: {}",
             err.message()
         );
+
+        svc.cluster
+            .record_step_complete(job_id, 0, 0)
+            .expect("test setup: complete step");
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a completed step outside the allocation must not be replayed");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err
+            .message()
+            .contains("not in the job's current allocation"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

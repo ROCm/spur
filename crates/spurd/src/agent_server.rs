@@ -1689,7 +1689,11 @@ pub async fn recover_stepds(
             work_dir: descriptor.work_dir.clone(),
             uid: descriptor.uid,
             gid: descriptor.gid,
-            user: descriptor.owner.clone(),
+            user: if owns_lifetime {
+                descriptor.owner.clone()
+            } else {
+                String::new()
+            },
             partition: descriptor.resources.partition.clone(),
             gpu_devices: descriptor.resources.gpu_devices.clone(),
             cpus: descriptor.resources.cpus,
@@ -1703,6 +1707,7 @@ pub async fn recover_stepds(
         if !owns_lifetime {
             continue;
         }
+        tracked.user = descriptor.owner.clone();
         tracked.cgroup_path = cgroup_path;
         if !descriptor.stdout_path.is_empty() {
             tracked.stdout_path = descriptor.stdout_path.clone();
@@ -6977,7 +6982,17 @@ impl SlurmAgent for AgentService {
             .as_ref()
             .map(|state| std::path::PathBuf::from(&state.cgroup_path))
             .filter(|path| !path.as_os_str().is_empty());
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry, job_attempt) = {
+        let (
+            gpu_devices,
+            partition,
+            cpus,
+            memory_mb,
+            nodelist,
+            job_mpi,
+            job_owner,
+            job_entry,
+            job_attempt,
+        ) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -7017,6 +7032,7 @@ impl SlurmAgent for AgentService {
                 tracked.memory_mb,
                 nodelist,
                 tracked.mpi.clone(),
+                tracked.user.clone(),
                 entry,
                 tracked.run_attempt,
             )
@@ -7342,11 +7358,7 @@ impl SlurmAgent for AgentService {
                 .collect();
             let step_script =
                 supervised_step_script(&job_entry, req.uid, req.gid, &work_dir, &command)?;
-            let username = env
-                .get("USER")
-                .or_else(|| env.get("LOGNAME"))
-                .cloned()
-                .unwrap_or_default();
+            let username = job_owner.clone();
             let container = match resolve_step_container_plan(
                 req.container.as_ref(),
                 joins_parent_namespaces,
@@ -7401,11 +7413,7 @@ impl SlurmAgent for AgentService {
                 allocation_holder: false,
                 work_dir: work_dir.clone(),
                 name: format!("{job_id}.{step_id}"),
-                user: env
-                    .get("USER")
-                    .or_else(|| env.get("LOGNAME"))
-                    .cloned()
-                    .unwrap_or_default(),
+                user: job_owner,
                 node: self.reporter.hostname.clone(),
                 array_job_id: None,
                 array_task_id: None,
@@ -14486,7 +14494,7 @@ mod tests {
     // Sessions are adopted in directory order, so a job whose step supervisor
     // is enumerated first must still report the job's own output, not the step's.
     #[tokio::test]
-    async fn a_steps_session_never_supplies_the_jobs_output_paths() {
+    async fn a_steps_session_never_supplies_the_jobs_owner_or_output_paths() {
         let mut step = crate::stepd::StepdDescriptor::new(
             44,
             1,
@@ -14498,6 +14506,18 @@ mod tests {
         );
         step.stdout_path = "/spool/job44/step0.out".into();
         step.stderr_path = "/spool/job44/step0.err".into();
+        step.owner = "spoofed-owner".into();
+        let orphaned = new_running_jobs();
+        recover_stepds(&orphaned, vec![step.clone()]).await;
+        assert_eq!(
+            orphaned
+                .lock()
+                .await
+                .get(&44)
+                .expect("step is tracked")
+                .user,
+            ""
+        );
         let mut batch = crate::stepd::StepdDescriptor::new(
             44,
             1,
@@ -14509,6 +14529,7 @@ mod tests {
         );
         batch.stdout_path = "/spool/job44.out".into();
         batch.stderr_path = "/spool/job44.err".into();
+        batch.owner = "testuser".into();
         batch.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
 
         for order in [
@@ -14521,6 +14542,7 @@ mod tests {
 
             let jobs = running.lock().await;
             let tracked = jobs.get(&44).expect("the adopted job is tracked");
+            assert_eq!(tracked.user, "testuser", "order {seen:?}");
             assert_eq!(
                 tracked.stdout_path, "/spool/job44.out",
                 "a step's spool file is not the job's output (order {seen:?})"
