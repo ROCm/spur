@@ -224,7 +224,7 @@ class TestK8sMultiControlPlane:
         assert len(set(cps)) == 3, f"control planes not distinct: {cps}"
 
         # All three report an active controller component.
-        active = cluster.k8s_active_controllers()
+        active = cluster.wait_k8s_active_controllers(3)
         assert len(active) == 3, f"expected 3 active controllers, got {active}"
 
         # Ground truth: the embedded etcd formed a real 3-member quorum. etcd
@@ -289,7 +289,7 @@ class TestK8sMultiControlPlane:
         assert etcd_after_ctrl == 3, (
             f"etcd quorum lost after controller restart: {etcd_after_ctrl}"
         )
-        active_after_ctrl = c.k8s_active_controllers()
+        active_after_ctrl = c.wait_k8s_active_controllers(3)
         assert len(active_after_ctrl) == 3, (
             f"active controllers != 3 after restart: {active_after_ctrl}"
         )
@@ -314,9 +314,9 @@ class TestK8sMultiControlPlane:
         assert etcd_after_agents == 3, (
             f"etcd quorum lost after rolling agent restart: {etcd_after_agents}"
         )
-        assert len(c.k8s_active_controllers()) == 3, (
-            f"active controllers != 3 after agent restarts: "
-            f"{c.k8s_active_controllers()}"
+        active_after_agents = c.wait_k8s_active_controllers(3)
+        assert len(active_after_agents) == 3, (
+            f"active controllers != 3 after agent restarts: {active_after_agents}"
         )
         if has_workers:
             _assert_canary_survived(c, "canary-multicp")
