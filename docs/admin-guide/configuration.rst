@@ -113,7 +113,8 @@ file, so followers keep the config they loaded at startup until they restart (in
 Kubernetes they re-read the same Secret). ``[[partitions]]`` is the exception —
 partition changes replicate through the write-ahead log — but a follower re-derives
 node features, weight, and resource caps (``cpus`` / ``memory_mb`` /
-``reserved_memory_mb``) from its own pre-reconfigure ``[[nodes]]`` blocks. In
+``reserved_memory_mb``) from its own pre-reconfigure ``[[nodes]]`` blocks.
+Allocation-derived node states also reflect each controller's resource caps. In
 particular, a cap you *lower* via ``reconfigure`` is not enforced by a follower that
 has not restarted, so after an immediate failover the new leader may briefly admit
 against the old (higher) cap. Do not rely on reconfigured non-partition state
@@ -1581,11 +1582,16 @@ matches, and the first matching entry wins.
 
 Resuming a node with ``scontrol update NodeName=<node> State=RESUME`` (or
 ``State=IDLE``) clears its administrative hold. The displayed state reflects
-its current allocations: ``ALLOCATED`` when all CPUs are allocated, ``MIXED``
-when some CPUs or devices are allocated, and ``IDLE`` when neither is allocated.
-Running jobs keep their allocations and continue executing. Controller startup
-also reconciles these service states in restored snapshots after applying the
-current resource caps; unavailable and administratively held states are preserved.
+its current allocations: ``IDLE`` when neither CPUs nor devices are allocated;
+otherwise ``ALLOCATED`` when the allocated CPU count meets or exceeds the node's
+reported CPU capacity, and ``MIXED`` when it is below that capacity. Explicit
+``State=MIXED`` and ``State=ALLOCATED`` requests use the same derivation.
+Running jobs keep their allocations and continue executing.
+
+These service states are also reconciled whenever the controller applies node
+resource policy, including live ``scontrol reconfigure``, agent inventory updates,
+and snapshot restore. Restored states reflect the current controller's resource
+caps; unavailable and administratively held states are preserved.
 
 ``[network]``
 -------------
