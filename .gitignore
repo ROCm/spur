@@ -40,3 +40,4 @@ __pycache__/
 /docs/sphinx/_toc.yml
 /dictionary.dic
 .venv/
+.worktrees/

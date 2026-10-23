@@ -64,7 +64,7 @@ html_theme_options = {
 # rocm-docs-core generates ./sphinx/_toc.yml from ./sphinx/_toc.yml.in at build time.
 external_toc_path = "./sphinx/_toc.yml"
 
-exclude_patterns = ["_build", ".venv", "sphinx/_toc.yml.in"]
+exclude_patterns = ["_build", ".venv", "sphinx/_toc.yml.in", "knowledge"]
 
 
 def setup(app):
