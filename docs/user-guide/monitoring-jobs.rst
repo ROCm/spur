@@ -441,7 +441,7 @@ Unlike ``squeue``, ``--format`` here takes **comma-separated field names**, not
 ``Account``, ``Partition``, ``State``, ``Elapsed``, ``NNodes``, ``ExitCode``,
 ``DerivedExitCode``, ``Start``, ``End``, ``Submit``, ``TimeLimit``, ``NodeList``,
 ``NCPUS``, ``ReqMem``, ``QOS``, ``PreemptedBy``, ``PreemptMode``, ``PreemptQOS``,
-``Borrowed``, ``Reason``, ``ReasonDetail``, and ``EndedBy``. Set a per-field width with
+``Borrowed``, ``Reason``, ``ReasonDetail``, ``EndedBy``, and ``ReqGPUS``. Set a per-field width with
 ``Field%N``, e.g. ``JobName%20``.
 
 ``NodeList`` is the compressed hostlist of the nodes the job was allocated, in
@@ -990,9 +990,10 @@ Endpoints
      - Live
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
    * - ``/metrics/jobs-users-accts``
-     - Planned
-     - Per-user/per-account breakdown. Returns ``404`` until implemented, even
-       with ``high_cardinality = true``.
+     - Live
+     - Per-user/per-account job gauges and karma counters. Requires
+       ``metrics.high_cardinality = true``; returns ``404`` otherwise.
+       See :doc:`/admin-guide/karma-scoring`.
 
 Job metrics — ``/metrics/jobs``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

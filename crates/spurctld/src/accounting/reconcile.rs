@@ -265,6 +265,9 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
             reservation: spec.reservation.clone(),
             nodelist: spur_core::hostlist::compress(&job.allocated_nodes),
             idle_fill: job.idle_fill,
+            // Minutes granularity matches Slurm sacct convention; sub-minute
+            // limits truncate to 0 (displayed as UNLIMITED).
+            time_limit_min: spec.time_limit.map(|d| d.num_minutes() as i32),
         },
     )
     .await
@@ -747,6 +750,7 @@ mod tests {
                     reservation: None,
                     nodelist: String::new(),
                     idle_fill: false,
+                    time_limit_min: None,
                 },
             )
             .await?;
