@@ -451,11 +451,12 @@ Open MPI expects.  The ``--mpi=mpirun`` value appears in
 
 .. note::
 
-   Multi-node ``mpirun`` jobs survive a controller restart: the ``srun``
-   process that PRRTE uses for daemon placement retries the controller
-   connection for up to 60 seconds (30 attempts x 2 s backoff).  If the
-   controller is back within that window, the agent recognises the
-   already-running step and returns its result without relaunching.
+   Buffered ``srun`` steps, including steps inside ``sbatch`` scripts and
+   multi-node ``mpirun`` daemon placement, survive a controller restart while
+   their allocation remains active. ``srun`` retries the controller connection
+   for up to 60 seconds (30 attempts x 2 s backoff); agents join an existing
+   step rather than launching it again. If its completion was already recorded,
+   the controller retrieves the original output and exit code from the agents.
 
 Distributed-training rendezvous variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
