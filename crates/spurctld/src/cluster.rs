@@ -2276,7 +2276,53 @@ impl ClusterManager {
     ) -> anyhow::Result<()> {
         let config = self.config();
         spur_core::constraints::validate(&job.spec).map_err(anyhow::Error::msg)?;
-        let required = spur_core::constraints::requires_same_fabric(&job.spec);
+        let constraints =
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        let properties = !constraints.same.is_empty() || !constraints.predicates.is_empty();
+        let mut group = None;
+        for name in node_names.iter().filter(|name| {
+            properties
+                || allocations
+                    .get(*name)
+                    .is_some_and(|a| a.gpu_binding.is_some())
+        }) {
+            let allocation = allocations
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("missing GPU allocation for {name}"))?;
+            let node = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("GPU node disappeared"))?;
+            if properties || allocation.gpu_binding.is_some() {
+                let binding = allocation.gpu_binding.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("GPU property constraint requires an enforced binding")
+                })?;
+                binding
+                    .validate(name, &node.total_resources, allocation)
+                    .map_err(anyhow::Error::msg)?;
+                for id in allocation.device_ids("gpu") {
+                    let gpu = node
+                        .total_resources
+                        .gpus
+                        .iter()
+                        .find(|g| g.stable_id == id)
+                        .ok_or_else(|| anyhow::anyhow!("GPU disappeared"))?;
+                    anyhow::ensure!(
+                        constraints.matches_gpu(gpu),
+                        "allocated GPU does not satisfy its property predicates"
+                    );
+                    let key = constraints.group_key(name, gpu).ok_or_else(|| {
+                        anyhow::anyhow!("allocated GPU has unknown grouping properties")
+                    })?;
+                    anyhow::ensure!(
+                        group.as_ref().is_none_or(|prior| prior == &key),
+                        "allocated GPUs violate same-property constraint"
+                    );
+                    group = Some(key);
+                }
+            }
+        }
+        let required = constraints.same_fabric;
         if !required
             && allocations
                 .values()
@@ -6229,7 +6275,12 @@ impl ClusterManager {
                     && !job.pending_reason.is_scheduling_hold()
                     && !job.reason_explains_begin_hold(Utc::now())
                 {
-                    job.set_pending_reason_desc(PendingReason::Resources, "FabricUnavailable: no consistent block with capable agents satisfies the request; inspect topology show");
+                    let description = if spur_core::constraints::requires_same_fabric(&job.spec) {
+                        "FabricUnavailable: no consistent block with capable agents satisfies the request; inspect topology show"
+                    } else {
+                        "GpuPropertiesUnavailable: no GPU placement with capable agents satisfies the requested properties; inspect control show node"
+                    };
+                    job.set_pending_reason_desc(PendingReason::Resources, description);
                 }
             }
         }
@@ -13055,6 +13106,117 @@ nodes = "ALL"
         let node = cm.get_node("node1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 4);
         assert_eq!(node.alloc_resources.memory_mb, 8000);
+    }
+
+    #[test]
+    fn gpu_pending_diagnostics_distinguish_properties_from_block_containment() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        for (id, expression, expected) in [
+            (1, "gpu.vram>=192GiB", "GpuPropertiesUnavailable"),
+            (2, "same(gpu.vpod_id)", "FabricUnavailable"),
+            (3, "gpu.vram>=192GiB&same(gpu.vpod_id)", "FabricUnavailable"),
+        ] {
+            let mut spec = basic_spec("properties");
+            spec.constraint = Some(expression.into());
+            cm.jobs.write().insert(id, Job::new(id, spec));
+            cm.annotate_fabric_pending(&[id]);
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.pending_reason, PendingReason::Resources);
+            assert!(job
+                .pending_reason_desc
+                .as_deref()
+                .unwrap()
+                .starts_with(expected));
+        }
+    }
+
+    #[test]
+    fn placement_entry_rejects_gpu_snapshot_predicate_and_local_group_mismatches() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut gpu = gpu_resource(0, 42);
+        gpu.topology = Some(spur_core::resource::DeviceTopology {
+            numa_node: Some(0),
+            pci_root: Some("pci0001:00".into()),
+            vram_bytes: Some(192 * 1024_u64.pow(3)),
+            ..Default::default()
+        });
+        let inventory = ResourceSet {
+            generation: 7,
+            fabric_binding_version: 3,
+            gpus: vec![gpu],
+            ..Default::default()
+        };
+        let mut allocations = HashMap::new();
+        for name in ["n0", "n1"] {
+            cm.nodes
+                .write()
+                .insert(name.into(), Node::new(name.into(), inventory.clone()));
+            let mut alloc = ResourceAllocations {
+                generation: 7,
+                devices: [(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(42)],
+                )]
+                .into(),
+                ..Default::default()
+            };
+            alloc.gpu_binding =
+                Some(spur_core::gpu_binding::GpuBinding::new(name, &inventory, &alloc).unwrap());
+            allocations.insert(name.into(), alloc);
+        }
+        let mut spec = basic_spec("properties");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
+        spec.constraint = Some("gpu.vram>=192GiB".into());
+        let job = Job::new(1, spec.clone());
+        let names = vec!["n0".into(), "n1".into()];
+        cm.validate_fabric_placement(&job, &names, &allocations)
+            .unwrap();
+        for expression in [
+            "gpu.vram>192GiB",
+            "same(gpu.numa_node_id)",
+            "same(gpu.pcie_root_id)",
+        ] {
+            spec.constraint = Some(expression.into());
+            cm.jobs.write().insert(1, Job::new(1, spec.clone()));
+            let error = cm
+                .reserve_placement(
+                    1,
+                    names.clone(),
+                    ResourceAllocations::default(),
+                    allocations.clone(),
+                    false,
+                    false,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("predicate")
+                    || error.to_string().contains("same-property"),
+                "{error}"
+            );
+            assert!(!cm.get_job(1).unwrap().holds_a_placement());
+        }
+        spec.constraint = Some("gpu.vram>=192GiB".into());
+        cm.jobs.write().insert(1, Job::new(1, spec));
+        cm.nodes
+            .write()
+            .get_mut("n0")
+            .unwrap()
+            .total_resources
+            .generation = 8;
+        let error = cm
+            .reserve_placement(
+                1,
+                names,
+                ResourceAllocations::default(),
+                allocations,
+                false,
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("stale GPU property"), "{error}");
+        assert!(!cm.get_job(1).unwrap().holds_a_placement());
     }
 
     fn gpu_resource(device_id: u32, stable_id: u64) -> spur_core::resource::GpuResource {
@@ -20254,6 +20416,7 @@ nodes = "ALL"
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            fabric: None,
             busy_until: &busy_until,
         };
         let mut scheduler =

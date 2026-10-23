@@ -246,8 +246,8 @@ Both jobs below use the same partition and discovered topology:
 The first job requests a locality preference and may span blocks. The second
 requires containment and stays pending if no single block can fit it.
 ``same(gpu.vpod_id)`` is an alias. Combine either predicate with required node
-features using commas or ``&``. Other GPU expressions and OR combinations are
-not supported yet. The constraint also works with ``spur alloc`` and standalone
+features using commas or ``&``. Per-device model, VRAM, NUMA, PCI-root, and
+domain filters are also supported; OR combinations are not supported. The constraint also works with ``spur alloc`` and standalone
 ``spur run``; steps inherit their allocation's binding.
 
 ``--topology none`` skips the hint without disabling an explicit constraint.

@@ -16,7 +16,6 @@ use crate::topology::DeviceTopology;
 use crate::types::LinkType;
 
 const AMD_CDI_KIND: &str = "amd.com/gpu";
-const KFD_TOPOLOGY_ROOT: &str = "/sys/class/kfd/kfd/topology/nodes";
 const KFD_AMD_VENDOR_ID: u32 = 4098; // 0x1002
 const VRAM_HEAP_TYPE: u64 = 1;
 const IO_LINK_XGMI: u32 = 2;
@@ -69,10 +68,6 @@ struct KfdIoLink {
     link_type: u32,
     weight: u32,
     max_bandwidth: u64,
-}
-
-fn discover_kfd_gpus() -> Vec<KfdGpuNode> {
-    discover_kfd_gpus_from_root(Path::new(KFD_TOPOLOGY_ROOT))
 }
 
 fn discover_kfd_gpus_from_root(root: &Path) -> Vec<KfdGpuNode> {
@@ -453,8 +448,21 @@ fn gpu_supplementary_gids_from_group_file(path: &str) -> Vec<u32> {
     gids
 }
 
+pub fn gpu_property_snapshots(
+    sysfs: &Path,
+) -> std::collections::BTreeMap<u64, (String, DeviceTopology)> {
+    discover_amd_gpus_from_root(sysfs)
+        .into_iter()
+        .filter_map(|gpu| Some((gpu.stable_id, (gpu.gpu_type, gpu.topology?))))
+        .collect()
+}
+
 fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
-    let kfd_nodes = discover_kfd_gpus();
+    discover_amd_gpus_from_root(Path::new("/sys"))
+}
+
+fn discover_amd_gpus_from_root(sysfs: &Path) -> Vec<DiscoveredGpu> {
+    let kfd_nodes = discover_kfd_gpus_from_root(&sysfs.join("class/kfd/kfd/topology/nodes"));
     if kfd_nodes.is_empty() {
         return Vec::new();
     }
@@ -472,7 +480,7 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
         .enumerate()
         .map(|(index, node)| {
             let device_index = node.render_minor.saturating_sub(128);
-            let render_device = format!("/sys/class/drm/renderD{}", node.render_minor);
+            let render_device = sysfs.join(format!("class/drm/renderD{}", node.render_minor));
             let device_path = Path::new(&render_device).join("device");
 
             let gpu_type = if node.device_id != 0 {
@@ -499,7 +507,7 @@ fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
             } else {
                 read_sysfs_string(&device_path.join("unique_id"))
             };
-            let card_id = find_card_for_render_minor(node.render_minor);
+            let card_id = find_card_for_render_minor(sysfs, node.render_minor);
             let partition_index = partition_index_by_render_minor
                 .get(&node.render_minor)
                 .copied()
@@ -569,9 +577,9 @@ fn build_link_weights(
     links
 }
 
-fn find_card_for_render_minor(render_minor: u32) -> Option<u32> {
+fn find_card_for_render_minor(sysfs: &Path, render_minor: u32) -> Option<u32> {
     let render_name = format!("renderD{render_minor}");
-    let drm_dir = Path::new("/sys/class/drm");
+    let drm_dir = sysfs.join("class/drm");
     let entries = std::fs::read_dir(drm_dir).ok()?;
 
     for entry in entries.flatten() {
@@ -1140,6 +1148,62 @@ mod tests {
         // Keying on render_minor directly would have changed every id by SHIFT;
         // keying on BDF + intra-BDF rank keeps them identical.
         assert_eq!(sids_base, sids_shifted);
+    }
+
+    #[test]
+    fn root_relative_discovery_preserves_all_gpu_metadata_and_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let kfd = root.join("class/kfd/kfd/topology/nodes");
+        make_kfd_gpu(&kfd, 2, 128, 1280);
+        make_kfd_gpu(&kfd, 3, 129, 10496);
+        for (minor, bdf, card) in [(128, "0000:05:00.0", 0), (129, "0000:29:00.0", 1)] {
+            let pci = root.join("devices/pci0000:00").join(bdf);
+            fs::create_dir_all(pci.join(format!("drm/renderD{minor}"))).unwrap();
+            for (name, value) in [
+                ("numa_node", "0"),
+                ("current_compute_partition", "SPX"),
+                ("current_memory_partition", "NPS1"),
+            ] {
+                fs::write(pci.join(name), value).unwrap();
+            }
+            for device in [format!("renderD{minor}"), format!("card{card}")] {
+                let path = root.join("class/drm").join(device);
+                fs::create_dir_all(&path).unwrap();
+                std::os::unix::fs::symlink(&pci, path.join("device")).unwrap();
+            }
+        }
+        let gpus = discover_amd_gpus_from_root(root);
+        assert_eq!(gpus.len(), 2);
+        let gpu = &gpus[0];
+        assert_eq!(gpu.gpu_type, "mi308x");
+        assert_eq!(gpu.stable_id, encode_stable_id(1280, 0, 0));
+        assert_eq!(gpu.card_id, Some(0));
+        assert_eq!(gpu.render_minor, 128);
+        assert_eq!(gpu.compute_partition.as_deref(), Some("SPX"));
+        assert_eq!(gpu.memory_partition.as_deref(), Some("NPS1"));
+        assert_eq!(gpu.unique_id, Some(format_unique_id(2864457224837561596)));
+        assert_eq!(gpu.link_type, LinkType::Xgmi);
+        assert_eq!(gpu.links, [-1, 20]);
+        let t = gpu.topology.as_ref().unwrap();
+        assert_eq!(t.pci_bdf.as_deref(), Some("0000:05:00.0"));
+        assert_eq!(t.pci_root.as_deref(), Some("pci0000:00"));
+        assert_eq!(t.numa_node, Some(0));
+        assert_eq!(t.vram_bytes, Some(206141652992));
+        assert!(t.fabric.is_none());
+        let before = gpu_property_snapshots(root);
+        assert_eq!(before[&gpu.stable_id], (gpu.gpu_type.clone(), t.clone()));
+        fs::write(root.join("devices/pci0000:00/0000:05:00.0/numa_node"), "-1").unwrap();
+        fs::write(
+            kfd.join("2/mem_banks/0/properties"),
+            "heap_type 1\nsize_in_bytes bad",
+        )
+        .unwrap();
+        let after = gpu_property_snapshots(root);
+        assert_eq!(after[&gpu.stable_id].1.numa_node, None);
+        assert_eq!(after[&gpu.stable_id].1.vram_bytes, None);
+        fs::remove_dir_all(kfd.join("2")).unwrap();
+        assert!(!gpu_property_snapshots(root).contains_key(&gpu.stable_id));
     }
 
     #[test]

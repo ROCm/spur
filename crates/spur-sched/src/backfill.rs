@@ -389,7 +389,7 @@ impl BackfillScheduler {
 }
 
 impl BackfillScheduler {
-    fn plan_block_job(
+    fn plan_gpu_job(
         &self,
         job: &Job,
         cluster: &ClusterState,
@@ -401,199 +401,245 @@ impl BackfillScheduler {
         if job.het_job_id.is_some() || job.het_group.is_some() {
             return None;
         }
+        let constraints =
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref()).ok()?;
+        let properties = !constraints.same.is_empty() || !constraints.predicates.is_empty();
         let mut block_job = job.clone();
-        block_job.spec.constraint = Some(
-            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
-                .ok()?
-                .features
-                .join(","),
-        );
+        block_job.spec.constraint = Some(constraints.features.join(","));
         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
         let gpu_type = resolve_gpu_demand(&job.spec)
             .ok()?
             .gpu_type()
             .map(str::to_string);
         let mut best: Option<(Assignment, chrono::DateTime<Utc>)> = None;
-        let mut blocks: Vec<_> = context
-            .view
-            .blocks
-            .iter()
-            .filter(|block| block.issues.is_empty())
-            .collect();
+        let mut blocks: Vec<_> = if constraints.same_fabric {
+            context
+                .view
+                .blocks
+                .iter()
+                .filter(|block| block.issues.is_empty())
+                .map(Some)
+                .collect()
+        } else {
+            vec![None]
+        };
         blocks.sort_by(|a, b| {
-            a.members
-                .len()
-                .cmp(&b.members.len())
-                .then_with(|| a.key.cmp(&b.key))
+            a.map(|b| (b.members.len(), &b.key))
+                .cmp(&b.map(|b| (b.members.len(), &b.key)))
         });
         for block in blocks {
-            let mut nodes = cluster.nodes.to_vec();
-            for node in &mut nodes {
-                let ids: BTreeSet<_> = block
-                    .members
-                    .iter()
-                    .filter(|member| member.device.node == node.name)
-                    .map(|member| member.device.stable_id)
-                    .collect();
-                let original_count = node.total_resources.gpus.len();
-                node.total_resources
-                    .gpus
-                    .retain(|gpu| ids.contains(&gpu.stable_id));
-                if ids.is_empty()
-                    || node.total_resources.fabric_binding_version < FABRIC_BINDING_VERSION
-                    || (job.spec.exclusive && node.total_resources.gpus.len() != original_count)
-                {
-                    node.state = spur_core::node::NodeState::Down;
+            let mut groups: std::collections::BTreeMap<Vec<String>, BTreeSet<(String, u64)>> =
+                Default::default();
+            for node in cluster.nodes {
+                for gpu in &node.total_resources.gpus {
+                    if !constraints.matches_gpu(gpu)
+                        || block.is_some_and(|block| {
+                            !block.members.iter().any(|m| {
+                                m.device.node == node.name && m.device.stable_id == gpu.stable_id
+                            })
+                        })
+                    {
+                        continue;
+                    }
+                    let Some(key) = constraints.group_key(&node.name, gpu) else {
+                        continue;
+                    };
+                    groups
+                        .entry(key)
+                        .or_default()
+                        .insert((node.name.clone(), gpu.stable_id));
                 }
             }
-            let projected = ClusterState {
-                nodes: &nodes,
-                partitions: cluster.partitions,
-                reservations: cluster.reservations,
-                topology: cluster.topology,
-                fabric: None,
-                busy_until: cluster.busy_until,
-            };
-            let mut floor = now;
-            loop {
-                let mut trial = Self {
-                    timelines: self.timelines.clone(),
-                    max_jobs: 1,
-                    last_outcome: HashMap::new(),
-                };
-                for (timeline, node) in trial.timelines.iter_mut().zip(&nodes) {
-                    timeline.total = node.total_resources.clone();
-                    let ids: BTreeSet<_> = node
-                        .total_resources
+            for allowed in groups.values() {
+                let mut nodes = cluster.nodes.to_vec();
+                for node in &mut nodes {
+                    let original_count = node.total_resources.gpus.len();
+                    node.total_resources
                         .gpus
-                        .iter()
-                        .map(|gpu| gpu.stable_id)
-                        .collect();
-                    for interval in &mut timeline.intervals {
-                        if let Some(devices) = interval.resources.devices.get_mut("gpu") {
-                            devices.retain(|device| ids.contains(&device.device_id));
-                        }
-                    }
-                }
-                let immediate =
-                    trial.schedule_jobs(std::slice::from_ref(&block_job), &projected, floor, false);
-                let mut start = None;
-                let mut allocations = HashMap::new();
-                for timeline in &trial.timelines {
-                    if let Some(interval) = timeline
-                        .intervals
-                        .iter()
-                        .find(|interval| interval.job_id == Some(job.job_id))
-                    {
-                        start = Some(interval.start);
-                        allocations.insert(timeline.node_name.clone(), interval.resources.clone());
-                    }
-                }
-                let Some(start) = start else {
-                    break;
-                };
-                if (job.idle_fill && start > now)
-                    || best.as_ref().is_some_and(|(_, at)| *at <= start)
-                {
-                    break;
-                }
-                let mut retry_at = None;
-                let mut valid = true;
-                for (index, node) in nodes.iter().enumerate() {
-                    let Some(allocation) = allocations.get_mut(&node.name) else {
-                        continue;
+                        .retain(|gpu| allowed.contains(&(node.name.clone(), gpu.stable_id)));
+                    let capability = if properties {
+                        spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY
+                    } else {
+                        FABRIC_BINDING_VERSION
                     };
-                    let overlapping: Vec<_> = self.timelines[index]
-                        .intervals
-                        .iter()
-                        .filter(|interval| {
-                            interval.start < start + duration && interval.end > start
-                        })
-                        .collect();
-                    let unavailable: BTreeSet<_> = overlapping
-                        .iter()
-                        .flat_map(|interval| interval.resources.device_ids("gpu"))
-                        .collect();
-                    let wanted = allocation.total_device_count("gpu") as usize;
-                    let available: Vec<_> = node
-                        .total_resources
-                        .gpus
-                        .iter()
-                        .filter(|gpu| {
-                            !unavailable.contains(&gpu.stable_id)
-                                && (job.spec.exclusive
-                                    || gpu_type
-                                        .as_deref()
-                                        .is_none_or(|kind| kind == "any" || gpu.gpu_type == kind))
-                        })
-                        .map(|gpu| spur_core::resource::AllocatedDevice::injectable(gpu.stable_id))
-                        .take(wanted)
-                        .collect();
-                    if available.len() < wanted {
-                        valid = false;
-                        if let Some(end) = overlapping
+                    if node.total_resources.gpus.is_empty()
+                        || node.total_resources.fabric_binding_version < capability
+                        || (job.spec.exclusive && node.total_resources.gpus.len() != original_count)
+                    {
+                        node.state = spur_core::node::NodeState::Down;
+                    }
+                }
+                let projected = ClusterState {
+                    nodes: &nodes,
+                    partitions: cluster.partitions,
+                    reservations: cluster.reservations,
+                    topology: cluster.topology,
+                    fabric: None,
+                    busy_until: cluster.busy_until,
+                };
+                let mut floor = now;
+                loop {
+                    let mut trial = Self {
+                        timelines: self.timelines.clone(),
+                        max_jobs: 1,
+                        last_outcome: HashMap::new(),
+                    };
+                    for (timeline, node) in trial.timelines.iter_mut().zip(&nodes) {
+                        timeline.total = node.total_resources.clone();
+                        let ids: BTreeSet<_> = node
+                            .total_resources
+                            .gpus
                             .iter()
-                            .map(|interval| interval.end)
-                            .filter(|end| *end > start)
-                            .min()
-                        {
-                            retry_at = Some(
-                                retry_at.map_or(end, |prior: chrono::DateTime<Utc>| prior.min(end)),
-                            );
+                            .map(|gpu| gpu.stable_id)
+                            .collect();
+                        for interval in &mut timeline.intervals {
+                            if let Some(devices) = interval.resources.devices.get_mut("gpu") {
+                                devices.retain(|device| ids.contains(&device.device_id));
+                            }
                         }
-                        continue;
                     }
-                    if wanted > 0 {
-                        allocation.devices.insert("gpu".into(), available);
+                    let immediate = trial.schedule_jobs(
+                        std::slice::from_ref(&block_job),
+                        &projected,
+                        floor,
+                        false,
+                    );
+                    let mut start = None;
+                    let mut allocations = HashMap::new();
+                    for timeline in &trial.timelines {
+                        if let Some(interval) = timeline
+                            .intervals
+                            .iter()
+                            .find(|interval| interval.job_id == Some(job.job_id))
+                        {
+                            start = Some(interval.start);
+                            allocations
+                                .insert(timeline.node_name.clone(), interval.resources.clone());
+                        }
                     }
-                    let Ok(binding) = FabricBinding::for_allocation(block, &node.name, allocation)
-                    else {
-                        valid = false;
-                        continue;
+                    let Some(start) = start else {
+                        break;
                     };
-                    if binding
-                        .validate(
-                            &context.view.namespace,
-                            &node.name,
-                            &node.total_resources,
-                            allocation,
-                        )
-                        .is_err()
+                    if (job.idle_fill && start > now)
+                        || best.as_ref().is_some_and(|(_, at)| *at <= start)
                     {
-                        valid = false;
-                        continue;
+                        break;
                     }
-                    allocation.fabric_binding = Some(binding);
-                }
-                if valid {
-                    let node_names = immediate
-                        .into_iter()
-                        .next()
-                        .map(|a| a.nodes)
-                        .unwrap_or_else(|| {
-                            nodes
+                    let mut retry_at = None;
+                    let mut valid = true;
+                    for (index, node) in nodes.iter().enumerate() {
+                        let Some(allocation) = allocations.get_mut(&node.name) else {
+                            continue;
+                        };
+                        let overlapping: Vec<_> = self.timelines[index]
+                            .intervals
+                            .iter()
+                            .filter(|interval| {
+                                interval.start < start + duration && interval.end > start
+                            })
+                            .collect();
+                        let unavailable: BTreeSet<_> = overlapping
+                            .iter()
+                            .flat_map(|interval| interval.resources.device_ids("gpu"))
+                            .collect();
+                        let wanted = allocation.total_device_count("gpu") as usize;
+                        let available: Vec<_> = node
+                            .total_resources
+                            .gpus
+                            .iter()
+                            .filter(|gpu| {
+                                !unavailable.contains(&gpu.stable_id)
+                                    && (job.spec.exclusive
+                                        || gpu_type.as_deref().is_none_or(|kind| {
+                                            kind == "any" || gpu.gpu_type == kind
+                                        }))
+                            })
+                            .map(|gpu| {
+                                spur_core::resource::AllocatedDevice::injectable(gpu.stable_id)
+                            })
+                            .take(wanted)
+                            .collect();
+                        if available.len() < wanted {
+                            valid = false;
+                            if let Some(end) = overlapping
                                 .iter()
-                                .filter(|node| allocations.contains_key(&node.name))
-                                .map(|node| node.name.clone())
-                                .collect()
-                        });
-                    best = Some((
-                        Assignment {
-                            job_id: job.job_id,
-                            nodes: node_names,
-                            per_node_alloc: allocations,
-                        },
-                        start,
-                    ));
-                    break;
+                                .map(|interval| interval.end)
+                                .filter(|end| *end > start)
+                                .min()
+                            {
+                                retry_at =
+                                    Some(retry_at.map_or(end, |prior: chrono::DateTime<Utc>| {
+                                        prior.min(end)
+                                    }));
+                            }
+                            continue;
+                        }
+                        if wanted > 0 {
+                            allocation.devices.insert("gpu".into(), available);
+                        }
+                        if let Some(block) = block {
+                            let Ok(binding) =
+                                FabricBinding::for_allocation(block, &node.name, allocation)
+                            else {
+                                valid = false;
+                                continue;
+                            };
+                            if binding
+                                .validate(
+                                    &context.view.namespace,
+                                    &node.name,
+                                    &node.total_resources,
+                                    allocation,
+                                )
+                                .is_err()
+                            {
+                                valid = false;
+                                continue;
+                            }
+                            allocation.fabric_binding = Some(binding);
+                        }
+                        if properties {
+                            let Ok(binding) = spur_core::gpu_binding::GpuBinding::new(
+                                &node.name,
+                                &node.total_resources,
+                                allocation,
+                            ) else {
+                                valid = false;
+                                continue;
+                            };
+                            allocation.gpu_binding = Some(binding);
+                        }
+                    }
+                    if valid {
+                        let node_names = immediate
+                            .into_iter()
+                            .next()
+                            .map(|a| a.nodes)
+                            .unwrap_or_else(|| {
+                                nodes
+                                    .iter()
+                                    .filter(|node| allocations.contains_key(&node.name))
+                                    .map(|node| node.name.clone())
+                                    .collect()
+                            });
+                        best = Some((
+                            Assignment {
+                                job_id: job.job_id,
+                                nodes: node_names,
+                                per_node_alloc: allocations,
+                            },
+                            start,
+                        ));
+                        break;
+                    }
+                    let Some(next) = retry_at else {
+                        break;
+                    };
+                    if next <= floor || next >= now + Duration::days(365) {
+                        break;
+                    }
+                    floor = next;
                 }
-                let Some(next) = retry_at else {
-                    break;
-                };
-                if next <= floor || next >= now + Duration::days(365) {
-                    break;
-                }
-                floor = next;
             }
         }
         best
@@ -694,7 +740,7 @@ impl BackfillScheduler {
                 continue;
             }
             if spur_core::constraints::validate(&job.spec).is_err()
-                || (spur_core::constraints::requires_same_fabric(&job.spec)
+                || (spur_core::constraints::requires_gpu_properties(&job.spec)
                     && cluster.fabric.is_none())
             {
                 note(UnplacedKind::FabricUnavailable, 0, None);
@@ -704,7 +750,7 @@ impl BackfillScheduler {
                 .fabric
                 .filter(|context| context.requires_binding(job))
             {
-                match self.plan_block_job(job, cluster, context, now) {
+                match self.plan_gpu_job(job, cluster, context, now) {
                     Some((assignment, start)) => {
                         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
                         for (node, allocation) in &assignment.per_node_alloc {

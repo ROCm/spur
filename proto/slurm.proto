@@ -38,6 +38,7 @@ message ResourceAllocations {
   map<string, DeviceAllocations> devices = 3;
   uint64 generation = 4;  // node inventory generation this allocation was made under
   FabricBinding fabric_binding = 5;
+  GpuPropertyBinding gpu_binding = 6;
 }
 
 message GpuResource {
@@ -136,6 +137,18 @@ message FabricBinding {
   uint64 inventory_generation = 6;
   optional string file_revision = 7;
   FabricBlockKey observed_key = 8;
+}
+
+message GpuPropertyBinding {
+  string node = 1;
+  uint64 generation = 2;
+  repeated BoundGpuProperties gpus = 3;
+}
+
+message BoundGpuProperties {
+  uint64 stable_id = 1;
+  string gpu_type = 2;
+  DeviceTopology topology = 3;
 }
 
 message ValidateBlockFileRequest {
@@ -429,6 +442,7 @@ message JobInfo {
   string last_requeue = 86;
   string last_requeue_by = 87;
   map<string, FabricBinding> fabric_bindings = 88;
+  map<string, GpuPropertyBinding> gpu_bindings = 89;
 }
 
 message NodeInfo {

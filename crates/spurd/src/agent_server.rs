@@ -47,6 +47,7 @@ fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &
 
 struct StepdLaunchOptions {
     fabric_binding: Option<spur_core::fabric_binding::FabricBinding>,
+    gpu_binding: Option<spur_core::gpu_binding::GpuBinding>,
     step_id: spur_core::step::StepId,
     allocation_only: bool,
     container_rootfs_mode: Option<crate::container::RootfsMode>,
@@ -241,6 +242,7 @@ async fn launch_stepd(
     let mut launch_spec = crate::stepd::StepdLaunchSpec::try_from(config)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
     launch_spec.resources.fabric_binding = options.fabric_binding;
+    launch_spec.resources.gpu_binding = options.gpu_binding;
     launch_spec.controller_addr = controller_addr.into();
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
@@ -901,6 +903,7 @@ mod gpu_deny_tests {
 
 pub struct TrackedJob {
     fabric_binding: Option<spur_core::fabric_binding::FabricBinding>,
+    gpu_binding: Option<spur_core::gpu_binding::GpuBinding>,
     job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
     stdout_path: String,
@@ -1678,6 +1681,7 @@ pub async fn recover_stepds(
             .then(|| descriptor.cgroup_path.clone());
         let tracked = jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
             fabric_binding: descriptor.resources.fabric_binding.clone(),
+            gpu_binding: descriptor.resources.gpu_binding.clone(),
             job: executor::RunningJob::AllocationOnly,
             // Only the job-owning step's cgroup is the job's own; a step
             // arriving first in directory order must not seed this from its
@@ -1713,6 +1717,7 @@ pub async fn recover_stepds(
         }
         tracked.user = descriptor.owner.clone();
         tracked.fabric_binding = descriptor.resources.fabric_binding.clone();
+        tracked.gpu_binding = descriptor.resources.gpu_binding.clone();
         tracked.cgroup_path = cgroup_path;
         if !descriptor.stdout_path.is_empty() {
             tracked.stdout_path = descriptor.stdout_path.clone();
@@ -3836,11 +3841,12 @@ impl AgentService {
             // A legacy descriptor holds positional ids that no longer match the
             // BDF-anchored stable_ids; translate through the live inventory so
             // the adopt succeeds instead of leaving the job's GPUs reading free.
-            let translated = if resources.fabric_binding.is_some() {
-                None
-            } else {
-                translate_legacy_gpu_ids(&resources.gpu_devices, &allocation.gpus)
-            };
+            let translated =
+                if resources.fabric_binding.is_some() || resources.gpu_binding.is_some() {
+                    None
+                } else {
+                    translate_legacy_gpu_ids(&resources.gpu_devices, &allocation.gpus)
+                };
             let gpu_ids: Vec<u64> = match &translated {
                 Some(stable_ids) => {
                     info!(
@@ -4013,13 +4019,13 @@ impl AgentService {
                 ))
             })?;
 
-        let fabric_binding = {
+        let (fabric_binding, gpu_binding) = {
             let jobs = self.running.lock().await;
             let tracked = jobs
                 .get(&job_id)
                 .ok_or_else(|| Status::failed_precondition("parent allocation disappeared"))?;
             self.check_tracked_fabric(tracked)?;
-            tracked.fabric_binding.clone()
+            (tracked.fabric_binding.clone(), tracked.gpu_binding.clone())
         };
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
@@ -4036,6 +4042,7 @@ impl AgentService {
             &self.stepd_state_dir,
             StepdLaunchOptions {
                 fabric_binding,
+                gpu_binding,
                 step_id,
                 allocation_only: false,
                 container_rootfs_mode,
@@ -4163,13 +4170,13 @@ impl AgentService {
                 ))
             })?;
 
-        let fabric_binding = {
+        let (fabric_binding, gpu_binding) = {
             let jobs = self.running.lock().await;
             let tracked = jobs
                 .get(&job_id)
                 .ok_or_else(|| Status::failed_precondition("parent allocation disappeared"))?;
             self.check_tracked_fabric(tracked)?;
-            tracked.fabric_binding.clone()
+            (tracked.fabric_binding.clone(), tracked.gpu_binding.clone())
         };
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
@@ -4186,6 +4193,7 @@ impl AgentService {
             &self.stepd_state_dir,
             StepdLaunchOptions {
                 fabric_binding,
+                gpu_binding,
                 step_id,
                 allocation_only: false,
                 container_rootfs_mode,
@@ -5152,6 +5160,55 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
     }
 }
 
+fn refresh_bound_gpu_properties(
+    inventory: &mut spur_core::resource::ResourceSet,
+    binding: &spur_core::gpu_binding::GpuBinding,
+    sysfs: &std::path::Path,
+) -> Result<(), Status> {
+    let native = |gpu: &spur_core::gpu_binding::BoundGpu| {
+        gpu.topology
+            .as_ref()
+            .and_then(|t| t.fabric.as_ref())
+            .is_some_and(|f| f.source == "amd-ualink")
+            || gpu.gpu_type.starts_with("amdgpu")
+            || matches!(
+                gpu.gpu_type.as_str(),
+                "mi100"
+                    | "mi210"
+                    | "mi250x"
+                    | "mi300a"
+                    | "mi300x"
+                    | "mi308x"
+                    | "mi325x"
+                    | "mi350x"
+                    | "mi355x"
+                    | "rx9070"
+            )
+    };
+    if !binding.gpus.iter().any(native) {
+        return Ok(());
+    }
+    let fresh = spur_devices::cdi::discovery::gpu_property_snapshots(sysfs);
+    for expected in &binding.gpus {
+        let Some(gpu) = inventory
+            .gpus
+            .iter_mut()
+            .find(|g| g.stable_id == expected.stable_id)
+        else {
+            continue;
+        };
+        if let Some((gpu_type, topology)) = fresh.get(&gpu.stable_id) {
+            gpu.gpu_type.clone_from(gpu_type);
+            gpu.topology = Some(topology.clone());
+        } else if native(expected) {
+            return Err(Status::failed_precondition(
+                "bound GPU is absent from live discovery",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn refresh_bound_fabric(
     inventory: &mut spur_core::resource::ResourceSet,
     binding: &spur_core::fabric_binding::FabricBinding,
@@ -5236,6 +5293,11 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<LaunchJobResponse>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        let gpu_binding = req
+            .allocated
+            .as_ref()
+            .and_then(|a| a.gpu_binding.clone())
+            .map(spur_core::gpu_binding::from_proto);
         let fabric_binding = req
             .allocated
             .as_ref()
@@ -5934,6 +5996,7 @@ impl SlurmAgent for AgentService {
                 &self.stepd_state_dir,
                 StepdLaunchOptions {
                     fabric_binding: fabric_binding.clone(),
+                    gpu_binding: gpu_binding.clone(),
                     step_id: launch_step,
                     // A `--pty` job's own step is a placeholder like `salloc`'s
                     // extern step: the real command runs via InteractiveSession.
@@ -6076,6 +6139,7 @@ impl SlurmAgent for AgentService {
                     job_id,
                     TrackedJob {
                         fabric_binding: fabric_binding.clone(),
+                        gpu_binding: gpu_binding.clone(),
                         job: result.job,
                         rootfs_mode: rootfs_mode.clone(),
                         stdout_path: result.stdout_path,
@@ -6212,10 +6276,25 @@ impl SlurmAgent for AgentService {
         }
 
         for descriptor in &gated {
-            if let Some(binding) = &descriptor.resources.fabric_binding {
+            if descriptor.resources.fabric_binding.is_some()
+                || descriptor.resources.gpu_binding.is_some()
+            {
                 let mut allocation = spur_core::resource::ResourceAllocations {
-                    generation: binding.inventory_generation,
-                    fabric_binding: Some(binding.clone()),
+                    generation: descriptor
+                        .resources
+                        .gpu_binding
+                        .as_ref()
+                        .map(|b| b.generation)
+                        .or_else(|| {
+                            descriptor
+                                .resources
+                                .fabric_binding
+                                .as_ref()
+                                .map(|b| b.inventory_generation)
+                        })
+                        .unwrap_or(0),
+                    fabric_binding: descriptor.resources.fabric_binding.clone(),
+                    gpu_binding: descriptor.resources.gpu_binding.clone(),
                     ..Default::default()
                 };
                 allocation.devices.insert(
@@ -6532,6 +6611,11 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        let gpu_binding = req
+            .allocated
+            .as_ref()
+            .and_then(|a| a.gpu_binding.clone())
+            .map(spur_core::gpu_binding::from_proto);
         let fabric_binding = req
             .allocated
             .as_ref()
@@ -6762,6 +6846,7 @@ impl SlurmAgent for AgentService {
                 &self.stepd_state_dir,
                 StepdLaunchOptions {
                     fabric_binding: fabric_binding.clone(),
+                    gpu_binding: gpu_binding.clone(),
                     step_id: spur_core::step::STEP_EXTERN,
                     allocation_only: true,
                     container_rootfs_mode: None,
@@ -6838,6 +6923,7 @@ impl SlurmAgent for AgentService {
             req.job_id,
             TrackedJob {
                 fabric_binding: fabric_binding.clone(),
+                gpu_binding: gpu_binding.clone(),
                 job: executor::RunningJob::AllocationOnly,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: String::new(),
@@ -9122,13 +9208,6 @@ impl AgentService {
     fn check_dispatch_allocation(&self, allocation: &ResourceAllocations) -> Result<(), Status> {
         let mut inventory = self.reporter.snapshot_resources();
         check_dispatch_generation(allocation.generation, inventory.generation)?;
-        let Some(binding) = allocation
-            .fabric_binding
-            .clone()
-            .map(spur_core::fabric_binding::from_proto)
-        else {
-            return Ok(());
-        };
         let mut resources = spur_core::resource::ResourceAllocations {
             generation: allocation.generation,
             ..Default::default()
@@ -9150,6 +9229,23 @@ impl AgentService {
                 })
                 .unwrap_or_default(),
         );
+        if let Some(binding) = allocation
+            .gpu_binding
+            .clone()
+            .map(spur_core::gpu_binding::from_proto)
+        {
+            refresh_bound_gpu_properties(&mut inventory, &binding, std::path::Path::new("/sys"))?;
+            binding
+                .validate(&self.reporter.hostname, &inventory, &resources)
+                .map_err(Status::failed_precondition)?;
+        }
+        let Some(binding) = allocation
+            .fabric_binding
+            .clone()
+            .map(spur_core::fabric_binding::from_proto)
+        else {
+            return Ok(());
+        };
         if let Some(revision) = &binding.file_revision {
             let path = self.block_file.as_deref().ok_or_else(|| {
                 Status::failed_precondition("block file is not configured on this agent")
@@ -9193,12 +9289,23 @@ impl AgentService {
     }
 
     fn check_tracked_fabric(&self, tracked: &TrackedJob) -> Result<(), Status> {
-        let Some(binding) = &tracked.fabric_binding else {
+        if tracked.fabric_binding.is_none() && tracked.gpu_binding.is_none() {
             return Ok(());
-        };
+        }
         let mut allocation = spur_core::resource::ResourceAllocations {
-            generation: binding.inventory_generation,
-            fabric_binding: Some(binding.clone()),
+            generation: tracked
+                .gpu_binding
+                .as_ref()
+                .map(|b| b.generation)
+                .or_else(|| {
+                    tracked
+                        .fabric_binding
+                        .as_ref()
+                        .map(|b| b.inventory_generation)
+                })
+                .unwrap_or(0),
+            fabric_binding: tracked.fabric_binding.clone(),
+            gpu_binding: tracked.gpu_binding.clone(),
             ..Default::default()
         };
         allocation.devices.insert(
@@ -10246,6 +10353,7 @@ impl TrackedJob {
             partition: String::new(),
             gpu_devices: Vec::new(),
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),
@@ -10763,6 +10871,7 @@ mod tests {
             state.path(),
             StepdLaunchOptions {
                 fabric_binding: None,
+                gpu_binding: None,
                 step_id: 0,
                 allocation_only: false,
                 container_rootfs_mode: None,
@@ -12253,6 +12362,7 @@ mod tests {
             job_id,
             TrackedJob {
                 fabric_binding: None,
+                gpu_binding: None,
                 run_attempt: 5,
                 ..TrackedJob::allocation_only(None)
             },
@@ -14538,6 +14648,7 @@ mod tests {
         );
         descriptor.resources = crate::stepd::StepdJobResources {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 8,
             memory_mb: 4096,
             gpu_devices: vec![2, 3],
@@ -14938,6 +15049,7 @@ mod tests {
             44,
             TrackedJob {
                 fabric_binding: None,
+                gpu_binding: None,
                 run_attempt: 1,
                 ..TrackedJob::dummy(std::process::id())
             },
@@ -16341,6 +16453,7 @@ mod tests {
             80,
             TrackedJob {
                 fabric_binding: None,
+                gpu_binding: None,
                 run_attempt: 1,
                 ..TrackedJob::allocation_only(None)
             },
@@ -16853,6 +16966,7 @@ mod tests {
             }),
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices,
@@ -16950,6 +17064,149 @@ mod tests {
             binding,
             crate::reporter::allocations_to_proto(&allocation),
         )
+    }
+
+    fn gpu_dispatch_fixture() -> (
+        AgentService,
+        spur_core::gpu_binding::GpuBinding,
+        ResourceAllocations,
+    ) {
+        let (service, _, mut allocation) = fabric_dispatch_fixture();
+        let mut inventory = service.reporter.snapshot_resources();
+        inventory.fabric_binding_version = spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY;
+        inventory.gpus[0].gpu_type = "test".into();
+        let t = inventory.gpus[0].topology.as_mut().unwrap();
+        t.pci_root = Some("pci0001:00".into());
+        t.numa_node = Some(0);
+        t.vram_bytes = Some(192 * 1024_u64.pow(3));
+        service.reporter.update_resources(inventory.clone());
+        allocation.fabric_binding = None;
+        let core = spur_core::resource::ResourceAllocations {
+            generation: 7,
+            devices: [(
+                "gpu".into(),
+                vec![spur_core::resource::AllocatedDevice::injectable(42)],
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let binding =
+            spur_core::gpu_binding::GpuBinding::new("test-node", &inventory, &core).unwrap();
+        allocation.gpu_binding = Some(spur_core::gpu_binding::to_proto(&binding));
+        (service, binding, allocation)
+    }
+
+    #[tokio::test]
+    async fn gpu_property_admission_and_steps_check_every_bound_fact_without_leaking_claims() {
+        for property in 0..8 {
+            let (service, binding, allocation) = gpu_dispatch_fixture();
+            service
+                .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+                .await
+                .unwrap();
+            service.allocation.lock().await.release_job(501);
+            let mut live = service.reporter.snapshot_resources();
+            match property {
+                0 => live.gpus[0].gpu_type = "changed".into(),
+                1 => live.gpus[0].topology.as_mut().unwrap().vram_bytes = None,
+                2 => live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1),
+                3 => live.gpus[0].topology.as_mut().unwrap().pci_root = Some("pci0002:00".into()),
+                4 => {
+                    live.gpus[0]
+                        .topology
+                        .as_mut()
+                        .unwrap()
+                        .fabric
+                        .as_mut()
+                        .unwrap()
+                        .physical_domain_id = Some("other".into())
+                }
+                5 => {
+                    live.gpus[0]
+                        .topology
+                        .as_mut()
+                        .unwrap()
+                        .fabric
+                        .as_mut()
+                        .unwrap()
+                        .fabric_domain_id = Some("other".into())
+                }
+                6 => live.gpus.clear(),
+                _ => live.generation += 1,
+            }
+            service.reporter.update_resources(live);
+            let error = service
+                .allocate_local_resources(502, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                tonic::Code::FailedPrecondition,
+                "property {property}"
+            );
+            assert!(service
+                .allocation
+                .lock()
+                .await
+                .allocated_gpu_ids()
+                .is_empty());
+            let mut tracked = TrackedJob::allocation_only(None);
+            tracked.gpu_devices = vec![42];
+            tracked.gpu_binding = Some(binding);
+            assert!(
+                service.check_tracked_fabric(&tracked).is_err(),
+                "property {property}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gpu_property_start_gate_checks_changes_after_admission() {
+        let (service, binding, _) = gpu_dispatch_fixture();
+        let mut descriptor = gated_descriptor(501, 1, spur_core::step::STEP_BATCH);
+        descriptor.resources.gpu_binding = Some(binding);
+        descriptor.resources.gpu_devices = vec![42];
+        service
+            .stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+        let mut live = service.reporter.snapshot_resources();
+        live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1);
+        service.reporter.update_resources(live);
+        let error = service
+            .start_job(controller_start(501, 1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(service.stepds.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovered_gpu_property_binding_remains_enforced() {
+        let (service, binding, _) = gpu_dispatch_fixture();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            501,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            "/tmp/unused.sock".into(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources.gpu_devices = vec![42];
+        descriptor.resources.gpu_binding = Some(binding.clone());
+        let restored = serde_json::from_str(&serde_json::to_string(&descriptor).unwrap()).unwrap();
+        recover_stepds(&service.running, vec![restored]).await;
+        let jobs = service.running.lock().await;
+        assert_eq!(jobs[&501].gpu_binding, Some(binding));
+        service.check_tracked_fabric(&jobs[&501]).unwrap();
+        let mut live = service.reporter.snapshot_resources();
+        live.generation += 1;
+        service.reporter.update_resources(live);
+        assert!(service.check_tracked_fabric(&jobs[&501]).is_err());
+        let legacy: crate::stepd::StepdJobResources = serde_json::from_str(r#"{"cpus":4,"memory_mb":1024,"gpu_devices":[42],"cpu_ids":[0,1,2,3],"partition":"rack","nodelist":"test-node","mpi":"none"}"#).unwrap();
+        assert!(legacy.gpu_binding.is_none());
     }
 
     #[tokio::test]
@@ -17303,6 +17560,7 @@ mod tests {
             }),
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices,
@@ -17352,6 +17610,7 @@ mod tests {
             }),
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17464,6 +17723,7 @@ mod tests {
             }),
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17522,6 +17782,7 @@ mod tests {
             }),
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17570,6 +17831,7 @@ mod tests {
             }),
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17620,6 +17882,7 @@ mod tests {
             }),
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 2,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17788,6 +18051,7 @@ mod tests {
         };
         let allocated = ResourceAllocations {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices,
@@ -17839,6 +18103,7 @@ mod tests {
         };
         let allocated = ResourceAllocations {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices,
@@ -17886,6 +18151,7 @@ mod tests {
         };
         let allocated = ResourceAllocations {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices,
@@ -17918,6 +18184,7 @@ mod tests {
         map.insert("gpu".to_string(), DeviceAllocations { devices });
         ResourceAllocations {
             fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: map,
@@ -18021,6 +18288,7 @@ mod tests {
             cpus: 1,
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices,
@@ -18155,6 +18423,7 @@ mod tests {
             run_attempt: 9,
             allocated: Some(ResourceAllocations {
                 fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -18990,6 +19259,7 @@ mod tests {
             .expect("failed to spawn SIGTERM-trapping process");
         let tracked = TrackedJob {
             fabric_binding: None,
+            gpu_binding: None,
             job: executor::RunningJob::Managed { child },
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: "/dev/null".into(),
@@ -19543,6 +19813,7 @@ mod tests {
             let pid = child.id().expect("pid") as i32;
             let t = TrackedJob {
                 fabric_binding: None,
+                gpu_binding: None,
                 job: executor::RunningJob::Managed { child },
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: "/dev/null".into(),
@@ -20084,6 +20355,7 @@ mod tests {
         fn allocation_only_job(run_attempt: u32) -> TrackedJob {
             TrackedJob {
                 fabric_binding: None,
+                gpu_binding: None,
                 job: executor::RunningJob::AllocationOnly,
                 cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
@@ -20171,6 +20443,7 @@ mod tests {
             job_id,
             TrackedJob {
                 fabric_binding: None,
+                gpu_binding: None,
                 job: executor::RunningJob::AllocationOnly,
                 cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
