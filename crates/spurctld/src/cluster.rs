@@ -3140,19 +3140,7 @@ impl ClusterManager {
     /// launch it — a caller evicting a job with launched-but-unconfirmed
     /// nodes owns sending the cancel RPC, and should send it before evicting
     /// so the cancel still names the attempt being torn down.
-    #[allow(dead_code)]
-    pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
-        self.evict_job_with_detail(job_id, None)
-    }
-
-    pub fn evict_job_with_detail(
-        &self,
-        job_id: JobId,
-        detail: Option<String>,
-    ) -> anyhow::Result<()> {
-        self.evict_job_attempt(job_id, None, detail)
-    }
-
+    ///
     /// Evict only while `run_attempt` is still the job's current one. A caller
     /// that awaited anything may be holding an epoch the job has already left.
     pub fn evict_job_attempt(
@@ -21181,7 +21169,7 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.evict_job(job_id).unwrap();
+        cm.evict_job_attempt(job_id, None, None).unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -27858,7 +27846,7 @@ mod tests {
         settle(&cm, id, JobState::Running);
 
         // n1's dispatch succeeded, n2's never reached the agent.
-        cm.evict_job(id).unwrap();
+        cm.evict_job_attempt(id, None, None).unwrap();
         settle(&cm, id, JobState::NodeFail);
 
         let job = cm.get_job(id).unwrap();
@@ -27941,7 +27929,7 @@ mod tests {
              leaving only B's 3 cpus"
         );
 
-        cm.evict_job(job_a).unwrap();
+        cm.evict_job_attempt(job_a, None, None).unwrap();
         settle(&cm, job_a, JobState::NodeFail);
 
         assert_eq!(

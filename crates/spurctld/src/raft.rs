@@ -693,18 +693,12 @@ impl openraft::RaftNetworkFactory<SpurTypeConfig> for Arc<SpurNetwork> {
             .get(&target)
             .cloned()
             .unwrap_or_else(|| format!("unknown-{}", target));
-        SpurNetworkConnection {
-            target,
-            addr,
-            client: None,
-        }
+        SpurNetworkConnection { addr, client: None }
     }
 }
 
 /// Connection to a single Raft peer.
 pub struct SpurNetworkConnection {
-    #[allow(dead_code)]
-    target: NodeId,
     addr: String,
     client: Option<
         spur_proto::raft_proto::raft_internal_client::RaftInternalClient<tonic::transport::Channel>,
@@ -2492,7 +2486,6 @@ mod tests {
         use spur_core::job::JobSpec;
 
         let mut conn = SpurNetworkConnection {
-            target: 99,
             addr: "http://127.0.0.1:1".into(),
             client: None,
         };
@@ -2540,7 +2533,6 @@ mod tests {
         use openraft::RaftNetwork;
 
         let mut conn = SpurNetworkConnection {
-            target: 99,
             addr: "http://127.0.0.1:1".into(),
             client: None,
         };
