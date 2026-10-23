@@ -222,39 +222,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
     let mut scheduler = BackfillScheduler::new(max_jobs);
 
-    // Build topology tree from config (if configured)
-    let topology = startup_config.topology.as_ref().and_then(|topo_config| {
-        use spur_core::topology::TopologyTree;
-        match topo_config.plugin.as_str() {
-            "tree" => {
-                let tree = TopologyTree::from_switches(&topo_config.switches);
-                info!(
-                    switches = tree.switches.len(),
-                    nodes = tree.node_switch.len(),
-                    "topology/tree loaded"
-                );
-                Some(tree)
-            }
-            "block" => {
-                let block_size = topo_config.block_size.unwrap_or(18);
-                let all_nodes = cluster.get_nodes();
-                let node_names: Vec<String> = all_nodes.iter().map(|n| n.name.clone()).collect();
-                let tree = TopologyTree::from_blocks(&node_names, block_size);
-                info!(
-                    blocks = tree.switches.len(),
-                    block_size, "topology/block loaded"
-                );
-                Some(tree)
-            }
-            _ => None,
-        }
-    });
-
     info!(
         interval_secs,
         max_jobs,
         plugin = scheduler.name(),
-        topology = topology.is_some(),
+        topology = startup_config
+            .topology
+            .as_ref()
+            .map(|config| config.plugin.as_str()),
         "scheduler loop started (event-driven wake enabled)"
     );
 
@@ -376,7 +351,15 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let cycle_start = Instant::now();
 
         let busy_until = running_jobs_busy_until(&cluster);
+        let config = cluster.config();
+        let view = cluster.fabric_view(chrono::Utc::now());
+        let topology = config
+            .topology
+            .as_ref()
+            .and_then(|config| config.build(&cluster.get_nodes(), &view));
+        let fabric = Some(spur_sched::traits::FabricSchedulingContext { view });
         let cluster_state = ClusterState {
+            fabric: fabric.as_ref(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -436,8 +419,17 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                 // This helps users distinguish "waiting for higher-priority jobs" vs
                 // "no suitable nodes at all".
                 cluster.update_pending_reasons(&unscheduled, &cluster_state);
+                cluster.annotate_fabric_pending(&scheduler.fabric_unavailable_jobs());
             }
 
+            let unscheduled: Vec<_> = unscheduled
+                .into_iter()
+                .filter(|job| {
+                    !fabric
+                        .as_ref()
+                        .is_some_and(|context| context.requires_binding(job))
+                })
+                .collect();
             {
                 // Deliberately outside the `unscheduled` guard: that list excludes
                 // borrow candidates, so gating reclaim on it made rule (B) reachable
@@ -458,6 +450,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         .iter()
                         .filter(|p| !assignments.iter().any(|a| a.job_id == p.job_id))
                         .filter(|j| !reclaim_in_flight.contains_key(&j.job_id))
+                        .filter(|job| {
+                            !fabric
+                                .as_ref()
+                                .is_some_and(|context| context.requires_binding(job))
+                        })
                         .collect();
                     let (freed, freed_for) = reclaim_for_unplaced(
                         &cluster,
@@ -3864,6 +3861,8 @@ mod tests {
 
     fn node_total(cpus: u32, memory_mb: u64, gpus: Vec<GpuResource>) -> ResourceSet {
         ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus,
             memory_mb,
             gpus,
@@ -3879,6 +3878,7 @@ mod tests {
             memory_mb: 192_000,
             peer_gpus: vec![],
             link_type: GpuLinkType::PCIe,
+            topology: None,
             stable_id: device_id as u64,
         }
     }
@@ -4023,6 +4023,8 @@ mod tests {
         let mut gen_a = HashMap::new();
         gen_a.insert("license:fluent".to_string(), 5u64);
         let total_a = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![],
@@ -4033,6 +4035,8 @@ mod tests {
         let mut gen_b = HashMap::new();
         gen_b.insert("license:fluent".to_string(), 3u64);
         let total_b = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 64,
             memory_mb: 256_000,
             gpus: vec![],
@@ -5338,6 +5342,7 @@ mod tests {
                 scheduler: Default::default(),
                 auth: Default::default(),
                 partitions: vec![spur_core::config::PartitionConfig {
+                    fabric: None,
                     name: "default".into(),
                     default: true,
                     state: "UP".into(),

@@ -1870,6 +1870,8 @@ converges to hardware changes without an agent restart — see
      - bool
      - ``true``
      - Discover GPUs from AMD KFD sysfs when the CDI cache is empty (AMD only).
+       Also refresh topology for matching AMD devices in on-disk CDI specs;
+       see :doc:`fabric-observation`.
    * - ``cdi_spec_dirs``
      - [string]
      - ``[]``
@@ -1914,11 +1916,12 @@ converges to the new device count without restarting ``spurd``.
 
 .. note::
 
-   Convergence only sees changes on the AMD KFD auto-detect path
-   (``auto_detect = true``). On nodes provisioned with static on-disk CDI specs
-   (``cdi_spec_dirs``), re-discovery re-reads the same spec files each tick, so
-   the reported inventory only changes if those specs are regenerated out of
-   band.
+   With ``auto_detect = true``, matching AMD devices receive live topology
+   observations even when on-disk CDI specs supply their injection edits.
+   Device selection and other static CDI metadata still require regenerating
+   those specs. With ``auto_detect = false``, all CDI metadata is re-read from
+   disk and changes only when the specs change. See :doc:`fabric-observation`
+   for the read-only fabric observation contract and its scheduling limits.
 
 ``[isolation]``
 ---------------
@@ -2657,14 +2660,19 @@ See :doc:`/deployment/managed-kubernetes` for provisioning a Spur-owned cluster.
    (string, e.g. ``"http://peer-ctrl:6817"``). Defaults to no peers.
 
 ``[topology]``
-   **Reload: Restart.** Optional switch-hierarchy configuration for locality-aware
+   **Reload: Live.** Optional block/tree configuration for locality-aware
    scheduling.
    ``plugin`` (string, default ``"none"``) selects the model: ``"tree"`` for a
-   switch hierarchy, ``"block"`` for fixed-size blocks, or ``"none"`` to disable.
+   switch hierarchy, ``"block"`` for flat groups, or ``"none"`` to disable.
    In tree mode, each ``[[topology.switches]]`` entry has ``name`` (string),
    ``nodes`` (hostlist pattern for a leaf switch), and ``switches`` (comma-separated
-   child switch names for an aggregation switch). In block mode, ``block_size``
-   (integer) sets the number of nodes per block. Defaults to no topology.
+   child switch names for an aggregation switch). Automatic native discovery or
+   the optional block file supplies whole-node leaves in block mode, and in tree
+   mode when no explicit switches are configured. Membership is refreshed each
+   scheduling cycle. In block mode without a membership source, ``block_size``
+   (integer, default ``18``) sets the number of nodes per block. It is not used to
+   infer vPods. Defaults to no topology. See :doc:`fabric-observation` for locality
+   options and the separate partition constraint that requires one block.
 
 ``[burst_buffer]``
    **Reload: Live.** Burst-buffer capacity. ``total_gb`` (integer, default ``0``)
@@ -2705,3 +2713,18 @@ See Also
 - :doc:`accounting`
 - :doc:`/deployment/ansible`
 - :doc:`/deployment/native-host`
+
+External fabric block source
+----------------------------
+
+``[partitions.fabric] mode = "preconfigured"`` declares externally owned,
+read-only fabric membership for a partition. It does not require every GPU job
+to fit one block. Jobs request that outcome with
+``--constraint='same(gpu.fabric_domain_id)'`` (alias ``same(gpu.vpod_id)``).
+Plain GPU jobs retain ordinary placement and may span blocks.
+
+The optional ``[topology.external] block_file`` absolute path selects
+administrator/operator whole-node definitions using ``BlockName=... Nodes=...``
+records. Omit it for automatic native discovery. Both sources feed the existing
+block/tree topology. See :doc:`fabric-observation` for the supported syntax,
+controller and agent installation, revision fencing, reconfiguration, and examples.

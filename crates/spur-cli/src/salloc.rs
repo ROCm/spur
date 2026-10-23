@@ -66,7 +66,7 @@ pub struct SallocArgs {
     #[arg(long)]
     pub gpus_per_task: Option<String>,
 
-    /// Required node features (e.g., "mi300x,nvlink")
+    /// Required node features or same(gpu.fabric_domain_id) for one fabric block
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 

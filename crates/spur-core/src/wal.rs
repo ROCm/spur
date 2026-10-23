@@ -367,6 +367,8 @@ pub enum WalOperation {
         is_default: Option<bool>,
         #[serde(default)]
         preempt_exempt_time: Option<Option<u32>>,
+        #[serde(default)]
+        fabric_mode: Option<String>,
     },
     PartitionDelete {
         name: String,
@@ -1423,6 +1425,7 @@ mod deregistration_wal_tests {
         match op {
             WalOperation::PartitionCreate { partition } => {
                 assert_eq!(partition.name, "gpu");
+                assert!(partition.fabric.is_none());
                 // Legacy "Off" decodes to an explicit Off, which resolves the
                 // same as unset — an upgraded cluster keeps its behaviour.
                 assert_eq!(
@@ -1432,6 +1435,23 @@ mod deregistration_wal_tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn old_partition_update_and_fabric_clear_round_trip() {
+        const LEGACY: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null}}"#;
+        let mut op: WalOperation = serde_json::from_str(LEGACY).unwrap();
+        if let WalOperation::PartitionUpdate { fabric_mode, .. } = &mut op {
+            assert!(fabric_mode.is_none());
+            *fabric_mode = Some(String::new());
+        } else {
+            panic!("wrong operation");
+        }
+        let decoded: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, WalOperation::PartitionUpdate { fabric_mode: Some(mode), .. } if mode.is_empty())
+        );
     }
 
     // A legacy entry that carried a real action must keep it.

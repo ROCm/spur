@@ -67,6 +67,7 @@ pub fn node_to_json(
 pub fn partition_to_json(part: &Partition) -> serde_json::Value {
     serde_json::json!({
         "name": part.name,
+        "fabric": part.fabric,
         "state": part.state.display(),
         "is_default": part.is_default,
         "total_nodes": 0,

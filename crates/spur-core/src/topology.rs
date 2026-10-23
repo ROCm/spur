@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,12 +24,12 @@ pub struct Switch {
     pub depth: u32,
 }
 
-/// The full fabric topology, built from config.
+/// The node topology, built from configuration or observed fabric membership.
 ///
 /// Supports two modes:
 /// - **tree**: Hierarchical switch topology (fat-tree, dragonfly).
 ///   Nodes are grouped under leaf switches, which connect to aggregation switches.
-/// - **block**: Flat grouping where nodes are divided into fixed-size blocks (racks).
+/// - **block**: Flat grouping by explicit membership or configured block size.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyTree {
     /// All switches by name.
@@ -39,6 +39,66 @@ pub struct TopologyTree {
 }
 
 impl TopologyTree {
+    /// Project complete whole-node fabric membership into the existing leaf model.
+    pub fn from_fabric(view: &crate::fabric::FabricView) -> Self {
+        let mut owners: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
+        let mut excluded: BTreeSet<&str> = view
+            .unresolved
+            .iter()
+            .map(|item| item.device.node.as_str())
+            .collect();
+        for (index, block) in view.blocks.iter().enumerate() {
+            for member in &block.members {
+                let node = member.device.node.as_str();
+                owners.entry(node).or_default().insert(index);
+                if !block.issues.is_empty() {
+                    excluded.insert(node);
+                }
+            }
+        }
+        let mut groups: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for (node, blocks) in owners {
+            // A node with split or incomplete GPU membership has no single leaf.
+            if excluded.contains(node) || blocks.len() != 1 {
+                continue;
+            }
+            if let Some(index) = blocks.into_iter().next() {
+                groups.entry(index).or_default().push(node.to_string());
+            }
+        }
+        let mut switches = HashMap::new();
+        let mut node_switch = HashMap::new();
+        for (index, nodes) in groups {
+            let key = &view.blocks[index].key;
+            let name = format!(
+                "fabric:{}:{}{}:{}{}:{}",
+                key.namespace.len(),
+                key.namespace,
+                key.physical_domain.len(),
+                key.physical_domain,
+                key.fabric_domain.len(),
+                key.fabric_domain,
+            );
+            for node in &nodes {
+                node_switch.insert(node.clone(), name.clone());
+            }
+            switches.insert(
+                name.clone(),
+                Switch {
+                    name,
+                    nodes,
+                    children: Vec::new(),
+                    parent: None,
+                    depth: 0,
+                },
+            );
+        }
+        Self {
+            switches,
+            node_switch,
+        }
+    }
+
     /// Build a topology tree from switch config entries.
     ///
     /// Each entry defines a switch with either `nodes` (leaf) or `switches` (aggregation).
@@ -239,9 +299,16 @@ impl TopologyTree {
             return candidates.to_vec();
         }
 
-        let groups = self.group_by_switch(candidates);
+        let (known, unknown): (Vec<_>, Vec<_>) = candidates
+            .iter()
+            .copied()
+            .partition(|node| self.node_switch.contains_key(*node));
+        if known.is_empty() {
+            return candidates.iter().copied().take(count).collect();
+        }
+        let groups = self.group_by_switch(&known);
         let mut sorted_groups: Vec<(String, Vec<&'a str>)> = groups.into_iter().collect();
-        sorted_groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
+        sorted_groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
 
         // If the largest group has enough, use it
         if sorted_groups[0].1.len() >= count {
@@ -260,7 +327,7 @@ impl TopologyTree {
                 (dist, sw_name, nodes)
             })
             .collect();
-        groups_with_dist.sort_by_key(|(dist, _, _)| *dist);
+        groups_with_dist.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         for (_, _, nodes) in groups_with_dist {
             let remaining = count - result.len();
@@ -270,6 +337,7 @@ impl TopologyTree {
             let take = remaining.min(nodes.len());
             result.extend_from_slice(&nodes[..take]);
         }
+        result.extend(unknown.into_iter().take(count - result.len()));
 
         result
     }
@@ -308,6 +376,8 @@ pub struct SwitchConfig {
 /// Top-level topology configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyConfig {
+    #[serde(default)]
+    pub external: Option<ExternalFabricConfig>,
     /// Plugin type: "tree", "block", or "none".
     #[serde(default = "default_topo_plugin")]
     pub plugin: String,
@@ -318,6 +388,62 @@ pub struct TopologyConfig {
     pub block_size: Option<usize>,
 }
 
+impl TopologyConfig {
+    pub fn build(
+        &self,
+        nodes: &[crate::node::Node],
+        view: &crate::fabric::FabricView,
+    ) -> Option<TopologyTree> {
+        if self.plugin == "tree" && !self.switches.is_empty() {
+            return Some(TopologyTree::from_switches(&self.switches));
+        }
+        if !matches!(self.plugin.as_str(), "tree" | "block") {
+            return None;
+        }
+        let has_membership_source = !view.blocks.is_empty()
+            || view
+                .unresolved
+                .iter()
+                .any(|item| item.issue != "missing_observation")
+            || self
+                .external
+                .as_ref()
+                .is_some_and(|external| external.block_file.is_some());
+        if has_membership_source {
+            return Some(TopologyTree::from_fabric(view));
+        }
+        if self.plugin == "tree" {
+            return Some(TopologyTree::from_switches(&self.switches));
+        }
+        let mut names: Vec<_> = nodes.iter().map(|node| node.name.clone()).collect();
+        names.sort();
+        Some(TopologyTree::from_blocks(
+            &names,
+            self.block_size.unwrap_or(18),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalFabricConfig {
+    #[serde(default)]
+    pub block_file: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    pub loaded_block_file: Option<crate::block_file::BlockFile>,
+}
+
+impl ExternalFabricConfig {
+    pub fn load_block_file(&mut self) -> Result<(), String> {
+        self.loaded_block_file = self
+            .block_file
+            .as_deref()
+            .map(crate::block_file::BlockFile::read)
+            .transpose()?;
+        Ok(())
+    }
+}
+
 fn default_topo_plugin() -> String {
     "none".into()
 }
@@ -325,6 +451,7 @@ fn default_topo_plugin() -> String {
 impl Default for TopologyConfig {
     fn default() -> Self {
         Self {
+            external: None,
             plugin: "none".into(),
             switches: Vec::new(),
             block_size: None,
@@ -448,5 +575,211 @@ mod tests {
             Some("fabric0")
         );
         assert!(tree.switches.get("fabric0").unwrap().parent.is_none());
+    }
+}
+
+#[cfg(test)]
+mod external_config_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_topology_json_omits_external_policy() {
+        let config: TopologyConfig =
+            serde_json::from_str(r#"{"plugin":"none","switches":[],"block_size":null}"#).unwrap();
+        assert!(config.external.is_none());
+    }
+
+    #[test]
+    fn obsolete_partition_list_is_rejected() {
+        assert!(toml::from_str::<TopologyConfig>(
+            "[external]\nsingle_block_partitions = [\"rack\"]\n"
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use crate::fabric::{
+        FabricBlock, FabricBlockKey, FabricDeviceKey, FabricMember, FabricView,
+        UnresolvedFabricDevice,
+    };
+
+    fn view() -> FabricView {
+        FabricView {
+            namespace: "test".into(),
+            unresolved: vec![],
+            blocks: [("rack-a", "7", ["n0", "n2"]), ("rack-b", "7", ["n1", "n3"])]
+                .into_iter()
+                .map(|(physical, fabric, nodes)| FabricBlock {
+                    key: FabricBlockKey {
+                        namespace: "test".into(),
+                        physical_domain: physical.into(),
+                        fabric_domain: fabric.into(),
+                    },
+                    members: nodes
+                        .into_iter()
+                        .map(|node| FabricMember {
+                            device: FabricDeviceKey {
+                                node: node.into(),
+                                stable_id: 42,
+                            },
+                            endpoint: node.into(),
+                            inventory_generation: 1,
+                        })
+                        .collect(),
+                    active_endpoints: vec![],
+                    physical_capacity: None,
+                    fabric_capacity: None,
+                    issues: vec![],
+                    file_revision: None,
+                    observed_key: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn native_and_declared_membership_use_existing_block_and_tree_models() {
+        for plugin in ["block", "tree"] {
+            let config = TopologyConfig {
+                plugin: plugin.into(),
+                block_size: Some(4),
+                ..Default::default()
+            };
+            for declared in [false, true] {
+                let mut view = view();
+                if declared {
+                    for block in &mut view.blocks {
+                        block.file_revision = Some("revision".into());
+                    }
+                }
+                let tree = config.build(&[], &view).unwrap();
+                assert_eq!(tree.switches.len(), 2);
+                assert_eq!(tree.node_switch["n0"], tree.node_switch["n2"]);
+                assert_ne!(tree.node_switch["n0"], tree.node_switch["n1"]);
+                assert_eq!(tree.distance("n0", "n2"), 0);
+                assert_eq!(tree.distance("n0", "n1"), u32::MAX);
+                assert_eq!(
+                    tree.select_local_nodes(&["n0", "n1", "n2", "n3"], 2),
+                    ["n0", "n2"]
+                );
+                assert!(tree.switches.values().all(|switch| switch.parent.is_none()));
+            }
+        }
+    }
+
+    #[test]
+    fn split_incomplete_and_invalid_nodes_have_no_inferred_leaf() {
+        let mut view = view();
+        let member = view.blocks[0].members[0].clone();
+        view.blocks[1].members.push(member);
+        let tree = TopologyTree::from_fabric(&view);
+        assert!(!tree.node_switch.contains_key("n0"));
+        assert_eq!(tree.node_switch.len(), 3);
+
+        view.unresolved.push(UnresolvedFabricDevice {
+            device: FabricDeviceKey {
+                node: "n2".into(),
+                stable_id: 43,
+            },
+            issue: "missing_observation".into(),
+        });
+        view.blocks[1].issues.push("stale_node".into());
+        assert!(TopologyTree::from_fabric(&view).switches.is_empty());
+        let config = TopologyConfig {
+            plugin: "block".into(),
+            ..Default::default()
+        };
+        assert!(config.build(&[], &view).unwrap().switches.is_empty());
+    }
+
+    #[test]
+    fn unavailable_source_does_not_fall_back_to_sized_blocks() {
+        let config = TopologyConfig {
+            plugin: "block".into(),
+            ..Default::default()
+        };
+        let nodes = [crate::node::Node::new("n0".into(), Default::default())];
+        let mut view = view();
+        view.blocks.clear();
+        view.unresolved.push(UnresolvedFabricDevice {
+            device: FabricDeviceKey {
+                node: "n0".into(),
+                stable_id: 42,
+            },
+            issue: "missing_domain".into(),
+        });
+        assert!(config.build(&nodes, &view).unwrap().node_switch.is_empty());
+        view.unresolved.clear();
+        assert_eq!(config.build(&nodes, &view).unwrap().node_switch.len(), 1);
+        let file_config = TopologyConfig {
+            external: Some(ExternalFabricConfig {
+                block_file: Some("/etc/spur/topology.conf".into()),
+                ..Default::default()
+            }),
+            ..config
+        };
+        assert!(file_config
+            .build(&nodes, &view)
+            .unwrap()
+            .node_switch
+            .is_empty());
+    }
+
+    #[test]
+    fn explicit_switch_hierarchy_and_disabled_plugin_keep_their_meaning() {
+        let config = TopologyConfig {
+            plugin: "tree".into(),
+            switches: vec![SwitchConfig {
+                name: "leaf".into(),
+                nodes: Some("n[0-3]".into()),
+                switches: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(config.build(&[], &view()).unwrap().switches.len(), 1);
+        assert!(TopologyConfig::default().build(&[], &view()).is_none());
+    }
+
+    #[test]
+    fn legacy_sized_blocks_are_independent_of_inventory_order() {
+        let config = TopologyConfig {
+            plugin: "block".into(),
+            block_size: Some(2),
+            ..Default::default()
+        };
+        let mut view = view();
+        view.blocks.clear();
+        let mut nodes: Vec<_> = ["n3", "n0", "n2", "n1"]
+            .into_iter()
+            .map(|name| crate::node::Node::new(name.into(), Default::default()))
+            .collect();
+        let first = config.build(&nodes, &view).unwrap();
+        assert_eq!(first.node_switch["n0"], first.node_switch["n1"]);
+        assert_ne!(first.node_switch["n0"], first.node_switch["n2"]);
+        nodes.reverse();
+        assert_eq!(
+            first.node_switch,
+            config.build(&nodes, &view).unwrap().node_switch
+        );
+    }
+
+    #[test]
+    fn unknown_nodes_do_not_form_a_fake_locality_group() {
+        let tree = TopologyTree::from_fabric(&view());
+        assert_eq!(
+            tree.select_local_nodes(&["u0", "u1", "u2", "n0", "n2"], 2),
+            ["n0", "n2"]
+        );
+        assert_eq!(
+            tree.select_local_nodes(&["u0", "u1", "u2"], 2),
+            ["u0", "u1"]
+        );
+        assert_eq!(
+            tree.select_local_nodes(&["n0", "u0", "u1"], 2),
+            ["n0", "u0"]
+        );
     }
 }
