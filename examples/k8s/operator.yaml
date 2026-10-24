@@ -32,7 +32,7 @@ spec:
       serviceAccountName: spur-operator
       containers:
         - name: operator
-          image: rocm/spur:0.15.0 # x-release-please-version
+          image: rocm/spur:0.16.0 # x-release-please-version
           command: [spur-k8s-operator]
           resources:
             requests:

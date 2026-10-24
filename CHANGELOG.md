@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.16.0](https://github.com/ROCm/spur/compare/v0.15.0...v0.16.0) (2026-10-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* **deploy:** run spurctld and the operator as UID and GID 10001 ([#1108](https://github.com/ROCm/spur/issues/1108))
+* **spur-cli:** honor ExcNodeList in scontrol update and fail on unknown keys ([#1089](https://github.com/ROCm/spur/issues/1089))
+
+### Features
+
+* **spur-cli:** add -p/-P parsable output to sacct ([#1082](https://github.com/ROCm/spur/issues/1082)) ([7eb45e5](https://github.com/ROCm/spur/commit/7eb45e5fd2a44a35640976f39e3a0ab052cd3e08))
+* **spurctld:** commit placement to Raft before dispatch ([#924](https://github.com/ROCm/spur/issues/924)) ([b050388](https://github.com/ROCm/spur/commit/b050388f877aa2331331a3e67746548979338ec0))
+* **spurd:** add durable admission ledger core ([#928](https://github.com/ROCm/spur/issues/928)) ([eb20be7](https://github.com/ROCm/spur/commit/eb20be7d3c79f20bffe2f79bf47ba69c456dd418))
+
+
+### Bug Fixes
+
+* **deploy:** run spurctld and the operator as UID and GID 10001 ([#1108](https://github.com/ROCm/spur/issues/1108)) ([f4be460](https://github.com/ROCm/spur/commit/f4be460c9df56e4b6284d4fcd8a5af0db1439801))
+* **spur-cli:** honor ExcNodeList in scontrol update and fail on unknown keys ([#1089](https://github.com/ROCm/spur/issues/1089)) ([f055a6a](https://github.com/ROCm/spur/commit/f055a6a9175978064090727e561380a4b363d3d4))
+* **spur-cli:** scancel --reservation, sacctmgr --help fields, and show association ([#1102](https://github.com/ROCm/spur/issues/1102)) ([fd9ad75](https://github.com/ROCm/spur/commit/fd9ad757c5243cd07f94a29240682e62cf3a4989))
+* **spur-core:** renumber the HIP device selector for the ROCR-narrowed set ([#915](https://github.com/ROCm/spur/issues/915)) ([953143d](https://github.com/ROCm/spur/commit/953143d610a49522bd6aef24323c84668c61c392))
+* **spurctld:** bound raft writes and leader confirmation so the scheduler cannot hang ([#1087](https://github.com/ROCm/spur/issues/1087)) ([905a075](https://github.com/ROCm/spur/commit/905a075b1e9187a05e7ca0518abbcc1c8539a30c))
+* **spurctld:** hoist in-flight preemptors to the front of placement ([#1099](https://github.com/ROCm/spur/issues/1099)) ([6d694a2](https://github.com/ROCm/spur/commit/6d694a28dcce0afdcfe477c19219527661b78ed4))
+* **spurctld:** record allocated nodes in job accounting ([#1115](https://github.com/ROCm/spur/issues/1115)) ([ea29007](https://github.com/ROCm/spur/commit/ea29007c43973146dbf4952672d253befb50b146))
+* **spurd:** stop stepd launch collisions and fast-exit pty failures ([#1020](https://github.com/ROCm/spur/issues/1020)) ([c1274a9](https://github.com/ROCm/spur/commit/c1274a9ba4dcc481878c64a034148fb1828156c4))
+
 ## [0.15.0](https://github.com/ROCm/spur/compare/v0.14.0...v0.15.0) (2026-10-16)
 
 
