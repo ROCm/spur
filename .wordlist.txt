@@ -63,6 +63,7 @@ ctrl
 Ctrl
 CUDA
 daemonize
+daemonized
 DaemonSet
 datapath
 datetime
