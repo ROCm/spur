@@ -436,15 +436,22 @@ Delete a QOS
 Show QOS
 ~~~~~~~~
 
-``show qos`` accepts a ``format=`` list to select and order columns. When no QOS
-exists and no name filter is given, Spur prints a synthetic ``normal`` QOS
-(preemption off, usage factor 1.0).
+The default columns include ``Preempt`` (the allow-list of QOS names this QOS
+may preempt), so a preemption setup can be read back without a ``format=``
+override. For the full set of stored fields — ``Descr``,
+``PreemptExemptTime``, ``MaxSubmitPA``, ``GrpSubmit``, ``IdleFillPreemptable``
+— pass ``--long`` (short ``-l``), equivalent to ``format=all``. ``show qos``
+also accepts a ``format=`` list to select and order columns; an explicit
+``format=`` takes precedence over ``--long``. When no QOS exists and no name
+filter is given, Spur prints a synthetic ``normal`` QOS (preemption off, usage
+factor 1.0).
 
 .. code-block:: bash
 
    sacctmgr show qos
+   sacctmgr show qos --long
    sacctmgr show qos name=highprio
-   sacctmgr show qos format=Name,Priority,GrpTRES,MaxTRES,MaxTRESPU,MaxJobsPU,MaxWall
+   sacctmgr show qos format=Name,Priority,Preempt,PreemptExemptTime
 
 QOS keys
 ~~~~~~~~

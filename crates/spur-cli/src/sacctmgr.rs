@@ -40,6 +40,10 @@ pub struct SacctmgrArgs {
     /// Output '|' delimited without a trailing '|'
     #[arg(short = 'P', long, global = true)]
     pub parsable2: bool,
+
+    /// Long listing — show all columns (equivalent to format=all)
+    #[arg(short = 'l', long, global = true)]
+    pub long: bool,
 }
 
 impl SacctmgrArgs {
@@ -171,7 +175,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         SacctmgrCommand::Delete { entity, params } => delete(&entity, &params, &addr).await,
         SacctmgrCommand::Modify { entity, params } => modify(&entity, &params, &addr).await,
         SacctmgrCommand::Show { entity, params } | SacctmgrCommand::List { entity, params } => {
-            show(&entity, &params, &addr, style).await
+            show(&entity, &params, &addr, style, args.long).await
         }
     }
 }
@@ -973,6 +977,7 @@ async fn show(
     params: &[String],
     addr: &str,
     style: format_engine::OutputStyle,
+    long: bool,
 ) -> Result<()> {
     let p = parse_params(params);
     let entity = entity.to_lowercase();
@@ -1025,8 +1030,13 @@ async fn show(
             Ok(())
         }
         "qos" => {
+            // Explicit format= wins; -l/--long otherwise selects the all-column view.
+            let format_param =
+                p.get("format")
+                    .map(String::as_str)
+                    .or(if long { Some("all") } else { None });
             let fields = format_engine::resolve_format(
-                p.get("format").map(String::as_str),
+                format_param,
                 QOS_DEFAULT_FORMAT,
                 QOS_ALL_FORMAT,
                 &qos_field_spec,
@@ -1408,9 +1418,9 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
 }
 
 const QOS_DEFAULT_FORMAT: &str =
-    "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
+    "%-15N %-8p %-10P %-12Q %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
 
-const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
+const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-12Q %-20E %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
 
 fn qos_header(spec: char) -> &'static str {
     match spec {
@@ -2286,6 +2296,75 @@ mod tests {
     }
 
     #[test]
+    fn qos_default_format_includes_preempt() {
+        assert!(
+            QOS_DEFAULT_FORMAT.contains('Q'),
+            "default show qos must include the Preempt column (letter Q)"
+        );
+    }
+
+    #[test]
+    fn qos_all_format_includes_every_stored_field() {
+        for letter in ['D', 'Q', 'E', 'A', 'B', 'I'] {
+            assert!(
+                QOS_ALL_FORMAT.contains(letter),
+                "format=all must include letter {letter}"
+            );
+        }
+    }
+
+    #[test]
+    fn qos_long_flag_resolves_to_all_format() {
+        // --long must select the same field set as format=all.
+        let from_long = format_engine::resolve_format(
+            Some("all"),
+            QOS_DEFAULT_FORMAT,
+            QOS_ALL_FORMAT,
+            &qos_field_spec,
+            &qos_header,
+            "",
+        )
+        .expect("all format resolves");
+        let from_default = format_engine::resolve_format(
+            None,
+            QOS_DEFAULT_FORMAT,
+            QOS_ALL_FORMAT,
+            &qos_field_spec,
+            &qos_header,
+            "",
+        )
+        .expect("default format resolves");
+
+        let q = QosInfo {
+            preempt: "low_priority".into(),
+            preempt_exempt_time: Some(300),
+            ..stub_qos()
+        };
+        let long_row = format_engine::format_row(&from_long, &|spec| resolve_qos_field(&q, spec));
+        let default_row =
+            format_engine::format_row(&from_default, &|spec| resolve_qos_field(&q, spec));
+
+        // Both views carry Preempt (it is in the default now); only --long adds
+        // the remaining stored fields such as preempt_exempt_time.
+        assert!(
+            long_row.contains("low_priority"),
+            "--long must show preempt: {long_row}"
+        );
+        assert!(
+            long_row.contains("300"),
+            "--long must show preempt_exempt_time: {long_row}"
+        );
+        assert!(
+            default_row.contains("low_priority"),
+            "default must show preempt: {default_row}"
+        );
+        assert!(
+            !default_row.contains("300"),
+            "default must not show preempt_exempt_time: {default_row}"
+        );
+    }
+
+    #[test]
     fn idle_fill_preemptable_renders_as_yes_or_no() {
         let fields = format_engine::parse_named_format(
             "Name,IdleFillPreemptable",
@@ -2851,6 +2930,44 @@ mod tests {
     }
 
     #[test]
+    fn long_flag_parses_on_show_qos() {
+        let args = SacctmgrArgs::try_parse_from(["sacctmgr", "show", "qos", "--long"])
+            .expect("--long must parse");
+        assert!(args.long);
+
+        let short =
+            SacctmgrArgs::try_parse_from(["sacctmgr", "-l", "show", "qos"]).expect("-l must parse");
+        assert!(short.long);
+    }
+
+    #[test]
+    fn qos_explicit_format_overrides_long() {
+        // Mirrors the precedence in show(): explicit format= wins over -l/--long.
+        let p: std::collections::HashMap<String, String> =
+            [("format".to_string(), "Name".to_string())]
+                .into_iter()
+                .collect();
+        let long = true;
+        let format_param =
+            p.get("format")
+                .map(String::as_str)
+                .or(if long { Some("all") } else { None });
+        assert_eq!(
+            format_param,
+            Some("Name"),
+            "explicit format must win over -l"
+        );
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let from_long =
+            empty
+                .get("format")
+                .map(String::as_str)
+                .or(if long { Some("all") } else { None });
+        assert_eq!(from_long, Some("all"), "-l with no format must select all");
+    }
+
+    #[test]
     fn delimiter_flag_long_names_match_slurm() {
         let trailing =
             SacctmgrArgs::try_parse_from(["sacctmgr", "--noheader", "--parsable", "show", "qos"])
@@ -3116,9 +3233,15 @@ mod tests {
     async fn unsupported_delimiter_fails_before_contacting_the_controller() {
         // Port 1 is unroutable: reaching the network at all would surface a connect error
         // instead, so this also pins that the check runs first.
-        let err = show("user", &[], "http://127.0.0.1:1", style_from(&["-P"]))
-            .await
-            .expect_err("delimited show user must fail");
+        let err = show(
+            "user",
+            &[],
+            "http://127.0.0.1:1",
+            style_from(&["-P"]),
+            false,
+        )
+        .await
+        .expect_err("delimited show user must fail");
 
         assert!(
             err.to_string().contains("not supported for 'user'"),
@@ -3128,9 +3251,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_entity_reports_itself_rather_than_the_delimiter() {
-        let err = show("wombat", &[], "http://127.0.0.1:1", style_from(&["-P"]))
-            .await
-            .expect_err("unknown entity must fail");
+        let err = show(
+            "wombat",
+            &[],
+            "http://127.0.0.1:1",
+            style_from(&["-P"]),
+            false,
+        )
+        .await
+        .expect_err("unknown entity must fail");
 
         assert!(
             err.to_string().contains("unknown entity 'wombat'"),
