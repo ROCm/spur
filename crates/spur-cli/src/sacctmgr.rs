@@ -972,6 +972,15 @@ fn reject_unsupported_delimiter(entity: &str, style: format_engine::OutputStyle)
     )
 }
 
+/// Resolve the format selector for an entity that supports `format=all`.
+/// An explicit `format=` always wins; otherwise `-l`/`--long` selects the
+/// all-column view.
+fn long_aware_format(p: &std::collections::HashMap<String, String>, long: bool) -> Option<&str> {
+    p.get("format")
+        .map(String::as_str)
+        .or(if long { Some("all") } else { None })
+}
+
 async fn show(
     entity: &str,
     params: &[String],
@@ -985,7 +994,7 @@ async fn show(
 
     match entity.as_str() {
         "account" | "accounts" => {
-            let fields = account_format_fields(p.get("format").map(String::as_str))?;
+            let fields = account_format_fields(long_aware_format(&p, long))?;
 
             let mut client = connect(addr).await?;
             let resp = client
@@ -1030,13 +1039,8 @@ async fn show(
             Ok(())
         }
         "qos" => {
-            // Explicit format= wins; -l/--long otherwise selects the all-column view.
-            let format_param =
-                p.get("format")
-                    .map(String::as_str)
-                    .or(if long { Some("all") } else { None });
             let fields = format_engine::resolve_format(
-                format_param,
+                long_aware_format(&p, long),
                 QOS_DEFAULT_FORMAT,
                 QOS_ALL_FORMAT,
                 &qos_field_spec,
@@ -1134,7 +1138,7 @@ async fn show(
             Ok(())
         }
         "txn" | "transaction" | "transactions" => {
-            let fields = txn_format_fields(p.get("format").map(String::as_str))?;
+            let fields = txn_format_fields(long_aware_format(&p, long))?;
             let request = build_txn_request(&p);
 
             let mut client = connect(addr).await?;
@@ -1418,9 +1422,9 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
 }
 
 const QOS_DEFAULT_FORMAT: &str =
-    "%-15N %-8p %-10P %-12Q %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
+    "%-15N %-8p %-10P %-20Q %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
 
-const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-12Q %-20E %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
+const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-20Q %-20E %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
 
 fn qos_header(spec: char) -> &'static str {
     match spec {
@@ -2941,30 +2945,71 @@ mod tests {
     }
 
     #[test]
-    fn qos_explicit_format_overrides_long() {
-        // Mirrors the precedence in show(): explicit format= wins over -l/--long.
-        let p: std::collections::HashMap<String, String> =
+    fn long_aware_format_prefers_explicit_format_over_long() {
+        let with_format: std::collections::HashMap<String, String> =
             [("format".to_string(), "Name".to_string())]
                 .into_iter()
                 .collect();
-        let long = true;
-        let format_param =
-            p.get("format")
-                .map(String::as_str)
-                .or(if long { Some("all") } else { None });
         assert_eq!(
-            format_param,
+            long_aware_format(&with_format, true),
             Some("Name"),
             "explicit format must win over -l"
         );
 
         let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let from_long =
-            empty
-                .get("format")
-                .map(String::as_str)
-                .or(if long { Some("all") } else { None });
-        assert_eq!(from_long, Some("all"), "-l with no format must select all");
+        assert_eq!(
+            long_aware_format(&empty, true),
+            Some("all"),
+            "-l with no format must select all"
+        );
+        assert_eq!(
+            long_aware_format(&empty, false),
+            None,
+            "no format and no -l falls back to the default view"
+        );
+    }
+
+    #[test]
+    fn long_selects_all_columns_for_account_and_txn() {
+        // --long is a global flag advertised as format=all; the account and txn
+        // arms honor it, not just qos.
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        let account_long = account_format_fields(long_aware_format(&empty, true))
+            .expect("account all-format resolves");
+        let account_default =
+            account_format_fields(long_aware_format(&empty, false)).expect("account default");
+        assert!(
+            account_long.len() > account_default.len(),
+            "--long must widen the account listing"
+        );
+
+        let txn_long =
+            txn_format_fields(long_aware_format(&empty, true)).expect("txn all-format resolves");
+        let txn_default = txn_format_fields(long_aware_format(&empty, false)).expect("txn default");
+        assert!(
+            txn_long.len() > txn_default.len(),
+            "--long must widen the txn listing"
+        );
+    }
+
+    #[test]
+    fn qos_preempt_column_is_wide_enough_for_a_two_name_list() {
+        // A Preempt value like "low_priority,batch" (18 chars) must not spill past
+        // its column and misalign the rest of the row.
+        let fields = format_engine::parse_format(QOS_DEFAULT_FORMAT, &qos_header);
+        let preempt = fields
+            .iter()
+            .find_map(|t| match t {
+                format_engine::FormatToken::Field(f) if f.spec == 'Q' => Some(f),
+                _ => None,
+            })
+            .expect("default format has a Preempt column");
+        assert!(
+            preempt.width >= "low_priority,batch".len(),
+            "Preempt column width {} too narrow for a typical two-name list",
+            preempt.width
+        );
     }
 
     #[test]

@@ -442,9 +442,10 @@ override. For the full set of stored fields — ``Descr``,
 ``PreemptExemptTime``, ``MaxSubmitPA``, ``GrpSubmit``, ``IdleFillPreemptable``
 — pass ``--long`` (short ``-l``), equivalent to ``format=all``. ``show qos``
 also accepts a ``format=`` list to select and order columns; an explicit
-``format=`` takes precedence over ``--long``. When no QOS exists and no name
-filter is given, Spur prints a synthetic ``normal`` QOS (preemption off, usage
-factor 1.0).
+``format=`` takes precedence over ``--long``. The same ``--long`` flag widens
+``show account`` and ``show txn`` to their full column sets as well. When no QOS
+exists and no name filter is given, Spur prints a synthetic ``normal`` QOS
+(preemption off, usage factor 1.0).
 
 .. code-block:: bash
 
