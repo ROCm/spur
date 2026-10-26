@@ -8001,7 +8001,9 @@ impl ClusterManager {
                 if let Some(node) = nodes.get_mut(name) {
                     node.state = *new_state;
                     // A proposal can wait behind the final deallocation in Raft.
-                    node.update_state_from_alloc();
+                    if new_state.is_up() || *new_state == NodeState::Draining {
+                        node.update_state_from_alloc();
+                    }
                     node.state_reason = reason.clone();
                     node.reason_uid = *reason_uid;
                     node.reason_time = *reason_time;
@@ -28818,6 +28820,49 @@ mod tests {
         assert!(node.admin_locked);
         assert_eq!(node.state_reason.as_deref(), Some("maintenance"));
         assert_eq!(node.reason_uid, Some(1000));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_state_change_preserves_explicit_unknown() {
+        for allocated_cpus in [0, 2] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 4, 8000);
+
+            if allocated_cpus > 0 {
+                let id = submit_and_wait(&cm, basic_spec("unknown-state"));
+                let alloc = scalar_alloc(allocated_cpus, 4000);
+                cm.start_job(
+                    id,
+                    vec!["n1".into()],
+                    alloc.clone(),
+                    per_node_for(&["n1"], alloc),
+                )
+                .unwrap();
+                settle(&cm, id, JobState::Running);
+            }
+
+            cm.apply_operation(&WalOperation::NodeStateChange {
+                name: "n1".into(),
+                old_state: cm.get_node("n1").unwrap().state,
+                new_state: NodeState::Unknown,
+                reason: Some("unavailable".into()),
+                admin_locked: false,
+                reason_uid: Some(1000),
+                reason_time: None,
+                at: None,
+            });
+
+            let node = cm.get_node("n1").unwrap();
+            assert_eq!(
+                node.state,
+                NodeState::Unknown,
+                "allocated CPUs: {allocated_cpus}"
+            );
+            assert!(!node.is_schedulable());
+            assert_eq!(node.alloc_resources.cpus, allocated_cpus);
+            assert_eq!(node.state_reason.as_deref(), Some("unavailable"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
