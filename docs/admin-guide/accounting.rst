@@ -1317,6 +1317,9 @@ command is ``scontrol update NodeName=…``.
 Accepted node states are ``drain`` (finish running jobs, accept no new ones),
 ``resume`` (or ``idle`` — return to service), and ``down`` (mark unavailable). An
 unrecognized state defaults to idle with a warning.
+An allocated node reports ``DRAINING`` until its last CPU or device allocation
+is released, then reports ``DRAINED`` in ``scontrol show node`` while keeping
+the administrative reason. An empty node enters ``DRAINED`` immediately.
 
 .. note::
 

@@ -5,7 +5,7 @@
 
 import pytest
 
-from cluster import job_state, parse_job_id, wait_job, wait_job_state, wait_node_state
+from cluster import job_state, parse_job_id, wait_job, wait_job_state, wait_node_state, wait_until
 
 
 def _node_fields(cluster, name):
@@ -81,3 +81,48 @@ class TestBusyNodeResume:
             fields = _node_fields(cluster, name)
             assert fields["State"] == "IDLE", fields
             assert fields["CPUAlloc"] == "0", fields
+
+
+class TestDrainCompletion:
+    @pytest.fixture
+    def cluster_config_overrides(self):
+        return {"nodes": [{"names": "ALL", "cpus": 4, "memory_mb": 4096}]}
+
+    def test_busy_node_reaches_drain_after_last_allocation_is_released(self, cluster):
+        name = cluster.node_names[0]
+        out = cluster.sbatch([
+            "-N", "1", "-w", name, "-c", "2", "-t", "10",
+            "--wrap", "sleep 600",
+            "-o", f"{cluster.remote_dir}/drain-{name}.out",
+        ])
+        job_id = parse_job_id(out)
+        assert job_id is not None, out
+
+        try:
+            wait_job_state(cluster, job_id, "R")
+            assert _node_fields(cluster, name)["CPUAlloc"] == "2"
+
+            cluster.scontrol("update", f"NodeName={name}",
+                             "State=DRAIN", "Reason=e2e-maintenance")
+            assert _node_fields(cluster, name)["State"] == "DRAINING"
+
+            cluster.scancel(str(job_id))
+            assert wait_job(cluster, job_id) == "CA"
+
+            def drained_fields():
+                fields = _node_fields(cluster, name)
+                return fields if fields.get("State") == "DRAINED" else None
+
+            fields = wait_until(
+                drained_fields,
+                timeout_s=60,
+                desc=f"node {name} finishing drain",
+            )
+            assert fields["CPUAlloc"] == "0", fields
+            assert fields["Reason"] == "e2e-maintenance", fields
+            assert cluster.sinfo_nodes()[name] == "drain"
+        finally:
+            cluster.cli_allow_fail(["scancel", str(job_id)])
+            cluster.cli_allow_fail([
+                "scontrol", "update", f"NodeName={name}", "State=RESUME",
+            ])
