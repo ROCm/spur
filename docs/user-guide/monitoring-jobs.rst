@@ -57,6 +57,10 @@ Common flags:
      - ``-t``
      - Filter by state codes or names (comma list). ``-t all`` shows every
        state.
+   * - ``--jobs``
+     - ``-j``
+     - Show only these job IDs (comma list). A step suffix (``30.0``) matches
+       the base job. A non-numeric ID is an error.
    * - ``--account``
      - ``-A``
      - Filter by account.
@@ -410,7 +414,8 @@ Flags:
        ``DEADLINE``/``DL``, ``RUNNING``/``R``, ``PENDING``/``PD``.
    * - ``--jobs``
      - ``-j``
-     - Filter by job ID (comma list; step suffixes like ``30.0`` match the base job).
+     - Filter by job ID (comma list; step suffixes like ``30.0`` match the base
+       job). A non-numeric ID is an error.
    * - ``--format``
      - ``-o``
      - Comma-separated field names (see below).
