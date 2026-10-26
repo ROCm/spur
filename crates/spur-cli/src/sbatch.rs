@@ -178,8 +178,12 @@ pub struct SbatchArgs {
     pub mpi: String,
 
     /// Allow requeue
-    #[arg(long, overrides_with = "requeue")]
+    #[arg(long, overrides_with_all = ["requeue", "no_requeue"])]
     pub requeue: bool,
+
+    /// Do not requeue
+    #[arg(long, overrides_with_all = ["requeue", "no_requeue"])]
+    pub no_requeue: bool,
 
     /// Exclusive node access
     #[arg(long, overrides_with = "exclusive")]
@@ -523,7 +527,12 @@ fn merge_resolved(cli_matches: &clap::ArgMatches, cli: SbatchArgs, dir: SbatchAr
     fallback!(topology, "topology");
     fallback!(open_mode, "open_mode");
     fallback!(mpi, "mpi");
-    fallback!(requeue, "requeue");
+    // `--requeue` and `--no-requeue` are two spellings of one choice, same as
+    // nodelist/nodefile: an explicit command-line answer of either spelling wins.
+    if is_default(cli_matches, "requeue") && is_default(cli_matches, "no_requeue") {
+        out.requeue = dir.requeue;
+        out.no_requeue = dir.no_requeue;
+    }
     fallback!(exclusive, "exclusive");
     fallback!(hold, "hold");
     fallback!(comment, "comment");
@@ -916,7 +925,7 @@ pub(crate) fn build_sbatch_job_spec(
         distribution: args.distribution.unwrap_or_default(),
         het_group: args.het_group.unwrap_or(0),
         array_spec: args.array.unwrap_or_default(),
-        requeue: args.requeue,
+        requeue: args.requeue && !args.no_requeue,
         exclusive: args.exclusive,
         hold: args.hold,
         comment: args.comment.unwrap_or_default(),
@@ -1126,6 +1135,32 @@ async fn wait_for_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_sbatch_job_spec_no_requeue_overrides_script_requeue() {
+        let argv = ["sbatch", "--no-requeue", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&["--requeue".to_string()], &argv).expect("args");
+        let spec =
+            build_sbatch_job_spec(args, None, "sbatch --no-requeue --wrap hostname").expect("spec");
+        assert!(!spec.requeue);
+    }
+
+    #[test]
+    fn build_sbatch_job_spec_requeue_enables_requeue() {
+        let argv = ["sbatch", "--requeue", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+        let spec =
+            build_sbatch_job_spec(args, None, "sbatch --requeue --wrap hostname").expect("spec");
+        assert!(spec.requeue);
+    }
+
+    #[test]
+    fn build_sbatch_job_spec_script_requeue_enables_requeue() {
+        let argv = ["sbatch", "--wrap", "hostname"].map(String::from);
+        let args = resolve_sbatch_args(&["--requeue".to_string()], &argv).expect("args");
+        let spec = build_sbatch_job_spec(args, None, "sbatch --wrap hostname").expect("spec");
+        assert!(spec.requeue);
+    }
 
     #[test]
     fn build_sbatch_job_spec_records_the_submit_line() {
@@ -1506,6 +1541,49 @@ echo "hello world"
         let args = parse_merged(&["--nodelist=node001"], &["sbatch", "-F", "nodes.txt"]);
         assert_eq!(args.nodefile.as_deref(), Some("nodes.txt"));
         assert!(args.nodelist.is_none());
+    }
+
+    #[test]
+    fn test_requeue_defaults_off() {
+        let args = parse_merged(&[], &["sbatch"]);
+        assert!(!args.requeue);
+        assert!(!args.no_requeue);
+    }
+
+    #[test]
+    fn test_no_requeue_cli_and_directive_are_accepted() {
+        let cli = parse_merged(&[], &["sbatch", "--no-requeue"]);
+        assert!(!cli.requeue);
+        assert!(cli.no_requeue);
+
+        let directive = parse_merged(&["--no-requeue"], &["sbatch"]);
+        assert!(!directive.requeue);
+        assert!(directive.no_requeue);
+    }
+
+    #[test]
+    fn test_cli_no_requeue_overrides_directive_requeue() {
+        let args = parse_merged(&["--requeue"], &["sbatch", "--no-requeue"]);
+        assert!(!args.requeue);
+        assert!(args.no_requeue);
+    }
+
+    #[test]
+    fn test_cli_requeue_overrides_directive_no_requeue() {
+        let args = parse_merged(&["--no-requeue"], &["sbatch", "--requeue"]);
+        assert!(args.requeue);
+        assert!(!args.no_requeue);
+    }
+
+    #[test]
+    fn test_requeue_flags_last_wins_on_the_command_line() {
+        let off_then_on = parse_merged(&[], &["sbatch", "--no-requeue", "--requeue"]);
+        assert!(off_then_on.requeue);
+        assert!(!off_then_on.no_requeue);
+
+        let on_then_off = parse_merged(&[], &["sbatch", "--requeue", "--no-requeue"]);
+        assert!(!on_then_off.requeue);
+        assert!(on_then_off.no_requeue);
     }
 
     #[test]
