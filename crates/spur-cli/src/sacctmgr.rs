@@ -40,6 +40,10 @@ pub struct SacctmgrArgs {
     /// Output '|' delimited without a trailing '|'
     #[arg(short = 'P', long, global = true)]
     pub parsable2: bool,
+
+    /// Long listing — show all columns (equivalent to format=all)
+    #[arg(short = 'l', long, global = true)]
+    pub long: bool,
 }
 
 impl SacctmgrArgs {
@@ -171,7 +175,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         SacctmgrCommand::Delete { entity, params } => delete(&entity, &params, &addr).await,
         SacctmgrCommand::Modify { entity, params } => modify(&entity, &params, &addr).await,
         SacctmgrCommand::Show { entity, params } | SacctmgrCommand::List { entity, params } => {
-            show(&entity, &params, &addr, style).await
+            show(&entity, &params, &addr, style, args.long).await
         }
     }
 }
@@ -968,11 +972,21 @@ fn reject_unsupported_delimiter(entity: &str, style: format_engine::OutputStyle)
     )
 }
 
+/// Resolve the format selector for an entity that supports `format=all`.
+/// An explicit `format=` always wins; otherwise `-l`/`--long` selects the
+/// all-column view.
+fn long_aware_format(p: &std::collections::HashMap<String, String>, long: bool) -> Option<&str> {
+    p.get("format")
+        .map(String::as_str)
+        .or(if long { Some("all") } else { None })
+}
+
 async fn show(
     entity: &str,
     params: &[String],
     addr: &str,
     style: format_engine::OutputStyle,
+    long: bool,
 ) -> Result<()> {
     let p = parse_params(params);
     let entity = entity.to_lowercase();
@@ -980,7 +994,7 @@ async fn show(
 
     match entity.as_str() {
         "account" | "accounts" => {
-            let fields = account_format_fields(p.get("format").map(String::as_str))?;
+            let fields = account_format_fields(long_aware_format(&p, long))?;
 
             let mut client = connect(addr).await?;
             let resp = client
@@ -1026,7 +1040,7 @@ async fn show(
         }
         "qos" => {
             let fields = format_engine::resolve_format(
-                p.get("format").map(String::as_str),
+                long_aware_format(&p, long),
                 QOS_DEFAULT_FORMAT,
                 QOS_ALL_FORMAT,
                 &qos_field_spec,
@@ -1124,7 +1138,7 @@ async fn show(
             Ok(())
         }
         "txn" | "transaction" | "transactions" => {
-            let fields = txn_format_fields(p.get("format").map(String::as_str))?;
+            let fields = txn_format_fields(long_aware_format(&p, long))?;
             let request = build_txn_request(&p);
 
             let mut client = connect(addr).await?;
@@ -1408,9 +1422,9 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
 }
 
 const QOS_DEFAULT_FORMAT: &str =
-    "%-15N %-8p %-10P %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
+    "%-15N %-8p %-10P %-20Q %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
 
-const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
+const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-20Q %-20E %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
 
 fn qos_header(spec: char) -> &'static str {
     match spec {
@@ -2286,6 +2300,75 @@ mod tests {
     }
 
     #[test]
+    fn qos_default_format_includes_preempt() {
+        assert!(
+            QOS_DEFAULT_FORMAT.contains('Q'),
+            "default show qos must include the Preempt column (letter Q)"
+        );
+    }
+
+    #[test]
+    fn qos_all_format_includes_every_stored_field() {
+        for letter in ['D', 'Q', 'E', 'A', 'B', 'I'] {
+            assert!(
+                QOS_ALL_FORMAT.contains(letter),
+                "format=all must include letter {letter}"
+            );
+        }
+    }
+
+    #[test]
+    fn qos_long_flag_resolves_to_all_format() {
+        // --long must select the same field set as format=all.
+        let from_long = format_engine::resolve_format(
+            Some("all"),
+            QOS_DEFAULT_FORMAT,
+            QOS_ALL_FORMAT,
+            &qos_field_spec,
+            &qos_header,
+            "",
+        )
+        .expect("all format resolves");
+        let from_default = format_engine::resolve_format(
+            None,
+            QOS_DEFAULT_FORMAT,
+            QOS_ALL_FORMAT,
+            &qos_field_spec,
+            &qos_header,
+            "",
+        )
+        .expect("default format resolves");
+
+        let q = QosInfo {
+            preempt: "low_priority".into(),
+            preempt_exempt_time: Some(300),
+            ..stub_qos()
+        };
+        let long_row = format_engine::format_row(&from_long, &|spec| resolve_qos_field(&q, spec));
+        let default_row =
+            format_engine::format_row(&from_default, &|spec| resolve_qos_field(&q, spec));
+
+        // Both views carry Preempt (it is in the default now); only --long adds
+        // the remaining stored fields such as preempt_exempt_time.
+        assert!(
+            long_row.contains("low_priority"),
+            "--long must show preempt: {long_row}"
+        );
+        assert!(
+            long_row.contains("300"),
+            "--long must show preempt_exempt_time: {long_row}"
+        );
+        assert!(
+            default_row.contains("low_priority"),
+            "default must show preempt: {default_row}"
+        );
+        assert!(
+            !default_row.contains("300"),
+            "default must not show preempt_exempt_time: {default_row}"
+        );
+    }
+
+    #[test]
     fn idle_fill_preemptable_renders_as_yes_or_no() {
         let fields = format_engine::parse_named_format(
             "Name,IdleFillPreemptable",
@@ -2851,6 +2934,85 @@ mod tests {
     }
 
     #[test]
+    fn long_flag_parses_on_show_qos() {
+        let args = SacctmgrArgs::try_parse_from(["sacctmgr", "show", "qos", "--long"])
+            .expect("--long must parse");
+        assert!(args.long);
+
+        let short =
+            SacctmgrArgs::try_parse_from(["sacctmgr", "-l", "show", "qos"]).expect("-l must parse");
+        assert!(short.long);
+    }
+
+    #[test]
+    fn long_aware_format_prefers_explicit_format_over_long() {
+        let with_format: std::collections::HashMap<String, String> =
+            [("format".to_string(), "Name".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            long_aware_format(&with_format, true),
+            Some("Name"),
+            "explicit format must win over -l"
+        );
+
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        assert_eq!(
+            long_aware_format(&empty, true),
+            Some("all"),
+            "-l with no format must select all"
+        );
+        assert_eq!(
+            long_aware_format(&empty, false),
+            None,
+            "no format and no -l falls back to the default view"
+        );
+    }
+
+    #[test]
+    fn long_selects_all_columns_for_account_and_txn() {
+        // --long is a global flag advertised as format=all; the account and txn
+        // arms honor it, not just qos.
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        let account_long = account_format_fields(long_aware_format(&empty, true))
+            .expect("account all-format resolves");
+        let account_default =
+            account_format_fields(long_aware_format(&empty, false)).expect("account default");
+        assert!(
+            account_long.len() > account_default.len(),
+            "--long must widen the account listing"
+        );
+
+        let txn_long =
+            txn_format_fields(long_aware_format(&empty, true)).expect("txn all-format resolves");
+        let txn_default = txn_format_fields(long_aware_format(&empty, false)).expect("txn default");
+        assert!(
+            txn_long.len() > txn_default.len(),
+            "--long must widen the txn listing"
+        );
+    }
+
+    #[test]
+    fn qos_preempt_column_is_wide_enough_for_a_two_name_list() {
+        // A Preempt value like "low_priority,batch" (18 chars) must not spill past
+        // its column and misalign the rest of the row.
+        let fields = format_engine::parse_format(QOS_DEFAULT_FORMAT, &qos_header);
+        let preempt = fields
+            .iter()
+            .find_map(|t| match t {
+                format_engine::FormatToken::Field(f) if f.spec == 'Q' => Some(f),
+                _ => None,
+            })
+            .expect("default format has a Preempt column");
+        assert!(
+            preempt.width >= "low_priority,batch".len(),
+            "Preempt column width {} too narrow for a typical two-name list",
+            preempt.width
+        );
+    }
+
+    #[test]
     fn delimiter_flag_long_names_match_slurm() {
         let trailing =
             SacctmgrArgs::try_parse_from(["sacctmgr", "--noheader", "--parsable", "show", "qos"])
@@ -3116,9 +3278,15 @@ mod tests {
     async fn unsupported_delimiter_fails_before_contacting_the_controller() {
         // Port 1 is unroutable: reaching the network at all would surface a connect error
         // instead, so this also pins that the check runs first.
-        let err = show("user", &[], "http://127.0.0.1:1", style_from(&["-P"]))
-            .await
-            .expect_err("delimited show user must fail");
+        let err = show(
+            "user",
+            &[],
+            "http://127.0.0.1:1",
+            style_from(&["-P"]),
+            false,
+        )
+        .await
+        .expect_err("delimited show user must fail");
 
         assert!(
             err.to_string().contains("not supported for 'user'"),
@@ -3128,9 +3296,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_entity_reports_itself_rather_than_the_delimiter() {
-        let err = show("wombat", &[], "http://127.0.0.1:1", style_from(&["-P"]))
-            .await
-            .expect_err("unknown entity must fail");
+        let err = show(
+            "wombat",
+            &[],
+            "http://127.0.0.1:1",
+            style_from(&["-P"]),
+            false,
+        )
+        .await
+        .expect_err("unknown entity must fail");
 
         assert!(
             err.to_string().contains("unknown entity 'wombat'"),
