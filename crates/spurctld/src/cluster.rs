@@ -25945,6 +25945,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("both assigned", || {
@@ -25993,6 +25994,7 @@ mod tests {
             cni: "calico".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         }
     }
 
@@ -26254,6 +26256,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: Some("node-a".into()),
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         };
         let mut tokens = crate::cluster_k8s::StartTracker::default();
         crate::cluster_k8s::reconcile_phase(&cm, &net, &cm.k0s_state(), &mut tokens, false).await;
@@ -26275,6 +26278,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         }
     }
 
@@ -26500,6 +26504,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         };
         let mut tokens = crate::cluster_k8s::StartTracker::default();
         // A token cached from the torn-down incarnation must not survive the Down tick: reusing it
@@ -26682,6 +26687,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("both nodes assigned k0s roles", || {
@@ -26736,6 +26742,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: Some("node-a".into()),
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("scoped nodes assigned", || {
@@ -26880,6 +26887,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("all four assigned", || {
@@ -26947,6 +26955,7 @@ mod tests {
             cni: "kuberouter".into(),
             control_plane_node: None,
             provisioning_timeout: std::time::Duration::from_secs(600),
+            kubelet_pulls: Default::default(),
         };
         crate::cluster_k8s::provision_assignments(&cm, &net, &cm.k0s_state()).unwrap();
         wait_for("all assigned", || {
