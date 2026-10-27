@@ -148,7 +148,7 @@ impl MpiPluginHost {
         &self.config
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn has_active_pmix(&self, job_id: u32, step_id: StepId) -> bool {
         match self.active_namespaces.lock() {
             Ok(guard) => guard.contains_key(&(job_id, step_id)),

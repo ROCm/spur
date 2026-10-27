@@ -3532,7 +3532,6 @@ pub struct AgentService {
     hooks: Arc<HooksConfig>,
     limits: spur_core::config::JobLimits,
     cgroup: CgroupConfig,
-    #[allow(dead_code)]
     device_registry: Arc<Mutex<DeviceRegistry>>,
     /// RPC-driven owner of this node's k0s systemd unit.
     k0s: Arc<crate::cluster::K0sAgent>,
