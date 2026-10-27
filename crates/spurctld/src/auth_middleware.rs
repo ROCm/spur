@@ -66,7 +66,7 @@ pub struct AuthLayer {
 }
 
 impl AuthLayer {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(mode: AuthMode, jwt_key: &str) -> Self {
         Self::from_bearer(BearerAuth::jwt(mode, jwt_key.as_bytes()))
     }

@@ -5416,34 +5416,6 @@ pub(crate) fn allocations_to_proto(
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn proto_to_allocations(
-    r: spur_proto::proto::ResourceAllocations,
-) -> spur_core::resource::ResourceAllocations {
-    use std::collections::HashMap;
-    spur_core::resource::ResourceAllocations {
-        cpus: r.cpus,
-        memory_mb: r.memory_mb,
-        devices: r
-            .devices
-            .into_iter()
-            .map(|(name, devs)| {
-                (
-                    name,
-                    devs.devices
-                        .into_iter()
-                        .map(|d| spur_core::resource::AllocatedDevice {
-                            device_id: d.device_id,
-                            count: d.count,
-                        })
-                        .collect(),
-                )
-            })
-            .collect::<HashMap<_, _>>(),
-        generation: r.generation,
-    }
-}
-
 pub(crate) fn resource_to_proto(
     r: &spur_core::resource::ResourceSet,
 ) -> spur_proto::proto::ResourceSet {
