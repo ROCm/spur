@@ -1,0 +1,90 @@
+# GPU runner scale set for github.com/powderluv/sglang.
+# Install (AFTER the controller — see install.md):
+#   helm install linux-mi35x-gpu-1 -n arc-runners -f runner-scale-set-values.yaml \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set   # PIN --version
+#
+# containerMode is INTENTIONALLY UNSET. ARC locks its auto-injected dind sidecar when containerMode
+# is set, so you cannot give it /dev/kfd. sglang's amd_ci_start_container.sh runs
+# `docker run --device=/dev/kfd --device=/dev/dri ...` against the dind daemon, so the devices must
+# live in the dind CONTAINER. We therefore hand-author the full pod spec below.
+githubConfigUrl: https://github.com/powderluv/sglang
+githubConfigSecret: sglang-arc-app                 # created from github-app-secret.example.yaml
+runnerScaleSetName: linux-mi35x-gpu-1              # MUST match ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+
+                                                   #   (sglang scripts parse arch from the pod hostname)
+                                                   #   -> gfx950 detected as mi35x. Also == workflow runs-on.
+minRunners: 0
+maxRunners: 4                                       # <= number of GPU workers; 1 GPU each
+
+template:
+  metadata:
+    annotations:
+      # sglang's amd_ci_start_container.sh does `DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)`
+      # when the file EXISTS (the downwardAPI mount always creates it), and only falls back to
+      # `--device /dev/dri` when the file is ABSENT. An empty value therefore collapses to NO
+      # /dev/dri at all -> ci_sglang sees /dev/kfd but no render node -> rocminfo finds no GPU.
+      # Interim: pass all render nodes (`--device /dev/dri`); safe while maxRunners <= GPUs/node.
+      # The device-plugin/CDI work (plan M2/M9) later replaces this with the allocated renderD(s).
+      spur.amd.com/render-devices: "--device /dev/dri"
+  spec:
+    nodeSelector: { spur.amd.com/compute: "true" }
+    # The sglang-runner:rocm image is built on each node and imported into containerd (k8s.io ns),
+    # so its pull is disabled (imagePullPolicy: Never below). To distribute via a registry instead,
+    # push it to ghcr and switch to imagePullPolicy: IfNotPresent + imagePullSecrets: [{name: ghcr-pull}].
+    initContainers:
+      - name: init-dind-externals
+        image: ghcr.io/powderluv/sglang-runner:rocm
+        imagePullPolicy: Never
+        command: ["cp", "-r", "-v", "/home/runner/externals/.", "/home/runner/tmpDir/"]
+        volumeMounts: [{ name: dind-externals, mountPath: /home/runner/tmpDir }]
+    containers:
+      - name: runner
+        image: ghcr.io/powderluv/sglang-runner:rocm      # PIN by digest in versions.lock.md
+        imagePullPolicy: Never                            # built + imported to containerd on each node
+        command: ["/home/runner/run.sh"]
+        env:
+          - { name: DOCKER_HOST, value: unix:///run/docker/docker.sock }
+        resources:
+          limits: { amd.com/gpu: 1 }                       # one MI355X per runner
+        securityContext: { privileged: true }
+        volumeMounts:
+          - { name: dind-sock, mountPath: /run/docker }
+          - { name: work, mountPath: /home/runner/_work }   # shared checkout — dind must see $GITHUB_WORKSPACE
+          - { name: podinfo, mountPath: /etc/podinfo }      # per-runner GPU pinning (below)
+      - name: dind
+        image: docker:dind                                  # PIN by digest
+        securityContext: { privileged: true }
+        env:
+          - { name: DOCKER_GROUP_GID, value: "123" }        # docker GID baked into the actions-runner base image
+          - name: POD_NAME                                  # names the per-pod dind graph subdir below
+            valueFrom: { fieldRef: { fieldPath: metadata.name } }
+        args: ["dockerd", "--host=unix:///run/docker/docker.sock", "--group=$(DOCKER_GROUP_GID)"]
+        volumeMounts:
+          - { name: dind-sock, mountPath: /run/docker }
+          - { name: work, mountPath: /home/runner/_work }   # shared checkout with the runner container
+          - { name: dind-externals, mountPath: /home/runner/externals }
+          # dockerd's image/layer store. MUST live on the node scratch disk, NOT the small root filesystem:
+          # the mi35x sglang image is tens of GB and filled ephemeral-storage -> NodeHasDiskPressure
+          # -> the runner pod was Evicted mid-pull ("runner lost communication"). subPathExpr gives
+          # each ephemeral runner its own data-root (concurrent dockerds must not share one).
+          - { name: dind-graph, mountPath: /var/lib/docker, subPathExpr: $(POD_NAME) }
+          - { name: dev-kfd, mountPath: /dev/kfd }          # <-- devices INTO the dind daemon
+          - { name: dev-dri, mountPath: /dev/dri }
+    volumes:
+      - { name: dind-sock, emptyDir: {} }
+      - { name: dind-externals, emptyDir: {} }
+      - { name: work, emptyDir: {} }
+      - { name: dev-kfd, hostPath: { path: /dev/kfd, type: CharDevice } }
+      - { name: dev-dri, hostPath: { path: /dev/dri, type: Directory } }
+      # dind image/layer store on the node scratch disk at /mnt/scratch (NOT the small root filesystem).
+      # DirectoryOrCreate makes the base dir; kubelet creates the per-pod subPathExpr subdir.
+      # NOTE: hostPath subdirs are not GC'd on pod delete — prune /mnt/scratch/sglang-dind/* periodically.
+      - { name: dind-graph, hostPath: { path: /mnt/scratch/sglang-dind, type: DirectoryOrCreate } }
+      # Per-runner GPU isolation: sglang reads /etc/podinfo/gha-render-devices to pin renderD nodes.
+      # Without it the CI falls back to --device /dev/dri (ALL GPUs). Until the device-plugin/CDI
+      # populates a real per-pod value, keep maxRunners <= #GPUs-per-node so "all" == "its own".
+      - name: podinfo
+        downwardAPI:
+          items:
+            - path: gha-render-devices
+              fieldRef:
+                fieldPath: "metadata.annotations['spur.amd.com/render-devices']"

@@ -1,0 +1,25 @@
+# NetworkAttachmentDefinitions (Multus) — one per RoCE rail. A pod annotated with these gets the
+# backend NIC(s) as secondary interfaces, in ADDITION to its Calico primary. RDMA rides these; the
+# Calico primary stays the pod/service + rendezvous network. Requires Multus + the SR-IOV device
+# plugin (sriov-rdma-device-plugin.yaml). resourceName must match `amd.com/roce_ionic`.
+#
+# One NAD per rail keeps NIC↔GPU rail alignment explicit; a distributed job requests all 8.
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: roce-rail-0
+  namespace: sglang
+  annotations:
+    k8s.v1.cni.cncf.io/resourceName: amd.com/roce_ionic
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "type": "sriov",
+      "name": "roce-rail-0",
+      "ipam": { "type": "static" }
+    }
+# ... repeat roce-rail-1 … roce-rail-7 (one per backend NIC / GPU rail).
+# For the simplest whole-node path you can skip NADs entirely and use hostNetwork: true (model A in
+# README.md); then the pod uses the host's backend NIC IPs directly and no Multus annotation is needed.

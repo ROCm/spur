@@ -1,0 +1,23 @@
+# Non-GPU runner scale set for the gated `kubectl apply` deploy job.
+# Runs on a GPU worker (only workers have a kubelet on k0s) but requests NO amd.com/gpu, so it never
+# consumes or queues behind a GPU. Uses an in-cluster ServiceAccount with RBAC into the sglang ns
+# (see ../40-serving/rbac-deployer.yaml). No dind needed -> default containerMode.
+#   helm install linux-cpu-deploy -n arc-runners -f cpu-deploy-values.yaml \
+#     oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set   # PIN --version
+githubConfigUrl: https://github.com/powderluv/sglang
+githubConfigSecret: sglang-arc-app
+runnerScaleSetName: linux-cpu-deploy               # == deploy job's runs-on
+minRunners: 0
+maxRunners: 1
+
+template:
+  spec:
+    nodeSelector: { spur.amd.com/compute: "true" }  # schedule on a worker (only workers run a kubelet)
+    serviceAccountName: sglang-deployer            # SA lives in arc-runners; RoleBinding in sglang ns
+    automountServiceAccountToken: true
+    containers:
+      - name: runner
+        image: ghcr.io/powderluv/sglang-runner:rocm   # same local image (Never); has kubectl baked in
+        imagePullPolicy: Never                        # built + imported to containerd on each node (no ghcr pull)
+        command: ["/home/runner/run.sh"]
+        # no resources.limits.amd.com/gpu  -> schedules without holding a GPU

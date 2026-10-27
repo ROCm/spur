@@ -1,0 +1,31 @@
+# ROCm-capable GitHub Actions runner image for the sglang fork CI.
+# Stock ghcr.io/actions/actions-runner has no ROCm, docker CLI, or kubectl.
+# Build + push:
+#   docker build -t ghcr.io/powderluv/sglang-runner:rocm -f Dockerfile.runner .
+#   docker push ghcr.io/powderluv/sglang-runner:rocm      # record the digest in versions.lock.md
+FROM ghcr.io/actions/actions-runner:latest
+USER root
+
+# docker CLI (talks to the dind sidecar), kubectl (used by the CPU deploy scale set), ROCm userspace.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      docker.io curl ca-certificates gnupg python3 python3-pip python3-venv \
+      libdrm-amdgpu1 libdrm2 libnuma1 pciutils && \
+    curl -fsSL https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl \
+      -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl && \
+    # Full ROCm release for gfx950 from TheRock's multi-arch nightly index. This installs the
+    # ROCm CLI tools (rocm-smi, amd-smi, rocminfo, rocprofiler, ...) as shims in /usr/local/bin,
+    # so the CI's ensure_vram_clear (rocm-smi) + arch assertion (rocminfo -> gfx950) run natively
+    # on the runner host. rocm-sdk-device-gfx950 pinned explicitly (workaround for TheRock #5347,
+    # where the `rocm` meta-package's device-* extra can be missing from published metadata).
+    pip install --break-system-packages --no-cache-dir \
+      --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
+      "rocm[libraries,device-gfx950]" rocm-sdk-device-gfx950 && \
+    # rocm-smi dlopen()s the UNVERSIONED libdrm_amdgpu.so; libdrm-amdgpu1 ships only the .so.1
+    # (the unversioned symlink normally comes from -dev). Without this, rocm-smi can't read GPU
+    # names/VRAM ("Fail to open libdrm_amdgpu.so") and ensure_vram_clear degrades.
+    ln -sf libdrm_amdgpu.so.1 /usr/lib/x86_64-linux-gnu/libdrm_amdgpu.so && ldconfig && \
+    (getent group render || groupadd render) && (getent group video || groupadd video) && \
+    usermod -aG docker,video,render runner && \
+    rm -rf /var/lib/apt/lists/*
+
+USER runner
