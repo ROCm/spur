@@ -942,6 +942,15 @@ message RunningJobStatus {
   // controller converge its per-node used-view to the ids the job actually
   // occupies. Empty from an old agent or a job with no GPUs.
   repeated uint64 gpu_stable_ids = 4;
+  // Present only when this agent read the job cgroup. Absent, rather than zero,
+  // on an older agent or a job with no cgroup, so a scrape does not publish a
+  // series for a sample that was never taken.
+  optional uint64 cpu_usage_usec = 5;
+  optional uint64 rss_bytes = 6;
+  optional uint64 virtual_bytes = 7;
+  optional uint64 swap_bytes = 8;
+  optional uint64 disk_read_bytes = 9;
+  optional uint64 disk_write_bytes = 10;
 }
 
 message HeartbeatResponse {}

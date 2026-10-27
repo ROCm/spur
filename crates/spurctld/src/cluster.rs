@@ -25,6 +25,7 @@ use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
     PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
 };
+use spur_core::job_usage::JobUsage;
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
 use spur_core::qos::{
@@ -592,6 +593,9 @@ pub struct ClusterManager {
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
     interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
+    /// Latest per-job cgroup readings and the term they arrived in, by node.
+    /// Telemetry, like node load, so kept out of the Raft log.
+    job_resources: RwLock<HashMap<String, (u64, Vec<JobUsage>)>>,
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
@@ -904,6 +908,7 @@ impl ClusterManager {
             planned_reservations: RwLock::new(HashMap::new()),
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
+            job_resources: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
@@ -3530,6 +3535,49 @@ impl ClusterManager {
         } else {
             false
         }
+    }
+
+    /// Replace this node's per-job cgroup readings, stamped with the Raft term
+    /// they arrived in. An empty list drops the node.
+    pub fn record_job_resources(&self, node: &str, term: u64, usage: Vec<JobUsage>) {
+        let mut map = self.job_resources.write();
+        if usage.is_empty() {
+            map.remove(node);
+        } else {
+            map.insert(node.to_string(), (term, usage));
+        }
+    }
+
+    /// Samples joined to the job record. Readings from an earlier term are
+    /// skipped: a controller that regains leadership saw no heartbeats in between.
+    /// A node that stops heartbeating leaves its list behind, so only a job still
+    /// active on that node is exported.
+    pub fn job_resource_samples(&self, term: u64) -> Vec<spur_metrics::LabeledJobUsage> {
+        let stored = self.job_resources.read();
+        let jobs = self.jobs.read();
+        let mut samples = Vec::new();
+        for (node, (recorded_term, usages)) in stored.iter() {
+            if *recorded_term != term {
+                continue;
+            }
+            for usage in usages {
+                let Some(job) = jobs.get(&usage.job_id) else {
+                    continue;
+                };
+                if !job.state.is_active() || !job.allocated_nodes.contains(node) {
+                    continue;
+                }
+                samples.push(spur_metrics::LabeledJobUsage {
+                    node: node.clone(),
+                    user: job.spec.user.clone(),
+                    partition: job.spec.partition.clone().unwrap_or_default(),
+                    account: job.spec.account.clone().unwrap_or_default(),
+                    usage: usage.clone(),
+                });
+            }
+        }
+        samples.sort_by(|a, b| (&a.node, a.usage.job_id).cmp(&(&b.node, b.usage.job_id)));
+        samples
     }
 
     /// Record a keepalive from an interactive allocation's client. In-memory
@@ -10427,6 +10475,135 @@ mod tests {
         let err =
             check_submission_size(&spec).expect_err("env + argv over the cap must be rejected");
         assert!(matches!(err, SubmitError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn job_resource_samples_join_the_job_record_and_a_heartbeat_replaces_them() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut alice = basic_spec("alice-job");
+        alice.user = "alice".into();
+        alice.partition = Some("debug".into());
+        alice.account = Some("team".into());
+        let mut bob = basic_spec("bob-job");
+        bob.user = "bob".into();
+        bob.partition = Some("other".into());
+        bob.account = Some("other-team".into());
+        cm.jobs
+            .write()
+            .insert(7, running_on(Job::new(7, alice), "n1"));
+        cm.jobs
+            .write()
+            .insert(9, running_on(Job::new(9, bob), "n1"));
+
+        cm.record_job_resources("n1", 1, vec![cgroup_usage(7, 22), cgroup_usage(8, 99)]);
+        let samples = cm.job_resource_samples(1);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].usage.job_id, 7);
+        assert_eq!(samples[0].user, "alice");
+        assert_eq!(samples[0].partition, "debug");
+        assert_eq!(samples[0].account, "team");
+        let text = spur_metrics::encode_job_resource_metrics(&samples);
+        let rss = text
+            .lines()
+            .find(|line| {
+                line.starts_with("spur_job_memory_rss_bytes") && line.contains("job_id=\"7\"")
+            })
+            .unwrap_or("");
+        assert!(rss.contains("node=\"n1\""), "{rss}");
+        assert!(rss.contains("job_user=\"alice\""), "{rss}");
+        assert!(rss.contains("job_partition=\"debug\""), "{rss}");
+        assert!(rss.contains("job_account=\"team\""), "{rss}");
+        assert!(rss.contains("} 22"), "{rss}");
+        assert!(!text.contains("bob"), "{text}");
+        assert!(!text.contains("job_id=\"8\""), "{text}");
+        assert!(!text.contains("job_id=\"9\""), "{text}");
+
+        cm.record_job_resources("n1", 1, vec![cgroup_usage(7, 22), cgroup_usage(9, 50)]);
+        let both = cm.job_resource_samples(1);
+        assert_eq!(both.len(), 2);
+        let crossed = spur_metrics::encode_job_resource_metrics(&both);
+        let alice_rss = crossed
+            .lines()
+            .find(|line| {
+                line.starts_with("spur_job_memory_rss_bytes") && line.contains("job_id=\"7\"")
+            })
+            .unwrap_or("");
+        let bob_rss = crossed
+            .lines()
+            .find(|line| {
+                line.starts_with("spur_job_memory_rss_bytes") && line.contains("job_id=\"9\"")
+            })
+            .unwrap_or("");
+        assert!(alice_rss.contains("job_user=\"alice\""), "{alice_rss}");
+        assert!(!alice_rss.contains("bob"), "{alice_rss}");
+        assert!(bob_rss.contains("job_user=\"bob\""), "{bob_rss}");
+        assert!(bob_rss.contains("} 50"), "{bob_rss}");
+        assert!(!bob_rss.contains("alice"), "{bob_rss}");
+
+        cm.record_job_resources("n1", 1, Vec::new());
+        assert!(cm.job_resource_samples(1).is_empty());
+    }
+
+    #[test]
+    fn job_resource_samples_drop_a_finished_job_and_a_node_the_job_is_not_on() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.jobs
+            .write()
+            .insert(7, running_on(Job::new(7, basic_spec("a")), "n1"));
+        let mut finished = running_on(Job::new(9, basic_spec("b")), "n1");
+        finished.state = JobState::NodeFail;
+        cm.jobs.write().insert(9, finished);
+
+        cm.record_job_resources("n1", 1, vec![cgroup_usage(7, 22), cgroup_usage(9, 50)]);
+        cm.record_job_resources("n2", 1, vec![cgroup_usage(7, 60)]);
+
+        let samples = cm.job_resource_samples(1);
+        assert_eq!(samples.len(), 1, "{samples:?}");
+        assert_eq!(
+            (samples[0].node.as_str(), samples[0].usage.job_id),
+            ("n1", 7)
+        );
+    }
+
+    #[test]
+    fn job_resource_samples_skip_readings_from_an_earlier_term() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.jobs
+            .write()
+            .insert(7, running_on(Job::new(7, basic_spec("a")), "n1"));
+        cm.jobs
+            .write()
+            .insert(9, running_on(Job::new(9, basic_spec("b")), "n2"));
+        cm.record_job_resources("n1", 3, vec![cgroup_usage(7, 22)]);
+        cm.record_job_resources("n2", 5, vec![cgroup_usage(9, 50)]);
+
+        let samples = cm.job_resource_samples(5);
+        assert_eq!(samples.len(), 1, "{samples:?}");
+        assert_eq!(
+            (samples[0].node.as_str(), samples[0].usage.job_id),
+            ("n2", 9)
+        );
+    }
+
+    fn running_on(mut job: Job, node: &str) -> Job {
+        job.state = JobState::Running;
+        job.allocated_nodes = vec![node.into()];
+        job
+    }
+
+    fn cgroup_usage(job_id: u32, rss_bytes: u64) -> JobUsage {
+        JobUsage {
+            job_id,
+            cpu_usage_usec: 11,
+            rss_bytes,
+            virtual_bytes: 33,
+            swap_bytes: 0,
+            disk_read_bytes: 0,
+            disk_write_bytes: 44,
+        }
     }
 
     fn test_config() -> SlurmConfig {

@@ -15,6 +15,7 @@ pub mod gpu_request;
 pub mod hooks;
 pub mod hostlist;
 pub mod job;
+pub mod job_usage;
 pub mod k0s;
 pub mod mpi;
 pub mod native_cred;

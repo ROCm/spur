@@ -183,8 +183,9 @@ pub struct MetricsConfig {
     /// `loopback` binds 127.0.0.1; `all` uses `listen_addr` as-is.
     #[serde(default)]
     pub bind: MetricsBind,
-    /// Serves `/metrics/jobs-users-accts`, which 404s while false. Off by default
-    /// because each job, user, and account becomes its own series.
+    /// Serves `/metrics/jobs-users-accts` and `/metrics/job-resources`, which 404
+    /// while false. Off by default because each job, user, and account becomes
+    /// its own series.
     #[serde(default)]
     pub high_cardinality: bool,
 }

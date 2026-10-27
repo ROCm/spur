@@ -11,6 +11,7 @@ cron
 crontab
 cryptographically
 daemonize
+daemonized
 datetime
 dbd
 deprovision

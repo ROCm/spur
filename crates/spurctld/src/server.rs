@@ -12,6 +12,7 @@ use tonic::{Code, Request, Response, Status};
 use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
+use spur_core::job_usage::JobUsage;
 use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
 use spur_core::task_launch::{
@@ -1383,6 +1384,25 @@ fn stale_reported_jobs(
         .collect()
 }
 
+/// A sample exists only when the agent set `cpu_usage_usec`. Older agents and
+/// the Kubernetes virtual agent leave it unset, and a zero must not become a series.
+fn job_usages_from_status(jobs: &[RunningJobStatus]) -> Vec<JobUsage> {
+    jobs.iter()
+        .filter_map(|job| {
+            let cpu_usage_usec = job.cpu_usage_usec?;
+            Some(JobUsage {
+                job_id: job.job_id,
+                cpu_usage_usec,
+                rss_bytes: job.rss_bytes.unwrap_or(0),
+                virtual_bytes: job.virtual_bytes.unwrap_or(0),
+                swap_bytes: job.swap_bytes.unwrap_or(0),
+                disk_read_bytes: job.disk_read_bytes.unwrap_or(0),
+                disk_write_bytes: job.disk_write_bytes.unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
 #[tonic::async_trait]
 impl SlurmController for ControllerService {
     async fn submit_job(
@@ -2520,6 +2540,11 @@ impl SlurmController for ControllerService {
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
         {
+            self.cluster.record_job_resources(
+                &req.hostname,
+                self.raft.current_term(),
+                job_usages_from_status(&req.running_jobs),
+            );
             // Learn a mesh key that appeared/changed after registration so the node joins ApplyMesh
             // without a restart. Only meaningful once the node is known (heartbeat accepted).
             if self
@@ -6485,6 +6510,36 @@ mod tests {
         assert_eq!(
             reported_held_gpu_ids(&reported),
             vec![(1u32, vec![0x63_0000u64, 0x83_0000u64])]
+        );
+    }
+
+    #[test]
+    fn job_usages_from_status_skips_jobs_without_a_cpu_reading() {
+        let reported = vec![
+            RunningJobStatus {
+                job_id: 1,
+                cpu_usage_usec: Some(0),
+                rss_bytes: Some(4096),
+                disk_write_bytes: Some(8),
+                ..Default::default()
+            },
+            RunningJobStatus {
+                job_id: 2,
+                rss_bytes: Some(4096),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            job_usages_from_status(&reported),
+            vec![JobUsage {
+                job_id: 1,
+                cpu_usage_usec: 0,
+                rss_bytes: 4096,
+                virtual_bytes: 0,
+                swap_bytes: 0,
+                disk_read_bytes: 0,
+                disk_write_bytes: 8,
+            }]
         );
     }
 

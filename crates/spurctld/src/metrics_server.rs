@@ -12,9 +12,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use spur_metrics::{
-    encode_audit_metrics, encode_auth_metrics, encode_job_metrics, encode_jobs_users_accts_metrics,
-    encode_k8s_metrics, encode_nodes_metrics, encode_partitions_metrics, encode_rpc_metrics,
-    encode_scheduler_metrics, CONTENT_TYPE,
+    encode_audit_metrics, encode_auth_metrics, encode_job_metrics, encode_job_resource_metrics,
+    encode_jobs_users_accts_metrics, encode_k8s_metrics, encode_nodes_metrics,
+    encode_partitions_metrics, encode_rpc_metrics, encode_scheduler_metrics, CONTENT_TYPE,
 };
 use tracing::info;
 
@@ -54,6 +54,7 @@ pub async fn serve(
         .route("/metrics/scheduler", get(metrics_scheduler))
         .route("/metrics/k8s", get(metrics_k8s))
         .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
+        .route("/metrics/job-resources", get(metrics_job_resources))
         .route("/metrics/auth", get(metrics_auth))
         .route("/metrics/audit", get(metrics_audit))
         .with_state(state);
@@ -109,6 +110,24 @@ async fn metrics_k8s(State(state): State<Arc<MetricsState>>) -> Response {
     metrics_response(encode_k8s_metrics(
         &state.cluster.k8s_cluster_metrics(),
         &state.cluster.k8s_metrics(),
+    ))
+}
+
+async fn metrics_job_resources(State(state): State<Arc<MetricsState>>) -> Response {
+    if !state.cluster.config().metrics.high_cardinality {
+        return (
+            StatusCode::NOT_FOUND,
+            "job-resources metrics disabled (set metrics.high_cardinality = true)",
+        )
+            .into_response();
+    }
+    if !state.raft.is_leader() {
+        return not_leader_response();
+    }
+    metrics_response(encode_job_resource_metrics(
+        &state
+            .cluster
+            .job_resource_samples(state.raft.current_term()),
     ))
 }
 
@@ -245,6 +264,7 @@ mod tests {
             .route("/metrics/scheduler", get(metrics_scheduler))
             .route("/metrics/k8s", get(metrics_k8s))
             .route("/metrics/jobs-users-accts", get(metrics_jobs_users_accts))
+            .route("/metrics/job-resources", get(metrics_job_resources))
             .route("/metrics/auth", get(metrics_auth))
             .with_state(state);
         (app, dir)
@@ -438,6 +458,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metrics_job_resources_on_a_follower_is_404_when_disabled_and_503_when_enabled() {
+        use axum::extract::State;
+
+        let dir = TempDir::new().unwrap();
+        let (_leader, follower) = two_node_raft(&dir).await;
+        let state_with = |high_cardinality: bool, name: &str| {
+            let mut config = test_config();
+            config.metrics.high_cardinality = high_cardinality;
+            Arc::new(MetricsState {
+                cluster: Arc::new(ClusterManager::new(config, &dir.path().join(name)).unwrap()),
+                raft: follower.clone(),
+                rpc_stats: Arc::new(RpcStatsCollector::new()),
+                sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+            })
+        };
+
+        let resp = metrics_job_resources(State(state_with(false, "off"))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = metrics_job_resources(State(state_with(true, "on"))).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn metrics_jobs_users_accts_returns_404_when_disabled() {
         let (app, _dir) = test_app().await;
         let resp = app
@@ -449,6 +492,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn metrics_job_resources_returns_404_when_disabled() {
+        let (app, _dir) = test_app().await;
+        let resp = app
+            .oneshot(
+                axum::http::Request::get("/metrics/job-resources")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains("high_cardinality"),
+            "a missing route must not look like the flag-off response: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_job_resources_returns_eof_when_enabled_and_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.metrics.high_cardinality = true;
+        let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        let state = Arc::new(MetricsState {
+            cluster: cm,
+            raft: Arc::new(handle),
+            rpc_stats: Arc::new(RpcStatsCollector::new()),
+            sched_stats: Arc::new(SchedStatsCollector::new("backfill")),
+        });
+        let resp = metrics_job_resources(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "# EOF\n");
     }
 
     #[tokio::test]

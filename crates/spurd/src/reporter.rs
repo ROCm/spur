@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use spur_core::job_usage::JobUsage;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
 use spur_proto::proto::{
@@ -16,6 +18,9 @@ use spur_proto::proto::{
 use spur_sched::cons_tres::NodeAllocation;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+use crate::executor::CGROUP_ROOT;
+use crate::job_resources::JobUsageSampler;
 
 /// Channel dial/keepalive and RPC/failover timeouts a [`NodeReporter`] applies to every
 /// controller connection. A caller with its own config (spurd's `[spurd]` section) should
@@ -369,6 +374,7 @@ impl NodeReporter {
     /// Periodic heartbeat loop.
     pub async fn heartbeat_loop(&self) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut usage_sampler = JobUsageSampler::default();
 
         loop {
             interval.tick().await;
@@ -377,7 +383,9 @@ impl NodeReporter {
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = read_recover(&self.node_token).clone();
-            let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
+            let held_ids = self.held_job_ids();
+            let usage = usage_sampler.sample(Path::new(CGROUP_ROOT), Path::new("/proc"), &held_ids);
+            let running_jobs = build_running_jobs(held_ids, &self.held_job_gpu_ids(), &usage);
             let req = spur_proto::proto::HeartbeatRequest {
                 hostname: self.hostname.clone(),
                 cpu_load: load,
@@ -422,16 +430,31 @@ impl NodeReporter {
 /// Build the heartbeat's per-job status list. Each held job carries its
 /// translated GPU stable_ids (empty when it holds no GPUs), so the controller
 /// can converge its per-node used-view to what the job actually occupies.
+/// Usage fields stay unset for a job with no sample.
 fn build_running_jobs(
     held_ids: Vec<u32>,
     gpu_ids: &HashMap<u32, Vec<u64>>,
+    usage: &[JobUsage],
 ) -> Vec<RunningJobStatus> {
+    let usage_by_job: HashMap<u32, &JobUsage> =
+        usage.iter().map(|usage| (usage.job_id, usage)).collect();
     held_ids
         .into_iter()
-        .map(|job_id| RunningJobStatus {
-            job_id,
-            gpu_stable_ids: gpu_ids.get(&job_id).cloned().unwrap_or_default(),
-            ..Default::default()
+        .map(|job_id| {
+            let mut status = RunningJobStatus {
+                job_id,
+                gpu_stable_ids: gpu_ids.get(&job_id).cloned().unwrap_or_default(),
+                ..Default::default()
+            };
+            if let Some(usage) = usage_by_job.get(&job_id) {
+                status.cpu_usage_usec = Some(usage.cpu_usage_usec);
+                status.rss_bytes = Some(usage.rss_bytes);
+                status.virtual_bytes = Some(usage.virtual_bytes);
+                status.swap_bytes = Some(usage.swap_bytes);
+                status.disk_read_bytes = Some(usage.disk_read_bytes);
+                status.disk_write_bytes = Some(usage.disk_write_bytes);
+            }
+            status
         })
         .collect()
 }
@@ -1067,7 +1090,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let mut jobs = build_running_jobs(held, &gpu_ids);
+        let mut jobs = build_running_jobs(held, &gpu_ids, &[]);
         jobs.sort_by_key(|j| j.job_id);
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0].job_id, 7);
@@ -1077,6 +1100,31 @@ mod tests {
             jobs[1].gpu_stable_ids.is_empty(),
             "a job with no GPUs carries an empty list"
         );
+        assert_eq!(jobs[0].cpu_usage_usec, None);
+    }
+
+    #[test]
+    fn build_running_jobs_copies_cgroup_usage_and_leaves_unsampled_jobs_unset() {
+        let usage = vec![JobUsage {
+            job_id: 7,
+            cpu_usage_usec: 11,
+            rss_bytes: 22,
+            virtual_bytes: 33,
+            swap_bytes: 44,
+            disk_read_bytes: 55,
+            disk_write_bytes: 66,
+        }];
+        let jobs = build_running_jobs(vec![7, 9], &HashMap::new(), &usage);
+        let seven = jobs.iter().find(|job| job.job_id == 7).unwrap();
+        assert_eq!(seven.cpu_usage_usec, Some(11));
+        assert_eq!(seven.rss_bytes, Some(22));
+        assert_eq!(seven.virtual_bytes, Some(33));
+        assert_eq!(seven.swap_bytes, Some(44));
+        assert_eq!(seven.disk_read_bytes, Some(55));
+        assert_eq!(seven.disk_write_bytes, Some(66));
+        let nine = jobs.iter().find(|job| job.job_id == 9).unwrap();
+        assert_eq!(nine.cpu_usage_usec, None);
+        assert_eq!(nine.disk_write_bytes, None);
     }
 
     #[test]

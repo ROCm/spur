@@ -600,8 +600,9 @@ Default fields: ``JobID NTasks NCPUS MemAlloc GPUAlloc Elapsed Nodelist``.
 .. note::
 
    The per-process ``Ave*`` and ``Max*`` fields (``AveCPU``, ``AveRSS``,
-   ``MaxRSS``, and similar) always report ``N/A`` — Spur does not collect
-   per-process metrics.
+   ``MaxRSS``, and similar) always report ``N/A``. A per-node sum of the job's
+   CPU time, resident memory, virtual memory, swap, and disk I/O is exported
+   at ``/metrics/job-resources`` when ``metrics.high_cardinality`` is true.
 
 Detailed Records — ``scontrol show``
 ------------------------------------
@@ -990,9 +991,13 @@ Endpoints
      - Live
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
    * - ``/metrics/jobs-users-accts``
-     - Planned
-     - Per-user/per-account breakdown. Returns ``404`` until implemented, even
-       with ``high_cardinality = true``.
+     - Live
+     - Per-user/per-account breakdown. Returns ``404`` while
+       ``high_cardinality`` is false.
+   * - ``/metrics/job-resources``
+     - Live
+     - Per-job CPU time, RSS, virtual memory, swap, and disk I/O on each node.
+       Returns ``404`` while ``high_cardinality`` is false.
 
 Job metrics — ``/metrics/jobs``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1053,6 +1058,62 @@ All gauges. Cluster-wide totals carry no labels; per-node gauges carry a
      - CPU load reported by the node agent.
    * - ``spur_node_free_memory_bytes``
      - Free memory (bytes) reported by the node agent.
+
+Job resource metrics — ``/metrics/job-resources``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Off unless ``metrics.high_cardinality`` is true; while it is false the route
+returns 404. Each series is one job on one node while the job is running,
+completing, or suspended there. The node agent reads the job cgroup on its
+heartbeat and the controller joins ``job_user``, ``job_partition``, and
+``job_account`` from the job record. Every series
+carries ``node``, ``job_id``, ``job_user``, ``job_partition``, and
+``job_account``. An empty account or partition is the empty string.
+
+CPU time and disk bytes are counters. Memory figures are gauges. A job that
+ends, or a node that reports no sampled jobs, drops out of the next scrape.
+``spur_node_cpu_load`` and ``spur_node_free_memory_bytes`` stay node gauges
+with only a ``node`` label.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 46 54
+
+   * - Metric
+     - Description
+   * - ``spur_job_cpu_seconds_total``
+     - CPU time (seconds) charged to the job cgroup on this node, summed
+       across that job's steps. ``rate()`` gives the cores in use.
+   * - ``spur_job_memory_rss_bytes``
+     - Resident set size of the job's processes on this node.
+   * - ``spur_job_memory_virtual_bytes``
+     - Virtual memory size of the job's processes on this node.
+   * - ``spur_job_memory_swap_bytes``
+     - Swap charged to the job cgroup on this node.
+   * - ``spur_job_disk_read_bytes_total``
+     - Bytes the job's processes on this node caused to be read from block
+       storage (``read_bytes`` in ``/proc/<pid>/io``).
+   * - ``spur_job_disk_write_bytes_total``
+     - Bytes the job's processes on this node caused to be written to block
+       storage (``write_bytes`` in ``/proc/<pid>/io``).
+
+A job has series only where ``spurd`` placed it in a job cgroup (see
+:doc:`/deployment/native-host`). A node with ``[cgroup]`` disabled, a
+cgroup-v1 host, and jobs run by the Kubernetes virtual agent export nothing
+here. Only the leader serves the route, and only readings it received in its
+current term: after a leader change each node reappears on its next heartbeat,
+within 30 seconds.
+
+The memory and disk figures add up the job's processes, so pages shared
+between them count once per process. The disk counters never go down: when a
+process leaves the job without being reaped inside it (for example a
+daemonized child), up to one heartbeat of the job's disk I/O can go uncounted.
+I/O to network filesystems may not be counted at all. A restart of ``spurd``,
+or a new run attempt of the job, starts the counters again.
+
+``sstat`` still reports ``N/A`` for ``AveCPU``, ``AveRSS``, ``AveVMSize``,
+``MaxRSS``, and ``MaxVMSize``. Those fields are per-step averages; this route
+is a per-node sum and does not fill them.
 
 k0s metrics from spurctld — ``/metrics/k8s``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
