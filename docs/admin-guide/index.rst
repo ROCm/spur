@@ -19,6 +19,8 @@ Configuring and operating a Spur cluster.
   citizenship karma score in Prometheus.
 - :doc:`tres-billing-weights` — configurable TRES billing weights for fairshare,
   so GPU-heavy clusters bill GPU-seconds at a higher rate than CPU-seconds.
+- :doc:`fabric-health-check` — a per-node RDMA fabric check
+  (``spur-fabric-check``) to run as a ``[[health.checks]]`` program.
 
 Partitions are defined statically in ``spur.conf`` (see
 :doc:`/deployment/partitioning`), not created at runtime.
