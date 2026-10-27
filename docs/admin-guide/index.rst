@@ -16,6 +16,8 @@ Configuring and operating a Spur cluster.
   hooks.
 - :doc:`karma-scoring` — per-user job lifecycle counters for computing a cluster
   citizenship karma score in Prometheus.
+- :doc:`fabric-health-check` — a per-node RDMA fabric check
+  (``spur-fabric-check``) to run as a ``[[health.checks]]`` program.
 
 Partitions are defined statically in ``spur.conf`` (see
 :doc:`/deployment/partitioning`), not created at runtime.

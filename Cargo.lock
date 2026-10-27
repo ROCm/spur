@@ -3594,6 +3594,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spur-fabric-check"
+version = "0.15.0"
+dependencies = [
+ "clap",
+ "tempfile",
+]
+
+[[package]]
 name = "spur-ffi"
 version = "0.15.0"
 dependencies = [
