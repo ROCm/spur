@@ -582,6 +582,7 @@ pub struct ClusterManager {
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
+    karma_stats: Arc<crate::karma_stats::KarmaStatsCollector>,
     /// Node -> (job_id, start_time) for a future backfill reservation,
     /// refreshed every cycle. Ephemeral: never persisted, cheap to recompute.
     planned_reservations: RwLock<HashMap<String, (JobId, DateTime<Utc>)>>,
@@ -901,6 +902,7 @@ impl ClusterManager {
             association_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
+            karma_stats: Arc::new(crate::karma_stats::KarmaStatsCollector::new()),
             planned_reservations: RwLock::new(HashMap::new()),
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
@@ -1243,6 +1245,7 @@ impl ClusterManager {
                 }
             }
 
+            let karma_user = task_spec.user.clone();
             self.propose(WalOperation::JobSubmit {
                 job_id: task_id,
                 spec: Box::new(task_spec),
@@ -1251,6 +1254,7 @@ impl ClusterManager {
             if let Some(stats) = self.sched_stats.get() {
                 stats.record_submitted(1);
             }
+            self.karma_stats.record_submitted(&karma_user);
         }
 
         self.scheduler_notify.notify_one();
@@ -1637,6 +1641,14 @@ impl ClusterManager {
     pub fn user_acct_metrics(&self) -> UserAcctMetricsSnapshot {
         let jobs = self.jobs.read();
         UserAcctMetricsSnapshot::collect(jobs.values())
+    }
+
+    pub fn karma_metrics(&self) -> spur_metrics::KarmaStatsSnapshot {
+        self.karma_stats.snapshot()
+    }
+
+    pub fn reset_karma_stats(&self) {
+        self.karma_stats.reset();
     }
 
     /// Get jobs matching filters.
@@ -2451,8 +2463,21 @@ impl ClusterManager {
                 reservation: spec_for_notify.reservation.clone(),
                 nodelist,
                 idle_fill,
+                // Seconds granularity preserves sub-minute limits like --time=0:00:30.
+                time_limit_secs: spec_for_notify.time_limit.map(|d| d.num_seconds()),
             });
         }
+
+        self.karma_stats.record_started(
+            job_id,
+            &spec_for_notify.user,
+            effective_gpus(&spec_for_notify, spec_for_notify.num_nodes) as u64,
+            spec_for_notify
+                .time_limit
+                .map(|d| d.num_seconds().max(0) as u64)
+                .unwrap_or(0),
+            idle_fill,
+        );
 
         debug!(job_id, "job activated");
         Ok(run_attempt)
@@ -2782,6 +2807,16 @@ impl ClusterManager {
             // Preempted finalize (see `Job::end_of_run_state`); Suspend is not.
             if finalized.state == JobState::Preempted {
                 stats.record_preempted();
+            }
+        }
+        {
+            let jobs = self.jobs.read();
+            if let Some(job) = jobs.get(&finalized.job_id) {
+                self.karma_stats.record_finalized(
+                    &job.spec.user,
+                    finalized.state,
+                    finalized.actual_secs,
+                );
             }
         }
         self.run_epilog_slurmctld(finalized.job_id);
@@ -7149,6 +7184,13 @@ impl ClusterManager {
                     per_node_map = job.per_node_alloc.clone();
                     job.node_completions.clear();
 
+                    // Capture run_time before reset clears start_time.
+                    // run_time() excludes suspended intervals.
+                    let elapsed = job
+                        .run_time()
+                        .map(|d| d.num_seconds().max(0) as u64)
+                        .unwrap_or(0);
+
                     if let Err(e) = job.transition(JobState::Pending) {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
                         return ClientResponse::default();
@@ -7160,7 +7202,8 @@ impl ClusterManager {
                     job.preempted_by = *preempted_by;
                     job.preempt_mode = Some("Requeue".to_string());
                     job.preempt_qos = preempt_qos.clone();
-                    finalized = JobFinalized::for_job(job, JobState::Preempted, -1);
+                    finalized =
+                        JobFinalized::for_job_with_elapsed(job, JobState::Preempted, -1, elapsed);
                     let desc = spur_core::end_reason::preemption_summary(
                         *preempted_by,
                         preempt_qos.as_deref(),
@@ -7210,8 +7253,20 @@ impl ClusterManager {
                     };
                     match job.state {
                         JobState::Running | JobState::Suspended => {
-                            finalized = Some(JobFinalized::for_job(job, JobState::Requeued, -1));
+                            // Set end_time and fold suspension so run_time()
+                            // gives elapsed excluding suspended intervals.
+                            job.end_time = Some(timestamp);
                             job.end_suspension(timestamp);
+                            let elapsed = job
+                                .run_time()
+                                .map(|d| d.num_seconds().max(0) as u64)
+                                .unwrap_or(0);
+                            finalized = Some(JobFinalized::for_job_with_elapsed(
+                                job,
+                                JobState::Requeued,
+                                -1,
+                                elapsed,
+                            ));
                             // The live run still holds its allocation; capture it
                             // to free below (reset clears node_completions).
                             freed_nodes = job.allocated_nodes.clone();
