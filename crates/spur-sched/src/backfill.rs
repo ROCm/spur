@@ -34,6 +34,8 @@ pub struct BackfillScheduler {
     /// Last cycle's outcome per unplaced job, so a steady-state stuck queue
     /// logs once on entry rather than every cycle.
     last_outcome: HashMap<JobId, Unplaced>,
+    /// Off for dry runs, whose outcomes must not reach the log or the dedup above.
+    report_unplaced: bool,
 }
 
 /// Scheduler's future-slot plan: job -> (nodes held, projected start).
@@ -102,6 +104,15 @@ impl BackfillScheduler {
             timelines: Vec::new(),
             max_jobs,
             last_outcome: HashMap::new(),
+            report_unplaced: true,
+        }
+    }
+
+    /// A scheduler for a placement dry run: same limits, its own state, no logging.
+    pub fn for_trial(&self) -> Self {
+        Self {
+            report_unplaced: false,
+            ..Self::new(self.max_jobs)
         }
     }
 
@@ -131,6 +142,9 @@ impl BackfillScheduler {
     /// Emit one line per job whose placement outcome changed since the last
     /// cycle, then adopt this cycle's set (which also drops jobs that started).
     fn log_unplaced(&mut self, current: HashMap<JobId, Unplaced>) {
+        if !self.report_unplaced {
+            return;
+        }
         for (job_id, outcome) in self.newly_unplaced(&current) {
             info!(
                 job_id = job_id,
@@ -971,6 +985,11 @@ mod tests {
         };
         assert_eq!(sched.schedule(&[make_job(1, 2, 1)], &cluster).len(), 1);
         assert!(sched.last_outcome.is_empty());
+
+        let mut trial = sched.for_trial();
+        assert!(trial.schedule(&[make_job(1, 4, 1)], &cluster).is_empty());
+        assert!(trial.last_outcome.is_empty(), "a dry run records nothing");
+        assert_eq!(trial.max_jobs, sched.max_jobs);
     }
 
     #[test]

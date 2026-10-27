@@ -796,8 +796,8 @@ class TestQosLimitReasons:
         """A job that fits the grp node cap but is waiting for a busy node must not
         hold the rest of the cap from a lower-priority job that can start now.
 
-        The reported production shape: 29 nodes running against a cap of 32 while
-        fresh jobs were refused with QOSGrpNodeLimit.
+        A different cause of the pool sitting below its cap than the PartitionTimeLimit
+        job covered above.
         """
         c = accounting_cluster
         if len(c.node_names) < 2:
@@ -832,9 +832,8 @@ class TestQosLimitReasons:
                 f"fixture needs the 2-node job waiting: {_reason(c, waiting)!r}"
             )
 
-            # 1 node running against a cap of 3, on the free node, and short enough to
-            # finish before the waiting job could start, so nothing but a held claim
-            # can stop it.
+            # Short enough to end before the waiting job could start, so only a held
+            # claim can stop it.
             legit = submit("wc-legit", 1, 5)
             try:
                 wait_job_state(c, legit, "R", timeout=90)
