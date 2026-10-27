@@ -4127,7 +4127,7 @@ mod tests {
         let mount = wrapper.find("mount -t tmpfs tmpfs /dev/dri").unwrap();
         let apply = wrapper.find(DRI_ROCR_BASH).expect("no rank step");
         let exec = wrapper.find("exec setpriv").unwrap();
-        assert!(mount < apply && apply < exec, "{wrapper}");
+        assert!(mount < apply && apply < exec);
     }
 
     /// A bulk `cp -a /dev/dri/.` recreates every host node with `mknod(2)`, which the
