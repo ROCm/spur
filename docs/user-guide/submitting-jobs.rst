@@ -190,6 +190,11 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--requeue``
      -
      - Allow the job to be requeued after a node failure. Default off.
+   * - ``--no-requeue``
+     -
+     - Do not requeue the job after a node failure. This is the default.
+       Either flag overrides the other, including a ``#SBATCH`` line, and the
+       later flag wins when both appear on the command line.
    * - ``--begin``
      -
      - Defer start until a time, e.g. ``now+2hours`` or an ISO 8601 timestamp.
