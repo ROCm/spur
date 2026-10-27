@@ -5,8 +5,6 @@ use std::collections::HashMap;
 
 use crate::types::LinkType;
 
-pub const PREFIX: &str = "spur.amd.com/";
-
 pub const GPU_TYPE: &str = "spur.amd.com/gpu-type";
 
 pub const MEMORY_MB: &str = "spur.amd.com/memory-mb";
