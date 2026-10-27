@@ -138,10 +138,16 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - CPUs per task. Default ``1``.
    * - ``--mem``
      -
-     - Memory per node. ``512G`` and ``4096M`` use suffixes; a bare ``4096`` means MB.
+     - Memory per node. Takes a ``K``, ``M``, ``G``, or ``T`` suffix
+       (case-insensitive), e.g. ``512G`` or ``4096M``; a bare ``4096`` means
+       MiB. ``sbatch``, ``srun``, and ``salloc`` accept the same set. A size is
+       rounded up to a whole MiB, so ``512K`` asks for 1 MiB, and ``0`` requests
+       all of the node's memory. As an extension to Slurm, which takes whole
+       numbers only, Spur also accepts a fractional size such as ``1.5G``.
    * - ``--mem-per-cpu``
      -
-     - Memory per allocated CPU instead of per node.
+     - Memory per allocated CPU instead of per node, taking the same suffixes as
+       ``--mem``. ``sbatch`` only — ``srun`` and ``salloc`` do not accept it.
    * - ``--gres``
      -
      - Generic resources, e.g. ``gpu:4`` or ``gpu:mi300x:8``. See
