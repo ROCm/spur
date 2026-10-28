@@ -191,8 +191,9 @@ where
     }
 }
 
-/// Only the node that applied the action records it, per its own `ControllerService::route` decision.
-/// Accounting bypasses Raft and records wherever it ran.
+/// Only the node that applied the action records it, per its own
+/// `ControllerService::route` decision. Accounting bypasses Raft and records
+/// wherever it ran.
 pub(super) fn should_record(scope: AuditScope, executed_locally: bool) -> bool {
     match scope {
         AuditScope::LeaderOnly => executed_locally,
