@@ -412,3 +412,6 @@ whitespace
 WEKA
 WEKA's
 frontend
+handoff
+handoffs
+preemptors
