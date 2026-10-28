@@ -1171,6 +1171,7 @@ address = "http://peer-a:6817"
         job.spec.num_nodes = 0;
 
         let cluster = spur_sched::traits::ClusterState {
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,

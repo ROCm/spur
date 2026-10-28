@@ -388,12 +388,14 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let cycle_start = Instant::now();
 
         let busy_until = running_jobs_busy_until(&cluster);
+        let handoffs = cluster.preemption_handoffs(&pending, &nodes, &reservations);
         let cluster_state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
             topology: topology.as_ref(),
             busy_until: &busy_until,
+            preemption_handoffs: &handoffs,
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -505,10 +507,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             }
 
             if !unscheduled.is_empty() {
-                try_preempt(
+                try_preempt_with_handoffs(
                     &cluster,
-                    &partitions,
-                    &nodes,
+                    &cluster_state,
                     &unscheduled,
                     &cluster.config().scheduler,
                 )
@@ -994,12 +995,14 @@ pub(crate) fn trial_placement(
     let partitions = cluster.get_partitions();
     let reservations = cluster.get_reservations();
     let busy_until = running_jobs_busy_until(cluster);
+    let handoffs = cluster.preemption_handoffs(&classification.jobs, &nodes, &reservations);
     let state = ClusterState {
         nodes: &nodes,
         partitions: &partitions,
         reservations: &reservations,
         topology,
         busy_until: &busy_until,
+        preemption_handoffs: &handoffs,
     };
     let mut list = classification.jobs.clone();
     list.extend(
@@ -1185,17 +1188,33 @@ fn effective_exempt_secs(
         .unwrap_or(sched.preempt_exempt_time)
 }
 
-/// Preempt running jobs to make room for pending ones. Only runs under
-/// `preempt_type = qos_priority`; eligibility and mode resolution follow the
-/// decision table in the admin guide. Victim selection proves the eviction
-/// would actually place the pending job; a non-`gone` failure mid-set leaves
-/// the already-evicted victims evicted with the pending job still unplaced.
+#[cfg(test)]
 pub(crate) async fn try_preempt(
     cluster: &Arc<ClusterManager>,
     partitions: &[spur_core::partition::Partition],
-    // The pass's own node view, not a fresh read: a node held back by dispatch
-    // cooldown is empty, and counting it would prove a placement the pass refused.
     cluster_nodes: &[spur_core::node::Node],
+    unscheduled: &[&spur_core::job::Job],
+    sched: &spur_core::config::SchedulerConfig,
+) {
+    let reservations = cluster.get_reservations();
+    let handoffs =
+        cluster.preemption_handoffs(&cluster.pending_jobs(), cluster_nodes, &reservations);
+    let state = ClusterState {
+        nodes: cluster_nodes,
+        partitions,
+        reservations: &reservations,
+        topology: None,
+        busy_until: &HashMap::new(),
+        preemption_handoffs: &handoffs,
+    };
+    try_preempt_with_handoffs(cluster, &state, unscheduled, sched).await;
+}
+
+// Reuse placement's handoffs, including owners selected but not yet dispatched.
+// Reclassifying here could disagree with this pass's quota decisions.
+async fn try_preempt_with_handoffs(
+    cluster: &Arc<ClusterManager>,
+    state: &ClusterState<'_>,
     unscheduled: &[&spur_core::job::Job],
     sched: &spur_core::config::SchedulerConfig,
 ) {
@@ -1209,7 +1228,9 @@ pub(crate) async fn try_preempt(
     }
 
     let now = chrono::Utc::now();
-    let reservations = cluster.get_reservations();
+    let partitions = state.partitions;
+    let cluster_nodes = state.nodes;
+    let reservations = state.reservations;
 
     // Only the reservation tier check reads this, so pick the highest tier.
     let partition_for = |job: &spur_core::job::Job| -> Option<&Partition> {
@@ -1301,7 +1322,7 @@ pub(crate) async fn try_preempt(
                 continue;
             }
 
-            if job_runs_in_active_reservation(candidate, &reservations, now) {
+            if job_runs_in_active_reservation(candidate, reservations, now) {
                 let candidate_tier = partition_for(candidate)
                     .map(|p| p.priority_tier)
                     .unwrap_or(1);
@@ -1350,6 +1371,7 @@ pub(crate) async fn try_preempt(
         // victim per cycle on a placement that will never happen. A set found in
         // the suspend pool is discarded rather than acted on: suspend never frees
         // the node, so it could not place the pending job either.
+        let available_nodes = state.nodes_for_handoff(pending, now);
         let mut found = None;
         for (is_suspend_pool, pool_ids) in [(false, by_mode(false)), (true, by_mode(true))] {
             if pool_ids.is_empty() {
@@ -1363,8 +1385,8 @@ pub(crate) async fn try_preempt(
                     priority: &victim_cost,
                     max_priority: None,
                 },
-                cluster_nodes,
-                &reservations,
+                &available_nodes,
+                reservations,
                 now,
             );
             if set.is_some() {
@@ -1591,6 +1613,7 @@ async fn reclaim_for_unplaced(
             || cluster.resolve_qos(reclaimer).idle_fill_preemptable;
         let ceiling = reclaimer_is_opportunistic.then(|| cluster.resolve_qos(reclaimer).priority);
 
+        let available_nodes = cluster_state.nodes_for_handoff(reclaimer, now);
         let Some(victims) = satisfiable_victim_set(
             reclaimer,
             &VictimPool {
@@ -1599,7 +1622,7 @@ async fn reclaim_for_unplaced(
                 priority: &victim_priority,
                 max_priority: ceiling,
             },
-            cluster_state.nodes,
+            &available_nodes,
             cluster_state.reservations,
             now,
         ) else {

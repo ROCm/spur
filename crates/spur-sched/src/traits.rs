@@ -30,6 +30,43 @@ pub struct ClusterState<'a> {
     /// Node name -> real time its last currently-running job is expected to
     /// end. Absent entries fall back to a conservative placeholder.
     pub busy_until: &'a HashMap<String, DateTime<Utc>>,
+    pub preemption_handoffs: &'a HashMap<String, JobId>,
+}
+
+impl ClusterState<'_> {
+    pub fn handoff_allows(&self, job: &Job, node: &str, now: DateTime<Utc>) -> bool {
+        self.preemption_handoffs
+            .get(node)
+            .is_none_or(|owner| *owner == job.job_id)
+            || spur_core::reservation::job_has_active_reservation(job, self.reservations, now)
+    }
+
+    /// Victim selection must not prove capacity using a different preemptor's nodes.
+    pub fn nodes_for_handoff(&self, job: &Job, now: DateTime<Utc>) -> std::borrow::Cow<'_, [Node]> {
+        let placement = crate::node_match::NodePlacement::new(job);
+        if placement.nodelist_is_additive()
+            && self
+                .nodes
+                .iter()
+                .any(|n| placement.is_listed(&n.name) && !self.handoff_allows(job, &n.name, now))
+        {
+            return std::borrow::Cow::Owned(Vec::new());
+        }
+        if self
+            .nodes
+            .iter()
+            .all(|n| self.handoff_allows(job, &n.name, now))
+        {
+            return std::borrow::Cow::Borrowed(self.nodes);
+        }
+        std::borrow::Cow::Owned(
+            self.nodes
+                .iter()
+                .filter(|n| self.handoff_allows(job, &n.name, now))
+                .cloned()
+                .collect(),
+        )
+    }
 }
 
 /// Trait for pluggable scheduler implementations.

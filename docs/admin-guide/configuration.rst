@@ -661,14 +661,22 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    With those policy settings in place, a pending job that cannot find free
    capacity can preempt an eligible lower-QOS job holding the capacity it needs.
 
-   A node freed by a preemption is held for the job that triggered it: while the
-   victim drains and for the cycle it finally frees the node, the preemptor is
-   placed at the front of the pending queue so the backfill scheduler reserves
-   that node for it. A different pending job with a higher effective priority
-   (for instance, a larger fair-share) but no right to evict the victim cannot
-   take the node the preemption just freed. Eviction eligibility is decided on
-   QOS rank alone (allow-list plus ``priority``); fair-share and age order the
-   rest of the queue but neither authorizes nor redirects a preemption.
+   Cancel and requeue preemption preserve a node handoff to the job that
+   triggered the eviction. While victims drain, and for two scheduling passes
+   after the last victim releases its resources, other pending jobs (including
+   competing preemptors) cannot take those nodes. This protects a multi-node
+   preemptor when its victims finish at different times. Active reservations
+   retain precedence. Requeue establishes the handoff when its resource release
+   commits, including a commit after the original request times out.
+
+   Only eligible pending preemptors can claim nodes matching their current
+   request. A cancelled, held or otherwise ineligible owner does not block
+   capacity, and ordinary idle-fill reclaim creates no preemption handoff.
+   The post-release handoff expires if the job cannot be placed; it is not a
+   permanent allocation or a guarantee that the workload will succeed.
+   Handoffs are transient and are not restored from snapshots after a restart.
+   Eviction eligibility uses the QOS allow-list and priority; fair-share and age
+   order the rest of the queue.
 
 .. note::
 
