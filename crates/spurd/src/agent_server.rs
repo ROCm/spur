@@ -4976,8 +4976,8 @@ pub(crate) struct CompletionReport<'a> {
     pub reporting_node: &'a str,
     pub drain: Option<&'a DrainRequest>,
     pub step_id: Option<spur_core::step::StepId>,
-    /// Node-identity token, verified by the controller only for the server-side
-    /// standalone-PTY completion path. Empty on whole-job reports and legacy agents.
+    /// Node-identity token. The controller verifies it only on the server-side
+    /// standalone-PTY completion path, so a report with no step may leave it empty.
     pub node_token: String,
 }
 

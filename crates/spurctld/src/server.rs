@@ -2528,6 +2528,13 @@ impl SlurmController for ControllerService {
                 || self
                     .verify_node_identity(&req.reporting_node, &req.node_token)
                     .is_ok();
+            if !token_ok {
+                warn!(
+                    job_id = req.job_id,
+                    node = %req.reporting_node,
+                    "interactive session report failed node identity; leaving the job to its client"
+                );
+            }
             if token_ok {
                 if let crate::cluster::PtyExitOutcome::JobFinished(job) =
                     self.cluster.finish_standalone_pty(
@@ -7659,6 +7666,104 @@ mod tests {
             .await
             .expect_err("another node's credential must not speak for this one");
         assert_eq!(error.code(), Code::PermissionDenied);
+    }
+
+    /// A running standalone `srun --pty` job on n1 with its shell's PTY step.
+    /// Returns the job id and the run attempt the node reports under.
+    async fn running_standalone_pty_job(svc: &ControllerService) -> (u32, u32) {
+        use spur_core::resource::ResourceAllocations;
+
+        point_node_at_probe_agent(svc, "n1", 6818).await;
+        let spec = spur_core::job::JobSpec {
+            name: "pty".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            srun_job: true,
+            pty: true,
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> =
+            [("n1".to_string(), res.clone())].into_iter().collect();
+        let run_attempt = svc
+            .cluster
+            .start_job_impl(job_id, vec!["n1".into()], res, per_node, true, false)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        svc.cluster
+            .create_step(spur_core::step::JobStep {
+                job_id,
+                step_id: 0,
+                name: "bash".into(),
+                state: spur_core::step::StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: true,
+            })
+            .unwrap();
+        (job_id, run_attempt)
+    }
+
+    // The admission docs promise that, under token admission, only the job's own
+    // node can finish a standalone PTY job; anything else must read as handled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_keyed_token_cluster_finishes_a_pty_job_only_on_its_nodes_credential() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_token_admission(&dir).await;
+        let (job_id, run_attempt) = running_standalone_pty_job(&svc).await;
+        let report = |node_token: String| ReportJobStatusRequest {
+            job_id,
+            state: JobState::Completed.to_proto_i32(),
+            reporting_node: "n1".into(),
+            run_attempt,
+            step_id: Some(spur_core::step::STEP_INTERACTIVE),
+            node_token,
+            ..Default::default()
+        };
+
+        let other = spur_core::admission::generate_node_token("n2", svc.jwt_key.as_bytes())
+            .expect("node token");
+        for token in [String::new(), "garbage".to_string(), other] {
+            svc.report_job_status(Request::new(report(token)))
+                .await
+                .expect("a rejected report is not an error, or spurd replays it forever");
+            assert_eq!(
+                svc.cluster.get_job(job_id).map(|j| j.state),
+                Some(JobState::Running),
+                "a report without the node's own credential must not finish the job"
+            );
+        }
+
+        let own = spur_core::admission::generate_node_token("n1", svc.jwt_key.as_bytes())
+            .expect("node token");
+        svc.report_job_status(Request::new(report(own)))
+            .await
+            .expect("report");
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Completed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            svc.cluster.get_job(job_id).map(|j| j.state),
+            Some(JobState::Completed)
+        );
     }
 
     // The positive case uses the credential registration actually handed back, so

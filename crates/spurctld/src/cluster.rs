@@ -2174,27 +2174,33 @@ impl ClusterManager {
             }
 
             let steps = self.steps.read();
-            // The standalone shell is the job's lowest-numbered PTY step; any
-            // higher one is an overlapping `--jobid ... --pty` session, which
-            // must close on its own without ending the job.
+            // The standalone shell is the job's first user step; any later PTY
+            // step is an overlapping `--jobid ... --pty` session, which must close
+            // on its own without ending the job. A first step logged before the
+            // `pty` flag existed reads back as non-PTY, so such a job has no
+            // primary here and is left to the client path.
             let primary = steps
                 .values()
-                .filter(|s| s.job_id == job_id && s.pty)
-                .map(|s| s.step_id)
-                .min();
+                .filter(|s| s.job_id == job_id && spur_core::step::is_user_step(s.step_id))
+                .min_by_key(|s| s.step_id)
+                .filter(|s| s.pty)
+                .map(|s| s.step_id);
             // A PTY session runs only on its step's first node (`create_job_step`
             // dispatches it there), though the step may list every node it was
             // given; matching on membership would let a second session's exit
-            // end the primary shell.
+            // end the primary shell. Only one session per job and node can be
+            // live, so any other live PTY step there is a stale attempt and the
+            // lowest id is the one that ran.
             let to_close = steps
                 .values()
-                .find(|s| {
+                .filter(|s| {
                     s.job_id == job_id
                         && s.pty
                         && !s.state.is_terminal()
                         && s.nodes.first().is_some_and(|n| n == reporting_node)
                 })
-                .map(|s| s.step_id);
+                .map(|s| s.step_id)
+                .min();
             (primary, to_close)
         };
 
@@ -2204,6 +2210,10 @@ impl ClusterManager {
             return PtyExitOutcome::Ignored;
         };
 
+        // spurstepd flags an OOM kill in the step's cgroup with a sentinel bit in
+        // the signal; strip it, and report the job as OOM like the per-node path.
+        let oom = signal & spur_core::job::OOM_SIGNAL_FLAG != 0;
+        let signal = signal & !spur_core::job::OOM_SIGNAL_FLAG;
         // A signal death carries no exit code; report it the shell way (128 +
         // signal), matching what the client records, so SIGHUP reads as 129 not 0.
         let effective_exit = if signal != 0 { 128 + signal } else { exit_code };
@@ -2220,7 +2230,9 @@ impl ClusterManager {
         let Some(job) = self.get_job(job_id) else {
             return PtyExitOutcome::Ignored;
         };
-        let state = if effective_exit == 0 {
+        let state = if oom {
+            JobState::OutOfMemory
+        } else if effective_exit == 0 {
             JobState::Completed
         } else {
             JobState::Failed
@@ -7921,9 +7933,12 @@ impl ClusterManager {
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
                     // Derived from the replicated entry, so every replica reports
-                    // the same reason for a job the watchdog had to force-kill.
-                    if *state == JobState::Timeout {
-                        job.set_pending_reason(PendingReason::TimeLimit);
+                    // the same reason for a job the watchdog had to force-kill or
+                    // that the kernel OOM-killed.
+                    match *state {
+                        JobState::Timeout => job.set_pending_reason(PendingReason::TimeLimit),
+                        JobState::OutOfMemory => job.set_pending_reason(PendingReason::OutOfMemory),
+                        _ => {}
                     }
                     if state.is_terminal() {
                         response.jobs_finalized.push(JobFinalized::for_job(
@@ -33023,7 +33038,7 @@ mod tests {
         });
     }
 
-    fn add_pty_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+    fn add_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str], pty: bool) {
         cm.apply_operation(&WalOperation::JobStepCreate {
             step: Box::new(spur_core::step::JobStep {
                 job_id: id,
@@ -33038,9 +33053,13 @@ mod tests {
                 start_time: Some(Utc::now()),
                 end_time: None,
                 exit_code: None,
-                pty: true,
+                pty,
             }),
         });
+    }
+
+    fn add_pty_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, true);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33076,6 +33095,77 @@ mod tests {
         assert!(matches!(outcome, PtyExitOutcome::JobFinished(_)));
         settle(&cm, id, JobState::Failed);
         assert_eq!(cm.get_job(id).unwrap().exit_code, Some(128 + 9));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_reports_an_oom_kill_as_out_of_memory() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        // The shell itself OOM-killed, then a shell that exits cleanly after a
+        // child was: the sentinel bit must never reach the recorded exit code.
+        let oom = spur_core::job::OOM_SIGNAL_FLAG;
+        for (signal, exit) in [(9 | oom, 128 + 9), (oom, 0)] {
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-oom"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_pty_step(&cm, id, 0, &["n1"]);
+
+            assert!(matches!(
+                cm.finish_standalone_pty(id, "n1", 0, signal, 1),
+                PtyExitOutcome::JobFinished(_)
+            ));
+            settle(&cm, id, JobState::OutOfMemory);
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.exit_code, Some(exit));
+            assert_eq!(job.pending_reason, PendingReason::OutOfMemory);
+            assert_eq!(cm.get_step(id, 0).unwrap().exit_code, Some(exit));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_never_promotes_a_later_session_over_a_legacy_shell() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-legacy");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // The shell's step was logged before the `pty` flag existed, so it reads
+        // back as non-PTY; step 1 is a later `--jobid ... -w n2 --pty` session.
+        add_step(&cm, id, 0, &["n1", "n2"], false);
+        add_pty_step(&cm, id, 1, &["n2"]);
+
+        assert!(
+            matches!(
+                cm.finish_standalone_pty(id, "n2", 0, 0, 1),
+                PtyExitOutcome::StepClosed
+            ),
+            "a later session must not stand in for the job's own shell"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(cm.get_step(id, 1).unwrap().state.is_terminal());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_the_job_despite_a_stale_session_on_its_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-stale-session"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        // Step 1 is an abandoned `--jobid ... --pty` attempt the agent refused as
+        // already active; its record stays live on the shell's own node.
+        add_pty_step(&cm, id, 1, &["n1"]);
+        add_pty_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            cm.finish_standalone_pty(id, "n1", 0, 0, 1),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

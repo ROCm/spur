@@ -404,19 +404,20 @@ class TestSrunPtyStepSupervision:
 
     def test_standalone_pty_job_finishes_when_the_client_is_killed(self, cluster):
         # The client reporting the exit is no longer load-bearing: SIGKILL it
-        # (a closed terminal, a dropped VPN, `kill -9`) and the controller must
-        # still finish the job from the node's own report when the shell exits,
-        # instead of leaving the allocation stuck in RUNNING.
+        # (a closed terminal, `kill -9`) and the controller must still finish
+        # the job from the node's own report when the shell exits, instead of
+        # leaving the allocation stuck in RUNNING.
         node = cluster.nodes[0]
         job_name = f"pty-client-killed-{time.time_ns()}"
         log = f"{cluster.remote_dir}/{job_name}.log"
         srun = f"{cluster.bin_dir}/srun"
         env = " ".join(cluster._cli_env_assignments())
+        # Pinned so the session check below looks at the node the shell runs on.
         # Ignoring SIGHUP keeps the shell alive through the hangup the lost client
         # causes, so it exits 5 on its own; `script` gives srun a controlling tty
         # without this backgrounded exec being one.
         inner = (
-            f"{srun} -N 1 -t 0:05 -J {job_name} --pty "
+            f"{srun} -N 1 -w {cluster.node_names[0]} -t 0:05 -J {job_name} --pty "
             "bash -c 'trap \"\" HUP; sleep 15; exit 5'"
         )
         node.exec(
@@ -433,9 +434,15 @@ class TestSrunPtyStepSupervision:
                 break
             time.sleep(1)
         assert job_id, "the standalone pty job never reached RUNNING"
+        # RUNNING comes before srun opens the session; killing it in that gap
+        # would leave no shell to exit at all.
+        assert _wait_for_interactive_step_session(cluster, job_id), (
+            "the shell's interactive session never started"
+        )
 
-        # SIGKILL the client so it can neither report the exit nor cancel the job.
-        node.exec_allow_fail("pkill -9 -f 'bin/srun .*--pty'")
+        # SIGKILL only this test's client, so it can neither report the exit nor
+        # cancel the job; the anchor skips the `script` wrapper around it.
+        node.exec_allow_fail(f"pkill -9 -f {shlex.quote(f'^[^ ]*/srun .*-J {job_name} ')}")
 
         deadline = time.time() + 60
         job_info = ""

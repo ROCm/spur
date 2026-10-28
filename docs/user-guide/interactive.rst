@@ -197,12 +197,14 @@ Standalone ``srun --pty`` Lifecycle
 
 A standalone ``srun --pty`` shell is the job's workload. When that shell exits,
 the node reports it and the controller finishes the job with the shell's exit
-code (``COMPLETED`` on ``0``, ``FAILED`` otherwise; a signal death reports
-``128 + signal``, so a hangup is ``129``). This does not depend on the ``srun``
-client: if the client is lost (closed terminal, dropped VPN, ``kill -9``), the
-shell's exit still ends the job within seconds rather than leaving the
-allocation in ``RUNNING``. A live client reports the exit too; whichever report
-arrives first finishes the job and the other is a no-op.
+code: ``COMPLETED`` on ``0`` and ``FAILED`` otherwise, or ``TIMEOUT`` and
+``OUT_OF_MEMORY`` when the shell was killed at its time limit or by the kernel
+OOM killer. A signal death reports ``128 + signal``, so a hangup is ``129``.
+This does not depend on the ``srun`` client: if the client is lost (closed
+terminal, ``kill -9``), the shell's exit still ends the job within seconds
+rather than leaving the allocation in ``RUNNING``. A live client reports the
+exit too; whichever report arrives first finishes the job and the other is a
+no-op.
 
 Two cases behave differently, by design:
 
