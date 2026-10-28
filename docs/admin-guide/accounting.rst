@@ -561,8 +561,9 @@ QOS keys
        jobs and the jobs starting in the same scheduling pass. A pending job that
        fits the cap but cannot be placed yet, for example because it waits for a
        busy node, keeps its place in the queue but does not hold the rest of the
-       cap from lower-priority jobs that can start now. The same applies to an
-       account's ``grptres``.
+       cap from lower-priority jobs that can start now. A pass re-checks up to
+       eight times, so a longer chain of such waiting jobs can still hold the
+       cap. The same applies to an account's ``grptres``.
    * - ``grpwall``
      - unset (no limit)
      - Aggregate wall-clock budget across all jobs under this QOS. A bare integer

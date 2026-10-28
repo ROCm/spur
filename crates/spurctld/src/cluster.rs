@@ -4659,7 +4659,14 @@ impl ClusterManager {
     /// alone (§5.3, D16).
     #[cfg(test)]
     pub fn pending_jobs_with_idle_fill_candidates(&self) -> (Vec<Job>, Vec<Job>) {
-        self.apply_classification(self.classify_pending_jobs())
+        let mut trial = spur_sched::backfill::BackfillScheduler::new(
+            self.config().scheduler.max_jobs_per_cycle as usize,
+        );
+        let (classification, _) =
+            crate::scheduler_loop::classify_without_phantom_claims(self, |c| {
+                crate::scheduler_loop::trial_placement(self, &mut trial, None, c)
+            });
+        self.apply_classification(classification)
     }
 
     /// Apply a classification's reasons, stage-in and evaluation stamps, and return
@@ -22964,22 +22971,32 @@ mod tests {
         spec
     }
 
-    fn place(cm: &ClusterManager, pending: &[Job]) -> Vec<JobId> {
-        use spur_sched::traits::Scheduler as _;
+    /// What the scheduler loop would dispatch for this classification.
+    fn dispatched(
+        cm: &ClusterManager,
+        classification: &PendingJobClassification,
+        unclaimed: &HashSet<JobId>,
+    ) -> Vec<JobId> {
         let (nodes, partitions, reservations) =
             (cm.get_nodes(), cm.get_partitions(), cm.get_reservations());
+        let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
         let state = spur_sched::traits::ClusterState {
-            busy_until: &HashMap::new(),
+            busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
         };
-        spur_sched::backfill::BackfillScheduler::new(10)
-            .schedule(pending, &state)
-            .into_iter()
-            .map(|a| a.job_id)
-            .collect()
+        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
+        crate::scheduler_loop::claimed_assignments(
+            &mut scheduler,
+            &classification.jobs,
+            &state,
+            unclaimed,
+        )
+        .into_iter()
+        .map(|a| a.job_id)
+        .collect()
     }
 
     fn classify_with_trials(cm: &ClusterManager) -> (PendingJobClassification, HashSet<JobId>) {
@@ -23022,9 +23039,7 @@ mod tests {
         assert!(admitted.contains(&fits), "{admitted:?}");
         assert_eq!(unclaimed, HashSet::from([waiting]));
 
-        let started = place(&cm, &classification.jobs);
-        assert!(started.contains(&fits), "{started:?}");
-        assert!(!started.contains(&waiting));
+        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![fits]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23038,19 +23053,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_second_unplaceable_job_is_unclaimed_in_a_later_round() {
-        // Cap 3 with n1 in use. Each waiting job claims the last two nodes in turn
-        // once the one ahead of it is unclaimed, so "fits" needs all three rounds.
+    async fn the_dispatch_guard_keeps_a_placeable_job_without_a_claim_from_starting() {
         let dir = TempDir::new().unwrap();
         let cm = grp_node_cluster(&dir, 3).await;
-        let first = submit_and_wait(&cm, pool_job("waits-a", 2, Some("n1,n2")));
-        let second = submit_and_wait(&cm, pool_job("waits-b", 2, Some("n1,n3")));
+        let waiting = submit_and_wait(&cm, pool_job("waits-for-n1", 2, Some("n1,n2")));
         let fits = submit_and_wait(&cm, pool_job("fits-now", 1, None));
 
         let (classification, unclaimed) = classify_with_trials(&cm);
-        assert_eq!(unclaimed, HashSet::from([first, second]));
-        assert!(admitted(&classification).contains(&fits));
+        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![fits]);
+        assert!(dispatched(&cm, &classification, &HashSet::from([waiting, fits])).is_empty());
+    }
+
+    /// Cap 3 with n1 in use: each waiting job claims the rest of the cap once the
+    /// ones ahead of it are unclaimed, so each round releases exactly one.
+    async fn chain_of_waiting_jobs(
+        dir: &TempDir,
+        len: usize,
+    ) -> (
+        Arc<ClusterManager>,
+        Vec<JobId>,
+        JobId,
+        PendingJobClassification,
+        HashSet<JobId>,
+    ) {
+        let cm = grp_node_cluster(dir, 3).await;
+        let waiting: Vec<JobId> = (0..len)
+            .map(|i| submit_and_wait(&cm, pool_job(&format!("waits-{i}"), 2, Some("n1,n2"))))
+            .collect();
+        let fits = submit_and_wait(&cm, pool_job("fits-now", 1, None));
+        let (classification, unclaimed) = classify_with_trials(&cm);
+        (cm, waiting, fits, classification, unclaimed)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chain_of_seven_waiting_jobs_releases_the_cap_within_one_pass() {
+        let dir = TempDir::new().unwrap();
+        let (cm, waiting, fits, classification, unclaimed) = chain_of_waiting_jobs(&dir, 7).await;
+        assert_eq!(unclaimed, waiting.iter().copied().collect());
         assert!(!classification.claims_blocked);
+        assert_eq!(dispatched(&cm, &classification, &unclaimed), vec![fits]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chain_of_eight_waiting_jobs_still_holds_the_cap_after_the_round_bound() {
+        let dir = TempDir::new().unwrap();
+        let (_cm, waiting, fits, classification, unclaimed) = chain_of_waiting_jobs(&dir, 8).await;
+        assert_eq!(unclaimed, waiting[..7].iter().copied().collect());
+        assert!(classification.claims_blocked);
+        assert!(admitted(&classification).contains(&waiting[7]));
+        assert!(!admitted(&classification).contains(&fits));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

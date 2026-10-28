@@ -793,12 +793,8 @@ class TestQosLimitReasons:
     def test_a_job_waiting_for_nodes_holds_no_grp_node_quota_from_one_that_can_start(
         self, accounting_cluster
     ):
-        """A job that fits the grp node cap but is waiting for a busy node must not
-        hold the rest of the cap from a lower-priority job that can start now.
-
-        A different cause of the pool sitting below its cap than the PartitionTimeLimit
-        job covered above.
-        """
+        """A job that fits the grp node cap but waits for a busy node must not hold
+        the rest of the cap from a lower-priority job that can start now."""
         c = accounting_cluster
         if len(c.node_names) < 2:
             pytest.skip("requires 2 nodes: one busy, one free")

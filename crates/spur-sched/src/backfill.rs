@@ -990,6 +990,11 @@ mod tests {
         assert!(trial.schedule(&[make_job(1, 4, 1)], &cluster).is_empty());
         assert!(trial.last_outcome.is_empty(), "a dry run records nothing");
         assert_eq!(trial.max_jobs, sched.max_jobs);
+        assert!(sched.schedule(&[make_job(1, 4, 1)], &cluster).is_empty());
+        assert!(
+            sched.last_outcome.contains_key(&1),
+            "the same input does record on a reporting scheduler"
+        );
     }
 
     #[test]

@@ -393,7 +393,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let sched_ref = &mut scheduler;
         let schedule_start = Instant::now();
         let assignments = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sched_ref.schedule(&pending, &cluster_state)
+            claimed_assignments(sched_ref, &pending, &cluster_state, &unclaimed)
         })) {
             Ok(a) => a,
             Err(e) => {
@@ -519,7 +519,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         }
 
         let mut jobs_started_cycle = 0u64;
-        let assignments = without_unclaimed(assignments, &unclaimed);
         let total_assignments = assignments.len();
         for (done, assignment) in assignments.into_iter().enumerate() {
             // `Assignment` carries no tier information, but this loop appended the
@@ -943,7 +942,9 @@ pub(crate) fn compute_job_allocation(
     }
 }
 
-const MAX_CLAIM_ROUNDS: usize = 3;
+/// Bounds the classifications per pass, which cost a trial placement each; a longer
+/// chain of waiting claimants keeps its last claims for the pass.
+const MAX_CLAIM_ROUNDS: usize = 8;
 
 /// Admission claims quota before placement, so a job that then cannot start would
 /// hold headroom from the jobs behind it; reclassify with such jobs unclaimed.
@@ -1017,6 +1018,16 @@ pub(crate) fn trial_placement(
         .into_iter()
         .map(|a| a.job_id)
         .collect()
+}
+
+/// The pass's placement, minus jobs that took no quota claim and so must not start.
+pub(crate) fn claimed_assignments(
+    scheduler: &mut impl Scheduler,
+    pending: &[spur_core::job::Job],
+    state: &ClusterState,
+    unclaimed: &HashSet<spur_core::job::JobId>,
+) -> Vec<Assignment> {
+    without_unclaimed(scheduler.schedule(pending, state), unclaimed)
 }
 
 /// Dispatching a job that took no quota this pass could breach a cap. Placement should
@@ -3758,22 +3769,6 @@ mod tests {
         ResourceAllocations, ResourceSet,
     };
     use std::collections::HashMap;
-
-    #[test]
-    fn an_assignment_for_a_job_without_a_quota_claim_is_not_dispatched() {
-        let assignments = [1, 2, 3]
-            .map(|job_id| Assignment {
-                job_id,
-                nodes: vec!["n1".into()],
-                per_node_alloc: HashMap::new(),
-            })
-            .into();
-        let kept: Vec<_> = without_unclaimed(assignments, &HashSet::from([2]))
-            .into_iter()
-            .map(|a| a.job_id)
-            .collect();
-        assert_eq!(kept, vec![1, 3]);
-    }
 
     #[test]
     fn stall_reporter_reports_a_stalled_leader_once_per_window() {
