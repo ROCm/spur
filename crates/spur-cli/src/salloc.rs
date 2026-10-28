@@ -321,6 +321,7 @@ fn build_salloc_job_spec(
         exclude: args.exclude.clone().unwrap_or_default(),
         reservation: args.reservation.clone().unwrap_or_default(),
         interactive: true,
+        client_keepalive: true,
         environment: HashMap::new(),
         ..Default::default()
     })
@@ -422,6 +423,13 @@ mod tests {
         let args = SallocArgs::parse_from(["salloc", "-N", "2"]);
         let spec = build_salloc_job_spec(&args, None, "salloc -N 2").expect("build spec");
         assert_eq!(spec.submit_line, "salloc -N 2");
+    }
+
+    #[test]
+    fn build_salloc_job_spec_opts_into_inactivity_reaping() {
+        let args = SallocArgs::parse_from(["salloc"]);
+        let spec = build_salloc_job_spec(&args, None, "salloc").expect("build spec");
+        assert!(spec.client_keepalive);
     }
 
     #[test]

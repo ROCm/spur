@@ -631,6 +631,11 @@ pub struct ClusterManager {
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
     interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
+    /// Allocations that have sent at least one keepalive this leadership term.
+    /// Makes an allocation reap-eligible even when its durable `client_keepalive`
+    /// flag is unset (a keepalive-sending client predating the flag). Reset on
+    /// leadership regain, like `interactive_last_seen`.
+    pinged_this_term: RwLock<HashSet<JobId>>,
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
@@ -947,6 +952,7 @@ impl ClusterManager {
             planned_reservations: RwLock::new(HashMap::new()),
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
+            pinged_this_term: RwLock::new(HashSet::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
@@ -2761,12 +2767,12 @@ impl ClusterManager {
     ) -> anyhow::Result<()> {
         // A time-limit expiry has to win over the caller's outcome here, not
         // just in the per-node completion path. The marker is only ever set on
-        // a run the watchdog signalled, so any completion routed through this
-        // method — the completing-timeout force-finish and the srun path, both
-        // of which finalize without seeing node_completions — is a wall-time
-        // expiry that would otherwise be reported as an ordinary failure and
-        // skip the Timeout requeue. Cancelled (user cancel, preemption) and an
-        // already-correct Timeout pass through untouched.
+        // a run the time-limit watchdog or the InactiveLimit reaper signalled,
+        // so any completion routed through this method — the completing-timeout
+        // force-finish and the srun paths, which finalize without seeing
+        // node_completions — is a timeout that would otherwise be reported as an
+        // ordinary failure and skip the Timeout requeue. Cancelled (user cancel,
+        // preemption) and an already-correct Timeout pass through untouched.
         let state = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -3713,12 +3719,15 @@ impl ClusterManager {
 
     fn record_job_keepalive_at(&self, job_id: JobId, at: DateTime<Utc>) {
         self.interactive_last_seen.write().insert(job_id, at);
+        self.pinged_this_term.write().insert(job_id);
     }
 
     /// Clear keepalive last-seen on leadership (re)gain: a follower records
     /// none, so carried-over stale entries would otherwise reap live allocations.
+    /// Also drops the per-term ping set, which is likewise leader-local.
     pub(crate) fn reset_interactive_last_seen(&self) {
         self.interactive_last_seen.write().clear();
+        self.pinged_this_term.write().clear();
     }
 
     #[cfg(test)]
@@ -3731,15 +3740,23 @@ impl ClusterManager {
     /// (so a just-promoted leader or a newly-seen allocation gets a full window
     /// before it can be reaped). `limit_secs == 0` disables reaping: the map is
     /// still pruned, but nothing is returned.
+    ///
+    /// Only keepalive-capable allocations are reaped: those whose durable
+    /// `client_keepalive` flag is set (`keepalive_capable`) or that have pinged
+    /// this term. Others (the K8s operator, third-party clients, pre-v0.9 CLIs)
+    /// are seeded but never returned, so they behave as before.
     pub(crate) fn interactive_reap_candidates(
         &self,
         running_ids: &[JobId],
+        keepalive_capable: &HashSet<JobId>,
         now: DateTime<Utc>,
         limit_secs: u32,
     ) -> Vec<JobId> {
         let live: HashSet<JobId> = running_ids.iter().copied().collect();
         let mut seen = self.interactive_last_seen.write();
         seen.retain(|id, _| live.contains(id));
+        let mut pinged = self.pinged_this_term.write();
+        pinged.retain(|id| live.contains(id));
         if limit_secs == 0 {
             return Vec::new();
         }
@@ -3747,7 +3764,11 @@ impl ClusterManager {
         running_ids
             .iter()
             .copied()
-            .filter(|id| now - *seen.entry(*id).or_insert(now) > limit)
+            .filter(|id| {
+                // Seed every live allocation's timer, but only reap eligible ones.
+                let idle = now - *seen.entry(*id).or_insert(now) > limit;
+                idle && (keepalive_capable.contains(id) || pinged.contains(id))
+            })
             .collect()
     }
 
@@ -10713,19 +10734,29 @@ mod tests {
         cm
     }
 
+    fn capable(ids: &[JobId]) -> HashSet<JobId> {
+        ids.iter().copied().collect()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interactive_reap_candidates_reaps_only_idle_allocations() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1, 2]);
 
         // First sighting seeds each allocation's timer; nothing is reaped yet.
-        assert!(cm.interactive_reap_candidates(&[1, 2], t0, 60).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[1, 2], &flagged, t0, 60)
+            .is_empty());
 
         // Job 2 pings recently; job 1 stays silent past the limit.
         cm.record_job_keepalive_at(2, t0 + chrono::Duration::seconds(55));
         let later = t0 + chrono::Duration::seconds(61);
-        assert_eq!(cm.interactive_reap_candidates(&[1, 2], later, 60), vec![1]);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1, 2], &flagged, later, 60),
+            vec![1]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10733,22 +10764,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1]);
 
         // A stale entry exists, but with the limit disabled it is pruned (the
         // allocation is no longer running) rather than reaped.
         cm.record_job_keepalive_at(1, t0);
-        assert!(cm.interactive_reap_candidates(&[], t0, 0).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[], &flagged, t0, 0)
+            .is_empty());
         // The prune actually happened: job 1's timer is gone, not just skipped
         // by the disabled early return.
         assert!(
             cm.interactive_last_seen.read().is_empty(),
             "pruning must drop entries for allocations no longer running"
         );
+        assert!(
+            cm.pinged_this_term.read().is_empty(),
+            "pruning must drop the ping record of an allocation no longer running"
+        );
 
         // Because the old entry was pruned, job 1 reappearing reseeds to `now`
         // and is not immediately reaped despite the original stale timestamp.
         let later = t0 + chrono::Duration::seconds(3600);
-        assert!(cm.interactive_reap_candidates(&[1], later, 60).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[1], &flagged, later, 60)
+            .is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10756,6 +10796,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1]);
 
         // A prior stint's timestamp for a still-running allocation, frozen at
         // t0 because a follower records no keepalives.
@@ -10765,7 +10806,7 @@ mod tests {
         // it and the live allocation looks idle past the limit.
         let later = t0 + chrono::Duration::seconds(3600);
         assert_eq!(
-            cm.interactive_reap_candidates(&[1], later, 60),
+            cm.interactive_reap_candidates(&[1], &flagged, later, 60),
             vec![1],
             "a stale carried-over entry would reap a live allocation"
         );
@@ -10774,8 +10815,65 @@ mod tests {
         // check reseeds job 1 to `now` and exempts it.
         cm.reset_interactive_last_seen();
         assert!(
-            cm.interactive_reap_candidates(&[1], later, 60).is_empty(),
+            cm.interactive_reap_candidates(&[1], &flagged, later, 60)
+                .is_empty(),
             "after reset, a live allocation is reseeded and not reaped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_exempts_a_client_that_never_pings() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // No durable flag and no ping this term: the K8s operator, a third-party
+        // API client, or a pre-keepalive CLI. Silent forever, never reaped.
+        assert!(cm
+            .interactive_reap_candidates(&[1], &HashSet::new(), t0, 60)
+            .is_empty());
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60)
+                .is_empty(),
+            "a client that never opted in must not be reaped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_reaps_an_unflagged_client_that_pinged_this_term() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // A client that predates the flag but does send keepalives opts in by
+        // pinging; once it goes silent past the limit it is reaped.
+        cm.record_job_keepalive_at(1, t0);
+        let later = t0 + chrono::Duration::seconds(61);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60),
+            vec![1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_interactive_last_seen_forgets_this_terms_pings() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+        cm.record_job_keepalive_at(1, t0);
+
+        // A new term starts with no evidence the unflagged client pings, so it is
+        // exempt until it pings again.
+        cm.reset_interactive_last_seen();
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert!(cm
+            .interactive_reap_candidates(&[1], &HashSet::new(), t0, 60)
+            .is_empty());
+        assert!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60)
+                .is_empty(),
+            "the ping set must not be inferred from the reseeded last-seen map"
         );
     }
 
@@ -33322,6 +33420,24 @@ mod tests {
         assert_eq!(job.derived_exit_code, 7);
         let step = cm.get_step(id, 0).unwrap();
         assert_eq!(step.exit_code, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finalizes_a_reaper_sigterm_as_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-reaped"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_pty_step(&cm, id, 0, &["n1"]);
+
+        // The InactiveLimit reaper records the run as timed out before its
+        // SIGTERM; a shell that dies on it must not read as FAILED 143.
+        cm.signal_time_limit(id, Utc::now()).unwrap();
+        let outcome = cm.finish_standalone_pty(id, "n1", 0, 15, 1);
+        assert!(matches!(outcome, PtyExitOutcome::JobFinished(_)));
+        settle(&cm, id, JobState::Timeout);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(128 + 15));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -211,15 +211,15 @@ only when that client reports the exit.
 Two cases behave differently, by design:
 
 - ``salloc``: exiting an attached ``srun --pty`` closes only that step. The
-  allocation stays until you exit the ``salloc`` shell.
+  allocation stays until you exit the ``salloc`` shell, or until its client has
+  been gone past ``InactiveLimit`` (see :ref:`inactive-limit`).
 - ``srun --jobid <id> --pty``, an extra session in the job, even one attached
   while the job was still pending: when its shell exits, the job keeps
   running.
 
 If the client is gone *and* the shell keeps running (for example a shell that
-ignores the hangup), the job runs until its time limit, or until the
-``InactiveLimit`` reaper reclaims it when ``inactive_limit_secs`` is set (see
-:doc:`../admin-guide/configuration`).
+ignores the hangup), the allocation is reclaimed by the ``InactiveLimit``
+reaper once it goes idle past the limit.
 
 .. _srun-controller-restart:
 

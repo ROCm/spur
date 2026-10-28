@@ -1946,6 +1946,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         pty: s.pty,
         initial_winsize: None,
         submit_line: s.submit_line.clone().unwrap_or_default(),
+        client_keepalive: s.client_keepalive,
     }
 }
 
@@ -2181,6 +2182,7 @@ async fn dispatch_to_agent(
         pty: spec.pty,
         initial_winsize: None,
         submit_line: spec.submit_line.clone().unwrap_or_default(),
+        client_keepalive: spec.client_keepalive,
     };
 
     let response = client
@@ -3095,13 +3097,18 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
             .filter(|j| j.spec.interactive || j.spec.srun_job)
             .collect();
         let ids: Vec<JobId> = running.iter().map(|j| j.job_id).collect();
+        let keepalive_capable: HashSet<JobId> = running
+            .iter()
+            .filter(|j| j.spec.client_keepalive)
+            .map(|j| j.job_id)
+            .collect();
 
         // Prunes the keepalive map every tick; returns candidates only when
-        // the limit is enabled.
-        let stale = cluster.interactive_reap_candidates(&ids, now, limit_secs);
+        // the limit is enabled and the client is keepalive-capable.
+        let stale = cluster.interactive_reap_candidates(&ids, &keepalive_capable, now, limit_secs);
         let stale_set: HashSet<JobId> = stale.iter().copied().collect();
-        // Drop grace timers for jobs that recovered (pinged again) or are gone,
-        // so a client that comes back during the grace aborts the kill.
+        // Drop grace timers for jobs that pinged again or are gone, so the
+        // reaper never force-kills them itself.
         signaled.retain(|id, _| stale_set.contains(id));
 
         let by_id: HashMap<JobId, &spur_core::job::Job> =
@@ -3120,6 +3127,14 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
                         grace_secs = GRACE_PERIOD_SECS,
                         "interactive allocation idle past InactiveLimit — sending SIGTERM, grace period starts"
                     );
+                    // Record before signalling, as the time-limit watchdog does:
+                    // the agent ends a run it is sent this SIGTERM for, and a run
+                    // that exits on it must finalize as TIMEOUT on every path
+                    // rather than as a plain signal death.
+                    if let Err(e) = cluster.signal_time_limit(job_id, now) {
+                        warn!(job_id, error = %e, "failed to record InactiveLimit reap");
+                        continue;
+                    }
                     send_cancel_to_agents(&cluster, job, 15).await; // SIGTERM
                     signaled.insert(job_id, now);
                 }

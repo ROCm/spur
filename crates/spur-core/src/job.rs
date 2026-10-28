@@ -711,6 +711,13 @@ pub struct JobSpec {
     /// boundaries survive. Client-asserted, so advisory rather than audit.
     #[serde(default)]
     pub submit_line: Option<String>,
+
+    /// The submitting client sends inactivity keepalives and accepts having its
+    /// allocation reaped once silent past `InactiveLimit`. First-party
+    /// srun/salloc set it; the operator, third-party clients, and pre-v0.9 CLIs
+    /// leave it false and stay exempt.
+    #[serde(default)]
+    pub client_keepalive: bool,
 }
 
 impl Default for JobSpec {
@@ -787,6 +794,7 @@ impl Default for JobSpec {
             open_mode: None,
             pty: false,
             submit_line: None,
+            client_keepalive: false,
         }
     }
 }
@@ -1668,6 +1676,16 @@ mod tests {
         value.as_object_mut().unwrap().remove("pty");
         let spec: JobSpec = serde_json::from_value(value).unwrap();
         assert!(!spec.pty);
+    }
+
+    // A job logged by an older controller decodes as not keepalive-capable, so
+    // its allocation stays exempt from InactiveLimit reaping.
+    #[test]
+    fn job_spec_deserializes_without_client_keepalive_field() {
+        let mut value = serde_json::to_value(JobSpec::default()).unwrap();
+        value.as_object_mut().unwrap().remove("client_keepalive");
+        let spec: JobSpec = serde_json::from_value(value).unwrap();
+        assert!(!spec.client_keepalive);
     }
 
     #[test]

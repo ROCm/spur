@@ -978,6 +978,7 @@ pub(crate) fn build_sbatch_job_spec(
         pty: false,
         initial_winsize: None,
         submit_line: submit_line.to_string(),
+        client_keepalive: false,
     })
 }
 

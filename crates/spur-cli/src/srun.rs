@@ -745,6 +745,7 @@ fn build_srun_job_spec(
         container_remap_root: container.is_some_and(|a| a.container_remap_root),
         srun_job: true,
         pty: args.pty,
+        client_keepalive: true,
         ..Default::default()
     })
 }
@@ -2477,6 +2478,17 @@ mod tests {
         let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun -w node1 hostname")
             .expect("spec");
         assert_eq!(spec.submit_line, "srun -w node1 hostname");
+    }
+
+    #[test]
+    fn build_srun_job_spec_opts_into_inactivity_reaping() {
+        for argv in [&["srun", "hostname"][..], &["srun", "--pty", "bash"][..]] {
+            let args = SrunArgs::parse_from(argv);
+            let io = resolve_io_paths(&args);
+            let spec =
+                build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").expect("spec");
+            assert!(spec.client_keepalive, "{argv:?} sends keepalives");
+        }
     }
 
     #[test]

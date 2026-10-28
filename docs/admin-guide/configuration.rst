@@ -551,16 +551,16 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        before.
    * - ``inactive_limit_secs``
      - integer
-     - ``0``
+     - ``300``
      - Live
-     - Reap an interactive allocation (``salloc``/``srun``) whose client has sent
-       no keepalive for this many seconds, freeing the nodes. ``0`` (the default)
-       disables reaping. Mirrors Slurm's ``InactiveLimit``. Once enabled, *every*
-       interactive allocation is subject to reaping regardless of client version:
-       a client too old to send keepalives is reaped once idle past the limit, so
-       upgrade all ``spur`` CLI clients before enabling this. Must be at least
-       twice the client keepalive interval (60 seconds); smaller non-zero values
-       are rejected at startup so a live client is never reaped between pings.
+     - Reap an interactive allocation (``salloc``, or a standalone ``srun`` with
+       or without ``--pty``) whose client has sent no keepalive for this many
+       seconds, freeing the nodes. The reaper sends SIGTERM, waits a 30 second
+       grace, then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
+       Mirrors Slurm's ``InactiveLimit``; the value in effect is shown by
+       ``scontrol show config``. Must be at least twice the client keepalive
+       interval (60 seconds); smaller non-zero values are rejected at startup so a
+       live client is never reaped between pings. See :ref:`inactive-limit`.
    * - ``resv_overrun_minutes``
      - integer
      - ``0``
@@ -685,6 +685,38 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    wall-time information makes backfill reservations meaningful. For a job
    that must not be starved by anything wall-time can't bound, use
    preemption (``preempt_type``, above) instead.
+
+.. _inactive-limit:
+
+Reaping abandoned interactive allocations (``inactive_limit_secs``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``salloc`` and standalone ``srun`` ping the controller every 30 seconds for as
+long as the client is running. When the pings stop for ``inactive_limit_secs``
+(default ``300``), the allocation is reaped: SIGTERM, a 30 second grace, then
+SIGKILL. The SIGTERM is final: a client that reconnects during the grace does
+not save the allocation, and the job ends ``TIMEOUT`` however its processes
+exit. With the default, an abandoned
+allocation is signalled 270 to 310 seconds after its client is lost (the last
+ping can be up to 30 seconds old) and is finished within about 40 seconds of
+the signal.
+
+Only allocations whose client sends keepalives are reaped:
+
+- Jobs submitted by ``spur`` ``salloc``/``srun`` are marked keepalive-capable at
+  submit, so they are covered from the start and across a controller failover.
+- A v0.9-or-later client that sends keepalives but predates that mark is
+  covered once it pings. After a failover it is exempt again until its next
+  ping.
+- The K8s operator, third-party REST/gRPC clients that do not send keepalives,
+  and CLIs older than v0.9 are exempt, so their allocations behave as before.
+
+A standalone ``srun`` without ``--pty`` whose client is gone (killed, closed
+terminal, dropped connection) is now reaped too, instead of running until its
+time limit. To keep the previous behaviour, set ``inactive_limit_secs = 0``.
+Set it before upgrading: a cluster with no explicit value picks up the ``300``
+default on upgrade. ``scontrol show config`` prints the value in effect as
+``InactiveLimit``.
 
 ``[auth]``
 ----------

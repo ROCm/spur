@@ -2372,6 +2372,7 @@ impl SlurmController for ControllerService {
             cluster_name: self.cluster.config().cluster_name.clone(),
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
+            inactive_limit_secs: Some(self.cluster.config().scheduler.inactive_limit_secs),
         }))
     }
 
@@ -5036,6 +5037,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         },
         pty: spec.pty,
         submit_line: sanitize_submit_line(&spec.submit_line),
+        client_keepalive: spec.client_keepalive,
     };
 
     // GPU demand is validated in `Cluster::submit_job` after node-count
@@ -11484,6 +11486,26 @@ mod tests {
         assert_eq!(
             stored("sbatch \u{1b}[2Kjob.sh"),
             Some("sbatch  [2Kjob.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn proto_to_job_spec_carries_the_keepalive_opt_in() {
+        let spec = |client_keepalive| spur_proto::proto::JobSpec {
+            name: "j".into(),
+            client_keepalive,
+            ..Default::default()
+        };
+        assert!(
+            proto_to_job_spec(spec(true))
+                .expect("valid")
+                .client_keepalive
+        );
+        // An old client never sets the field, which must decode as exempt.
+        assert!(
+            !proto_to_job_spec(spec(false))
+                .expect("valid")
+                .client_keepalive
         );
     }
 
