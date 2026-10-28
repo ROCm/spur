@@ -204,7 +204,8 @@ def test_property_constraints_with_optional_block_file(sim):
         job = sim.submit("gpu.vram>=192GiB&same(gpu.vpod_id)", nodes=2, gpus=6,
                          extra=["--topology", "block"])
         assert set(sim.selected(job)) == {"sim-node-0", "sim-node-1"}
-        assert "BindingVersion=1" in sim.detail(job)
+        detail = sim.detail(job)
+        assert "FabricDomain=15" in detail and "BlockFileRevision=" not in detail
         sim.cancel(job)
         job = sim.submit("gpu.vram>=192GiB&same(gpu.vpod_id)", nodes=4, gpus=12)
         sim.pending(job)
