@@ -9,7 +9,6 @@
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,7 +20,7 @@ pub enum AddressError {
 }
 
 /// How a node's address was determined.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressSource {
     /// Detected from an existing WireGuard interface.
     WireGuardDetected { interface: String },
@@ -30,7 +29,7 @@ pub enum AddressSource {
 }
 
 /// A resolved node address with metadata about its source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct NodeAddress {
     pub ip: String,
     pub hostname: String,
