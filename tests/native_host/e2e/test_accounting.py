@@ -738,8 +738,9 @@ class TestQosLimitReasons:
         nodes every scheduling pass.
         """
         c = accounting_cluster
-        if len(c.node_names) < 3:
-            pytest.skip("requires 3 nodes: 1 occupied, 1 phantom, 1 that must stay usable")
+        # The blocked job is never placed, so it needs no node of its own.
+        if len(c.node_names) < 2:
+            pytest.skip("requires 2 nodes: 1 occupied, 1 that must stay usable")
 
         c.sacctmgr(["add", "qos", "name=phantomcap", "grptres=node=2"])
         time.sleep(15)
@@ -784,6 +785,110 @@ class TestQosLimitReasons:
                 ) from exc
             assert job_state(c.squeue_all(), occupied) == "R", (
                 "the holder ended before ph-legit started, so its start proves nothing"
+            )
+        finally:
+            for job_id in submitted:
+                c.scancel(job_id)
+
+    def test_a_job_waiting_for_nodes_holds_no_grp_node_quota_from_one_that_can_start(
+        self, accounting_cluster
+    ):
+        """A job that fits the grp node cap but waits for a busy node must not hold
+        the rest of the cap from a lower-priority job that can start now."""
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("requires 2 nodes: one busy, one free")
+        first, second = c.node_names[0], c.node_names[1]
+
+        c.sacctmgr(["add", "qos", "name=waitcap", "grptres=node=3"])
+        time.sleep(15)
+
+        hold = c.write_file("waitcap-hold.sh", "#!/bin/bash\nsleep 900\n")
+        submitted = []
+
+        def submit(name, nodes, minutes, nodelist=None):
+            args = ["-J", name, "-N", str(nodes), "-n", str(nodes), "--exclusive",
+                    "-t", str(minutes), "-q", "waitcap"]
+            if nodelist:
+                args += ["-w", nodelist]
+            job_id = parse_job_id(c.sbatch(args + [hold]))
+            assert job_id is not None
+            submitted.append(job_id)
+            return job_id
+
+        try:
+            occupied = submit("wc-hold", 1, 30, first)
+            wait_job_state(c, occupied, "R", timeout=60)
+
+            # 1 + 2 nodes fits the cap of 3, but it needs the busy node, so it waits
+            # for the holder and is ahead of the next job in priority.
+            waiting = submit("wc-wait", 2, 10, f"{first},{second}")
+            time.sleep(10)
+            assert job_state(c.squeue_all(), waiting) == "PD", (
+                f"fixture needs the 2-node job waiting: {_reason(c, waiting)!r}"
+            )
+
+            # Short enough to end before the waiting job could start, so only a held
+            # claim can stop it.
+            legit = submit("wc-legit", 1, 5)
+            try:
+                wait_job_state(c, legit, "R", timeout=90)
+            except (AssertionError, TimeoutError) as exc:
+                raise AssertionError(
+                    f"a job waiting for nodes held grp node quota: {_reason(c, legit)!r}\n"
+                    f"{c.squeue(['-t', 'all', '-o', '%i %j %t %r'])}"
+                ) from exc
+            assert job_state(c.squeue_all(), occupied) == "R"
+            assert job_state(c.squeue_all(), waiting) == "PD", (
+                "the waiting job must keep waiting; only its quota claim was released"
+            )
+        finally:
+            for job_id in submitted:
+                c.scancel(job_id)
+
+    def test_jobs_that_can_both_start_cannot_go_over_the_grp_node_cap_together(
+        self, accounting_cluster
+    ):
+        """Two exclusive 1-node jobs fit the free nodes, but the grp node cap has
+        room for one, so the second must pend on QOSGrpNodeLimit."""
+        c = accounting_cluster
+        if len(c.node_names) < 2:
+            pytest.skip("requires 2 free nodes so only the cap can refuse a job")
+
+        c.sacctmgr(["add", "qos", "name=paircap", "grptres=node=1"])
+        time.sleep(15)
+
+        hold = c.write_file("paircap-hold.sh", "#!/bin/bash\nsleep 300\n")
+        submitted = []
+        try:
+            for _ in range(2):
+                job_id = parse_job_id(
+                    c.sbatch(["-J", "paircap", "-N", "1", "--exclusive", "-t", "10",
+                              "-q", "paircap", hold])
+                )
+                assert job_id is not None
+                submitted.append(job_id)
+
+            deadline = time.time() + 60
+            running = []
+            while time.time() < deadline:
+                running = c.running_job_ids_by_name("paircap")
+                assert len(running) <= 1, (
+                    f"grptres=node=1 over-subscribed: {len(running)} jobs running {running}"
+                )
+                if running:
+                    break
+                time.sleep(2)
+            assert len(running) == 1, f"expected one job running under the cap, got {running}"
+
+            # Hold the window open past several scheduler passes so a later round
+            # cannot start the refused job either.
+            time.sleep(20)
+            running = c.running_job_ids_by_name("paircap")
+            assert len(running) == 1, f"grptres=node=1 over-subscribed: {running}"
+            blocked = next(j for j in submitted if j not in running)
+            assert _reason(c, blocked) == "QOSGrpNodeLimit", (
+                f"blocked job {blocked} reason: {_reason(c, blocked)!r}"
             )
         finally:
             for job_id in submitted:
