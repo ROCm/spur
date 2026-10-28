@@ -705,9 +705,23 @@ The limit measures the client, not the job. A busy job whose client is gone is
 reaped, and so is one whose client is only stopped, such as a foreground
 ``srun`` suspended with Ctrl-Z or paused in a debugger. A client whose keepalive
 fails rebuilds its connection and retries at once, re-running the auth
-handshake and falling through to the other configured controllers, so a
-controller restart or failover does not reap a session whose client is still
-running.
+handshake and moving on to the next configured controller when one cannot be
+reached, so a controller restart or failover does not reap a session whose
+client is still running. A controller that accepts connections but cannot reach
+the leader is not skipped: if it stays cut off for longer than the limit, the
+sessions whose clients connect to it are reaped.
+
+Each keepalive carries the caller's credential. Under ``plugin = "jwt"`` that
+is the user's token, and an expired token is refused even in ``permissive``
+mode, so a session that outlives its user's token is reaped about one limit
+after the token expires, with its client still running. A token's lifetime
+counts from when it was minted, not from when the session started. Issue
+tokens that outlive the longest interactive time limit
+(``spur token user --ttl``), or set ``inactive_limit_secs = 0``. A failed
+keepalive re-reads ``~/.spur/token``, so replacing that file before the session
+is reaped keeps it. A token in ``$SPUR_AUTH_TOKEN`` takes precedence over the
+file and cannot change in a running client. ``plugin = "spur"`` mints a fresh
+credential for every call and is not affected.
 
 Only allocations whose client sends keepalives are reaped:
 

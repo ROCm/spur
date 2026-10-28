@@ -689,6 +689,12 @@ including for a ``spur.conf`` with no such line. It defaulted to ``0`` (off).
        this release, or an older v0.9+ CLI once it has pinged
      - The K8s operator, third-party API clients that do not send keepalives,
        and CLIs older than v0.9 stay exempt.
+   * - A session that outlives its user's token under ``plugin = "jwt"``
+     - Ran to its time limit
+     - Reaped about 300 seconds after the token expires, even with its client
+       still running
+     - Issue user tokens that outlive the longest interactive time limit. A
+       token's lifetime counts from when it was minted.
 
 To keep the previous behavior, set the limit to ``0`` in ``spur.conf`` on the
 controller **before** upgrading:
