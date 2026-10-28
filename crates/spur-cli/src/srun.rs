@@ -1038,9 +1038,9 @@ async fn run_step_with_retry(
 }
 
 /// Bounds the client's terminal RPCs so a stuck controller cannot hang the
-/// user's shell. Giving up does not strand a standalone PTY job: the controller
-/// finishes it when its shell exits. Any other allocation is left to
-/// InactiveLimit, when that is enabled.
+/// user's shell. Giving up does not strand the allocation: the controller
+/// finishes a standalone PTY job when its shell exits, and InactiveLimit reaps
+/// any other allocation once its client has gone (unless a site sets it to 0).
 const TERMINAL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn release_srun_allocation(
@@ -1155,8 +1155,13 @@ async fn run_standalone_srun(
     }
 
     // Guard drops (and stops pinging) on every return path, including `?`.
-    let _keepalive =
-        crate::interactive::spawn_keepalive(client.clone(), job_id, owner.clone(), "srun");
+    let _keepalive = crate::interactive::spawn_keepalive(
+        client.clone(),
+        args.controller.clone(),
+        job_id,
+        owner.clone(),
+        "srun",
+    );
 
     if args.pty {
         ctrl_c_handle.abort();

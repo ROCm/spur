@@ -691,15 +691,23 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 Reaping abandoned interactive allocations (``inactive_limit_secs``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``salloc`` and standalone ``srun`` ping the controller every 30 seconds for as
-long as the client is running. When the pings stop for ``inactive_limit_secs``
-(default ``300``), the allocation is reaped: SIGTERM, a 30 second grace, then
-SIGKILL. The SIGTERM is final: a client that reconnects during the grace does
-not save the allocation, and the job ends ``TIMEOUT`` however its processes
-exit. With the default, an abandoned
-allocation is signalled 270 to 310 seconds after its client is lost (the last
-ping can be up to 30 seconds old) and is finished within about 40 seconds of
-the signal.
+``salloc`` and standalone ``srun`` (with or without ``--pty``) ping the
+controller every 30 seconds for as long as the client is running. When the pings
+stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
+allocation is reaped: SIGTERM, a 30 second grace, then SIGKILL. The SIGTERM is
+final: a client that reconnects during the grace does not save the allocation,
+and the job ends ``TIMEOUT`` however its processes exit. With the default, an
+abandoned allocation is signalled 270 to 310 seconds after its client is lost
+(the last ping can be up to 30 seconds old) and is finished within about 40
+seconds of the signal.
+
+The limit measures the client, not the job. A busy job whose client is gone is
+reaped, and so is one whose client is only stopped, such as a foreground
+``srun`` suspended with Ctrl-Z or paused in a debugger. A client whose keepalive
+fails rebuilds its connection and retries at once, re-running the auth
+handshake and falling through to the other configured controllers, so a
+controller restart or failover does not reap a session whose client is still
+running.
 
 Only allocations whose client sends keepalives are reaped:
 
@@ -711,12 +719,9 @@ Only allocations whose client sends keepalives are reaped:
 - The K8s operator, third-party REST/gRPC clients that do not send keepalives,
   and CLIs older than v0.9 are exempt, so their allocations behave as before.
 
-A standalone ``srun`` without ``--pty`` whose client is gone (killed, closed
-terminal, dropped connection) is now reaped too, instead of running until its
-time limit. To keep the previous behaviour, set ``inactive_limit_secs = 0``.
-Set it before upgrading: a cluster with no explicit value picks up the ``300``
-default on upgrade. ``scontrol show config`` prints the value in effect as
-``InactiveLimit``.
+``scontrol show config`` prints the value in effect as ``InactiveLimit``. For
+what changed when this default was introduced, and how to keep the old
+behavior, see :ref:`inactive-limit-upgrade-notes`.
 
 ``[auth]``
 ----------

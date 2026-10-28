@@ -232,8 +232,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Keep the allocation attended while the shell is open: absence of these
     // pings past the controller's InactiveLimit is what lets it reap an
     // abandoned allocation. The guard stops the pings on drop.
-    let _keepalive =
-        crate::interactive::spawn_keepalive(client.clone(), job_id, owner.clone(), "salloc");
+    let _keepalive = crate::interactive::spawn_keepalive(
+        client.clone(),
+        controller.clone(),
+        job_id,
+        owner.clone(),
+        "salloc",
+    );
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut cmd = tokio::process::Command::new(&shell);
