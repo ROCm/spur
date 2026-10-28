@@ -348,6 +348,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let nodes = cluster.nodes_off_dispatch_cooldown(&pending);
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
+        // A requeued job can retain its previous run's borrowed stamp despite current admission.
+        let handoffs = cluster.preemption_handoffs(&pending, &nodes, &reservations);
 
         // Append the borrow candidates below every in-quota job, strictly after the
         // node set and the depth metric are derived from the in-quota list alone. A
@@ -388,7 +390,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let cycle_start = Instant::now();
 
         let busy_until = running_jobs_busy_until(&cluster);
-        let handoffs = cluster.preemption_handoffs(&pending, &nodes, &reservations);
         let cluster_state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,

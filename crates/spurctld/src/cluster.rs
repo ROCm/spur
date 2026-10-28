@@ -1112,7 +1112,7 @@ impl ClusterManager {
     /// changed placement constraints must not strand another job's capacity.
     pub(crate) fn preemption_handoffs<'a>(
         &self,
-        pending: impl IntoIterator<Item = &'a Job>,
+        in_quota_pending: impl IntoIterator<Item = &'a Job>,
         nodes: &[Node],
         reservations: &[Reservation],
     ) -> HashMap<String, JobId> {
@@ -1132,7 +1132,7 @@ impl ClusterManager {
         }
         let now = Utc::now();
         let mut handoffs = HashMap::new();
-        for owner in pending.into_iter().filter(|j| !j.idle_fill) {
+        for owner in in_quota_pending {
             let Some(claimed) = by_owner.get(&owner.job_id) else {
                 continue;
             };
@@ -20390,6 +20390,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn competing_preemptors_preserve_staggered_handoffs() {
+        assert_competing_preemptor_handoffs(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeued_borrower_admitted_in_quota_preserves_preemptor_handoff() {
+        assert_competing_preemptor_handoffs(true).await;
+    }
+
+    async fn assert_competing_preemptor_handoffs(previously_borrowed: bool) {
         let dir = TempDir::new().unwrap();
         let mut config = preempting_config();
         config.scheduler.complete_wait_secs = 60;
@@ -20409,6 +20418,39 @@ mod tests {
                 preempt,
                 ..Default::default()
             });
+        }
+
+        let mut pinned = basic_spec("hunter-b");
+        pinned.qos = Some("hunter-b".into());
+        pinned.num_nodes = 2;
+        pinned.num_tasks = 2;
+        pinned.nodelist = Some("n2,n3".into());
+        pinned.exclusive = true;
+        pinned.time_limit = Some(chrono::Duration::hours(1));
+        let pinned_id = submit_and_wait(&cm, pinned);
+        if previously_borrowed {
+            cm.start_job_impl(
+                pinned_id,
+                vec!["n2".into(), "n3".into()],
+                scalar_alloc(16, 32000),
+                per_node_for(&["n2", "n3"], scalar_alloc(8, 16000)),
+                false,
+                true,
+            )
+            .unwrap();
+            settle(&cm, pinned_id, JobState::Running);
+            let outcome = cm
+                .requeue_job_by_user(pinned_id, "testuser", false, true)
+                .unwrap();
+            assert_eq!(outcome.requeued, 1);
+            assert!(outcome.killed[0].idle_fill);
+            cm.release_job(pinned_id).unwrap();
+            let classification = cm.classify_pending_jobs_with(&HashSet::new());
+            assert!(classification
+                .jobs
+                .iter()
+                .any(|j| j.job_id == pinned_id && j.idle_fill));
+            assert!(classification.idle_fill_candidates.is_empty());
         }
 
         let mut victim_a = basic_spec("victim-a");
@@ -20448,14 +20490,6 @@ mod tests {
         flex.exclusive = true;
         flex.time_limit = Some(chrono::Duration::hours(1));
         let flex_id = submit_and_wait(&cm, flex);
-        let mut pinned = basic_spec("hunter-b");
-        pinned.qos = Some("hunter-b".into());
-        pinned.num_nodes = 2;
-        pinned.num_tasks = 2;
-        pinned.nodelist = Some("n2,n3".into());
-        pinned.exclusive = true;
-        pinned.time_limit = Some(chrono::Duration::hours(1));
-        let pinned_id = submit_and_wait(&cm, pinned);
 
         let partitions = cm.get_partitions();
         for (preemptor, victim) in [(flex_id, victim_a_id), (pinned_id, victim_b_id)] {
