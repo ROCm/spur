@@ -191,7 +191,7 @@ where
     }
 }
 
-/// Only the node that applied the action records it, per its own `check_leader`.
+/// Only the node that applied the action records it, per its own `ControllerService::route` decision.
 /// Accounting bypasses Raft and records wherever it ran.
 pub(super) fn should_record(scope: AuditScope, executed_locally: bool) -> bool {
     match scope {
@@ -577,7 +577,7 @@ mod tests {
     }
 
     /// Inner service standing in for a tonic handler. `executes_locally` mimics
-    /// `check_leader` accepting the request instead of forwarding it.
+    /// `route` accepting the request instead of forwarding it.
     #[derive(Clone)]
     struct StubHandler {
         annotate_target: Option<&'static str>,
@@ -753,7 +753,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_accounting_mutation_records_without_a_leader_decision() {
-        // Accounting bypasses Raft and never calls `check_leader`, so its rows
+        // Accounting bypasses Raft and never calls `route`, so its rows
         // cannot depend on the local-execution flag.
         let rows = rows_for(
             "CreateAccount",

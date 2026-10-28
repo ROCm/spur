@@ -92,7 +92,7 @@ impl AuditSlot {
     }
 }
 
-/// Set by `check_leader` when this controller applies the action itself, so the
+/// Set by `ControllerService::route` when this controller applies the action itself, so the
 /// layer never samples leadership again and disagrees with it.
 pub(crate) fn mark_executed_locally<T>(request: &tonic::Request<T>) {
     if let Some(slot) = request.extensions().get::<Arc<AuditSlot>>() {
@@ -216,7 +216,7 @@ where
 
     let result = call(request).await;
 
-    // `check_leader` marks the slot when this node applied the action, so a
+    // `route` marks the slot when this node applied the action, so a
     // request the handler forwarded is recorded by the leader, not here.
     if layer::should_record(m.scope, slot.executed_locally()) && !slot.recorded_in_band() {
         let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
@@ -347,7 +347,7 @@ mod tests {
             tonic::Request::new(()),
             |req| async move {
                 // Stands in for the handler: names its target and, as
-                // `check_leader` would on the leader, claims the work.
+                // `route` would on the leader, claims the work.
                 mark_executed_locally(&req);
                 annotate(&slot(&req), Annotation::new("7", serde_json::json!({})));
                 Ok(())

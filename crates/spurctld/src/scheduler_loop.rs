@@ -909,9 +909,9 @@ async fn start_one_agent(
 /// allocated and the backfill scheduler's CPU-saturation check fires for
 /// subsequent jobs. Memory stays at requested (matches Slurm semantics).
 ///
-/// `node_totals` returns the total resources for a node by name. Returns
-/// `None` if the node has been deregistered between assignment and start;
-/// in that case its contribution is silently zero.
+/// `per_node_alloc` holds the scheduler's slice for each assigned node. A node
+/// missing from it (deregistered between assignment and start) contributes
+/// nothing.
 pub(crate) fn compute_job_allocation(
     job: &spur_core::job::Job,
     assignment_nodes: &[String],
@@ -2483,17 +2483,15 @@ fn abort_pending_pmix_dispatch(
 /// stream_job_output's node-side lookups need a retry of their own — see the
 /// comments at each of those lookups.
 ///
-/// Failure handling necessarily differs from the old post-Running
-/// `dispatch_job_to_nodes` this replaces, because the job is still Pending
-/// here — there is no Running/Failed/NodeFail detour to route a partial
-/// failure through:
-///   - A node whose own prolog rejected the job is drained, exactly as before
-///     (this is a per-node action, independent of the job's state).
+/// The job is still Pending here, so there is no Running/Failed/NodeFail
+/// detour to route a partial failure through:
+///   - A node whose own prolog rejected the job is drained (a per-node action,
+///     independent of the job's state).
 ///   - If `hold_on_prolog_fail` is set (the default) and applies, the job is
 ///     parked the same way `scontrol hold` parks a Pending job
-///     (`ClusterManager::hold_job_for_launch_failure`), since holding via the
-///     old Running→Failed→Held path isn't reachable from Pending. Interactive
-///     jobs are cancelled instead, same as before.
+///     (`ClusterManager::hold_job_for_launch_failure`), since a
+///     Running→Failed→Held path isn't reachable from Pending. Interactive
+///     jobs are cancelled instead.
 ///   - Otherwise (no prolog failure, or holding is disabled) the job is
 ///     simply left Pending for the next scheduler tick — the same
 ///     simplification `register_allocation_on_nodes`'s own failure arms above
@@ -2503,7 +2501,7 @@ fn abort_pending_pmix_dispatch(
 ///     actual Failed transition the job never has here; a persistently
 ///     failing node still gets drained on repeated prolog failures, but a
 ///     transient (non-prolog) failure can retry immediately rather than
-///     backing off. See the fix's write-up for why this trade-off was made.
+///     backing off.
 #[allow(clippy::too_many_arguments)]
 async fn confirm_dispatch_on_nodes(
     cluster: Arc<ClusterManager>,
@@ -4426,13 +4424,6 @@ mod tests {
         );
     }
 
-    // ── dispatch_job_to_nodes: real partial-dispatch-failure trigger path ──
-    //
-    // Exercises the actual JoinSet success/failure counting in
-    // dispatch_job_to_nodes (not a reimplementation of it) against a real
-    // agent over the network, so the eviction + cancel-RPC behavior it
-    // drives is verified end-to-end rather than by calling evict_job
-    // directly on an already-Running job.
     mod idle_fill_reclaim_tests {
         use super::*;
 
@@ -5690,10 +5681,9 @@ mod tests {
 
             assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
-            // The job must never have been visible as Running — admission
-            // failed before that transition, not after it (unlike the old
-            // dispatch_job_to_nodes, which evicted an already-Running job to
-            // NodeFail on the same partial failure).
+            // The job must never have been visible as Running: admission
+            // failed before that transition, so no Running job is evicted to
+            // NodeFail on a partial failure.
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert!(job.allocated_nodes.is_empty());
