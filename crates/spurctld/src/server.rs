@@ -348,7 +348,7 @@ async fn replay_completed_step(
 
     let mut stdout = String::new();
     let mut stderr = String::new();
-    let mut replay_warnings = String::new();
+    let mut warnings = Vec::new();
     while let Some(result) = set.join_next().await {
         let (node, response) = result
             .map_err(|error| Status::internal(format!("step replay task failed: {error}")))?;
@@ -368,18 +368,9 @@ async fn replay_completed_step(
             Err(error) => {
                 warn!(job_id = step.job_id, step_id = step.step_id, %node, %error,
                     "completed step output unavailable; preserving recorded exit code");
-                replay_warnings.push_str(&format!(
-                    "srun: output from {node} is no longer available\n"
-                ));
+                warnings.push(format!("output from {node} is no longer available"));
             }
         }
-    }
-
-    if !replay_warnings.is_empty() {
-        if !stderr.is_empty() && !stderr.ends_with('\n') {
-            stderr.push('\n');
-        }
-        stderr.push_str(&replay_warnings);
     }
 
     Ok(RunStepResponse {
@@ -387,6 +378,7 @@ async fn replay_completed_step(
         stdout,
         stderr,
         node: step.nodes.join(","),
+        warnings,
     })
 }
 
@@ -3973,6 +3965,7 @@ impl SlurmController for ControllerService {
             stdout,
             stderr,
             node: ran_nodes.join(","),
+            warnings: Vec::new(),
         }))
     }
 
@@ -10003,6 +9996,7 @@ mod tests {
         assert_eq!(resp.exit_code, 7, "recorded exit code must be returned");
         assert_eq!(resp.stdout, original_stdout);
         assert_eq!(resp.stderr, "original stderr\n");
+        assert!(resp.warnings.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10045,8 +10039,10 @@ mod tests {
                     .into_inner();
                 assert_eq!(response.exit_code, exit_code, "{code:?}");
                 assert!(response.stdout.is_empty(), "{code:?}");
+                assert!(response.stderr.is_empty(), "{code:?}");
                 assert_eq!(
-                    response.stderr, "srun: output from n1 is no longer available\n",
+                    response.warnings,
+                    ["output from n1 is no longer available"],
                     "{code:?}"
                 );
             }
@@ -10140,17 +10136,14 @@ mod tests {
             .expect("unavailable nodes must not discard another node's output");
         assert_eq!(response.exit_code, 7);
         assert_eq!(response.stdout, "retained stdout");
-        let warnings = response
-            .stderr
-            .strip_prefix("retained stderr\n")
-            .expect("warnings must not merge into the step's stderr");
-        let mut warnings: Vec<_> = warnings.lines().collect();
+        assert_eq!(response.stderr, "retained stderr");
+        let mut warnings = response.warnings;
         warnings.sort_unstable();
         assert_eq!(
             warnings,
             [
-                "srun: output from n2 is no longer available",
-                "srun: output from unregistered is no longer available",
+                "output from n2 is no longer available",
+                "output from unregistered is no longer available",
             ]
         );
     }

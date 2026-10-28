@@ -43,6 +43,8 @@ pub(crate) struct StepCapture {
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
+    run_step_response: Arc<Mutex<Option<proto::RunStepResponse>>>,
+    get_node_response: Arc<Mutex<Option<proto::NodeInfo>>>,
     get_node_names: Arc<Mutex<Vec<String>>>,
     get_node_requests: Arc<Mutex<Vec<String>>>,
     update_node_names: Arc<Mutex<Vec<String>>>,
@@ -104,6 +106,14 @@ impl StepCapture {
     /// Number of `RunStep` calls, so tests can assert dispatch stopped early.
     pub(crate) fn run_step_calls(&self) -> u32 {
         self.run_step_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_run_step_response(&self, response: proto::RunStepResponse) {
+        *self.run_step_response.lock().unwrap() = Some(response);
+    }
+
+    pub(crate) fn set_get_node_response(&self, node: proto::NodeInfo) {
+        *self.get_node_response.lock().unwrap() = Some(node);
     }
 
     pub(crate) fn set_get_node_names(&self, names: Vec<String>) {
@@ -290,11 +300,15 @@ mock_controller_impl! {
                 .run_step_step_id
                 .store(request.into_inner().step_id, Ordering::SeqCst);
             self.capture.run_step_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(response) = self.capture.run_step_response.lock().unwrap().clone() {
+                return Ok(tonic::Response::new(response));
+            }
             Ok(tonic::Response::new(proto::RunStepResponse {
                 exit_code: MOCK_EXIT_CODE,
                 stdout: String::new(),
                 stderr: String::new(),
                 node: String::new(),
+                warnings: Vec::new(),
             }))
         }
 
@@ -310,15 +324,15 @@ mock_controller_impl! {
             Ok(tonic::Response::new(()))
         }
 
-        /// Records the name, then reports `NotFound`. A caller treats a failed
-        /// lookup as "node unreachable" and stops there, which keeps tests off
-        /// the network instead of dialling an agent that is not running.
         async fn get_node(
             &self,
             request: tonic::Request<proto::GetNodeRequest>,
         ) -> Result<tonic::Response<proto::NodeInfo>, tonic::Status> {
             let name = request.into_inner().name;
             self.capture.get_node_requests.lock().unwrap().push(name.clone());
+            if let Some(node) = self.capture.get_node_response.lock().unwrap().clone() {
+                return Ok(tonic::Response::new(node));
+            }
             Err(tonic::Status::not_found(format!("node {name} not found")))
         }
 

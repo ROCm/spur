@@ -970,6 +970,9 @@ async fn dispatch_step(
     if !streamed {
         emit_step_output(io, job_id, work_dir, &resp.stdout, &resp.stderr).await;
     }
+    for warning in &resp.warnings {
+        eprintln!("srun: {warning}");
+    }
 
     Ok(StepDispatchResult {
         exit_code: resp.exit_code,
@@ -3667,6 +3670,130 @@ mod tests {
             msg.contains("failed to create job step"),
             "expected a CreateJobStep failure, got: {msg}"
         );
+    }
+
+    #[test]
+    fn dispatch_step_keeps_diagnostics_separate_from_workload_output() {
+        for mode in ["streamed", "buffered", "redirected"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "srun::tests::dispatch_step_output_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|path| ("LLVM_PROFILE_FILE", path)))
+                .env("SPUR_AUTH_PLUGIN", "jwt")
+                .env("SPUR_AUTH_TOKEN", "fixture-token")
+                .env("SPUR_TEST_STEP_OUTPUT_MODE", mode)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");
+            assert_eq!(
+                stderr
+                    .matches("srun: output from n1 is no longer available\n")
+                    .count(),
+                1,
+                "{mode}: {stderr}"
+            );
+            assert!(!stdout.contains("no longer available"), "{mode}: {stdout}");
+            let copies = usize::from(mode != "redirected");
+            assert_eq!(
+                stdout.matches("workload output\n").count(),
+                copies,
+                "{mode}: {stdout}"
+            );
+            assert_eq!(
+                stderr.matches("workload output\n").count(),
+                copies,
+                "{mode}: {stderr}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess fixture captures real dispatch and live-stream output"]
+    async fn dispatch_step_output_fixture() {
+        use crate::mock_agent::ScriptedStream;
+
+        let mode = std::env::var("SPUR_TEST_STEP_OUTPUT_MODE").unwrap();
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        agent_capture.script(vec![
+            ScriptedStream {
+                data: b"workload output\n".to_vec(),
+                then_eof: true,
+            },
+            ScriptedStream {
+                data: b"workload output\n".to_vec(),
+                then_eof: true,
+            },
+        ]);
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_get_job_sequence(vec![spur_proto::JobInfo {
+            nodelist: if mode == "streamed" {
+                "127.0.0.1"
+            } else {
+                "n[1-2]"
+            }
+            .into(),
+            ..Default::default()
+        }]);
+        capture.set_get_node_response(spur_proto::NodeInfo {
+            agent_port: agent_addr.port().into(),
+            ..Default::default()
+        });
+        capture.set_run_step_response(spur_proto::RunStepResponse {
+            exit_code: 7,
+            stdout: "workload output\n".into(),
+            stderr: "workload output\n".into(),
+            warnings: vec!["output from n1 is no longer available".into()],
+            ..Default::default()
+        });
+        let mut client = crate::mock_controller::client(addr).await;
+        let args = SrunArgs::try_parse_from(["srun", "true"]).unwrap();
+        let mut io = empty_io();
+        let dir = tempfile::TempDir::new().unwrap();
+        if mode == "redirected" {
+            io.stdout = dir.path().join("stdout").to_str().unwrap().into();
+            io.stderr = dir.path().join("stderr").to_str().unwrap().into();
+        }
+        let params = StepDispatchParams {
+            args: &args,
+            explicit_num_nodes: None,
+            requested_nodelist: None,
+            work_dir: dir.path().to_str().unwrap(),
+            io: &io,
+            mpi: spur_core::mpi::MPI_NONE,
+            user: "tester",
+        };
+
+        let result = dispatch_step(&mut client, 1, &params).await.unwrap();
+
+        assert_eq!(result.exit_code, 7);
+        assert_eq!(capture.run_step_calls(), 1);
+        assert_eq!(
+            agent_capture.start_offsets(),
+            if mode == "streamed" {
+                vec![0, 0]
+            } else {
+                vec![]
+            }
+        );
+        if mode == "redirected" {
+            assert_eq!(
+                std::fs::read_to_string(&io.stdout).unwrap(),
+                "workload output\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&io.stderr).unwrap(),
+                "workload output\n"
+            );
+        }
     }
 
     #[tokio::test]

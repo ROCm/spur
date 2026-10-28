@@ -1147,6 +1147,8 @@ message RunStepResponse {
   string stdout = 2;     // Aggregated stdout from all tasks/nodes
   string stderr = 3;     // Aggregated stderr from all tasks/nodes
   string node = 4;       // Comma-separated hostnames that ran tasks
+  // Separate diagnostics so live output streaming cannot suppress them.
+  repeated string warnings = 5;
 }
 
 // -- Native cluster (k0s) lifecycle messages --

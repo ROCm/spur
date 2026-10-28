@@ -211,11 +211,16 @@ also requires the agent's spool files. An agent restart can recover completion
 from its retained on-disk record.
 
 If an output fetch fails, the recorded exit code and any output returned by
-other agents are preserved. ``srun`` reports each unavailable node on stderr
+other agents are preserved. ``srun`` reports each unavailable node on standard error
 as ``srun: output from <node> is no longer available``. Authorization failures
 still reject the request. Once the client exhausts its reconnect attempts, it
 exits with an error; the payload can remain running until it finishes or is
 cancelled with ``scancel``.
+
+These diagnostics are displayed even when workload output was streamed live
+or redirected with ``--output`` or ``--error``. They require an updated client
+and controller; older clients still receive the recorded exit code and available
+workload output.
 
 Surviving an Agent Restart
 --------------------------
