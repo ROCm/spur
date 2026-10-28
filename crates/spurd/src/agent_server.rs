@@ -13257,7 +13257,6 @@ mod tests {
 
     #[test]
     fn build_nsenter_argv_pty_shell_wraps_with_setpriv_init_groups() {
-        // interactive_step_script passes the resolved shell as the command.
         let entry = nsenter_job_entry(1000, 1000);
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
         let argv = build_nsenter_argv(&entry, Some(&pd), &["/bin/bash".to_string()]);
