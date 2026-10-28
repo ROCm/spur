@@ -312,6 +312,7 @@ pub struct DeviceSlice {
 }
 
 impl ExecutionCredential {
+    #[cfg(test)]
     pub fn target_nodes(&self) -> impl Iterator<Item = &str> {
         self.resources_by_node.iter().map(|n| n.node.as_str())
     }

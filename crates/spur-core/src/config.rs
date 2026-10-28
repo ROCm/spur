@@ -22,9 +22,6 @@ pub enum ConfigError {
 }
 
 /// Top-level configuration (slurm.conf equivalent, in TOML).
-///
-/// We support reading both our native TOML format and the traditional
-/// Slurm key=value format for migration purposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlurmConfig {
     pub cluster_name: String,

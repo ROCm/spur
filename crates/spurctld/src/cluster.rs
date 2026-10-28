@@ -2840,7 +2840,7 @@ impl ClusterManager {
     /// then resumed so the pending check can land.
     pub fn run_node_health_pass(&self) {
         let config = self.config();
-        if config.health.checks.is_empty() {
+        if !config.health.is_enabled() {
             return;
         }
         let now = std::time::Instant::now();
