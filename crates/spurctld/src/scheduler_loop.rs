@@ -320,6 +320,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let nodes = cluster.nodes_off_dispatch_cooldown(&pending);
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
+        // A requeued job can retain its previous run's borrowed stamp despite current admission.
+        let handoffs = cluster.preemption_handoffs(&pending, &nodes, &reservations);
 
         // Append the borrow candidates below every in-quota job, strictly after the
         // node set and the depth metric are derived from the in-quota list alone. A
@@ -367,7 +369,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             .as_ref()
             .and_then(|config| config.build(&cluster.get_nodes(), &view));
         let fabric = Some(spur_sched::traits::FabricSchedulingContext { view });
-        let handoffs = cluster.preemption_handoffs(&pending, &nodes, &reservations);
         let cluster_state = ClusterState {
             fabric: fabric.as_ref(),
             nodes: &nodes,

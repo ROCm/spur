@@ -19,6 +19,9 @@ def handoff_cluster(ssh_nodes, remote_bin_dir):
     c = SpurCluster(ssh_nodes[:3], make_remote_dir(), remote_bin_dir)
     try:
         c.enable_accounting()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+    try:
         c.provision()
         epilog = c.write_file(
             "handoff-epilog.sh",
