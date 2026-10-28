@@ -512,22 +512,6 @@ impl ForwardedIdentity {
         }
     }
 
-    pub fn require_digest(&self, digest: &[u8; DIGEST_LEN]) -> Result<(), CredentialError> {
-        if &self.request_digest == digest {
-            Ok(())
-        } else {
-            Err(CredentialError::Malformed("request digest"))
-        }
-    }
-
-    pub fn require_action(&self, action: &str) -> Result<(), CredentialError> {
-        if self.action == action {
-            Ok(())
-        } else {
-            Err(CredentialError::Malformed("action"))
-        }
-    }
-
     fn validate(&self) -> Result<(), CredentialError> {
         require_nonempty("cluster_id", &self.cluster_id)?;
         require_nonempty("user", &self.user)?;

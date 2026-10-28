@@ -23,9 +23,6 @@ pub const K0S_REPO: &str = "k0sproject/k0s";
 /// ships cluster addons (e.g. local-path storage) by writing files here — no in-cluster kube client.
 pub const K0S_MANIFESTS_DIR: &str = "/var/lib/k0s/manifests";
 
-/// Vendored local-path-provisioner release (see `assets/local-path-provisioner.yaml`).
-pub const LOCAL_PATH_VERSION: &str = "v0.0.31";
-
 /// Default node directory the local-path provisioner stores PersistentVolumes in. Override via
 /// `[cluster] local_path_dir` — point it at a large scratch disk if PVCs will hold much data (the
 /// default lives under `/var/lib`, i.e. the root filesystem).
