@@ -373,20 +373,22 @@ Optional administrator or operator block file
 ---------------------------------------------
 
 For a rack system whose placement groups are maintained by an administrator or
-external operator, set ``block_file`` as the membership source:
+external operator and not available through native fabric discovery, set
+``block_file`` as a fallback membership source:
 
 .. code-block:: toml
 
    [topology.external]
    block_file = "/etc/spur/topology.conf"
 
-This selects file-defined blocks for the controller. Omitting ``block_file``
-keeps automatic discovery. The filename has no special meaning; an absolute
-path is required. Install the same configuration setting and file on every
-participating agent and controller. Agents must advertise
-``FabricBindingVersion`` of at least 2. All nodes can remain in one partition:
-the file defines the groups within that candidate node pool. The job constraint
-selects hard containment; plain GPU jobs retain ordinary scheduling.
+Native discovery remains authoritative when ``block_file`` is configured.
+The file adds whole-node groups for nodes without native fabric observations;
+discovered vPods need not be listed. The filename has no special meaning; an
+absolute path is required. Install the same setting and file on the controller
+and agents participating in file-defined groups. Those agents must advertise
+``FabricBindingVersion`` of at least 2. Native-only agents do not require the
+file and use native bindings. All nodes can remain in one partition. The job
+constraint selects hard containment; plain GPU jobs retain ordinary scheduling.
 
 The file is text, with one record per block:
 
@@ -410,16 +412,34 @@ and each declared block is a boundary for jobs requesting containment. A node ca
 only one declared block. The record covers all currently registered GPUs on
 each named node; it cannot describe separate groups within a node. GPU counts,
 types, identities, free resources, and health are never taken from this file.
-Nodes omitted from the file cannot supply GPUs to same-fabric jobs, but remain
-available to ordinary scheduling.
+Discovered nodes omitted from the file keep their native block membership.
+Nodes with neither native membership nor a file declaration cannot supply GPUs
+to same-fabric jobs, but remain available to ordinary scheduling.
 
-If the selected GPUs have native fabric observations, the entire declared
-block must resolve to one complete, consistent native block. A file can
-subdivide a native block by whole nodes. It cannot merge distinct observed
-vPods or override incomplete or contradictory observations. If only some GPUs
-have observations, missing observations make the declared block unavailable.
-Native endpoint coverage still applies, including native members outside a
-subdivision.
+If any named node has native fabric observations, the entire file record is
+ignored. An exact match with one complete native block produces an informational
+notice. A conflicting grouping, subdivision, mixed record, or unavailable native
+membership produces a warning. A file cannot merge or subdivide discovered
+vPods. A record mixing discovered and non-discovered nodes is ignored in full;
+write a separate record for the non-discovered nodes. Notices appear in
+``spur control topology show`` and ``topology validate --format block``;
+``topology show --json`` includes structured ``notices``. Reconfigure also logs
+them. These notices do not make healthy native blocks unavailable.
+
+For example, if nodes 01/02 form discovered vPod 15 and nodes 03/04 have no
+native fabric observations, only ``BlockName=group-b Nodes=node[03-04]`` is
+needed. Both groups participate in the existing block/tree topology and
+same-fabric scheduling. A conflicting ``BlockName=group-a Nodes=node[01-04]``
+would instead be ignored, leaving vPod 15 intact and nodes 03/04 undeclared.
+
+Missing or inconsistent native observations remain unavailable for affected
+placement; the file cannot turn failed discovery into usable membership.
+During an agent's lifetime, losing a previously observed native source retains
+an unavailable marker until observations recover. This history is in memory;
+a fresh agent cannot distinguish an absent source from hardware that never
+exposed it. After a restart, the administrator remains responsible for the
+correctness of any fallback declaration. Native endpoint coverage, heartbeat,
+and exact-device binding checks still apply.
 
 If none of a declared block's GPUs reports native membership, the file is an
 explicit administrator declaration. This path is vendor neutral. Spur enforces
@@ -431,8 +451,8 @@ This does not add fabric programming or manager credentials to Spur.
 Creating and validating a candidate
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-An administrator can write the records directly. When automatic discovery
-already produces whole-node groups, it can provide an initial candidate:
+An administrator can write the records directly. Export is useful for
+inspection or as a starting point for declarations on non-discovered nodes:
 
 .. code-block:: console
 
@@ -451,8 +471,12 @@ original bounded text is sent unchanged, so expansion of a compact hostlist
 does not inflate the validation request beyond the file-size limit. Validation
 does not require the candidate revision to be deployed to agents, so it can
 be used before installation. Missing nodes, stale agents, missing GPUs, or
-conflicting native membership are reported as errors. Success does not test
-fabric connectivity or install the file. Plain ``export`` and ``validate``
+invalid file-only membership are reported as errors. Records superseded by
+native discovery produce notices instead; unrelated unhealthy native blocks
+do not reject a valid file-only candidate. The result reports applied and
+ignored record counts. Exported native groups are ignored if installed while
+native observations are present. Success does not test fabric connectivity or
+install the file. Plain ``export`` and ``validate``
 retain the existing JSON format; JSON manifests are inspection/validation
 artifacts and are not accepted as ``block_file`` input.
 
@@ -460,12 +484,13 @@ Deployment and updates
 ~~~~~~~~~~~~~~~~~~~~~~
 
 For first activation, upgrade all controllers and participating agents, install
-the validated file at the configured path, and restart agents to load the new
-``block_file`` setting. Reconfigure or restart the controller to enable the
+the validated file on controllers and file-only agents, and restart those
+agents to load the new ``block_file`` setting. Reconfigure or restart the controller to enable the
 setting. A controller can start before nodes register; affected blocks remain
 unavailable until complete live inventory and matching revisions arrive.
-Reconfigure requires every candidate block to resolve against current
-inventory, so wait for registration before using it for activation.
+Reconfigure requires every applied file-only block to resolve against current
+inventory, so wait for registration before using it for activation. Records
+superseded by native discovery do not require matching files on native agents.
 
 For later membership changes:
 
@@ -487,15 +512,18 @@ admission and new steps. The controller retains a parsed immutable snapshot
 until reconfigure/restart. A malformed or missing candidate causes reconfigure
 to fail while preserving the previous configuration. A missing, malformed, or
 different agent file fences that agent's declared block; another valid block
-can still schedule. Restore the matching file and wait for inventory refresh
+can still schedule. Native agents ignore file revisions, so file changes do
+not change their inventory generation or invalidate their native bindings.
+Restore the matching file and wait for inventory refresh
 to make the affected block available again.
 
 Revisions hash normalized block names and expanded node memberships. Comments,
 whitespace, field order, and record order do not change the revision. Membership
 or block-name changes do. During rollout, revision differences deliberately
-make affected placement unavailable; there is no fallback to automatic groups.
-The revision covers the whole file, so even an edit to another record fences
-allocations using an older revision. Plan updates as a coordinated operation.
+make affected file-only placement unavailable. Native blocks remain independent
+of file revisions. The revision covers the whole file, so even an edit to
+another record fences file-bound allocations using an older revision. Plan
+updates as a coordinated operation.
 Step dispatch is not an atomic multi-node barrier: during partial rollout, a
 step may start on nodes that still validate the old binding while another node
 rejects it. Quiesce affected allocations before changing membership.
@@ -520,7 +548,8 @@ A smaller job may share a block when its CPUs, memory, and GPUs are free. A cons
 cannot combine two blocks even if their summed free GPUs meet its request.
 ``--exclusive`` still reserves whole nodes, not a whole block.
 
-For four nodes with four GPUs each and the two records above:
+For four nodes without native fabric observations, four GPUs per node, and
+the two records above:
 
 .. code-block:: console
 
@@ -534,6 +563,15 @@ The first two jobs can use different eight-GPU blocks. The twelve-GPU job stays
 pending because it cannot fit within either block. Omitting ``-p`` uses the
 configured default partition; the constraint is independent of that default.
 ``topology show`` includes ``Source=file``, ``Revision``, and
-``NativeObservation``. Job inspection includes ``BlockFileRevision`` and
-``BindingVersion=2`` alongside exact per-node GPU bindings. The constraint uses the existing submission flag; no job ID environment variable
+``NativeObservation=false`` for file-only blocks. Native blocks retain their
+native domain IDs. Job inspection includes ``BlockFileRevision`` and
+``BindingVersion=2`` for file bindings, or ``BindingVersion=1`` for native
+fabric bindings, alongside exact per-node GPU bindings. The constraint uses
+the existing submission flag; no job ID environment variable
 is required when submitting a new job.
+
+Existing allocations created with file-backed native bindings before this
+precedence change keep their accounting identities, but their next step may
+be rejected because that file-defined group is no longer active. Quiesce and
+requeue those allocations to acquire fresh native bindings. File-only bindings
+and the wire representation of existing bindings remain supported.

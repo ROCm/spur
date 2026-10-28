@@ -56,10 +56,29 @@ pub struct UnresolvedFabricDevice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockFileNotice {
+    pub block_name: String,
+    pub warning: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FabricView {
     pub namespace: String,
     pub blocks: Vec<FabricBlock>,
     pub unresolved: Vec<UnresolvedFabricDevice>,
+    #[serde(default)]
+    pub notices: Vec<BlockFileNotice>,
+}
+
+pub fn has_native_fabric(resources: &crate::resource::ResourceSet) -> bool {
+    resources.gpus.iter().any(|gpu| {
+        gpu.topology
+            .as_ref()
+            .and_then(|t| t.fabric.as_ref())
+            // Generic discovery failure markers also protect declaration-only GPUs.
+            .is_some_and(|observation| observation.source != "device-discovery")
+    })
 }
 
 fn nonempty(value: &Option<String>) -> Option<&str> {
@@ -180,6 +199,7 @@ impl FabricView {
             namespace: namespace.into(),
             blocks,
             unresolved,
+            notices: Vec::new(),
         }
     }
 }
@@ -441,6 +461,15 @@ impl From<&FabricView> for spur_proto::proto::GetFabricTopologyResponse {
         };
         Self {
             single_block_partitions: Vec::new(),
+            notices: view
+                .notices
+                .iter()
+                .map(|notice| proto::BlockFileNotice {
+                    block_name: notice.block_name.clone(),
+                    warning: notice.warning,
+                    message: notice.message.clone(),
+                })
+                .collect(),
             namespace: view.namespace.clone(),
             blocks: view
                 .blocks
@@ -546,6 +575,15 @@ impl TryFrom<spur_proto::proto::GetFabricTopologyResponse> for FabricView {
             namespace: view.namespace,
             blocks,
             unresolved,
+            notices: view
+                .notices
+                .into_iter()
+                .map(|notice| BlockFileNotice {
+                    block_name: notice.block_name,
+                    warning: notice.warning,
+                    message: notice.message,
+                })
+                .collect(),
         })
     }
 }
@@ -555,6 +593,18 @@ mod tests {
     use super::*;
     use crate::node::NodeState;
     use crate::resource::{DeviceTopology, GpuLinkType, GpuResource, ResourceSet};
+
+    #[test]
+    fn legacy_topology_view_defaults_to_no_notices() {
+        let view: FabricView =
+            serde_json::from_str(r#"{"namespace":"test","blocks":[],"unresolved":[]}"#).unwrap();
+        assert!(view.notices.is_empty());
+        let wire = spur_proto::proto::GetFabricTopologyResponse {
+            namespace: "test".into(),
+            ..Default::default()
+        };
+        assert_eq!(FabricView::try_from(wire).unwrap(), view);
+    }
 
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()

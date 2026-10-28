@@ -389,10 +389,18 @@ fn future_total_gpu_reservation_routes_long_job_to_another_block() {
         node.total_resources.fabric_binding_version = 2;
         node.total_resources.block_file_revision = Some(file.revision.clone());
     }
-    for view in [
-        FabricView::from_nodes("test", &nodes, now(), 90),
-        file.view("test", &nodes, now(), 90, true),
-    ] {
+    for declared in [false, true] {
+        let mut nodes = nodes.clone();
+        let view = if declared {
+            for node in &mut nodes {
+                for gpu in &mut node.total_resources.gpus {
+                    gpu.topology = None;
+                }
+            }
+            file.view("test", &nodes, now(), 90, true)
+        } else {
+            FabricView::from_nodes("test", &nodes, now(), 90)
+        };
         let (scheduler, assignments) =
             run_with_view(&nodes, &[reserved.clone(), long.clone()], true, view);
         assert_eq!(assignments.len(), 1);
@@ -422,55 +430,50 @@ fn future_total_gpu_reservation_routes_long_job_to_another_block() {
 fn file_blocks_schedule_exact_devices_and_fence_mismatched_agents() {
     use spur_core::block_file::BlockFile;
     let file = BlockFile::parse("BlockName=a Nodes=n[0-1]\nBlockName=b Nodes=n[2-3]").unwrap();
-    for native in [false, true] {
-        let mut nodes = nodes(4);
-        for node in &mut nodes {
-            node.total_resources.fabric_binding_version = 2;
-            node.total_resources.block_file_revision = Some(file.revision.clone());
-            if !native {
-                for gpu in &mut node.total_resources.gpus {
-                    gpu.topology = None;
-                }
-            }
+    let mut nodes = nodes(4);
+    for node in &mut nodes {
+        node.total_resources.fabric_binding_version = 2;
+        node.total_resources.block_file_revision = Some(file.revision.clone());
+        for gpu in &mut node.total_resources.gpus {
+            gpu.topology = None;
+        }
+    }
+    let view = file.view("test", &nodes, now(), 90, true);
+    let (_, assignments) = run_with_view(&nodes, &[job(1, 2, 3), job(2, 2, 3)], true, view.clone());
+    assert_eq!(assignments.len(), 2);
+    for (assignment, block) in assignments.iter().zip(["a", "b"]) {
+        for (name, allocation) in &assignment.per_node_alloc {
+            let binding = allocation.fabric_binding.as_ref().unwrap();
+            assert_eq!(binding.version, 2);
+            assert_eq!(binding.key.fabric_domain, block);
+            let node = nodes.iter().find(|n| n.name == *name).unwrap();
+            binding
+                .validate("test", name, &node.total_resources, allocation)
+                .unwrap();
+        }
+    }
+    assert!(run_with_view(&nodes, &[job(3, 3, 6)], true, view.clone())
+        .1
+        .is_empty());
+    assert_eq!(
+        run_with_view(&nodes, &[job(3, 3, 6)], false, view).1.len(),
+        1
+    );
+    for mismatch in [false, true] {
+        if mismatch {
+            nodes[0].total_resources.block_file_revision = None;
+        } else {
+            nodes[0].total_resources.fabric_binding_version = 1;
         }
         let view = file.view("test", &nodes, now(), 90, true);
-        let (_, assignments) =
-            run_with_view(&nodes, &[job(1, 2, 3), job(2, 2, 3)], true, view.clone());
-        assert_eq!(assignments.len(), 2);
-        for (assignment, block) in assignments.iter().zip(["a", "b"]) {
-            for (name, allocation) in &assignment.per_node_alloc {
-                let binding = allocation.fabric_binding.as_ref().unwrap();
-                assert_eq!(binding.version, 2);
-                assert_eq!(binding.key.fabric_domain, block);
-                let node = nodes.iter().find(|n| n.name == *name).unwrap();
-                binding
-                    .validate("test", name, &node.total_resources, allocation)
-                    .unwrap();
-            }
-        }
-        assert!(run_with_view(&nodes, &[job(3, 3, 6)], true, view.clone())
-            .1
-            .is_empty());
-        assert_eq!(
-            run_with_view(&nodes, &[job(3, 3, 6)], false, view).1.len(),
-            1
-        );
-        for mismatch in [false, true] {
-            if mismatch {
-                nodes[0].total_resources.block_file_revision = None;
-            } else {
-                nodes[0].total_resources.fabric_binding_version = 1;
-            }
-            let view = file.view("test", &nodes, now(), 90, true);
-            let (_, assignments) = run_with_view(&nodes, &[job(4, 2, 3)], true, view);
-            assert_eq!(assignments.len(), 1);
-            assert_eq!(assignments[0].nodes, ["n2", "n3"]);
-        }
+        let (_, assignments) = run_with_view(&nodes, &[job(4, 2, 3)], true, view);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes, ["n2", "n3"]);
     }
 }
 
 #[test]
-fn file_block_ties_use_the_scoped_key_across_physical_domains() {
+fn native_block_ties_ignore_declared_names_across_physical_domains() {
     let file = spur_core::block_file::BlockFile::parse(
         "BlockName=a Nodes=n[2-3]\nBlockName=b Nodes=n[0-1]",
     )
@@ -490,8 +493,100 @@ fn file_block_ties_use_the_scoped_key_across_physical_domains() {
             .unwrap()
             .key
             .fabric_domain,
-        "b"
+        "7"
     );
+}
+
+#[test]
+fn native_precedence_keeps_both_vpods_schedulable_with_stale_or_conflicting_files() {
+    let mut nodes = nodes(4);
+    for (index, node) in nodes.iter_mut().enumerate() {
+        for (slot, gpu) in node.total_resources.gpus.iter_mut().enumerate() {
+            let fabric = gpu.topology.as_mut().unwrap().fabric.as_mut().unwrap();
+            fabric.physical_domain_id = Some("rack".into());
+            fabric.fabric_domain_id = Some((15 + index / 2).to_string());
+            fabric.endpoint_id = Some((index * 2 + slot).to_string());
+            fabric.active_endpoints = (index / 2 * 4..index / 2 * 4 + 4)
+                .map(|e| e.to_string())
+                .collect();
+            fabric.local_endpoints = (index * 2..index * 2 + 2).map(|e| e.to_string()).collect();
+        }
+    }
+    for text in [
+        "BlockName=a Nodes=n[0-1]",
+        "BlockName=a Nodes=n0,n2",
+        "BlockName=a Nodes=n0",
+    ] {
+        let file = spur_core::block_file::BlockFile::parse(text).unwrap();
+        for hint in ["block", "tree", "none"] {
+            let view = file.view("test", &nodes, now(), 90, true);
+            let mut jobs = [job(1, 2, 3), job(2, 2, 3)];
+            for job in &mut jobs {
+                job.spec.topology = Some(hint.into());
+            }
+            let (_, assignments) = run_with_view(&nodes, &jobs, true, view.clone());
+            assert_eq!(assignments.len(), 2, "{text} {hint}");
+            assert_eq!(assignments[0].nodes, ["n0", "n1"]);
+            assert_eq!(assignments[1].nodes, ["n2", "n3"]);
+            for assignment in assignments {
+                for allocation in assignment.per_node_alloc.values() {
+                    assert_eq!(allocation.fabric_binding.as_ref().unwrap().version, 1);
+                    assert!(allocation
+                        .fabric_binding
+                        .as_ref()
+                        .unwrap()
+                        .file_revision
+                        .is_none());
+                }
+            }
+            let mut spanning = job(3, 3, 6);
+            spanning.spec.topology = Some(hint.into());
+            assert!(
+                run_with_view(&nodes, std::slice::from_ref(&spanning), true, view.clone())
+                    .1
+                    .is_empty()
+            );
+            assert_eq!(run_with_view(&nodes, &[spanning], false, view).1.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn mixed_fleet_schedules_native_and_file_blocks_with_independent_revision_checks() {
+    let file = spur_core::block_file::BlockFile::parse("BlockName=b Nodes=n[2-3]").unwrap();
+    let mut nodes = nodes(4);
+    for node in &mut nodes[2..] {
+        node.total_resources.fabric_binding_version = 2;
+        node.total_resources.block_file_revision = Some(file.revision.clone());
+        for gpu in &mut node.total_resources.gpus {
+            gpu.topology = None;
+        }
+    }
+    let view = file.view("test", &nodes, now(), 90, true);
+    let (_, assignments) = run_with_view(&nodes, &[job(1, 2, 3), job(2, 2, 3)], true, view);
+    assert_eq!(assignments.len(), 2);
+    let versions: std::collections::BTreeSet<_> = assignments
+        .iter()
+        .flat_map(|a| a.per_node_alloc.values())
+        .map(|a| a.fabric_binding.as_ref().unwrap().version)
+        .collect();
+    assert_eq!(versions, [1, 2].into());
+    nodes[2].total_resources.block_file_revision = None;
+    let view = file.view("test", &nodes, now(), 90, true);
+    let (_, assignments) = run_with_view(&nodes, &[job(3, 2, 3)], true, view);
+    assert_eq!(assignments[0].nodes, ["n0", "n1"]);
+    nodes[2].total_resources.block_file_revision = Some(file.revision.clone());
+    nodes[0].total_resources.gpus[0]
+        .topology
+        .as_mut()
+        .unwrap()
+        .fabric
+        .as_mut()
+        .unwrap()
+        .fabric_domain_id = None;
+    let view = file.view("test", &nodes, now(), 90, true);
+    let (_, assignments) = run_with_view(&nodes, &[job(4, 2, 3)], true, view);
+    assert_eq!(assignments[0].nodes, ["n2", "n3"]);
 }
 
 #[test]

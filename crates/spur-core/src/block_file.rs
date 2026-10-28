@@ -10,7 +10,8 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::fabric::{
-    FabricBlock, FabricBlockKey, FabricDeviceKey, FabricMember, FabricView, UnresolvedFabricDevice,
+    has_native_fabric, BlockFileNotice, FabricBlock, FabricBlockKey, FabricDeviceKey, FabricMember,
+    FabricView,
 };
 use crate::node::Node;
 
@@ -186,67 +187,136 @@ impl BlockFile {
         heartbeat_timeout_secs: u64,
         check_revision: bool,
     ) -> FabricView {
-        let native = FabricView::from_nodes(namespace, nodes, now, heartbeat_timeout_secs);
-        let native_devices: BTreeMap<_, _> = native
+        let mut view = FabricView::from_nodes(namespace, nodes, now, heartbeat_timeout_secs);
+        let native_devices: BTreeMap<_, _> = view
             .blocks
             .iter()
             .flat_map(|block| {
                 block
                     .members
                     .iter()
-                    .map(move |member| (&member.device, (block, member)))
+                    .map(move |member| (&member.device, block))
             })
             .collect();
-        let native_blocks: BTreeMap<_, _> = native.blocks.iter().map(|b| (&b.key, b)).collect();
         let by_name: BTreeMap<_, _> = nodes.iter().map(|n| (n.name.as_str(), n)).collect();
+        let native_nodes: BTreeSet<_> = nodes
+            .iter()
+            .filter(|node| has_native_fabric(&node.total_resources))
+            .map(|node| node.name.as_str())
+            .collect();
         let mut covered = BTreeSet::new();
-        let mut blocks = Vec::new();
+        let mut declared = Vec::new();
         for definition in &self.blocks {
-            let mut issues = BTreeSet::new();
-            let mut selected = Vec::new();
-            for name in &definition.nodes {
-                covered.insert(name.as_str());
-                let Some(node) = by_name.get(name.as_str()) else {
-                    issues.insert(format!("node_unregistered:{name}"));
-                    continue;
-                };
-                if !node.state.is_up() {
-                    issues.insert(format!("node_unavailable:{name}"));
-                }
-                if node.last_heartbeat.is_none_or(|t| {
-                    (now - t).num_seconds() < 0
-                        || (now - t).num_seconds() as u64 > heartbeat_timeout_secs
-                }) {
-                    issues.insert(format!("stale_node:{name}"));
-                }
-                if check_revision
-                    && (node.total_resources.fabric_binding_version
-                        < crate::fabric_binding::FILE_BINDING_VERSION
-                        || node.total_resources.block_file_revision.as_deref()
-                            != Some(&self.revision))
-                {
-                    issues.insert(format!("block_file_revision_mismatch:{name}"));
-                }
-                if node.total_resources.generation == 0 {
-                    issues.insert(format!("missing_inventory_generation:{name}"));
-                }
-                if node.total_resources.gpus.is_empty() {
-                    issues.insert(format!("node_has_no_gpus:{name}"));
-                }
-                for gpu in &node.total_resources.gpus {
-                    selected.push((*node, gpu));
-                }
+            if definition
+                .nodes
+                .iter()
+                .any(|name| native_nodes.contains(name.as_str()))
+            {
+                view.notices
+                    .push(definition.native_notice(&native_devices, &by_name));
+                continue;
             }
-            let has_observations = selected.iter().any(|(_, gpu)| {
-                gpu.topology
-                    .as_ref()
-                    .and_then(|t| t.fabric.as_ref())
-                    .is_some()
-            });
-            let mut native_keys = BTreeSet::new();
-            let mut members = Vec::new();
-            let mut ids = BTreeSet::new();
-            for (node, gpu) in &selected {
+            covered.extend(definition.nodes.iter().map(String::as_str));
+            declared.push(definition.resolve(
+                namespace,
+                &by_name,
+                &self.revision,
+                now,
+                heartbeat_timeout_secs,
+                check_revision,
+            ));
+        }
+        view.blocks.extend(declared);
+        view.blocks.sort_by(|a, b| a.key.cmp(&b.key));
+        view.unresolved
+            .retain(|gpu| !covered.contains(gpu.device.node.as_str()));
+        for gpu in &mut view.unresolved {
+            if !native_nodes.contains(gpu.device.node.as_str())
+                && gpu.issue == "missing_observation"
+            {
+                gpu.issue = "node_not_in_block_file".into();
+            }
+        }
+        view
+    }
+}
+
+impl DefinedBlock {
+    fn native_notice(
+        &self,
+        native: &BTreeMap<&FabricDeviceKey, &FabricBlock>,
+        nodes: &BTreeMap<&str, &Node>,
+    ) -> BlockFileNotice {
+        let mut key = None;
+        let mut count = 0;
+        let agrees = self.nodes.iter().all(|name| {
+            nodes.get(name.as_str()).is_some_and(|node| {
+                !node.total_resources.gpus.is_empty()
+                    && node.total_resources.gpus.iter().all(|gpu| {
+                        let device = FabricDeviceKey {
+                            node: name.clone(),
+                            stable_id: gpu.stable_id,
+                        };
+                        let Some(block) = native.get(&device) else {
+                            return false;
+                        };
+                        count += 1;
+                        let first = key.get_or_insert(*block);
+                        block.issues.is_empty() && first.key == block.key
+                    })
+            })
+        }) && key.is_some_and(|block| block.members.len() == count);
+        BlockFileNotice {
+            block_name: self.name.clone(),
+            warning: !agrees,
+            message: if agrees {
+                "file declaration agrees with discovery and is ignored; native membership takes precedence"
+            } else {
+                "file declaration conflicts with or cannot confirm native membership and is ignored in full; discovery takes precedence, and nodes without native observations require a separate declaration"
+            }.into(),
+        }
+    }
+
+    fn resolve(
+        &self,
+        namespace: &str,
+        nodes: &BTreeMap<&str, &Node>,
+        revision: &str,
+        now: DateTime<Utc>,
+        heartbeat_timeout_secs: u64,
+        check_revision: bool,
+    ) -> FabricBlock {
+        let mut issues = BTreeSet::new();
+        let mut members = Vec::new();
+        let mut ids = BTreeSet::new();
+        for name in &self.nodes {
+            let Some(node) = nodes.get(name.as_str()) else {
+                issues.insert(format!("node_unregistered:{name}"));
+                continue;
+            };
+            if !node.state.is_up() {
+                issues.insert(format!("node_unavailable:{name}"));
+            }
+            if node.last_heartbeat.is_none_or(|t| {
+                (now - t).num_seconds() < 0
+                    || (now - t).num_seconds() as u64 > heartbeat_timeout_secs
+            }) {
+                issues.insert(format!("stale_node:{name}"));
+            }
+            if check_revision
+                && (node.total_resources.fabric_binding_version
+                    < crate::fabric_binding::FILE_BINDING_VERSION
+                    || node.total_resources.block_file_revision.as_deref() != Some(revision))
+            {
+                issues.insert(format!("block_file_revision_mismatch:{name}"));
+            }
+            if node.total_resources.generation == 0 {
+                issues.insert(format!("missing_inventory_generation:{name}"));
+            }
+            if node.total_resources.gpus.is_empty() {
+                issues.insert(format!("node_has_no_gpus:{name}"));
+            }
+            for gpu in &node.total_resources.gpus {
                 let device = FabricDeviceKey {
                     node: node.name.clone(),
                     stable_id: gpu.stable_id,
@@ -254,78 +324,38 @@ impl BlockFile {
                 if gpu.stable_id == 0 || !ids.insert(device.clone()) {
                     issues.insert("invalid_device_identity".into());
                 }
-                let mut endpoint = declared_endpoint(&node.name, gpu.stable_id);
-                if has_observations {
-                    match native_devices.get(&device) {
-                        Some((block, member)) if block.issues.is_empty() => {
-                            native_keys.insert(block.key.clone());
-                            endpoint = member.endpoint.clone();
-                        }
-                        _ => {
-                            issues.insert("native_membership_unavailable".into());
-                        }
-                    }
+                if gpu
+                    .topology
+                    .as_ref()
+                    .and_then(|t| t.fabric.as_ref())
+                    .is_some()
+                {
+                    issues.insert("native_membership_unavailable".into());
                 }
                 members.push(FabricMember {
+                    endpoint: declared_endpoint(&node.name, gpu.stable_id),
                     device,
-                    endpoint,
                     inventory_generation: node.total_resources.generation,
                 });
             }
-            if native_keys.len() > 1 {
-                issues.insert("declared_block_crosses_native_blocks".into());
-            }
-            let observed_key = if native_keys.len() == 1 {
-                native_keys.into_iter().next()
-            } else {
-                None
-            };
-            let native_block = observed_key
-                .as_ref()
-                .and_then(|key| native_blocks.get(key).copied());
-            let active_endpoints = native_block
-                .map(|b| b.active_endpoints.clone())
-                .unwrap_or_else(|| members.iter().map(|m| m.endpoint.clone()).collect());
-            members.sort_by(|a, b| a.device.cmp(&b.device));
-            blocks.push(FabricBlock {
-                key: FabricBlockKey {
-                    namespace: namespace.into(),
-                    physical_domain: native_block
-                        .map(|b| b.key.physical_domain.clone())
-                        .unwrap_or_else(|| "admin-defined".into()),
-                    fabric_domain: definition.name.clone(),
-                },
-                members,
-                active_endpoints,
-                physical_capacity: native_block.and_then(|b| b.physical_capacity),
-                fabric_capacity: native_block.and_then(|b| b.fabric_capacity),
-                issues: issues.into_iter().collect(),
-                file_revision: Some(self.revision.clone()),
-                observed_key,
-            });
         }
-        blocks.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut unresolved: Vec<_> = nodes
-            .iter()
-            .filter(|n| !covered.contains(n.name.as_str()))
-            .flat_map(|node| {
-                node.total_resources
-                    .gpus
-                    .iter()
-                    .map(|gpu| UnresolvedFabricDevice {
-                        device: FabricDeviceKey {
-                            node: node.name.clone(),
-                            stable_id: gpu.stable_id,
-                        },
-                        issue: "node_not_in_block_file".into(),
-                    })
-            })
-            .collect();
-        unresolved.sort_by(|a, b| a.device.cmp(&b.device));
-        FabricView {
-            namespace: namespace.into(),
-            blocks,
-            unresolved,
+        members.sort_by(|a, b| a.device.cmp(&b.device));
+        FabricBlock {
+            key: FabricBlockKey {
+                namespace: namespace.into(),
+                physical_domain: "admin-defined".into(),
+                fabric_domain: self.name.clone(),
+            },
+            active_endpoints: members
+                .iter()
+                .map(|member| member.endpoint.clone())
+                .collect(),
+            members,
+            physical_capacity: None,
+            fabric_capacity: None,
+            issues: issues.into_iter().collect(),
+            file_revision: Some(revision.into()),
+            observed_key: None,
         }
     }
 }
@@ -395,19 +425,67 @@ mod tests {
     }
 
     #[test]
-    fn declared_blocks_bind_live_devices_with_and_without_native_observations() {
+    fn declaration_only_blocks_bind_live_devices_and_require_matching_revisions() {
         let file = BlockFile::parse("BlockName=a Nodes=n[0-1]").unwrap();
-        for native in [false, true] {
-            let (now, nodes) = fixture(&file, native);
+        let (now, nodes) = fixture(&file, false);
+        let view = file.view("test", &nodes, now, 90, true);
+        assert_eq!(view.blocks[0].members.len(), 4);
+        assert_eq!(view.unresolved.len(), 4);
+        assert!(view.blocks[0].issues.is_empty());
+        assert!(view.blocks[0].observed_key.is_none());
+        assert!(view.notices.is_empty());
+        let allocation = ResourceAllocations {
+            generation: 7,
+            devices: [("gpu".into(), vec![AllocatedDevice::injectable(42)])].into(),
+            ..Default::default()
+        };
+        let binding = crate::fabric_binding::FabricBinding::for_allocation(
+            &view.blocks[0],
+            "n0",
+            &allocation,
+        )
+        .unwrap();
+        binding
+            .validate("test", "n0", &nodes[0].total_resources, &allocation)
+            .unwrap();
+        assert_eq!(binding.version, 2);
+        assert_eq!(
+            crate::fabric_binding::from_proto(crate::fabric_binding::to_proto(&binding)),
+            binding
+        );
+        let mut changed = nodes[0].total_resources.clone();
+        changed.block_file_revision = None;
+        assert!(binding
+            .validate("test", "n0", &changed, &allocation)
+            .is_err());
+    }
+
+    #[test]
+    fn discovery_wins_over_matching_conflicting_and_partial_declarations() {
+        for (text, warning) in [
+            ("BlockName=a Nodes=n[0-1]", false),
+            ("BlockName=a Nodes=n0,n2", true),
+            ("BlockName=a Nodes=n0", true),
+            ("BlockName=a Nodes=n0,missing", true),
+        ] {
+            let file = BlockFile::parse(text).unwrap();
+            let (now, mut nodes) = fixture(&file, true);
+            for node in &mut nodes {
+                node.total_resources.block_file_revision = None;
+                node.total_resources.fabric_binding_version = 1;
+            }
+            let native = FabricView::from_nodes("test", &nodes, now, 90);
             let view = file.view("test", &nodes, now, 90, true);
-            assert_eq!(view.blocks[0].members.len(), 4);
-            assert_eq!(view.unresolved.len(), 4);
-            assert!(
-                view.blocks[0].issues.is_empty(),
-                "{:?}",
-                view.blocks[0].issues
-            );
-            assert_eq!(view.blocks[0].observed_key.is_some(), native);
+            assert_eq!(view.blocks, native.blocks, "{text}");
+            assert_eq!(view.unresolved, native.unresolved);
+            assert!(view.unresolved.is_empty());
+            assert_eq!(view.notices.len(), 1);
+            assert_eq!(view.notices[0].warning, warning, "{text}");
+            assert!(view.notices[0].message.contains("ignored"));
+            let roundtrip =
+                FabricView::try_from(spur_proto::proto::GetFabricTopologyResponse::from(&view))
+                    .unwrap();
+            assert_eq!(view, roundtrip);
             let allocation = ResourceAllocations {
                 generation: 7,
                 devices: [("gpu".into(), vec![AllocatedDevice::injectable(42)])].into(),
@@ -419,41 +497,100 @@ mod tests {
                 &allocation,
             )
             .unwrap();
+            assert_eq!(binding.version, 1);
+            assert!(binding.file_revision.is_none());
             binding
                 .validate("test", "n0", &nodes[0].total_resources, &allocation)
                 .unwrap();
-            assert_eq!(binding.version, 2);
-            assert_eq!(
-                crate::fabric_binding::from_proto(crate::fabric_binding::to_proto(&binding)),
-                binding
-            );
-            let roundtrip =
-                FabricView::try_from(spur_proto::proto::GetFabricTopologyResponse::from(&view))
-                    .unwrap();
-            assert_eq!(view, roundtrip);
-            let mut changed = nodes[0].total_resources.clone();
-            changed.block_file_revision = None;
-            assert!(binding
-                .validate("test", "n0", &changed, &allocation)
-                .is_err());
         }
     }
 
     #[test]
-    fn native_boundaries_cannot_be_overridden_by_a_file() {
-        let file = BlockFile::parse("BlockName=a Nodes=n0,n2").unwrap();
-        let (now, nodes) = fixture(&file, true);
+    fn mixed_fleet_retains_discovered_blocks_omitted_from_the_file() {
+        let file = BlockFile::parse("BlockName=b Nodes=n[2-3]").unwrap();
+        let (now, mut nodes) = fixture(&file, true);
+        for node in &mut nodes[2..] {
+            for gpu in &mut node.total_resources.gpus {
+                gpu.topology = None;
+            }
+        }
         let view = file.view("test", &nodes, now, 90, true);
-        assert!(view.blocks[0]
-            .issues
+        assert_eq!(view.blocks.len(), 2);
+        assert!(view.unresolved.is_empty());
+        assert!(view.notices.is_empty());
+        assert!(view.blocks.iter().all(|block| block.issues.is_empty()));
+        assert_eq!(
+            view.blocks
+                .iter()
+                .filter(|block| block.file_revision.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(
+            view.blocks
+                .iter()
+                .filter(|block| block.file_revision.is_none())
+                .count(),
+            1
+        );
+        nodes[2].total_resources.block_file_revision = None;
+        let view = file.view("test", &nodes, now, 90, true);
+        assert!(view
+            .blocks
             .iter()
-            .any(|i| i == "declared_block_crosses_native_blocks"));
-        let mut missing = nodes;
-        missing[2].total_resources.gpus[0].topology = None;
-        assert!(file.view("test", &missing, now, 90, true).blocks[0]
+            .find(|block| block.file_revision.is_none())
+            .unwrap()
             .issues
+            .is_empty());
+        assert!(!view
+            .blocks
             .iter()
-            .any(|i| i == "native_membership_unavailable"));
+            .find(|block| block.file_revision.is_some())
+            .unwrap()
+            .issues
+            .is_empty());
+    }
+
+    #[test]
+    fn mixed_record_is_ignored_without_silently_redefining_its_remaining_nodes() {
+        let file = BlockFile::parse("BlockName=a Nodes=n0,n2").unwrap();
+        let (now, mut nodes) = fixture(&file, true);
+        for node in &mut nodes[2..] {
+            for gpu in &mut node.total_resources.gpus {
+                gpu.topology = None;
+            }
+        }
+        let view = file.view("test", &nodes, now, 90, true);
+        assert_eq!(view.blocks.len(), 1);
+        assert!(view.blocks[0].file_revision.is_none());
+        assert!(view.blocks[0].issues.is_empty());
+        assert_eq!(view.unresolved.len(), 4);
+        assert!(view.notices[0].warning);
+        assert!(view.notices[0].message.contains("separate declaration"));
+    }
+
+    #[test]
+    fn incomplete_native_observations_never_fall_back_to_file_membership() {
+        let file = BlockFile::parse("BlockName=a Nodes=n[0-1]").unwrap();
+        let (now, mut nodes) = fixture(&file, true);
+        let fabric = nodes[0].total_resources.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap();
+        fabric.fabric_domain_id = None;
+        fabric.status = crate::fabric::ObservationStatus::Incomplete;
+        let view = file.view("test", &nodes, now, 90, true);
+        assert!(view
+            .blocks
+            .iter()
+            .all(|block| block.file_revision.is_none()));
+        assert!(!view.blocks[0].issues.is_empty());
+        assert!(view.blocks[1].issues.is_empty());
+        assert_eq!(view.unresolved.len(), 1);
+        assert!(view.notices[0].warning);
     }
 
     #[test]

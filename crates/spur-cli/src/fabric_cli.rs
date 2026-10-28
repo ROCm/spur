@@ -117,14 +117,24 @@ pub async fn run(controller: &str, command: TopologyCommand) -> Result<()> {
             format: TopologyFormat::Block,
             ..
         } => {
-            if let Some(block) = view.blocks.iter().find(|b| !b.issues.is_empty()) {
+            print!("{}", format_notices(&view));
+            if let Some(block) = view
+                .blocks
+                .iter()
+                .find(|b| b.file_revision.is_some() && !b.issues.is_empty())
+            {
                 bail!(
                     "Invalid block {}: {}",
                     block.key.fabric_domain,
                     block.issues.join(",")
                 );
             }
-            println!("Valid: {} declared blocks resolve against live inventory. Validation does not install this file or verify fabric connectivity.", view.blocks.len());
+            let declared = view
+                .blocks
+                .iter()
+                .filter(|block| block.file_revision.is_some())
+                .count();
+            println!("Valid: {declared} declared blocks resolve against live inventory; {} declarations ignored in favor of discovery. Validation does not install this file or verify fabric connectivity.", view.notices.len());
         }
         TopologyCommand::Validate {
             format: TopologyFormat::Json,
@@ -179,6 +189,7 @@ fn format_view(view: &FabricView) -> String {
         view.blocks.len(),
         view.unresolved.len()
     );
+    out.push_str(&format_notices(view));
     for block in &view.blocks {
         if let Some(revision) = &block.file_revision {
             let _ = writeln!(
@@ -227,6 +238,20 @@ fn format_view(view: &FabricView) -> String {
             out,
             "UnresolvedNode={} StableId={} Issue={}",
             item.device.node, item.device.stable_id, item.issue
+        );
+    }
+    out
+}
+
+fn format_notices(view: &FabricView) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for notice in &view.notices {
+        let level = if notice.warning { "Warning" } else { "Info" };
+        let _ = writeln!(
+            out,
+            "{level}: BlockName={} {}",
+            notice.block_name, notice.message
         );
     }
     out
@@ -288,6 +313,18 @@ mod tests {
     #[test]
     fn formats_scoped_members_and_failures() {
         let view = FabricView {
+            notices: vec![
+                spur_core::fabric::BlockFileNotice {
+                    block_name: "a".into(),
+                    warning: false,
+                    message: "agrees; ignored".into(),
+                },
+                spur_core::fabric::BlockFileNotice {
+                    block_name: "b".into(),
+                    warning: true,
+                    message: "conflicts; ignored".into(),
+                },
+            ],
             namespace: "test".into(),
             unresolved: Vec::new(),
             blocks: vec![FabricBlock {
@@ -313,6 +350,8 @@ mod tests {
             }],
         };
         let output = format_view(&view);
+        assert!(output.contains("Info: BlockName=a agrees; ignored"));
+        assert!(output.contains("Warning: BlockName=b conflicts; ignored"));
         assert!(output.contains("PhysicalDomain=rack-a FabricDomain=7"));
         assert!(output.contains("Membership=invalid"));
         assert!(output.contains("Issues=stale_node"));
