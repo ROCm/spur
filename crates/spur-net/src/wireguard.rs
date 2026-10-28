@@ -400,23 +400,6 @@ pub fn interface_up(interface: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bring down a WireGuard interface using wg-quick.
-pub fn interface_down(interface: &str) -> anyhow::Result<()> {
-    let output = Command::new("wg-quick")
-        .args(["down", interface])
-        .output()
-        .context("failed to run wg-quick down")?;
-    if !output.status.success() {
-        // Not fatal — interface may not be up
-        tracing::warn!(
-            interface,
-            stderr = %String::from_utf8_lossy(&output.stderr),
-            "wg-quick down failed (interface may not be up)"
-        );
-    }
-    Ok(())
-}
-
 /// Add a peer to a running WireGuard interface without restarting.
 pub fn add_peer(interface: &str, peer: &WgPeer) -> anyhow::Result<()> {
     let mut args = vec![
