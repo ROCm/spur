@@ -899,19 +899,14 @@ async fn start_one_agent(
     }
 }
 
-/// Compute the resource set to record against the cluster for an assignment.
+/// Compute the resource set to record against the cluster for an assignment:
+/// the sum of the scheduler's per-node slices in `per_node_alloc`.
 ///
-/// Non-exclusive: per-node request × node count (cpus, memory, generic),
-/// plus the per-job GPU list verbatim.
-///
-/// Exclusive (#147): cpus / gpus / generic gres are bumped to the **sum of
-/// each assigned node's total resources**, so the node shows as fully
-/// allocated and the backfill scheduler's CPU-saturation check fires for
-/// subsequent jobs. Memory stays at requested (matches Slurm semantics).
-///
-/// `node_totals` returns the total resources for a node by name. Returns
-/// `None` if the node has been deregistered between assignment and start;
-/// in that case its contribution is silently zero.
+/// For an exclusive job each slice already holds the node's full cpus / gpus /
+/// generic gres, with memory at the request (matches Slurm semantics), so the
+/// node shows as fully allocated and backfill's CPU-saturation check fires for
+/// subsequent jobs. With no slices at all, an exclusive job falls back to a
+/// memory-only allocation.
 pub(crate) fn compute_job_allocation(
     job: &spur_core::job::Job,
     assignment_nodes: &[String],
@@ -2459,16 +2454,12 @@ fn abort_pending_pmix_dispatch(
 /// RPC to resolve before returning anything the caller can use to flip the
 /// job to Running.
 ///
-/// This is the structural fix for the srun-step startup race: an earlier
-/// mitigation only widened an agent-side retry window on one lookup. The old
-/// flow called `start_job` (Running, visible to squeue/scontrol) and then
-/// fired this dispatch in the background via `tokio::spawn`, so a step could
-/// target a node before that node's own `LaunchJob` had actually finished.
-/// Now the scheduler loop awaits this function *before* calling `start_job`,
-/// mirroring the pattern `register_allocation_on_nodes` already uses for
-/// standalone srun/salloc allocations — except this confirms the heavier
-/// `LaunchJob` RPC (which actually spawns the job's process), not the
-/// lightweight `RegisterJobAllocation` used there.
+/// The caller awaits this *before* `ClusterManager::activate_job`, so a step
+/// can never target a node whose own `LaunchJob` is still in flight (the
+/// srun-step startup race). Same pattern as `register_allocation_on_nodes`
+/// uses for standalone srun/salloc allocations, but confirming the heavier
+/// `LaunchJob` RPC (which spawns the job's process) rather than the
+/// lightweight `RegisterJobAllocation`.
 ///
 /// This closes the race for every consumer that gates on `job.state ==
 /// Running` before targeting a node, not just the step-dispatch path
@@ -2483,27 +2474,21 @@ fn abort_pending_pmix_dispatch(
 /// stream_job_output's node-side lookups need a retry of their own — see the
 /// comments at each of those lookups.
 ///
-/// Failure handling necessarily differs from the old post-Running
-/// `dispatch_job_to_nodes` this replaces, because the job is still Pending
-/// here — there is no Running/Failed/NodeFail detour to route a partial
-/// failure through:
-///   - A node whose own prolog rejected the job is drained, exactly as before
-///     (this is a per-node action, independent of the job's state).
+/// The job is still Pending here, so there is no Running/Failed/NodeFail
+/// detour to route a partial failure through:
+///   - A node whose own prolog rejected the job is drained (a per-node action,
+///     independent of the job's state).
 ///   - If `hold_on_prolog_fail` is set (the default) and applies, the job is
 ///     parked the same way `scontrol hold` parks a Pending job
-///     (`ClusterManager::hold_job_for_launch_failure`), since holding via the
-///     old Running→Failed→Held path isn't reachable from Pending. Interactive
-///     jobs are cancelled instead, same as before.
-///   - Otherwise (no prolog failure, or holding is disabled) the job is
-///     simply left Pending for the next scheduler tick — the same
-///     simplification `register_allocation_on_nodes`'s own failure arms above
-///     already make for the srun path. This intentionally does not reproduce
-///     `requeue_after_launch_failure`'s exponential backoff / requeue-count
-///     bookkeeping for a *non*-prolog failure, since that path requires an
-///     actual Failed transition the job never has here; a persistently
-///     failing node still gets drained on repeated prolog failures, but a
-///     transient (non-prolog) failure can retry immediately rather than
-///     backing off. See the fix's write-up for why this trade-off was made.
+///     (`ClusterManager::hold_job_for_launch_failure`), since a
+///     Running→Failed→Held path isn't reachable from Pending. Interactive
+///     jobs are cancelled instead.
+///   - Otherwise (no prolog failure, or holding is disabled) the job stays
+///     Pending and is backed off by
+///     `ClusterManager::backoff_pending_job_after_dispatch_failure`, as on the
+///     srun-allocation path: `requeue_count` is bumped and `begin_time` pushed
+///     out exponentially, and a job already at `max_batch_requeue` is held
+///     (`JobHoldMaxRequeue`) instead.
 #[allow(clippy::too_many_arguments)]
 async fn confirm_dispatch_on_nodes(
     cluster: Arc<ClusterManager>,
@@ -4426,13 +4411,6 @@ mod tests {
         );
     }
 
-    // ── dispatch_job_to_nodes: real partial-dispatch-failure trigger path ──
-    //
-    // Exercises the actual JoinSet success/failure counting in
-    // dispatch_job_to_nodes (not a reimplementation of it) against a real
-    // agent over the network, so the eviction + cancel-RPC behavior it
-    // drives is verified end-to-end rather than by calling evict_job
-    // directly on an already-Running job.
     mod idle_fill_reclaim_tests {
         use super::*;
 
@@ -5669,11 +5647,10 @@ mod tests {
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
 
-            // This calls the exact same function `run()` now awaits per
-            // assignment *before* start_job: real network dispatch to both
-            // nodes, real JoinSet success/failure counting, and the real
-            // branch that aborts admission on a partial failure — n1 (real
-            // agent) accepts, n2 (nothing listening) fails.
+            // The same call `process_assignment` awaits before `activate_job`:
+            // real network dispatch to both nodes, real JoinSet
+            // success/failure counting, and the real abort on a partial
+            // failure. n1 (real agent) accepts, n2 (nothing listening) fails.
             let outcome = confirm_dispatch_on_nodes(
                 cm.clone(),
                 job_id,
@@ -5690,10 +5667,8 @@ mod tests {
 
             assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
 
-            // The job must never have been visible as Running — admission
-            // failed before that transition, not after it (unlike the old
-            // dispatch_job_to_nodes, which evicted an already-Running job to
-            // NodeFail on the same partial failure).
+            // Admission aborted before any Running transition, so the job is
+            // still Pending and holds no nodes.
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
             assert!(job.allocated_nodes.is_empty());
