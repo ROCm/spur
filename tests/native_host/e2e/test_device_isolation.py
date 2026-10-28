@@ -392,7 +392,7 @@ class TestStepAndExecDeviceIsolation:
     def test_pty_attach_into_a_zero_gpu_job_is_denied_the_gpu_control_node(
         self, gpu_cluster
     ):
-        # `srun --pty` opens an interactive PTY step via spawn_pty_in_job, a path
+        # `srun --pty` opens an interactive PTY step via interactive_session, a path
         # of its own — not a batch payload, a run_command step, or spur exec.
         cluster = gpu_cluster
         cluster.gpu_preflight(1)

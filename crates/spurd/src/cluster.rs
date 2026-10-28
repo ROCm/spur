@@ -129,8 +129,9 @@ pub struct ComponentStatus {
 
 /// Inputs the supervisor needs to own a k0s unit.
 ///
-/// Increment-2 prototype: sourced from env (`from_env`). Later increments populate this from
-/// `spur_core` `ClusterConfig` + a controller-supplied role/join-token over the agent RPC.
+/// Built from a `StartClusterComponent` request (role, join token, k0s config, node IP), rebuilt
+/// from a running unit's `ExecStart` (`parse_execstart`) when spurd re-adopts it, or left bare
+/// (`probe_supervisor`) to probe or stop a unit by name.
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     pub role: ClusterRole,
@@ -622,7 +623,7 @@ async fn remove_cdi_spec() {
 }
 
 /// k0s node status this agent surfaces to the controller on each heartbeat, for `spur_k8s_node_*`
-/// metrics. `install_secs` is one-shot: `take_install_secs` returns it once after an install, then
+/// metrics. `install_secs` is one-shot: `take_for_heartbeat` returns it once after an install, then
 /// clears it, so the controller observes each install duration exactly once.
 #[derive(Debug, Default)]
 pub struct K0sNodeState {
@@ -714,11 +715,6 @@ impl K0sAgent {
         self.status.clone()
     }
 
-    /// Re-adopt an already-running spurd-owned k0s unit at startup. A spurd restart leaves the k0s
-    /// systemd unit running (by design) but `active` empty, so `status()` would report `inactive`
-    /// and `supervise()` would idle for a unit it owns. This probes the two unit names, and on the
-    /// active one rebuilds the `ClusterSupervisor` from the unit's `ExecStart`. No-op (best-effort)
-    /// when neither unit is active; call before spawning `supervise()`.
     /// A bare `ClusterSupervisor` for `role` (no config/token) — used to probe/stop the actual
     /// spurd-owned units by name when there is no tracked component.
     fn probe_supervisor(&self, role: ClusterRole) -> ClusterSupervisor {
@@ -731,6 +727,11 @@ impl K0sAgent {
         })
     }
 
+    /// Re-adopt an already-running spurd-owned k0s unit at startup. A spurd restart leaves the k0s
+    /// systemd unit running (by design) but `active` empty, so `status()` would report `inactive`
+    /// and `supervise()` would idle for a unit it owns. This probes the two unit names, and on the
+    /// active one rebuilds the `ClusterSupervisor` from the unit's `ExecStart`. No-op (best-effort)
+    /// when neither unit is active; call before spawning `supervise()`.
     pub async fn adopt_running_unit(&self) {
         // Controller & Single share k0scontroller.service; the ExecStart disambiguates them.
         for probe_role in [ClusterRole::Controller, ClusterRole::Worker] {

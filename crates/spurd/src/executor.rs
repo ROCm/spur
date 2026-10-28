@@ -1779,10 +1779,10 @@ pub(crate) struct StepOutputFiles {
     pub stderr_path: PathBuf,
 }
 
-/// The candidate spool paths for a step's stdout or stderr, mirroring the spool
-/// roots [`open_step_output_files`] (via [`create_job_spool_dir`]) chooses
-/// between. A reader that did not open the file cannot see which root the writer
-/// picked, so it checks both. Kept in sync with `open_step_output_files`' names.
+/// The candidate spool paths for a step's stdout or stderr. A reader that did
+/// not open the file cannot see which root the writer picked, so it checks
+/// every root. Keep the roots in sync with `default_job_spool_candidates` and
+/// the file names with `open_step_output_files_under`.
 pub fn step_output_path_candidates(job_id: JobId, step_id: u32, stderr: bool) -> Vec<PathBuf> {
     let name = format!("step{step_id}.{}", if stderr { "err" } else { "out" });
     [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")]
@@ -1804,11 +1804,6 @@ pub(crate) fn existing_step_output_path(
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Open a step's stdout/stderr spool files under the job spool dir, creating the
-/// dir if needed. The agent (root) opens the files and hands the write fds to the
-/// child via stdio redirection, so the child writes even after dropping to its
-/// uid; the files stay agent-readable so `stream_job_output` can tail them.
-/// Lives under the job spool tree so `cleanup_job_spool` reclaims it at job end.
 fn step_output_open_error(path: &Path, error: std::io::Error) -> LaunchError {
     classify_spool_error(
         path,
@@ -1822,6 +1817,11 @@ pub(crate) fn default_job_spool_candidates() -> Vec<PathBuf> {
     vec![PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")]
 }
 
+/// Open a step's stdout/stderr spool files under the job spool dir, creating the
+/// dir if needed. The agent (root) opens the files and hands the write fds to the
+/// child via stdio redirection, so the child writes even after dropping to its
+/// uid; the files stay agent-readable so `stream_job_output` can tail them.
+/// Lives under the job spool tree so `cleanup_job_spool` reclaims it at job end.
 pub(crate) fn open_step_output_files_under(
     candidates: &[PathBuf],
     job_id: JobId,
