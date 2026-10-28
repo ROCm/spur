@@ -38,18 +38,6 @@ impl ReservationFlags {
         Ok(flags)
     }
 
-    pub fn parse_csv(csv: &str) -> Result<Self, String> {
-        if csv.is_empty() {
-            return Ok(Self::default());
-        }
-        Self::parse_list(
-            &csv.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>(),
-        )
-    }
-
     pub fn display_csv(&self) -> String {
         let mut parts = Vec::new();
         if self.maint {
@@ -354,17 +342,20 @@ mod tests {
     }
 
     #[test]
-    fn flags_parse_csv() {
-        let f = ReservationFlags::parse_csv("maint,ignore_jobs,overlap").unwrap();
+    fn flags_parse_list_splits_commas() {
+        let f = ReservationFlags::parse_list(&["maint,ignore_jobs,overlap".into()]).unwrap();
         assert!(f.maint);
         assert!(f.ignore_jobs);
         assert!(!f.no_hold_jobs);
         assert!(f.overlap);
+
+        let f = ReservationFlags::parse_list(&[" maint,,overlap, ".into()]).unwrap();
+        assert!(f.maint && f.overlap && !f.ignore_jobs);
     }
 
     #[test]
     fn flags_reject_unknown() {
-        assert!(ReservationFlags::parse_csv("not_a_flag").is_err());
+        assert!(ReservationFlags::parse_list(&["not_a_flag".into()]).is_err());
     }
 
     #[test]

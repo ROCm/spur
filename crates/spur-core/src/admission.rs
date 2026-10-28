@@ -20,8 +20,6 @@ const TOKEN_SECRET_LEN: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum AdmissionError {
-    #[error("admission token required")]
-    TokenRequired,
     #[error("invalid token format")]
     InvalidFormat,
     #[error("token not found: {0}")]

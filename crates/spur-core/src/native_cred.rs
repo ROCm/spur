@@ -312,6 +312,7 @@ pub struct DeviceSlice {
 }
 
 impl ExecutionCredential {
+    #[cfg(test)]
     pub fn target_nodes(&self) -> impl Iterator<Item = &str> {
         self.resources_by_node.iter().map(|n| n.node.as_str())
     }
@@ -509,22 +510,6 @@ impl ForwardedIdentity {
             Ok(())
         } else {
             Err(CredentialError::AudienceMismatch)
-        }
-    }
-
-    pub fn require_digest(&self, digest: &[u8; DIGEST_LEN]) -> Result<(), CredentialError> {
-        if &self.request_digest == digest {
-            Ok(())
-        } else {
-            Err(CredentialError::Malformed("request digest"))
-        }
-    }
-
-    pub fn require_action(&self, action: &str) -> Result<(), CredentialError> {
-        if self.action == action {
-            Ok(())
-        } else {
-            Err(CredentialError::Malformed("action"))
         }
     }
 

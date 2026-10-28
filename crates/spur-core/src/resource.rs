@@ -98,6 +98,7 @@ impl ResourceAllocations {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn allocated_count(
         &self,
         gres_name: &str,

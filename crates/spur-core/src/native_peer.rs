@@ -26,7 +26,8 @@ pub const FORWARDED_HEADER: &str = "x-spur-forwarded";
 #[derive(Debug, Clone)]
 pub struct RpcPath(pub String);
 
-/// Body binding from a verified envelope; the handler must call [`Self::require`].
+/// Body binding from a verified envelope; the auth middleware checks `action`
+/// against the request path and `request_digest` against the received body.
 /// `action` is the method path — every `Empty` RPC shares one type and digest.
 #[derive(Debug, Clone)]
 pub struct ForwardedBinding {
@@ -35,6 +36,7 @@ pub struct ForwardedBinding {
 }
 
 impl ForwardedBinding {
+    #[cfg(test)]
     pub fn require(&self, action: &str, digest: &[u8; DIGEST_LEN]) -> Result<(), CredentialError> {
         if self.action != action {
             return Err(CredentialError::Malformed("action"));
