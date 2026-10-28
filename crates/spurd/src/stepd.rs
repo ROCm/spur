@@ -704,8 +704,8 @@ impl PtyHandoff {
     }
 }
 
-// A Stepd supervises exactly one step's process tree; PTY/srun steps get
-// their own separate Stepd in follow-up work, not a slot in this one.
+// A Stepd supervises exactly one step's process tree; each PTY or srun step
+// runs under its own Stepd, not a slot in this one.
 
 pub struct Stepd {
     job: Mutex<RunningJob>,

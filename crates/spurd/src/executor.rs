@@ -1780,9 +1780,9 @@ pub(crate) struct StepOutputFiles {
 }
 
 /// The candidate spool paths for a step's stdout or stderr, mirroring the spool
-/// roots [`open_step_output_files`] (via [`create_job_spool_dir`]) chooses
-/// between. A reader that did not open the file cannot see which root the writer
-/// picked, so it checks both. Kept in sync with `open_step_output_files`' names.
+/// roots `open_step_output_files_under` chooses between. A reader that did not
+/// open the file cannot see which root the writer picked, so it checks both.
+/// Kept in sync with `open_step_output_files_under`'s names.
 pub fn step_output_path_candidates(job_id: JobId, step_id: u32, stderr: bool) -> Vec<PathBuf> {
     let name = format!("step{step_id}.{}", if stderr { "err" } else { "out" });
     [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")]

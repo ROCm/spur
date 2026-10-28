@@ -129,8 +129,8 @@ pub struct ComponentStatus {
 
 /// Inputs the supervisor needs to own a k0s unit.
 ///
-/// Increment-2 prototype: sourced from env (`from_env`). Later increments populate this from
-/// `spur_core` `ClusterConfig` + a controller-supplied role/join-token over the agent RPC.
+/// Built from the controller-supplied role and join token over the agent RPC, or rebuilt from a
+/// running unit's `ExecStart` (`parse_execstart`) when spurd re-adopts it.
 #[derive(Clone, Debug)]
 pub struct ClusterConfig {
     pub role: ClusterRole,
@@ -622,7 +622,7 @@ async fn remove_cdi_spec() {
 }
 
 /// k0s node status this agent surfaces to the controller on each heartbeat, for `spur_k8s_node_*`
-/// metrics. `install_secs` is one-shot: `take_install_secs` returns it once after an install, then
+/// metrics. `install_secs` is one-shot: `take_for_heartbeat` returns it once after an install, then
 /// clears it, so the controller observes each install duration exactly once.
 #[derive(Debug, Default)]
 pub struct K0sNodeState {

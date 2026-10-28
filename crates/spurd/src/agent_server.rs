@@ -4668,8 +4668,8 @@ struct LaunchPlan {
     apply_priv_in_child: bool,
 }
 
-/// Decide how to enter a job and run `command`, shared by `exec_in_job` and
-/// `spawn_pty_in_job`.
+/// Decide how to enter a job and run `command`, shared by `exec_in_job`,
+/// `run_command` and `supervised_step_script`.
 ///
 /// When the job has live namespaces, enter them with `nsenter` and drop
 /// privilege inside via `setpriv` (see [`build_nsenter_argv`]); the child hook
@@ -8223,8 +8223,8 @@ impl SlurmAgent for AgentService {
         let interactive = !init.non_interactive;
 
         // Same defense-in-depth gate as exec_in_job: the uid comes from the tracked job, but an
-        // interactive PTY into a root job must obey allow_root_jobs too. Checked here rather than
-        // inside spawn_pty_in_job, which is a static helper with no access to the agent config.
+        // interactive PTY into a root job must obey allow_root_jobs too. Checked here because
+        // interactive_step_script is a static helper with no access to the agent config.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
             entry.uid,
             self.allow_root_jobs,
@@ -13257,7 +13257,7 @@ mod tests {
 
     #[test]
     fn build_nsenter_argv_pty_shell_wraps_with_setpriv_init_groups() {
-        // spawn_pty_in_job passes the resolved shell as the command.
+        // interactive_step_script passes the resolved shell as the command.
         let entry = nsenter_job_entry(1000, 1000);
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
         let argv = build_nsenter_argv(&entry, Some(&pd), &["/bin/bash".to_string()]);
@@ -16944,7 +16944,7 @@ mod tests {
 
     // Counterpart to the test above: a standalone `srun` request routed
     // through the batch dispatch path (Kubernetes-inclusive allocations;
-    // see `dispatch_job_to_nodes` in scheduler_loop.rs) sets
+    // see `process_assignment` in spurctld's scheduler_loop.rs) sets
     // `task_fanout: true` because there the dispatched "script" is the
     // literal command srun was asked to run `tasks_per_node` times — real
     // srun semantics that must not regress into running only once.
