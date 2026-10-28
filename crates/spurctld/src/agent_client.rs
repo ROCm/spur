@@ -213,9 +213,12 @@ pub async fn connect(
     }
     let channel = builder.connect().await?;
     let cred = credential_for_channel(channel.clone()).await;
-    Ok(SlurmAgentClient::new(InterceptedService::new(
-        channel, cred,
-    )))
+    // Completed-step replay can return buffered output larger than tonic's default limit.
+    Ok(
+        SlurmAgentClient::new(InterceptedService::new(channel, cred))
+            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE),
+    )
 }
 
 #[cfg(test)]

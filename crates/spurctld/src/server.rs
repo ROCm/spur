@@ -299,6 +299,7 @@ impl LeaderProxy {
 
 const STEP_REAWAIT_ATTEMPTS: u32 = 30;
 const STEP_REAWAIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+const STEP_REPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// tonic surfaces a dropped connection as Unknown/"transport error" rather than
 /// Unavailable, so both count as losing the agent rather than losing the step.
@@ -307,6 +308,100 @@ fn is_agent_connection_loss(status: &Status) -> bool {
         status.code(),
         tonic::Code::Unavailable | tonic::Code::Unknown
     )
+}
+
+async fn replay_completed_step(
+    cluster: &ClusterManager,
+    job: &spur_core::job::Job,
+    step: &spur_core::step::JobStep,
+) -> Result<RunStepResponse, Status> {
+    if step.nodes.is_empty() {
+        return Err(Status::failed_precondition("completed step has no nodes"));
+    }
+
+    let mut agents = Vec::with_capacity(step.nodes.len());
+    for node_name in &step.nodes {
+        if !job.allocated_nodes.contains(node_name) {
+            return Err(Status::failed_precondition(format!(
+                "step node {node_name} is not in the job's current allocation"
+            )));
+        }
+        let agent_addr = cluster
+            .get_node(node_name)
+            .ok_or_else(|| Status::unavailable(format!("node {node_name} is not registered")))
+            .and_then(|node| node_comm_http_url(&node, node_name));
+        agents.push((node_name.clone(), agent_addr));
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for (node, agent_addr) in agents {
+        let user = job.spec.user.clone();
+        let job_id = step.job_id;
+        let run_attempt = job.run_attempt;
+        let step_id = step.step_id;
+        set.spawn(async move {
+            let response =
+                completed_step_output(agent_addr, job_id, run_attempt, step_id, user).await;
+            (node, response)
+        });
+    }
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    while let Some(result) = set.join_next().await {
+        let (node, response) = result
+            .map_err(|error| Status::internal(format!("step replay task failed: {error}")))?;
+        match response {
+            Ok(response) => {
+                stdout.push_str(&response.stdout);
+                stderr.push_str(&response.stderr);
+            }
+            Err(error)
+                if is_agent_connection_loss(&error)
+                    || matches!(
+                        error.code(),
+                        tonic::Code::NotFound | tonic::Code::DeadlineExceeded
+                    ) =>
+            {
+                warn!(job_id = step.job_id, step_id = step.step_id, %node, %error,
+                    "completed step output unavailable; preserving recorded exit code");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(RunStepResponse {
+        exit_code: step.exit_code.unwrap_or(0),
+        stdout,
+        stderr,
+        node: step.nodes.join(","),
+    })
+}
+
+async fn completed_step_output(
+    agent_addr: Result<String, Status>,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: u32,
+    user: String,
+) -> Result<spur_proto::RunCommandResponse, Status> {
+    // Completion is durable; fetching ephemeral output must not wait for a live step.
+    tokio::time::timeout(STEP_REPLAY_TIMEOUT, async {
+        let mut agent = crate::agent_client::connect(agent_addr?)
+            .await
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        agent
+            .await_step(spur_proto::AwaitStepRequest {
+                job_id,
+                step_id,
+                user,
+                run_attempt,
+            })
+            .await
+            .map(Response::into_inner)
+    })
+    .await
+    .unwrap_or_else(|_| Err(Status::deadline_exceeded("completed step output timed out")))
 }
 
 /// A supervised step outlives the agent that launched it, so a lost call is not
@@ -3529,6 +3624,15 @@ impl SlurmController for ControllerService {
             .ok_or_else(|| {
                 Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
+
+        if matches!(
+            step.state,
+            spur_core::step::StepState::Completed | spur_core::step::StepState::Failed
+        ) {
+            return replay_completed_step(&self.cluster, &job, &step)
+                .await
+                .map(Response::new);
+        }
 
         if step.state.is_terminal() {
             let exit_code = step.exit_code.unwrap_or(0);
@@ -7182,6 +7286,8 @@ mod tests {
 
     struct ProbeAgent {
         active: bool,
+        step_response: Option<Result<spur_proto::proto::RunCommandResponse, Status>>,
+        step_started: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[tonic::async_trait]
@@ -7214,7 +7320,14 @@ mod tests {
             &self,
             _request: Request<spur_proto::proto::AwaitStepRequest>,
         ) -> Result<Response<spur_proto::proto::RunCommandResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
+            if let Some(started) = &self.step_started {
+                started.notify_one();
+                return std::future::pending().await;
+            }
+            self.step_response
+                .clone()
+                .unwrap_or_else(|| Err(Status::unimplemented("not used in tests")))
+                .map(Response::new)
         }
         async fn prepare_pmix(
             &self,
@@ -7343,13 +7456,28 @@ mod tests {
 
     /// Spawn a real `ProbeAgent` gRPC server on an OS-assigned localhost port.
     async fn spawn_probe_agent(active: bool) -> std::net::SocketAddr {
+        spawn_probe_agent_with_step_response(active, None).await
+    }
+
+    async fn spawn_probe_agent_with_step_response(
+        active: bool,
+        step_response: Option<Result<spur_proto::proto::RunCommandResponse, Status>>,
+    ) -> std::net::SocketAddr {
+        spawn_probe_agent_server(ProbeAgent {
+            active,
+            step_response,
+            step_started: None,
+        })
+        .await
+    }
+
+    async fn spawn_probe_agent_server(agent: ProbeAgent) -> std::net::SocketAddr {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let agent = ProbeAgent { active };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
-                .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
+                .add_service(spur_proto::agent_server(agent))
                 .serve_with_incoming(incoming)
                 .await;
         });
@@ -9826,14 +9954,11 @@ mod tests {
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_step_rejects_completed_step() {
+    async fn completed_step_owned_by(svc: &ControllerService, exit_code: i32) -> u32 {
         use spur_core::resource::ResourceAllocations;
         use spur_core::step::{JobStep, StepState, TaskDistribution};
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
-        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let job_id = running_job_owned_by(svc, "ubuntu").await;
         let allocated_nodes = svc.cluster.get_job(job_id).unwrap().allocated_nodes.clone();
         svc.cluster
             .create_step(JobStep {
@@ -9852,8 +9977,27 @@ mod tests {
             })
             .expect("test setup: seed step");
         svc.cluster
-            .record_step_complete(job_id, 0, 0)
+            .record_step_complete(job_id, 0, exit_code)
             .expect("test setup: complete step");
+        job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_replays_completed_step_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = completed_step_owned_by(&svc, 7).await;
+        let original_stdout = "x".repeat(5 * 1024 * 1024);
+        let agent = spawn_probe_agent_with_step_response(
+            false,
+            Some(Ok(spur_proto::proto::RunCommandResponse {
+                exit_code: 99,
+                stdout: original_stdout.clone(),
+                stderr: "original stderr\n".into(),
+            })),
+        )
+        .await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
 
         let resp = svc
             .run_step(Request::new(RunStepRequest {
@@ -9866,7 +10010,138 @@ mod tests {
             .await
             .expect("a completed step returns the recorded exit code")
             .into_inner();
-        assert_eq!(resp.exit_code, 0, "recorded exit code must be returned");
+        assert_eq!(resp.exit_code, 7, "recorded exit code must be returned");
+        assert_eq!(resp.stdout, original_stdout);
+        assert_eq!(resp.stderr, "original stderr\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_preserves_recorded_exit_when_output_is_unavailable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for exit_code in [0, 7] {
+            let job_id = completed_step_owned_by(&svc, exit_code).await;
+            for code in [
+                Code::NotFound,
+                Code::Unavailable,
+                Code::Unknown,
+                Code::DeadlineExceeded,
+            ] {
+                let agent = spawn_probe_agent_with_step_response(
+                    false,
+                    Some(Err(Status::new(code, "output unavailable"))),
+                )
+                .await;
+                point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+                let response = svc
+                    .run_step(Request::new(RunStepRequest {
+                        job_id,
+                        step_id: 0,
+                        user: "ubuntu".into(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .expect("missing output must not replace the recorded result")
+                    .into_inner();
+                assert_eq!(response.exit_code, exit_code, "{code:?}");
+                assert!(response.stdout.is_empty(), "{code:?}");
+                assert!(response.stderr.is_empty(), "{code:?}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_replay_preserves_agent_rejections() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = completed_step_owned_by(&svc, 0).await;
+        for code in [
+            Code::PermissionDenied,
+            Code::Unauthenticated,
+            Code::FailedPrecondition,
+        ] {
+            let agent = spawn_probe_agent_with_step_response(
+                false,
+                Some(Err(Status::new(code, "replay refused"))),
+            )
+            .await;
+            point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+            let error = svc
+                .run_step(Request::new(RunStepRequest {
+                    job_id,
+                    step_id: 0,
+                    user: "ubuntu".into(),
+                    ..Default::default()
+                }))
+                .await
+                .expect_err("an agent rejection must not become a successful replay");
+            assert_eq!(error.code(), code);
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_step_output_bounds_an_unresponsive_agent() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let agent = spawn_probe_agent_server(ProbeAgent {
+            active: false,
+            step_response: None,
+            step_started: Some(started.clone()),
+        })
+        .await;
+        let replay = tokio::spawn(completed_step_output(
+            Ok(format!("http://{agent}")),
+            1,
+            1,
+            0,
+            "ubuntu".into(),
+        ));
+        started.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(STEP_REPLAY_TIMEOUT).await;
+
+        let error = replay
+            .await
+            .expect("replay task")
+            .expect_err("the replay deadline must bound an unresponsive agent");
+        assert_eq!(error.code(), Code::DeadlineExceeded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_step_replay_keeps_output_from_available_nodes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = completed_step_owned_by(&svc, 7).await;
+        let available = spawn_probe_agent_with_step_response(
+            false,
+            Some(Ok(spur_proto::RunCommandResponse {
+                exit_code: 0,
+                stdout: "retained stdout".into(),
+                stderr: "retained stderr".into(),
+            })),
+        )
+        .await;
+        let unavailable =
+            spawn_probe_agent_with_step_response(false, Some(Err(Status::not_found("expired"))))
+                .await;
+        point_node_at_probe_agent(&svc, "n1", available.port()).await;
+        point_node_at_probe_agent(&svc, "n2", unavailable.port()).await;
+        let mut job = svc.cluster.get_job(job_id).unwrap();
+        job.allocated_nodes
+            .extend(["n2".into(), "unregistered".into()]);
+        let mut step = svc
+            .cluster
+            .get_steps(job_id)
+            .into_iter()
+            .find(|step| step.step_id == 0)
+            .expect("completed numbered step");
+        step.nodes = job.allocated_nodes.clone();
+
+        let response = replay_completed_step(&svc.cluster, &job, &step)
+            .await
+            .expect("unavailable nodes must not discard another node's output");
+        assert_eq!(response.exit_code, 7);
+        assert_eq!(response.stdout, "retained stdout");
+        assert_eq!(response.stderr, "retained stderr");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9911,6 +10186,24 @@ mod tests {
             "unexpected message: {}",
             err.message()
         );
+
+        svc.cluster
+            .record_step_complete(job_id, 0, 0)
+            .expect("test setup: complete step");
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a completed step outside the allocation must not be replayed");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err
+            .message()
+            .contains("not in the job's current allocation"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

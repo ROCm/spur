@@ -1621,10 +1621,25 @@ tar -C "$R" -czf '{local_tar}' .
             "c=$(docker ps -aq --filter name=spur-e2e-pg-); "
             "[ -n \"$c\" ] && docker rm -f $c || true"
         )
+        images = (
+            "mirror.gcr.io/library/postgres:16-alpine",
+            "public.ecr.aws/docker/library/postgres:16-alpine",
+            "docker.io/library/postgres:16-alpine",
+        )
+        for image in images:
+            cached, _ = node.exec_with_exit(f"docker image inspect {image}")
+            if cached == 0:
+                break
+            exit_code, output = node.exec_with_exit(f"docker pull {image}")
+            if exit_code == 0:
+                break
+            logger.warning("Postgres image pull failed from %s: %s", image, output.strip())
+        else:
+            raise RuntimeError("Postgres test image is unavailable from all registries")
         node.exec(
             f"docker run -d --name '{self._pg_container}' "
             f"-e POSTGRES_USER=spur -e POSTGRES_PASSWORD=spur -e POSTGRES_DB=spur "
-            f"-p 0:5432 mirror.gcr.io/library/postgres:16-alpine"
+            f"-p 0:5432 {image}"
         )
         self._pg_port = parse_published_port(
             node.exec(
