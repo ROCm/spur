@@ -342,12 +342,15 @@ mod tests {
     }
 
     #[test]
-    fn flags_parse_csv() {
+    fn flags_parse_list_splits_commas() {
         let f = ReservationFlags::parse_list(&["maint,ignore_jobs,overlap".into()]).unwrap();
         assert!(f.maint);
         assert!(f.ignore_jobs);
         assert!(!f.no_hold_jobs);
         assert!(f.overlap);
+
+        let f = ReservationFlags::parse_list(&[" maint,,overlap, ".into()]).unwrap();
+        assert!(f.maint && f.overlap && !f.ignore_jobs);
     }
 
     #[test]
