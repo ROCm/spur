@@ -10813,6 +10813,7 @@ mod tests {
                 .submit_job(Request::new(SubmitJobRequest {
                     spec: Some(JobSpec {
                         user: "test".into(),
+                        script: "#!/bin/sh\ntrue\n".into(),
                         partition: "default".into(),
                         num_nodes: 1,
                         num_tasks: 1,
@@ -10835,6 +10836,7 @@ mod tests {
                 .submit_job(Request::new(SubmitJobRequest {
                     spec: Some(JobSpec {
                         user: "test".into(),
+                        script: "#!/bin/sh\ntrue\n".into(),
                         partition: "default".into(),
                         num_nodes: 1,
                         num_tasks: 1,
