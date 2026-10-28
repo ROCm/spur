@@ -483,6 +483,7 @@ impl BackfillScheduler {
                         timelines: self.timelines.clone(),
                         max_jobs: 1,
                         last_outcome: HashMap::new(),
+                        report_unplaced: false,
                     };
                     for (timeline, node) in trial.timelines.iter_mut().zip(&nodes) {
                         timeline.total = node.total_resources.clone();

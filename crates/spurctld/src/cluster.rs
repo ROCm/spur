@@ -4819,7 +4819,7 @@ impl ClusterManager {
         );
         let (classification, _) =
             crate::scheduler_loop::classify_without_phantom_claims(self, |c| {
-                crate::scheduler_loop::trial_placement(self, &mut trial, None, c)
+                crate::scheduler_loop::trial_placement(self, &mut trial, c)
             });
         self.apply_classification(classification)
     }
@@ -11127,6 +11127,11 @@ nodes = "ALL"
 plugin = "block"
 [topology.external]
 block_file = {:?}
+[[partitions]]
+name = "default"
+nodes = "ALL"
+default = true
+state = "UP"
 "#,
             block_path
         );
@@ -11134,6 +11139,8 @@ block_file = {:?}
         let mut native = Node::new(
             "n0".into(),
             ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
                 generation: 7,
                 fabric_binding_version: 1,
                 gpus: vec![spur_core::resource::GpuResource {
@@ -11181,6 +11188,26 @@ block_file = {:?}
             .unwrap();
         };
         register(&native);
+        let assert_trial = |node: &str, placed: bool| {
+            let spec = JobSpec {
+                partition: Some("default".into()),
+                gres: vec!["gpu:1".into()],
+                nodelist: Some(node.into()),
+                constraint: Some("same(gpu.fabric_domain_id)".into()),
+                ..basic_spec("trial-fabric")
+            };
+            let classification = PendingJobClassification {
+                jobs: vec![Job::new(1, spec)],
+                reason_updates: vec![],
+                bb_stage_candidates: vec![],
+                idle_fill_candidates: vec![],
+                claims_blocked: false,
+            };
+            let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
+            let actual = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
+            assert_eq!(actual.contains(&1), placed, "{node}");
+        };
+        assert_trial("n0", true);
         for (text, warning) in [
             ("BlockName=a Nodes=n0", false),
             ("BlockName=a Nodes=n0,missing", true),
@@ -11230,6 +11257,8 @@ block_file = {:?}
             .unwrap()
             .issues
             .is_empty());
+        assert_trial("n0", false);
+        assert_trial("n1", true);
     }
 
     #[tokio::test]
@@ -23517,6 +23546,7 @@ block_file = {:?}
             (cm.get_nodes(), cm.get_partitions(), cm.get_reservations());
         let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -23538,7 +23568,7 @@ block_file = {:?}
     fn classify_with_trials(cm: &ClusterManager) -> (PendingJobClassification, HashSet<JobId>) {
         let mut trial = spur_sched::backfill::BackfillScheduler::new(10);
         crate::scheduler_loop::classify_without_phantom_claims(cm, |c| {
-            crate::scheduler_loop::trial_placement(cm, &mut trial, None, c)
+            crate::scheduler_loop::trial_placement(cm, &mut trial, c)
         })
     }
 

@@ -308,7 +308,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // even with nothing schedulable.
         let mut trial_scheduler = scheduler.for_trial();
         let (classification, unclaimed) = classify_without_phantom_claims(&cluster, |c| {
-            trial_placement(&cluster, &mut trial_scheduler, topology.as_ref(), c)
+            trial_placement(&cluster, &mut trial_scheduler, c)
         });
         let (mut pending, idle_fill_candidates) = cluster.apply_classification(classification);
         if pending.is_empty() && idle_fill_candidates.is_empty() {
@@ -988,18 +988,25 @@ pub(crate) fn classify_without_phantom_claims(
 pub(crate) fn trial_placement(
     cluster: &ClusterManager,
     scheduler: &mut BackfillScheduler,
-    topology: Option<&spur_core::topology::TopologyTree>,
     classification: &crate::cluster::PendingJobClassification,
 ) -> HashSet<spur_core::job::JobId> {
     let nodes = cluster.nodes_off_dispatch_cooldown(&classification.jobs);
     let partitions = cluster.get_partitions();
     let reservations = cluster.get_reservations();
     let busy_until = running_jobs_busy_until(cluster);
+    let config = cluster.config();
+    let view = cluster.fabric_view(Utc::now());
+    let topology = config
+        .topology
+        .as_ref()
+        .and_then(|config| config.build(&cluster.get_nodes(), &view));
+    let fabric = spur_sched::traits::FabricSchedulingContext { view };
     let state = ClusterState {
+        fabric: Some(&fabric),
         nodes: &nodes,
         partitions: &partitions,
         reservations: &reservations,
-        topology,
+        topology: topology.as_ref(),
         busy_until: &busy_until,
     };
     let mut list = classification.jobs.clone();
