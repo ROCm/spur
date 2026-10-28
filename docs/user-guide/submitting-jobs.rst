@@ -35,6 +35,9 @@ Spur takes the job's script body from one of three sources:
 
      spur submit < train.sh
 
+An empty script file or empty piped input is rejected before a job ID is
+assigned.
+
 ``#SBATCH`` directives in the script header are parsed the same way Slurm parses
 them: lines beginning with ``#SBATCH`` are read until the first line that is
 neither a comment nor the shebang. ``#PBS`` directives are also converted on a

@@ -819,6 +819,9 @@ pub(crate) fn build_sbatch_job_spec(
             buf
         }
     };
+    if script.is_empty() {
+        bail!("Batch script is empty!");
+    }
 
     let work_dir = args
         .chdir
@@ -1126,6 +1129,19 @@ async fn wait_for_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_sbatch_job_spec_rejects_empty_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("empty.sbatch");
+        std::fs::write(&path, "").expect("write empty script");
+        let argv = ["sbatch".to_string(), path.to_string_lossy().into_owned()];
+        let args = resolve_sbatch_args(&[], &argv).expect("args");
+
+        let err = build_sbatch_job_spec(args, None, &crate::submitline::render(&argv))
+            .expect_err("empty script must not be submitted");
+        assert!(err.to_string().contains("Batch script is empty!"));
+    }
 
     #[test]
     fn build_sbatch_job_spec_records_the_submit_line() {

@@ -1402,6 +1402,10 @@ impl SlurmController for ControllerService {
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
 
+        if !spec.srun_job && !spec.interactive && spec.script.is_empty() && spec.argv.is_empty() {
+            return Err(Status::invalid_argument("job script or argv is required"));
+        }
+
         let mut core_spec = proto_to_job_spec(spec)?;
         Self::bind_spec_to_identity(&mut core_spec, identity.as_ref())?;
 
@@ -6418,6 +6422,54 @@ mod tests {
             .expect_err("submit_job must not serve locally when there is no leader");
         assert_eq!(status.code(), Code::Unavailable);
         assert_eq!(status.message(), "not the Raft leader");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_rejects_empty_batch_before_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = test_service(&dir).await;
+        let spec = spur_proto::proto::JobSpec {
+            name: "empty-batch".into(),
+            user: "testuser".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            ..Default::default()
+        };
+
+        let status = service
+            .submit_job(Request::new(SubmitJobRequest { spec: Some(spec) }))
+            .await
+            .expect_err("empty batch must not be admitted");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "job script or argv is required");
+        assert!(service.cluster.get_job(1).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_accepts_allocation_only_srun() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = test_service(&dir).await;
+        let spec = spur_proto::proto::JobSpec {
+            name: "allocation-only-srun".into(),
+            user: "testuser".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            srun_job: true,
+            ..Default::default()
+        };
+
+        let response = service
+            .submit_job(Request::new(SubmitJobRequest { spec: Some(spec) }))
+            .await
+            .expect("allocation-only srun must be admitted")
+            .into_inner();
+        let job = service
+            .cluster
+            .get_job(response.job_id)
+            .expect("submitted job must be stored");
+        assert!(job.spec.srun_job);
+        assert!(job.spec.script.is_none());
+        assert!(job.spec.argv.is_empty());
     }
 
     #[test]
