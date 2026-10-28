@@ -192,6 +192,30 @@ the local login name, matching step-mode ``srun`` under JWT authentication.
    sattach 1024
    sattach 1024 --output-only --output stderr
 
+Standalone ``srun --pty`` Lifecycle
+-----------------------------------
+
+A standalone ``srun --pty`` shell is the job's workload. When that shell exits,
+the node reports it and the controller finishes the job with the shell's exit
+code (``COMPLETED`` on ``0``, ``FAILED`` otherwise; a signal death reports
+``128 + signal``, so a hangup is ``129``). This does not depend on the ``srun``
+client: if the client is lost (closed terminal, dropped VPN, ``kill -9``), the
+shell's exit still ends the job within seconds rather than leaving the
+allocation in ``RUNNING``. A live client reports the exit too; whichever report
+arrives first finishes the job and the other is a no-op.
+
+Two cases behave differently, by design:
+
+- ``salloc``: exiting an attached ``srun --pty`` closes only that step. The
+  allocation stays until you exit the ``salloc`` shell.
+- ``srun --jobid <id> --pty``, an extra session in a running job: when its
+  shell exits, the parent job keeps running.
+
+If the client is gone *and* the shell keeps running (for example a shell that
+ignores the hangup), the job runs until its time limit, or until the
+``InactiveLimit`` reaper reclaims it when ``inactive_limit_secs`` is set (see
+:doc:`../admin-guide/configuration`).
+
 .. _srun-controller-restart:
 
 Surviving a Controller Restart

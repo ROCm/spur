@@ -1867,6 +1867,7 @@ mod evict_wal_tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            pty: false,
         };
         let op = WalOperation::JobStepCreate {
             step: Box::new(step.clone()),

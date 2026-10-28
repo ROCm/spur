@@ -1609,6 +1609,10 @@ message ReportJobStatusRequest {
   // Step whose supervisor is reporting. Absent from a legacy agent, and from a
   // report that speaks for the whole node rather than one step.
   optional uint32 step_id = 10;
+  // Node identity token, as sent on Heartbeat. The controller verifies it only
+  // when node-identity enforcement is on, and only for the server-side
+  // standalone-PTY completion path; empty from a legacy agent.
+  string node_token = 11;
 }
 
 // ============================================================

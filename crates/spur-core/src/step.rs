@@ -104,6 +104,11 @@ pub struct JobStep {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
+
+    /// A PTY step (`srun --pty`). Lets the controller tell the standalone-PTY
+    /// step that owns a job's lifetime from an overlapping `--jobid ... --pty`.
+    #[serde(default)]
+    pub pty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +507,7 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            pty: false,
         };
         let encoded = serde_json::to_string(&step).expect("serialize");
         assert!(
@@ -511,6 +517,30 @@ mod tests {
         );
         let decoded: JobStep = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded.name, step.name);
+    }
+
+    // A step logged by an older controller has no `pty`; replay must not crash.
+    #[test]
+    fn job_step_deserializes_without_pty_field() {
+        let step = JobStep {
+            job_id: 1,
+            step_id: 0,
+            name: "s".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: ResourceAllocations::default(),
+            nodes: vec!["node001".into()],
+            distribution: TaskDistribution::Block,
+            start_time: None,
+            end_time: None,
+            exit_code: None,
+            pty: true,
+        };
+        let mut value = serde_json::to_value(&step).expect("serialize");
+        value.as_object_mut().expect("object").remove("pty");
+        let decoded: JobStep = serde_json::from_value(value).expect("deserialize");
+        assert!(!decoded.pty);
     }
 
     #[test]
@@ -530,6 +560,7 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            pty: false,
         };
 
         assert!(!step.state.is_terminal());

@@ -142,6 +142,12 @@ impl NodeReporter {
         }
     }
 
+    /// The learned node-identity token, read live (it is set at registration and
+    /// may change on re-registration). Empty when node identity is not in use.
+    pub fn node_token(&self) -> String {
+        read_recover(&self.node_token).clone()
+    }
+
     /// Controller endpoints for the next dial. Skips a host that failed within the last
     /// [`ReporterTimeouts::failover_cooldown`], provided there's another one to prefer instead.
     fn dial_endpoints(&self) -> String {

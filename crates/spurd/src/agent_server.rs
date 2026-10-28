@@ -1071,6 +1071,7 @@ async fn run_completion_hooks_and_report(
                 reporting_node: &local_hostname,
                 drain: drain.as_ref(),
                 step_id: None,
+                node_token: String::new(),
             },
         )
         .await;
@@ -1518,6 +1519,7 @@ pub struct CompletionListenerContext {
     stepds_store: crate::stepd::StepdStore,
     controller_addr: String,
     hostname: String,
+    reporter: Arc<NodeReporter>,
 }
 
 impl StepdRecoveryCleanup {
@@ -1780,9 +1782,10 @@ pub(crate) fn monitor_recovered_stepds(
     completions: crate::step_completion::StepCompletions,
     descriptors: Vec<crate::stepd::StepdDescriptor>,
     store: crate::stepd::StepdStore,
-    controller_addr: String,
+    reporter: Arc<NodeReporter>,
 ) {
     tokio::spawn(async move {
+        let controller_addr = reporter.controller_addr.clone();
         let mut pending: StepdMap = descriptors
             .into_iter()
             .map(|descriptor| (stepd_key(&descriptor), descriptor))
@@ -1881,6 +1884,7 @@ pub(crate) fn monitor_recovered_stepds(
                             reason: "epilog script failed".into(),
                         }),
                         step_id: Some(completion.step_id),
+                        node_token: reporter.node_token(),
                     },
                 )
                 .await
@@ -1971,6 +1975,7 @@ async fn fence_dead_stepd(
         stepds_store: store,
         controller_addr,
         hostname,
+        reporter,
     } = context;
     if !claim_stepd(stepds, &descriptor).await {
         return;
@@ -2039,6 +2044,7 @@ async fn fence_dead_stepd(
             reporting_node: hostname,
             drain: None,
             step_id: Some(descriptor.step_id),
+            node_token: reporter.node_token(),
         },
     )
     .await;
@@ -2200,6 +2206,7 @@ async fn handle_completion_notification(
                         reason: "epilog script failed".into(),
                     }),
                     step_id: Some(step_id),
+                    node_token: context.reporter.node_token(),
                 },
             )
             .await;
@@ -2252,6 +2259,7 @@ pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
     controller_addr: &str,
     reporting_node: &str,
+    node_token: &str,
 ) -> anyhow::Result<Vec<SessionIdentity>> {
     let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
@@ -2267,6 +2275,7 @@ pub async fn replay_unacknowledged_stepd_completions(
                     reason: "epilog script failed".into(),
                 }),
                 step_id: Some(completion.step_id),
+                node_token: node_token.to_string(),
             },
         )
         .await
@@ -2286,12 +2295,18 @@ pub fn retry_unacknowledged_stepd_completions(
     store: crate::stepd::StepdStore,
     controller_addr: String,
     reporting_node: String,
+    reporter: Arc<NodeReporter>,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match replay_unacknowledged_stepd_completions(&store, &controller_addr, &reporting_node)
-                .await
+            match replay_unacknowledged_stepd_completions(
+                &store,
+                &controller_addr,
+                &reporting_node,
+                &reporter.node_token(),
+            )
+            .await
             {
                 Ok(reconciled) if !reconciled.is_empty() => {
                     tracing::info!(
@@ -3922,7 +3937,7 @@ impl AgentService {
             self.step_completions.clone(),
             descriptors.to_vec(),
             crate::stepd::StepdStore::new(&self.stepd_state_dir),
-            self.reporter.controller_addr.clone(),
+            self.reporter.clone(),
         );
     }
 
@@ -4258,6 +4273,7 @@ impl AgentService {
             stepds_store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
+            reporter: self.reporter.clone(),
         }
     }
 
@@ -4960,6 +4976,9 @@ pub(crate) struct CompletionReport<'a> {
     pub reporting_node: &'a str,
     pub drain: Option<&'a DrainRequest>,
     pub step_id: Option<spur_core::step::StepId>,
+    /// Node-identity token, verified by the controller only for the server-side
+    /// standalone-PTY completion path. Empty on whole-job reports and legacy agents.
+    pub node_token: String,
 }
 
 pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
@@ -4971,6 +4990,7 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
         reporting_node,
         drain,
         step_id,
+        node_token,
     } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
@@ -4978,42 +4998,46 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
-    let result = retry_controller_rpc(move |attempt| async move {
-        let channel = spur_client::connect_channel(controller_addr)
-            .await
-            .map_err(|e| {
+    let result = retry_controller_rpc(move |attempt| {
+        let node_token = node_token.clone();
+        async move {
+            let channel = spur_client::connect_channel(controller_addr)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        job_id,
+                        attempt,
+                        error = %e,
+                        "failed to connect to controller for completion report"
+                    );
+                    ControllerRpcError::Connect(e)
+                })?;
+            let mut client = crate::controller_auth::wrap(channel)
+                .await
+                .map_err(ControllerRpcError::Rpc)?;
+            let req = ReportJobStatusRequest {
+                step_id,
+                job_id,
+                state,
+                exit_code,
+                signal,
+                message: format!("exit_code={}", exit_code),
+                drain_node: drain.is_some(),
+                drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
+                reporting_node: reporting_node.to_string(),
+                run_attempt,
+                node_token,
+            };
+            client.report_job_status(req).await.map_err(|e| {
                 warn!(
                     job_id,
                     attempt,
                     error = %e,
-                    "failed to connect to controller for completion report"
+                    "ReportJobStatus RPC failed"
                 );
-                ControllerRpcError::Connect(e)
-            })?;
-        let mut client = crate::controller_auth::wrap(channel)
-            .await
-            .map_err(ControllerRpcError::Rpc)?;
-        let req = ReportJobStatusRequest {
-            step_id,
-            job_id,
-            state,
-            exit_code,
-            signal,
-            message: format!("exit_code={}", exit_code),
-            drain_node: drain.is_some(),
-            drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
-            reporting_node: reporting_node.to_string(),
-            run_attempt,
-        };
-        client.report_job_status(req).await.map_err(|e| {
-            warn!(
-                job_id,
-                attempt,
-                error = %e,
-                "ReportJobStatus RPC failed"
-            );
-            ControllerRpcError::Rpc(e)
-        })
+                ControllerRpcError::Rpc(e)
+            })
+        }
     })
     .await;
 
@@ -11868,6 +11892,7 @@ mod tests {
             stepds_store: crate::stepd::StepdStore::new(state_dir.path()),
             controller_addr: controller_addr.into(),
             hostname: "test-node".into(),
+            reporter: test_reporter(),
         };
         (context, running, sessions, state_dir, completions)
     }
@@ -18398,6 +18423,7 @@ mod tests {
             stepds_store: store.clone(),
             controller_addr: "http://127.0.0.1:1".into(),
             hostname: "test-node".into(),
+            reporter: test_reporter(),
         }
     }
 

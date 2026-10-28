@@ -1710,7 +1710,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
-        let job = self
+        let completion = self
             .cluster
             .finish_srun_job_for(
                 req.job_id,
@@ -1730,9 +1730,6 @@ impl SlurmController for ControllerService {
                         "job {id} does not use native step dispatch"
                     ))
                 }
-                crate::cluster::SrunCompleteError::AlreadyTerminal { job_id, state } => {
-                    Status::failed_precondition(format!("job {job_id} is already {state:?}"))
-                }
                 crate::cluster::SrunCompleteError::NotOwner { job_id, user } => {
                     Status::permission_denied(format!(
                         "user {user} is not permitted to complete job {job_id}"
@@ -1743,10 +1740,15 @@ impl SlurmController for ControllerService {
                 }
             })?;
 
-        let cluster = self.cluster.clone();
-        tokio::spawn(async move {
-            crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job).await;
-        });
+        // Only a fresh completion releases the allocation. An already-terminal
+        // job (the server-side PTY path or an earlier call won the race) is a
+        // no-op, so the client's own CompleteJob stays quiet.
+        if let crate::cluster::SrunCompletion::Finished(job) = completion {
+            let cluster = self.cluster.clone();
+            tokio::spawn(async move {
+                crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job).await;
+            });
+        }
 
         Ok(Response::new(()))
     }
@@ -2517,6 +2519,34 @@ impl SlurmController for ControllerService {
             None
         };
 
+        // A standalone `srun --pty` job ends when its shell does, without relying
+        // on a client that may be gone. A bad token (enforcing mode only) is
+        // dropped silently: an error would make spurd replay the report forever.
+        if !req.reporting_node.is_empty() && req.step_id == Some(spur_core::step::STEP_INTERACTIVE)
+        {
+            let token_ok = !self.enforces_node_identity()
+                || self
+                    .verify_node_identity(&req.reporting_node, &req.node_token)
+                    .is_ok();
+            if token_ok {
+                if let crate::cluster::PtyExitOutcome::JobFinished(job) =
+                    self.cluster.finish_standalone_pty(
+                        req.job_id,
+                        &req.reporting_node,
+                        req.exit_code,
+                        req.signal,
+                        req.run_attempt,
+                    )
+                {
+                    let cluster = self.cluster.clone();
+                    tokio::spawn(async move {
+                        crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job)
+                            .await;
+                    });
+                }
+            }
+        }
+
         if req.drain_node && !req.reporting_node.is_empty() {
             warn!(
                 node = %req.reporting_node,
@@ -3007,6 +3037,7 @@ impl SlurmController for ControllerService {
             start_time: Some(chrono::Utc::now()),
             end_time: None,
             exit_code: None,
+            pty: req.pty,
         };
 
         self.cluster
@@ -9957,6 +9988,7 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: false,
             })
             .expect("test setup: seed step");
         svc.cluster
@@ -10209,6 +10241,7 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: false,
             })
             .expect("test setup: seed step with stale nodes");
 
@@ -10323,6 +10356,7 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: false,
             })
             .expect("test setup: seed step for run_step");
 

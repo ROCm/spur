@@ -1855,7 +1855,12 @@ Controls which nodes may register with the controller.
      - string
      - ``"open"``
      - Node admission mode. ``open`` lets any node register; ``token`` requires a
-       registering ``spurd`` to present a valid admission token.
+       registering ``spurd`` to present a valid admission token. Job completion
+       reports carry no verified node identity in ``open`` mode, so any host that
+       can reach the controller can report a job finished. With ``token`` and an
+       ``[auth]`` signing key, a standalone ``srun --pty`` job is finished only by
+       a report from its own node; batch completions are not verified in either
+       mode.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
 
