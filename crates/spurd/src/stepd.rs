@@ -1839,7 +1839,7 @@ async fn serve_until_start(
         let requested = match request {
             StepdRequest::Start => Some(GateOutcome::Released),
             // A signal has no live workload to reach yet, so it's rejected like any
-            // other pre-launch request; only teardown/shutdown decides the gate here.
+            // other pre-launch request; only Shutdown decides the gate here.
             StepdRequest::Shutdown => Some(GateOutcome::Cancelled),
             _ => None,
         };
@@ -1851,9 +1851,8 @@ async fn serve_until_start(
             // This connection's own request is the one that stuck.
             (StepdRequest::Start, Some(GateOutcome::Released)) => StepdResponse::Acknowledged,
             (StepdRequest::Shutdown, Some(GateOutcome::Cancelled)) => StepdResponse::Acknowledged,
-            // Start lost to a Shutdown decided on another
-            // connection: never claim success, or the caller launches a
-            // workload it was just told was cancelled.
+            // Start lost to a Shutdown decided on another connection: never claim
+            // success, or the caller launches a workload it was just told was cancelled.
             (StepdRequest::Start, Some(GateOutcome::Cancelled)) => StepdResponse::Rejected {
                 message: "cancelled before start".into(),
             },
@@ -2232,8 +2231,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for spurd to start the job"))
             .and_then(|result| result.map_err(anyhow::Error::from));
-        // A cancel arriving before Start (Shutdown) decides the gate
-        // directly, instead of sitting out the full START_GATE_TIMEOUT.
+        // A cancel arriving before Start (a Shutdown) decides the gate directly,
+        // instead of sitting out the full START_GATE_TIMEOUT.
         let error = match gate {
             Ok(GateOutcome::Released) => None,
             Ok(GateOutcome::Cancelled) => Some(anyhow::anyhow!("cancelled before start")),
