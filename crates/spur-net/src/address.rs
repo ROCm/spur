@@ -23,8 +23,6 @@ pub enum AddressError {
 /// How a node's address was determined.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AddressSource {
-    /// Address assigned from the WireGuard mesh pool.
-    WireGuard { interface: String },
     /// Detected from an existing WireGuard interface.
     WireGuardDetected { interface: String },
     /// Static address from config or hostname resolution.
