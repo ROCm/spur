@@ -601,6 +601,31 @@ pub fn mark_fabric_unavailable(resources: &mut ResourceSet) {
     }
 }
 
+pub fn retain_native_fabric_loss(old: &ResourceSet, fresh: &mut ResourceSet) {
+    let observed: std::collections::HashMap<_, _> = old
+        .gpus
+        .iter()
+        .filter_map(|gpu| {
+            let fabric = gpu.topology.as_ref()?.fabric.as_ref()?;
+            (fabric.source != "device-discovery").then_some((gpu.stable_id, fabric))
+        })
+        .collect();
+    for gpu in &mut fresh.gpus {
+        let Some(previous) = observed.get(&gpu.stable_id) else {
+            continue;
+        };
+        let topology = gpu.topology.get_or_insert_with(Default::default);
+        if topology.fabric.is_none() {
+            // A vanished native source is not an administrator-declared fabric.
+            topology.fabric = Some(spur_devices::topology::FabricObservation::unavailable(
+                &previous.source,
+                "fabric",
+                spur_devices::topology::ObservationIssueKind::Missing,
+            ));
+        }
+    }
+}
+
 fn mark_gpu_fabric_unavailable(gpu: &mut GpuResource) {
     let topology = gpu.topology.get_or_insert_with(Default::default);
     let source = topology
@@ -680,6 +705,10 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
 }
 
 pub fn refresh_block_file(resources: &mut ResourceSet, path: Option<&std::path::Path>) {
+    if spur_core::fabric::has_native_fabric(resources) {
+        resources.block_file_revision = None;
+        return;
+    }
     resources.block_file_revision =
         path.and_then(|path| match spur_core::block_file::BlockFile::read(path) {
             Ok(file) => Some(file.revision),
@@ -1079,6 +1108,97 @@ mod tests {
             90,
             true,
         )
+    }
+
+    #[test]
+    fn ignored_file_changes_do_not_trigger_native_inventory_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topology.conf");
+        let file = spur_core::block_file::BlockFile::parse("BlockName=a Nodes=n0").unwrap();
+        let (_, mut node) = declaration_only_node(false);
+        node.total_resources.gpus.truncate(1);
+        node.total_resources.gpus[0].topology = Some(observed_topology("15"));
+        refresh_block_file(&mut node.total_resources, Some(&path));
+        let baseline = node.total_resources.clone();
+        assert!(baseline.block_file_revision.is_none());
+        for text in [
+            Some(file.to_text()),
+            Some("BlockName=b Nodes=elsewhere".into()),
+            Some("malformed".into()),
+            None,
+        ] {
+            if let Some(text) = text {
+                std::fs::write(&path, text).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            refresh_block_file(&mut node.total_resources, Some(&path));
+            assert_eq!(
+                classify(&baseline, &node.total_resources, &Default::default()),
+                InventoryDelta::Unchanged
+            );
+            assert_eq!(
+                baseline.schedulable_fingerprint(),
+                node.total_resources.schedulable_fingerprint()
+            );
+        }
+        node.total_resources.gpus[0].topology = None;
+        std::fs::write(&path, file.to_text()).unwrap();
+        refresh_block_file(&mut node.total_resources, Some(&path));
+        assert_eq!(
+            node.total_resources.block_file_revision.as_deref(),
+            Some(file.revision.as_str())
+        );
+        std::fs::remove_file(&path).unwrap();
+        refresh_block_file(&mut node.total_resources, Some(&path));
+        assert!(node.total_resources.block_file_revision.is_none());
+    }
+
+    #[test]
+    fn vanished_native_source_stays_unavailable_until_discovery_recovers() {
+        let (file, mut node) = declaration_only_node(true);
+        node.total_resources.gpus[0].topology = Some(observed_topology("15"));
+        let baseline = node.total_resources.clone();
+        node.total_resources.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric = None;
+        retain_native_fabric_loss(&baseline, &mut node.total_resources);
+        assert!(spur_core::fabric::has_native_fabric(&node.total_resources));
+        let lost = node.total_resources.clone();
+        let fabric = lost.gpus[0]
+            .topology
+            .as_ref()
+            .unwrap()
+            .fabric
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            fabric.status,
+            spur_core::fabric::ObservationStatus::Unavailable
+        );
+        assert_eq!(lost.gpus[0].stable_id, baseline.gpus[0].stable_id);
+        let view = declaration_only_view(&file, &node);
+        assert!(view.blocks.is_empty());
+        assert!(view.notices[0].warning);
+        node.total_resources.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric = None;
+        retain_native_fabric_loss(&lost, &mut node.total_resources);
+        assert_eq!(node.total_resources, lost);
+        let mut recovered = baseline.clone();
+        retain_native_fabric_loss(&lost, &mut recovered);
+        assert_eq!(recovered, baseline);
+        let mut declaration = baseline.clone();
+        for gpu in &mut declaration.gpus {
+            gpu.topology = None;
+        }
+        let mut unchanged = declaration.clone();
+        retain_native_fabric_loss(&declaration, &mut unchanged);
+        assert_eq!(unchanged, declaration);
     }
 
     #[test]

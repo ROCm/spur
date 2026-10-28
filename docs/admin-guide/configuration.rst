@@ -2737,8 +2737,10 @@ to fit one block. Jobs request that outcome with
 ``--constraint='same(gpu.fabric_domain_id)'`` (alias ``same(gpu.vpod_id)``).
 Plain GPU jobs retain ordinary placement and may span blocks.
 
-The optional ``[topology.external] block_file`` absolute path selects
+The optional ``[topology.external] block_file`` absolute path adds
 administrator/operator whole-node definitions using ``BlockName=... Nodes=...``
-records. Omit it for automatic native discovery. Both sources feed the existing
-block/tree topology. See :doc:`fabric-observation` for the supported syntax,
+records for nodes without native fabric observations. Native discovery takes
+precedence: overlapping records are ignored with informational or warning
+notices, and discovered nodes need not appear in the file. Both sources feed
+the existing block/tree topology. See :doc:`fabric-observation` for the supported syntax,
 controller and agent installation, revision fencing, reconfiguration, and examples.

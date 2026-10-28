@@ -10728,8 +10728,10 @@ mod tests {
             "{:?}",
             view.blocks[0].issues
         );
-        assert!(view.blocks[0].file_revision.is_some());
-        assert!(view.blocks[0].observed_key.is_some());
+        assert!(view.blocks[0].file_revision.is_none());
+        assert!(view.blocks[0].observed_key.is_none());
+        assert_eq!(view.notices.len(), 1);
+        assert!(!view.notices[0].warning);
         assert!(svc.cluster.fabric_view(Utc::now()).blocks[0]
             .file_revision
             .is_none());
@@ -10738,7 +10740,13 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(!invalid.blocks[0].issues.is_empty());
+        assert!(!invalid
+            .blocks
+            .iter()
+            .find(|block| block.file_revision.is_some())
+            .unwrap()
+            .issues
+            .is_empty());
         let error = svc
             .validate_block_file(candidate("BlockSizes=2"))
             .await

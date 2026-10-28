@@ -40,9 +40,9 @@ Tests skip if the adapter is unset. The adapter protocol is:
 | `inventory` | Return JSON mapping node names to the GPU records asserted in `test_all_reported_gpu_properties`. Obtain values from controller inspection, not the generator's expected manifest. |
 | `step <job-id> <args...>` | Execute `spur run` inside that existing allocation. A remote harness may set `SPUR_JOB_ID` for this operation; ordinary submission does not require it. |
 | `mutate <node> <field> <value>` | Change only the disposable fixture: `type` changes KFD/PCI device IDs, `vram` changes the KFD bank, `numa` changes PCI NUMA, `root` changes the canonical host bridge and symlinks; other fields name `ualink` attributes. `<missing>` removes the attribute. |
-| `hide-fabric` | Hide only generated `ualink` directories, leaving KFD/PCI GPU facts intact for declaration-only block testing. |
+| `hide-fabric` | With no active jobs, hide generated `ualink` directories and restart the simulated agents to establish a fresh non-discovered fleet for declaration-only tests. Leave KFD/PCI GPU facts intact. Removing a previously observed source from a running agent is discovery loss and must remain unavailable. |
 | `reset` | Restore all grouped fixtures while preserving the mounted root and cgroup directory inodes. Waits in tests observe the controller's refreshed inventory. |
-| `block-file enable` | Install `BlockName=a Nodes=sim-node-[0-1]` and `BlockName=b Nodes=sim-node-[2-3]` on controller and agents, configure `topology.external.block_file`, and reload/restart as required. Wait for fresh agent inventories before reconfiguring the controller; check the reload result and active file revisions. |
+| `block-file enable` | Install `BlockName=a Nodes=sim-node-[0-1]` and `BlockName=b Nodes=sim-node-[2-3]` on controller and agents, configure `topology.external.block_file`, and reload/restart as required. Wait for fresh agent inventories before reconfiguring the controller; check the reload result, ignored-declaration notices, and revisions on file-only agents. Native blocks retain native bindings and need no file revision. |
 | `block-file disable` | Restore automatic block discovery on controller and agents. |
 
 The operator owns deployment, transport, and final container/network cleanup.

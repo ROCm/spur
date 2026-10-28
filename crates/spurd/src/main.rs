@@ -996,6 +996,7 @@ fn spawn_inventory_refresh(
                 reporter::mark_fabric_unavailable(&mut fresh);
             }
 
+            reporter::retain_native_fabric_loss(&old, &mut fresh);
             let block_path = config
                 .as_ref()
                 .and_then(|c| c.topology.as_ref())

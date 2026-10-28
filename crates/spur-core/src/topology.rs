@@ -608,6 +608,7 @@ mod discovery_tests {
 
     fn view() -> FabricView {
         FabricView {
+            notices: Vec::new(),
             namespace: "test".into(),
             unresolved: vec![],
             blocks: [("rack-a", "7", ["n0", "n2"]), ("rack-b", "7", ["n1", "n3"])]

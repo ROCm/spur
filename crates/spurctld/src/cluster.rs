@@ -5737,7 +5737,18 @@ impl ClusterManager {
                     new_config.controller.heartbeat_timeout_secs.unwrap_or(90),
                     false,
                 );
-                if let Some(block) = view.blocks.iter().find(|b| !b.issues.is_empty()) {
+                for notice in &view.notices {
+                    if notice.warning {
+                        warn!(block_name = %notice.block_name, "{}", notice.message);
+                    } else {
+                        info!(block_name = %notice.block_name, "{}", notice.message);
+                    }
+                }
+                if let Some(block) = view
+                    .blocks
+                    .iter()
+                    .find(|b| b.file_revision.is_some() && !b.issues.is_empty())
+                {
                     anyhow::bail!(
                         "invalid block file membership for {}: {}",
                         block.key.fabric_domain,
@@ -11103,6 +11114,122 @@ nodes = "ALL"
             dir.path()
         )
         .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_reload_preserves_native_groups_and_validates_only_applied_declarations() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=n0").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology]
+plugin = "block"
+[topology.external]
+block_file = {:?}
+"#,
+            block_path
+        );
+        let (cm, _) = test_cluster_with_conf_file(&dir, &conf).await;
+        let mut native = Node::new(
+            "n0".into(),
+            ResourceSet {
+                generation: 7,
+                fabric_binding_version: 1,
+                gpus: vec![spur_core::resource::GpuResource {
+                    device_id: 0,
+                    stable_id: 42,
+                    gpu_type: "test".into(),
+                    memory_mb: 100,
+                    peer_gpus: vec![],
+                    link_type: spur_core::resource::GpuLinkType::PCIe,
+                    topology: Some(spur_core::resource::DeviceTopology {
+                        pci_bdf: Some("0001:04:00.0".into()),
+                        fabric: Some(spur_core::fabric::FabricObservation {
+                            source: "test".into(),
+                            status: spur_core::fabric::ObservationStatus::Observed,
+                            physical_domain_id: Some("rack".into()),
+                            fabric_domain_id: Some("15".into()),
+                            endpoint_id: Some("1".into()),
+                            physical_capacity: Some(1),
+                            fabric_capacity: Some(1),
+                            active_endpoints: vec!["1".into()],
+                            local_endpoints: vec!["1".into()],
+                            endpoint_state: Some("active".into()),
+                            transport: Some("UALoE".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            },
+        );
+        let register = |node: &Node| {
+            cm.register_node(
+                node.name.clone(),
+                node.name.clone(),
+                node.total_resources.clone(),
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                true,
+            )
+            .unwrap();
+        };
+        register(&native);
+        for (text, warning) in [
+            ("BlockName=a Nodes=n0", false),
+            ("BlockName=a Nodes=n0,missing", true),
+        ] {
+            std::fs::write(&block_path, text).unwrap();
+            cm.reconfigure().unwrap();
+            let view = cm.fabric_view(Utc::now());
+            assert_eq!(view.blocks.len(), 1);
+            assert_eq!(view.blocks[0].key.fabric_domain, "15");
+            assert!(view.blocks[0].issues.is_empty());
+            assert!(view.blocks[0].file_revision.is_none());
+            assert_eq!(view.notices[0].warning, warning);
+        }
+        let mut declared = native.clone();
+        declared.name = "n1".into();
+        declared.total_resources.fabric_binding_version = 2;
+        declared.total_resources.gpus[0].topology = None;
+        native.total_resources.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap()
+            .status = spur_core::fabric::ObservationStatus::Incomplete;
+        native.total_resources.generation += 1;
+        let text = "BlockName=b Nodes=n1";
+        let file = spur_core::block_file::BlockFile::parse(text).unwrap();
+        declared.total_resources.block_file_revision = Some(file.revision);
+        register(&native);
+        register(&declared);
+        std::fs::write(&block_path, text).unwrap();
+        cm.reconfigure().unwrap();
+        let view = cm.fabric_view(Utc::now());
+        assert_eq!(view.blocks.len(), 2);
+        assert!(view
+            .blocks
+            .iter()
+            .find(|b| b.file_revision.is_some())
+            .unwrap()
+            .issues
+            .is_empty());
+        assert!(!view
+            .blocks
+            .iter()
+            .find(|b| b.file_revision.is_none())
+            .unwrap()
+            .issues
+            .is_empty());
     }
 
     #[tokio::test]
