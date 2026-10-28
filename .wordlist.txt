@@ -139,6 +139,7 @@ BPF
 checksums
 CIDRs
 CLI
+CLIs
 CNI
 conf
 ConfigMap
@@ -227,6 +228,7 @@ RWO
 SHA
 SIGKILL
 SIGSTOP
+SIGTERM
 SPDX
 SpurJob
 SpurJobs
