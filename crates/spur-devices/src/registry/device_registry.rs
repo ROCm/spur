@@ -135,6 +135,7 @@ fn expanded_to_device_entry(expanded: &ExpandedGresDevice) -> DeviceEntry {
         device_edits: expanded.device_edits.clone(),
         shared_edits: expanded.shared_edits.clone(),
         device_paths: expanded.device_paths.clone(),
+        topology: None,
         stable_id: 0,
     }
 }
@@ -160,6 +161,7 @@ fn countable_pool_entry(pool: &CountableGresPool) -> DeviceEntry {
         device_edits: Default::default(),
         shared_edits: Default::default(),
         device_paths: Vec::new(),
+        topology: None,
         stable_id: 0,
     }
 }

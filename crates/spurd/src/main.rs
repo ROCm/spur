@@ -512,10 +512,16 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(Mutex::new(registry));
 
     // Discover local resources (CPU/memory from sysfs, GPUs from device registry)
-    let resources = {
+    let mut resources = {
         let reg = registry.lock().await;
         reporter::discover_resources(&reg)
     };
+    let block_file = config
+        .as_ref()
+        .and_then(|c| c.topology.as_ref())
+        .and_then(|t| t.external.as_ref())
+        .and_then(|e| e.block_file.clone());
+    reporter::refresh_block_file(&mut resources, block_file.as_deref());
     info!(
         cpus = resources.cpus,
         memory_mb = resources.memory_mb,
@@ -656,6 +662,7 @@ async fn main() -> anyhow::Result<()> {
     .with_runtime_state_dir(stepd_state_dir.clone());
     if let Some(config) = config.as_ref() {
         agent_service.apply_auth_policy(&config.auth);
+        agent_service.set_block_file(block_file.clone());
     }
     // Give the reporter the live allocation so heartbeats carry each held job's
     // translated GPU stable_ids. Wired before the replay below records adopted
@@ -976,16 +983,26 @@ fn spawn_inventory_refresh(
 
             let old = reporter.snapshot_resources();
 
-            // Refuse to converge a full-GPU dropout: a zeroed scan is more likely
-            // a loader read error than a real GPU-less node.
-            if is_suspect_gpu_dropout(&old, &fresh) {
+            // A failed scan cannot safely remove capacity, but old fabric
+            // observations must no longer appear current.
+            let suspect_dropout = is_suspect_gpu_dropout(&old, &fresh);
+            if suspect_dropout {
                 warn!(
                     old_gpus = old.gpus.len(),
-                    "discovery returned zero GPUs where some were present; ignoring suspect scan"
+                    "discovery returned zero GPUs; retaining capacity with unavailable fabric observations"
                 );
-                continue;
+                fresh = old.clone();
+                fresh.generation = old.generation + 1;
+                reporter::mark_fabric_unavailable(&mut fresh);
             }
 
+            reporter::retain_native_fabric_loss(&old, &mut fresh);
+            let block_path = config
+                .as_ref()
+                .and_then(|c| c.topology.as_ref())
+                .and_then(|t| t.external.as_ref())
+                .and_then(|e| e.block_file.as_deref());
+            reporter::refresh_block_file(&mut fresh, block_path);
             let held: std::collections::HashSet<u64> = {
                 let a = allocation.lock().await;
                 a.allocated_gpu_ids().into_iter().collect()
@@ -1009,7 +1026,9 @@ fn spawn_inventory_refresh(
                     match change {
                         CapacityChange::Applied => {
                             let commit = converge(&reporter, &fresh, &delta, &mut last_delta).await;
-                            publish_registry(&registry, candidate, commit).await;
+                            if !suspect_dropout {
+                                publish_registry(&registry, candidate, commit).await;
+                            }
                         }
                         // A concurrent allocation grabbed a device that the fresh
                         // read dropped; leave capacity untouched and re-detect.
@@ -1081,8 +1100,8 @@ async fn converge(
 }
 
 /// A >0 -> 0 GPU discovery is a suspect scan: KFD/CDI loaders turn a read/parse
-/// error into an empty registry, indistinguishable from a GPU-less node. Refuse
-/// to auto-converge a full-GPU dropout; a real loss is a fault, not a partition.
+/// error into an empty registry, indistinguishable from a GPU-less node. Retain
+/// capacity and invalidate observations until a nonempty scan recovers.
 fn is_suspect_gpu_dropout(
     old: &spur_core::resource::ResourceSet,
     fresh: &spur_core::resource::ResourceSet,
@@ -1316,6 +1335,8 @@ mod tests {
     fn rs_with_gpus(n: usize) -> spur_core::resource::ResourceSet {
         use spur_core::resource::{GpuLinkType, GpuResource};
         spur_core::resource::ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: (0..n as u32)
@@ -1325,6 +1346,7 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 128 + i as u64,
                 })
                 .collect(),

@@ -129,7 +129,7 @@ pub struct SbatchArgs {
     #[arg(short = 'x', long, overrides_with = "exclude")]
     pub exclude: Option<String>,
 
-    /// Required node features (e.g., "mi300x,nvlink")
+    /// Required node features or same(gpu.fabric_domain_id) for one fabric block
     #[arg(short = 'C', long, overrides_with = "constraint")]
     pub constraint: Option<String>,
 
@@ -165,7 +165,7 @@ pub struct SbatchArgs {
     #[arg(long, overrides_with = "spread_job")]
     pub spread_job: bool,
 
-    /// Topology-aware scheduling: "tree" (minimize switch hops) or "block" (keep within rack)
+    /// Prefer topology locality (tree/block); none skips the hint. Explicit same-fabric constraints still apply.
     #[arg(long, overrides_with = "topology")]
     pub topology: Option<String>,
 

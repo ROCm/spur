@@ -292,11 +292,14 @@ fn extract_resources(node: &K8sNode) -> ResourceSet {
             link_type,
             // No KFD render_minor is available from k8s labels; the positional
             // index is the only stable identity this synthetic inventory has.
+            topology: None,
             stable_id: i as u64,
         })
         .collect();
 
     ResourceSet {
+        fabric_binding_version: 0,
+        block_file_revision: None,
         cpus,
         memory_mb,
         gpus,
@@ -723,10 +726,13 @@ mod tests {
                 memory_mb: 196608,
                 peer_gpus: vec![],
                 link_type: 1,
+                topology: None,
                 stable_id: i as u64,
             })
             .collect();
         ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus,
             memory_mb: mem,
             gpus,

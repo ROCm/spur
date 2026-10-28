@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Partition {
     pub name: String,
+    #[serde(default)]
+    pub fabric: Option<PartitionFabric>,
     pub state: PartitionState,
     pub is_default: bool,
 
@@ -44,6 +46,38 @@ pub struct Partition {
     /// cluster-wide `preempt_exempt_time` in `SchedulerConfig`.
     #[serde(default)]
     pub preempt_exempt_time: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartitionFabric {
+    pub mode: FabricMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FabricMode {
+    Preconfigured,
+}
+
+impl PartitionFabric {
+    pub fn parse(value: &str) -> Result<Option<Self>, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "none" => Ok(None),
+            "preconfigured" => Ok(Some(Self {
+                mode: FabricMode::Preconfigured,
+            })),
+            _ => Err(format!(
+                "unsupported fabric mode {value:?}; expected preconfigured or none"
+            )),
+        }
+    }
+
+    pub fn mode_str(&self) -> &'static str {
+        match self.mode {
+            FabricMode::Preconfigured => "preconfigured",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +202,7 @@ impl Default for Partition {
     fn default() -> Self {
         Self {
             name: String::new(),
+            fabric: None,
             state: PartitionState::Up,
             is_default: false,
             nodes: String::new(),

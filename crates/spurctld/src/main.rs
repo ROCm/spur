@@ -430,6 +430,7 @@ fn default_config() -> spur_core::config::SlurmConfig {
         scheduler: Default::default(),
         auth: Default::default(),
         partitions: vec![spur_core::config::PartitionConfig {
+            fabric: None,
             name: "default".into(),
             default: true,
             state: "UP".into(),

@@ -627,7 +627,7 @@ pub struct JobSpec {
     pub dependency: Vec<String>,
     pub nodelist: Option<String>,
     pub exclude: Option<String>,
-    /// Node feature constraint (comma-separated, all must match).
+    /// Node features and optional same(gpu.fabric_domain_id) placement constraint.
     pub constraint: Option<String>,
 
     // MPI
@@ -684,7 +684,7 @@ pub struct JobSpec {
     /// Spread job across least-loaded nodes.
     pub spread_job: bool,
     /// Topology-aware scheduling: "tree" (minimize switch hops) or
-    /// "block" (keep within one rack). None = default (no topology preference).
+    /// "block" (prefer one block). None = default (no topology preference).
     pub topology: Option<String>,
 
     // Kubernetes pod options

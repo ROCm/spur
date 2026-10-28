@@ -187,6 +187,10 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--exclusive``
      -
      - Do not share allocated nodes with other jobs. Default off.
+   * - ``--topology``
+     -
+     - Prefer locality with ``block`` or ``tree``; ``none`` skips the hint.
+       An explicit same-fabric constraint still applies.
    * - ``--hold``
      - ``-H``
      - Submit the job held; it will not start until released. Default off.
@@ -222,6 +226,36 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Block until the job terminates; exit code reflects the job outcome.
        Works with ``--parsable`` (ID printed at submission, then blocks).
        Also accepted as an ``#SBATCH --wait`` directive in scripts.
+
+Topology Locality and Block Containment
+---------------------------------------
+
+When the administrator enables block topology, automatically discovered vPods
+or administrator-declared node groups supply the existing topology model.
+``--topology block`` and ``--topology tree`` use the configured model to prefer
+nearby nodes. These options permit allocations across blocks when needed.
+
+To require all allocated GPUs inside one block, add a same-fabric constraint.
+Both jobs below use the same partition and discovered topology:
+
+.. code-block:: bash
+
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --topology block train.sh
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --constraint='same(gpu.fabric_domain_id)' train.sh
+
+The first job requests a locality preference and may span blocks. The second
+requires containment and stays pending if no single block can fit it.
+``same(gpu.vpod_id)`` is an alias. Combine either predicate with required node
+features using commas or ``&``. Per-device model, VRAM, NUMA, PCI-root, and
+domain filters are also supported; OR combinations are not supported. The constraint also works with ``spur alloc`` and standalone
+``spur run``; steps inherit their allocation's binding.
+
+``--topology none`` skips the hint without disabling an explicit constraint.
+Omitting ``-p`` uses the default partition and does not alter the constraint.
+A partition's ``mode = "preconfigured"`` describes read-only fabric ownership;
+a plain GPU job in that partition still uses ordinary scheduling. Partition
+names have no built-in topology meaning. See
+:doc:`/admin-guide/fabric-observation` for configuration and inspection.
 
 .. _submit-export:
 

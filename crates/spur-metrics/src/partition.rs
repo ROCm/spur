@@ -133,6 +133,8 @@ mod tests {
         let mut node = Node::new(
             name.into(),
             ResourceSet {
+                fabric_binding_version: 0,
+                block_file_revision: None,
                 cpus,
                 memory_mb,
                 gpus: Vec::new(),

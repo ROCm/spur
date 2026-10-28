@@ -858,10 +858,13 @@ impl ClusterManager {
     }
 
     pub fn new_with_config_path(
-        config: SlurmConfig,
+        mut config: SlurmConfig,
         _state_dir: &Path,
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        if let Some(external) = config.topology.as_mut().and_then(|t| t.external.as_mut()) {
+            external.load_block_file().map_err(anyhow::Error::msg)?;
+        }
         let partitions = config.build_partitions();
         let config_seeded_partitions: HashSet<String> =
             partitions.iter().map(|p| p.name.clone()).collect();
@@ -1159,6 +1162,8 @@ impl ClusterManager {
         // like `-N4 -n1 --gpus=2` (valid once reduced to one node) is accepted.
         spur_core::gpu_request::resolve_gpu_demand(&spec)
             .map_err(|e| SubmitError::invalid(e.to_string()))?;
+
+        spur_core::constraints::validate(&spec).map_err(SubmitError::invalid)?;
 
         // Reject a node count outside the partition's bounds at submit, matching
         // Slurm, instead of accepting a job that would pend forever.
@@ -2263,6 +2268,113 @@ impl ClusterManager {
         )
     }
 
+    pub(crate) fn validate_fabric_placement(
+        &self,
+        job: &Job,
+        node_names: &[String],
+        allocations: &HashMap<String, ResourceAllocations>,
+    ) -> anyhow::Result<()> {
+        let config = self.config();
+        spur_core::constraints::validate(&job.spec).map_err(anyhow::Error::msg)?;
+        let constraints =
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        let properties = !constraints.same.is_empty() || !constraints.predicates.is_empty();
+        let mut group = None;
+        for name in node_names.iter().filter(|name| {
+            properties
+                || allocations
+                    .get(*name)
+                    .is_some_and(|a| a.gpu_binding.is_some())
+        }) {
+            let allocation = allocations
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("missing GPU allocation for {name}"))?;
+            let node = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("GPU node disappeared"))?;
+            if properties || allocation.gpu_binding.is_some() {
+                let binding = allocation.gpu_binding.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("GPU property constraint requires an enforced binding")
+                })?;
+                binding
+                    .validate(name, &node.total_resources, allocation)
+                    .map_err(anyhow::Error::msg)?;
+                for id in allocation.device_ids("gpu") {
+                    let gpu = node
+                        .total_resources
+                        .gpus
+                        .iter()
+                        .find(|g| g.stable_id == id)
+                        .ok_or_else(|| anyhow::anyhow!("GPU disappeared"))?;
+                    anyhow::ensure!(
+                        constraints.matches_gpu(gpu),
+                        "allocated GPU does not satisfy its property predicates"
+                    );
+                    let key = constraints.group_key(name, gpu).ok_or_else(|| {
+                        anyhow::anyhow!("allocated GPU has unknown grouping properties")
+                    })?;
+                    anyhow::ensure!(
+                        group.as_ref().is_none_or(|prior| prior == &key),
+                        "allocated GPUs violate same-property constraint"
+                    );
+                    group = Some(key);
+                }
+            }
+        }
+        let required = constraints.same_fabric;
+        if !required
+            && allocations
+                .values()
+                .all(|allocation| allocation.fabric_binding.is_none())
+        {
+            return Ok(());
+        }
+        let view = self.fabric_view(Utc::now());
+        let mut key = None;
+        for name in node_names {
+            let allocation = allocations
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("missing fabric allocation for {name}"))?;
+            let binding = allocation.fabric_binding.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "same-fabric constraint requires an enforced fabric binding for {name}"
+                )
+            })?;
+            if key.is_some_and(|key| key != &binding.key) {
+                anyhow::bail!("allocation crosses fabric blocks");
+            }
+            key = Some(&binding.key);
+            let block = view
+                .blocks
+                .iter()
+                .find(|block| block.key == binding.key && block.issues.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("fabric block is no longer consistent"))?;
+            if block.active_endpoints != binding.active_endpoints
+                || block.file_revision != binding.file_revision
+                || block.observed_key != binding.observed_key
+                || binding
+                    .members
+                    .iter()
+                    .any(|member| !block.members.contains(member))
+            {
+                anyhow::bail!("fabric membership changed before dispatch");
+            }
+            let node = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("fabric node disappeared"))?;
+            binding
+                .validate(
+                    &config.cluster_name,
+                    name,
+                    &node.total_resources,
+                    allocation,
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
     /// Charge a placement in Raft before dispatching, so a leader change
     /// mid-dispatch finds it charged rather than free. Returns the run epoch.
     pub fn reserve_placement(
@@ -2283,6 +2395,10 @@ impl ClusterManager {
                 );
             }
         }
+        let job = self
+            .get_job(job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
+        self.validate_fabric_placement(&job, &node_names, &per_node_alloc)?;
         let run_attempt = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -3739,6 +3855,26 @@ impl ClusterManager {
         self.nodes.read().values().cloned().collect()
     }
 
+    pub fn fabric_view(&self, now: DateTime<Utc>) -> spur_core::fabric::FabricView {
+        let config = self.config();
+        let nodes = self.get_nodes();
+        let timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
+        let definition = config
+            .topology
+            .as_ref()
+            .and_then(|t| t.external.as_ref())
+            .and_then(|e| e.loaded_block_file.as_ref());
+        match definition {
+            Some(file) => file.view(&config.cluster_name, &nodes, now, timeout, true),
+            None => spur_core::fabric::FabricView::from_nodes(
+                &config.cluster_name,
+                &nodes,
+                now,
+                timeout,
+            ),
+        }
+    }
+
     /// Nodes eligible for new placement this tick: all nodes minus those on a
     /// dispatch cooldown, except a cooling node pinned by a pending job's
     /// `--nodelist` (its only option). Exclusion is resource-agnostic by design.
@@ -4683,7 +4819,7 @@ impl ClusterManager {
         );
         let (classification, _) =
             crate::scheduler_loop::classify_without_phantom_claims(self, |c| {
-                crate::scheduler_loop::trial_placement(self, &mut trial, None, c)
+                crate::scheduler_loop::trial_placement(self, &mut trial, c)
             });
         self.apply_classification(classification)
     }
@@ -5480,6 +5616,7 @@ impl ClusterManager {
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
         preempt_exempt_time: Option<Option<u32>>,
+        fabric_mode: Option<String>,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -5519,6 +5656,9 @@ impl ClusterManager {
             max_nodes.map(Some)
         };
 
+        if let Some(mode) = &fabric_mode {
+            spur_core::partition::PartitionFabric::parse(mode).map_err(PartitionError::invalid)?;
+        }
         self.propose(WalOperation::PartitionUpdate {
             name: name.to_string(),
             nodes,
@@ -5537,6 +5677,7 @@ impl ClusterManager {
             preempt_mode,
             is_default,
             preempt_exempt_time,
+            fabric_mode,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         Ok(())
@@ -5581,7 +5722,41 @@ impl ClusterManager {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
-        let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        let mut new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        if let Some(external) = new_config
+            .topology
+            .as_mut()
+            .and_then(|t| t.external.as_mut())
+        {
+            external.load_block_file().map_err(anyhow::Error::msg)?;
+            if let Some(file) = &external.loaded_block_file {
+                let view = file.view(
+                    &new_config.cluster_name,
+                    &self.get_nodes(),
+                    Utc::now(),
+                    new_config.controller.heartbeat_timeout_secs.unwrap_or(90),
+                    false,
+                );
+                for notice in &view.notices {
+                    if notice.warning {
+                        warn!(block_name = %notice.block_name, "{}", notice.message);
+                    } else {
+                        info!(block_name = %notice.block_name, "{}", notice.message);
+                    }
+                }
+                if let Some(block) = view
+                    .blocks
+                    .iter()
+                    .find(|b| b.file_revision.is_some() && !b.issues.is_empty())
+                {
+                    anyhow::bail!(
+                        "invalid block file membership for {}: {}",
+                        block.key.fabric_domain,
+                        block.issues.join(",")
+                    );
+                }
+            }
+        }
         new_config.auth.check_private_data()?;
         if let Some(warning) = new_config.auth.private_data_warning() {
             warn!("{warning}");
@@ -5660,6 +5835,7 @@ impl ClusterManager {
                 // Only push a WAL change when TOML explicitly sets the field;
                 // absent means "leave whatever the runtime WAL already has".
                 preempt_exempt_time: part.preempt_exempt_time.map(Some),
+                fabric_mode: Some(part.fabric.as_ref().map_or("", |f| f.mode_str()).into()),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -6100,6 +6276,25 @@ impl ClusterManager {
     /// Get all reservations.
     pub fn get_reservations(&self) -> Vec<Reservation> {
         self.reservations.read().clone()
+    }
+
+    pub fn annotate_fabric_pending(&self, ids: &[JobId]) {
+        let mut jobs = self.jobs.write();
+        for id in ids {
+            if let Some(job) = jobs.get_mut(id) {
+                if job.state == JobState::Pending
+                    && !job.pending_reason.is_scheduling_hold()
+                    && !job.reason_explains_begin_hold(Utc::now())
+                {
+                    let description = if spur_core::constraints::requires_same_fabric(&job.spec) {
+                        "FabricUnavailable: no consistent block with capable agents satisfies the request; inspect topology show"
+                    } else {
+                        "GpuPropertiesUnavailable: no GPU placement with capable agents satisfies the requested properties; inspect control show node"
+                    };
+                    job.set_pending_reason_desc(PendingReason::Resources, description);
+                }
+            }
+        }
     }
 
     /// Update pending_reason for jobs the scheduler couldn't schedule.
@@ -8261,6 +8456,7 @@ impl ClusterManager {
                 preempt_mode,
                 is_default,
                 preempt_exempt_time,
+                fabric_mode,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -8318,6 +8514,14 @@ impl ClusterManager {
                         }
                         if let Some(def) = is_default {
                             part.is_default = *def;
+                        }
+                        if let Some(mode) = fabric_mode {
+                            match spur_core::partition::PartitionFabric::parse(mode) {
+                                Ok(fabric) => part.fabric = fabric,
+                                Err(error) => {
+                                    warn!(name, %error, "invalid fabric mode in partition update")
+                                }
+                            }
                         }
                         if let Some(et) = preempt_exempt_time {
                             part.preempt_exempt_time = *et;
@@ -10498,6 +10702,7 @@ mod tests {
             scheduler: Default::default(),
             auth: Default::default(),
             partitions: vec![spur_core::config::PartitionConfig {
+                fabric: None,
                 name: "default".into(),
                 default: true,
                 state: "UP".into(),
@@ -10847,6 +11052,213 @@ mod tests {
         std::fs::write(&conf_path, format!("{base}preempt_mode = \"off\"\n")).unwrap();
         cm.reconfigure().unwrap();
         assert_eq!(gpu(&cm), Some(PreemptMode::Off));
+    }
+
+    #[tokio::test]
+    async fn invalid_block_reload_preserves_config_and_partitions() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=worker1").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "gpu"
+nodes = "ALL"
+"#,
+            block_path
+        );
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf).await;
+        let revision = cm
+            .config()
+            .topology
+            .as_ref()
+            .unwrap()
+            .external
+            .as_ref()
+            .unwrap()
+            .loaded_block_file
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        assert_eq!(cm.fabric_view(Utc::now()).blocks[0].key.fabric_domain, "a");
+        for invalid in ["BlockName=b Nodes=missing", "BlockName=broken"] {
+            std::fs::write(&block_path, invalid).unwrap();
+            std::fs::write(
+                &conf_path,
+                conf.replace(r#"name = "gpu""#, r#"name = "changed""#),
+            )
+            .unwrap();
+            assert!(cm.reconfigure().is_err());
+            assert_eq!(
+                cm.config()
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .external
+                    .as_ref()
+                    .unwrap()
+                    .loaded_block_file
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                revision
+            );
+            assert!(cm.get_partitions().iter().any(|p| p.name == "gpu"));
+            assert!(!cm.get_partitions().iter().any(|p| p.name == "changed"));
+        }
+        assert!(ClusterManager::new(
+            spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap(),
+            dir.path()
+        )
+        .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_reload_preserves_native_groups_and_validates_only_applied_declarations() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=n0").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology]
+plugin = "block"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "default"
+nodes = "ALL"
+default = true
+state = "UP"
+"#,
+            block_path
+        );
+        let (cm, _) = test_cluster_with_conf_file(&dir, &conf).await;
+        let mut native = Node::new(
+            "n0".into(),
+            ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                generation: 7,
+                fabric_binding_version: 1,
+                gpus: vec![spur_core::resource::GpuResource {
+                    device_id: 0,
+                    stable_id: 42,
+                    gpu_type: "test".into(),
+                    memory_mb: 100,
+                    peer_gpus: vec![],
+                    link_type: spur_core::resource::GpuLinkType::PCIe,
+                    topology: Some(spur_core::resource::DeviceTopology {
+                        pci_bdf: Some("0001:04:00.0".into()),
+                        fabric: Some(spur_core::fabric::FabricObservation {
+                            source: "test".into(),
+                            status: spur_core::fabric::ObservationStatus::Observed,
+                            physical_domain_id: Some("rack".into()),
+                            fabric_domain_id: Some("15".into()),
+                            endpoint_id: Some("1".into()),
+                            physical_capacity: Some(1),
+                            fabric_capacity: Some(1),
+                            active_endpoints: vec!["1".into()],
+                            local_endpoints: vec!["1".into()],
+                            endpoint_state: Some("active".into()),
+                            transport: Some("UALoE".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            },
+        );
+        let register = |node: &Node| {
+            cm.register_node(
+                node.name.clone(),
+                node.name.clone(),
+                node.total_resources.clone(),
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                true,
+            )
+            .unwrap();
+        };
+        register(&native);
+        let assert_trial = |node: &str, placed: bool| {
+            let spec = JobSpec {
+                partition: Some("default".into()),
+                gres: vec!["gpu:1".into()],
+                nodelist: Some(node.into()),
+                constraint: Some("same(gpu.fabric_domain_id)".into()),
+                ..basic_spec("trial-fabric")
+            };
+            let classification = PendingJobClassification {
+                jobs: vec![Job::new(1, spec)],
+                reason_updates: vec![],
+                bb_stage_candidates: vec![],
+                idle_fill_candidates: vec![],
+                claims_blocked: false,
+            };
+            let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
+            let actual = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
+            assert_eq!(actual.contains(&1), placed, "{node}");
+        };
+        assert_trial("n0", true);
+        for (text, warning) in [
+            ("BlockName=a Nodes=n0", false),
+            ("BlockName=a Nodes=n0,missing", true),
+        ] {
+            std::fs::write(&block_path, text).unwrap();
+            cm.reconfigure().unwrap();
+            let view = cm.fabric_view(Utc::now());
+            assert_eq!(view.blocks.len(), 1);
+            assert_eq!(view.blocks[0].key.fabric_domain, "15");
+            assert!(view.blocks[0].issues.is_empty());
+            assert!(view.blocks[0].file_revision.is_none());
+            assert_eq!(view.notices[0].warning, warning);
+        }
+        let mut declared = native.clone();
+        declared.name = "n1".into();
+        declared.total_resources.fabric_binding_version = 2;
+        declared.total_resources.gpus[0].topology = None;
+        native.total_resources.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap()
+            .status = spur_core::fabric::ObservationStatus::Incomplete;
+        native.total_resources.generation += 1;
+        let text = "BlockName=b Nodes=n1";
+        let file = spur_core::block_file::BlockFile::parse(text).unwrap();
+        declared.total_resources.block_file_revision = Some(file.revision);
+        register(&native);
+        register(&declared);
+        std::fs::write(&block_path, text).unwrap();
+        cm.reconfigure().unwrap();
+        let view = cm.fabric_view(Utc::now());
+        assert_eq!(view.blocks.len(), 2);
+        assert!(view
+            .blocks
+            .iter()
+            .find(|b| b.file_revision.is_some())
+            .unwrap()
+            .issues
+            .is_empty());
+        assert!(!view
+            .blocks
+            .iter()
+            .find(|b| b.file_revision.is_none())
+            .unwrap()
+            .issues
+            .is_empty());
+        assert_trial("n0", false);
+        assert_trial("n1", true);
     }
 
     #[tokio::test]
@@ -12432,6 +12844,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions.push(spur_core::config::PartitionConfig {
+            fabric: None,
             name: "small".into(),
             default: false,
             state: "UP".into(),
@@ -12688,6 +13101,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions.push(spur_core::config::PartitionConfig {
+            fabric: None,
             name: "small".into(),
             default: false,
             state: "UP".into(),
@@ -12850,6 +13264,117 @@ mod tests {
         assert_eq!(node.alloc_resources.memory_mb, 8000);
     }
 
+    #[test]
+    fn gpu_pending_diagnostics_distinguish_properties_from_block_containment() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        for (id, expression, expected) in [
+            (1, "gpu.vram>=192GiB", "GpuPropertiesUnavailable"),
+            (2, "same(gpu.vpod_id)", "FabricUnavailable"),
+            (3, "gpu.vram>=192GiB&same(gpu.vpod_id)", "FabricUnavailable"),
+        ] {
+            let mut spec = basic_spec("properties");
+            spec.constraint = Some(expression.into());
+            cm.jobs.write().insert(id, Job::new(id, spec));
+            cm.annotate_fabric_pending(&[id]);
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.pending_reason, PendingReason::Resources);
+            assert!(job
+                .pending_reason_desc
+                .as_deref()
+                .unwrap()
+                .starts_with(expected));
+        }
+    }
+
+    #[test]
+    fn placement_entry_rejects_gpu_snapshot_predicate_and_local_group_mismatches() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut gpu = gpu_resource(0, 42);
+        gpu.topology = Some(spur_core::resource::DeviceTopology {
+            numa_node: Some(0),
+            pci_root: Some("pci0001:00".into()),
+            vram_bytes: Some(192 * 1024_u64.pow(3)),
+            ..Default::default()
+        });
+        let inventory = ResourceSet {
+            generation: 7,
+            fabric_binding_version: 3,
+            gpus: vec![gpu],
+            ..Default::default()
+        };
+        let mut allocations = HashMap::new();
+        for name in ["n0", "n1"] {
+            cm.nodes
+                .write()
+                .insert(name.into(), Node::new(name.into(), inventory.clone()));
+            let mut alloc = ResourceAllocations {
+                generation: 7,
+                devices: [(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(42)],
+                )]
+                .into(),
+                ..Default::default()
+            };
+            alloc.gpu_binding =
+                Some(spur_core::gpu_binding::GpuBinding::new(name, &inventory, &alloc).unwrap());
+            allocations.insert(name.into(), alloc);
+        }
+        let mut spec = basic_spec("properties");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
+        spec.constraint = Some("gpu.vram>=192GiB".into());
+        let job = Job::new(1, spec.clone());
+        let names = vec!["n0".into(), "n1".into()];
+        cm.validate_fabric_placement(&job, &names, &allocations)
+            .unwrap();
+        for expression in [
+            "gpu.vram>192GiB",
+            "same(gpu.numa_node_id)",
+            "same(gpu.pcie_root_id)",
+        ] {
+            spec.constraint = Some(expression.into());
+            cm.jobs.write().insert(1, Job::new(1, spec.clone()));
+            let error = cm
+                .reserve_placement(
+                    1,
+                    names.clone(),
+                    ResourceAllocations::default(),
+                    allocations.clone(),
+                    false,
+                    false,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("predicate")
+                    || error.to_string().contains("same-property"),
+                "{error}"
+            );
+            assert!(!cm.get_job(1).unwrap().holds_a_placement());
+        }
+        spec.constraint = Some("gpu.vram>=192GiB".into());
+        cm.jobs.write().insert(1, Job::new(1, spec));
+        cm.nodes
+            .write()
+            .get_mut("n0")
+            .unwrap()
+            .total_resources
+            .generation = 8;
+        let error = cm
+            .reserve_placement(
+                1,
+                names,
+                ResourceAllocations::default(),
+                allocations,
+                false,
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("stale GPU property"), "{error}");
+        assert!(!cm.get_job(1).unwrap().holds_a_placement());
+    }
+
     fn gpu_resource(device_id: u32, stable_id: u64) -> spur_core::resource::GpuResource {
         spur_core::resource::GpuResource {
             device_id,
@@ -12857,6 +13382,7 @@ mod tests {
             memory_mb: 0,
             peer_gpus: vec![],
             link_type: spur_core::resource::GpuLinkType::XGMI,
+            topology: None,
             stable_id,
         }
     }
@@ -12929,6 +13455,8 @@ mod tests {
         // Bug reproduction: the stale positional ids match no live stable_id, so
         // both real GPUs read free.
         let want_two_gpus = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 0,
             memory_mb: 0,
             gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
@@ -17420,6 +17948,7 @@ mod tests {
         // The guard site in update_pending_reasons. An empty cluster_state would
         // otherwise force Resources/NodeDown.
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -17458,6 +17987,7 @@ mod tests {
         assert!(cm.get_job(job_id).unwrap().is_begin_held(Utc::now()));
 
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -18217,6 +18747,7 @@ mod tests {
             jobs.get_mut(&job_id).unwrap().pending_reason = PendingReason::DeadLine;
         }
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -18248,6 +18779,7 @@ mod tests {
         node.alloc_resources = scalar_alloc(4, 8000);
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18265,6 +18797,7 @@ mod tests {
         down.state = NodeState::Down;
         let nodes = vec![down];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18294,6 +18827,7 @@ mod tests {
         node.k0s_role = Some(K0sRole::Worker);
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18314,6 +18848,7 @@ mod tests {
         busy.state = NodeState::Mixed;
         let nodes = vec![busy];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18352,6 +18887,7 @@ mod tests {
         let n2 = cm.get_node("n2").unwrap();
         let nodes = vec![n1, n2];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18387,6 +18923,7 @@ mod tests {
             cm.get_node("n3").unwrap(),
         ];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18426,6 +18963,7 @@ mod tests {
             cm.get_node("n4").unwrap(),
         ];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18476,6 +19014,7 @@ mod tests {
             owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18526,6 +19065,7 @@ mod tests {
             owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18557,6 +19097,7 @@ mod tests {
 
         let nodes = vec![cm.get_node("n1").unwrap(), cm.get_node("n2").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18585,6 +19126,7 @@ mod tests {
         // Node has no features.
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18762,6 +19304,7 @@ mod tests {
 
         // An empty cluster forces a real wait reason, which must win.
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -20029,6 +20572,7 @@ mod tests {
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            fabric: None,
             busy_until: &busy_until,
         };
         let mut scheduler =
@@ -22905,6 +23449,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -23001,6 +23546,7 @@ mod tests {
             (cm.get_nodes(), cm.get_partitions(), cm.get_reservations());
         let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -23022,7 +23568,7 @@ mod tests {
     fn classify_with_trials(cm: &ClusterManager) -> (PendingJobClassification, HashSet<JobId>) {
         let mut trial = spur_sched::backfill::BackfillScheduler::new(10);
         crate::scheduler_loop::classify_without_phantom_claims(cm, |c| {
-            crate::scheduler_loop::trial_placement(cm, &mut trial, None, c)
+            crate::scheduler_loop::trial_placement(cm, &mut trial, c)
         })
     }
 
@@ -23495,6 +24041,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -23574,6 +24121,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -26222,6 +26770,7 @@ mod tests {
         let job = submit_and_wait(&cm, basic_spec("post-teardown"));
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -31503,6 +32052,7 @@ mod tests {
         let mut cfg = test_config();
         cfg.partitions = vec![
             spur_core::config::PartitionConfig {
+                fabric: None,
                 name: "default".into(),
                 default: true,
                 state: "UP".into(),
@@ -31522,6 +32072,7 @@ mod tests {
                 preempt_exempt_time: None,
             },
             spur_core::config::PartitionConfig {
+                fabric: None,
                 name: "train".into(),
                 default: false,
                 state: "UP".into(),
@@ -31582,6 +32133,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.partitions = vec![spur_core::config::PartitionConfig {
+            fabric: None,
             name: "inference".into(),
             default: false,
             state: "UP".into(),
@@ -32898,6 +33450,7 @@ mod tests {
         assert_eq!(gpu.priority_tier, 2);
 
         cm.apply_operation(&WalOperation::PartitionUpdate {
+            fabric_mode: None,
             name: "gpu".into(),
             nodes: None,
             selector: None,
@@ -33021,6 +33574,7 @@ mod tests {
         let before = cm.get_partitions().len();
 
         cm.apply_operation(&WalOperation::PartitionUpdate {
+            fabric_mode: None,
             name: "does-not-exist".into(),
             nodes: Some("n1".into()),
             selector: None,
@@ -33066,6 +33620,7 @@ mod tests {
 
         // Make "gpu" the default.
         cm.apply_operation(&WalOperation::PartitionUpdate {
+            fabric_mode: None,
             name: "gpu".into(),
             nodes: None,
             selector: None,
