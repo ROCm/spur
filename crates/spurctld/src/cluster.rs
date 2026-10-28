@@ -4125,10 +4125,6 @@ impl ClusterManager {
     }
 
     /// Update node state (admin: drain, resume, etc.)
-    ///
-    /// When draining a node that still has running jobs, the state is set to
-    /// `Draining` instead of `Drain`. Once all jobs complete (tracked in
-    /// `complete_job`), the node transitions to `Drain`.
     pub fn update_node_state(
         &self,
         name: &str,
@@ -6829,12 +6825,6 @@ impl ClusterManager {
             });
             node.alloc_resources.subtract(&slice);
             node.update_state_from_alloc();
-            if node.state == NodeState::Draining
-                && node.alloc_resources.cpus == 0
-                && !node.alloc_resources.has_devices()
-            {
-                node.state = NodeState::Drain;
-            }
         }
     }
 
@@ -7438,12 +7428,6 @@ impl ClusterManager {
                             });
                             node.alloc_resources.subtract(&slice);
                             node.update_state_from_alloc();
-                            if node.state == NodeState::Draining
-                                && node.alloc_resources.cpus == 0
-                                && !node.alloc_resources.has_devices()
-                            {
-                                node.state = NodeState::Drain;
-                            }
                         }
                     }
                 }
@@ -7653,12 +7637,6 @@ impl ClusterManager {
                                 });
                                 node.alloc_resources.subtract(&slice);
                                 node.update_state_from_alloc();
-                                if node.state == NodeState::Draining
-                                    && node.alloc_resources.cpus == 0
-                                    && !node.alloc_resources.has_devices()
-                                {
-                                    node.state = NodeState::Drain;
-                                }
                             }
                         }
                     }
@@ -8103,9 +8081,8 @@ impl ClusterManager {
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.state = *new_state;
-                    // Service-state requests may wait behind allocation changes in Raft.
-                    // Capacity reflects this controller's resource policy.
-                    if new_state.is_up() {
+                    // A proposal can wait behind the final deallocation in Raft.
+                    if new_state.is_up() || *new_state == NodeState::Draining {
                         node.update_state_from_alloc();
                     }
                     node.state_reason = reason.clone();
@@ -29138,6 +29115,90 @@ mod tests {
             cm.apply_operation(&late_recovery);
             assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Idle);
             assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_drain_wal_reaches_drain_after_last_allocation_is_freed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, basic_spec("drain-race"));
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+
+        let pending_drain = WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Mixed,
+            new_state: NodeState::Draining,
+            reason: Some("maintenance".into()),
+            admin_locked: true,
+            reason_uid: Some(1000),
+            reason_time: None,
+            at: None,
+        };
+
+        cm.complete_job(id, 0, JobState::Completed).unwrap();
+        settle(&cm, id, JobState::Completed);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+
+        cm.apply_operation(&pending_drain);
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Drain);
+        assert_eq!(node.alloc_resources.cpus, 0);
+        assert!(!node.alloc_resources.has_devices());
+        assert!(node.admin_locked);
+        assert_eq!(node.state_reason.as_deref(), Some("maintenance"));
+        assert_eq!(node.reason_uid, Some(1000));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_state_change_preserves_explicit_unknown() {
+        for allocated_cpus in [0, 2] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 4, 8000);
+
+            if allocated_cpus > 0 {
+                let id = submit_and_wait(&cm, basic_spec("unknown-state"));
+                let alloc = scalar_alloc(allocated_cpus, 4000);
+                cm.start_job(
+                    id,
+                    vec!["n1".into()],
+                    alloc.clone(),
+                    per_node_for(&["n1"], alloc),
+                )
+                .unwrap();
+                settle(&cm, id, JobState::Running);
+            }
+
+            cm.apply_operation(&WalOperation::NodeStateChange {
+                name: "n1".into(),
+                old_state: cm.get_node("n1").unwrap().state,
+                new_state: NodeState::Unknown,
+                reason: Some("unavailable".into()),
+                admin_locked: false,
+                reason_uid: Some(1000),
+                reason_time: None,
+                at: None,
+            });
+
+            let node = cm.get_node("n1").unwrap();
+            assert_eq!(
+                node.state,
+                NodeState::Unknown,
+                "allocated CPUs: {allocated_cpus}"
+            );
+            assert!(!node.is_schedulable());
+            assert_eq!(node.alloc_resources.cpus, allocated_cpus);
+            assert_eq!(node.state_reason.as_deref(), Some("unavailable"));
         }
     }
 

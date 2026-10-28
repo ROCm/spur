@@ -466,6 +466,13 @@ impl Node {
 
     /// Update state based on allocation level.
     pub fn update_state_from_alloc(&mut self) {
+        if self.state == NodeState::Draining {
+            if self.alloc_resources.cpus == 0 && !self.alloc_resources.has_devices() {
+                self.state = NodeState::Drain;
+            }
+            return;
+        }
+
         if self.state.is_admin_hold() {
             return;
         }
