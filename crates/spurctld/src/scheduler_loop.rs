@@ -1358,6 +1358,9 @@ async fn try_preempt_with_handoffs(
             }
             eligible.push((candidate, mode));
         }
+        if eligible.is_empty() {
+            continue;
+        }
 
         // Suspend keeps the allocation, so it is a configured outcome rather than a
         // way to free a node: searched alone, never mixed into a releasing set.
