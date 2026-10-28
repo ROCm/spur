@@ -501,7 +501,6 @@ pub enum StepdRequest {
     SignalAllocation {
         signal: i32,
     },
-    BeginTeardown,
     Shutdown,
 }
 
@@ -1684,7 +1683,7 @@ pub async fn serve_control(stream: UnixStream, session: &Stepd) -> io::Result<()
             // The job is already running by the time control is served, so a
             // repeat Start (a retrying agent) is a no-op rather than an error.
             StepdRequest::Start => StepdResponse::Acknowledged,
-            StepdRequest::BeginTeardown | StepdRequest::Shutdown => {
+            StepdRequest::Shutdown => {
                 session.begin_teardown().await;
                 StepdResponse::Acknowledged
             }
@@ -1841,7 +1840,7 @@ async fn serve_until_start(
             StepdRequest::Start => Some(GateOutcome::Released),
             // A signal has no live workload to reach yet, so it's rejected like any
             // other pre-launch request; only teardown/shutdown decides the gate here.
-            StepdRequest::BeginTeardown | StepdRequest::Shutdown => Some(GateOutcome::Cancelled),
+            StepdRequest::Shutdown => Some(GateOutcome::Cancelled),
             _ => None,
         };
         let final_outcome = match requested {
@@ -1851,21 +1850,16 @@ async fn serve_until_start(
         let response = match (request, final_outcome) {
             // This connection's own request is the one that stuck.
             (StepdRequest::Start, Some(GateOutcome::Released)) => StepdResponse::Acknowledged,
-            (
-                StepdRequest::BeginTeardown | StepdRequest::Shutdown,
-                Some(GateOutcome::Cancelled),
-            ) => StepdResponse::Acknowledged,
-            // Start lost to a Shutdown/BeginTeardown decided on another
+            (StepdRequest::Shutdown, Some(GateOutcome::Cancelled)) => StepdResponse::Acknowledged,
+            // Start lost to a Shutdown decided on another
             // connection: never claim success, or the caller launches a
             // workload it was just told was cancelled.
             (StepdRequest::Start, Some(GateOutcome::Cancelled)) => StepdResponse::Rejected {
                 message: "cancelled before start".into(),
             },
-            // Unreachable given `claim_decision`'s rules (Shutdown/BeginTeardown
-            // always sets Cancelled), kept exhaustive rather than panicking.
-            (StepdRequest::BeginTeardown | StepdRequest::Shutdown, Some(GateOutcome::Released)) => {
-                StepdResponse::Acknowledged
-            }
+            // Unreachable given `claim_decision`'s rules (Shutdown always sets
+            // Cancelled), kept exhaustive rather than panicking.
+            (StepdRequest::Shutdown, Some(GateOutcome::Released)) => StepdResponse::Acknowledged,
             // The agent probes readiness with QueryState before releasing the
             // job, so refusing it here would deadlock the launch.
             (StepdRequest::QueryState, _) => StepdResponse::State {
@@ -2238,7 +2232,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             .await
             .map_err(|_| anyhow::anyhow!("timed out waiting for spurd to start the job"))
             .and_then(|result| result.map_err(anyhow::Error::from));
-        // A cancel arriving before Start (BeginTeardown/Shutdown) decides the gate
+        // A cancel arriving before Start (Shutdown) decides the gate
         // directly, instead of sitting out the full START_GATE_TIMEOUT.
         let error = match gate {
             Ok(GateOutcome::Released) => None,
@@ -5150,7 +5144,7 @@ mod tests {
         );
         let server = tokio::spawn(async move { serve_control(server_stream, &session).await });
         let (reader, mut writer) = client_stream.into_split();
-        for request in [StepdRequest::QueryState, StepdRequest::BeginTeardown] {
+        for request in [StepdRequest::QueryState, StepdRequest::Shutdown] {
             writer
                 .write_all(
                     format!(
