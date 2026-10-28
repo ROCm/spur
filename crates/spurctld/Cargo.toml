@@ -41,6 +41,7 @@ tower-http = { workspace = true }
 mlua = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 tokio-stream = { version = "0.1", features = ["net"] }

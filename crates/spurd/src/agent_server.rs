@@ -17488,6 +17488,7 @@ mod tests {
         );
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
             job_id: 55,
+            user: "allocation-owner".into(),
             cpus: 1,
             allocated: Some(ResourceAllocations {
                 cpus: 1,
@@ -17509,6 +17510,10 @@ mod tests {
         // The job is in `running`, so reconcile must spare it (not orphan-reclaim).
         {
             let jobs = svc.running.lock().await;
+            assert_eq!(
+                jobs.get(&55).expect("registered job").user,
+                "allocation-owner"
+            );
             reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
         }
         assert_eq!(

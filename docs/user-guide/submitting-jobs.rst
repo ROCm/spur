@@ -456,7 +456,13 @@ Open MPI expects.  The ``--mpi=mpirun`` value appears in
    their allocation remains active. ``srun`` retries the controller connection
    for up to 60 seconds (30 attempts x 2 s backoff); agents join an existing
    step rather than launching it again. If its completion was already recorded,
-   the controller retrieves the original output and exit code from the agents.
+   the controller returns its recorded exit code and attempts to retrieve the
+   original output from the agents, allowing up to 10 seconds per agent in
+   parallel. Settled completion records are retained for up to 10 minutes,
+   subject to capacity limits, and output replay also requires the agent's
+   spool files. An agent restart can recover completion from its retained
+   on-disk record. If records have expired or an agent is unavailable, the
+   recorded exit code is still returned, but that agent's output may be missing.
 
 Distributed-training rendezvous variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
