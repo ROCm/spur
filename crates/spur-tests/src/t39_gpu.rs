@@ -255,6 +255,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -323,6 +324,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -388,6 +390,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,

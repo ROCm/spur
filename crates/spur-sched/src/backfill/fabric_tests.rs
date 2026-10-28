@@ -119,6 +119,7 @@ fn run_with_view(
         .map(|node| (node.name.clone(), now() + Duration::seconds(60)))
         .collect();
     let cluster = ClusterState {
+        preemption_handoffs: &std::collections::HashMap::new(),
         nodes,
         partitions: &partitions,
         reservations: &[],
@@ -604,6 +605,7 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
     }];
     let busy = HashMap::new();
     let cluster = ClusterState {
+        preemption_handoffs: &std::collections::HashMap::new(),
         nodes: &nodes,
         partitions: &parts,
         reservations: &[],
@@ -637,6 +639,7 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
             .values()
             .all(|a| a.fabric_binding.is_some()));
         let unavailable = ClusterState {
+            preemption_handoffs: &std::collections::HashMap::new(),
             fabric: None,
             ..cluster
         };
@@ -690,6 +693,7 @@ fn property_run(nodes: &[Node], jobs: &[Job]) -> (BackfillScheduler, Vec<Assignm
         .map(|n| (n.name.clone(), now() + Duration::seconds(60)))
         .collect();
     let cluster = ClusterState {
+        preemption_handoffs: &std::collections::HashMap::new(),
         nodes,
         partitions: &partitions,
         reservations: &[],

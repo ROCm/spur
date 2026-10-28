@@ -28,6 +28,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -54,6 +55,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -79,6 +81,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -100,6 +103,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -124,6 +128,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -151,6 +156,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -182,6 +188,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -327,6 +334,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -355,6 +363,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -381,6 +390,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -408,6 +418,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -439,6 +450,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -505,6 +517,7 @@ mod tests {
         let job = make_job_with_resources("train", 1, 1, 1, Some(60));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -527,6 +540,7 @@ mod tests {
         let job = make_job_with_resources("train", 1, 1, 1, Some(60));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -588,6 +602,7 @@ mod tests {
         let job = make_job_with_resources("regular-job", 1, 1, 1, Some(60));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -627,6 +642,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -650,6 +666,7 @@ mod tests {
         let job = make_job_with_resources("free-job", 1, 1, 1, Some(60));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -674,6 +691,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -697,6 +715,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -724,6 +743,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -752,6 +772,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -781,6 +802,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -812,6 +834,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -863,6 +886,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -928,6 +952,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -972,6 +997,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1016,6 +1042,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1069,6 +1096,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1096,6 +1124,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
