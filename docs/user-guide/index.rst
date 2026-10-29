@@ -7,4 +7,5 @@ know Slurm, your commands and job scripts work unchanged — see
 
 This guide covers the :doc:`architecture`, :doc:`submitting-jobs`,
 :doc:`interactive` jobs, :doc:`monitoring-jobs`, :doc:`running-containers`, and
-:doc:`slurm-compatibility`.
+:doc:`slurm-compatibility`. To add your own commands to the CLI, see
+:doc:`plugins`.
