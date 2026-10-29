@@ -9,6 +9,7 @@ pub mod audit_metrics;
 pub mod auth;
 pub mod burst_buffer;
 pub mod config;
+pub mod cpu_topology;
 pub mod dependency;
 pub mod end_reason;
 pub mod gpu_request;
