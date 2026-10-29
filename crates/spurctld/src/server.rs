@@ -5070,6 +5070,7 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
             .collect(),
         generic: r.generic,
         generation: r.generation,
+        topology: None,
     };
     rs.backfill_stable_ids();
     rs
@@ -6004,6 +6005,7 @@ mod tests {
             }],
             generic: Default::default(),
             generation: 42,
+            topology: None,
         };
         let back = proto_to_resource_set(resource_to_proto(&rs));
         assert_eq!(back.generation, 42);

@@ -1197,6 +1197,7 @@ mod tests {
                 .collect(),
             generic: Default::default(),
             generation: 1,
+            topology: None,
         };
         // start with 2 gpus (stable 128,129); job holds stable 129
         let mut node = NodeAllocation::new("n".into(), &mk(&[(0, 128), (1, 129)]));
@@ -1230,6 +1231,7 @@ mod tests {
                 .collect(),
             generic: Default::default(),
             generation: 1,
+            topology: None,
         };
         let mut node = NodeAllocation::new("n".into(), &mk(&[(0, 128), (1, 129)]));
         node.allocate_for_job(7, 0, 0, 0, &[129]).unwrap();
@@ -1323,6 +1325,7 @@ mod tests {
             gpus,
             generic: Default::default(),
             generation: 1,
+            topology: None,
         };
         let mut node = NodeAllocation::new("n".into(), &rs);
         // allocate by stable id 129

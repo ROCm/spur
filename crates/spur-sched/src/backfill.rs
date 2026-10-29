@@ -798,6 +798,7 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
         gpus: Vec::new(),
         generic,
         generation: 0,
+        topology: None,
     }
 }
 

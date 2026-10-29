@@ -3968,6 +3968,7 @@ mod tests {
             gpus,
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         }
     }
 
@@ -4127,6 +4128,7 @@ mod tests {
             gpus: vec![],
             generic: gen_a,
             generation: 0,
+            topology: None,
         };
 
         let mut gen_b = HashMap::new();
@@ -4137,6 +4139,7 @@ mod tests {
             gpus: vec![],
             generic: gen_b,
             generation: 0,
+            topology: None,
         };
 
         let nodes = vec!["n1".to_string(), "n2".to_string()];

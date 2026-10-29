@@ -1336,6 +1336,7 @@ mod tests {
                 .collect(),
             generic: Default::default(),
             generation: 0,
+            topology: None,
         }
     }
 

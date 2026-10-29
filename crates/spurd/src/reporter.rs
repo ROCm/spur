@@ -648,6 +648,7 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         generic: generic_from_registry(registry),
         // Bumped by the periodic refresh task on topology rebuild, not here.
         generation: 0,
+        topology: None,
     }
 }
 
@@ -1356,6 +1357,7 @@ mod tests {
             gpus,
             generic: Default::default(),
             generation: 0,
+            topology: None,
         };
         let two = rs(vec![g(0, 128), g(1, 129)]);
         let three = rs(vec![g(0, 128), g(1, 129), g(2, 130)]);
@@ -1402,6 +1404,7 @@ mod tests {
             gpus,
             generic: Default::default(),
             generation,
+            topology: None,
         }
     }
 
@@ -1577,6 +1580,7 @@ mod tests {
             gpus: vec![],
             generic: Default::default(),
             generation: 1,
+            topology: None,
         };
         let reporter = test_reporter(base.clone());
         // same content, different generation -> not a change

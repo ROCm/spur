@@ -8734,7 +8734,7 @@ impl ClusterManager {
             node.weight = nc.weight;
             node.total_resources =
                 node.detected_resources
-                    .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb);
+                    .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb, 0);
             // An unset memory cap prevents config validation from detecting this
             // scheduling stall until the agent reports its inventory.
             if node.total_resources.memory_mb == 0 && node.detected_resources.memory_mb > 0 {
@@ -13184,6 +13184,7 @@ mod tests {
             gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
             generic: Default::default(),
             generation: 0,
+            topology: None,
         };
         {
             let node = cm.get_node("n1").unwrap();

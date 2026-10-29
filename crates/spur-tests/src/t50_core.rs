@@ -1415,6 +1415,7 @@ address = "http://peer-a:6817"
             gpus: vec![],
             generic: std::collections::HashMap::new(),
             generation: 0,
+            topology: None,
         };
         let alloc = ResourceAllocations::with_scalar(60, 200000);
         let required = ResourceSet {
@@ -1423,6 +1424,7 @@ address = "http://peer-a:6817"
             gpus: vec![],
             generic: std::collections::HashMap::new(),
             generation: 0,
+            topology: None,
         };
 
         assert!(total.can_satisfy(&required));

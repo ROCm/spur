@@ -16881,6 +16881,7 @@ mod tests {
                 }],
                 generic: Default::default(),
                 generation: 7,
+                topology: None,
             },
             spur_net::NodeAddress {
                 ip: "127.0.0.1".into(),
