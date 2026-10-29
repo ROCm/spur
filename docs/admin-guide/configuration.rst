@@ -705,11 +705,13 @@ The limit measures the client, not the job. A busy job whose client is gone is
 reaped, and so is one whose client is only stopped, such as a foreground
 ``srun`` suspended with Ctrl-Z or paused in a debugger. A client whose keepalive
 fails rebuilds its connection and retries at once, re-running the auth
-handshake and moving on to the next configured controller when one cannot be
-reached, so a controller restart or failover does not reap a session whose
-client is still running. A controller that accepts connections but cannot reach
-the leader is not skipped: if it stays cut off for longer than the limit, the
-sessions whose clients connect to it are reaped.
+handshake. It tries each configured controller and keeps a connection only
+after that controller accepts the keepalive, so a controller that accepts the
+dial but cannot reach the leader is skipped in favor of one that can serve the
+ping. A controller restart, or a follower cut off from the leader, does not
+reap a session whose client can still reach a controller that accepts the
+keepalive. The session is reaped when every configured controller rejects it
+for the whole limit.
 
 Each keepalive carries the caller's credential. Under ``plugin = "jwt"`` that
 is the user's token, and an expired token is refused even in ``permissive``
