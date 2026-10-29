@@ -55,6 +55,7 @@ struct StepdLaunchOptions {
     cred_id: String,
     cred_kid: String,
     cred_digest: String,
+    pty_step_id: Option<spur_core::step::StepId>,
 }
 
 /// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
@@ -251,6 +252,7 @@ async fn launch_stepd(
     launch_spec.cred_id = options.cred_id;
     launch_spec.cred_kid = options.cred_kid;
     launch_spec.cred_digest = options.cred_digest;
+    launch_spec.pty_step_id = options.pty_step_id;
     let store = crate::stepd::StepdStore::new(state_dir);
     let intended_session_dir = store.session_dir(config.job_id, run_attempt, launch_spec.step_id);
     let session_dir = store
@@ -273,6 +275,7 @@ async fn launch_stepd(
     descriptor.cred_id = launch_spec.cred_id.clone();
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
+    descriptor.pty_step_id = launch_spec.pty_step_id;
     let namespaces = launch_namespaces(config, nix::unistd::geteuid().is_root());
     descriptor.has_pid_namespace = namespaces.pid;
     descriptor.has_user_namespace = namespaces.user;
@@ -1072,6 +1075,7 @@ async fn run_completion_hooks_and_report(
                 drain: drain.as_ref(),
                 step_id: None,
                 node_token: String::new(),
+                pty_step_id: None,
             },
         )
         .await;
@@ -1772,6 +1776,7 @@ async fn settle_recovered_stepd(
         exit_code,
         signal,
         epilog_failed,
+        pty_step_id: descriptor.pty_step_id,
     })
 }
 
@@ -1885,6 +1890,7 @@ pub(crate) fn monitor_recovered_stepds(
                         }),
                         step_id: Some(completion.step_id),
                         node_token: reporter.node_token(),
+                        pty_step_id: completion.pty_step_id,
                     },
                 )
                 .await
@@ -2045,6 +2051,7 @@ async fn fence_dead_stepd(
             drain: None,
             step_id: Some(descriptor.step_id),
             node_token: reporter.node_token(),
+            pty_step_id: descriptor.pty_step_id,
         },
     )
     .await;
@@ -2207,6 +2214,7 @@ async fn handle_completion_notification(
                     }),
                     step_id: Some(step_id),
                     node_token: context.reporter.node_token(),
+                    pty_step_id: descriptor.pty_step_id,
                 },
             )
             .await;
@@ -2276,6 +2284,7 @@ pub async fn replay_unacknowledged_stepd_completions(
                 }),
                 step_id: Some(completion.step_id),
                 node_token: node_token.to_string(),
+                pty_step_id: completion.pty_step_id,
             },
         )
         .await
@@ -4036,6 +4045,7 @@ impl AgentService {
                 cred_id: persist_cred.0,
                 cred_kid: persist_cred.1,
                 cred_digest: persist_cred.2,
+                pty_step_id: None,
             },
             &admission,
         )
@@ -4128,6 +4138,7 @@ impl AgentService {
         &self,
         job_id: u32,
         run_attempt: u32,
+        pty_step_id: spur_core::step::StepId,
         cfg: &executor::JobLaunchConfig,
         container_rootfs_mode: Option<crate::container::RootfsMode>,
     ) -> Result<
@@ -4177,6 +4188,7 @@ impl AgentService {
                 cred_id: String::new(),
                 cred_kid: String::new(),
                 cred_digest: String::new(),
+                pty_step_id: Some(pty_step_id),
             },
             &admission,
         )
@@ -4979,6 +4991,8 @@ pub(crate) struct CompletionReport<'a> {
     /// Node-identity token. The controller verifies it only on the server-side
     /// standalone-PTY completion path, so a report with no step may leave it empty.
     pub node_token: String,
+    /// See [`crate::stepd::StepdDescriptor::pty_step_id`].
+    pub pty_step_id: Option<spur_core::step::StepId>,
 }
 
 pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
@@ -4991,6 +5005,7 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
         drain,
         step_id,
         node_token,
+        pty_step_id,
     } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
@@ -5027,6 +5042,7 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
                 reporting_node: reporting_node.to_string(),
                 run_attempt,
                 node_token,
+                pty_step_id,
             };
             client.report_job_status(req).await.map_err(|e| {
                 warn!(
@@ -5886,6 +5902,7 @@ impl SlurmAgent for AgentService {
                     cred_id: persist_cred.0,
                     cred_kid: persist_cred.1,
                     cred_digest: persist_cred.2,
+                    pty_step_id: None,
                 },
                 &admission,
             )
@@ -6673,6 +6690,7 @@ impl SlurmAgent for AgentService {
                     cred_id: String::new(),
                     cred_kid: String::new(),
                     cred_digest: String::new(),
+                    pty_step_id: None,
                 },
                 &admission,
             )
@@ -8560,6 +8578,7 @@ impl SlurmAgent for AgentService {
                         .launch_interactive_step(
                             init.job_id,
                             run_attempt,
+                            init.step_id,
                             &cfg,
                             container_rootfs_mode,
                         )
@@ -10575,6 +10594,7 @@ mod tests {
                 cred_id: String::new(),
                 cred_kid: String::new(),
                 cred_digest: String::new(),
+                pty_step_id: None,
             },
             &wrong,
         )
@@ -11144,6 +11164,7 @@ mod tests {
                 exit_code: 0,
                 signal: 0,
                 epilog_failed: false,
+                pty_step_id: None,
             })
             .expect("acknowledge completion");
 
@@ -11665,6 +11686,46 @@ mod tests {
             0,
             "an acknowledged report leaves nothing for the replay loop"
         );
+    }
+
+    // After a restart the replay loop is all that reports a session's exit, so
+    // the numbered step has to come back from disk with the rest of it.
+    #[tokio::test]
+    async fn a_replayed_interactive_session_exit_names_its_numbered_step() {
+        const SLOT: spur_core::step::StepId = spur_core::step::STEP_INTERACTIVE;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            SLOT,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            store.session_dir(42, 7, SLOT).join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.pty_step_id = Some(3);
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(42, 7, SLOT)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 1,
+            })
+            .expect("record exit");
+
+        let replayed =
+            replay_unacknowledged_stepd_completions(&store, &controller_addr, "test-node", "")
+                .await
+                .expect("replay");
+
+        assert_eq!(replayed, vec![(42, 7, SLOT)]);
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].step_id, Some(SLOT));
+        assert_eq!(reports[0].pty_step_id, Some(3));
     }
 
     #[tokio::test]
@@ -12487,6 +12548,57 @@ mod tests {
                 signal: 0,
             }
         );
+    }
+
+    // Every `srun --pty` in a job runs in the one interactive slot, so only the
+    // numbered step tells the controller which session's shell exited.
+    #[tokio::test]
+    async fn an_interactive_sessions_exit_report_names_its_numbered_step() {
+        const SLOT: spur_core::step::StepId = spur_core::step::STEP_INTERACTIVE;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let (context, _running, sessions, _state_dir, _completions) =
+            completion_listener_fixture_for_step(&controller_addr, SLOT).await;
+        sessions
+            .lock()
+            .await
+            .get_mut(&(42, SLOT))
+            .expect("tracked session")
+            .pty_step_id = Some(3);
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::stepd::AgentNotification::StepdCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            step_id: SLOT,
+            exit_code: 0,
+            signal: 1,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::stepd::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1, "the session's exit is reported once");
+        assert_eq!(reports[0].step_id, Some(SLOT));
+        assert_eq!(reports[0].pty_step_id, Some(3));
     }
 
     async fn completion_listener_fixture(

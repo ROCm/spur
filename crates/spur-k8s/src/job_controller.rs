@@ -396,6 +396,7 @@ async fn report_pod_released(ctx: &JobControllerCtx, job_id: u32, pod: &Pod) {
         reporting_node,
         run_attempt: 0,
         node_token: String::new(),
+        pty_step_id: None,
     };
     let result = ctx
         .ctrl_client
@@ -700,6 +701,7 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     // controller-side staleness check for this report.
                     run_attempt: 0,
                     node_token: String::new(),
+                    pty_step_id: None,
                 };
                 if let Err(e) = ctrl
                     .call(|mut c| async move { c.report_job_status(req).await })

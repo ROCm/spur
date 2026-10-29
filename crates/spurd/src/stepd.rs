@@ -98,6 +98,8 @@ pub struct StepdLaunchSpec {
     pub cred_kid: String,
     #[serde(default)]
     pub cred_digest: String,
+    #[serde(default)]
+    pub pty_step_id: Option<spur_core::step::StepId>,
 }
 
 /// Everything the supervisor needs to host its own PMIx server. The agent builds
@@ -231,6 +233,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             cred_id: String::new(),
             cred_kid: String::new(),
             cred_digest: String::new(),
+            pty_step_id: None,
         })
     }
 }
@@ -932,6 +935,11 @@ pub struct StepdDescriptor {
     pub cred_kid: String,
     #[serde(default)]
     pub cred_digest: String,
+    /// For an interactive session, the numbered step its `srun --pty`
+    /// invocation created. Every invocation in a job shares the interactive
+    /// slot, so the exit report needs this to say which one ended.
+    #[serde(default)]
+    pub pty_step_id: Option<spur_core::step::StepId>,
 }
 
 impl StepdDescriptor {
@@ -973,6 +981,7 @@ impl StepdDescriptor {
             cred_id: String::new(),
             cred_kid: String::new(),
             cred_digest: String::new(),
+            pty_step_id: None,
         }
     }
 
@@ -2179,6 +2188,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.cred_id = launch_spec.cred_id.clone();
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
+    descriptor.pty_step_id = launch_spec.pty_step_id;
     store.publish(&descriptor)?;
     // Custody of an interactive session's pty master outlives the agent that
     // created it, so the terminal survives a restart and can be picked back up.
@@ -2332,6 +2342,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         session.await_pty_handoff(pty_handoff);
     }
     let capability = descriptor.capability.clone();
+    let pty_step_id = descriptor.pty_step_id;
     // An allocation's supervisor never launches, so it holds no cgroup of its
     // own — but the agent made one and recorded it, and it still has to go.
     let recorded_cgroup =
@@ -2452,6 +2463,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             exit_code,
             signal,
             epilog_failed,
+            pty_step_id,
         })?;
     }
     Ok(exit_code)
@@ -2498,6 +2510,7 @@ pub struct PendingStepdCompletion {
     pub exit_code: i32,
     pub signal: i32,
     pub epilog_failed: bool,
+    pub pty_step_id: Option<spur_core::step::StepId>,
 }
 
 #[derive(Clone)]
@@ -2809,6 +2822,7 @@ impl StepdStore {
                     exit_code,
                     signal,
                     epilog_failed,
+                    pty_step_id: descriptor.pty_step_id,
                 });
             }
         }
@@ -3777,6 +3791,7 @@ mod tests {
             cred_id: String::new(),
             cred_kid: String::new(),
             cred_digest: String::new(),
+            pty_step_id: None,
         }
     }
 
@@ -4584,6 +4599,7 @@ mod tests {
                 exit_code: 7,
                 signal: 0,
                 epilog_failed: false,
+                pty_step_id: None,
             })
             .expect("acknowledge completion");
         assert_eq!(
@@ -5402,6 +5418,15 @@ mod tests {
     /// Supervise `step_id` for real and return the notice spurd receives. The
     /// epilog cannot spawn, so whether it ran shows up as `epilog_failed`.
     async fn supervised_completion_notice(step_id: spur_core::step::StepId) -> AgentNotification {
+        supervise_allocation(step_id, None).await.1
+    }
+
+    /// [`supervised_completion_notice`], also returning the descriptor the
+    /// supervisor published for itself while it ran.
+    async fn supervise_allocation(
+        step_id: spur_core::step::StepId,
+        pty_step_id: Option<spur_core::step::StepId>,
+    ) -> (StepdDescriptor, AgentNotification) {
         let state_dir = tempfile::tempdir().expect("state dir");
         let store = StepdStore::new(state_dir.path());
         create_private_dir_all(store.root()).expect("create runtime dir");
@@ -5434,6 +5459,7 @@ mod tests {
                 .display()
                 .to_string(),
         );
+        spec.pty_step_id = pty_step_id;
         let capability = spec.capability.clone();
         let spec_path = state_dir.path().join("launch.json");
         fs::write(&spec_path, serde_json::to_vec(&spec).expect("encode spec"))
@@ -5447,22 +5473,24 @@ mod tests {
         ];
         let supervisor = tokio::spawn(async move { run_process(&args).await });
 
-        let socket_path = store
-            .session_dir(job_id, run_attempt, step_id)
-            .join("runtime.sock");
+        // The supervisor binds its socket before it publishes, so this covers both.
+        let session_dir = store.session_dir(job_id, run_attempt, step_id);
+        let mut published = None;
         for _ in 0..10_000 {
-            if socket_path.exists() {
+            if let Ok(descriptor) = store.load_descriptor(&session_dir) {
+                published = Some(descriptor);
                 break;
             }
             tokio::task::yield_now().await;
         }
+        let published = published.expect("the supervisor publishes its descriptor");
         let mut descriptor = StepdDescriptor::new(
             job_id,
             run_attempt,
             step_id,
             0,
             0,
-            socket_path,
+            session_dir.join("runtime.sock"),
             PathBuf::new(),
         );
         descriptor.capability = capability;
@@ -5474,7 +5502,15 @@ mod tests {
             .await
             .expect("supervisor task")
             .expect("supervisor exits cleanly");
-        agent.await.expect("agent task")
+        (published, agent.await.expect("agent task"))
+    }
+
+    // spurd's provisional descriptor is replaced by the one the supervisor
+    // publishes from its launch spec, which must keep the session's step.
+    #[tokio::test]
+    async fn the_supervisor_publishes_the_pty_step_it_was_launched_for() {
+        let (published, _) = supervise_allocation(spur_core::step::STEP_INTERACTIVE, Some(4)).await;
+        assert_eq!(published.pty_step_id, Some(4));
     }
 
     // The node epilog is per-job-per-node: a numbered step re-running it would

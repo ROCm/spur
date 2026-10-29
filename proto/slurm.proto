@@ -1613,6 +1613,11 @@ message ReportJobStatusRequest {
   // when node-identity enforcement is on, and only for the server-side
   // standalone-PTY completion path; empty from a legacy agent.
   string node_token = 11;
+  // For an interactive session's report (step_id = the interactive step), the
+  // numbered step its `srun --pty` invocation created. Every invocation in a
+  // job shares the interactive step id, so this names which one exited.
+  // Absent from a legacy agent.
+  optional uint32 pty_step_id = 12;
 }
 
 // ============================================================

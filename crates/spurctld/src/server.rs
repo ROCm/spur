@@ -1340,6 +1340,59 @@ impl ControllerService {
         }
         Ok(())
     }
+
+    /// A standalone `srun --pty` job ends when its shell does, without relying
+    /// on a client that may be gone. A rejected report reads as handled, since
+    /// spurd replays an error for its lifetime; a failed write is `Unavailable`,
+    /// so the node keeps the report and replays it.
+    fn finish_standalone_pty_on_report(&self, req: &ReportJobStatusRequest) -> Result<(), Status> {
+        if req.reporting_node.is_empty() || req.step_id != Some(spur_core::step::STEP_INTERACTIVE) {
+            return Ok(());
+        }
+        // Every session in a job shares the interactive step, so an agent too
+        // old to name its session's own step leaves the job to its client.
+        let Some(step_id) = req.pty_step_id else {
+            return Ok(());
+        };
+        if self
+            .verify_node_identity(&req.reporting_node, &req.node_token)
+            .is_err()
+        {
+            warn!(
+                job_id = req.job_id,
+                node = %req.reporting_node,
+                "interactive session report failed node identity; leaving the job to its client"
+            );
+            return Ok(());
+        }
+        let exit = crate::cluster::PtySessionExit {
+            job_id: req.job_id,
+            run_attempt: req.run_attempt,
+            step_id,
+            node: &req.reporting_node,
+            exit_code: req.exit_code,
+            signal: req.signal,
+        };
+        let outcome = self.cluster.finish_standalone_pty(exit).map_err(|e| {
+            warn!(
+                job_id = req.job_id,
+                step_id,
+                error = %e,
+                "failed to record an interactive session's exit; the node will retry"
+            );
+            Status::unavailable(format!(
+                "failed to record the exit of step {}.{step_id}: {e}",
+                req.job_id
+            ))
+        })?;
+        if let crate::cluster::PtyExitOutcome::JobFinished(job) = outcome {
+            let cluster = self.cluster.clone();
+            tokio::spawn(async move {
+                crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job).await;
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Whether a runtime recovery report came from a node that proved its identity.
@@ -2519,40 +2572,8 @@ impl SlurmController for ControllerService {
             None
         };
 
-        // A standalone `srun --pty` job ends when its shell does, without relying
-        // on a client that may be gone. A bad token (enforcing mode only) is
-        // dropped silently: an error would make spurd replay the report forever.
-        if !req.reporting_node.is_empty() && req.step_id == Some(spur_core::step::STEP_INTERACTIVE)
-        {
-            let token_ok = !self.enforces_node_identity()
-                || self
-                    .verify_node_identity(&req.reporting_node, &req.node_token)
-                    .is_ok();
-            if !token_ok {
-                warn!(
-                    job_id = req.job_id,
-                    node = %req.reporting_node,
-                    "interactive session report failed node identity; leaving the job to its client"
-                );
-            }
-            if token_ok {
-                if let crate::cluster::PtyExitOutcome::JobFinished(job) =
-                    self.cluster.finish_standalone_pty(
-                        req.job_id,
-                        &req.reporting_node,
-                        req.exit_code,
-                        req.signal,
-                        req.run_attempt,
-                    )
-                {
-                    let cluster = self.cluster.clone();
-                    tokio::spawn(async move {
-                        crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job)
-                            .await;
-                    });
-                }
-            }
-        }
+        // Surfaced only after the drain below, so a failed write cannot hold it up.
+        let pty_exit = self.finish_standalone_pty_on_report(&req);
 
         if req.drain_node && !req.reporting_node.is_empty() {
             warn!(
@@ -2576,6 +2597,8 @@ impl SlurmController for ControllerService {
                 );
             }
         }
+
+        pty_exit?;
 
         use crate::cluster::NodeCompleteResult;
 
@@ -7719,22 +7742,32 @@ mod tests {
         (job_id, run_attempt)
     }
 
-    // The admission docs promise that, under token admission, only the job's own
-    // node can finish a standalone PTY job; anything else must read as handled.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_keyed_token_cluster_finishes_a_pty_job_only_on_its_nodes_credential() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let svc = test_service_with_token_admission(&dir).await;
-        let (job_id, run_attempt) = running_standalone_pty_job(&svc).await;
-        let report = |node_token: String| ReportJobStatusRequest {
+    /// n1's report that the job's shell (step 0) exited cleanly.
+    fn shell_exit_report(
+        job_id: u32,
+        run_attempt: u32,
+        node_token: String,
+    ) -> ReportJobStatusRequest {
+        ReportJobStatusRequest {
             job_id,
             state: JobState::Completed.to_proto_i32(),
             reporting_node: "n1".into(),
             run_attempt,
             step_id: Some(spur_core::step::STEP_INTERACTIVE),
             node_token,
+            pty_step_id: Some(0),
             ..Default::default()
-        };
+        }
+    }
+
+    // Under token admission a session-exit report acts only on the reporting
+    // node's own credential; a rejected one must still read as handled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_keyed_token_cluster_acts_on_a_pty_exit_report_only_with_its_nodes_credential() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_token_admission(&dir).await;
+        let (job_id, run_attempt) = running_standalone_pty_job(&svc).await;
+        let report = |node_token: String| shell_exit_report(job_id, run_attempt, node_token);
 
         let other = spur_core::admission::generate_node_token("n2", svc.jwt_key.as_bytes())
             .expect("node token");
@@ -7763,6 +7796,50 @@ mod tests {
         assert_eq!(
             svc.cluster.get_job(job_id).map(|j| j.state),
             Some(JobState::Completed)
+        );
+    }
+
+    // Every session in a job reports under the interactive step, so a report
+    // that cannot say which one exited must not end the job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pty_exit_report_without_its_step_is_left_to_the_client() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (job_id, run_attempt) = running_standalone_pty_job(&svc).await;
+
+        svc.report_job_status(Request::new(ReportJobStatusRequest {
+            pty_step_id: None,
+            ..shell_exit_report(job_id, run_attempt, String::new())
+        }))
+        .await
+        .expect("a legacy agent's report is not an error");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).map(|j| j.state),
+            Some(JobState::Running)
+        );
+        let shell = svc.cluster.get_step(job_id, 0).expect("shell step");
+        assert!(!shell.state.is_terminal());
+    }
+
+    // spurd keeps a report only while the controller answers with an error, so
+    // a write the controller could not commit must not read as handled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pty_exit_report_whose_write_fails_is_retryable() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (job_id, run_attempt) = running_standalone_pty_job(&svc).await;
+        svc.raft.raft.shutdown().await.expect("stop raft");
+
+        let error = svc
+            .finish_standalone_pty_on_report(&shell_exit_report(job_id, run_attempt, String::new()))
+            .expect_err("the write cannot commit");
+
+        assert_eq!(error.code(), Code::Unavailable);
+        assert!(spur_proto::controller_rpc_retryable(&error));
+        assert_eq!(
+            svc.cluster.get_job(job_id).map(|j| j.state),
+            Some(JobState::Running)
         );
     }
 

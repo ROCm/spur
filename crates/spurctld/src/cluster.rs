@@ -133,6 +133,24 @@ impl std::fmt::Display for RegisterNodeError {
 
 impl std::error::Error for RegisterNodeError {}
 
+/// A node's report that one `srun --pty` session's shell exited.
+#[derive(Debug, Clone, Copy)]
+pub struct PtySessionExit<'a> {
+    pub job_id: JobId,
+    pub run_attempt: u32,
+    /// The numbered step the session's `srun --pty` invocation created.
+    pub step_id: u32,
+    pub node: &'a str,
+    pub exit_code: i32,
+    pub signal: i32,
+}
+
+/// What a session-exit report may still act on.
+struct PtyExitTarget {
+    step_open: bool,
+    ends_job: bool,
+}
+
 /// Outcome of a server-side standalone-PTY completion report
 /// ([`ClusterManager::finish_standalone_pty`]).
 #[derive(Debug)]
@@ -2134,101 +2152,40 @@ impl ClusterManager {
     /// a lost client cannot strand the allocation. Driven by the node's
     /// completion report (reserved interactive step), not by the client.
     ///
-    /// Never errors: spurd replays any error forever, so every rejected report
-    /// must read as handled — the client-driven path remains the fallback.
+    /// A rejected report is `Ok(Ignored)`: spurd replays an error for its
+    /// lifetime, and the client-driven path remains the fallback. An error
+    /// means a write failed, so the node's replay can still finish the job.
     pub fn finish_standalone_pty(
         &self,
-        job_id: JobId,
-        reporting_node: &str,
-        exit_code: i32,
-        signal: i32,
-        run_attempt: u32,
-    ) -> PtyExitOutcome {
-        let (primary_step, step_to_close) = {
-            let jobs = self.jobs.read();
-            let Some(job) = jobs.get(&job_id) else {
-                return PtyExitOutcome::Ignored;
-            };
-            // Only a standalone srun --pty allocation is finished by its shell's
-            // exit. A salloc parent (interactive) and a batch parent keep their
-            // own lifecycle; a `--jobid ... --pty` step inside one closes without
-            // ending the parent.
-            if !(job.spec.srun_job
-                && job.spec.pty
-                && !job.spec.interactive
-                && job.srun_step_dispatch)
-            {
-                return PtyExitOutcome::Ignored;
-            }
-            // Act only on the live run. COMPLETING (scancel), SUSPENDED, and a
-            // PENDING preempt-requeue (where run_attempt still matches) must not
-            // be force-finished here.
-            if job.state != JobState::Running {
-                return PtyExitOutcome::Ignored;
-            }
-            if run_attempt == 0 || run_attempt != job.run_attempt {
-                return PtyExitOutcome::Ignored;
-            }
-            if !job.allocated_nodes.iter().any(|n| n == reporting_node) {
-                return PtyExitOutcome::Ignored;
-            }
-
-            let steps = self.steps.read();
-            // The standalone shell is the job's first user step; any later PTY
-            // step is an overlapping `--jobid ... --pty` session, which must close
-            // on its own without ending the job. A first step logged before the
-            // `pty` flag existed reads back as non-PTY, so such a job has no
-            // primary here and is left to the client path.
-            let primary = steps
-                .values()
-                .filter(|s| s.job_id == job_id && spur_core::step::is_user_step(s.step_id))
-                .min_by_key(|s| s.step_id)
-                .filter(|s| s.pty)
-                .map(|s| s.step_id);
-            // A PTY session runs only on its step's first node (`create_job_step`
-            // dispatches it there), though the step may list every node it was
-            // given; matching on membership would let a second session's exit
-            // end the primary shell. Only one session per job and node can be
-            // live, so any other live PTY step there is a stale attempt and the
-            // lowest id is the one that ran.
-            let to_close = steps
-                .values()
-                .filter(|s| {
-                    s.job_id == job_id
-                        && s.pty
-                        && !s.state.is_terminal()
-                        && s.nodes.first().is_some_and(|n| n == reporting_node)
-                })
-                .map(|s| s.step_id)
-                .min();
-            (primary, to_close)
-        };
-
-        // No live PTY step on the node means the report is a duplicate or replay
-        // of one already settled — idempotent no-op.
-        let Some(step_id) = step_to_close else {
-            return PtyExitOutcome::Ignored;
+        exit: PtySessionExit<'_>,
+    ) -> anyhow::Result<PtyExitOutcome> {
+        let Some(target) = self.pty_exit_target(&exit) else {
+            return Ok(PtyExitOutcome::Ignored);
         };
 
         // spurstepd flags an OOM kill in the step's cgroup with a sentinel bit in
         // the signal; strip it, and report the job as OOM like the per-node path.
-        let oom = signal & spur_core::job::OOM_SIGNAL_FLAG != 0;
-        let signal = signal & !spur_core::job::OOM_SIGNAL_FLAG;
+        let oom = exit.signal & spur_core::job::OOM_SIGNAL_FLAG != 0;
+        let signal = exit.signal & !spur_core::job::OOM_SIGNAL_FLAG;
         // A signal death carries no exit code; report it the shell way (128 +
         // signal), matching what the client records, so SIGHUP reads as 129 not 0.
-        let effective_exit = if signal != 0 { 128 + signal } else { exit_code };
+        let effective_exit = if signal != 0 {
+            128 + signal
+        } else {
+            exit.exit_code
+        };
 
         // Close the step as the client's own CompleteJobStep would, so its exit
         // reaches DerivedExitCode whichever report lands first.
-        if let Err(e) = self.record_step_complete(job_id, step_id, effective_exit) {
-            warn!(job_id, step_id, error = %e, "failed to record PTY step completion");
+        if target.step_open {
+            self.record_step_complete(exit.job_id, exit.step_id, effective_exit)?;
         }
-        if Some(step_id) != primary_step {
-            return PtyExitOutcome::StepClosed;
+        if !target.ends_job {
+            return Ok(PtyExitOutcome::StepClosed);
         }
 
-        let Some(job) = self.get_job(job_id) else {
-            return PtyExitOutcome::Ignored;
+        let Some(job) = self.get_job(exit.job_id) else {
+            return Ok(PtyExitOutcome::Ignored);
         };
         let state = if oom {
             JobState::OutOfMemory
@@ -2237,11 +2194,71 @@ impl ClusterManager {
         } else {
             JobState::Failed
         };
-        if let Err(e) = self.complete_job(job_id, effective_exit, state) {
-            warn!(job_id, error = %e, "failed to finish standalone PTY job on shell exit");
-            return PtyExitOutcome::Ignored;
+        if let Err(e) = self.complete_job(exit.job_id, effective_exit, state) {
+            // The client's own CompleteJob or a cancel finished it first.
+            if self
+                .get_job(exit.job_id)
+                .is_some_and(|j| j.state.is_terminal())
+            {
+                return Ok(PtyExitOutcome::Ignored);
+            }
+            return Err(e);
         }
-        PtyExitOutcome::JobFinished(Box::new(job))
+        Ok(PtyExitOutcome::JobFinished(Box::new(job)))
+    }
+
+    /// What a session-exit report may still act on, or `None` to drop it.
+    fn pty_exit_target(&self, exit: &PtySessionExit<'_>) -> Option<PtyExitTarget> {
+        let jobs = self.jobs.read();
+        let job = jobs.get(&exit.job_id)?;
+        // Only a standalone srun --pty allocation is finished by its shell's
+        // exit. A salloc parent (interactive) and a batch parent keep their
+        // own lifecycle; a `--jobid ... --pty` step inside one closes without
+        // ending the parent.
+        if !(job.spec.srun_job && job.spec.pty && !job.spec.interactive && job.srun_step_dispatch) {
+            return None;
+        }
+        // Act only on the live run. COMPLETING (scancel), SUSPENDED, and a
+        // PENDING preempt-requeue (where run_attempt still matches) must not
+        // be force-finished here.
+        if job.state != JobState::Running {
+            return None;
+        }
+        if exit.run_attempt == 0 || exit.run_attempt != job.run_attempt {
+            return None;
+        }
+        if !job.allocated_nodes.iter().any(|n| n == exit.node) {
+            return None;
+        }
+
+        let steps = self.steps.read();
+        let step = steps.get(&(exit.job_id, exit.step_id))?;
+        // A PTY session runs on its step's first node (`create_job_step`
+        // dispatches it there), so no other node can report its exit.
+        if !step.pty || step.nodes.first().map(String::as_str) != Some(exit.node) {
+            return None;
+        }
+        // The standalone shell is the job's first user step; any later PTY
+        // step is an overlapping `--jobid ... --pty` session, which closes on
+        // its own without ending the job. A first step logged before the `pty`
+        // flag existed reads back as non-PTY, so that job is left to its client.
+        let ends_job = steps
+            .values()
+            .filter(|s| s.job_id == exit.job_id && spur_core::step::is_user_step(s.step_id))
+            .map(|s| s.step_id)
+            .min()
+            == Some(exit.step_id);
+        let step_open = !step.state.is_terminal();
+        // A closed overlapping step makes this a replay. A closed shell step on a
+        // running job does not: the job's own write failed, or the client closed
+        // the step and was lost before it finished the job.
+        if !step_open && !ends_job {
+            return None;
+        }
+        Some(PtyExitTarget {
+            step_open,
+            ends_job,
+        })
     }
 
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
@@ -33062,6 +33079,24 @@ mod tests {
         add_step(cm, id, step_id, nodes, true);
     }
 
+    /// `node`'s report that step `step_id`'s session exited cleanly in run
+    /// attempt 1; a test overrides whatever it exercises.
+    fn session_exit(id: JobId, step_id: u32, node: &str) -> PtySessionExit<'_> {
+        PtySessionExit {
+            job_id: id,
+            run_attempt: 1,
+            step_id,
+            node,
+            exit_code: 0,
+            signal: 0,
+        }
+    }
+
+    fn finish_pty(cm: &ClusterManager, exit: PtySessionExit<'_>) -> PtyExitOutcome {
+        cm.finish_standalone_pty(exit)
+            .expect("the report's writes commit")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_standalone_pty_completes_the_job_on_a_clean_shell_exit() {
         let dir = TempDir::new().unwrap();
@@ -33071,7 +33106,7 @@ mod tests {
         start_pty_job(&cm, id, &["n1"], 1);
         add_pty_step(&cm, id, 0, &["n1"]);
 
-        let outcome = cm.finish_standalone_pty(id, "n1", 0, 0, 1);
+        let outcome = finish_pty(&cm, session_exit(id, 0, "n1"));
         assert!(
             matches!(outcome, PtyExitOutcome::JobFinished(ref job) if job.job_id == id),
             "a standalone PTY's shell exit finishes the job"
@@ -33091,8 +33126,14 @@ mod tests {
 
         // A signal death reports exit_code 0 with the signal set; it must not read
         // as COMPLETED 0.
-        let outcome = cm.finish_standalone_pty(id, "n1", 0, 9, 1);
-        assert!(matches!(outcome, PtyExitOutcome::JobFinished(_)));
+        let exit = PtySessionExit {
+            signal: 9,
+            ..session_exit(id, 0, "n1")
+        };
+        assert!(matches!(
+            finish_pty(&cm, exit),
+            PtyExitOutcome::JobFinished(_)
+        ));
         settle(&cm, id, JobState::Failed);
         assert_eq!(cm.get_job(id).unwrap().exit_code, Some(128 + 9));
     }
@@ -33111,8 +33152,12 @@ mod tests {
             start_pty_job(&cm, id, &["n1"], 1);
             add_pty_step(&cm, id, 0, &["n1"]);
 
+            let report = PtySessionExit {
+                signal,
+                ..session_exit(id, 0, "n1")
+            };
             assert!(matches!(
-                cm.finish_standalone_pty(id, "n1", 0, signal, 1),
+                finish_pty(&cm, report),
                 PtyExitOutcome::JobFinished(_)
             ));
             settle(&cm, id, JobState::OutOfMemory);
@@ -33140,13 +33185,20 @@ mod tests {
 
         assert!(
             matches!(
-                cm.finish_standalone_pty(id, "n2", 0, 0, 1),
+                finish_pty(&cm, session_exit(id, 1, "n2")),
                 PtyExitOutcome::StepClosed
             ),
             "a later session must not stand in for the job's own shell"
         );
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
         assert!(cm.get_step(id, 1).unwrap().state.is_terminal());
+
+        // The legacy shell itself is left to its client.
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33162,7 +33214,7 @@ mod tests {
         add_pty_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 0, 0, 1),
+            finish_pty(&cm, session_exit(id, 0, "n1")),
             PtyExitOutcome::JobFinished(_)
         ));
         settle(&cm, id, JobState::Completed);
@@ -33179,8 +33231,12 @@ mod tests {
 
         // The node's report usually beats the client's CompleteJobStep, which then
         // finds the step closed; the step's exit must still reach the job.
+        let exit = PtySessionExit {
+            exit_code: 7,
+            ..session_exit(id, 0, "n1")
+        };
         assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 7, 0, 1),
+            finish_pty(&cm, exit),
             PtyExitOutcome::JobFinished(_)
         ));
         settle(&cm, id, JobState::Failed);
@@ -33203,7 +33259,7 @@ mod tests {
         add_pty_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 0, 0, 1),
+            finish_pty(&cm, session_exit(id, 0, "n1")),
             PtyExitOutcome::Ignored
         ));
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
@@ -33216,9 +33272,10 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_spec("srun-nonpty"));
         start_pty_job(&cm, id, &["n1"], 1);
+        add_pty_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 0, 0, 1),
+            finish_pty(&cm, session_exit(id, 0, "n1")),
             PtyExitOutcome::Ignored
         ));
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
@@ -33234,14 +33291,13 @@ mod tests {
         add_pty_step(&cm, id, 0, &["n1"]);
 
         // A report for a superseded attempt (and the unset 0) is dropped.
-        assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 0, 0, 1),
-            PtyExitOutcome::Ignored
-        ));
-        assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 0, 0, 0),
-            PtyExitOutcome::Ignored
-        ));
+        for run_attempt in [1, 0] {
+            let exit = PtySessionExit {
+                run_attempt,
+                ..session_exit(id, 0, "n1")
+            };
+            assert!(matches!(finish_pty(&cm, exit), PtyExitOutcome::Ignored));
+        }
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
     }
 
@@ -33255,7 +33311,7 @@ mod tests {
         add_pty_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
-            cm.finish_standalone_pty(id, "n2", 0, 0, 1),
+            finish_pty(&cm, session_exit(id, 0, "n2")),
             PtyExitOutcome::Ignored
         ));
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
@@ -33277,9 +33333,12 @@ mod tests {
         add_pty_step(&cm, id, 0, &["n1", "n2"]);
         add_pty_step(&cm, id, 1, &["n2"]);
 
-        let outcome = cm.finish_standalone_pty(id, "n2", 2, 0, 1);
+        let overlap = PtySessionExit {
+            exit_code: 2,
+            ..session_exit(id, 1, "n2")
+        };
         assert!(
-            matches!(outcome, PtyExitOutcome::StepClosed),
+            matches!(finish_pty(&cm, overlap), PtyExitOutcome::StepClosed),
             "an overlapping PTY step closes without ending the job"
         );
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
@@ -33287,18 +33346,144 @@ mod tests {
         assert!(!cm.get_step(id, 0).unwrap().state.is_terminal());
 
         // A replay of n2's report must not fall through to the primary step.
-        assert!(matches!(
-            cm.finish_standalone_pty(id, "n2", 2, 0, 1),
-            PtyExitOutcome::Ignored
-        ));
+        assert!(matches!(finish_pty(&cm, overlap), PtyExitOutcome::Ignored));
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
 
         // The primary shell's own exit, on its session node, ends the job.
         assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 0, 0, 1),
+            finish_pty(&cm, session_exit(id, 0, "n1")),
             PtyExitOutcome::JobFinished(_)
         ));
         settle(&cm, id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_applies_a_late_duplicate_only_to_its_own_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-late-duplicate");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // The shell runs on n1; two `--jobid ... -w n2 --pty` sessions then run
+        // one after the other on n2, sharing the job's run attempt.
+        add_pty_step(&cm, id, 0, &["n1"]);
+        add_pty_step(&cm, id, 1, &["n2"]);
+        let first = PtySessionExit {
+            exit_code: 3,
+            ..session_exit(id, 1, "n2")
+        };
+        assert!(matches!(finish_pty(&cm, first), PtyExitOutcome::StepClosed));
+        add_pty_step(&cm, id, 2, &["n2"]);
+
+        assert!(
+            matches!(finish_pty(&cm, first), PtyExitOutcome::Ignored),
+            "a late duplicate of the first session's report must not close the second"
+        );
+        let second = cm.get_step(id, 2).unwrap();
+        assert!(!second.state.is_terminal());
+        assert_eq!(second.exit_code, None);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 2, "n2")),
+            PtyExitOutcome::StepClosed
+        ));
+        assert_eq!(cm.get_step(id, 2).unwrap().exit_code, Some(0));
+        assert_eq!(cm.get_step(id, 1).unwrap().exit_code, Some(3));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_step_that_is_not_the_nodes_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-misaddressed");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        add_pty_step(&cm, id, 0, &["n1"]);
+        add_pty_step(&cm, id, 1, &["n2"]);
+        add_step(&cm, id, 2, &["n1"], false);
+
+        for (step_id, why) in [
+            (1, "another node's session"),
+            (2, "a step that is no PTY session"),
+            (9, "a step the job never created"),
+        ] {
+            assert!(
+                matches!(
+                    finish_pty(&cm, session_exit(id, step_id, "n1")),
+                    PtyExitOutcome::Ignored
+                ),
+                "n1 must not close {why}"
+            );
+        }
+        assert!(!cm.get_step(id, 1).unwrap().state.is_terminal());
+        assert!(!cm.get_step(id, 2).unwrap().state.is_terminal());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_a_job_whose_shell_step_already_closed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-step-closed"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_pty_step(&cm, id, 0, &["n1"]);
+        // The shell's step closed but the job did not: the job's own write failed
+        // after the step's, or the client closed the step and was then lost.
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: id,
+            step_id: 0,
+            exit_code: 3,
+        });
+
+        let exit = PtySessionExit {
+            exit_code: 3,
+            ..session_exit(id, 0, "n1")
+        };
+        assert!(
+            matches!(finish_pty(&cm, exit), PtyExitOutcome::JobFinished(_)),
+            "the node's replay must still finish the job"
+        );
+        settle(&cm, id, JobState::Failed);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.exit_code, Some(3));
+        assert_eq!(job.derived_exit_code, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_returns_a_failed_write_as_an_error() {
+        // A live shell step fails on its own write; one that already closed
+        // fails on the job's, as on a leadership loss between the two.
+        for step_closed in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 4, 8000);
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-write-fails"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_pty_step(&cm, id, 0, &["n1"]);
+            if step_closed {
+                cm.apply_operation(&WalOperation::JobStepComplete {
+                    job_id: id,
+                    step_id: 0,
+                    exit_code: 0,
+                });
+            }
+            let raft = cm.raft.read().clone().expect("raft is set");
+            raft.shutdown().await.expect("stop raft");
+
+            assert!(
+                cm.finish_standalone_pty(session_exit(id, 0, "n1")).is_err(),
+                "a failed write must not read as a handled report, or the node drops it"
+            );
+            assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33311,13 +33496,13 @@ mod tests {
         add_pty_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 0, 0, 1),
+            finish_pty(&cm, session_exit(id, 0, "n1")),
             PtyExitOutcome::JobFinished(_)
         ));
         settle(&cm, id, JobState::Completed);
         // A replayed report for the now-terminal job is a no-op.
         assert!(matches!(
-            cm.finish_standalone_pty(id, "n1", 0, 0, 1),
+            finish_pty(&cm, session_exit(id, 0, "n1")),
             PtyExitOutcome::Ignored
         ));
     }
