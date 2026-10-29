@@ -2541,6 +2541,7 @@ impl SlurmController for ControllerService {
             accepted: true,
             message: "registered".into(),
             node_token: node_token_response,
+            core_layout: None,
         }))
     }
 
@@ -2704,7 +2705,7 @@ impl SlurmController for ControllerService {
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
-            Ok(Response::new(HeartbeatResponse {}))
+            Ok(Response::new(HeartbeatResponse { reregister: false }))
         } else {
             Err(Status::not_found(format!(
                 "node {} not found — is the node registered?",
@@ -5508,6 +5509,9 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         reason_uid: node.reason_uid,
         reason_time: node.reason_time.map(datetime_to_proto),
         agent_port: u32::from(node.port),
+        spec_cpus: String::new(),
+        core_spec_count: 0,
+        mem_spec_mb: 0,
     }
 }
 

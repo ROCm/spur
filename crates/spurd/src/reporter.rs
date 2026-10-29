@@ -311,6 +311,7 @@ impl NodeReporter {
             wg_pubkey: self.wg_pubkey(),
             labels,
             join_token: self.join_token.clone(),
+            topology: None,
         };
         let inner = self
             .with_controller(move |mut client| async move { client.register_agent(req).await })
@@ -399,6 +400,7 @@ impl NodeReporter {
                         install_duration_seconds: install_secs,
                     }
                 }),
+                core_layout_fingerprint: 0,
             };
 
             // Bounded by `with_controller`'s own timeout, so a controller that goes

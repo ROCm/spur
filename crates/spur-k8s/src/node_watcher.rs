@@ -133,6 +133,7 @@ pub async fn run(
                         wg_pubkey: String::new(),
                         labels: std::collections::HashMap::new(),
                         join_token: String::new(),
+                        topology: None,
                     };
 
                     let reg = req.clone();

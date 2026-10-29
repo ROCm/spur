@@ -2201,6 +2201,7 @@ async fn dispatch_to_agent(
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
             execution_credential: params.execution_credential.to_string(),
+            core_layout: None,
         })
         .await
         .map_err(|s| match s.code() {

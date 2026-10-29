@@ -172,4 +172,46 @@ mod tests {
             "Timeout expired"
         )));
     }
+
+    #[test]
+    fn a_register_request_from_an_old_agent_has_no_topology() {
+        use prost::Message;
+        let old = crate::proto::RegisterAgentRequest {
+            hostname: "n1".into(),
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::RegisterAgentRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.topology.is_none());
+    }
+
+    #[test]
+    fn a_core_layout_survives_the_wire() {
+        use prost::Message;
+        let layout = crate::proto::CoreLayout {
+            spec_cpus: vec![127, 255],
+            mem_spec_mb: 16384,
+            gpu_reserved: vec![crate::proto::GpuReservedCpus {
+                stable_id: 7,
+                cpus: vec![0, 128],
+            }],
+            general_cpus: vec![32, 33],
+            daemons_off_spec: true,
+        };
+        let resp = crate::proto::RegisterAgentResponse {
+            accepted: true,
+            core_layout: Some(layout.clone()),
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::RegisterAgentResponse::decode(resp.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.core_layout, Some(layout));
+    }
+
+    #[test]
+    fn an_empty_heartbeat_reply_does_not_ask_to_reregister() {
+        use prost::Message;
+        let decoded = crate::proto::HeartbeatResponse::decode(&[][..]).unwrap();
+        assert!(!decoded.reregister);
+    }
 }
