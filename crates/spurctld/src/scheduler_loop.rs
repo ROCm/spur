@@ -22,6 +22,7 @@ use spur_sched::traits::{Assignment, ClusterState, Scheduler};
 use crate::cluster::{ClusterManager, JobEndFacts, JobFilter};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
+use crate::victim_order::VictimOrder;
 
 /// Upper bound on a single CancelJob RPC (connect + call) when the caller
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
@@ -476,7 +477,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         &reclaimers,
                         &borrow_ids,
                         &cluster_state,
-                        sched_cfg.idle_fill_exempt_secs,
+                        &sched_cfg,
                     )
                     .await;
                     if !freed.is_empty() {
@@ -1259,6 +1260,10 @@ pub(crate) async fn try_preempt(
         .iter()
         .map(|(id, qos)| (*id, qos.priority))
         .collect();
+    let victim_keys = &sched.preempt_victim_order;
+    let owner_standing = cluster
+        .owner_standing_cache()
+        .standings(victim_keys, &running, now);
 
     // Pending job's QOS is resolved once per pending job; used for the
     // QosPriority hierarchy check.
@@ -1366,6 +1371,9 @@ pub(crate) async fn try_preempt(
                     occupants: &occupants,
                     priority: &victim_cost,
                     max_priority: None,
+                    order: owner_standing
+                        .as_ref()
+                        .map(|standing| VictimOrder::new(victim_keys, standing, pending.job_id)),
                 },
                 cluster_nodes,
                 &reservations,
@@ -1503,7 +1511,7 @@ fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
 /// Separate from `try_preempt`: the pool is borrowed runs, an opportunistic
 /// reclaimer sits under a QOS priority ceiling, and the eviction is always
 /// `Requeue`. Both prove the shortfall closes first (D2, §8.1).
-async fn reclaim_for_unplaced(
+pub(crate) async fn reclaim_for_unplaced(
     cluster: &Arc<ClusterManager>,
     unplaced: &[&spur_core::job::Job],
     // Pending jobs that are themselves opportunistic: the stamped borrow candidates.
@@ -1511,8 +1519,9 @@ async fn reclaim_for_unplaced(
     // recognised from its QOS rather than needing to be listed here.
     opportunistic: &HashSet<spur_core::job::JobId>,
     cluster_state: &ClusterState<'_>,
-    exempt_secs: u32,
+    sched: &spur_core::config::SchedulerConfig,
 ) -> (Vec<String>, Option<spur_core::job::JobId>) {
+    let exempt_secs = sched.idle_fill_exempt_secs;
     let now = Utc::now();
     let running = cluster.get_jobs(&JobFilter {
         states: &[spur_core::job::JobState::Running],
@@ -1586,6 +1595,10 @@ async fn reclaim_for_unplaced(
         reclaimable.iter().map(|r| r.job_id).collect();
     let victim_priority: HashMap<spur_core::job::JobId, i32> =
         reclaimable.iter().map(|r| (r.job_id, r.priority)).collect();
+    let victim_keys = &sched.preempt_victim_order;
+    let owner_standing = cluster
+        .owner_standing_cache()
+        .standings(victim_keys, &running, now);
 
     for reclaimer in unplaced {
         // An opportunistic reclaimer displaces only opportunistic work strictly
@@ -1602,6 +1615,9 @@ async fn reclaim_for_unplaced(
                 occupants: &occupants,
                 priority: &victim_priority,
                 max_priority: ceiling,
+                order: owner_standing
+                    .as_ref()
+                    .map(|standing| VictimOrder::new(victim_keys, standing, reclaimer.job_id)),
             },
             cluster_state.nodes,
             cluster_state.reservations,
@@ -1681,6 +1697,8 @@ struct VictimPool<'a> {
     /// Set for an opportunistic reclaimer, which may only displace opportunistic
     /// work of strictly lower priority. `None` when `evictable` is already final.
     max_priority: Option<i32>,
+    /// Ranks nodes of equal cost before node name does. `None` is node-name order.
+    order: Option<VictimOrder<'a>>,
 }
 
 /// The set of evictable jobs whose removal would let `reclaimer` actually run, or
@@ -1738,16 +1756,27 @@ fn satisfiable_victim_set(
 
     // Spend the cheapest opportunistic work first, and only climb to a more
     // valuable victim if that is still not enough. A node's cost is the highest
-    // priority it carries, since evacuating it forfeits every run on it, and
-    // ties break on node name so the choice is deterministic rather than
-    // dependent on registration order.
-    evacuable.sort_by_key(|(name, on_node)| {
-        let cost = on_node
+    // priority it carries, since evacuating it forfeits every run on it. Ties go to
+    // the configured order if any, then to node name, so the choice is
+    // deterministic rather than dependent on registration order.
+    let cost_of = |on_node: &[spur_core::job::JobId]| {
+        on_node
             .iter()
             .map(|id| pool.priority.get(id).copied().unwrap_or(0))
             .max()
-            .unwrap_or(0);
-        (cost, *name)
+            .unwrap_or(0)
+    };
+    evacuable.sort_by(|a, b| {
+        cost_of(a.1)
+            .cmp(&cost_of(b.1))
+            .then_with(|| {
+                pool.order
+                    .as_ref()
+                    .map_or(std::cmp::Ordering::Equal, |order| {
+                        order.compare((a.0, a.1.as_slice()), (b.0, b.1.as_slice()))
+                    })
+            })
+            .then_with(|| a.0.cmp(b.0))
     });
 
     for (_, on_node) in evacuable {
@@ -4526,6 +4555,8 @@ mod tests {
 
     mod idle_fill_reclaim_tests {
         use super::*;
+        use crate::victim_order::OwnerStanding;
+        use spur_core::partition::VictimOrderKey;
 
         fn no_priorities() -> HashMap<spur_core::job::JobId, i32> {
             HashMap::new()
@@ -4574,6 +4605,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &no_priorities(),
                         max_priority: None,
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4594,6 +4626,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &no_priorities(),
                         max_priority: None,
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4621,6 +4654,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &no_priorities(),
                         max_priority: None,
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4642,6 +4676,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &no_priorities(),
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
@@ -4674,6 +4709,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &priorities,
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
@@ -4713,6 +4749,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &priorities,
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
@@ -4744,6 +4781,7 @@ mod tests {
                         priority: &priorities,
                         // An opportunistic reclaimer at burst priority.
                         max_priority: Some(1001),
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4764,6 +4802,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &priorities,
                         max_priority: None,
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4794,6 +4833,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &priorities,
                         max_priority: Some(6000),
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4812,6 +4852,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &priorities,
                         max_priority: Some(1001),
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4840,6 +4881,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &priorities,
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
@@ -4850,6 +4892,125 @@ mod tests {
                 victims,
                 [7].into_iter().collect(),
                 "ties break on node name, so n1's occupant goes even though n2 is listed first"
+            );
+        }
+
+        /// Two single-job nodes, n1 holding job 7 and n2 job 9, registered in reverse
+        /// name order, and the one victim a one-node reclaimer evicts under `order`.
+        fn evict_one_of_two(
+            order: Option<(
+                &[VictimOrderKey],
+                &HashMap<spur_core::job::JobId, OwnerStanding>,
+            )>,
+            priorities: &HashMap<spur_core::job::JobId, i32>,
+        ) -> HashSet<spur_core::job::JobId> {
+            let nodes = vec![node("n2", 4), node("n1", 4)];
+            let mut occupants = HashMap::new();
+            occupants.insert("n1", vec![7]);
+            occupants.insert("n2", vec![9]);
+            let reclaimable: HashSet<spur_core::job::JobId> = [7, 9].into_iter().collect();
+            let pending = reclaimer(1, 1);
+            satisfiable_victim_set(
+                &pending,
+                &VictimPool {
+                    evictable: &reclaimable,
+                    occupants: &occupants,
+                    priority: priorities,
+                    max_priority: None,
+                    order: order
+                        .map(|(keys, standing)| VictimOrder::new(keys, standing, pending.job_id)),
+                },
+                &nodes,
+                &[],
+                Utc::now(),
+            )
+            .expect("one evacuable node is enough")
+        }
+
+        fn equal_priorities() -> HashMap<spur_core::job::JobId, i32> {
+            [(7, 100), (9, 100)].into_iter().collect()
+        }
+
+        fn owners(n1: (f64, f64), n2: (f64, f64)) -> HashMap<spur_core::job::JobId, OwnerStanding> {
+            [
+                (
+                    7,
+                    OwnerStanding {
+                        usage_share: n1.0,
+                        burden: n1.1,
+                    },
+                ),
+                (
+                    9,
+                    OwnerStanding {
+                        usage_share: n2.0,
+                        burden: n2.1,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect()
+        }
+
+        #[test]
+        fn a_configured_order_takes_the_heaviest_owner_before_node_name() {
+            let standing = owners((0.2, 0.0), (3.0, 0.0));
+            let keys = [VictimOrderKey::UsageShare];
+            assert_eq!(
+                evict_one_of_two(None, &equal_priorities()),
+                [7].into_iter().collect(),
+                "control: without the order, node name picks n1"
+            );
+            assert_eq!(
+                evict_one_of_two(Some((&keys, &standing)), &equal_priorities()),
+                [9].into_iter().collect(),
+                "n2's owner is far over its share, so it goes although n1 sorts first"
+            );
+        }
+
+        #[test]
+        fn an_account_that_already_lost_nodes_is_protected() {
+            let standing = owners((1.0, 90_000.0), (1.0, 0.0));
+            let keys = [VictimOrderKey::PreemptBurden];
+            assert_eq!(
+                evict_one_of_two(Some((&keys, &standing)), &equal_priorities()),
+                [9].into_iter().collect(),
+                "n1's owner lost the most recently, so the next preemption takes n2"
+            );
+        }
+
+        #[test]
+        fn a_hash_order_stops_favouring_the_lowest_node_name() {
+            // The pinned hash puts n2 ahead of n1 for this preemptor.
+            let keys = [VictimOrderKey::Hash];
+            let standing = HashMap::new();
+            assert_eq!(
+                evict_one_of_two(Some((&keys, &standing)), &equal_priorities()),
+                [9].into_iter().collect()
+            );
+        }
+
+        #[test]
+        fn qos_priority_still_outranks_a_configured_order() {
+            // n1's owner is the heaviest, but its job is the dearer one: the order only
+            // separates nodes of equal cost.
+            let standing = owners((3.0, 0.0), (0.2, 0.0));
+            let keys = [VictimOrderKey::UsageShare];
+            let priorities: HashMap<spur_core::job::JobId, i32> =
+                [(7, 200), (9, 100)].into_iter().collect();
+            assert_eq!(
+                evict_one_of_two(Some((&keys, &standing)), &priorities),
+                [9].into_iter().collect()
+            );
+        }
+
+        #[test]
+        fn a_configured_order_with_nothing_to_separate_falls_back_to_node_name() {
+            let standing = owners((1.0, 0.0), (1.0, 0.0));
+            let keys = [VictimOrderKey::UsageShare, VictimOrderKey::PreemptBurden];
+            assert_eq!(
+                evict_one_of_two(Some((&keys, &standing)), &equal_priorities()),
+                [7].into_iter().collect()
             );
         }
 
@@ -4869,6 +5030,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &no_priorities(),
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],

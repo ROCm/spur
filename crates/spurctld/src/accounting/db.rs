@@ -143,6 +143,8 @@ CREATE INDEX IF NOT EXISTS idx_jobs_start_time ON jobs(start_time);
 -- a first-refresh timeout leaves the budget unapplied. end_time leads: it bounds the window.
 CREATE INDEX IF NOT EXISTS idx_jobs_grp_wall_window ON jobs(end_time, qos, start_time)
     WHERE qos <> '' AND start_time IS NOT NULL;
+-- Serves the preemption-burden aggregate, which reads only the recent PREEMPTED runs.
+CREATE INDEX IF NOT EXISTS idx_jobs_preempted_end ON jobs(end_time) WHERE state = 'PREEMPTED';
 CREATE INDEX IF NOT EXISTS idx_usage_period ON usage(period_start, period_end);
 CREATE INDEX IF NOT EXISTS idx_assoc_user ON associations(user_name);
 CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
@@ -985,6 +987,83 @@ pub async fn consumed_wall_minutes_by_qos(
         .collect();
 
     Ok(consumed)
+}
+
+/// A run that accounting records as ended by preemption.
+pub struct PreemptedRun {
+    pub account: String,
+    pub nodes: u32,
+    pub started: DateTime<Utc>,
+    pub ended: DateTime<Utc>,
+}
+
+/// Runs recorded as `PREEMPTED` that ended after `since`. A job that was requeued
+/// and has started again no longer reads `PREEMPTED` (the row is reused for its next
+/// run), so its earlier loss is not here.
+pub async fn preempted_runs_since(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+) -> anyhow::Result<Vec<PreemptedRun>> {
+    let rows = sqlx::query(
+        "SELECT account, num_nodes, start_time, end_time FROM jobs
+         WHERE state = 'PREEMPTED' AND start_time IS NOT NULL AND end_time > $1",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| PreemptedRun {
+            account: row.get("account"),
+            nodes: row.get::<i32, _>("num_nodes").max(0) as u32,
+            started: row.get("start_time"),
+            ended: row.get("end_time"),
+        })
+        .collect())
+}
+
+/// Capacity consumed by finished runs, for one account and UTC start hour.
+pub struct CapacityBucket {
+    pub account: String,
+    pub period_start: DateTime<Utc>,
+    pub capacity_seconds: f64,
+}
+
+/// Capacity consumed in finished runs that started at or after `since`: elapsed
+/// seconds times allocated CPUs plus GPUs, per account and start hour, the same
+/// buckets the fair-share `usage` rows use.
+///
+/// The `usage` table cannot answer this, because it stores each run already
+/// multiplied by its QOS `usage_factor`; this reads the runs themselves, so every
+/// QOS counts at its true size. Runs that have not ended are left to the caller,
+/// which knows what is running now.
+pub async fn consumed_capacity_by_hour(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+) -> anyhow::Result<Vec<CapacityBucket>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT account,
+               date_trunc('hour', start_time AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS period_start,
+               SUM(GREATEST(EXTRACT(EPOCH FROM (end_time - start_time))::float8, 0)
+                   * (num_tasks::float8 * cpus_per_task::float8 + total_gpus::float8))::float8
+                 AS capacity_seconds
+        FROM jobs
+        WHERE start_time >= $1 AND end_time IS NOT NULL
+        GROUP BY account, period_start
+        "#,
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| CapacityBucket {
+            account: row.get("account"),
+            period_start: row.get("period_start"),
+            capacity_seconds: row.get::<Option<f64>, _>("capacity_seconds").unwrap_or(0.0),
+        })
+        .collect())
 }
 
 #[derive(Debug)]
@@ -2847,6 +2926,80 @@ mod job_history_tests {
         );
 
         tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn standing_queries_read_the_runs_not_the_billed_usage() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let base: JobId = 9_300_000 + (pid % 10_000) * 10;
+        let ids = [base, base + 1, base + 2];
+        let user = format!("spur_standing_user_{pid}");
+        let account = format!("spur_standing_acct_{pid}");
+        let qos = format!("spur_standing_qos_{pid}");
+        delete_jobs(&pool, &ids).await.ok();
+        sqlx::query(
+            "INSERT INTO qos (name, usage_factor) VALUES ($1, 0.5)
+             ON CONFLICT (name) DO UPDATE SET usage_factor = 0.5",
+        )
+        .bind(&qos)
+        .execute(&pool)
+        .await?;
+
+        // One completed and one preempted run, both billed at half; a third still running.
+        // Each is 2 tasks x 2 cpus plus 2 GPUs for 1000 s: 6 units.
+        let now = Utc::now();
+        for (id, ago, state) in [
+            (ids[0], 3, Some("COMPLETED")),
+            (ids[1], 5, Some("PREEMPTED")),
+            (ids[2], 1, None),
+        ] {
+            let began = now - Duration::hours(ago);
+            start_with_qos(
+                &pool, id, "standing", &user, &account, "", &qos, 1, 2, 2, 0, began, began, "",
+            )
+            .await?;
+            sqlx::query("UPDATE jobs SET total_gpus = 2 WHERE job_id = $1")
+                .bind(id as i64)
+                .execute(&pool)
+                .await?;
+            if let Some(state) = state {
+                end(&pool, id, state, 0, began + Duration::seconds(1000), 0, 0).await?;
+            }
+        }
+
+        let since = now - Duration::days(1);
+        let buckets = consumed_capacity_by_hour(&pool, since).await;
+        let billed = get_usage(&pool, Some(&user), None, since).await;
+        let preempted = preempted_runs_since(&pool, since).await;
+        delete_jobs(&pool, &ids).await.ok();
+        sqlx::query("DELETE FROM usage WHERE user_name = $1")
+            .bind(&user)
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&qos)
+            .execute(&pool)
+            .await?;
+        let (buckets, billed, preempted) = (buckets?, billed?, preempted?);
+
+        let consumed: f64 = buckets
+            .iter()
+            .filter(|b| b.account == account)
+            .map(|b| b.capacity_seconds)
+            .sum();
+        let stored: i64 = billed.iter().map(|r| r.cpu_seconds + r.gpu_seconds).sum();
+        let preempted_here = preempted.iter().filter(|r| r.account == account).count();
+        // The two ended runs consumed 2 x 6000 capacity-seconds; the running one is left
+        // to the caller. Billing stored half of that.
+        assert!(
+            (consumed - 12_000.0).abs() < 1.0,
+            "true size of the ended runs"
+        );
+        assert!(stored == 6_000, "billing keeps the QOS factor");
+        assert!(preempted_here == 1, "only the preempted run");
         Ok(())
     }
 

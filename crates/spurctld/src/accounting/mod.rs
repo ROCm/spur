@@ -6,6 +6,7 @@ mod fairshare;
 mod grpc;
 mod notifier;
 mod reconcile;
+mod standing;
 pub(crate) mod txn;
 
 pub use db::{JobEndRecord, JobStartRecord};
@@ -14,6 +15,7 @@ pub use notifier::AccountingNotifier;
 pub use reconcile::spawn_loop as spawn_reconcile_loop;
 pub use reconcile::spawn_txn_purge_loop;
 pub use reconcile::RECONCILE_INTERVAL_SECS;
+pub(crate) use standing::{load as load_standing, StandingSnapshot};
 pub(crate) use txn::{TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource};
 
 use std::collections::{HashMap, HashSet};
@@ -184,10 +186,13 @@ fn activate(
         .association_cache()
         .spawn_refresh_loop(pool.clone(), params.refresh_secs);
     cluster.grp_wall_cache().spawn_refresh_loop(
-        pool,
+        pool.clone(),
         params.refresh_secs,
         params.grp_wall_window_days,
     );
+    cluster
+        .owner_standing_cache()
+        .spawn_refresh_loop(pool, cluster.clone(), params.refresh_secs);
 }
 
 /// Compute fairshare factors directly from the database.
@@ -198,11 +203,7 @@ pub async fn fairshare_factors(
     pool: &PgPool,
     halflife_days: u32,
 ) -> anyhow::Result<HashMap<(String, String), f64>> {
-    let halflife_days = if halflife_days == 0 {
-        14
-    } else {
-        halflife_days.clamp(1, 365)
-    };
+    let halflife_days = fairshare::effective_halflife_days(halflife_days);
     let now = chrono::Utc::now();
     let since = now - chrono::Duration::days(halflife_days as i64 * 4);
 

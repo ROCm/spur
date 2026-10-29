@@ -443,6 +443,10 @@ pub const MAX_TERMINAL_JOB_RETENTION_SECS: u64 = 366 * 24 * 60 * 60;
 /// query matches nothing, leaving every `GrpWall` budget unenforced.
 pub const MAX_GRP_WALL_WINDOW_DAYS: u32 = 3650;
 
+/// Longest `scheduler.preempt_burden_window_hours`: a year of hours, far past any
+/// useful horizon, so the value stays representable wherever it is converted.
+const MAX_PREEMPT_BURDEN_WINDOW_HOURS: u32 = 24 * 365;
+
 fn default_listen_addr() -> String {
     "[::]:6817".into()
 }
@@ -656,6 +660,16 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
+    /// Opt-in secondary order among preemption victims of equal QOS priority,
+    /// as a list of keys in precedence order (`usage_share`, `preempt_burden`,
+    /// `hash`). Applied after QOS priority and before node name, to candidates
+    /// that are already eligible. Empty (default) keeps node-name order.
+    #[serde(default)]
+    pub preempt_victim_order: Vec<crate::partition::VictimOrderKey>,
+    /// Window, in hours, over which `preempt_burden` counts node-seconds lost to
+    /// preemption; a loss weighs less the older it is and drops out at the edge.
+    #[serde(default = "default_preempt_burden_window_hours")]
+    pub preempt_burden_window_hours: u32,
     /// Master switch for idle-fill scheduling. `false` (default) means no
     /// behavior change anywhere: an over-quota job never borrows spare capacity.
     #[serde(default)]
@@ -705,6 +719,9 @@ fn default_max_user_priority() -> u32 {
 fn default_idle_fill_exempt_secs() -> u32 {
     60
 }
+fn default_preempt_burden_window_hours() -> u32 {
+    24
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -721,6 +738,8 @@ impl Default for SchedulerConfig {
             max_user_priority: default_max_user_priority(),
             preempt_type: PreemptType::None,
             preempt_exempt_time: 0,
+            preempt_victim_order: Vec::new(),
+            preempt_burden_window_hours: default_preempt_burden_window_hours(),
             idle_fill_enabled: false,
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
             idle_fill_max_borrow_factor: 0.0,
@@ -2308,6 +2327,28 @@ impl SlurmConfig {
                 value: format!(
                     "{inactive} (0 disables reaping; otherwise must be >= {})",
                     2 * KEEPALIVE_INTERVAL_SECS
+                ),
+            });
+        }
+        // A repeated key would be silently redundant in a precedence list, and a
+        // zero window makes the burden weight of every loss zero.
+        let order = &self.scheduler.preempt_victim_order;
+        if let Some(dup) = order
+            .iter()
+            .enumerate()
+            .find_map(|(i, key)| order[..i].contains(key).then_some(key))
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.preempt_victim_order".into(),
+                value: format!("{dup:?} listed more than once"),
+            });
+        }
+        let burden_window = self.scheduler.preempt_burden_window_hours;
+        if burden_window == 0 || burden_window > MAX_PREEMPT_BURDEN_WINDOW_HOURS {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.preempt_burden_window_hours".into(),
+                value: format!(
+                    "{burden_window} (must be between 1 and {MAX_PREEMPT_BURDEN_WINDOW_HOURS})"
                 ),
             });
         }
@@ -4280,6 +4321,60 @@ inactive_limit_secs = 20
             "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 60\n",
         )
         .expect("a value at the floor must be accepted");
+    }
+
+    #[test]
+    fn preempt_victim_order_defaults_to_off_and_parses_a_key_list() {
+        let unset = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert!(unset.scheduler.preempt_victim_order.is_empty());
+        assert_eq!(unset.scheduler.preempt_burden_window_hours, 24);
+
+        let cfg = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\n\
+             preempt_victim_order = [\"usage_share\", \"preempt_burden\", \"hash\"]\n\
+             preempt_burden_window_hours = 72\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.scheduler.preempt_victim_order,
+            [
+                crate::partition::VictimOrderKey::UsageShare,
+                crate::partition::VictimOrderKey::PreemptBurden,
+                crate::partition::VictimOrderKey::Hash,
+            ]
+        );
+        assert_eq!(cfg.scheduler.preempt_burden_window_hours, 72);
+    }
+
+    #[test]
+    fn preempt_victim_order_rejects_unknown_and_repeated_keys() {
+        for (value, needle) in [
+            ("[\"usage_shares\"]", "usage_shares"),
+            (
+                "[\"hash\", \"usage_share\", \"hash\"]",
+                "preempt_victim_order",
+            ),
+        ] {
+            let err = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[scheduler]\npreempt_victim_order = {value}\n"
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains(needle), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn preempt_burden_window_must_be_positive_and_bounded() {
+        for hours in [0, 24 * 365 + 1] {
+            let err = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[scheduler]\npreempt_burden_window_hours = {hours}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("preempt_burden_window_hours"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

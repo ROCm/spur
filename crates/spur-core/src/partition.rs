@@ -84,6 +84,20 @@ pub enum PreemptType {
     QosPriority,
 }
 
+/// One key of the optional secondary order among preemption victims of equal
+/// QOS priority (`scheduler.preempt_victim_order`). Keys only rank candidates
+/// that are already eligible; they never make a job preemptable or exempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VictimOrderKey {
+    /// Owner (account) whose recent usage is largest relative to its share goes first.
+    UsageShare,
+    /// Owner (account) that has lost the least work to preemption recently goes first.
+    PreemptBurden,
+    /// Stable hash of the preempting job and the node, so no node name is favoured.
+    Hash,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PreemptMode {
     #[default]

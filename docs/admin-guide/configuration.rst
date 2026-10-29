@@ -591,6 +591,30 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        ``sacctmgr``); the most specific value wins (QOS > partition > global).
        Mirrors Slurm's ``PreemptExemptTime``. Does not apply to idle-fill reclaim,
        which uses ``idle_fill_exempt_secs`` instead.
+   * - ``preempt_victim_order``
+     - list of strings
+     - ``[]``
+     - Live
+     - Opt-in order among preemption victims of equal QOS priority, as keys in
+       precedence order: ``"usage_share"`` (the account furthest over its share
+       goes first), ``"preempt_burden"`` (the account that has lost the least to
+       preemption recently goes first) and ``"hash"`` (a stable hash of the
+       preempting job and the node). Empty (the default) takes victims from the
+       lowest-named node first. The keys only rank jobs that are already eligible;
+       they never change who may be preempted. A key may be listed once. Also
+       applies to idle-fill reclaim. ``usage_share`` measures the capacity an
+       account actually consumed across all QOS, with the fair-share half-life, and
+       deliberately ignores QOS ``usage_factor``, which stays a billing and
+       pending-priority setting. Example: ``["usage_share", "preempt_burden",
+       "hash"]``. See :doc:`accounting`.
+   * - ``preempt_burden_window_hours``
+     - integer
+     - ``24``
+     - Live
+     - Window, between ``1`` and ``8760``, over which the ``preempt_burden`` key
+       counts node-seconds lost to preemption; a loss weighs less the older it is
+       and drops out at the edge. Read only when ``preempt_victim_order`` lists
+       ``preempt_burden``.
    * - ``idle_fill_enabled``
      - boolean
      - ``false``
