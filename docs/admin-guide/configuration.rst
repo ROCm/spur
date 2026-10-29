@@ -1855,13 +1855,14 @@ Controls which nodes may register with the controller.
      - string
      - ``"open"``
      - Node admission mode. ``open`` lets any node register; ``token`` requires a
-       registering ``spurd`` to present a valid admission token. Admission does
-       not authenticate job completion reports: in either mode, any caller that
+       registering ``spurd`` to present a valid admission token. Job completion
+       reports are not node-authenticated: in either mode, any caller that
        passes RPC authentication can report a job finished by naming one of its
-       allocated nodes. With ``token`` and an ``[auth]`` signing key, the
-       controller checks the node token on one report only, the exit of an
-       ``srun --pty`` session. Every other completion report, including one for
-       the same ``srun --pty`` job, is taken on trust.
+       allocated nodes. The one exception is the report that an ``srun --pty``
+       session exited: with ``token`` and an ``[auth]`` signing key, the
+       controller acts on it only when it carries the reporting node's own node
+       token. Every other completion report, including one for the same
+       ``srun --pty`` job, is taken on trust.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
 
