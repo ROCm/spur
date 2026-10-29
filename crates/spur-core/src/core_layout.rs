@@ -201,11 +201,24 @@ fn cores_of_cpus(topology: &CpuTopology, cpus: &[u32]) -> Result<BTreeSet<usize>
 
 /// `[[nodes]]` entries (by `names`, or the sorted selector when `names` is
 /// empty) whose restart-only core settings differ between two configs.
+/// Entries sharing a key on the same side are disambiguated by occurrence
+/// order (`"K"`, `"K#2"`, `"K#3"`, ...) so none are silently dropped.
 pub fn restart_only_node_changes(old: &[NodeConfig], new: &[NodeConfig]) -> Vec<String> {
     let index = |nodes: &[NodeConfig]| -> BTreeMap<String, NodeCoreSettings> {
+        let mut seen: BTreeMap<String, u32> = BTreeMap::new();
         nodes
             .iter()
-            .map(|nc| (entry_key(nc), NodeCoreSettings::from_config(nc)))
+            .map(|nc| {
+                let base = entry_key(nc);
+                let count = seen.entry(base.clone()).or_insert(0);
+                *count += 1;
+                let key = if *count == 1 {
+                    base
+                } else {
+                    format!("{base}#{count}")
+                };
+                (key, NodeCoreSettings::from_config(nc))
+            })
             .collect()
     };
     let (old, new) = (index(old), index(new));
@@ -509,6 +522,34 @@ mod tests {
         assert_eq!(
             restart_only_node_changes(&old, &removed),
             vec!["a".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_entries_are_compared_one_by_one() {
+        let parse = |s: &str| -> Vec<crate::config::NodeConfig> {
+            #[derive(serde::Deserialize)]
+            struct Nodes {
+                nodes: Vec<crate::config::NodeConfig>,
+            }
+            toml::from_str::<Nodes>(s).unwrap().nodes
+        };
+        let old = parse(
+            "[[nodes]]\nnames = \"a\"\ncore_spec_count = 1\n[[nodes]]\nnames = \"a\"\nweight = 2\n",
+        );
+        let first_changed = parse(
+            "[[nodes]]\nnames = \"a\"\ncore_spec_count = 2\n[[nodes]]\nnames = \"a\"\nweight = 2\n",
+        );
+        assert_eq!(
+            restart_only_node_changes(&old, &first_changed),
+            vec!["a".to_string()]
+        );
+        let second_changed = parse(
+            "[[nodes]]\nnames = \"a\"\ncore_spec_count = 1\n[[nodes]]\nnames = \"a\"\nweight = 2\ncore_spec_count = 1\n",
+        );
+        assert_eq!(
+            restart_only_node_changes(&old, &second_changed),
+            vec!["a#2".to_string()]
         );
     }
 }
