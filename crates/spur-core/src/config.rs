@@ -1018,7 +1018,7 @@ pub struct NodeConfig {
     pub memory_mb: u64,
     /// Memory (MiB) reserved for the OS/runtime, subtracted from detected memory
     /// so jobs cannot be packed into headroom the host needs. 0 = none.
-    #[serde(default)]
+    #[serde(default, alias = "mem_spec_limit")]
     pub reserved_memory_mb: u64,
     #[serde(default)]
     pub gres: Vec<String>,
@@ -1030,6 +1030,16 @@ pub struct NodeConfig {
     /// Scheduling weight. Higher weight = preferred for scheduling.
     #[serde(default = "default_one")]
     pub weight: u32,
+    /// Physical cores set aside for node services (Slurm `CoreSpecCount`).
+    #[serde(default)]
+    pub core_spec_count: Option<u32>,
+    /// OS CPU IDs set aside for node services, widened to whole cores.
+    /// Unlike Slurm's `CpuSpecList`, these are OS IDs, not abstract IDs.
+    #[serde(default)]
+    pub cpu_spec_list: Option<String>,
+    /// Keep spurd and spurstepd off the spec CPUs (Slurm `SlurmdOffSpec`).
+    #[serde(default = "default_true_fn")]
+    pub daemons_off_spec: bool,
 }
 
 /// Network / WireGuard mesh configuration.
@@ -2571,6 +2581,25 @@ impl SlurmConfig {
                     ),
                 });
             }
+            let spec_count = nc.core_spec_count.is_some_and(|n| n > 0);
+            let spec_list = nc
+                .cpu_spec_list
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+            if spec_count && spec_list {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("nodes.{}.cpu_spec_list", nc.names),
+                    value: "set core_spec_count or cpu_spec_list, not both".into(),
+                });
+            }
+            if let Some(list) = &nc.cpu_spec_list {
+                if let Err(e) = crate::cpu_topology::parse_cpu_list(list) {
+                    return Err(ConfigError::InvalidValue {
+                        field: format!("nodes.{}.cpu_spec_list", nc.names),
+                        value: format!("{list:?} ({e})"),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -2857,6 +2886,47 @@ mod tests {
             matches!(error, ConfigError::InvalidValue { ref field, .. } if field.contains("reserved_memory_mb")),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn node_spec_settings_parse_with_defaults_and_alias() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"riot-[001-512]\"\ncore_spec_count = 1\nmem_spec_limit = 16384\n",
+        )
+        .unwrap();
+        let nc = &config.nodes[0];
+        assert_eq!(nc.core_spec_count, Some(1));
+        assert_eq!(nc.cpu_spec_list, None);
+        assert_eq!(nc.reserved_memory_mb, 16384);
+        assert!(nc.daemons_off_spec);
+    }
+
+    #[test]
+    fn both_spec_settings_are_rejected() {
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"n1\"\ncore_spec_count = 1\ncpu_spec_list = \"127,255\"\n",
+        )
+        .unwrap_err();
+        let msg = error.to_string();
+        assert!(msg.contains("cpu_spec_list"), "{msg}");
+    }
+
+    #[test]
+    fn unparsable_cpu_spec_list_is_rejected() {
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"n1\"\ncpu_spec_list = \"1,\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn zero_or_blank_spec_settings_mean_unset_and_pass_validation() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[[nodes]]\nnames = \"n1\"\ncore_spec_count = 0\ncpu_spec_list = \"  \"\n",
+        )
+        .unwrap();
+        assert_eq!(config.nodes[0].core_spec_count, Some(0));
     }
 
     #[test]

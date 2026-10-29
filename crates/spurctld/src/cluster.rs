@@ -11393,6 +11393,9 @@ mod tests {
             features: Vec::new(),
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }
     }
 
@@ -31738,6 +31741,9 @@ mod tests {
             features: Vec::new(),
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         };
         let labels = HashMap::from([("gpu".into(), "mi300x".into())]);
         assert!(super::node_config_matches(&nc, "any-host", &labels));
@@ -31919,6 +31925,9 @@ mod tests {
             features: vec!["common".into()],
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         };
         assert!(super::node_config_matches(&nc, "any-host", &HashMap::new()));
         assert!(super::node_config_matches(
@@ -32043,6 +32052,9 @@ mod tests {
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -32091,6 +32103,9 @@ mod tests {
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -32130,6 +32145,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -32179,6 +32197,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -32227,6 +32248,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -32265,6 +32289,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
