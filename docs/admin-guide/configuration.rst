@@ -258,8 +258,10 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - ``5``
      - Live
      - Maximum automatic requeues (excluding preemption) before a job is held with
-       ``JobHoldMaxRequeue``. A node that still reports that job on its heartbeat
-       is told to stop the process. Must be ``>= 1``; ``0`` is a validation error.
+       ``JobHoldMaxRequeue``. A node that still reports a held job on its
+       heartbeat, from this or any other hold, is told to stop the process. Until
+       that heartbeat the node shows the job's resources as free. Must be
+       ``>= 1``; ``0`` is a validation error.
    * - ``max_launch_backoff_secs``
      - integer
      - ``300``

@@ -1428,7 +1428,8 @@ fn reservation_manager_ruling(
 const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(16);
 
 /// Whether `node` may release what it holds for `job_id`: the run is over, the
-/// job is active elsewhere, or the id is untracked but was issued by us.
+/// job is held, the job is active elsewhere, or the id is untracked but was
+/// issued by us.
 fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
     match cluster.get_job(job_id) {
         Some(job) if job.state.is_terminal() => true,
