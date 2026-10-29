@@ -1432,6 +1432,15 @@ const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(16);
 fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
     match cluster.get_job(job_id) {
         Some(job) if job.state.is_terminal() => true,
+        // A hold is not going to be dispatched. The node still reporting the
+        // job is running a process this controller has already released, and
+        // no later launch will cancel it.
+        Some(job)
+            if job.state == spur_core::job::JobState::Pending
+                && job.pending_reason.is_scheduling_hold() =>
+        {
+            true
+        }
         // A cancel this old that the node is still claiming never reached it
         // (an agent that was down when it was sent); the run is over regardless.
         Some(job)
@@ -6886,6 +6895,59 @@ mod tests {
             is_reclaimable(&cluster, "n1", 30),
             "an unstored id below the watermark is reclaimable — reachable only if an agent reports it"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_reported_jobs_reclaims_a_held_job_the_node_still_runs() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, PendingReason};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        for (job_id, name) in [(50u32, "held"), (51, "waiting")] {
+            apply(&WalOperation::JobSubmit {
+                job_id,
+                spec: Box::new(JobSpec {
+                    name: name.into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            });
+        }
+        apply(&WalOperation::JobPriorityChange {
+            job_id: 50,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::JobHoldMaxRequeue),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: None,
+        });
+
+        let reported: Vec<RunningJobStatus> = [50, 51]
+            .into_iter()
+            .map(|job_id| RunningJobStatus {
+                job_id,
+                ..Default::default()
+            })
+            .collect();
+
+        assert_eq!(stale_reported_jobs(&cluster, "n1", &reported), vec![50]);
+        assert!(!is_reclaimable(&cluster, "n1", 51));
     }
 
     /// A node evicted mid-run keeps the job and its devices; the controller

@@ -9070,8 +9070,16 @@ impl AgentService {
                 ) {
                     Ok(result) => result,
                     Err(_) => {
+                        // `job_id` is the dispatch being refused. The operator
+                        // needs the job that still owns the devices.
+                        let held_by: Vec<u32> = alloc
+                            .conflicting_owners(&controller_gpu_ids)
+                            .into_iter()
+                            .filter(|owner| live.contains(owner))
+                            .collect();
                         warn!(
                             job_id,
+                            held_by = ?held_by,
                             requested = ?controller_gpu_ids,
                             already_allocated = ?alloc.allocated_gpu_ids(),
                             "rejecting dispatch: controller-allocated GPUs already in use in the \
