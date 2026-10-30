@@ -19,6 +19,7 @@ import time
 import pytest
 
 from cluster import SpurCluster, make_remote_dir, parse_job_id, job_state, wait_job
+from conftest import _reset_k0s_all_nodes
 
 pytestmark = pytest.mark.k0s
 
@@ -62,6 +63,7 @@ def sharing_cluster(ssh_nodes, remote_bin_dir):
     except Exception:
         pass
     c.teardown()
+    _reset_k0s_all_nodes(c)
     for node in c.nodes:
         node.exec_allow_fail(f"{sudo}rm -f {FAKE_RENDER}")
 
