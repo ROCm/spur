@@ -25084,6 +25084,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_oversubscribe_qos_grp_node_with_running_and_wave() {
+        // Companion to the empty-running-set guard below, with a non-empty
+        // baseline: one non-exclusive 1-node job is already RUNNING on a
+        // saturated node (no reuse credit), and a wave of five pending 1-node
+        // jobs (four exclusive, one non-exclusive) each has a free node to land
+        // on. grp_tres node=3 minus the one already running leaves room for 2,
+        // so a single pass must admit at most 2 — total running stays within 3.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for n in ["n1", "n2", "n3", "n4", "n5", "n6"] {
+            register_node(&cm, n, 8, 128000);
+        }
+        // Saturate the running job's node so it offers no packing credit.
+        if let Some(node) = cm.nodes.write().get_mut("n1") {
+            node.alloc_resources.cpus = 8;
+            node.alloc_resources.memory_mb = 128000;
+        }
+
+        let mut grp = TresRecord::new();
+        grp.set(TresType::Node, 3);
+        cm.qos_cache().insert(Qos {
+            name: "cvs".into(),
+            limits: spur_core::accounting::QosLimits {
+                grp_tres: Some(grp),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        {
+            let mut jobs = cm.jobs.write();
+            let mut j = make_running_job(101, &["n1"], 8);
+            j.spec.num_nodes = 1;
+            j.spec.qos = Some("cvs".into());
+            jobs.insert(101, j);
+        }
+
+        let ids: Vec<JobId> = (0..5)
+            .map(|i| {
+                let mut s = basic_spec(&format!("w{i}"));
+                s.qos = Some("cvs".into());
+                s.num_nodes = 1;
+                s.exclusive = i < 4;
+                submit_and_wait(&cm, s)
+            })
+            .collect();
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = ids.iter().filter(|id| pending.contains(id)).count();
+        assert!(
+            granted <= 2,
+            "grp_tres node=3 with one job already running leaves room for 2, \
+             but pending_jobs() admitted {granted} of the wave"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_jobs_does_not_oversubscribe_qos_grp_node_within_one_pass() {
         // Three pending 1-node jobs share a QOS capped at grp_tres node=2. Each
         // fits against the empty running total, but a single pass must admit at
