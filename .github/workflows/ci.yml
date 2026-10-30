@@ -270,7 +270,7 @@ jobs:
       - name: Run accounting DB tests with coverage
         env:
           DATABASE_URL: postgres://spur_ci:spur_ci@localhost:5432/spur_acct_ci
-        run: cargo llvm-cov --locked -p spurctld --no-report --no-clean -- --ignored --test-threads=1
+        run: cargo llvm-cov --locked -p spurctld --no-report -- --ignored --test-threads=1
 
       - name: Generate combined coverage report
         run: cargo llvm-cov report --lcov --output-path lcov.info
