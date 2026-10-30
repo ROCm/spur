@@ -31,6 +31,7 @@ def handoff_cluster(ssh_nodes, remote_bin_dir):
             'while [ -e "$gate" ]; do sleep 0.1; done\n',
             all_nodes=True,
         )
+        # A broad stale-daemon sweep would also stop unrelated Spur daemons sharing these hosts.
         c.start({
             "scheduler": {"preempt_type": "qos_priority", "complete_wait_secs": 300},
             "hooks": {"epilog": epilog},

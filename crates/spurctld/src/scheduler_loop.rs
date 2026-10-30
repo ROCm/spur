@@ -1448,7 +1448,6 @@ async fn try_preempt_with_handoffs(
         // victim per cycle on a placement that will never happen. A set found in
         // the suspend pool is discarded rather than acted on: suspend never frees
         // the node, so it could not place the pending job either.
-        let available_nodes = state.nodes_for_handoff(pending);
         let mut found = None;
         for (is_suspend_pool, pool_ids) in [(false, by_mode(false)), (true, by_mode(true))] {
             if pool_ids.is_empty() {
@@ -1462,8 +1461,7 @@ async fn try_preempt_with_handoffs(
                     priority: &victim_cost,
                     max_priority: None,
                 },
-                &available_nodes,
-                reservations,
+                state,
                 now,
             );
             if set.is_some() {
@@ -1950,7 +1948,6 @@ async fn reclaim_for_unplaced(
             || cluster.resolve_qos(reclaimer).idle_fill_preemptable;
         let ceiling = reclaimer_is_opportunistic.then(|| cluster.resolve_qos(reclaimer).priority);
 
-        let available_nodes = cluster_state.nodes_for_handoff(reclaimer);
         let Some(victims) = satisfiable_victim_set(
             reclaimer,
             &VictimPool {
@@ -1959,8 +1956,7 @@ async fn reclaim_for_unplaced(
                 priority: &victim_priority,
                 max_priority: ceiling,
             },
-            &available_nodes,
-            cluster_state.reservations,
+            cluster_state,
             now,
         ) else {
             continue;
@@ -2051,11 +2047,14 @@ struct VictimPool<'a> {
 fn satisfiable_victim_set(
     reclaimer: &spur_core::job::Job,
     pool: &VictimPool<'_>,
-    nodes: &[spur_core::node::Node],
-    reservations: &[spur_core::reservation::Reservation],
+    state: &ClusterState<'_>,
     now: DateTime<Utc>,
 ) -> Option<HashSet<spur_core::job::JobId>> {
+    let (nodes, reservations) = (state.nodes, state.reservations);
     let placement = spur_sched::node_match::NodePlacement::new(reclaimer);
+    if state.listed_node_handed_off(reclaimer, &placement) {
+        return None;
+    }
     let required = spur_sched::backfill::job_resource_request(reclaimer);
     // Total rather than currently-free resources: an evacuated node is empty, so
     // what matters is whether the whole node can host the job. Same suitability
@@ -2064,6 +2063,7 @@ fn satisfiable_victim_set(
     let suitable = |node: &spur_core::node::Node| {
         placement.matches_for_reservation(node, reservations, now)
             && node.total_resources.can_satisfy(&required)
+            && state.handoff_allows(reclaimer, &node.name)
     };
 
     let needed = (reclaimer.spec.num_nodes as usize).max(1);
@@ -5536,6 +5536,61 @@ mod tests {
             HashMap::new()
         }
 
+        fn victim_set_with_handoffs(
+            reclaimer: &Job,
+            pool: &VictimPool<'_>,
+            nodes: &[Node],
+            handoffs: &HashMap<String, spur_core::job::JobId>,
+        ) -> Option<HashSet<spur_core::job::JobId>> {
+            let state = ClusterState {
+                nodes,
+                partitions: &[],
+                reservations: &[],
+                topology: None,
+                busy_until: &HashMap::new(),
+                preemption_handoffs: handoffs,
+            };
+            satisfiable_victim_set(reclaimer, pool, &state, Utc::now())
+        }
+
+        fn victim_set_without_handoffs(
+            reclaimer: &Job,
+            pool: &VictimPool<'_>,
+            nodes: &[Node],
+            reservations: &[spur_core::reservation::Reservation],
+            now: DateTime<Utc>,
+        ) -> Option<HashSet<spur_core::job::JobId>> {
+            let state = ClusterState {
+                nodes,
+                partitions: &[],
+                reservations,
+                topology: None,
+                busy_until: &HashMap::new(),
+                preemption_handoffs: &HashMap::new(),
+            };
+            satisfiable_victim_set(reclaimer, pool, &state, now)
+        }
+
+        #[test]
+        fn reclaim_does_not_count_a_node_handed_to_another_job() {
+            let nodes = vec![node("n1", 4), node("n2", 4)];
+            let occupants: HashMap<&str, Vec<spur_core::job::JobId>> =
+                [("n2", vec![7])].into_iter().collect();
+            let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
+            let pool = VictimPool {
+                evictable: &reclaimable,
+                occupants: &occupants,
+                priority: &no_priorities(),
+                max_priority: None,
+            };
+            let two_nodes = reclaimer(2, 4);
+            assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &HashMap::new()).is_some());
+            let handed_off = HashMap::from([("n1".to_string(), two_nodes.job_id + 1)]);
+            assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &handed_off).is_none());
+            let own = HashMap::from([("n1".to_string(), two_nodes.job_id)]);
+            assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &own).is_some());
+        }
+
         fn node(name: &str, cpus: u32) -> Node {
             let mut n = Node::new(
                 name.into(),
@@ -5572,7 +5627,7 @@ mod tests {
             // Wants 16 CPUs on one node; the only node has 4. No eviction can help.
             let greedy = reclaimer(1, 16);
             assert!(
-                satisfiable_victim_set(
+                victim_set_without_handoffs(
                     &greedy,
                     &VictimPool {
                         evictable: &reclaimable,
@@ -5592,7 +5647,7 @@ mod tests {
             // unplaceability and not by the fixture being unsatisfiable for everyone.
             let fits = reclaimer(1, 2);
             assert_eq!(
-                satisfiable_victim_set(
+                victim_set_without_handoffs(
                     &fits,
                     &VictimPool {
                         evictable: &reclaimable,
@@ -5619,7 +5674,7 @@ mod tests {
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
 
             assert!(
-                satisfiable_victim_set(
+                victim_set_without_handoffs(
                     &reclaimer(2, 1),
                     &VictimPool {
                         evictable: &reclaimable,
@@ -5640,7 +5695,7 @@ mod tests {
             occupants.insert("n1", vec![7]);
             occupants.insert("n2", vec![8]);
             let reclaimable: HashSet<spur_core::job::JobId> = [7, 8].into_iter().collect();
-            let victims = satisfiable_victim_set(
+            let victims = victim_set_without_handoffs(
                 &reclaimer(2, 1),
                 &VictimPool {
                     evictable: &reclaimable,
@@ -5672,7 +5727,7 @@ mod tests {
                 [(7, 5000), (9, 10)].into_iter().collect();
 
             // One node needed, so exactly one victim: the cheaper one.
-            let victims = satisfiable_victim_set(
+            let victims = victim_set_without_handoffs(
                 &reclaimer(1, 1),
                 &VictimPool {
                     evictable: &reclaimable,
@@ -5711,7 +5766,7 @@ mod tests {
             let priorities: HashMap<spur_core::job::JobId, i32> =
                 [(7, 5000), (9, 10)].into_iter().collect();
 
-            let victims = satisfiable_victim_set(
+            let victims = victim_set_without_handoffs(
                 &reclaimer(2, 1),
                 &VictimPool {
                     evictable: &reclaimable,
@@ -5741,7 +5796,7 @@ mod tests {
 
             let cheap = reclaimer(1, 1); // priority 0 in the fixture
             assert!(
-                satisfiable_victim_set(
+                victim_set_without_handoffs(
                     &cheap,
                     &VictimPool {
                         evictable: &reclaimable,
@@ -5762,7 +5817,7 @@ mod tests {
             // victim is fair game, so the refusal above is the ceiling and not the
             // fixture being unsatisfiable.
             assert_eq!(
-                satisfiable_victim_set(
+                victim_set_without_handoffs(
                     &cheap,
                     &VictimPool {
                         evictable: &reclaimable,
@@ -5792,7 +5847,7 @@ mod tests {
 
             let dear = reclaimer(1, 1);
             assert_eq!(
-                satisfiable_victim_set(
+                victim_set_without_handoffs(
                     &dear,
                     &VictimPool {
                         evictable: &reclaimable,
@@ -5810,7 +5865,7 @@ mod tests {
 
             // Equal priority is not "strictly lower", so nothing moves.
             assert!(
-                satisfiable_victim_set(
+                victim_set_without_handoffs(
                     &dear,
                     &VictimPool {
                         evictable: &reclaimable,
@@ -5838,7 +5893,7 @@ mod tests {
             let priorities: HashMap<spur_core::job::JobId, i32> =
                 [(7, 100), (9, 100)].into_iter().collect();
 
-            let victims = satisfiable_victim_set(
+            let victims = victim_set_without_handoffs(
                 &reclaimer(1, 1),
                 &VictimPool {
                     evictable: &reclaimable,
@@ -5867,7 +5922,7 @@ mod tests {
             occupants.insert("n1", vec![7, 9]); // 7 borrowed, 9 has a claim
             let reclaimable: HashSet<spur_core::job::JobId> = [7].into_iter().collect();
 
-            assert!(satisfiable_victim_set(
+            assert!(victim_set_without_handoffs(
                 &reclaimer(1, 1),
                 &VictimPool {
                     evictable: &reclaimable,
