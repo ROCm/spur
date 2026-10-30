@@ -241,7 +241,6 @@ mod tests {
             stable_id,
             render_minor,
             card_id: card,
-            selector_bdf: String::new(),
         }
     }
 
