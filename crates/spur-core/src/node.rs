@@ -462,9 +462,11 @@ impl Node {
         !(self.alloc_resources.cpus >= self.total_resources.cpus && self.total_resources.cpus > 0)
     }
 
-    /// Whether this node can accept new work.
+    /// Whether this node can accept new work. A node whose core settings cannot
+    /// yield a valid layout is excluded until the settings are fixed, so jobs
+    /// never land on a node that cannot enforce its spec cores (SPUR-386).
     pub fn is_schedulable(&self) -> bool {
-        self.state.is_available()
+        self.state.is_available() && self.layout_error.is_none()
     }
 
     /// Routable comm address (NodeAddr), when registered.

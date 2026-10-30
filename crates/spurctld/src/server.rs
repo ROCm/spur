@@ -5525,10 +5525,16 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         }
         _ => (String::new(), 0, 0),
     };
+    // A bad core layout excludes the node from scheduling; surface it as the
+    // reason so operators see why, even though it is not an operator drain.
+    let state_reason = match &node.layout_error {
+        Some(err) => format!("core-layout: {err}"),
+        None => node.state_reason.clone().unwrap_or_default(),
+    };
     NodeInfo {
         name: node.name.clone(),
         state: node.state.to_proto_i32(),
-        state_reason: node.state_reason.clone().unwrap_or_default(),
+        state_reason,
         partitions: node.partitions.clone(),
         total_resources: Some(resource_to_proto(&node.total_resources)),
         alloc_resources: Some(allocations_to_proto(&node.alloc_resources)),
