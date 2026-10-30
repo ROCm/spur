@@ -919,7 +919,7 @@ async fn dispatch_step(
     validate_step_cpu_bind(&environment, ntasks)?;
     // Live-stream the step's output when it lands on a single node and the user
     // has not redirected to a file. The tail runs concurrently with the blocking
-    // RunStep and ends when the step leaves the agent's active_steps (#781).
+    // RunStep and ends when the step leaves the agent's active_steps.
     let live_node = if io.stdout.is_empty() && io.stderr.is_empty() {
         single_step_node(client, job_id).await
     } else {
@@ -3898,7 +3898,7 @@ mod tests {
     }
 
     /// --container-readonly is a no-op in the runtime today, so it is refused at
-    /// submission rather than silently ignored (the #777-class failure mode).
+    /// submission rather than silently ignored.
     #[tokio::test]
     async fn container_readonly_is_rejected() {
         let result = main_with_args(vec![

@@ -209,7 +209,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(cmd) = canonical {
         // Rewrite argv: replace ["spur", "cmd", ...rest] with ["cmd", ...rest]
         //
-        // Special case (issue #53): `spur show node X` should dispatch as
+        // Special case: `spur show node X` should dispatch as
         // `scontrol show node X`, not `scontrol node X`. When the user's
         // command is "show", insert the implicit "show" subcommand for scontrol.
         let implicit_show = args[1].as_str() == "show" && cmd == "scontrol";

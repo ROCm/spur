@@ -7563,7 +7563,7 @@ impl SlurmAgent for AgentService {
             //
             // If the step asked for its own image, it is not honored here: the
             // step joins the parent's live container. Leave a trace rather than
-            // silently dropping it (the #777 anti-pattern).
+            // silently dropping it.
             if let Some(c) = req.container.as_ref() {
                 if !c.image.is_empty() {
                     warn!(
@@ -13905,7 +13905,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prolog_that_cannot_even_start_reports_the_underlying_errno() {
-        // Issue 520: `{e}` renders only the outermost context, reducing this to
+        // `{e}` renders only the outermost context, reducing this to
         // "prolog_slurmd script failed to execute: ..." and dropping the errno
         // that says whether the script is missing, unreadable or not executable.
         let svc = AgentService::new(
@@ -14692,7 +14692,7 @@ mod tests {
         }
     }
 
-    // STEP_INTERACTIVE (a non-owning step, since this PR) sits between user
+    // STEP_INTERACTIVE (a non-owning step) sits between user
     // steps and STEP_BATCH/STEP_EXTERN in id order; directory order is
     // otherwise arbitrary, so the job's own cgroup must win regardless of
     // which descriptor recovery processes first.
@@ -15975,7 +15975,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
-    /// Regression for #777: a step carrying `container_image` must take the
+    /// Regression: a step carrying `container_image` must take the
     /// container path, not silently run the command on the host. A bogus image
     /// makes the container path fail at image resolution *before* the command
     /// would run. The command (`echo`) would exit 0 on the host, so an Ok result

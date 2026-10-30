@@ -397,7 +397,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
-        // the entire scheduling loop (issue #56).
+        // the entire scheduling loop.
         let sched_ref = &mut scheduler;
         let schedule_start = Instant::now();
         let assignments = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4014,7 +4014,7 @@ mod tests {
             .collect()
     }
 
-    // ── #147: --exclusive enforcement ─────────────────────────────
+    // ── --exclusive enforcement ───────────────────────────────────
     //
     // Repro of the reported bug: an exclusive job that requests 1 CPU
     // would only record 1 CPU as allocated against the node. Backfill's

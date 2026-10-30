@@ -1588,7 +1588,7 @@ mod tests {
     #[test]
     fn build_add_user_request_allows_defaultqos_alone_without_a_list() {
         // Pinning only a default (no qos= list) is still valid — it's
-        // PR #490's single-QOS scoping, not a validation error.
+        // single-QOS scoping, not a validation error.
         let p = parse_params(&[
             "name=testuser".into(),
             "account=testacct".into(),

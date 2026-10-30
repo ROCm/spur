@@ -763,11 +763,11 @@ mod tests {
         assert_eq!(parts[5], "sbatch /path/to/script.sh"); // command
     }
 
-    // ── T50.75: Node count single-node partition (#25) ───────────
+    // ── T50.75: Node count single-node partition ─────────────────
 
     #[test]
     fn t50_75_single_node_partition_count_nonzero() {
-        // Regression: node count showed 0 on single-node setups (#25).
+        // Regression: node count showed 0 on single-node setups.
         // A partition with one node in its spec must report count >= 1.
         let nodes_spec = "node001";
         let count = spur_core::hostlist::expand(nodes_spec)
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     fn t50_76_reservation_field_flows_through_job_spec() {
-        // Regression: --reservation flag was missing from submit commands (#26).
+        // Regression: --reservation flag was missing from submit commands.
         // The field must exist on JobSpec and be passable to the scheduler.
         let spec = spur_core::job::JobSpec {
             reservation: Some("res-gpu".into()),
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn t50_77_reservation_update_fields_present() {
-        // Regression: no command to update a reservation (#28).
+        // Regression: no command to update a reservation.
         // Reservation must have all fields needed for an update operation.
         use spur_core::reservation::Reservation;
         let now = chrono::Utc::now();
@@ -817,7 +817,7 @@ mod tests {
 
     #[test]
     fn t50_78_single_node_name_matches_hostlist() {
-        // Regression: single-node clusters had inconsistent node naming (#30).
+        // Regression: single-node clusters had inconsistent node naming.
         // The node name used at registration must be what the hostlist expands to.
         let config_spec = "ubb-r09-01";
         let expanded = spur_core::hostlist::expand(config_spec).unwrap();
@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn t50_79_sinfo_nodelist_uses_registered_names() {
-        // Regression: sinfo NODELIST showed "localhost" instead of real node names (#36).
+        // Regression: sinfo NODELIST showed "localhost" instead of real node names.
         // When registered nodes are available the NODELIST should use their names,
         // not fall back to the static partition spec string.
         let registered_names = ["ubb-r09-09", "ubb-r09-11"];
@@ -937,11 +937,11 @@ address = "http://peer-a:6817"
         }
     }
 
-    // ── T50.89-91: Issue #41-43 fixes ────────────────────────────
+    // ── T50.89-91: default partition, pending reason, exec routing ──
 
     #[test]
     fn t50_89_default_partition_assigned_on_submit() {
-        // Issue #43: when no --partition is specified, the default partition
+        // When no --partition is specified, the default partition
         // should be assigned so the scheduler can match nodes correctly.
         // Verify that Partition carries is_default and that the scheduler
         // harness correctly sets it.
@@ -958,7 +958,7 @@ address = "http://peer-a:6817"
 
     #[test]
     fn t50_90_pending_reason_resources_when_no_nodes() {
-        // Issue #43: pending_reason should reflect inability to schedule, not
+        // pending_reason should reflect inability to schedule, not
         // just always show "Priority".
         let reason = spur_core::job::PendingReason::Resources;
         assert_eq!(reason.display(), "Resources");
@@ -972,7 +972,7 @@ address = "http://peer-a:6817"
 
     #[test]
     fn t50_91_exec_uses_controller_not_agent() {
-        // Issue #42: spur exec should route through the controller so it works
+        // spur exec should route through the controller so it works
         // from login nodes regardless of where the job is running.
         // This is a structural test — verify the ExecInJobRequest message exists
         // and can be constructed.
@@ -1077,11 +1077,11 @@ address = "http://peer-a:6817"
         assert_eq!(ws.ypixel, 768);
     }
 
-    // ── Issue #46: CLI reads config file for controller port ──────
+    // ── CLI reads config file for controller port ─────────────────
 
     #[test]
     fn t50_93_config_controller_addr_from_toml() {
-        // Issue #46: the CLI should read controller address from config.
+        // The CLI should read controller address from config.
         // Verify SlurmConfig can parse a custom port and hosts.
         let toml = r#"
             cluster_name = "test"
@@ -1098,11 +1098,11 @@ address = "http://peer-a:6817"
         assert_eq!(port, "6821");
     }
 
-    // ── Issue #47: nodes auto-join default partition ──────────────
+    // ── Nodes auto-join default partition ─────────────────────────
 
     #[test]
     fn t50_94_node_auto_partition_assignment() {
-        // Issue #47: when a node doesn't match any partition hostlist,
+        // When a node doesn't match any partition hostlist,
         // it should auto-join the default partition.
         let mut node = Node::new(
             "dynamic-node".into(),
@@ -1122,11 +1122,11 @@ address = "http://peer-a:6817"
         assert_eq!(node.partitions, vec!["batch"]);
     }
 
-    // ── Issue #48: container image resolution fallback ────────────
+    // ── Container image resolution fallback ───────────────────────
 
     #[test]
     fn t50_95_container_image_absolute_path_basename_fallback() {
-        // Issue #48: when the agent receives an absolute path from the
+        // When the agent receives an absolute path from the
         // login node that doesn't exist locally, it should try the
         // basename in the local image directory.
         let path = std::path::Path::new("/var/spool/spur/images/ubuntu+22.04.sqsh");
@@ -1142,11 +1142,11 @@ address = "http://peer-a:6817"
         assert_eq!(format!("{}.sqsh", sanitized), basename);
     }
 
-    // ── Issue #56 (reopen #47): scheduler crash recovery ─────────
+    // ── Scheduler crash recovery ──────────────────────────────────
 
     #[test]
     fn t50_96_scheduler_handles_num_nodes_zero_safely() {
-        // Issue #56: If num_nodes is somehow 0, the scheduler should not
+        // If num_nodes is somehow 0, the scheduler should not
         // panic on .max().unwrap() with an empty iterator.
         // The fix ensures num_nodes.max(1) is used in the scheduling loop.
         use spur_sched::traits::Scheduler;
@@ -1183,11 +1183,11 @@ address = "http://peer-a:6817"
         assert_eq!(assignments.len(), 1);
     }
 
-    // ── Issue #56: update_pending_reasons checks constraints ─────
+    // ── update_pending_reasons checks constraints ─────────────────
 
     #[test]
     fn t50_97_pending_reason_respects_constraints() {
-        // Issue #56: A job with --constraint=gpu should show
+        // A job with --constraint=gpu should show
         // Reason=Resources (not Priority) when no node has that feature.
         let _reason_with_features: () = {
             let mut node = Node::new(
@@ -1230,11 +1230,11 @@ address = "http://peer-a:6817"
         };
     }
 
-    // ── Issue #55 (reopen): agent image_dir fallback ─────────────
+    // ── Agent image_dir fallback ──────────────────────────────────
 
     #[test]
     fn t50_98_image_dir_fallback_logic() {
-        // Issue #55: The agent's image_dir() should fall back to
+        // The agent's image_dir() should fall back to
         // ~/.spur/images when /var/spool/spur/images doesn't exist.
         // This test verifies the fallback logic conceptually.
         let system_dir = std::path::Path::new("/var/spool/spur/images");
@@ -1251,11 +1251,11 @@ address = "http://peer-a:6817"
         }
     }
 
-    // ── Issue #53: CLI show dispatch ─────────────────────────────
+    // ── CLI show dispatch ─────────────────────────────────────────
 
     #[test]
     fn t50_100_show_dispatch_inserts_implicit_show() {
-        // Issue #53: `spur show node X` should dispatch as
+        // `spur show node X` should dispatch as
         // `scontrol show node X`, not `scontrol node X`.
         //
         // Simulate the argv rewriting logic from main.rs.
@@ -1303,11 +1303,11 @@ address = "http://peer-a:6817"
         assert_eq!(rewritten, vec!["scontrol", "show", "node", "gpu-1"]);
     }
 
-    // ── Issue #51: K8s operator address resolution ───────────────
+    // ── K8s operator address resolution ───────────────────────────
 
     #[test]
     fn t50_102_k8s_address_resolution_priority() {
-        // Issue #51: The operator should prefer --address flag over
+        // The operator should prefer --address flag over
         // POD_IP env var over hostname. Verify the priority logic.
         //
         // Test the priority: explicit > POD_IP > listen IP > hostname
@@ -1347,11 +1347,11 @@ address = "http://peer-a:6817"
         assert_eq!(result, "10.244.1.5");
     }
 
-    // ── Issue #52: retry loop backoff ────────────────────────────
+    // ── Retry loop backoff ────────────────────────────────────────
 
     #[test]
     fn t50_104_retry_backoff_doubles_then_caps() {
-        // Issue #52: verify exponential backoff logic caps at 60s.
+        // Verify exponential backoff logic caps at 60s.
         let max_backoff = std::time::Duration::from_secs(60);
         let mut backoff = std::time::Duration::from_secs(1);
 
@@ -1366,11 +1366,11 @@ address = "http://peer-a:6817"
         assert_eq!(backoff.as_secs(), 1);
     }
 
-    // ── Issue #63 (reopen of #55): agent image search checks all dirs ──
+    // ── Agent image search checks all dirs ────────────────────────
 
     #[test]
     fn t50_105_image_dirs_returns_multiple_candidates() {
-        // Issue #63: The agent's image_dir() only returned one directory,
+        // The agent's image_dir() only returned one directory,
         // so images imported to ~/.spur/images were invisible if
         // /var/spool/spur/images existed (even if not writable).
         // Now image_dirs() returns ALL candidate directories.
@@ -1387,23 +1387,23 @@ address = "http://peer-a:6817"
         }
     }
 
-    // ── Issue #64 (reopen of #54): raw terminal mode for attach ─────
+    // ── Raw terminal mode for attach ──────────────────────────────
 
     #[test]
     fn t50_106_attach_raw_mode_is_nonfatal_for_pipes() {
         // Moved to spur-cli/src/sattach.rs::tests::raw_mode_fails_on_pipe
         // which tests the REAL RawModeGuard::enter_on_fd() with an explicit
-        // pipe fd. See issue #111 — the old test simulated isatty() instead
+        // pipe fd. The old test simulated isatty() instead
         // of calling the actual unit, and depended on the test runner env.
         //
         // This placeholder ensures the test ID isn't reused.
     }
 
-    // ── Issue #65 (reopen of #56): pending reason uses available resources ──
+    // ── Pending reason uses available resources ───────────────────
 
     #[test]
     fn t50_107_pending_reason_checks_available_not_total() {
-        // Issue #65: update_pending_reasons used total_resources.can_satisfy()
+        // update_pending_reasons used total_resources.can_satisfy()
         // which always returned true for nodes with enough total capacity,
         // even when alloc_resources consumed most of the node. Should use
         // available = total - alloc.

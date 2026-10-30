@@ -993,7 +993,7 @@ class TestQosWallCapDefaulting:
         assert job_id is not None
 
         # Half one: the untimed job inherits MaxWall (1:00) as its limit rather
-        # than being admitted UNLIMITED — the bug this PR fixes.
+        # than being admitted UNLIMITED.
         limit = _wait_time_limit(c, job_id)
         assert limit == "1:00", (
             f"untimed job must inherit the QOS MaxWall as its limit, got {limit!r} "
@@ -1079,8 +1079,7 @@ class TestSacctmgrQosAuthorization:
 
     def test_submission_rejects_borrowing_qos_from_a_different_account(self, accounting_cluster):
         # A user in two accounts, each pinned to its own QOS, must not be
-        # able to submit under one account while borrowing the other's QOS
-        # — the exact cross-account confusion reported in SPUR-101.
+        # able to submit under one account while borrowing the other's QOS.
         c = accounting_cluster
         user = c.nodes[0].user
 
@@ -1306,7 +1305,7 @@ class TestSacctmgrQosAuthorization:
         # scontrol update job qos= must enforce the same per-association
         # authorization as submission, including when qos= and account= are
         # changed together to an account the user has no association with
-        # (the account-spoofing bypass this PR closes).
+        # (an account-spoofing bypass).
         c = accounting_cluster
         user = c.nodes[0].user
 

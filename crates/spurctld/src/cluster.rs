@@ -3385,7 +3385,7 @@ impl ClusterManager {
     /// Unlike `maybe_requeue`, this is unconditional and doesn't require
     /// the requeue flag on the spec. Used when the agent rejects a job
     /// (e.g., container image not found) so it can be retried after the
-    /// user fixes the issue. (Issue #91)
+    /// user fixes the issue.
     pub fn requeue_job(&self, job_id: JobId) -> anyhow::Result<()> {
         self.requeue_after_launch_failure(job_id, false)
     }
@@ -20289,7 +20289,7 @@ mod tests {
 
     /// A pending bystander with a lower QOS base than the hunter (6000 vs 11000)
     /// but a higher effective priority once fair-share and age are folded in
-    /// (~6000 x 3.0 x age). This is the #1095 shape: the bystander wins the
+    /// (~6000 x 3.0 x age). The bystander wins the
     /// effective-priority axis but has no claim to the contested capacity.
     fn submit_bystander(cm: &Arc<ClusterManager>, node: &str) -> JobId {
         cm.qos_cache().insert(Qos {
@@ -20353,7 +20353,7 @@ mod tests {
         (victim_id, hunter_id)
     }
 
-    /// The #1095 example: a bystander with a lower QOS base but higher effective
+    /// A bystander with a lower QOS base but higher effective
     /// priority (via fair-share) must not outrank the in-flight preemptor for the
     /// node the preemptor is freeing. The preemptor is hoisted to the front of
     /// the pending list so backfill reserves that node for it.
@@ -20447,7 +20447,7 @@ mod tests {
     /// Abandonment: if the preemptor is cancelled mid-drain, the victim's
     /// `preempted_by` has nothing to anchor the hoist to once it finalizes, so
     /// the freed node returns to the best current pending claimant — the
-    /// deliberate divergence from #1095's QOS-wide hold.
+    /// deliberate divergence from a QOS-wide hold.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_preemption_returns_node_to_best_claimant() {
         let dir = TempDir::new().unwrap();
@@ -23610,9 +23610,8 @@ mod tests {
         // node (real becomes 2, well under its cap of 5). Instead, the
         // account's irrelevant credit poisons the QOS's own computation,
         // charging it 1 new node it doesn't need, and the job is wrongly
-        // blocked on QosGrpNodeLimit -- the exact under-utilization bug
-        // class issue #709 (and this whole PR) was meant to fix, now
-        // reintroduced via the interaction between the two gates.
+        // blocked on QosGrpNodeLimit -- an under-utilization bug caused by
+        // the interaction between the two gates.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 128000);
@@ -28548,7 +28547,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_job_qos_rejects_unauthorized_association_qos() {
         // `scontrol update job qos=` must enforce the same per-association
-        // authorization as submission (SPUR-101).
+        // authorization as submission.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(Qos {
@@ -28617,7 +28616,7 @@ mod tests {
     async fn update_job_qos_rejects_bypass_via_unaffiliated_account() {
         // Pairing the QOS change with an account the user has no recorded
         // association for must not fall back to "nothing to check" — that
-        // was a live bypass of the authorization this PR adds.
+        // would bypass the per-association QOS authorization.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(Qos {
@@ -31106,7 +31105,7 @@ mod tests {
     #[test]
     fn apply_default_qos_explicit_unauthorized_qos_is_rejected() {
         // An explicit QOS that exists but isn't the association's own default
-        // must be rejected, not silently accepted (SPUR-101).
+        // must be rejected, not silently accepted.
         let assoc = AssociationCache::new();
         assoc.insert_default_qos("testuser", "research", "highprio");
         let qos = qos_cache_with(&["highprio", "other-teams-qos"]);
@@ -31169,7 +31168,7 @@ mod tests {
     fn apply_default_qos_explicit_rejects_other_accounts_qos() {
         // A user in two accounts, each pinned to its own QOS, must not be
         // able to borrow one account's QOS while submitting under the
-        // other — the exact cross-account confusion reported in SPUR-101.
+        // other.
         let assoc = AssociationCache::new();
         assoc.insert_default_qos("testuser", "hyperloom", "hyperloom-qos");
         assoc.insert_default_qos("testuser", "primus", "primus-qos");

@@ -383,7 +383,7 @@ pub enum PendingReason {
     // Slurm 25.11 reason-code parity additions; each maps to a WAIT_*/FAIL_*
     // reason, with the byte-exact Slurm string in display(). Only reasons with
     // a live emission path are landed here; the rest are added alongside their
-    // enforcement logic (see #307) to avoid dead variants accreting in the
+    // enforcement logic to avoid dead variants accreting in the
     // Raft-snapshot deserialization contract.
     Reservation,
     QosMaxCpuPerJobLimit,
@@ -1056,7 +1056,7 @@ impl Job {
             // Start with None — the scheduler loop's update_pending_reasons()
             // will set the actual reason (Priority, Resources, etc.) on the
             // first cycle. This avoids showing a misleading "Priority" reason
-            // before the scheduler has evaluated the job. (Issue #90)
+            // before the scheduler has evaluated the job.
             PendingReason::None
         };
         Self {
