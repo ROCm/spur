@@ -45,7 +45,6 @@ uuid = { workspace = true }
 # GPU sharing with Kubernetes: own-node label, ResourceClaim/ResourceSlice watch
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

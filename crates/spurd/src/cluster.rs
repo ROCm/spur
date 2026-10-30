@@ -1081,7 +1081,7 @@ impl K0sAgent {
         let kubeconfig = self
             .bound_token_kubeconfig(
                 &service_account,
-                crate::gpu_sharing::placeholder::NAMESPACE,
+                crate::gpu_sharing::credential::NAMESPACE,
                 crate::gpu_sharing::credential::TOKEN_DURATION,
             )
             .await?;

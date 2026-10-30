@@ -211,21 +211,16 @@ class TestGpuSharingOnHardware:
                                       f"{c.remote_dir}/gs-all.out", script]))
         one = parse_job_id(c.sbatch(["-J", "gs-one", "--gres", "gpu:1", "-o",
                                      f"{c.remote_dir}/gs-one.out", script]))
-        placeholder = f"-l spur.amd.com/job-id={one}"
-        job_gpu = _wait("placeholder claim",
-                        lambda: _allocated(c, "spur-system", placeholder), timeout=180)
-        assert job_gpu == [_wait("job hold",
-                                 lambda: next((d for d, s in _gpu_lines(c).items()
-                                               if s == f"job {one}"), None))]
-        assert pod_gpu not in job_gpu
+        job_gpu = _wait("job gpu", lambda: next(
+            (d for d, s in _gpu_lines(c).items() if s == f"job {one}"), None), timeout=180)
+        assert job_gpu != pod_gpu
         assert job_state(c.squeue_all(), full) == "PD", c.squeue_all()
 
         wait_job(c, one, timeout=180)
         opened = re.findall(r"OPEN /dev/dri/renderD(\d+)",
                             c.nodes[0].read_file(f"{c.remote_dir}/gs-one.out"))
-        assert opened == [job_gpu[0].rsplit("-", 1)[1]], opened
-        _wait("placeholder deleted", lambda: f"spur-job-{one}-" not in _kubectl(
-            c, "-n spur-system get pods,resourceclaims -o name"), timeout=120)
+        assert opened == [job_gpu.rsplit("-", 1)[1]], opened
+        assert "spur-system" not in _kubectl(c, "get pods,resourceclaims -A -o name")
         c.scancel(str(full))
 
     def test_extended_resource_pod_is_held(self, gpu_sharing_node):

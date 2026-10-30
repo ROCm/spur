@@ -124,35 +124,6 @@ def _fake_slice(node: str) -> dict:
     }
 
 
-def _orphan(node: str, job_id: int) -> list[dict]:
-    labels = {
-        "app.kubernetes.io/managed-by": "spurd",
-        "spur.amd.com/job-id": str(job_id),
-        "spur.amd.com/run-attempt": "0",
-        "spur.amd.com/node": node,
-    }
-    name = f"spur-job-{job_id}-0-{node}"
-    claim = {
-        "apiVersion": "resource.k8s.io/v1",
-        "kind": "ResourceClaim",
-        "metadata": {"name": name, "namespace": "spur-system", "labels": labels},
-        "spec": {"devices": {"requests": [{
-            "name": "gpu0",
-            "exactly": {"deviceClassName": "gpu.amd.com", "count": 1},
-        }]}},
-    }
-    pod = {
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"name": name, "namespace": "spur-system", "labels": labels},
-        "spec": {
-            "nodeSelector": {"kubernetes.io/hostname": node},
-            "containers": [{"name": "pause", "image": "quay.io/k0sproject/pause:3.10.2-0"}],
-        },
-    }
-    return [claim, pod]
-
-
 class TestGpuSharingWithoutGpus:
     def test_shared_node_lifecycle(self, sharing_cluster):
         c = sharing_cluster
@@ -201,15 +172,7 @@ class TestGpuSharingWithoutGpus:
               lambda: "GpuUnshareable" not in _show_node(c, shared)
               and "State=unshareable" in _show_node(c, shared))
 
-        # A placeholder of a job that is not live on the node is deleted.
-        for i, obj in enumerate(_orphan(k_shared, 999999)):
-            _kubectl_apply(c, f"orphan-{i}", obj)
-        _wait("orphans deleted",
-              lambda: "spur-job-999999" not in _kubectl(
-                  c, "-n spur-system get pods,resourceclaims -o name"),
-              timeout=180)
-
-        # Opt-out: label `false` at once, links go with no live placeholder.
+        # Opt-out: label `false` and the links go at once.
         c.cli_as_user("root", ["spur", "node", "gpu-sharing", shared, "off"])
         _wait("opt-out label", lambda: _label(c, shared) == "false")
         _wait("links removed",
