@@ -105,10 +105,15 @@ pub struct JobStep {
     pub end_time: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
 
-    /// A PTY step (`srun --pty`). Lets the controller tell the standalone-PTY
-    /// step that owns a job's lifetime from an overlapping `--jobid ... --pty`.
+    /// A PTY step (`srun --pty`), whose session's exit its node reports.
     #[serde(default)]
     pub pty: bool,
+
+    /// The standalone `srun --pty` shell that is the job's own workload, so its
+    /// exit ends the job. Marked by that `srun` when it creates the step: a step
+    /// id cannot tell it apart from an extra session that got there first.
+    #[serde(default)]
+    pub job_shell: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +513,7 @@ mod tests {
             end_time: None,
             exit_code: None,
             pty: false,
+            job_shell: false,
         };
         let encoded = serde_json::to_string(&step).expect("serialize");
         assert!(
@@ -519,9 +525,9 @@ mod tests {
         assert_eq!(decoded.name, step.name);
     }
 
-    // A step logged by an older controller has no `pty`; replay must not crash.
+    // A step logged by an older controller has neither flag; replay must not crash.
     #[test]
-    fn job_step_deserializes_without_pty_field() {
+    fn job_step_deserializes_without_pty_or_job_shell_fields() {
         let step = JobStep {
             job_id: 1,
             step_id: 0,
@@ -536,11 +542,15 @@ mod tests {
             end_time: None,
             exit_code: None,
             pty: true,
+            job_shell: true,
         };
         let mut value = serde_json::to_value(&step).expect("serialize");
-        value.as_object_mut().expect("object").remove("pty");
+        let fields = value.as_object_mut().expect("object");
+        fields.remove("pty");
+        fields.remove("job_shell");
         let decoded: JobStep = serde_json::from_value(value).expect("deserialize");
         assert!(!decoded.pty);
+        assert!(!decoded.job_shell);
     }
 
     #[test]
@@ -561,6 +571,7 @@ mod tests {
             end_time: None,
             exit_code: None,
             pty: false,
+            job_shell: false,
         };
 
         assert!(!step.state.is_terminal());

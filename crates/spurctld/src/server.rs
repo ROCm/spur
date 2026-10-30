@@ -3068,6 +3068,7 @@ impl SlurmController for ControllerService {
             end_time: None,
             exit_code: None,
             pty: req.pty,
+            job_shell: req.job_shell && req.pty && job.is_standalone_pty(),
         };
 
         self.cluster
@@ -7737,6 +7738,7 @@ mod tests {
                 end_time: None,
                 exit_code: None,
                 pty: true,
+                job_shell: true,
             })
             .unwrap();
         (job_id, run_attempt)
@@ -7841,6 +7843,41 @@ mod tests {
             svc.cluster.get_job(job_id).map(|j| j.state),
             Some(JobState::Running)
         );
+    }
+
+    // A step marked as the job's shell ends the job when its session exits, so
+    // the mark only sticks on a standalone `srun --pty` job's PTY step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_marks_the_job_shell_only_on_a_standalone_pty_step() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let other = running_job_owned_by(&svc, "u").await;
+        let (standalone, _) = running_standalone_pty_job(&svc).await;
+
+        for (job_id, pty, marked) in [
+            (standalone, true, true),
+            (standalone, false, false),
+            (other, true, false),
+        ] {
+            let step_id = svc
+                .create_job_step(Request::new(CreateJobStepRequest {
+                    job_id,
+                    command: vec!["bash".into()],
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    overlap: true,
+                    pty,
+                    user: "u".into(),
+                    job_shell: true,
+                    ..Default::default()
+                }))
+                .await
+                .expect("create the step")
+                .into_inner()
+                .step_id;
+            let step = svc.cluster.get_step(job_id, step_id).expect("created step");
+            assert_eq!(step.job_shell, marked, "job {job_id}, pty={pty}");
+        }
     }
 
     // The positive case uses the credential registration actually handed back, so
@@ -9927,6 +9964,7 @@ mod tests {
                 container: None,
                 num_nodes: 0,
                 nodelist: String::new(),
+                job_shell: false,
             }))
             .await
             .expect("uid match must authorize step creation despite username mismatch");
@@ -10171,6 +10209,7 @@ mod tests {
                 end_time: None,
                 exit_code: None,
                 pty: false,
+                job_shell: false,
             })
             .expect("test setup: seed step");
         svc.cluster
@@ -10424,6 +10463,7 @@ mod tests {
                 end_time: None,
                 exit_code: None,
                 pty: false,
+                job_shell: false,
             })
             .expect("test setup: seed step with stale nodes");
 
@@ -10539,6 +10579,7 @@ mod tests {
                 end_time: None,
                 exit_code: None,
                 pty: false,
+                job_shell: false,
             })
             .expect("test setup: seed step for run_step");
 

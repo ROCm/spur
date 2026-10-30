@@ -2211,11 +2211,7 @@ impl ClusterManager {
     fn pty_exit_target(&self, exit: &PtySessionExit<'_>) -> Option<PtyExitTarget> {
         let jobs = self.jobs.read();
         let job = jobs.get(&exit.job_id)?;
-        // Only a standalone srun --pty allocation is finished by its shell's
-        // exit. A salloc parent (interactive) and a batch parent keep their
-        // own lifecycle; a `--jobid ... --pty` step inside one closes without
-        // ending the parent.
-        if !(job.spec.srun_job && job.spec.pty && !job.spec.interactive && job.srun_step_dispatch) {
+        if !job.is_standalone_pty() {
             return None;
         }
         // Act only on the live run. COMPLETING (scancel), SUSPENDED, and a
@@ -2238,16 +2234,10 @@ impl ClusterManager {
         if !step.pty || step.nodes.first().map(String::as_str) != Some(exit.node) {
             return None;
         }
-        // The standalone shell is the job's first user step; any later PTY
-        // step is an overlapping `--jobid ... --pty` session, which closes on
-        // its own without ending the job. A first step logged before the `pty`
-        // flag existed reads back as non-PTY, so that job is left to its client.
-        let ends_job = steps
-            .values()
-            .filter(|s| s.job_id == exit.job_id && spur_core::step::is_user_step(s.step_id))
-            .map(|s| s.step_id)
-            .min()
-            == Some(exit.step_id);
+        // Any other PTY step is an extra `--jobid ... --pty` session, which closes
+        // on its own without ending the job. A shell step logged before the marker
+        // existed reads back unmarked, so that job is left to its client.
+        let ends_job = step.job_shell;
         let step_open = !step.state.is_terminal();
         // A closed overlapping step makes this a replay. A closed shell step on a
         // running job does not: the job's own write failed, or the client closed
@@ -2587,6 +2577,7 @@ impl ClusterManager {
                 end_time: None,
                 exit_code: None,
                 pty: false,
+                job_shell: false,
             };
             if let Err(e) = self.create_step(batch_step) {
                 warn!(job_id, error = %e, "failed to record batch step");
@@ -13270,6 +13261,7 @@ mod tests {
             end_time: None,
             exit_code: None,
             pty: false,
+            job_shell: false,
         };
         cm.steps.write().insert((1, 0), step(1));
         cm.steps.write().insert((2, 0), step(2));
@@ -14471,6 +14463,7 @@ mod tests {
                 end_time: None,
                 exit_code: None,
                 pty: true,
+                job_shell: false,
             }),
         });
         cm.apply_operation(&WalOperation::JobStepComplete {
@@ -27454,6 +27447,7 @@ mod tests {
             end_time: None,
             exit_code: None,
             pty: false,
+            job_shell: false,
         }
     }
 
@@ -33055,7 +33049,14 @@ mod tests {
         });
     }
 
-    fn add_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str], pty: bool) {
+    fn add_step(
+        cm: &ClusterManager,
+        id: JobId,
+        step_id: u32,
+        nodes: &[&str],
+        pty: bool,
+        job_shell: bool,
+    ) {
         cm.apply_operation(&WalOperation::JobStepCreate {
             step: Box::new(spur_core::step::JobStep {
                 job_id: id,
@@ -33071,12 +33072,24 @@ mod tests {
                 end_time: None,
                 exit_code: None,
                 pty,
+                job_shell,
             }),
         });
     }
 
-    fn add_pty_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
-        add_step(cm, id, step_id, nodes, true);
+    /// The standalone `srun --pty`'s own shell, marked as it creates its step.
+    fn add_shell_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, true, true);
+    }
+
+    /// An extra `srun --jobid ... --pty` session.
+    fn add_session_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, true, false);
+    }
+
+    /// A buffered `srun --jobid ... cmd` step, or one logged before either flag existed.
+    fn add_plain_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, false, false);
     }
 
     /// `node`'s report that step `step_id`'s session exited cleanly in run
@@ -33104,7 +33117,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_pty_spec("pty-clean"));
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         let outcome = finish_pty(&cm, session_exit(id, 0, "n1"));
         assert!(
@@ -33122,7 +33135,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_pty_spec("pty-signal"));
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         // A signal death reports exit_code 0 with the signal set; it must not read
         // as COMPLETED 0.
@@ -33150,7 +33163,7 @@ mod tests {
         for (signal, exit) in [(9 | oom, 128 + 9), (oom, 0)] {
             let id = submit_and_wait(&cm, srun_pty_spec("pty-oom"));
             start_pty_job(&cm, id, &["n1"], 1);
-            add_pty_step(&cm, id, 0, &["n1"]);
+            add_shell_step(&cm, id, 0, &["n1"]);
 
             let report = PtySessionExit {
                 signal,
@@ -33178,10 +33191,10 @@ mod tests {
         spec.num_nodes = 2;
         let id = submit_and_wait(&cm, spec);
         start_pty_job(&cm, id, &["n1", "n2"], 1);
-        // The shell's step was logged before the `pty` flag existed, so it reads
-        // back as non-PTY; step 1 is a later `--jobid ... -w n2 --pty` session.
-        add_step(&cm, id, 0, &["n1", "n2"], false);
-        add_pty_step(&cm, id, 1, &["n2"]);
+        // The shell's step was logged before either flag existed, so it reads
+        // back unmarked; step 1 is a later `--jobid ... -w n2 --pty` session.
+        add_plain_step(&cm, id, 0, &["n1", "n2"]);
+        add_session_step(&cm, id, 1, &["n2"]);
 
         assert!(
             matches!(
@@ -33202,6 +33215,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_never_lets_a_session_holding_the_lowest_step_end_the_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-session-first");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // A `--jobid ... -w n2 --pty` attached while the job pended retries faster
+        // than srun polls for RUNNING, so it takes step 0 before the shell does.
+        add_session_step(&cm, id, 0, &["n2"]);
+        add_shell_step(&cm, id, 1, &["n1"]);
+
+        assert!(
+            matches!(
+                finish_pty(&cm, session_exit(id, 0, "n2")),
+                PtyExitOutcome::StepClosed
+            ),
+            "the extra session's exit must not end the job and kill the shell"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(!cm.get_step(id, 1).unwrap().state.is_terminal());
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 1, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_the_job_from_a_shell_behind_another_step() {
+        // Step 0 is a buffered `srun --jobid ... cmd` that ran before the shell's
+        // step existed, or the shell's own first CreateJobStep whose response was
+        // lost, so srun retried and its session runs as step 1.
+        type AddStep = fn(&ClusterManager, JobId, u32, &[&str]);
+        let step_zero: [(&str, AddStep); 2] = [
+            ("a buffered step", add_plain_step),
+            ("an orphaned shell step", add_shell_step),
+        ];
+        for (what, add_first) in step_zero {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 4, 8000);
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-shell-second"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_first(&cm, id, 0, &["n1"]);
+            add_shell_step(&cm, id, 1, &["n1"]);
+
+            let exit = PtySessionExit {
+                exit_code: 4,
+                ..session_exit(id, 1, "n1")
+            };
+            assert!(
+                matches!(finish_pty(&cm, exit), PtyExitOutcome::JobFinished(_)),
+                "the shell must end the job even with {what} at step 0"
+            );
+            settle(&cm, id, JobState::Failed);
+            assert_eq!(cm.get_job(id).unwrap().exit_code, Some(4));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_standalone_pty_finishes_the_job_despite_a_stale_session_on_its_node() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -33210,8 +33287,8 @@ mod tests {
         start_pty_job(&cm, id, &["n1"], 1);
         // Step 1 is an abandoned `--jobid ... --pty` attempt the agent refused as
         // already active; its record stays live on the shell's own node.
-        add_pty_step(&cm, id, 1, &["n1"]);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_session_step(&cm, id, 1, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
             finish_pty(&cm, session_exit(id, 0, "n1")),
@@ -33227,7 +33304,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_pty_spec("pty-derived"));
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         // The node's report usually beats the client's CompleteJobStep, which then
         // finds the step closed; the step's exit must still reach the job.
@@ -33256,7 +33333,7 @@ mod tests {
         spec.interactive = true;
         let id = submit_and_wait(&cm, spec);
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
             finish_pty(&cm, session_exit(id, 0, "n1")),
@@ -33272,7 +33349,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_spec("srun-nonpty"));
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
             finish_pty(&cm, session_exit(id, 0, "n1")),
@@ -33288,7 +33365,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_pty_spec("pty-stale"));
         start_pty_job(&cm, id, &["n1"], 2);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         // A report for a superseded attempt (and the unset 0) is dropped.
         for run_attempt in [1, 0] {
@@ -33308,7 +33385,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_pty_spec("pty-wrongnode"));
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
             finish_pty(&cm, session_exit(id, 0, "n2")),
@@ -33330,8 +33407,8 @@ mod tests {
         // Step 0 is the standalone shell (primary), recorded with both nodes as
         // `-N2 -w n1,n2` leaves it though its session runs on n1 only; step 1 is
         // an overlapping `--jobid ... -w n2 --pty`.
-        add_pty_step(&cm, id, 0, &["n1", "n2"]);
-        add_pty_step(&cm, id, 1, &["n2"]);
+        add_shell_step(&cm, id, 0, &["n1", "n2"]);
+        add_session_step(&cm, id, 1, &["n2"]);
 
         let overlap = PtySessionExit {
             exit_code: 2,
@@ -33369,14 +33446,14 @@ mod tests {
         start_pty_job(&cm, id, &["n1", "n2"], 1);
         // The shell runs on n1; two `--jobid ... -w n2 --pty` sessions then run
         // one after the other on n2, sharing the job's run attempt.
-        add_pty_step(&cm, id, 0, &["n1"]);
-        add_pty_step(&cm, id, 1, &["n2"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
+        add_session_step(&cm, id, 1, &["n2"]);
         let first = PtySessionExit {
             exit_code: 3,
             ..session_exit(id, 1, "n2")
         };
         assert!(matches!(finish_pty(&cm, first), PtyExitOutcome::StepClosed));
-        add_pty_step(&cm, id, 2, &["n2"]);
+        add_session_step(&cm, id, 2, &["n2"]);
 
         assert!(
             matches!(finish_pty(&cm, first), PtyExitOutcome::Ignored),
@@ -33405,9 +33482,9 @@ mod tests {
         spec.num_nodes = 2;
         let id = submit_and_wait(&cm, spec);
         start_pty_job(&cm, id, &["n1", "n2"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
-        add_pty_step(&cm, id, 1, &["n2"]);
-        add_step(&cm, id, 2, &["n1"], false);
+        add_shell_step(&cm, id, 0, &["n1"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+        add_plain_step(&cm, id, 2, &["n1"]);
 
         for (step_id, why) in [
             (1, "another node's session"),
@@ -33434,7 +33511,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_pty_spec("pty-step-closed"));
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
         // The shell's step closed but the job did not: the job's own write failed
         // after the step's, or the client closed the step and was then lost.
         cm.apply_operation(&WalOperation::JobStepComplete {
@@ -33467,7 +33544,7 @@ mod tests {
             register_node(&cm, "n1", 4, 8000);
             let id = submit_and_wait(&cm, srun_pty_spec("pty-write-fails"));
             start_pty_job(&cm, id, &["n1"], 1);
-            add_pty_step(&cm, id, 0, &["n1"]);
+            add_shell_step(&cm, id, 0, &["n1"]);
             if step_closed {
                 cm.apply_operation(&WalOperation::JobStepComplete {
                     job_id: id,
@@ -33493,7 +33570,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_pty_spec("pty-dup"));
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         assert!(matches!(
             finish_pty(&cm, session_exit(id, 0, "n1")),

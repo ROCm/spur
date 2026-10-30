@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -39,6 +39,7 @@ pub(crate) struct StepCapture {
     create_step_num_tasks: Arc<AtomicU32>,
     create_step_num_nodes: Arc<AtomicU32>,
     create_step_nodelist: Arc<Mutex<String>>,
+    create_step_job_shell: Arc<AtomicBool>,
     create_step_error: Arc<Mutex<Option<tonic::Code>>>,
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
     run_step_step_id: Arc<AtomicU32>,
@@ -86,6 +87,10 @@ impl StepCapture {
 
     pub(crate) fn create_step_nodelist(&self) -> String {
         self.create_step_nodelist.lock().unwrap().clone()
+    }
+
+    pub(crate) fn create_step_job_shell(&self) -> bool {
+        self.create_step_job_shell.load(Ordering::SeqCst)
     }
 
     /// Make `create_job_step` fail, so tests can drive the pre-step failure path.
@@ -210,6 +215,9 @@ mock_controller_impl! {
                 .create_step_num_nodes
                 .store(request.num_nodes, Ordering::SeqCst);
             *self.capture.create_step_nodelist.lock().unwrap() = request.nodelist;
+            self.capture
+                .create_step_job_shell
+                .store(request.job_shell, Ordering::SeqCst);
             if let Some(code) = *self.capture.create_step_error.lock().unwrap() {
                 return Err(tonic::Status::new(code, "mock create_job_step failure"));
             }

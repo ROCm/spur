@@ -204,14 +204,17 @@ This does not depend on the ``srun`` client: if the client is lost (closed
 terminal, ``kill -9``), the shell's exit still ends the job within seconds
 rather than leaving the allocation in ``RUNNING``. A live client reports the
 exit too; whichever report arrives first finishes the job and the other is a
-no-op.
+no-op. ``srun`` marks its shell's step for the controller when it opens the
+session, so a job started by an ``srun`` from an earlier release still ends
+only when that client reports the exit.
 
 Two cases behave differently, by design:
 
 - ``salloc``: exiting an attached ``srun --pty`` closes only that step. The
   allocation stays until you exit the ``salloc`` shell.
-- ``srun --jobid <id> --pty``, an extra session in a running job: when its
-  shell exits, the parent job keeps running.
+- ``srun --jobid <id> --pty``, an extra session in the job, even one attached
+  while the job was still pending: when its shell exits, the job keeps
+  running.
 
 If the client is gone *and* the shell keeps running (for example a shell that
 ignores the hangup), the job runs until its time limit, or until the

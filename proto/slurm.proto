@@ -1845,6 +1845,9 @@ message CreateJobStepRequest {
   ContainerSpec container = 11;  // Step's own container request (empty image = none/inherit)
   uint32 num_nodes = 12;       // Explicit step node count (-N); 0 = use all allocated nodes
   string nodelist = 13;        // Exact step node subset (-w); empty = derive from num_nodes/allocation
+  // Set only by a standalone `srun --pty` for its own shell, whose exit then
+  // ends the job. An extra `srun --jobid <id> --pty` session leaves it unset.
+  bool job_shell = 14;
 }
 
 message CreateJobStepResponse {
