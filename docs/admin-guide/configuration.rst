@@ -244,14 +244,16 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - integer
      - none
      - Restart
-     - Seconds without a heartbeat before a node is marked Down. Unset by
-       default; the controller applies a 90-second fallback when absent.
-       Jobs on a Down node end as ``NODE_FAIL`` (``CANCELLED`` if already
-       being cancelled); a job submitted with
-       ``--requeue`` goes back to the queue, and is held there after
-       ``max_batch_requeue`` requeues. Any run the job's nodes kept going is
-       stopped when they heartbeat again, or when the job is relaunched there
-       (see :ref:`requeued-run-upgrade-notes` for older agents).
+     - Seconds without a heartbeat before the leader checks on a node. Unset by
+       default; the controller applies a 90-second fallback when absent. A
+       ``spurd`` node whose agent still answers is kept; one that fails the
+       check on two consecutive health passes is marked Down. Jobs on a Down
+       node end as ``NODE_FAIL`` (``CANCELLED`` if already being cancelled); a
+       job submitted with ``--requeue`` goes back to the queue, and is held
+       there after ``max_batch_requeue`` requeues. Any run the job's nodes kept
+       going is stopped when they heartbeat again, or when the job is
+       relaunched there (see :ref:`requeued-run-upgrade-notes` for older
+       agents). See :ref:`node-liveness`.
    * - ``health_tick_secs``
      - integer
      - ``30``
@@ -259,6 +261,14 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Seconds between node-health passes. After winning a Raft election the
        controller withholds DOWN marking for ``max(heartbeat_timeout_secs,
        health_tick_secs)`` so heartbeats can refresh. Must be ``>= 1``.
+   * - ``max_stale_node_fraction``
+     - float
+     - ``0.5``
+     - Restart
+     - Largest fraction of watched nodes that may stop heartbeating in one
+       health pass. Above it, the leader assumes the fault is on its side,
+       marks none of them Down, and logs an error. Must be greater than ``0``
+       and at most ``1``; ``1`` turns the check off. See :ref:`node-liveness`.
    * - ``max_batch_requeue``
      - integer
      - ``5``
@@ -3281,6 +3291,7 @@ The controller validates ``spur.conf`` on load and refuses to start on error:
 
 - ``cluster_name`` must be non-empty.
 - ``controller.max_batch_requeue`` must be ``>= 1``.
+- ``controller.max_stale_node_fraction`` must be greater than ``0`` and at most ``1``.
 - When ``[cluster]`` is enabled:
 
   - ``distro`` must be ``"k0s"``.
