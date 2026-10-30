@@ -11,8 +11,7 @@ use spur_devices::cdi::SharingIdentity;
 use spur_proto::proto::{GpuHold, GpuHoldReport, GpuHoldState};
 
 pub const DRA_DRIVER: &str = "gpu.amd.com";
-pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
-pub const MANAGED_BY_SPURD: &str = "spurd";
+/// Claim label, set by the bridge, that names the Spur job a pod's GPUs belong to.
 pub const JOB_ID_LABEL: &str = "spur.amd.com/job-id";
 
 /// The allocated claim that names one DRA device.
@@ -22,8 +21,8 @@ pub struct ClaimHolder {
     pub claim: String,
     /// First pod the claim is reserved for; empty before the scheduler reserves it.
     pub pod: String,
-    /// Set when the claim belongs to a Spur job's placeholder.
-    pub placeholder_job: Option<u32>,
+    /// The Spur job of the claim's `spur.amd.com/job-id` label.
+    pub owner_job: Option<u32>,
 }
 
 /// What Kubernetes says about this node's GPUs.
@@ -65,13 +64,12 @@ impl K8sView {
 }
 
 fn claim_holder(claim: &ResourceClaim) -> Option<ClaimHolder> {
-    let labels = claim.metadata.labels.as_ref();
-    let label = |key: &str| labels.and_then(|l| l.get(key)).map(String::as_str);
-    let placeholder_job = (label(MANAGED_BY_LABEL) == Some(MANAGED_BY_SPURD)).then(|| {
-        label(JOB_ID_LABEL)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    });
+    let owner_job = claim
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(JOB_ID_LABEL))
+        .and_then(|v| v.parse().ok());
     let pod = claim
         .status
         .as_ref()?
@@ -85,7 +83,7 @@ fn claim_holder(claim: &ResourceClaim) -> Option<ClaimHolder> {
         namespace: claim.metadata.namespace.clone().unwrap_or_default(),
         claim: claim.metadata.name.clone().unwrap_or_default(),
         pod,
-        placeholder_job,
+        owner_job,
     })
 }
 
@@ -169,17 +167,24 @@ fn gpu_hold(
         );
     }
     let Some(holder) = view.holders.get(&device) else {
+        let state = match spur_job {
+            Some(_) => GpuHoldState::GpuHoldSpurJob,
+            None => GpuHoldState::GpuHoldFree,
+        };
         return GpuHold {
             stable_id,
-            state: GpuHoldState::GpuHoldFree as i32,
+            state: state as i32,
+            job_id: spur_job.unwrap_or_default(),
             dra_device: device,
             ..Default::default()
         };
     };
-    let (state, job_id) = match (holder.placeholder_job, spur_job) {
-        (Some(job), _) => (GpuHoldState::GpuHoldSpurJob, job),
-        (None, Some(job)) => (GpuHoldState::GpuHoldConflict, job),
-        (None, None) => (GpuHoldState::GpuHoldK8s, 0),
+    let (state, job_id) = match spur_job {
+        Some(job) if holder.owner_job != Some(job) => (GpuHoldState::GpuHoldConflict, job),
+        _ => (
+            GpuHoldState::GpuHoldK8s,
+            holder.owner_job.unwrap_or_default(),
+        ),
     };
     GpuHold {
         stable_id,
@@ -263,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn holds_classify_free_k8s_spur_job_conflict_and_unshareable() {
+    fn holds_classify_k8s_conflict_and_unshareable() {
         let slices = [
             slice(NODE, DRA_DRIVER, &["gpu-1-128", "gpu-9-136", "gpu-17-144"]),
             slice("other-node", DRA_DRIVER, &["gpu-25-152"]),
@@ -279,12 +284,12 @@ mod tests {
                 Some("infer-0"),
             ),
             claim(
-                "spur-system",
-                "spur-job-7-0",
-                serde_json::json!({MANAGED_BY_LABEL: MANAGED_BY_SPURD, JOB_ID_LABEL: "7"}),
+                "team",
+                "serve",
+                serde_json::json!({JOB_ID_LABEL: "7"}),
                 NODE,
                 &["gpu-1-128"],
-                Some("spur-job-7-0"),
+                Some("serve-0"),
             ),
             claim(
                 "team",
@@ -322,10 +327,10 @@ mod tests {
         let (s, g) = state(&report, 1);
         assert_eq!(
             (s, g.job_id, g.claim_name.as_str()),
-            (GpuHoldState::GpuHoldSpurJob, 7, "spur-job-7-0")
+            (GpuHoldState::GpuHoldK8s, 7, "serve")
         );
         let (s, g) = state(&report, 2);
-        assert_eq!(s, GpuHoldState::GpuHoldK8s);
+        assert_eq!((s, g.job_id), (GpuHoldState::GpuHoldK8s, 0));
         assert_eq!(
             (
                 g.pod_namespace.as_str(),
@@ -359,6 +364,46 @@ mod tests {
             (s, g.reason.as_str()),
             (GpuHoldState::GpuHoldUnshareable, "not a KFD device")
         );
+    }
+
+    #[test]
+    fn claim_label_names_the_owner_job_of_a_pod_gpu() {
+        let slices = [slice(
+            NODE,
+            DRA_DRIVER,
+            &["gpu-1-128", "gpu-9-136", "gpu-17-144", "gpu-25-152"],
+        )];
+        let owned_by = |name: &str, job: &str, device: &str| {
+            claim(
+                "team",
+                name,
+                serde_json::json!({JOB_ID_LABEL: job}),
+                NODE,
+                &[device],
+                Some(name),
+            )
+        };
+        let claims = [
+            owned_by("same-job", "7", "gpu-1-128"),
+            owned_by("job-gone", "8", "gpu-9-136"),
+            owned_by("other-job", "9", "gpu-17-144"),
+        ];
+        let view = K8sView::from_objects(&claims, &slices, NODE);
+        let job_gpus = HashMap::from([(7, vec![1]), (4, vec![3]), (5, vec![4])]);
+
+        let report = build_report(1, &[1, 2, 3, 4], &identities(), &view, &job_gpus, NODE);
+
+        let owner = |sid| {
+            let (s, g) = state(&report, sid);
+            (s, g.job_id, g.claim_name.clone())
+        };
+        assert_eq!(owner(1), (GpuHoldState::GpuHoldK8s, 7, "same-job".into()));
+        assert_eq!(owner(2), (GpuHoldState::GpuHoldK8s, 8, "job-gone".into()));
+        assert_eq!(
+            owner(3),
+            (GpuHoldState::GpuHoldConflict, 4, "other-job".into())
+        );
+        assert_eq!(owner(4), (GpuHoldState::GpuHoldSpurJob, 5, String::new()));
     }
 
     #[test]

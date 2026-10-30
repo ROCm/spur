@@ -4,8 +4,10 @@
 //! GPU-level sharing with the managed Kubernetes on this node. Inactive, with
 //! no Kubernetes client, unless the controller marks the node as shared.
 //!
-//! Kubernetes allocation is the ledger of record: this module reads which
-//! GPUs Kubernetes allocated (holds) and reports them on the heartbeat.
+//! Spur is the ledger: a bridge pins the claim of each pod to the GPUs of a
+//! Spur job. This module reads which GPUs Kubernetes allocated (holds) and
+//! reports them on the heartbeat, so the controller keeps a GPU busy until
+//! its claim is gone.
 
 pub mod credential;
 pub mod holds;
