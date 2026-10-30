@@ -551,16 +551,16 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        before.
    * - ``inactive_limit_secs``
      - integer
-     - ``0``
+     - ``300``
      - Live
-     - Reap an interactive allocation (``salloc``/``srun``) whose client has sent
-       no keepalive for this many seconds, freeing the nodes. ``0`` (the default)
-       disables reaping. Mirrors Slurm's ``InactiveLimit``. Once enabled, *every*
-       interactive allocation is subject to reaping regardless of client version:
-       a client too old to send keepalives is reaped once idle past the limit, so
-       upgrade all ``spur`` CLI clients before enabling this. Must be at least
-       twice the client keepalive interval (60 seconds); smaller non-zero values
-       are rejected at startup so a live client is never reaped between pings.
+     - Reap an interactive allocation (``salloc``, or a standalone ``srun`` with
+       or without ``--pty``) whose client has sent no keepalive for this many
+       seconds, freeing the nodes. The reaper sends SIGTERM, waits a 30 second
+       grace, then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
+       Mirrors Slurm's ``InactiveLimit``; the value in effect is shown by
+       ``scontrol show config``. Must be at least twice the client keepalive
+       interval (60 seconds); smaller non-zero values are rejected at startup so a
+       live client is never reaped between pings. See :ref:`inactive-limit`.
    * - ``resv_overrun_minutes``
      - integer
      - ``0``
@@ -685,6 +685,59 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    wall-time information makes backfill reservations meaningful. For a job
    that must not be starved by anything wall-time can't bound, use
    preemption (``preempt_type``, above) instead.
+
+.. _inactive-limit:
+
+Reaping abandoned interactive allocations (``inactive_limit_secs``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``salloc`` and standalone ``srun`` (with or without ``--pty``) ping the
+controller every 30 seconds for as long as the client is running. When the pings
+stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
+allocation is reaped: SIGTERM, a 30 second grace, then SIGKILL. The SIGTERM is
+final: a client that reconnects during the grace does not save the allocation,
+and the job ends ``TIMEOUT`` however its processes exit. With the default, an
+abandoned allocation is signalled 270 to 310 seconds after its client is lost
+(the last ping can be up to 30 seconds old) and is finished within about 40
+seconds of the signal.
+
+The limit measures the client, not the job. A busy job whose client is gone is
+reaped, and so is one whose client is only stopped, such as a foreground
+``srun`` suspended with Ctrl-Z or paused in a debugger. A client whose keepalive
+fails rebuilds its connection and retries at once, re-running the auth
+handshake. It tries each configured controller and keeps a connection only
+after that controller accepts the keepalive, so a controller that accepts the
+dial but cannot reach the leader is skipped in favor of one that can serve the
+ping. A controller restart, or a follower cut off from the leader, does not
+reap a session whose client can still reach a controller that accepts the
+keepalive. The session is reaped when every configured controller rejects it
+for the whole limit.
+
+Each keepalive carries the caller's credential. Under ``plugin = "jwt"`` that
+is the user's token, and an expired token is refused even in ``permissive``
+mode, so a session that outlives its user's token is reaped about one limit
+after the token expires, with its client still running. A token's lifetime
+counts from when it was minted, not from when the session started. Issue
+tokens that outlive the longest interactive time limit
+(``spur token user --ttl``), or set ``inactive_limit_secs = 0``. A failed
+keepalive re-reads ``~/.spur/token``, so replacing that file before the session
+is reaped keeps it. A token in ``$SPUR_AUTH_TOKEN`` takes precedence over the
+file and cannot change in a running client. ``plugin = "spur"`` mints a fresh
+credential for every call and is not affected.
+
+Only allocations whose client sends keepalives are reaped:
+
+- Jobs submitted by ``spur`` ``salloc``/``srun`` are marked keepalive-capable at
+  submit, so they are covered from the start and across a controller failover.
+- A v0.9-or-later client that sends keepalives but predates that mark is
+  covered once it pings. After a failover it is exempt again until its next
+  ping.
+- The K8s operator, third-party REST/gRPC clients that do not send keepalives,
+  and CLIs older than v0.9 are exempt, so their allocations behave as before.
+
+``scontrol show config`` prints the value in effect as ``InactiveLimit``. For
+what changed when this default was introduced, and how to keep the old
+behavior, see :ref:`inactive-limit-upgrade-notes`.
 
 ``[auth]``
 ----------

@@ -660,6 +660,55 @@ Leaving ``preempt_type`` at its ``"none"`` default is safe but silent: nothing
 logs that preemption was skipped, so verify with a test job rather than
 assuming the old behavior carried over.
 
+.. _inactive-limit-upgrade-notes:
+
+Reaping abandoned interactive allocations (``inactive_limit_secs``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release turns ``scheduler.inactive_limit_secs`` on by default (``300``),
+including for a ``spur.conf`` with no such line. It defaulted to ``0`` (off).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Behavior
+     - Before
+     - After
+     - Effect
+   * - An ``salloc`` or standalone ``srun`` whose client is gone or stopped
+     - Held its nodes until the time limit
+     - Reaped once its client has been silent for 300 seconds; the job ends
+       ``TIMEOUT``
+     - **A non-PTY standalone ``srun`` whose client is gone no longer runs to
+       completion**, for example ``srun ./train.sh &`` started from an SSH
+       session that then closed.
+   * - Which allocations a set limit reaps
+     - Every interactive allocation
+     - Only allocations whose client sends keepalives: ``salloc``/``srun`` from
+       this release, or an older v0.9+ CLI once it has pinged
+     - The K8s operator, third-party API clients that do not send keepalives,
+       and CLIs older than v0.9 stay exempt.
+   * - A session that outlives its user's token under ``plugin = "jwt"``
+     - Ran to its time limit
+     - Reaped about 300 seconds after the token expires, even with its client
+       still running
+     - Issue user tokens that outlive the longest interactive time limit. A
+       token's lifetime counts from when it was minted.
+
+To keep the previous behavior, set the limit to ``0`` in ``spur.conf`` on the
+controller **before** upgrading:
+
+.. code-block:: toml
+
+   [scheduler]
+   inactive_limit_secs = 0
+
+The field is live and applies on ``scontrol reconfigure``. Jobs submitted while
+an older controller ran carry no keepalive mark, so they are reaped only if
+their client pings the upgraded controller. ``scontrol show config`` prints the
+value in effect as ``InactiveLimit``. See :ref:`inactive-limit`.
+
 See Also
 --------
 

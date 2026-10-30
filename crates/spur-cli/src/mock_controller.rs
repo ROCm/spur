@@ -8,9 +8,9 @@
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every
-//! other RPC reports `unimplemented` so an unexpected call fails loudly instead
-//! of silently returning a default.
+//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`,
+//! `JobKeepalive`); every other RPC reports `unimplemented` so an unexpected
+//! call fails loudly instead of silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -61,11 +61,26 @@ pub(crate) struct StepCapture {
     /// `node_addr` handed back from `CreateJobStep`, so a test can point an
     /// interactive step at a mock agent instead of an empty address.
     create_step_node_addr: Arc<Mutex<String>>,
+    /// Peer of every `JobKeepalive`, so a test can tell a retry on the same
+    /// connection from one on a rebuilt client.
+    keepalive_peers: Arc<Mutex<Vec<Option<SocketAddr>>>>,
+    /// `JobKeepalive` calls still to reject as unauthenticated.
+    keepalive_failures: Arc<AtomicU32>,
 }
 
 impl StepCapture {
     pub(crate) fn get_job_calls(&self) -> u32 {
         self.get_job_calls.load(Ordering::SeqCst)
+    }
+
+    /// Reject the next `count` keepalives, as a controller that no longer
+    /// accepts the client's credential would.
+    pub(crate) fn fail_next_keepalives(&self, count: u32) {
+        self.keepalive_failures.store(count, Ordering::SeqCst);
+    }
+
+    pub(crate) fn keepalive_peers(&self) -> Vec<Option<SocketAddr>> {
+        self.keepalive_peers.lock().unwrap().clone()
     }
 
     pub(crate) fn set_get_job_user(&self, user: impl Into<String>) {
@@ -393,9 +408,28 @@ mock_controller_impl! {
                 .push((request.name, request.force));
             Ok(tonic::Response::new(proto::DeregisterNodeResponse::default()))
         }
+
+        async fn job_keepalive(
+            &self,
+            request: tonic::Request<proto::JobKeepaliveRequest>,
+        ) -> Result<tonic::Response<proto::JobKeepaliveResponse>, tonic::Status> {
+            self.capture
+                .keepalive_peers
+                .lock()
+                .unwrap()
+                .push(request.remote_addr());
+            let reject = self
+                .capture
+                .keepalive_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if reject {
+                return Err(tonic::Status::unauthenticated("stale credential"));
+            }
+            Ok(tonic::Response::new(proto::JobKeepaliveResponse::default()))
+        }
     }
     unimplemented {
-        job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();

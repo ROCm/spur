@@ -197,9 +197,10 @@ Standalone ``srun --pty`` Lifecycle
 
 A standalone ``srun --pty`` shell is the job's workload. When that shell exits,
 the node reports it and the controller finishes the job with the shell's exit
-code: ``COMPLETED`` on ``0`` and ``FAILED`` otherwise, or ``TIMEOUT`` and
-``OUT_OF_MEMORY`` when the shell was killed at its time limit or by the kernel
-OOM killer. A signal death reports ``128 + signal``, so a hangup is ``129``.
+code: ``COMPLETED`` on ``0`` and ``FAILED`` otherwise, ``TIMEOUT`` if the
+shell was killed at its time limit or by the ``InactiveLimit`` reaper, and
+``OUT_OF_MEMORY`` if the kernel OOM killer took it. A signal death reports
+``128 + signal``, so a hangup is ``129``.
 This does not depend on the ``srun`` client: if the client is lost (closed
 terminal, ``kill -9``), the shell's exit still ends the job within seconds
 rather than leaving the allocation in ``RUNNING``. A live client reports the
@@ -211,15 +212,16 @@ only when that client reports the exit.
 Two cases behave differently, by design:
 
 - ``salloc``: exiting an attached ``srun --pty`` closes only that step. The
-  allocation stays until you exit the ``salloc`` shell.
+  allocation stays until you exit the ``salloc`` shell, or until its client has
+  been gone past ``InactiveLimit`` (see :ref:`inactive-limit`).
 - ``srun --jobid <id> --pty``, an extra session in the job, even one attached
   while the job was still pending: when its shell exits, the job keeps
   running.
 
 If the client is gone *and* the shell keeps running (for example a shell that
-ignores the hangup), the job runs until its time limit, or until the
-``InactiveLimit`` reaper reclaims it when ``inactive_limit_secs`` is set (see
-:doc:`../admin-guide/configuration`).
+ignores the hangup), the ``InactiveLimit`` reaper reclaims the allocation once
+the client has been silent past the limit (see :ref:`inactive-limit`). With
+``inactive_limit_secs = 0`` the job runs until its time limit.
 
 .. _srun-controller-restart:
 

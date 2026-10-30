@@ -5187,6 +5187,7 @@ impl SlurmAgent for AgentService {
             cluster_name: String::new(),
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
+            inactive_limit_secs: None,
         }))
     }
 

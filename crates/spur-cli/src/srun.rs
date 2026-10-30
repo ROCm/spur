@@ -745,6 +745,7 @@ fn build_srun_job_spec(
         container_remap_root: container.is_some_and(|a| a.container_remap_root),
         srun_job: true,
         pty: args.pty,
+        client_keepalive: true,
         ..Default::default()
     })
 }
@@ -1037,9 +1038,9 @@ async fn run_step_with_retry(
 }
 
 /// Bounds the client's terminal RPCs so a stuck controller cannot hang the
-/// user's shell. Giving up does not strand a standalone PTY job: the controller
-/// finishes it when its shell exits. Any other allocation is left to
-/// InactiveLimit, when that is enabled.
+/// user's shell. Giving up does not strand the allocation: the controller
+/// finishes a standalone PTY job when its shell exits, and InactiveLimit reaps
+/// any other allocation once its client has gone (unless a site sets it to 0).
 const TERMINAL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn release_srun_allocation(
@@ -1154,8 +1155,13 @@ async fn run_standalone_srun(
     }
 
     // Guard drops (and stops pinging) on every return path, including `?`.
-    let _keepalive =
-        crate::interactive::spawn_keepalive(client.clone(), job_id, owner.clone(), "srun");
+    let _keepalive = crate::interactive::spawn_keepalive(
+        client.clone(),
+        args.controller.clone(),
+        job_id,
+        owner.clone(),
+        "srun",
+    );
 
     if args.pty {
         ctrl_c_handle.abort();
@@ -2477,6 +2483,17 @@ mod tests {
         let spec = build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun -w node1 hostname")
             .expect("spec");
         assert_eq!(spec.submit_line, "srun -w node1 hostname");
+    }
+
+    #[test]
+    fn build_srun_job_spec_opts_into_inactivity_reaping() {
+        for argv in [&["srun", "hostname"][..], &["srun", "--pty", "bash"][..]] {
+            let args = SrunArgs::parse_from(argv);
+            let io = resolve_io_paths(&args);
+            let spec =
+                build_srun_job_spec(&args, "/tmp/work", &io, "none", "srun --test").expect("spec");
+            assert!(spec.client_keepalive, "{argv:?} sends keepalives");
+        }
     }
 
     #[test]

@@ -195,6 +195,12 @@ message JobSpec {
   // Submit command line as invoked, shell-quoted so word boundaries survive.
   // Client-asserted: the controller bounds and sanitizes it but cannot verify it.
   string submit_line = 85;
+
+  // The submitting client sends inactivity keepalives and is willing to have
+  // its allocation reaped once it goes silent past InactiveLimit. First-party
+  // srun/salloc set it; the K8s operator, third-party API clients, and CLIs
+  // older than v0.9 leave it false and stay exempt.
+  bool client_keepalive = 86;
 }
 
 message JobInfo {
@@ -740,6 +746,9 @@ message PingResponse {
   // into user-RPC credentials. Empty when `[auth] plugin` is not `spur`.
   string auth_audience = 6;
   uint64 auth_epoch = 7;
+  // InactiveLimit in effect on the controller, in seconds (0 = reaping off).
+  // Unset from a node agent or a controller predating the field.
+  optional uint32 inactive_limit_secs = 8;
 }
 
 message JobStateCount {

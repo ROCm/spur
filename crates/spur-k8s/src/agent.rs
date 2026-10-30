@@ -244,6 +244,7 @@ impl SlurmAgent for VirtualAgent {
             cluster_name: self.cluster_id.clone(),
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
+            inactive_limit_secs: None,
         }))
     }
 

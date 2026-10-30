@@ -232,8 +232,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Keep the allocation attended while the shell is open: absence of these
     // pings past the controller's InactiveLimit is what lets it reap an
     // abandoned allocation. The guard stops the pings on drop.
-    let _keepalive =
-        crate::interactive::spawn_keepalive(client.clone(), job_id, owner.clone(), "salloc");
+    let _keepalive = crate::interactive::spawn_keepalive(
+        client.clone(),
+        controller.clone(),
+        job_id,
+        owner.clone(),
+        "salloc",
+    );
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let mut cmd = tokio::process::Command::new(&shell);
@@ -321,6 +326,7 @@ fn build_salloc_job_spec(
         exclude: args.exclude.clone().unwrap_or_default(),
         reservation: args.reservation.clone().unwrap_or_default(),
         interactive: true,
+        client_keepalive: true,
         environment: HashMap::new(),
         ..Default::default()
     })
@@ -422,6 +428,13 @@ mod tests {
         let args = SallocArgs::parse_from(["salloc", "-N", "2"]);
         let spec = build_salloc_job_spec(&args, None, "salloc -N 2").expect("build spec");
         assert_eq!(spec.submit_line, "salloc -N 2");
+    }
+
+    #[test]
+    fn build_salloc_job_spec_opts_into_inactivity_reaping() {
+        let args = SallocArgs::parse_from(["salloc"]);
+        let spec = build_salloc_job_spec(&args, None, "salloc").expect("build spec");
+        assert!(spec.client_keepalive);
     }
 
     #[test]
