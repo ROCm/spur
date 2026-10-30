@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -105,6 +106,10 @@ pub struct NodeReporter {
     /// Endpoint a dial/RPC most recently failed against, and until when to prefer a
     /// different one. Left stale once the cooldown lapses; never read past then.
     last_failed_endpoint: std::sync::Mutex<Option<(String, Instant)>>,
+    /// Node core/memory specialization enforcer. Holds the layout the
+    /// controller delivers via the registration reply and launch requests, and
+    /// applies it to the cgroup root on each heartbeat.
+    spec: std::sync::Mutex<crate::spec::SpecEnforcer>,
     timeouts: ReporterTimeouts,
 }
 
@@ -138,6 +143,9 @@ impl NodeReporter {
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
             last_failed_endpoint: std::sync::Mutex::new(None),
+            spec: std::sync::Mutex::new(crate::spec::SpecEnforcer::new(std::path::PathBuf::from(
+                crate::executor::CGROUP_ROOT,
+            ))),
             timeouts,
         }
     }
@@ -146,6 +154,39 @@ impl NodeReporter {
     /// may change on re-registration). Empty when node identity is not in use.
     pub fn node_token(&self) -> String {
         read_recover(&self.node_token).clone()
+    }
+
+    /// Adopt a core layout the controller delivered (registration reply or
+    /// launch request). Returns true when the held layout changed.
+    pub fn adopt_core_layout(&self, layout: Option<spur_proto::proto::CoreLayout>) -> bool {
+        lock_recover(&self.spec).adopt(layout.map(Into::into))
+    }
+
+    /// Apply the held spec layout to the cgroup root and return the fingerprint
+    /// to report this heartbeat. Gathers live job cpusets and the root's memory
+    /// usage from the cgroupfs so the applier can reconcile and sequence memory.
+    /// A write error is logged; the reported fingerprint is unchanged so the
+    /// controller keeps redelivering until the node adopts cleanly.
+    fn apply_spec_layout(&self) -> u64 {
+        let root = Path::new(crate::executor::CGROUP_ROOT);
+        let live = read_live_job_cpusets(root);
+        let total = discover_memory_mb();
+        let current = read_cgroup_mem_current_mb(root).unwrap_or(0);
+        let (fingerprint, daemon_cpus) = {
+            let mut spec = lock_recover(&self.spec);
+            if let Err(e) = spec.apply(&live, total, current) {
+                warn!(error = %e, "failed to apply node spec layout to cgroup root");
+            }
+            (spec.held_fingerprint(), spec.daemon_cpuset())
+        };
+        // Keep spurd (and its threads) off the spec cores when daemons_off_spec,
+        // so the daemon does not contend with the node service that owns them.
+        if let Some(cpus) = daemon_cpus {
+            if let Err(e) = pin_current_process_threads(&cpus) {
+                warn!(error = %e, "failed to pin spurd off spec cores");
+            }
+        }
+        fingerprint
     }
 
     /// Controller endpoints for the next dial. Skips a host that failed within the last
@@ -311,6 +352,9 @@ impl NodeReporter {
             wg_pubkey: self.wg_pubkey(),
             labels,
             join_token: self.join_token.clone(),
+            topology: discover_cpu_topology(Path::new("/sys"))
+                .as_ref()
+                .map(Into::into),
         };
         let inner = self
             .with_controller(move |mut client| async move { client.register_agent(req).await })
@@ -322,6 +366,9 @@ impl NodeReporter {
             if !inner.node_token.is_empty() {
                 *write_recover(&self.node_token) = inner.node_token;
             }
+            // The registration reply is the authoritative layout source; adopt it
+            // so spec enforcement starts before the first heartbeat.
+            self.adopt_core_layout(inner.core_layout);
             info!("registered with controller");
         } else {
             anyhow::bail!("controller rejected registration: {}", inner.message);
@@ -384,6 +431,7 @@ impl NodeReporter {
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = read_recover(&self.node_token).clone();
             let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
+            let core_layout_fingerprint = self.apply_spec_layout();
             let req = spur_proto::proto::HeartbeatRequest {
                 hostname: self.hostname.clone(),
                 cpu_load: load,
@@ -399,6 +447,7 @@ impl NodeReporter {
                         install_duration_seconds: install_secs,
                     }
                 }),
+                core_layout_fingerprint,
             };
 
             // Bounded by `with_controller`'s own timeout, so a controller that goes
@@ -646,6 +695,7 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         generic: generic_from_registry(registry),
         // Bumped by the periodic refresh task on topology rebuild, not here.
         generation: 0,
+        topology: None,
     }
 }
 
@@ -731,6 +781,131 @@ fn discover_cpus() -> u32 {
 
     // Last resort
     num_cpus()
+}
+
+/// Read this node's online CPUs grouped by physical core from sysfs, for the
+/// controller to compute the core layout. The `/sys` root is a
+/// parameter so tests exercise fixture trees. Returns `None` when the online
+/// set or a CPU's `core_id` is unreadable; the controller then fails the layout
+/// only if the node's settings need it.
+fn discover_cpu_topology(sys_root: &Path) -> Option<spur_core::cpu_topology::CpuTopology> {
+    use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+
+    let cpu_base = sys_root.join("devices/system/cpu");
+    let online = std::fs::read_to_string(cpu_base.join("online")).ok()?;
+    let cpu_ids = spur_core::cpu_topology::parse_cpu_list(online.trim()).ok()?;
+
+    let numa = numa_membership(&sys_root.join("devices/system/node"));
+    let mut records = Vec::with_capacity(cpu_ids.len());
+    for cpu in cpu_ids {
+        let topo = cpu_base.join(format!("cpu{cpu}")).join("topology");
+        let core_id = read_sysfs_u32(&topo.join("core_id"))?;
+        let socket = read_sysfs_u32(&topo.join("physical_package_id")).unwrap_or(0);
+        records.push(CpuRecord {
+            cpu,
+            socket,
+            core_id,
+            numa_node: numa.get(&cpu).copied(),
+        });
+    }
+    Some(CpuTopology::from_cpus(&records))
+}
+
+fn read_sysfs_u32(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// The `cpuset.cpus` of each live job cgroup under the spur root, for the
+/// enforcer to reconcile the root against (so a shrinking root never empties a
+/// running job's set). A job with no cpuset bound contributes nothing.
+fn read_live_job_cpusets(root: &Path) -> Vec<Vec<u32>> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(n) = name.to_str() else { continue };
+        if !n.starts_with("job_") {
+            continue;
+        }
+        if let Ok(list) = std::fs::read_to_string(entry.path().join("cpuset.cpus")) {
+            if let Ok(cpus) = spur_core::cpu_topology::parse_cpu_list(list.trim()) {
+                if !cpus.is_empty() {
+                    out.push(cpus);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pin every thread of the current process (spurd) to `cpus`. Best-effort: a
+/// thread that exits mid-iteration or a kernel that rejects the mask is logged
+/// by the caller, not fatal. Widening back when spec settings are removed waits
+/// for the next spurd restart.
+fn pin_current_process_threads(cpus: &[u32]) -> std::io::Result<()> {
+    let mut set = nix::sched::CpuSet::new();
+    for &cpu in cpus {
+        set.set(cpu as usize)
+            .map_err(|e| std::io::Error::other(format!("cpu {cpu}: {e}")))?;
+    }
+    for tid in current_process_tids() {
+        // A thread that died since we listed it is fine to skip.
+        let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(tid), &set);
+    }
+    Ok(())
+}
+
+fn current_process_tids() -> Vec<i32> {
+    let mut tids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+        for entry in entries.flatten() {
+            if let Some(tid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                tids.push(tid);
+            }
+        }
+    }
+    tids
+}
+
+fn read_cgroup_mem_current_mb(root: &Path) -> Option<u64> {
+    let bytes: u64 = std::fs::read_to_string(root.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
+/// Map each online CPU to its NUMA node by reading `node<N>/cpulist`.
+fn numa_membership(node_base: &Path) -> std::collections::HashMap<u32, u32> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir(node_base) else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(node) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("node"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Ok(list) = std::fs::read_to_string(entry.path().join("cpulist")) {
+            if let Ok(cpus) = spur_core::cpu_topology::parse_cpu_list(list.trim()) {
+                for cpu in cpus {
+                    map.insert(cpu, node);
+                }
+            }
+        }
+    }
+    map
 }
 
 /// Parse "0-191" or "0-63,128-191" into a total count.
@@ -868,6 +1043,61 @@ mod tests {
     use spur_devices::cdi::cache::CdiCache;
     use spur_devices::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
     use spur_devices::{DeviceRegistry, GresCache, GresEntry};
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn discover_cpu_topology_groups_real_ids_by_core_and_numa() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path();
+        let cpu = sys.join("devices/system/cpu");
+        // Two cores, two hyperthreads each, split across two sockets/NUMA nodes.
+        write_file(&cpu.join("online"), "0-1,64-65\n");
+        for (id, core, pkg) in [(0u32, 0u32, 0u32), (1, 0, 0), (64, 0, 1), (65, 0, 1)] {
+            write_file(
+                &cpu.join(format!("cpu{id}/topology/core_id")),
+                &core.to_string(),
+            );
+            write_file(
+                &cpu.join(format!("cpu{id}/topology/physical_package_id")),
+                &pkg.to_string(),
+            );
+        }
+        let node = sys.join("devices/system/node");
+        write_file(&node.join("node0/cpulist"), "0-1");
+        write_file(&node.join("node1/cpulist"), "64-65");
+
+        let topo = discover_cpu_topology(sys).expect("topology");
+        assert_eq!(topo.online_cpus(), vec![0, 1, 64, 65]);
+        assert_eq!(topo.cores.len(), 2);
+        assert_eq!(topo.cores[0].cpus, vec![0, 1]);
+        assert_eq!(topo.cores[0].socket, 0);
+        assert_eq!(topo.cores[0].numa_node, Some(0));
+        assert_eq!(topo.cores[1].cpus, vec![64, 65]);
+        assert_eq!(topo.cores[1].socket, 1);
+        assert_eq!(topo.cores[1].numa_node, Some(1));
+    }
+
+    #[test]
+    fn discover_cpu_topology_is_none_without_online_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(discover_cpu_topology(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_live_job_cpusets_reads_each_job_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_file(&root.join("job_7_0/cpuset.cpus"), "0-2");
+        write_file(&root.join("job_9_1/cpuset.cpus"), "4,5");
+        write_file(&root.join("not_a_job/cpuset.cpus"), "8");
+        let mut sets = read_live_job_cpusets(root);
+        sets.sort();
+        assert_eq!(sets, vec![vec![0, 1, 2], vec![4, 5]]);
+    }
 
     #[test]
     fn test_gpus_from_registry_link_type() {
@@ -1354,6 +1584,7 @@ mod tests {
             gpus,
             generic: Default::default(),
             generation: 0,
+            topology: None,
         };
         let two = rs(vec![g(0, 128), g(1, 129)]);
         let three = rs(vec![g(0, 128), g(1, 129), g(2, 130)]);
@@ -1400,6 +1631,7 @@ mod tests {
             gpus,
             generic: Default::default(),
             generation,
+            topology: None,
         }
     }
 
@@ -1575,6 +1807,7 @@ mod tests {
             gpus: vec![],
             generic: Default::default(),
             generation: 1,
+            topology: None,
         };
         let reporter = test_reporter(base.clone());
         // same content, different generation -> not a change

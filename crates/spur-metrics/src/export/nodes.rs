@@ -170,6 +170,7 @@ mod tests {
             gpus,
             generic: Default::default(),
             generation: 0,
+            topology: None,
         }
     }
 

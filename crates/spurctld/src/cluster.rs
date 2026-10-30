@@ -20,6 +20,7 @@ use spur_core::accounting::{
 };
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
+use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
@@ -8734,7 +8735,7 @@ impl ClusterManager {
             node.weight = nc.weight;
             node.total_resources =
                 node.detected_resources
-                    .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb);
+                    .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb, 0);
             // An unset memory cap prevents config validation from detecting this
             // scheduling stall until the agent reports its inventory.
             if node.total_resources.memory_mb == 0 && node.detected_resources.memory_mb > 0 {
@@ -8749,12 +8750,45 @@ impl ClusterManager {
                     node.address = Some(cfg_addr.clone());
                 }
             }
+            self.recompute_core_layout(node, Some(nc));
         } else {
             node.total_resources = node.detected_resources.clone();
             node.reset_config_policy();
+            self.recompute_core_layout(node, None);
         }
         if node.state.is_up() {
             node.update_state_from_alloc();
+        }
+    }
+
+    /// Recompute a node's core/memory specialization layout from its reported
+    /// CPU topology and the matching `NodeConfig`. A layout the
+    /// settings cannot satisfy — spec cores exceeding the node, or a node that
+    /// sets spec cores but has not reported topology — leaves `core_layout`
+    /// absent and records a `layout_error`, which makes the node unschedulable.
+    /// Stamped with the node's inventory generation so the agent can order
+    /// deliveries. A node with no spec/reserved core settings clears both.
+    fn recompute_core_layout(&self, node: &mut Node, nc: Option<&spur_core::config::NodeConfig>) {
+        let Some(nc) = nc else {
+            node.core_layout = None;
+            node.layout_error = None;
+            return;
+        };
+        let settings = NodeCoreSettings::from_config(nc);
+        match CoreLayout::compute(node.detected_resources.topology.as_ref(), &settings) {
+            Ok(Some(mut layout)) => {
+                layout.generation = node.detected_resources.generation;
+                node.core_layout = Some(layout);
+                node.layout_error = None;
+            }
+            Ok(None) => {
+                node.core_layout = None;
+                node.layout_error = None;
+            }
+            Err(e) => {
+                node.core_layout = None;
+                node.layout_error = Some(e.to_string());
+            }
         }
     }
 
@@ -11393,6 +11427,9 @@ mod tests {
             features: Vec::new(),
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }
     }
 
@@ -13181,6 +13218,7 @@ mod tests {
             gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
             generic: Default::default(),
             generation: 0,
+            topology: None,
         };
         {
             let node = cm.get_node("n1").unwrap();
@@ -31738,6 +31776,9 @@ mod tests {
             features: Vec::new(),
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         };
         let labels = HashMap::from([("gpu".into(), "mi300x".into())]);
         assert!(super::node_config_matches(&nc, "any-host", &labels));
@@ -31919,6 +31960,9 @@ mod tests {
             features: vec!["common".into()],
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         };
         assert!(super::node_config_matches(&nc, "any-host", &HashMap::new()));
         assert!(super::node_config_matches(
@@ -32043,6 +32087,9 @@ mod tests {
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -32091,6 +32138,9 @@ mod tests {
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -32130,6 +32180,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -32179,6 +32232,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -32227,6 +32283,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -32265,6 +32324,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 

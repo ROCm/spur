@@ -1973,6 +1973,9 @@ struct AgentDispatchParams<'a> {
     modex_verify_timeout_secs: u32,
     pmix_prepared: bool,
     execution_credential: &'a str,
+    /// The target node's current core layout, so a job launched between
+    /// re-registrations still lands under enforced spec cores.
+    core_layout: Option<spur_proto::proto::CoreLayout>,
 }
 
 /// Resolved output paths reported by an agent after a successful launch.
@@ -2201,6 +2204,7 @@ async fn dispatch_to_agent(
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
             execution_credential: params.execution_credential.to_string(),
+            core_layout: params.core_layout.clone(),
         })
         .await
         .map_err(|s| match s.code() {
@@ -2750,6 +2754,11 @@ async fn confirm_dispatch_on_nodes(
                 modex_verify_timeout_secs,
                 pmix_prepared: false,
                 execution_credential: "",
+                core_layout: cluster.get_node(node_name).and_then(|n| {
+                    n.core_layout
+                        .as_ref()
+                        .map(spur_proto::proto::CoreLayout::from)
+                }),
             };
             let pmix_plan = match build_pmix_plan_proto(&params, &spec, tasks_per_node) {
                 Ok(Some(plan)) => plan,
@@ -2809,6 +2818,11 @@ async fn confirm_dispatch_on_nodes(
         let pmix_tmpdir = pmix_tmpdir.clone();
         let agent_addr = agent_addr.clone();
         let execution_credential = execution_credential.clone();
+        let core_layout = cluster.get_node(node_name).and_then(|n| {
+            n.core_layout
+                .as_ref()
+                .map(spur_proto::proto::CoreLayout::from)
+        });
         // Held for the whole call: a cut taken before this lands is silent about
         // the job for reasons that have nothing to do with the node dropping it.
         let in_flight = cluster.dispatch_tracker().begin(node_name, job_id);
@@ -2832,6 +2846,7 @@ async fn confirm_dispatch_on_nodes(
                 modex_verify_timeout_secs,
                 pmix_prepared: needs_pmix_prepare,
                 execution_credential: &execution_credential,
+                core_layout,
             };
             let dispatch = dispatch_to_agent(&agent_addr, &params);
             // The join below drains every node, so one agent that accepts the call and never answers
@@ -3967,6 +3982,7 @@ mod tests {
             gpus,
             generic: HashMap::new(),
             generation: 0,
+            topology: None,
         }
     }
 
@@ -4126,6 +4142,7 @@ mod tests {
             gpus: vec![],
             generic: gen_a,
             generation: 0,
+            topology: None,
         };
 
         let mut gen_b = HashMap::new();
@@ -4136,6 +4153,7 @@ mod tests {
             gpus: vec![],
             generic: gen_b,
             generation: 0,
+            topology: None,
         };
 
         let nodes = vec!["n1".to_string(), "n2".to_string()];

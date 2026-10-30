@@ -52,6 +52,37 @@ enum GpuLinkType {
   GPU_LINK_NVLINK = 2;
 }
 
+// One physical core: all of its hyperthreads share socket and NUMA node.
+message CoreInfo {
+  uint32 socket = 1;
+  optional uint32 numa_node = 2;
+  repeated uint32 cpus = 3;          // online OS CPU IDs of this core
+}
+
+// Agent-reported CPU topology; the core's position is its abstract core index.
+message CpuTopology {
+  repeated CoreInfo cores = 1;
+}
+
+message GpuReservedCpus {
+  uint64 stable_id = 1;
+  repeated uint32 cpus = 2;
+}
+
+// Controller-computed split of a node's CPUs. Absent = node has no core settings.
+message CoreLayout {
+  repeated uint32 spec_cpus = 1;
+  uint64 mem_spec_mb = 2;            // 0 unless spec cores are set
+  repeated GpuReservedCpus gpu_reserved = 3;
+  repeated uint32 general_cpus = 4;
+  bool daemons_off_spec = 5;
+  // Node inventory generation this layout was computed under. The agent adopts
+  // a delivered layout only when its generation is not older than the one it
+  // currently holds, so a late launch carrying a stale layout cannot overwrite
+  // a newer one adopted from a registration reply.
+  uint64 generation = 6;
+}
+
 enum JobState {
   JOB_PENDING = 0;
   JOB_RUNNING = 1;
@@ -366,6 +397,10 @@ message NodeInfo {
   // Port the node's agent listens on, so a client dialling it directly does not
   // have to assume the default.
   uint32 agent_port = 58;
+
+  string spec_cpus = 59;             // CPU list, e.g. "127,255"; empty when none
+  uint32 core_spec_count = 60;
+  uint64 mem_spec_mb = 61;
 }
 
 message PartitionInfo {
@@ -912,12 +947,14 @@ message RegisterAgentRequest {
   string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
   map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
   string join_token = 8;     // Admission token for token-based admission
+  CpuTopology topology = 9;  // absent from agents that predate it
 }
 
 message RegisterAgentResponse {
   bool accepted = 1;
   string message = 2;
   string node_token = 3;
+  CoreLayout core_layout = 4;
 }
 
 message HeartbeatRequest {
@@ -932,6 +969,7 @@ message HeartbeatRequest {
   string wg_pubkey = 6;
   // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
   optional K0sNodeStatus k0s_status = 7;
+  uint64 core_layout_fingerprint = 8; // fingerprint of the layout spurd holds; 0 = none
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
@@ -953,7 +991,9 @@ message RunningJobStatus {
   repeated uint64 gpu_stable_ids = 4;
 }
 
-message HeartbeatResponse {}
+message HeartbeatResponse {
+  bool reregister = 1;               // layout changed or topology missing: register again
+}
 
 message StepdRecoveryRequest {
   string hostname = 1;
@@ -1029,6 +1069,7 @@ message LaunchJobRequest {
   bool pmix_prepared = 12;
   // Controller-signed job execution credential. Required when [auth] plugin = "spur".
   string execution_credential = 13;
+  CoreLayout core_layout = 14;       // node's current layout; absent = none
 }
 
 // Why a launch was rejected, when the controller's response depends on it.

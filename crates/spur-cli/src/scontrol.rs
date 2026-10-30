@@ -717,6 +717,22 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         .collect();
                     println!("   Gres={}", gpu_types.join(","));
                 }
+                if !node.spec_cpus.is_empty() || node.core_spec_count > 0 || node.mem_spec_mb > 0 {
+                    // CPUEfctv is the schedulable CPU count (spec cores already
+                    // excluded upstream). Show whichever spec knobs are set.
+                    let mut parts =
+                        vec![format!("CPUEfctv={}", total.map(|r| r.cpus).unwrap_or(0))];
+                    if node.core_spec_count > 0 {
+                        parts.push(format!("CoreSpecCount={}", node.core_spec_count));
+                    }
+                    if !node.spec_cpus.is_empty() {
+                        parts.push(format!("CPUSpecList={}", node.spec_cpus));
+                    }
+                    if node.mem_spec_mb > 0 {
+                        parts.push(format!("MemSpecLimit={}", node.mem_spec_mb));
+                    }
+                    println!("   {}", parts.join(" "));
+                }
                 println!("   Arch={} OS={}", node.arch, node.os);
                 if !node.labels.is_empty() {
                     let mut label_str: Vec<String> = node

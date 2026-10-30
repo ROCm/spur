@@ -172,4 +172,220 @@ mod tests {
             "Timeout expired"
         )));
     }
+
+    #[test]
+    fn a_register_request_from_an_old_agent_has_no_topology() {
+        use prost::Message;
+        let old = crate::proto::RegisterAgentRequest {
+            hostname: "n1".into(),
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::RegisterAgentRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.topology.is_none());
+    }
+
+    #[test]
+    fn a_core_layout_survives_the_wire() {
+        use prost::Message;
+        let layout = crate::proto::CoreLayout {
+            spec_cpus: vec![127, 255],
+            mem_spec_mb: 16384,
+            gpu_reserved: vec![crate::proto::GpuReservedCpus {
+                stable_id: 7,
+                cpus: vec![0, 128],
+            }],
+            general_cpus: vec![32, 33],
+            daemons_off_spec: true,
+            generation: 42,
+        };
+        let resp = crate::proto::RegisterAgentResponse {
+            accepted: true,
+            core_layout: Some(layout.clone()),
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::RegisterAgentResponse::decode(resp.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.core_layout, Some(layout));
+    }
+
+    #[test]
+    fn an_empty_heartbeat_reply_does_not_ask_to_reregister() {
+        use prost::Message;
+        let decoded = crate::proto::HeartbeatResponse::decode(&[][..]).unwrap();
+        assert!(!decoded.reregister);
+    }
+
+    #[test]
+    fn a_cpu_topology_keeps_numa_presence() {
+        use prost::Message;
+        let topology = crate::proto::CpuTopology {
+            cores: vec![
+                crate::proto::CoreInfo {
+                    socket: 0,
+                    numa_node: Some(0),
+                    cpus: vec![0, 128],
+                },
+                crate::proto::CoreInfo {
+                    socket: 1,
+                    numa_node: None,
+                    cpus: vec![64, 192],
+                },
+            ],
+        };
+        let req = crate::proto::RegisterAgentRequest {
+            topology: Some(topology.clone()),
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::RegisterAgentRequest::decode(req.encode_to_vec().as_slice()).unwrap();
+        let cores = decoded.topology.unwrap().cores;
+        assert_eq!(cores[0].numa_node, Some(0));
+        assert_eq!(cores[1].numa_node, None);
+        assert_eq!(cores, topology.cores);
+    }
+
+    #[test]
+    fn a_launch_request_carries_the_layout_or_none() {
+        use prost::Message;
+        let old = crate::proto::LaunchJobRequest {
+            job_id: 7,
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::LaunchJobRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.core_layout.is_none());
+
+        let layout = crate::proto::CoreLayout {
+            spec_cpus: vec![127, 255],
+            general_cpus: vec![0, 1],
+            ..Default::default()
+        };
+        let new = crate::proto::LaunchJobRequest {
+            job_id: 7,
+            core_layout: Some(layout.clone()),
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::LaunchJobRequest::decode(new.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.core_layout, Some(layout));
+    }
+
+    #[test]
+    fn a_heartbeat_fingerprint_defaults_to_zero() {
+        use prost::Message;
+        let old = crate::proto::HeartbeatRequest {
+            hostname: "n1".into(),
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::HeartbeatRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.core_layout_fingerprint, 0);
+
+        let new = crate::proto::HeartbeatRequest {
+            core_layout_fingerprint: u64::MAX,
+            ..Default::default()
+        };
+        let decoded =
+            crate::proto::HeartbeatRequest::decode(new.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.core_layout_fingerprint, u64::MAX);
+    }
+
+    #[test]
+    fn node_info_spec_fields_default_when_absent() {
+        use prost::Message;
+        let old = crate::proto::NodeInfo {
+            name: "n1".into(),
+            ..Default::default()
+        };
+        let decoded = crate::proto::NodeInfo::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.spec_cpus, "");
+        assert_eq!(decoded.core_spec_count, 0);
+        assert_eq!(decoded.mem_spec_mb, 0);
+
+        let new = crate::proto::NodeInfo {
+            spec_cpus: "127,255".into(),
+            core_spec_count: 1,
+            mem_spec_mb: 16384,
+            ..Default::default()
+        };
+        let decoded = crate::proto::NodeInfo::decode(new.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.spec_cpus, "127,255");
+        assert_eq!(decoded.core_spec_count, 1);
+        assert_eq!(decoded.mem_spec_mb, 16384);
+    }
+
+    // Exact bytes pin each new field's tag: a renumbered field still round-trips
+    // through prost but would break old and new peers on the wire.
+    #[test]
+    fn new_fields_use_their_assigned_tags() {
+        use prost::Message;
+        let reregister = crate::proto::HeartbeatResponse { reregister: true };
+        assert_eq!(reregister.encode_to_vec(), [0x08, 0x01]);
+
+        let topology = crate::proto::RegisterAgentRequest {
+            topology: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(topology.encode_to_vec(), [0x4A, 0x00]);
+
+        let reply_layout = crate::proto::RegisterAgentResponse {
+            core_layout: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(reply_layout.encode_to_vec(), [0x22, 0x00]);
+
+        let launch_layout = crate::proto::LaunchJobRequest {
+            core_layout: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(launch_layout.encode_to_vec(), [0x72, 0x00]);
+
+        let fingerprint = crate::proto::HeartbeatRequest {
+            core_layout_fingerprint: 1,
+            ..Default::default()
+        };
+        assert_eq!(fingerprint.encode_to_vec(), [0x40, 0x01]);
+
+        let spec_cpus = crate::proto::NodeInfo {
+            spec_cpus: "1".into(),
+            ..Default::default()
+        };
+        assert_eq!(spec_cpus.encode_to_vec(), [0xDA, 0x03, 0x01, b'1']);
+        let core_spec_count = crate::proto::NodeInfo {
+            core_spec_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(core_spec_count.encode_to_vec(), [0xE0, 0x03, 0x01]);
+        let mem_spec_mb = crate::proto::NodeInfo {
+            mem_spec_mb: 1,
+            ..Default::default()
+        };
+        assert_eq!(mem_spec_mb.encode_to_vec(), [0xE8, 0x03, 0x01]);
+    }
+
+    #[test]
+    fn numa_node_presence_is_on_the_wire() {
+        use prost::Message;
+        let known = crate::proto::CoreInfo {
+            numa_node: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(known.encode_to_vec(), [0x10, 0x00]);
+        let unknown = crate::proto::CoreInfo::default();
+        assert!(unknown.encode_to_vec().is_empty());
+    }
+
+    #[test]
+    fn a_truncated_layout_fails_to_decode() {
+        use prost::Message;
+        let layout = crate::proto::CoreLayout {
+            spec_cpus: vec![127, 255],
+            general_cpus: vec![32, 33],
+            ..Default::default()
+        };
+        let mut bytes = layout.encode_to_vec();
+        bytes.pop();
+        assert!(crate::proto::CoreLayout::decode(bytes.as_slice()).is_err());
+    }
 }

@@ -1604,6 +1604,30 @@ matches, and the first matching entry wins.
        (e.g. ROCm), so jobs cannot be packed into headroom the host needs. Applied
        together with ``memory_mb``; the smaller resulting value wins. Must be less
        than ``memory_mb`` when both are set (rejected at config load otherwise).
+       Accepts the Slurm name ``mem_spec_limit`` as an alias. When the node also
+       sets spec cores, this amount is enforced on the ``spur`` cgroup root
+       (``memory.max``), not just subtracted from the advertised total.
+   * - ``core_spec_count``
+     - integer
+     - ``0``
+     - Restart
+     - Number of physical cores reserved for node services (e.g. a WEKA client)
+       and excluded from jobs — Slurm's ``CoreSpecCount``. Reserves whole cores
+       (every hyperthread), chosen from the highest-numbered cores. ``0`` means
+       unset. Mutually exclusive with ``cpu_spec_list``.
+   * - ``cpu_spec_list``
+     - string
+     - ``""``
+     - Restart
+     - Specific OS CPU IDs reserved for node services, e.g. ``"127,255"`` —
+       Slurm's ``CpuSpecList`` (OS CPU IDs, not abstract indices). Mutually
+       exclusive with ``core_spec_count``.
+   * - ``daemons_off_spec``
+     - bool
+     - ``true``
+     - Restart
+     - Keep ``spurd`` (and the per-job ``spurstepd`` supervisors) off the spec
+       cores, so the daemon does not contend with the service that owns them.
    * - ``gres``
      - [string]
      - ``[]``
@@ -1654,6 +1678,31 @@ These service states are also reconciled whenever the controller applies node
 resource policy, including live ``scontrol reconfigure``, agent inventory updates,
 and snapshot restore. Restored states reflect the current controller's resource
 caps; unavailable and administratively held states are preserved.
+
+Core and memory specialization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``core_spec_count`` / ``cpu_spec_list`` and ``reserved_memory_mb`` reserve CPUs
+and memory on a node for services that run alongside jobs — a WEKA client
+frontend, for example. The controller computes the node's core layout from the
+CPU topology the agent reports, and ``spurd`` enforces it on the ``spur`` cgroup
+root: the root's ``cpuset.cpus`` excludes the spec CPUs, so no job — every job
+runs under that root — can land on them, and when spec cores are set the
+reserved memory is enforced as the root's ``memory.max``. The service itself
+still has to pin to the reserved CPUs (e.g. WEKA's own ``isolate_cpusets`` /
+frontend core setting); Spur guarantees only that jobs stay off them.
+
+``scontrol show node`` shows ``CPUEfctv``, ``CoreSpecCount``, ``CPUSpecList``,
+and ``MemSpecLimit`` for a node that reserves cores or memory.
+
+These settings are **restart-only**: changing ``core_spec_count``,
+``cpu_spec_list``, or ``daemons_off_spec`` on a running cluster requires
+restarting the controllers, because the layout is part of the inventory the
+agent and controller agree on at registration. A node whose settings cannot
+yield a valid layout — spec cores exceeding the node, or a node that sets spec
+cores but has not reported topology — is excluded from scheduling and shown with
+a ``core-layout:`` reason until the settings are fixed; this is derived from the
+settings, not an operator drain.
 
 ``[network]``
 -------------
