@@ -172,11 +172,21 @@ impl NodeReporter {
         let live = read_live_job_cpusets(root);
         let total = discover_memory_mb();
         let current = read_cgroup_mem_current_mb(root).unwrap_or(0);
-        let mut spec = lock_recover(&self.spec);
-        if let Err(e) = spec.apply(&live, total, current) {
-            warn!(error = %e, "failed to apply node spec layout to cgroup root");
+        let (fingerprint, daemon_cpus) = {
+            let mut spec = lock_recover(&self.spec);
+            if let Err(e) = spec.apply(&live, total, current) {
+                warn!(error = %e, "failed to apply node spec layout to cgroup root");
+            }
+            (spec.held_fingerprint(), spec.daemon_cpuset())
+        };
+        // Keep spurd (and its threads) off the spec cores when daemons_off_spec,
+        // so the daemon does not contend with the node service that owns them.
+        if let Some(cpus) = daemon_cpus {
+            if let Err(e) = pin_current_process_threads(&cpus) {
+                warn!(error = %e, "failed to pin spurd off spec cores");
+            }
         }
-        spec.held_fingerprint()
+        fingerprint
     }
 
     /// Controller endpoints for the next dial. Skips a host that failed within the last
@@ -828,6 +838,39 @@ fn read_live_job_cpusets(root: &Path) -> Vec<Vec<u32>> {
         }
     }
     out
+}
+
+/// Pin every thread of the current process (spurd) to `cpus`. Best-effort: a
+/// thread that exits mid-iteration or a kernel that rejects the mask is logged
+/// by the caller, not fatal. Widening back when spec settings are removed waits
+/// for the next spurd restart.
+fn pin_current_process_threads(cpus: &[u32]) -> std::io::Result<()> {
+    let mut set = nix::sched::CpuSet::new();
+    for &cpu in cpus {
+        set.set(cpu as usize)
+            .map_err(|e| std::io::Error::other(format!("cpu {cpu}: {e}")))?;
+    }
+    for tid in current_process_tids() {
+        // A thread that died since we listed it is fine to skip.
+        let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(tid), &set);
+    }
+    Ok(())
+}
+
+fn current_process_tids() -> Vec<i32> {
+    let mut tids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+        for entry in entries.flatten() {
+            if let Some(tid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                tids.push(tid);
+            }
+        }
+    }
+    tids
 }
 
 fn read_cgroup_mem_current_mb(root: &Path) -> Option<u64> {
