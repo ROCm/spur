@@ -1210,6 +1210,17 @@ refused. A job that is already finished or unknown does not fail a plain cancel
    scontrol suspend 1024    # SIGSTOP, keep the allocation
    scontrol resume 1024     # SIGCONT
 
+.. _held-job-still-running:
+
+A held job gives up its nodes as soon as it is held. That covers the reasons
+``JobHeldUser``, ``JobHeldAdmin``, ``JobHoldMaxRequeue`` and
+``ReservationDeleted``. If the stop sent at that moment does not reach a node,
+the process keeps running there while ``sinfo`` already shows the node's
+resources as free, and a new job sent to the same GPUs is refused. The node's
+spurd log names the job still holding them (``held_by=[...]``). On that node's
+next heartbeat (every 30 seconds) the controller tells it to stop the held
+job's process, and the resources become usable.
+
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
 ``Account=``, ``Comment=``, ``QOS=``, and ``ExcNodeList=`` (also spelled
