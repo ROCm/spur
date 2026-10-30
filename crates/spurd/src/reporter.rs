@@ -270,10 +270,6 @@ impl NodeReporter {
         let _ = self.gpu_sharing.set(sharing);
     }
 
-    pub fn gpu_sharing(&self) -> Option<&Arc<crate::gpu_sharing::GpuSharing>> {
-        self.gpu_sharing.get()
-    }
-
     /// This node's current WireGuard mesh public key (empty if the interface has no key / no mesh).
     /// Read live from the interface so a key that appears or changes after startup is picked up.
     fn wg_pubkey(&self) -> String {

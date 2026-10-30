@@ -9,9 +9,7 @@
 
 pub mod credential;
 pub mod holds;
-pub mod jobs;
 pub mod kubelet_links;
-pub mod placeholder;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -86,7 +84,6 @@ pub struct GpuSharing {
     labeled: Mutex<Option<bool>>,
     watch: Mutex<Option<Watch>>,
     identities: Mutex<(u64, HashMap<u64, SharingIdentity>)>,
-    placeholders: Mutex<HashMap<(u32, u32), jobs::Tracked>>,
     changed: Notify,
     converge: Notify,
 }
@@ -137,7 +134,6 @@ impl GpuSharing {
             labeled: Mutex::new(None),
             watch: Mutex::new(None),
             identities: Mutex::new((0, HashMap::new())),
-            placeholders: Mutex::new(HashMap::new()),
             changed: Notify::new(),
             converge: Notify::new(),
         }
@@ -206,15 +202,6 @@ impl GpuSharing {
         carries_label(k0s.role().await, has_gpus)
     }
 
-    /// Sharing identity of the GPU with `stable_id`, rediscovered when unknown.
-    pub fn identity(&self, stable_id: u64) -> Option<SharingIdentity> {
-        let mut cache = lock(&self.identities);
-        if !cache.1.contains_key(&stable_id) {
-            cache.1 = discover_identities();
-        }
-        cache.1.get(&stable_id).cloned()
-    }
-
     /// Ask for one extra heartbeat now because the hold state changed.
     pub fn notify_change(&self) {
         self.changed.notify_one();
@@ -232,12 +219,6 @@ impl GpuSharing {
             info!(shared, node = %self.node_name, "GPU sharing flag changed");
             self.converge.notify_one();
         }
-    }
-
-    /// Placeholder pods of Spur jobs still on this node. Opt-out keeps the
-    /// kubelet links until this is zero.
-    pub fn live_placeholders(&self) -> usize {
-        lock(&self.placeholders).len()
     }
 
     pub async fn converge_loop(self: Arc<Self>) {
@@ -303,7 +284,7 @@ impl GpuSharing {
                 return;
             }
         }
-        if !self.links.any_ours() || self.live_placeholders() > 0 {
+        if !self.links.any_ours() {
             return;
         }
         match self.links.remove_ours() {
@@ -463,16 +444,14 @@ impl GpuSharing {
             cache.1.clone()
         };
         let stable_ids: Vec<u64> = inventory.gpus.iter().map(|g| g.stable_id).collect();
-        let mut report = holds::build_report(
+        Some(holds::build_report(
             inventory.generation,
             &stable_ids,
             &identities,
             &view,
             job_gpus,
             &self.node_name,
-        );
-        jobs::mark_conflicts(&mut report, &self.conflicts());
-        Some(report)
+        ))
     }
 }
 

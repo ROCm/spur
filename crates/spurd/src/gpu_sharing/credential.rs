@@ -7,7 +7,10 @@
 
 use serde_json::{json, Value};
 
-use super::placeholder::{LABEL_MANAGED_BY, MANAGED_BY, NAMESPACE};
+/// Namespace of the per-node ServiceAccounts.
+pub const NAMESPACE: &str = "spur-system";
+const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
+const MANAGED_BY: &str = "spurd";
 
 /// Lifetime of a minted token. The worker rebuilds its client well before this.
 pub const TOKEN_DURATION: &str = "24h";
@@ -16,13 +19,12 @@ pub fn service_account_name(node: &str) -> String {
     format!("spurd-gpu-sharing-{node}")
 }
 
-/// Namespace, ServiceAccount and minimum RBAC for the GPU sharing of `node`,
+/// Namespace, ServiceAccount and read-only RBAC for the GPU sharing of `node`,
 /// as one `v1/List` for `kubectl apply`. `node` must be a DNS-1123 label.
 pub fn rbac_manifest(node: &str) -> Value {
     let name = service_account_name(node);
     let labels = json!({ LABEL_MANAGED_BY: MANAGED_BY });
     let subjects = json!([{"kind": "ServiceAccount", "name": name, "namespace": NAMESPACE}]);
-    let owned = ["create", "get", "list", "watch", "delete", "patch"];
     json!({
         "apiVersion": "v1",
         "kind": "List",
@@ -30,11 +32,7 @@ pub fn rbac_manifest(node: &str) -> Value {
             {
                 "apiVersion": "v1",
                 "kind": "Namespace",
-                "metadata": {"name": NAMESPACE, "labels": {
-                    LABEL_MANAGED_BY: MANAGED_BY,
-                    // A worker credential may create pods here; baseline keeps them unprivileged.
-                    "pod-security.kubernetes.io/enforce": "baseline",
-                }},
+                "metadata": {"name": NAMESPACE, "labels": labels},
             },
             {
                 "apiVersion": "v1",
@@ -51,8 +49,6 @@ pub fn rbac_manifest(node: &str) -> Value {
                      "verbs": ["get", "list", "watch"]},
                     {"apiGroups": [""], "resources": ["nodes"],
                      "resourceNames": [node], "verbs": ["get", "patch"]},
-                    {"apiGroups": [""], "resources": ["namespaces"],
-                     "resourceNames": [NAMESPACE], "verbs": ["get"]},
                 ],
             },
             {
@@ -60,22 +56,6 @@ pub fn rbac_manifest(node: &str) -> Value {
                 "kind": "ClusterRoleBinding",
                 "metadata": {"name": name, "labels": labels},
                 "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name},
-                "subjects": subjects,
-            },
-            {
-                "apiVersion": "rbac.authorization.k8s.io/v1",
-                "kind": "Role",
-                "metadata": {"name": name, "namespace": NAMESPACE, "labels": labels},
-                "rules": [
-                    {"apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": owned},
-                    {"apiGroups": [""], "resources": ["pods"], "verbs": owned},
-                ],
-            },
-            {
-                "apiVersion": "rbac.authorization.k8s.io/v1",
-                "kind": "RoleBinding",
-                "metadata": {"name": name, "namespace": NAMESPACE, "labels": labels},
-                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": name},
                 "subjects": subjects,
             },
         ],
@@ -86,9 +66,7 @@ pub fn rbac_manifest(node: &str) -> Value {
 mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::{Namespace, ServiceAccount};
-    use k8s_openapi::api::rbac::v1::{
-        ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding,
-    };
+    use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, PolicyRule};
 
     fn item<T: serde::de::DeserializeOwned>(manifest: &Value, kind: &str) -> T {
         let items = manifest["items"].as_array().expect("items");
@@ -117,10 +95,6 @@ mod tests {
 
         assert_eq!(ns.metadata.name.as_deref(), Some("spur-system"));
         assert_eq!(
-            ns.metadata.labels.unwrap()["pod-security.kubernetes.io/enforce"],
-            "baseline"
-        );
-        assert_eq!(
             sa.metadata.name.as_deref(),
             Some("spurd-gpu-sharing-gpu-node-1")
         );
@@ -128,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_rights_are_read_only_except_the_own_node() {
+    fn rights_are_read_only_except_the_own_node_label() {
         let m = rbac_manifest("gpu-node-1");
         let role: ClusterRole = item(&m, "ClusterRole");
         let rules = role.rules.unwrap();
@@ -141,43 +115,29 @@ mod tests {
         let nodes = rule(&rules, "nodes");
         assert_eq!(strings(&nodes.resource_names), ["gpu-node-1"]);
         assert_eq!(nodes.verbs, ["get", "patch"]);
-        let namespaces = rule(&rules, "namespaces");
-        assert_eq!(strings(&namespaces.resource_names), ["spur-system"]);
-        assert_eq!(namespaces.verbs, ["get"]);
-        assert_eq!(rules.len(), 3);
-    }
-
-    #[test]
-    fn namespaced_rights_cover_claims_and_pods_in_spur_system_only() {
-        let m = rbac_manifest("gpu-node-1");
-        let role: Role = item(&m, "Role");
-        let rules = role.rules.unwrap();
-
-        assert_eq!(role.metadata.namespace.as_deref(), Some("spur-system"));
-        for resource in ["resourceclaims", "pods"] {
-            let r = rule(&rules, resource);
-            assert_eq!(
-                r.verbs,
-                ["create", "get", "list", "watch", "delete", "patch"]
-            );
-        }
         assert_eq!(rules.len(), 2);
+        let kinds: Vec<&str> = m["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .filter_map(|i| i["kind"].as_str())
+            .collect();
+        assert!(
+            !kinds.contains(&"Role"),
+            "no write access to any namespace: {kinds:?}"
+        );
     }
 
     #[test]
-    fn bindings_tie_the_roles_to_the_node_service_account() {
+    fn binding_ties_the_role_to_the_node_service_account() {
         let m = rbac_manifest("gpu-node-1");
         let crb: ClusterRoleBinding = item(&m, "ClusterRoleBinding");
-        let rb: RoleBinding = item(&m, "RoleBinding");
 
-        for (role_ref, subjects) in [(crb.role_ref, crb.subjects), (rb.role_ref, rb.subjects)] {
-            assert_eq!(role_ref.name, "spurd-gpu-sharing-gpu-node-1");
-            let subjects = subjects.unwrap();
-            assert_eq!(subjects.len(), 1);
-            assert_eq!(subjects[0].kind, "ServiceAccount");
-            assert_eq!(subjects[0].name, "spurd-gpu-sharing-gpu-node-1");
-            assert_eq!(subjects[0].namespace.as_deref(), Some("spur-system"));
-        }
-        assert_eq!(rb.metadata.namespace.as_deref(), Some("spur-system"));
+        assert_eq!(crb.role_ref.name, "spurd-gpu-sharing-gpu-node-1");
+        let subjects = crb.subjects.unwrap();
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].kind, "ServiceAccount");
+        assert_eq!(subjects[0].name, "spurd-gpu-sharing-gpu-node-1");
+        assert_eq!(subjects[0].namespace.as_deref(), Some("spur-system"));
     }
 }

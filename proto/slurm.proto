@@ -1116,9 +1116,6 @@ message LaunchJobResponse {
   string stdout_path = 3;  // absolute resolved output path on the launching node
   string stderr_path = 4;
   LaunchFailureKind failure_kind = 5;
-  // Devices actually bound on a shared node, set only when Kubernetes picked
-  // different sibling partitions than requested.
-  optional ResourceAllocations substituted_alloc = 6;
 }
 
 message AgentStartJobRequest {
