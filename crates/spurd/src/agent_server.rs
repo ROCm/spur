@@ -5196,7 +5196,10 @@ impl SlurmAgent for AgentService {
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
         Self::require_controller(&request)?;
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        // A launch may carry a layout newer than our last registration adopted;
+        // take it so this job lands under current spec enforcement (SPUR-386).
+        self.reporter.adopt_core_layout(req.core_layout.take());
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
