@@ -30,10 +30,12 @@ pub struct ClusterState<'a> {
     /// Node name -> real time its last currently-running job is expected to
     /// end. Absent entries fall back to a conservative placeholder.
     pub busy_until: &'a HashMap<String, DateTime<Utc>>,
+    /// Node name -> pending preemptor its victims' released capacity is held for.
     pub preemption_handoffs: &'a HashMap<String, JobId>,
 }
 
 impl ClusterState<'_> {
+    /// Whether `job` may be placed on `node` despite another preemptor's handoff.
     pub fn handoff_allows(&self, job: &Job, node: &str, now: DateTime<Utc>) -> bool {
         self.preemption_handoffs
             .get(node)
@@ -41,15 +43,27 @@ impl ClusterState<'_> {
             || spur_core::reservation::job_has_active_reservation(job, self.reservations, now)
     }
 
-    /// Victim selection must not prove capacity using a different preemptor's nodes.
-    pub fn nodes_for_handoff(&self, job: &Job, now: DateTime<Utc>) -> std::borrow::Cow<'_, [Node]> {
-        let placement = crate::node_match::NodePlacement::new(job);
-        if placement.nodelist_is_additive()
+    /// An additive `--nodelist` needs every listed node, so one handed-off node blocks the job.
+    pub fn listed_node_handed_off(
+        &self,
+        job: &Job,
+        placement: &crate::node_match::NodePlacement,
+        now: DateTime<Utc>,
+    ) -> bool {
+        placement.nodelist_is_additive()
             && self
                 .nodes
                 .iter()
                 .any(|n| placement.is_listed(&n.name) && !self.handoff_allows(job, &n.name, now))
-        {
+    }
+
+    /// Victim selection must not prove capacity using a different preemptor's nodes.
+    pub fn nodes_for_handoff(&self, job: &Job, now: DateTime<Utc>) -> std::borrow::Cow<'_, [Node]> {
+        if self.preemption_handoffs.is_empty() {
+            return std::borrow::Cow::Borrowed(self.nodes);
+        }
+        let placement = crate::node_match::NodePlacement::new(job);
+        if self.listed_node_handed_off(job, &placement, now) {
             return std::borrow::Cow::Owned(Vec::new());
         }
         if self

@@ -1000,12 +1000,8 @@ impl ClusterManager {
         cooldowns.keys().cloned().collect()
     }
 
-    /// Scheduling passes a freed-node earmark hoists its preemptor for. The
-    /// preemptor is offered the node on the first pass after it frees (when the
-    /// node and the earmark are both visible); the extra pass is slack for a
-    /// cycle in which it could not yet be placed. `tick_preempt_freed_earmarks`
-    /// drops an entry on the pass its budget reaches zero, so a budget of 3
-    /// hoists across two passes.
+    /// Passes a freed node stays hoisted and handed off to its preemptor; the tick
+    /// drops an entry when its budget hits zero, so 3 covers two placement passes.
     const PREEMPT_FREED_EARMARK_PASSES: u32 = 3;
 
     /// Publish the beneficiary before releasing the jobs/nodes locks, so placement
@@ -1122,7 +1118,10 @@ impl ClusterManager {
         for (node, (owner, _)) in earmarks.iter() {
             by_owner.entry(*owner).or_default().insert(node);
         }
-        for victim in jobs.values().filter(|j| j.state == JobState::Completing) {
+        let draining_cancelled_victims = jobs.values().filter(|j| {
+            j.state == JobState::Completing && j.preempt_mode.as_deref() == Some("Cancel")
+        });
+        for victim in draining_cancelled_victims {
             if let Some(owner) = victim.preempted_by {
                 by_owner
                     .entry(owner)
@@ -20682,6 +20681,12 @@ mod tests {
             let bystander = submit_bystander(&cm, "n1");
             report_nodes_released(&cm, victim);
             settle(&cm, victim, JobState::Cancelled);
+            let pending = cm.pending_jobs();
+            assert!(
+                !cm.preemption_handoffs(&pending, &cm.get_nodes(), &cm.get_reservations())
+                    .is_empty(),
+                "{change}: the owner must hold the node before it changes"
+            );
             match change {
                 "cancel" => {
                     cm.cancel_job(owner, "testuser").unwrap();
@@ -20709,6 +20714,30 @@ mod tests {
                 "{change}"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_suspend_victim_hands_off_nothing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        let victim = run_job_on(&cm, "victim", "n1");
+        let owner = submit_and_wait(&cm, basic_spec("owner"));
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: victim,
+            at: Utc::now(),
+            preempted_by: Some(owner),
+            preempt_qos: None,
+            by: None,
+        });
+        cm.cancel_job(victim, "testuser").unwrap();
+        let drained = cm.get_job(victim).unwrap();
+        assert_eq!(drained.state, JobState::Completing);
+        assert_eq!(drained.preempted_by, Some(owner));
+        let pending = cm.pending_jobs();
+        assert!(cm
+            .preemption_handoffs(&pending, &cm.get_nodes(), &cm.get_reservations())
+            .is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

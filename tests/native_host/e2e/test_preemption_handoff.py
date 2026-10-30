@@ -39,7 +39,8 @@ def handoff_cluster(ssh_nodes, remote_bin_dir):
         for name, priority, targets, mode in [
             ("victim-a", 100, "", "cancel"),
             ("victim-b", 100, "", "cancel"),
-            ("hunter-a", 10000, "victim-a", "off"),
+            ("victim-r", 100, "", "requeue"),
+            ("hunter-a", 10000, "victim-a,victim-r", "off"),
             ("hunter-b", 5000, "victim-b", "off"),
             ("bystander", 20000, "", "off"),
         ]:
@@ -166,18 +167,24 @@ def test_abandoned_handoff_reuses_freed_node(handoff_cluster, action):
     assert f"NodeList={c.node_names[1]}" in show, show
 
 
-def test_requeue_handoff_beats_higher_priority_bystander(handoff_cluster):
+@pytest.mark.parametrize("victim_qos", ["victim-a", "victim-r"])
+def test_freed_node_goes_to_preemptor_over_higher_priority_bystander(handoff_cluster, victim_qos):
     c = handoff_cluster
-    c.cli(["spur", "sacctmgr", "modify", "qos", "name=victim-a", "set", "preemptmode=requeue"])
-    time.sleep(15)
     node = c.node_names[0]
-    victim = _submit(c, "requeue-victim", "victim-a", node)
+    victim = _submit(c, "victim", victim_qos, node)
     wait_job_state(c, victim, "R", timeout=60)
-    bystander = _submit(c, "requeue-bystander", "bystander", node)
-    hunter = _submit(c, "requeue-hunter", "hunter-a", node)
-    wait_job_state(c, hunter, "R", timeout=90)
+    drains = victim_qos == "victim-a"
+    if drains:
+        _gate(c, victim, [0], True)
+    bystander = _submit(c, "bystander", "bystander", node)
+    hunter = _submit(c, "hunter", "hunter-a", node)
+    if drains:
+        _wait_epilog(c, victim, [0])
+        _assert_pending_for_passes(c, [hunter, bystander])
+        _gate(c, victim, [0], False)
+    wait_job_state(c, hunter, "R", timeout=60)
     show = c.scontrol("show", "job", str(victim))
-    assert f"PreemptedBy={hunter}" in show and "PreemptMode=Requeue" in show, show
-    _assert_pending_for_passes(c, [bystander])
-    c.cli(["scancel", str(hunter)])
-    wait_job_state(c, bystander, "R", timeout=60)
+    assert f"PreemptedBy={hunter}" in show, show
+    _state(c, bystander, "PENDING")
+    show = _state(c, hunter, "RUNNING")
+    assert f"NodeList={node}" in show, show

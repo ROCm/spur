@@ -348,7 +348,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let nodes = cluster.nodes_off_dispatch_cooldown(&pending);
         let partitions = cluster.get_partitions();
         let reservations = cluster.get_reservations();
-        // A requeued job can retain its previous run's borrowed stamp despite current admission.
+        // Only this pass's in-quota admissions own handoffs, so derive them before borrowers join.
         let handoffs = cluster.preemption_handoffs(&pending, &nodes, &reservations);
 
         // Append the borrow candidates below every in-quota job, strictly after the
@@ -1211,8 +1211,8 @@ pub(crate) async fn try_preempt(
     try_preempt_with_handoffs(cluster, &state, unscheduled, sched).await;
 }
 
-// Reuse placement's handoffs, including owners selected but not yet dispatched.
-// Reclassifying here could disagree with this pass's quota decisions.
+/// Preempt running jobs so a pending one can be placed (`preempt_type = qos_priority` only).
+/// Uses the pass's own node view and handoffs, so it never proves capacity the pass refused.
 async fn try_preempt_with_handoffs(
     cluster: &Arc<ClusterManager>,
     state: &ClusterState<'_>,

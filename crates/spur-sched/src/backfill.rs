@@ -278,10 +278,7 @@ impl BackfillScheduler {
         };
 
         if placement.additive_listed_node_unavailable(nodes.iter(), reservations, now, &required)
-            || (placement.nodelist_is_additive()
-                && nodes.iter().any(|n| {
-                    placement.is_listed(&n.name) && !cluster.handoff_allows(job, &n.name, now)
-                }))
+            || cluster.listed_node_handed_off(job, &placement, now)
         {
             return Vec::new();
         }
