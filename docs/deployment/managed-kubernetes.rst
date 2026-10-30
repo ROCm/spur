@@ -501,7 +501,7 @@ Request GPUs
 
 GPU worker nodes advertise ``amd.com/gpu`` (containerd injects the devices from a
 CDI spec spurd writes on join). Request them in a pod spec. On a node that shares
-its GPUs with Spur, a pod must use a ``ResourceClaim`` instead (see
+its GPUs with Spur, a pod gets its GPUs through a bridge (see
 :doc:`gpu-sharing`).
 
 .. code-block:: yaml

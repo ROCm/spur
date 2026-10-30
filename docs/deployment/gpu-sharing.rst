@@ -7,15 +7,17 @@ usually reserved for Kubernetes as a whole. Spur does not place jobs on it.
 A **shared node** is different. Spur jobs and Kubernetes pods use the GPUs of
 the same node at the same time. The split is per GPU and changes with the load.
 For example, a node with 8 GPUs can run 3 GPUs of Spur jobs and 5 GPUs of pods.
-Claims coordinate new allocations so that a Spur job and a pod use different
-GPUs. This protection depends on all GPU consumers having claims and on the
-claims remaining allocated while their workloads run. Live mode changes and
-lost placeholders can break that protection; see `Mark a node as shared`_
-and `Failure cases`_.
 
-Kubernetes is the ledger of record for the GPUs of a shared node. Before a
-new GPU job starts, Spur reserves its GPUs with a placeholder pod and claim.
-Spur also reads allocated application claims and reports their GPUs as holds.
+Spur is the ledger of record for the GPUs of a shared node. A native Spur job
+makes no Kubernetes object. Spur reads the allocated claims of the node and
+reports their GPUs as **holds**, and does not give a held GPU to a new job. A
+pod gets its GPUs from Spur through a bridge: the bridge submits a Spur job for
+the pod and gives the GPUs of that job to the pod (see `Bridge contract`_).
+
+Kubernetes does not see the GPUs of native Spur jobs. Only admission control on
+the Kubernetes side stops a pod that does not use the bridge from taking such a
+GPU (see `Limits`_). Live mode changes can also break the protection; see
+`Mark a node as shared`_ and `Failure cases`_.
 
 .. note::
 
@@ -68,7 +70,7 @@ Before enrolment with sharing, or before either mode change:
    Keep these blocks in place throughout the driver change.
 2. Let existing native GPU jobs and Kubernetes GPU pods finish. Verify that
    their processes have stopped and their GPU allocations are released.
-   For opt-out, include Kubernetes DRA consumers, not only Spur placeholders.
+   For opt-out, include all Kubernetes DRA consumers.
 3. Change the sharing flag and reconcile the driver installation. Follow
    `The node label`_ when the gpu-operator manages the driver.
 4. Before you resume placement, verify that only the intended GPU driver
@@ -76,8 +78,7 @@ Before enrolment with sharing, or before either mode change:
    a fresh valid Spur hold report. For opt-out, verify that no old DRA
    consumer remains and that the device plugin is ready.
 
-An existing native job gets no placeholder retroactively. A running pod
-allocated by the device plugin also has no DRA claim, and removing that
+A running pod allocated by the device plugin has no DRA claim, and removing that
 plugin does not remove the pod's GPU access. Publishing those GPUs through
 DRA before the old workloads finish can allocate the same GPU twice.
 
@@ -134,22 +135,19 @@ Opt-out changes admission immediately; it does not safely drain the driver:
 
 - The node is reserved for Kubernetes again. Spur places no new jobs on it.
 - Spur does not stop existing jobs or pods.
-- ``spurd`` sets the node label to ``false`` immediately and stops the claim
-  watch and live-placeholder presence checks.
-- Cleanup of tracked placeholders continues as jobs finish. The kubelet links
-  stay while tracked placeholders remain.
+- ``spurd`` sets the node label to ``false`` immediately, stops the claim
+  watch and removes the kubelet links.
 
 With the disjoint selectors below, the label change selects the device plugin
-instead of DRA. Keeping the links does not keep the DRA driver running, and a
-missing placeholder is not repaired during opt-out. Finish all native GPU jobs
-and Kubernetes DRA consumers before opt-out, as described above.
+instead of DRA. Finish all native GPU jobs and Kubernetes DRA consumers before
+opt-out, as described above.
 
 The node label
 ~~~~~~~~~~~~~~
 
 ``spurd`` sets the label ``spur.amd.com/gpu-sharing`` on each GPU node that k0s
 enrolls with the role ``worker`` or ``single``. A node that is not shared gets
-the label too, but ``spurd`` does not watch its claims or make placeholders:
+the label too, but ``spurd`` does not watch its claims:
 
 .. list-table::
    :header-rows: 1
@@ -190,9 +188,8 @@ always has a value, because the node selectors of the AMD gpu-operator 1.5.x
 The Kubernetes credential
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``spurd`` uses the Kubernetes API to set the label, to watch claims and
-``ResourceSlice`` objects, and to make placeholders. The credential depends on
-the k0s role of the node:
+``spurd`` uses the Kubernetes API to set the label, and to watch claims and
+``ResourceSlice`` objects. The credential depends on the k0s role of the node:
 
 - On a node with the role ``single``, ``spurd`` uses the local admin
   kubeconfig (``k0s kubeconfig admin``).
@@ -220,19 +217,13 @@ bound token of 24 hours for the ServiceAccount:
    * - Object
      - Contents
    * - Namespace ``spur-system``
-     - Label ``pod-security.kubernetes.io/enforce=baseline``. Thus a pod in it
-       cannot be privileged and cannot mount a host path.
+     - Holds the ServiceAccounts.
    * - ServiceAccount ``spur-system/spurd-gpu-sharing-<node>``
      - The identity of the worker.
    * - ClusterRole and ClusterRoleBinding ``spurd-gpu-sharing-<node>``
      - ``get``, ``list`` and ``watch`` on ``resourceclaims`` and
        ``resourceslices`` (``resource.k8s.io``). ``get`` and ``patch`` on the
-       ``Node`` of this node only. ``get`` on the namespace ``spur-system``
-       only.
-   * - Role and RoleBinding ``spur-system/spurd-gpu-sharing-<node>``
-     - ``create``, ``get``, ``list``, ``watch``, ``delete`` and ``patch`` on
-       all ``resourceclaims`` and ``pods`` in ``spur-system``, including
-       placeholders of other nodes. These permissions are not node-scoped.
+       ``Node`` of this node only.
 
 ``spurd`` does not log the token or the kubeconfig. It makes a new client
 every 12 hours, and immediately when the API server answers HTTP 401.
@@ -245,14 +236,15 @@ every 12 hours, and immediately when the API server answers HTTP 401.
    GPU node. The same check is bypassed when no signing key or signer is
    available. Use token admission with a working signer before deployment.
 
-   This credential can modify other nodes' pods and claims in ``spur-system``.
-   Pod Security baseline does not prevent these API operations. A firewall
-   can limit access, but does not correct the credential issuance defect.
+   This credential can read all claims and slices of the cluster, and can
+   change the ``Node`` object of its node, which includes its taints. A
+   firewall can limit access, but does not correct the credential issuance
+   defect.
 
 Opt-out and node removal do not delete the ServiceAccount or its RBAC objects.
 An administrator must remove these objects when the node no longer needs
 Kubernetes access. Do not remove them while the agent still needs them for
-placeholder cleanup or node-label updates. Token rotation is not revocation.
+node-label updates. Token rotation is not revocation.
 
 The kubelet links
 ~~~~~~~~~~~~~~~~~
@@ -423,103 +415,59 @@ vendor starts with ``k8s.``. DRA drivers use such a vendor for the
 specifications that they write for each allocated claim. These devices belong
 to a pod, and are not in the inventory of the node.
 
-How Spur holds a GPU: the placeholder pod
------------------------------------------
+Bridge contract
+---------------
 
-Before ``spurd`` starts a Spur job on a shared node, it makes one
-``ResourceClaim`` and one placeholder pod for the job:
+A pod gets GPUs of a shared node through a bridge. The bridge is not part of
+Spur. It uses only the public gRPC API of Spur: ``SubmitJob``, ``GetJobs``,
+``GetJob``, ``GetNode`` and ``CancelJob``. Spur expects this sequence from it:
 
-- Namespace: ``spur-system``. ``spurd`` makes the namespace.
-- Name of the pod and of the claim: ``spur-job-<jobid>-<run_attempt>-<node>``,
-  for example ``spur-job-1042-0-gpu01``. A job on many nodes has one
-  placeholder on each node.
-- Labels: ``spur.amd.com/job-id``, ``spur.amd.com/run-attempt``,
-  ``spur.amd.com/node``, ``spur.amd.com/user``, ``spur.amd.com/account`` and
-  ``app.kubernetes.io/managed-by=spurd``. A user or account name that is not a
-  valid label value is left out.
-- The pod runs the pause image of k0s. It has no CPU or memory request.
-- The pod selects the node with a node selector on the hostname. It does not
-  use ``spec.nodeName``, because then kube-scheduler does not allocate the
-  claim.
+1. The bridge submits one Spur job for the pod. The job only waits, for
+   example ``sleep infinity``. The job runs on node X with the GPUs S. The
+   stable ids of S are in ``JobInfo.resources.devices["gpu"]``. ``GetNode``
+   gives the DRA device name of each GPU in ``gpu_holds.gpus[].dra_device``.
+2. The bridge writes the allocation of the pod's ``ResourceClaim`` for the
+   devices of S. It sets the claim label ``spur.amd.com/job-id`` to the id of
+   the job.
+3. The bridge waits until ``GetNode`` for X shows each GPU of S as held by the
+   claim, with the id of the job.
+4. The bridge reads the job again. If the job does not run, the bridge deletes
+   the claim and stops. If the job runs, the bridge lets the pod start, for
+   example with the removal of a scheduling gate.
+5. When the job ends, the bridge deletes the pod. When the pod ends, the
+   bridge cancels the job.
 
-The claim uses ``deviceClassName: gpu.amd.com``. It has one request for each
-whole GPU, with a CEL selector on the ``pciBusID``. For a partitioned (CPX) GPU
-it has one request with ``count`` *k* on the ``pciBusID`` of the parent GPU.
-For example:
+If the job ends before step 3, the bridge sees it in step 4, and the pod does
+not start. If the job ends after step 3, the hold keeps the GPUs busy until
+the pod stops and DRA releases the claim.
 
-.. code-block:: yaml
+The controller uses the claim label as follows:
 
-   apiVersion: resource.k8s.io/v1
-   kind: ResourceClaim
-   metadata:
-     name: spur-job-1042-0-gpu01
-     namespace: spur-system
-     labels:
-       spur.amd.com/job-id: "1042"
-       spur.amd.com/run-attempt: "0"
-       spur.amd.com/node: gpu01
-       spur.amd.com/user: alice
-       spur.amd.com/account: research
-       app.kubernetes.io/managed-by: spurd
-   spec:
-     devices:
-       requests:
-         - name: g0
-           exactly:
-             deviceClassName: gpu.amd.com
-             allocationMode: ExactCount
-             count: 1
-             selectors:
-               - cel:
-                   expression: device.attributes["resource.kubernetes.io"].pciBusID == "0000:2f:00.0"
+- While the job holds the allocation of a GPU, the hold of the pod on that GPU
+  is part of the job. The scheduler counts the GPU once, as the allocation of
+  the job. Thus preemption and idle-fill reclaim can stop the job to free the
+  GPU.
+- After the job ends, the hold counts again, until the claim goes. This is the
+  fence between the stopping pod and the next job. It does not depend on how
+  the job ended: cancel, preemption, requeue, time limit, a node that goes
+  down, a ``spurd`` restart and a controller leader change all keep the GPU
+  held.
+- A pending job that preempted the job does not preempt more jobs while the
+  hold of the pod is on a node that the pending job can use.
 
-``spurd`` waits until kube-scheduler allocates the claim and schedules the pod.
-Then it starts the job. The launch deadline is the only limit of this wait.
-``spurd`` reads ``controller.dispatch_timeout_secs`` (default 300 seconds) from
-its own configuration file and stops the wait 10 seconds before this time
-passes, counted from when the launch request arrives. Thus the controller
-gets the answer before its own deadline. Use the same value on the controller
-and on the agents. A slow API server does not cause a failure: ``spurd`` tries
-a timed out API call again, in the deadline.
-
-Two conditions stop the wait:
-
-- The placeholder gets ``PodScheduled=False`` with the reason
-  ``Unschedulable``. The DRA scheduler plugin sets this when it cannot allocate
-  the claim, for example because a pod holds the GPU.
-- The deadline passes.
-
-In the two conditions, ``spurd`` deletes the placeholder and the claim, and
-refuses the launch. The job goes back to the queue.
-
-On a CPX GPU, kube-scheduler selects which sibling partitions to give. The
-job then runs on those partitions. The controller accepts a different
-partition only when the number of devices is the same and each device has the
-same parent GPU as a device in the request.
-
-When the job ends, or when its launch fails after ``spurd`` made the
-placeholder, ``spurd`` deletes the pod and the claim. Every 30 seconds
-``spurd`` also does a check of its placeholders:
-
-- It deletes each placeholder of the node that has no live job. A job is live
-  from the start of its launch until its resources are released.
-- While sharing is enabled, it tries to recreate a missing placeholder of a
-  tracked running job.
-- While sharing is enabled, it reports a conflict if the claim of a tracked
-  running job holds different GPUs from the job.
-
-After a restart, ``spurd`` also does these two last steps for the GPU jobs that
-it recovers from before the restart. Recreation is not an atomic reservation:
-another pod can acquire the GPU before the replacement claim.
-Do not delete a live job's placeholder or claim.
+A claim without the label is a hold for as long as it is allocated. On a GPU
+that a Spur job uses, a claim that does not name that job is a conflict.
+Spur does not check who wrote the label. Only the bridge must write claim
+allocations and the label on shared nodes (see `Limits`_).
 
 How Spur sees pod GPUs: holds
 -----------------------------
 
 ``spurd`` watches the ``ResourceClaim`` objects and the ``ResourceSlice`` of
 its node. Each GPU that an allocated claim of a pod names is a **hold**. A
-hold starts when kube-scheduler allocates the claim, before the pod starts.
-Placeholder pods of Spur are not holds.
+hold starts when the claim is allocated, before the pod starts. The claim
+label ``spur.amd.com/job-id`` names the Spur job of the hold (see
+`Bridge contract`_).
 
 ``spurd`` sends the full hold state of the node in each heartbeat, every 30
 seconds. When the state changes, it sends one more heartbeat immediately. The
@@ -539,7 +487,8 @@ Jobs that use only CPUs can go to a shared node in these conditions.
 
 When the report is valid, the controller does not give a GPU that a pod holds,
 that is in conflict, or that is unshareable. Backfill thinks that a held GPU
-is busy for all time, because a pod has no end time.
+is busy for all time, because a pod has no end time. A hold that is part of a
+running job is busy until the end of the job.
 
 See the GPU owners
 ------------------
@@ -556,6 +505,7 @@ See the GPU owners
       GpuSharing=yes
       Gpu=0x1b0000 Device=gpu-1-128 State=free
       Gpu=0x2f0000 Device=gpu-9-136 State=job 1042
+      Gpu=0x3a0000 Device=gpu-13-140 State=job 1044 held aim/llama-2 (claim llama-2-gpu)
       Gpu=0x4e0000 Device=gpu-17-144 State=held aim/llama-0 (claim llama-0-gpu)
       Gpu=0x620000 Device=gpu-25-152 State=conflict job 1043 vs aim/llama-1
 
@@ -569,16 +519,21 @@ DRA device name, or ``-`` when the GPU has none. ``State`` is one of:
    * - State
      - Meaning
    * - ``free``
-     - No allocated claim holds the GPU. This is not proof that no process
-       uses it: a job without a placeholder or an old device-plugin pod is
-       not protected by this ledger.
+     - No allocated claim holds the GPU, and no Spur job uses it. This is not
+       proof that no process uses it: an old device-plugin pod is not in this
+       ledger.
    * - ``job <id>``
-     - The placeholder of Spur job ``<id>`` holds the GPU.
+     - Spur job ``<id>`` uses the GPU. No claim holds it.
+   * - ``job <id> held <ns>/<pod> (claim <name>)``
+     - The claim ``<name>`` of the pod ``<ns>/<pod>`` holds the GPU for Spur
+       job ``<id>``. While the job holds the GPU, the GPU is part of the job.
+       After the job ends, the GPU stays held until the claim goes.
    * - ``held <ns>/<pod> (claim <name>)``
-     - The claim ``<name>`` of the pod ``<ns>/<pod>`` holds the GPU.
+     - The claim ``<name>`` of the pod ``<ns>/<pod>`` holds the GPU, and names
+       no Spur job.
    * - ``conflict job <id> vs <ns>/<pod>``
-     - Spur job ``<id>`` uses the GPU, but its placeholder lost the GPU to the
-       pod. See `Failure cases`_.
+     - Spur job ``<id>`` uses the GPU, but the claim of the pod holds the GPU
+       and does not name job ``<id>``. See `Failure cases`_.
    * - ``unshareable (<reason>)``
      - The GPU is not in the Kubernetes ledger, for example
        ``no DRM card for renderD130``. Spur does not place jobs on it.
@@ -597,63 +552,17 @@ Do not treat missing telemetry as proof that GPUs are free.
 Run a pod on a shared node
 --------------------------
 
-With `The DeviceClass`_, a pod can request ``amd.com/gpu`` as on an ordinary
-GPU node:
+A pod gets GPUs of a shared node through the bridge (see `Bridge contract`_).
+The bridge decides which pods and which claims it serves. A pod that it
+serves waits in the Spur queue as a Spur job, and starts when Spur gives GPUs
+to that job.
 
-.. code-block:: yaml
-
-   resources:
-     limits:
-       amd.com/gpu: 1
-
-kube-scheduler makes a ``ResourceClaim`` for the pod, in the namespace of the
-pod, and allocates a ``gpu.amd.com`` device to it. The name of the claim is
-``<pod>-extended-resources-<suffix>``, and is shorter when the pod name is
-long. The pod field ``status.extendedResourceClaimStatus.resourceClaimName``
-gives the name. ``spurd`` sees this claim as any other claim, and
-``scontrol show node`` shows ``held <ns>/<pod> (claim <name>)``. AIM and
-KServe pods use this path with no change.
-
-A pod can also request a ``ResourceClaim`` directly:
-
-.. code-block:: yaml
-
-   apiVersion: resource.k8s.io/v1
-   kind: ResourceClaim
-   metadata:
-     name: one-gpu
-     namespace: demo
-   spec:
-     devices:
-       requests:
-         - name: gpu
-           exactly:
-             deviceClassName: gpu.amd.com
-             allocationMode: ExactCount
-             count: 1
-   ---
-   apiVersion: v1
-   kind: Pod
-   metadata:
-     name: gpu-probe
-     namespace: demo
-   spec:
-     restartPolicy: Never
-     nodeSelector:
-       spur.amd.com/gpu-sharing: "true"
-     resourceClaims:
-       - name: gpu
-         resourceClaimName: one-gpu
-     containers:
-       - name: rocm
-         image: rocm/dev-ubuntu-24.04:latest
-         command: ["rocm-smi"]
-         resources:
-           claims:
-             - name: gpu
-
-The ``nodeSelector`` is optional. Without it, kube-scheduler can put the pod on
-any node with a free ``gpu.amd.com`` device.
+A pod that kube-scheduler allocates without the bridge is a hold with no Spur
+job: ``scontrol show node`` shows ``held <ns>/<pod> (claim <name>)``, and
+Spur does not use its GPUs while the claim is allocated. But kube-scheduler
+does not see the GPUs of native Spur jobs. Thus such a pod can get a GPU that
+a Spur job uses, which is a conflict. On shared nodes, let only the bridge
+allocate GPUs (see `Limits`_).
 
 Validation scope
 ----------------
@@ -691,10 +600,15 @@ Limits
   node is shared. The unit of sharing is one KFD device.
 - Use one Spur agent for each node. The ``spur-k8s`` operator mode must not
   also register a shared node.
-- Spur and Kubernetes keep their own queues. Spur does not stop a pod to start
-  a job, and does not stop a job to start a pod.
-- Each Spur job on a shared node needs one more kube-scheduler cycle before it
-  starts. A busy API server makes this time longer, up to the launch deadline.
+- Kubernetes does not see the GPUs of native Spur jobs: the ``ResourceSlice``
+  shows them as free. Spur makes no Kubernetes object for them. Use admission
+  on the Kubernetes side, for example a taint on shared nodes and a
+  ``ValidatingAdmissionPolicy`` on claim allocations, so that only the bridge
+  allocates GPUs of a shared node. Spur shows a pod that gets past it as a
+  conflict, but does not stop it.
+- Spur preemption and idle-fill reclaim can stop the Spur job of a bridge pod.
+  The bridge then deletes the pod. Spur does not stop a pod that the bridge
+  does not serve.
 
 Failure cases
 -------------
@@ -705,19 +619,15 @@ Failure cases
 
    * - Case
      - Result
-   * - A tracked running job loses its placeholder.
-     - While sharing is enabled, ``spurd`` tries to recreate it at a presence
-       check. This does not apply during opt-out. Another pod can
-       acquire the GPU before repair; conflict reporting does not stop
-       either workload.
-   * - A GPU is in conflict.
+   * - A GPU is in conflict, for example because a pod got the GPU of a native
+       Spur job without the bridge.
      - ``scontrol show node`` shows ``conflict`` and the reason. The job gets
        no comment. The controller gives the GPU to no new job. Spur stops no job and no
        pod. The administrator decides what to do.
    * - ``spurd`` cannot connect to the API server.
-     - ``spurd`` refuses new launches on the node. The last report becomes old,
-       and after the heartbeat timeout the controller gives no GPU of the node
-       to a job.
+     - ``spurd`` sends a report that says that the node is unshareable, or no
+       report. The controller gives no GPU of the node to a new job: at once
+       for an unshareable node, and else after the heartbeat timeout.
    * - A worker cannot get its credential, for example because no
        control-plane ``spurd`` answers.
      - The same as when ``spurd`` cannot connect to the API server. On a
