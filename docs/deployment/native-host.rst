@@ -401,6 +401,13 @@ directly before acting:
 Nodes managed by the Kubernetes operator are not checked this way; they are marked ``DOWN``
 on the heartbeat timeout alone.
 
+A node marked ``DOWN`` for not responding returns to service on the next health pass after
+its heartbeats resume. If it still runs jobs the controller already ended, for example
+because it was unreachable when they ended, the controller cancels them again and keeps the
+node ``DOWN`` until it stops reporting them, so no new job lands beside them. The hold lasts at most
+``controller.heartbeat_timeout_secs``; after that the node returns anyway and the leader
+logs ``recovering it after the hold cap``.
+
 Joining Worker Nodes
 --------------------
 
