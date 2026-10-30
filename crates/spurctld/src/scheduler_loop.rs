@@ -1212,7 +1212,7 @@ pub(crate) async fn try_preempt(
 }
 
 /// Preempt running jobs so a pending one can be placed (`preempt_type = qos_priority` only).
-/// Uses the pass's own node view and handoffs, so it never proves capacity the pass refused.
+/// A non-`gone` failure mid-set leaves the already-evicted victims evicted, job still unplaced.
 async fn try_preempt_with_handoffs(
     cluster: &Arc<ClusterManager>,
     state: &ClusterState<'_>,
@@ -1230,6 +1230,7 @@ async fn try_preempt_with_handoffs(
 
     let now = chrono::Utc::now();
     let partitions = state.partitions;
+    // The pass's own node view: a node on dispatch cooldown would prove a refused placement.
     let cluster_nodes = state.nodes;
     let reservations = state.reservations;
 
@@ -1375,7 +1376,7 @@ async fn try_preempt_with_handoffs(
         // victim per cycle on a placement that will never happen. A set found in
         // the suspend pool is discarded rather than acted on: suspend never frees
         // the node, so it could not place the pending job either.
-        let available_nodes = state.nodes_for_handoff(pending, now);
+        let available_nodes = state.nodes_for_handoff(pending);
         let mut found = None;
         for (is_suspend_pool, pool_ids) in [(false, by_mode(false)), (true, by_mode(true))] {
             if pool_ids.is_empty() {
@@ -1617,7 +1618,7 @@ async fn reclaim_for_unplaced(
             || cluster.resolve_qos(reclaimer).idle_fill_preemptable;
         let ceiling = reclaimer_is_opportunistic.then(|| cluster.resolve_qos(reclaimer).priority);
 
-        let available_nodes = cluster_state.nodes_for_handoff(reclaimer, now);
+        let available_nodes = cluster_state.nodes_for_handoff(reclaimer);
         let Some(victims) = satisfiable_victim_set(
             reclaimer,
             &VictimPool {

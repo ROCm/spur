@@ -639,8 +639,8 @@ pub struct ClusterManager {
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
-    /// Transient handoffs bridge victim release and placement; bounded by scheduler passes.
-    /// Reconstructed during WAL application, but not included in snapshots.
+    /// Transient handoffs bridging victim release and placement, recorded on every replica
+    /// at apply but aged only by the leader's passes; never included in snapshots.
     preempt_freed_nodes: RwLock<HashMap<String, (JobId, u32)>>,
     /// When each (check index, node name) last completed a check, so the pass
     /// knows when the next one is due. Leader-local and transient (like
@@ -1057,7 +1057,7 @@ impl ClusterManager {
             if job.state == JobState::Pending && !job.pending_reason.is_scheduling_hold() {
                 schedulable_owners.insert(job.job_id);
             }
-            if job.state == JobState::Completing {
+            if job.is_draining_cancel_victim() {
                 if let Some(preemptor) = job.preempted_by {
                     owners_still_draining.insert(preemptor);
                 }
@@ -1118,10 +1118,7 @@ impl ClusterManager {
         for (node, (owner, _)) in earmarks.iter() {
             by_owner.entry(*owner).or_default().insert(node);
         }
-        let draining_cancelled_victims = jobs.values().filter(|j| {
-            j.state == JobState::Completing && j.preempt_mode.as_deref() == Some("Cancel")
-        });
-        for victim in draining_cancelled_victims {
+        for victim in jobs.values().filter(|j| j.is_draining_cancel_victim()) {
             if let Some(owner) = victim.preempted_by {
                 by_owner
                     .entry(owner)
@@ -5001,7 +4998,7 @@ impl ClusterManager {
         let hoisted: HashSet<JobId> = {
             let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
             for job in jobs.values() {
-                if job.state == JobState::Completing && !job.allocated_nodes.is_empty() {
+                if job.is_draining_cancel_victim() && !job.allocated_nodes.is_empty() {
                     if let Some(owner) = job.preempted_by {
                         draining_by_owner.entry(owner).or_default().push(job);
                     }
@@ -7724,6 +7721,10 @@ impl ClusterManager {
                     job.preempted_by = None;
                     job.preempt_mode = None;
                     job.preempt_qos = None;
+                    // Followers never age earmarks, so a placed owner must drop them on every replica.
+                    self.preempt_freed_nodes
+                        .write()
+                        .retain(|_, (owner, _)| *owner != *job_id);
                     // Same reason, and it must be here rather than at requeue:
                     // the finished run's record is written after that apply.
                     job.derived_exit_code = 0;
@@ -8828,6 +8829,7 @@ impl StateMachineApply for ClusterManager {
 
         let mut nodes = self.nodes.write();
         nodes.clear();
+        self.preempt_freed_nodes.write().clear();
         for mut node in snap.nodes {
             // Legacy snapshots lack detected_resources; seed it from total_resources
             // so reconcile_partitions doesn't clamp a zero inventory into scheduling.
@@ -20716,6 +20718,53 @@ mod tests {
         }
     }
 
+    fn requeue_into_earmark(cm: &ClusterManager) -> JobId {
+        let victim = run_job_on(cm, "victim", "n1");
+        let owner = submit_and_wait(cm, basic_spec("owner"));
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: victim,
+            begin_time: Utc::now() + chrono::Duration::hours(1),
+            preempted_by: Some(owner),
+            preempt_qos: None,
+            at: Some(Utc::now()),
+            handoff_to: Some(owner),
+        });
+        assert_eq!(cm.preempt_freed_nodes_raw()["n1"].0, owner);
+        owner
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_start_drops_its_earmarks_on_every_replica() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        for node in ["n1", "n2"] {
+            register_node(&cm, node, 8, 16000);
+        }
+        let owner = requeue_into_earmark(&cm);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: owner,
+            nodes: vec!["n2".into()],
+            resources: scalar_alloc(2, 4000),
+            per_node_alloc: per_node_for(&["n2"], scalar_alloc(2, 4000)),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+            idle_fill: false,
+            at: Some(Utc::now()),
+        });
+        assert!(cm.preempt_freed_nodes_raw().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_install_drops_earmarks() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        let snapshot = cm.snapshot_state().unwrap();
+        requeue_into_earmark(&cm);
+        cm.restore_from_snapshot(&snapshot).unwrap();
+        assert!(cm.preempt_freed_nodes_raw().is_empty());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn draining_suspend_victim_hands_off_nothing() {
         let dir = TempDir::new().unwrap();
@@ -20819,8 +20868,9 @@ mod tests {
         hunter.time_limit = Some(chrono::Duration::hours(13));
         let hunter_id = submit_and_wait(&cm, hunter);
         let bystander = submit_bystander(&cm, "n1");
+        // Short enough to backfill before the drain deadline, so only the handoff keeps it off n1.
         cm.jobs.write().get_mut(&bystander).unwrap().spec.time_limit =
-            Some(chrono::Duration::hours(1));
+            Some(chrono::Duration::seconds(10));
         let pending = cm.get_job(hunter_id).unwrap();
         crate::scheduler_loop::try_preempt(
             &cm,

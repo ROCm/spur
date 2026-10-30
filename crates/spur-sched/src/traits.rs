@@ -35,12 +35,11 @@ pub struct ClusterState<'a> {
 }
 
 impl ClusterState<'_> {
-    /// Whether `job` may be placed on `node` despite another preemptor's handoff.
-    pub fn handoff_allows(&self, job: &Job, node: &str, now: DateTime<Utc>) -> bool {
+    /// Whether `job` may use `node`; reservation rules already shaped who owns its handoff.
+    pub fn handoff_allows(&self, job: &Job, node: &str) -> bool {
         self.preemption_handoffs
             .get(node)
             .is_none_or(|owner| *owner == job.job_id)
-            || spur_core::reservation::job_has_active_reservation(job, self.reservations, now)
     }
 
     /// An additive `--nodelist` needs every listed node, so one handed-off node blocks the job.
@@ -48,35 +47,31 @@ impl ClusterState<'_> {
         &self,
         job: &Job,
         placement: &crate::node_match::NodePlacement,
-        now: DateTime<Utc>,
     ) -> bool {
-        placement.nodelist_is_additive()
+        !self.preemption_handoffs.is_empty()
+            && placement.nodelist_is_additive()
             && self
                 .nodes
                 .iter()
-                .any(|n| placement.is_listed(&n.name) && !self.handoff_allows(job, &n.name, now))
+                .any(|n| placement.is_listed(&n.name) && !self.handoff_allows(job, &n.name))
     }
 
     /// Victim selection must not prove capacity using a different preemptor's nodes.
-    pub fn nodes_for_handoff(&self, job: &Job, now: DateTime<Utc>) -> std::borrow::Cow<'_, [Node]> {
+    pub fn nodes_for_handoff(&self, job: &Job) -> std::borrow::Cow<'_, [Node]> {
         if self.preemption_handoffs.is_empty() {
             return std::borrow::Cow::Borrowed(self.nodes);
         }
         let placement = crate::node_match::NodePlacement::new(job);
-        if self.listed_node_handed_off(job, &placement, now) {
+        if self.listed_node_handed_off(job, &placement) {
             return std::borrow::Cow::Owned(Vec::new());
         }
-        if self
-            .nodes
-            .iter()
-            .all(|n| self.handoff_allows(job, &n.name, now))
-        {
+        if self.nodes.iter().all(|n| self.handoff_allows(job, &n.name)) {
             return std::borrow::Cow::Borrowed(self.nodes);
         }
         std::borrow::Cow::Owned(
             self.nodes
                 .iter()
-                .filter(|n| self.handoff_allows(job, &n.name, now))
+                .filter(|n| self.handoff_allows(job, &n.name))
                 .cloned()
                 .collect(),
         )

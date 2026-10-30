@@ -663,21 +663,22 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 
    Cancel and requeue preemption hand the freed nodes to the job that
    triggered the eviction. While its victims drain, and for two scheduling
-   passes after the last one releases its resources, other pending jobs,
-   including competing preemptors, cannot be placed on those nodes. This
-   protects a multi-node preemptor whose victims finish at different times.
-   A requeue sets up the handoff when it commits, even if the controller was
-   slow to record it.
+   passes (about two ``interval_secs``) after the last one releases its
+   resources, other pending jobs, including competing preemptors, cannot be
+   placed on those nodes. This protects a multi-node preemptor whose victims
+   finish at different times. A requeue records the handoff as part of the
+   requeue itself.
 
    The handoff is held for the whole node, not only the released resources.
    On nodes shared by several jobs, capacity left over beside the victim stays
    unused until the preemptor is placed or the handoff ends.
 
-   A handoff ends when its preemptor starts, is cancelled or held, no longer
-   matches the node, or is still unplaced after the two passes. Active
-   reservations keep precedence, and idle-fill reclaim creates no handoff.
-   Post-release handoffs are kept in controller memory: a restart or leader
-   change can drop one, or renew it for two more passes.
+   A handoff ends when its preemptor starts, is cancelled or held, falls
+   outside its quota, no longer matches the node, or is still unplaced after
+   the two passes. A node in an active reservation is handed off only to a
+   preemptor allowed to use that reservation, and idle-fill reclaim creates no
+   handoff. Post-release handoffs are kept in controller memory: a restart or
+   leader change can drop one, or renew it for two more passes.
 
    Eviction eligibility uses the QOS allow-list and priority; fair-share and
    age order the rest of the queue.

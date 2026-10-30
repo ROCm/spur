@@ -1223,6 +1223,11 @@ impl Job {
         self.spec.srun_job && self.spec.pty && !self.spec.interactive && self.srun_step_dispatch
     }
 
+    /// A cancel-mode preemption victim still releasing its nodes to `preempted_by`.
+    pub fn is_draining_cancel_victim(&self) -> bool {
+        self.state == JobState::Completing && self.preempt_mode.as_deref() == Some("Cancel")
+    }
+
     /// Whether a placement is already charged. `reserve_placement` charges while still
     /// `Pending`, before dispatch, so "yes" here means a second placement would double-charge.
     pub fn holds_a_placement(&self) -> bool {

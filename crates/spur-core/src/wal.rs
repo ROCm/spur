@@ -201,7 +201,7 @@ pub enum WalOperation {
         /// When the preempted run ended, distinct from `begin_time`'s future hold.
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
-        /// Reclaim shares this operation but must return capacity to the general pool.
+        /// Pending preemptor the freed nodes are handed to; `None` for reclaim.
         #[serde(default)]
         handoff_to: Option<JobId>,
     },

@@ -273,12 +273,11 @@ impl BackfillScheduler {
             if !placement.matches_for_reservation(node, reservations, now) {
                 return false;
             }
-            node.total_resources.can_satisfy(&required)
-                && cluster.handoff_allows(job, &node.name, now)
+            node.total_resources.can_satisfy(&required) && cluster.handoff_allows(job, &node.name)
         };
 
         if placement.additive_listed_node_unavailable(nodes.iter(), reservations, now, &required)
-            || cluster.listed_node_handed_off(job, &placement, now)
+            || cluster.listed_node_handed_off(job, &placement)
         {
             return Vec::new();
         }
@@ -915,37 +914,33 @@ mod tests {
     }
 
     #[test]
-    fn handoff_blocks_competitor_but_preserves_active_reservation_precedence() {
+    fn handoff_blocks_a_competitor_even_inside_the_owners_reservation() {
         let nodes = make_nodes(1);
-        let owner = make_job(1, 1, 4);
-        let competitor = make_job(2, 1, 4);
-        let handoffs = HashMap::from([("node001".into(), owner.job_id)]);
-        let mut state = ClusterState {
-            nodes: &nodes,
-            partitions: &[],
-            reservations: &[],
-            topology: None,
-            busy_until: &HashMap::new(),
-            preemption_handoffs: &handoffs,
-        };
-        let mut scheduler = BackfillScheduler::new(100);
-        let assignments = scheduler.schedule(&[competitor.clone(), owner], &state);
-        assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].job_id, 1);
-        assert!(state.nodes_for_handoff(&competitor, Utc::now()).is_empty());
-
         let reservations = vec![make_active_reservation(
             "reserved",
             vec!["node001".into()],
             vec!["test".into()],
         )];
-        state.reservations = &reservations;
-        let mut reserved = competitor;
-        reserved.spec.reservation = Some("reserved".into());
-        assert_eq!(state.nodes_for_handoff(&reserved, Utc::now()).len(), 1);
-        let assignments = scheduler.schedule(&[reserved], &state);
+        let mut owner = make_job(1, 1, 4);
+        let mut competitor = make_job(2, 1, 4);
+        for job in [&mut owner, &mut competitor] {
+            job.spec.reservation = Some("reserved".into());
+        }
+        let handoffs = HashMap::from([("node001".into(), owner.job_id)]);
+        let state = ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &reservations,
+            topology: None,
+            busy_until: &HashMap::new(),
+            preemption_handoffs: &handoffs,
+        };
+        let mut scheduler = BackfillScheduler::new(100);
+        assert!(state.nodes_for_handoff(&competitor).is_empty());
+        assert!(scheduler.schedule(&[competitor.clone()], &state).is_empty());
+        let assignments = scheduler.schedule(&[competitor, owner], &state);
         assert_eq!(assignments.len(), 1);
-        assert_eq!(assignments[0].job_id, 2);
+        assert_eq!(assignments[0].job_id, 1);
     }
 
     #[test]
@@ -962,7 +957,7 @@ mod tests {
             preemption_handoffs: &HashMap::from([("node001".into(), 1)]),
         };
         let mut scheduler = BackfillScheduler::new(100);
-        assert!(state.nodes_for_handoff(&competitor, Utc::now()).is_empty());
+        assert!(state.nodes_for_handoff(&competitor).is_empty());
         assert!(scheduler.schedule(&[competitor], &state).is_empty());
     }
 
