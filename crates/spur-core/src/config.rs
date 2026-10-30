@@ -317,7 +317,7 @@ pub struct ControllerConfig {
     pub raft_listen_addr: String,
 
     /// Seconds without a heartbeat before a node is marked Down.
-    /// Defaults to 90 when absent.
+    /// Defaults to 90 when absent. Set to 0 to disable down-detection.
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
@@ -2111,14 +2111,7 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
-        // Zero makes every heartbeat instantly stale, so the first health pass
-        // past the grace window marks every registered node Down.
-        if self.controller.heartbeat_timeout_secs == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "controller.heartbeat_timeout_secs".into(),
-                value: "0 (must be at least 1)".into(),
-            });
-        }
+        // 0 disables heartbeat-based down-detection (like Slurm's SlurmdTimeout=0).
         // Zero would clamp every launch-failure hold to zero, restoring the tight
         // re-dispatch loop the backoff exists to prevent. The upper bound keeps
         // the hold instant representable.
@@ -4937,18 +4930,13 @@ heartbeat_timeout_secs = 120
     }
 
     #[test]
-    fn controller_config_rejects_a_zero_heartbeat_timeout() {
-        let err = SlurmConfig::load_from_str(
+    fn controller_config_zero_heartbeat_timeout_disables_detection() {
+        let config = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n[controller]\nheartbeat_timeout_secs = 0\n",
         )
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("controller.heartbeat_timeout_secs"),
-            "unexpected error: {err}"
-        );
+        .unwrap();
+        assert_eq!(config.controller.heartbeat_timeout_secs, Some(0));
 
-        // Absent stays absent: only an explicit 0 is rejected.
         let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
         assert_eq!(config.controller.heartbeat_timeout_secs, None);
     }

@@ -10171,6 +10171,27 @@ pub(crate) fn evaluate_node_health(
     now: DateTime<Utc>,
     timeout_secs: u64,
 ) -> Vec<HealthAction> {
+    if timeout_secs == 0 {
+        // Down-detection disabled; only recover nodes whose heartbeat returned.
+        let mut actions = Vec::new();
+        for node in nodes {
+            if node.last_heartbeat.is_none() {
+                continue;
+            }
+            if node
+                .state
+                .transition(&NodeEvent::HeartbeatRecovered, node.admin_locked)
+                .is_some()
+            {
+                actions.push(HealthAction::Recover {
+                    name: node.name.clone(),
+                    old_state: node.state,
+                });
+            }
+        }
+        return actions;
+    }
+
     let threshold = chrono::Duration::seconds(timeout_secs as i64);
     let mut actions = Vec::new();
 
@@ -30009,6 +30030,93 @@ mod tests {
                 name: "back".into(),
                 old_state: NodeState::Down,
             }
+        );
+    }
+
+    #[test]
+    fn health_zero_timeout_never_marks_down() {
+        let stale = make_health_node(
+            "stale",
+            NodeState::Idle,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(9999)),
+        );
+        let actions = super::evaluate_node_health(&[&stale], Utc::now(), 0);
+        assert!(
+            actions.is_empty(),
+            "timeout=0 disables down-detection; no MarkDown action expected"
+        );
+    }
+
+    #[test]
+    fn health_zero_timeout_still_recovers_down_node() {
+        let down = make_health_node(
+            "n1",
+            NodeState::Down,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(5)),
+        );
+        let actions = super::evaluate_node_health(&[&down], Utc::now(), 0);
+        assert_eq!(
+            actions,
+            vec![super::HealthAction::Recover {
+                name: "n1".into(),
+                old_state: NodeState::Down,
+            }],
+            "timeout=0 should still recover a Down node with a fresh heartbeat"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn check_node_health_zero_timeout_keeps_stale_node_up() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "stale", 4, 8000);
+
+        if let Some(node) = cm.nodes.write().get_mut("stale") {
+            node.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(9999));
+        }
+
+        cm.check_node_health(0, super::MarkDownPolicy::Allowed);
+        assert_eq!(
+            cm.get_node("stale").unwrap().state,
+            NodeState::Idle,
+            "timeout=0 must never mark a node Down"
+        );
+    }
+
+    #[test]
+    fn health_300s_default_does_not_mark_200s_stale() {
+        let node = make_health_node(
+            "n1",
+            NodeState::Idle,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(200)),
+        );
+        let actions = super::evaluate_node_health(&[&node], Utc::now(), 300);
+        assert!(
+            actions.is_empty(),
+            "200s stale with 300s timeout must not be marked Down"
+        );
+    }
+
+    #[test]
+    fn health_300s_default_marks_400s_stale() {
+        let node = make_health_node(
+            "n1",
+            NodeState::Idle,
+            false,
+            Some(Utc::now() - chrono::Duration::seconds(400)),
+        );
+        let actions = super::evaluate_node_health(&[&node], Utc::now(), 300);
+        assert_eq!(
+            actions,
+            vec![super::HealthAction::MarkDown {
+                name: "n1".into(),
+                old_state: NodeState::Idle,
+                admin_locked: false,
+            }],
+            "400s stale with 300s timeout must be marked Down"
         );
     }
 

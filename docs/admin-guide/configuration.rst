@@ -246,6 +246,7 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Restart
      - Seconds without a heartbeat before a node is marked Down. Unset by
        default; the controller applies a 90-second fallback when absent.
+       Set to ``0`` to disable heartbeat-based down-detection entirely.
    * - ``health_tick_secs``
      - integer
      - ``30``
