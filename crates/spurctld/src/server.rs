@@ -809,8 +809,8 @@ impl ControllerService {
     }
 
     /// Re-send a cancel to a node still holding an allocation the controller no
-    /// longer believes belongs to it there — job finished, job moved to
-    /// another node, or an id older than any this controller issued. Best-effort.
+    /// longer believes belongs to it there — job finished, job held, job moved
+    /// to another node, or an id older than any this controller issued. Best-effort.
     fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
         let stale = stale_reported_jobs(&self.cluster, node, reported);
         if stale.is_empty() {
@@ -1435,10 +1435,12 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
         Some(job) if job.state.is_terminal() => true,
         // A hold is not going to be dispatched. The node still reporting the
         // job is running a process this controller has already released, and
-        // no later launch will cancel it.
+        // no later launch will cancel it. A hold naming an older run keeps the
+        // newer run's reservation, and that launch must be left alone.
         Some(job)
             if job.state == spur_core::job::JobState::Pending
-                && job.pending_reason.is_scheduling_hold() =>
+                && job.pending_reason.is_scheduling_hold()
+                && !job.is_held_on(node) =>
         {
             true
         }
@@ -6949,6 +6951,79 @@ mod tests {
 
         assert_eq!(stale_reported_jobs(&cluster, "n1", &reported), vec![50]);
         assert!(!is_reclaimable(&cluster, "n1", 51));
+    }
+
+    /// A hold naming an older run leaves the newer run's reservation in place,
+    /// so the node being launched on must not be told to release it.
+    #[tokio::test]
+    async fn stale_reported_jobs_spares_a_held_job_still_reserved_on_the_node() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState, PendingReason};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 52,
+            spec: Box::new(JobSpec {
+                name: "relaunching".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+            generation: 0,
+        };
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        apply(&WalOperation::JobStart {
+            job_id: 52,
+            nodes: vec!["n1".into()],
+            resources: res,
+            per_node_alloc: per_node,
+            srun_step_dispatch: false,
+            run_attempt: 2,
+            idle_fill: false,
+            at: None,
+        });
+        apply(&WalOperation::JobPriorityChange {
+            job_id: 52,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::JobHoldMaxRequeue),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: Some(1),
+        });
+        let job = cluster.get_job(52).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.pending_reason.is_scheduling_hold());
+        assert!(
+            job.is_held_on("n1"),
+            "a hold for an older run keeps this reservation"
+        );
+
+        let reported = vec![RunningJobStatus {
+            job_id: 52,
+            ..Default::default()
+        }];
+        assert!(stale_reported_jobs(&cluster, "n1", &reported).is_empty());
     }
 
     /// A node evicted mid-run keeps the job and its devices; the controller
