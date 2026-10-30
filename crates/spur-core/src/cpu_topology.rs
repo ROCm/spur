@@ -50,16 +50,9 @@ impl CpuTopology {
                 .cpus
                 .push(r.cpu);
         }
-        let mut cores: Vec<CoreInfo> = by_core
-            .into_values()
-            .map(|mut core| {
-                core.cpus.sort_unstable();
-                core.cpus.dedup();
-                core
-            })
-            .collect();
-        cores.sort_by_key(|c| (c.socket, c.cpus.first().copied().unwrap_or(u32::MAX)));
-        CpuTopology { cores }
+        CpuTopology {
+            cores: normalize_cores(by_core.into_values().collect()),
+        }
     }
 
     pub fn online_cpus(&self) -> Vec<u32> {
@@ -76,6 +69,17 @@ impl CpuTopology {
     pub fn core_of_cpu(&self, cpu: u32) -> Option<usize> {
         self.cores.iter().position(|c| c.cpus.contains(&cpu))
     }
+}
+
+/// Sort+dedup each core's CPUs, then order cores socket-major, by lowest CPU
+/// ID, as `CoreLayout::compute` requires regardless of input order.
+fn normalize_cores(mut cores: Vec<CoreInfo>) -> Vec<CoreInfo> {
+    for core in &mut cores {
+        core.cpus.sort_unstable();
+        core.cpus.dedup();
+    }
+    cores.sort_by_key(|c| (c.socket, c.cpus.first().copied().unwrap_or(u32::MAX)));
+    cores
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -165,16 +169,17 @@ impl From<&CpuTopology> for spur_proto::proto::CpuTopology {
 
 impl From<spur_proto::proto::CpuTopology> for CpuTopology {
     fn from(t: spur_proto::proto::CpuTopology) -> Self {
+        let cores = t
+            .cores
+            .into_iter()
+            .map(|c| CoreInfo {
+                socket: c.socket,
+                numa_node: c.numa_node,
+                cpus: c.cpus,
+            })
+            .collect();
         CpuTopology {
-            cores: t
-                .cores
-                .into_iter()
-                .map(|c| CoreInfo {
-                    socket: c.socket,
-                    numa_node: c.numa_node,
-                    cpus: c.cpus,
-                })
-                .collect(),
+            cores: normalize_cores(cores),
         }
     }
 }
@@ -244,6 +249,42 @@ mod tests {
         assert_eq!(
             parse_cpu_list("0-4294967295"),
             Err(CpuListError::TooLarge(4_294_967_295))
+        );
+    }
+
+    #[test]
+    fn proto_conversion_normalizes_unsorted_and_undeduped_cpus() {
+        // Agent-reported ordering can't be trusted: socket order reversed,
+        // and one core's CPUs unsorted with a duplicate.
+        let proto = spur_proto::proto::CpuTopology {
+            cores: vec![
+                spur_proto::proto::CoreInfo {
+                    socket: 1,
+                    numa_node: None,
+                    cpus: vec![192, 64],
+                },
+                spur_proto::proto::CoreInfo {
+                    socket: 0,
+                    numa_node: Some(0),
+                    cpus: vec![128, 0, 128],
+                },
+            ],
+        };
+        let topo = CpuTopology::from(proto);
+        assert_eq!(
+            topo.cores,
+            vec![
+                CoreInfo {
+                    socket: 0,
+                    numa_node: Some(0),
+                    cpus: vec![0, 128],
+                },
+                CoreInfo {
+                    socket: 1,
+                    numa_node: None,
+                    cpus: vec![64, 192],
+                },
+            ]
         );
     }
 

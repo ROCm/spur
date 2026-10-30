@@ -199,38 +199,73 @@ fn cores_of_cpus(topology: &CpuTopology, cpus: &[u32]) -> Result<BTreeSet<usize>
         .collect()
 }
 
-/// `[[nodes]]` entries (by `names`, or the sorted selector when `names` is
-/// empty) whose restart-only core settings differ between two configs.
-/// Entries sharing a key on the same side are disambiguated by occurrence
-/// order (`"K"`, `"K#2"`, `"K#3"`, ...) so none are silently dropped.
-pub fn restart_only_node_changes(old: &[NodeConfig], new: &[NodeConfig]) -> Vec<String> {
-    let index = |nodes: &[NodeConfig]| -> BTreeMap<String, NodeCoreSettings> {
-        let mut seen: BTreeMap<String, u32> = BTreeMap::new();
-        nodes
+/// Matching rule of a `[[nodes]]` entry: `names` plus `selector`, the latter
+/// as a sorted map so two entries with the same pairs in a different
+/// `HashMap` iteration order still compare equal.
+type EntryMatcher = (String, BTreeMap<String, String>);
+
+fn entry_matcher(nc: &NodeConfig) -> EntryMatcher {
+    (
+        nc.names.clone(),
+        nc.selector
             .iter()
-            .map(|nc| {
-                let base = entry_key(nc);
-                let count = seen.entry(base.clone()).or_insert(0);
-                *count += 1;
-                let key = if *count == 1 {
-                    base
-                } else {
-                    format!("{base}#{count}")
-                };
-                (key, NodeCoreSettings::from_config(nc))
-            })
-            .collect()
-    };
-    let (old, new) = (index(old), index(new));
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    )
+}
+
+/// `[[nodes]]` entries (by `entry_key`) whose restart-only core settings could
+/// change a node's effective layout. A node's settings come from the FIRST
+/// matching entry (`node_config_matches` in spurctld), so changing a matcher,
+/// reordering entries, or changing settings anywhere up to the last entry
+/// that still sets spec cores/memory can shift which entry wins for some
+/// node — not just a per-entry diff. Entries after that point can't affect
+/// any node's effective settings, so changes there are not reported.
+pub fn restart_only_node_changes(old: &[NodeConfig], new: &[NodeConfig]) -> Vec<String> {
     let unset = NodeCoreSettings {
         daemons_off_spec: true,
         ..Default::default()
     };
-    let keys: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
-    keys.into_iter()
-        .filter(|k| old.get(*k).unwrap_or(&unset) != new.get(*k).unwrap_or(&unset))
-        .cloned()
-        .collect()
+    let keyed = |nodes: &[NodeConfig]| -> Vec<(EntryMatcher, NodeCoreSettings)> {
+        nodes
+            .iter()
+            .map(|nc| (entry_matcher(nc), NodeCoreSettings::from_config(nc)))
+            .collect()
+    };
+    let prefix_len = |entries: &[(EntryMatcher, NodeCoreSettings)]| {
+        entries
+            .iter()
+            .rposition(|(_, s)| *s != unset)
+            .map_or(0, |i| i + 1)
+    };
+
+    let old_entries = keyed(old);
+    let new_entries = keyed(new);
+    let old_prefix = &old_entries[..prefix_len(&old_entries)];
+    let new_prefix = &new_entries[..prefix_len(&new_entries)];
+    if old_prefix == new_prefix {
+        return Vec::new();
+    }
+
+    let mut changed = Vec::new();
+    for i in 0..old_prefix.len().max(new_prefix.len()) {
+        if old_prefix.get(i) == new_prefix.get(i) {
+            continue;
+        }
+        if i < old_prefix.len() {
+            let key = entry_key(&old[i]);
+            if !changed.contains(&key) {
+                changed.push(key);
+            }
+        }
+        if i < new_prefix.len() {
+            let key = entry_key(&new[i]);
+            if !changed.contains(&key) {
+                changed.push(key);
+            }
+        }
+    }
+    changed
 }
 
 fn entry_key(nc: &NodeConfig) -> String {
@@ -363,6 +398,55 @@ mod tests {
     }
 
     #[test]
+    fn non_contiguous_sockets_with_uneven_core_counts_follow_slurm_order() {
+        // Non-SMT: socket 0 has 3 cores (local 0-2), socket 2 has 2 (local 0-1).
+        // Slurm order: highest local index first, highest socket first at each
+        // index, skipping sockets that lack that local index.
+        let topo = CpuTopology {
+            cores: vec![
+                CoreInfo {
+                    socket: 0,
+                    numa_node: None,
+                    cpus: vec![0],
+                },
+                CoreInfo {
+                    socket: 0,
+                    numa_node: None,
+                    cpus: vec![1],
+                },
+                CoreInfo {
+                    socket: 0,
+                    numa_node: None,
+                    cpus: vec![2],
+                },
+                CoreInfo {
+                    socket: 2,
+                    numa_node: None,
+                    cpus: vec![10],
+                },
+                CoreInfo {
+                    socket: 2,
+                    numa_node: None,
+                    cpus: vec![11],
+                },
+            ],
+        };
+        // local 2: only socket 0 has it -> core 2 (cpu 2).
+        // local 1: socket 2 first -> core (cpu 11), then socket 0 -> core (cpu 1).
+        let two = CoreLayout::compute(Some(&topo), &spec_count(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(two.spec_cpus, vec![2, 11]);
+        assert_eq!(two.general_cpus, vec![0, 1, 10]);
+
+        let three = CoreLayout::compute(Some(&topo), &spec_count(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(three.spec_cpus, vec![1, 2, 11]);
+        assert_eq!(three.general_cpus, vec![0, 10]);
+    }
+
+    #[test]
     fn cpu_spec_list_is_widened_to_whole_cores() {
         let one = CoreLayout::compute(Some(&example_node()), &spec_list("127"))
             .unwrap()
@@ -441,8 +525,6 @@ mod tests {
 
     #[test]
     fn fingerprint_matches_the_documented_encoding() {
-        // Golden value: FNV-1a 64 over the canonical encoding (see
-        // `CoreLayout::fingerprint`). Pins cross-build stability.
         let layout = CoreLayout {
             spec_cpus: vec![127, 255],
             mem_spec_mb: 16384,
@@ -549,7 +631,65 @@ mod tests {
         );
         assert_eq!(
             restart_only_node_changes(&old, &second_changed),
-            vec!["a#2".to_string()]
+            vec!["a".to_string()]
         );
+    }
+
+    #[test]
+    fn a_matcher_change_shadowing_a_later_spec_entry_is_reported() {
+        let parse = |s: &str| -> Vec<crate::config::NodeConfig> {
+            #[derive(serde::Deserialize)]
+            struct Nodes {
+                nodes: Vec<crate::config::NodeConfig>,
+            }
+            toml::from_str::<Nodes>(s).unwrap().nodes
+        };
+        let old = parse(
+            "[[nodes]]\nnames = \"n1\"\nweight = 2\n[[nodes]]\nnames = \"ALL\"\ncore_spec_count = 1\n",
+        );
+        // Only the first entry's matcher widens; its settings are unchanged,
+        // so a per-key diff would miss that it now shadows more nodes.
+        let new = parse(
+            "[[nodes]]\nnames = \"n[1-2]\"\nweight = 2\n[[nodes]]\nnames = \"ALL\"\ncore_spec_count = 1\n",
+        );
+        assert!(!restart_only_node_changes(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn reordering_entries_ahead_of_a_spec_entry_is_reported() {
+        let parse = |s: &str| -> Vec<crate::config::NodeConfig> {
+            #[derive(serde::Deserialize)]
+            struct Nodes {
+                nodes: Vec<crate::config::NodeConfig>,
+            }
+            toml::from_str::<Nodes>(s).unwrap().nodes
+        };
+        let old = parse(
+            "[[nodes]]\nnames = \"x\"\nweight = 1\n[[nodes]]\nnames = \"y\"\nweight = 2\n[[nodes]]\nnames = \"ALL\"\ncore_spec_count = 1\n",
+        );
+        // Same entries, swapped order: no per-key difference, but node x and
+        // y can now resolve against each other's old shadowed settings.
+        let new = parse(
+            "[[nodes]]\nnames = \"y\"\nweight = 2\n[[nodes]]\nnames = \"x\"\nweight = 1\n[[nodes]]\nnames = \"ALL\"\ncore_spec_count = 1\n",
+        );
+        assert!(!restart_only_node_changes(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn changes_after_the_last_spec_entry_are_not_reported() {
+        let parse = |s: &str| -> Vec<crate::config::NodeConfig> {
+            #[derive(serde::Deserialize)]
+            struct Nodes {
+                nodes: Vec<crate::config::NodeConfig>,
+            }
+            toml::from_str::<Nodes>(s).unwrap().nodes
+        };
+        let old = parse(
+            "[[nodes]]\nnames = \"ALL\"\ncore_spec_count = 1\n[[nodes]]\nnames = \"tail\"\nweight = 1\n",
+        );
+        let new = parse(
+            "[[nodes]]\nnames = \"ALL\"\ncore_spec_count = 1\n[[nodes]]\nnames = \"tail\"\nweight = 99\n",
+        );
+        assert!(restart_only_node_changes(&old, &new).is_empty());
     }
 }

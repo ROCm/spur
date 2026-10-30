@@ -40,8 +40,9 @@ pub struct ResourceSet {
     /// for a different logical device is caught by a generation mismatch.
     #[serde(default)]
     pub generation: u64,
-    /// Agent-reported CPU topology. Kept only in a node's raw report
-    /// (`detected_resources`); `clamped` drops it, so listings never carry it.
+    /// Agent-reported CPU topology. Belongs in a node's raw report
+    /// (`detected_resources`); `clamped` drops it when deriving schedulable
+    /// resources from that report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<crate::cpu_topology::CpuTopology>,
 }
@@ -224,8 +225,10 @@ impl ResourceSet {
     }
 
     /// Clamp this detected inventory to operator caps. `cpus_cap`/`memory_cap_mb`
-    /// are caps (0 = unset); `reserved_memory_mb` is subtracted from detected memory.
-    /// The smaller of cap and (detected - reserved) wins; GPUs/generic are unaffected.
+    /// are caps (0 = unset); `reserved_memory_mb` is subtracted from detected memory;
+    /// `spec_cpus` (cores set aside for node services) is subtracted from detected
+    /// CPUs before `cpus_cap` is applied. The smaller of cap and (detected - reserved)
+    /// wins; GPUs/generic are unaffected.
     pub fn clamped(
         &self,
         cpus_cap: u32,
