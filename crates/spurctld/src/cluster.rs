@@ -14020,7 +14020,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_accepts_gpu_after_node_reduction() {
-        // C3: -N4 -n1 --gpus=2 is valid once the node count is reduced to one;
+        // -N4 -n1 --gpus=2 is valid once the node count is reduced to one;
         // the pre-normalization guard used to reject it.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -14036,7 +14036,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_warns_when_node_count_reduced() {
-        // I2: a shrunk request returns a user-facing warning; an exact-fit
+        // A shrunk request returns a user-facing warning; an exact-fit
         // request returns none.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -14063,7 +14063,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_rejects_below_partition_min_nodes() {
-        // I1: -N4 -n1 on a MinNodes=4 partition is rejected at submit, not left
+        // -N4 -n1 on a MinNodes=4 partition is rejected at submit, not left
         // pending forever.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -14109,7 +14109,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_pmix_accepts_single_node_after_reduction() {
-        // I5: -N4 -n1 --mpi=pmix reduces to one node and is accepted.
+        // -N4 -n1 --mpi=pmix reduces to one node and is accepted.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -14135,7 +14135,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_keeps_full_node_count_for_total_gpus() {
-        // C2: -N4 --gpus=8 (ntasks defaulted to nodes) keeps all four nodes so
+        // -N4 --gpus=8 (ntasks defaulted to nodes) keeps all four nodes so
         // the eight GPUs spread across them instead of collapsing to one node.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -20289,8 +20289,8 @@ mod tests {
 
     /// A pending bystander with a lower QOS base than the hunter (6000 vs 11000)
     /// but a higher effective priority once fair-share and age are folded in
-    /// (~6000 x 3.0 x age). The bystander wins the
-    /// effective-priority axis but has no claim to the contested capacity.
+    /// (~6000 x 3.0 x age). The bystander wins the effective-priority axis but
+    /// has no claim to the contested capacity.
     fn submit_bystander(cm: &Arc<ClusterManager>, node: &str) -> JobId {
         cm.qos_cache().insert(Qos {
             name: "bystander-qos".into(),
@@ -20353,9 +20353,9 @@ mod tests {
         (victim_id, hunter_id)
     }
 
-    /// A bystander with a lower QOS base but higher effective
-    /// priority (via fair-share) must not outrank the in-flight preemptor for the
-    /// node the preemptor is freeing. The preemptor is hoisted to the front of
+    /// A bystander with a lower QOS base but higher effective priority (via
+    /// fair-share) must not outrank the in-flight preemptor for the node the
+    /// preemptor is freeing. The preemptor is hoisted to the front of
     /// the pending list so backfill reserves that node for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inflight_preemptor_hoists_ahead_of_higher_effective_priority_bystander() {
@@ -20446,8 +20446,8 @@ mod tests {
 
     /// Abandonment: if the preemptor is cancelled mid-drain, the victim's
     /// `preempted_by` has nothing to anchor the hoist to once it finalizes, so
-    /// the freed node returns to the best current pending claimant — the
-    /// deliberate divergence from a QOS-wide hold.
+    /// the freed node returns to the best current pending claimant. The node is
+    /// deliberately not held for the preemptor's QOS as a whole.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_preemption_returns_node_to_best_claimant() {
         let dir = TempDir::new().unwrap();

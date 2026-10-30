@@ -94,7 +94,7 @@ mod tests {
 
     #[test]
     fn t05_7_pending_reason_displayed() {
-        // Initial pending reason is now None (not Priority).
+        // Initial pending reason is None (not Priority).
         // The scheduler sets the actual reason after evaluating the job.
         let job = make_job("test");
         assert_eq!(job.pending_reason.display(), "None");

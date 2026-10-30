@@ -16632,7 +16632,7 @@ mod tests {
             .expect("read failed");
     }
 
-    // G1: the enforced budget — and therefore the cpuset — must cover every task
+    // The enforced budget — and therefore the cpuset — must cover every task
     // the controller placed here, not just one task's `--cpus-per-task`.
     #[tokio::test]
     async fn cpuset_covers_every_task_on_the_node() {

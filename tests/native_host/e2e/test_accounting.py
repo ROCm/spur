@@ -1050,7 +1050,7 @@ class TestSacctmgrUserAssociationLimits:
 
 class TestSacctmgrQosAuthorization:
     """A user submitting an explicit --qos outside their association's
-    pinned default QOS must be rejected (SPUR-101), not silently accepted."""
+    pinned default QOS must be rejected, not silently accepted."""
 
     def test_submission_rejects_qos_outside_association_default(self, accounting_cluster):
         c = accounting_cluster

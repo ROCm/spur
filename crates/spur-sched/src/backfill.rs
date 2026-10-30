@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(assignments.len(), 2);
     }
 
-    // I3: an uneven task split reserves the exact per-node CPU counts (block
+    // An uneven task split reserves the exact per-node CPU counts (block
     // distribution 7 tasks over 2 nodes -> [4,3]), summing to the total instead
     // of over-reserving [4,4] on both nodes.
     #[test]
@@ -1218,7 +1218,7 @@ mod tests {
         assert_eq!(cpus.iter().sum::<u32>(), 7);
     }
 
-    // I3 + C2: an uneven CPU split combined with a job-total GPU request places
+    // An uneven CPU split combined with a job-total GPU request places
     // CPUs [4,3] and GPUs [4,4] on the same two nodes, staying positionally
     // aligned (CPU vector and GPU vector are resolved independently).
     #[test]
@@ -1276,7 +1276,7 @@ mod tests {
         assert!(gpus.iter().all(|&g| g >= 1));
     }
 
-    // C2: -N4 --gpus=8 (one task per node) keeps all four nodes and places the
+    // -N4 --gpus=8 (one task per node) keeps all four nodes and places the
     // 8 GPUs across them (greedy packing), rather than collapsing onto one node.
     #[test]
     fn schedule_total_gpus_spread_across_nodes() {
@@ -1327,7 +1327,7 @@ mod tests {
         );
     }
 
-    // I6: after submit reduces -N4 -n1 to a single node, a 4-node --nodelist is
+    // After submit reduces -N4 -n1 to a single node, a 4-node --nodelist is
     // restrictive (a candidate pool), not additive: the job lands on exactly one
     // of the named nodes. Documents the additive->restrictive shift.
     #[test]
