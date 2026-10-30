@@ -140,6 +140,40 @@ def _submit(cluster, name: str, body: str, *flags: str) -> int:
     return job_id
 
 
+class TestSacctUnstartedMetadata:
+    def test_pending_cancel_retains_submission_without_execution(self, accounting_cluster):
+        c = accounting_cluster
+        account = "pending_accounting"
+        owner = c.nodes[0].user
+        c.sacctmgr(["add", "account", f"name={account}"])
+        c.sacctmgr(["add", "user", f"name={owner}", f"account={account}"])
+        job_id = _submit(
+            c, "pending-metadata", "exit 0", "--hold", f"--account={account}",
+            "--partition=default", "--ntasks=3", "--cpus-per-task=2",
+            "--mem=128", "--time=0:01:30",
+        )
+        submitted = c.scontrol("show", "job", str(job_id))
+        submit_time = re.search(r"SubmitTime=(\S+)", submitted).group(1)
+        c.scancel(job_id)
+        assert _wait_end(c.cli, job_id)["reason"] == "UserCancel"
+
+        row = c.psql(
+            "SELECT name,user_name,account,partition_name,state,num_nodes,num_tasks,"
+            "cpus_per_task,memory_mb,start_time IS NULL,reason,usage_recorded,"
+            "time_limit_secs,to_char(submit_time AT TIME ZONE 'UTC',"
+            "'YYYY-MM-DD\"T\"HH24:MI:SS') "
+            f"FROM jobs WHERE job_id={job_id}"
+        ).strip().split("|")
+        assert row == [
+            "pending-metadata", owner, account, "default", "CANCELLED", "1", "3",
+            "2", "128", "t", "UserCancel", "f", "90", submit_time,
+        ], row
+        assert _sacct_field(c.cli, job_id, "Start", 30) == "Unknown"
+        output = c.sacct(["-j", str(job_id)])
+        assert output.splitlines()[0].split()[-1] == "Reason", output
+        assert output.splitlines()[-1].split()[-1] == "UserCancel", output
+
+
 class TestSacctEndReason:
     """Each way a job fails is recorded with its own reason code."""
 

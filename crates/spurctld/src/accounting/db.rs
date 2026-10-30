@@ -8,7 +8,7 @@ use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, QueryBuilder, Row};
 
 use spur_core::end_reason::EndReason;
-use spur_core::job::JobId;
+use spur_core::job::{effective_gpus, effective_memory_mb, Job, JobId};
 
 /// Apply the database schema, serialized across controllers by a fixed advisory
 /// lock: migrate now also rewrites data (default-account dedup) and builds a
@@ -398,11 +398,53 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct UnstartedJobRecord {
+    pub name: String,
+    pub user: String,
+    pub account: String,
+    pub partition: String,
+    pub qos: String,
+    pub num_nodes: u32,
+    pub num_tasks: u32,
+    pub cpus_per_task: u32,
+    pub total_gpus: u32,
+    pub memory_mb: u64,
+    pub submit_time: DateTime<Utc>,
+    pub reservation: String,
+    pub time_limit_secs: Option<i64>,
+}
+
+impl UnstartedJobRecord {
+    pub fn for_job(job: &Job) -> Option<Self> {
+        if job.start_time.is_some() {
+            return None;
+        }
+        let spec = &job.spec;
+        Some(Self {
+            name: spec.name.clone(),
+            user: spec.user.clone(),
+            account: spec.account.clone().unwrap_or_default(),
+            partition: spec.partition.clone().unwrap_or_default(),
+            qos: spec.qos.clone().unwrap_or_default(),
+            num_nodes: spec.num_nodes,
+            num_tasks: spec.num_tasks,
+            cpus_per_task: spec.cpus_per_task,
+            total_gpus: effective_gpus(spec, spec.num_nodes) as u32,
+            memory_mb: effective_memory_mb(spec, spec.num_nodes),
+            submit_time: job.submit_time,
+            reservation: spec.reservation.clone().unwrap_or_default(),
+            time_limit_secs: spec.time_limit.map(|limit| limit.num_seconds()),
+        })
+    }
+}
+
 /// One finished run, as `record_job_end` writes it. Named fields for the same
 /// reason as `JobStartRecord`.
 #[derive(Debug, Clone)]
 pub struct JobEndRecord {
     pub job_id: JobId,
+    pub unstarted: Option<UnstartedJobRecord>,
     /// Accounting state string; the legacy `RecordJobEnd` RPC maps its own
     /// proto values (including `UNKNOWN`), so this is not a `JobState`.
     pub state: String,
@@ -425,13 +467,19 @@ pub struct JobEndRecord {
 /// Record a job completion in the database. See `record_job_start` for why
 /// this takes a `&mut PgConnection` rather than a `&PgPool`.
 pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyhow::Result<()> {
+    let unstarted = rec.unstarted.as_ref();
     // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
     let row = sqlx::query(
         r#"
         INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code,
                           preempted_by, preempt_mode, preempt_qos, reason, reason_detail,
-                          ended_by, ended_by_uid)
-        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                          ended_by, ended_by_uid, name, account, partition_name, qos,
+                          num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb,
+                          submit_time, reservation, time_limit_secs)
+        VALUES ($1, COALESCE($15, ''), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                COALESCE($14, ''), COALESCE($16, ''), COALESCE($17, ''), COALESCE($18, ''),
+                COALESCE($19, 1), COALESCE($20, 1), COALESCE($21, 1), COALESCE($22, 0),
+                COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
@@ -444,7 +492,24 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
             reason = $10,
             reason_detail = $11,
             ended_by = $12,
-            ended_by_uid = $13
+            ended_by_uid = $13,
+            name = COALESCE($14, jobs.name),
+            user_name = COALESCE($15, jobs.user_name),
+            account = COALESCE($16, jobs.account),
+            partition_name = COALESCE($17, jobs.partition_name),
+            qos = COALESCE($18, jobs.qos),
+            num_nodes = COALESCE($19, jobs.num_nodes),
+            num_tasks = COALESCE($20, jobs.num_tasks),
+            cpus_per_task = COALESCE($21, jobs.cpus_per_task),
+            total_gpus = COALESCE($22, jobs.total_gpus),
+            memory_mb = COALESCE($23, jobs.memory_mb),
+            submit_time = COALESCE($24, jobs.submit_time),
+            reservation = COALESCE($25, jobs.reservation),
+            time_limit_secs = CASE WHEN $14 IS NOT NULL THEN $26 ELSE jobs.time_limit_secs END,
+            start_time = CASE WHEN $14 IS NOT NULL THEN NULL ELSE jobs.start_time END,
+            nodelist = CASE WHEN $14 IS NOT NULL THEN '' ELSE jobs.nodelist END,
+            idle_fill = CASE WHEN $14 IS NOT NULL THEN FALSE ELSE jobs.idle_fill END,
+            usage_recorded = CASE WHEN $14 IS NOT NULL THEN FALSE ELSE jobs.usage_recorded END
         RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
         "#,
     )
@@ -461,6 +526,19 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     .bind(&rec.reason_detail)
     .bind(&rec.ended_by)
     .bind(rec.ended_by_uid.map(i64::from))
+    .bind(unstarted.map(|job| &job.name))
+    .bind(unstarted.map(|job| &job.user))
+    .bind(unstarted.map(|job| &job.account))
+    .bind(unstarted.map(|job| &job.partition))
+    .bind(unstarted.map(|job| &job.qos))
+    .bind(unstarted.map(|job| job.num_nodes as i32))
+    .bind(unstarted.map(|job| job.num_tasks as i32))
+    .bind(unstarted.map(|job| job.cpus_per_task as i32))
+    .bind(unstarted.map(|job| job.total_gpus as i32))
+    .bind(unstarted.map(|job| job.memory_mb as i64))
+    .bind(unstarted.map(|job| job.submit_time))
+    .bind(unstarted.map(|job| &job.reservation))
+    .bind(unstarted.and_then(|job| job.time_limit_secs))
     .fetch_one(&mut *conn)
     .await?;
 
@@ -472,12 +550,9 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
 /// A job row's accounting state, as seen by the reconciliation pass.
 pub struct AccountingRowState {
     pub state: String,
-    /// True when the row is missing metadata that a proper `record_job_start`
-    /// would have populated (e.g. `record_job_end` created a bare row from
-    /// scratch because `record_job_start` never landed, or the row predates
-    /// the `total_gpus` column). A row in this shape needs a
-    /// `record_job_start` backfill even if `state` already matches.
-    pub needs_start_backfill: bool,
+    /// An end-only row needs its submission backfilled even if the state matches.
+    pub missing_metadata: bool,
+    pub has_start_time: bool,
     pub total_gpus: u32,
 }
 
@@ -508,7 +583,8 @@ pub async fn job_accounting_states(
             let total_gpus = r.get::<i32, _>("total_gpus").max(0) as u32;
             let row = AccountingRowState {
                 state: r.get("state"),
-                needs_start_backfill: user_name.is_empty() || start_time.is_none(),
+                missing_metadata: user_name.is_empty(),
+                has_start_time: start_time.is_some(),
                 total_gpus,
             };
             (job_id, row)
@@ -1905,6 +1981,7 @@ mod job_history_tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
+            unstarted: None,
         }
     }
 

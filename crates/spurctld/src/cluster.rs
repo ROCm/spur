@@ -3303,6 +3303,7 @@ impl ClusterManager {
                 .unwrap_or((0, 0, None, None, None));
             notifier.notify_job_end(JobEndRecord {
                 job_id,
+                unstarted: finalized.unstarted.clone(),
                 state: state.display().to_owned(),
                 exit_code: finalized.exit_code,
                 end_time: Utc::now(),
@@ -15620,6 +15621,77 @@ mod tests {
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.end_reason(JobState::Cancelled).0, EndReason::UserCancel);
         assert_eq!(job.cancelled_by.unwrap().user, owner);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unstarted_finalization_captures_submission_metadata() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 6,
+            cpus_per_task: 2,
+            memory_per_node_mb: Some(256),
+            time_limit: Some(chrono::Duration::seconds(90)),
+            ..basic_spec("pending-metadata")
+        };
+        let job_id = submit_and_wait(&cm, spec);
+        let submitted = cm.get_job(job_id).unwrap();
+        let response = cm.apply_operation(&WalOperation::job_cancelled(
+            job_id,
+            CancelProvenance::system(),
+        ));
+        let finalized = &response.jobs_finalized[0];
+        let metadata = finalized.unstarted.as_ref().unwrap();
+        assert_eq!(metadata.name, "pending-metadata");
+        assert_eq!(metadata.user, submitted.spec.user);
+        assert_eq!(metadata.account, submitted.spec.account.unwrap_or_default());
+        assert_eq!(
+            metadata.partition,
+            submitted.spec.partition.unwrap_or_default()
+        );
+        assert_eq!(metadata.submit_time, submitted.submit_time);
+        assert_eq!(
+            (
+                metadata.num_nodes,
+                metadata.num_tasks,
+                metadata.cpus_per_task
+            ),
+            (2, 6, 2)
+        );
+        assert_eq!(metadata.memory_mb, 512);
+        assert_eq!(metadata.time_limit_secs, Some(90));
+        assert_eq!(finalized.reason, EndReason::SystemCancel);
+        assert!(cm.get_job(job_id).unwrap().start_time.is_none());
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id,
+            hold: true,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+        assert_eq!(metadata.name, "pending-metadata");
+        assert_eq!(metadata.submit_time, submitted.submit_time);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_does_not_mark_the_ended_run_unstarted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "requeue-metadata", "worker1");
+        let response = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id,
+            begin_time: Utc::now() + chrono::Duration::minutes(1),
+            preempted_by: None,
+            preempt_qos: None,
+            at: None,
+        });
+        assert!(cm.get_job(job_id).unwrap().start_time.is_none());
+        let finalized = &response.jobs_finalized[0];
+        assert_eq!(finalized.state, JobState::Preempted);
+        assert!(finalized.unstarted.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

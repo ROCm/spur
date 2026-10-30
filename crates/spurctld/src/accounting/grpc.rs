@@ -365,6 +365,7 @@ impl SlurmAccounting for AccountingService {
             &mut tx,
             &db::JobEndRecord {
                 job_id: req.job_id,
+                unstarted: None,
                 state: state_str.to_string(),
                 exit_code: req.exit_code,
                 end_time,

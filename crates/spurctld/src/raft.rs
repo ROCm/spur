@@ -84,6 +84,8 @@ pub struct JobFinalized {
     pub reason_detail: Option<String>,
     #[serde(skip)]
     pub ended_by: Option<CancelProvenance>,
+    #[serde(skip)]
+    pub unstarted: Option<crate::accounting::db::UnstartedJobRecord>,
 }
 
 impl JobFinalized {
@@ -101,6 +103,7 @@ impl JobFinalized {
             reason,
             reason_detail,
             ended_by: job.ended_by(reason).cloned(),
+            unstarted: crate::accounting::db::UnstartedJobRecord::for_job(job),
         }
     }
 
@@ -121,6 +124,8 @@ impl JobFinalized {
             reason,
             reason_detail,
             ended_by: job.ended_by(reason).cloned(),
+            // Requeue may already have cleared the ended run's start time.
+            unstarted: None,
         }
     }
 }
@@ -1353,6 +1358,18 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_finalized_response_has_no_unstarted_metadata() {
+        let finalized: super::JobFinalized =
+            serde_json::from_str(r#"{"job_id":1,"state":"CANCELLED","exit_code":-1}"#).unwrap();
+        assert!(finalized.unstarted.is_none());
+        assert!(!serde_json::to_value(finalized)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("unstarted"));
+    }
+
     use super::*;
     use tempfile::TempDir;
 

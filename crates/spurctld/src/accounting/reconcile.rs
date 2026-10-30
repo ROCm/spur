@@ -75,23 +75,15 @@ pub fn spawn_txn_purge_loop(
     });
 }
 
-/// Only jobs that have actually started accrue an accounting record
-/// (`notify_job_start` fires from `start_job`), so jobs still pending are
-/// not candidates.
 async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     let candidates: Vec<Job> = cluster
         .get_jobs(&JobFilter::default())
         .into_iter()
-        .filter(|j| j.start_time.is_some())
+        .filter(is_accounted_job)
         .collect();
     if candidates.is_empty() {
         return;
     }
-
-    let expected: Vec<(JobId, String)> = candidates
-        .iter()
-        .map(|j| (j.job_id, accounting_state(j).display().to_owned()))
-        .collect();
 
     let job_ids: Vec<JobId> = candidates.iter().map(|j| j.job_id).collect();
     let (accounting_states, unknown): (HashMap<JobId, AccountingRowState>, HashSet<JobId>) =
@@ -111,23 +103,9 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
             }
         };
 
-    let mut stale: Vec<JobId> = jobs_needing_resync(&expected, &accounting_states, &unknown);
-
-    // Also flag in-flight jobs whose DB row has total_gpus=0 but the
-    // in-memory spec has GPUs — covers the upgrade window where the row
-    // predates the total_gpus column.
-    for job in &candidates {
-        if stale.contains(&job.job_id) || unknown.contains(&job.job_id) {
-            continue;
-        }
-        if let Some(row) = accounting_states.get(&job.job_id) {
-            let expected_gpus =
-                spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32;
-            if expected_gpus > 0 && row.total_gpus == 0 {
-                stale.push(job.job_id);
-            }
-        }
-    }
+    let stale: HashSet<JobId> = jobs_needing_resync(&candidates, &accounting_states, &unknown)
+        .into_iter()
+        .collect();
 
     if stale.is_empty() {
         return;
@@ -140,12 +118,22 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     for job in candidates.iter().filter(|j| stale.contains(&j.job_id)) {
         let row = accounting_states.get(&job.job_id);
         let row_missing = row.is_none();
-        let expected_gpus = spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32;
-        let needs_start_backfill = row
-            .map(|r| r.needs_start_backfill || (expected_gpus > 0 && r.total_gpus == 0))
+        let missing_metadata = row
+            .map(|r| needs_metadata_backfill(job, r))
             .unwrap_or(false);
-        resync_job(pool, job, row_missing, needs_start_backfill).await;
+        resync_job(pool, job, row_missing, missing_metadata).await;
     }
+}
+
+fn is_accounted_job(job: &Job) -> bool {
+    job.start_time.is_some() || job.state.is_finalized()
+}
+
+fn needs_metadata_backfill(job: &Job, row: &AccountingRowState) -> bool {
+    let expected_gpus = spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32;
+    row.missing_metadata
+        || (job.start_time.is_some() != row.has_start_time)
+        || (expected_gpus > 0 && row.total_gpus == 0)
 }
 
 /// What accounting should show for a job's current state. Accounting only
@@ -173,46 +161,33 @@ fn accounting_state(job: &Job) -> JobState {
 /// read failed this pass — distinct from a confirmed-absent row, so they're
 /// skipped rather than treated as missing.
 fn jobs_needing_resync(
-    expected: &[(JobId, String)],
+    expected: &[Job],
     accounting: &HashMap<JobId, AccountingRowState>,
     unknown: &HashSet<JobId>,
 ) -> Vec<JobId> {
     expected
         .iter()
-        .filter(|(id, _)| !unknown.contains(id))
-        .filter(|(id, state)| match accounting.get(id) {
+        .filter(|job| !unknown.contains(&job.job_id))
+        .filter(|job| match accounting.get(&job.job_id) {
             None => true,
-            Some(row) => row.needs_start_backfill || &row.state != state,
+            Some(row) => {
+                needs_metadata_backfill(job, row) || row.state != accounting_state(job).display()
+            }
         })
-        .map(|(id, _)| *id)
+        .map(|job| job.job_id)
         .collect()
 }
 
-/// Resync one job's accounting record. `write_start` and `write_end` (when
-/// both are needed) run inside a single transaction so a failure partway
-/// through — including `write_start` itself failing — rolls back cleanly
-/// instead of leaving the row in an intermediate state: `record_job_start`
-/// unconditionally sets `state='RUNNING'` with a wiped end time and exit
-/// code, and previously that reset was committed on its own statement, with
-/// `write_end` relied on to fix it back up immediately after. Any failure
-/// between the two — or a concurrent reader landing in the gap — could
-/// observe or permanently persist a correct finalized record clobbered back
-/// to `RUNNING`. The whole attempt is bounded by `ATTEMPT_TIMEOUT` so a
-/// wedged connection can't stall the reconciliation loop; a timed-out job is
-/// simply retried on the next pass.
-async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, needs_start_backfill: bool) {
-    // record_job_start unconditionally sets state='RUNNING', so only call it
-    // when the row doesn't exist yet, is missing start metadata a proper
-    // record_job_start would have populated (see AccountingRowState), or the
-    // job hasn't reached a finalized state — otherwise it would clobber a
-    // correct finalized state. The finalized case is corrected in the same
-    // transaction by write_end below.
-    let needs_start = row_missing || needs_start_backfill || !job.state.is_finalized();
+/// Keep metadata repair and finalization atomic so a failed end write cannot
+/// leave a finished job appearing to run or charge usage for a partial repair.
+async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, missing_metadata: bool) {
+    // A never-started job must be repaired without inventing an execution start.
+    let needs_start = row_missing || missing_metadata || !job.state.is_finalized();
     let is_finalized = job.state.is_finalized();
 
     let attempt = async {
         let mut tx = pool.begin().await?;
-        if needs_start {
+        if needs_start && job.start_time.is_some() {
             write_start(&mut tx, job).await?;
         }
         if is_finalized {
@@ -243,7 +218,9 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
         .as_ref()
         .map(|r| r.memory_mb)
         .unwrap_or(0);
-    let start_time = job.start_time.unwrap_or(job.submit_time);
+    let start_time = job
+        .start_time
+        .ok_or_else(|| anyhow::anyhow!("job {} has not started", job.job_id))?;
     db::record_job_start(
         conn,
         &db::JobStartRecord {
@@ -280,6 +257,7 @@ async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<(
         conn,
         &db::JobEndRecord {
             job_id: job.job_id,
+            unstarted: db::UnstartedJobRecord::for_job(job),
             state: state.display().to_owned(),
             exit_code: job.exit_code.unwrap_or(0),
             end_time: job.end_time.unwrap_or_else(Utc::now),
@@ -306,7 +284,8 @@ mod tests {
     fn synced_row(state: &str) -> AccountingRowState {
         AccountingRowState {
             state: state.to_string(),
-            needs_start_backfill: false,
+            missing_metadata: false,
+            has_start_time: true,
             total_gpus: 0,
         }
     }
@@ -316,8 +295,48 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_includes_unstarted_terminal_jobs_but_not_pending_jobs() {
+        for state in [JobState::Cancelled, JobState::Deadline, JobState::Failed] {
+            let mut job = test_job(1, state);
+            job.start_time = None;
+            assert!(is_accounted_job(&job));
+        }
+        let mut pending = test_job(1, JobState::Pending);
+        pending.start_time = None;
+        assert!(!is_accounted_job(&pending));
+    }
+
+    #[test]
+    fn an_unstarted_terminal_row_converges_without_a_start_time() {
+        let mut job = test_job(1, JobState::Cancelled);
+        job.start_time = None;
+        let expected = vec![job];
+        let mut row = synced_row("CANCELLED");
+        row.has_start_time = false;
+        row.missing_metadata = true;
+        let mut accounting = HashMap::from([(1, row)]);
+        assert_eq!(
+            jobs_needing_resync(&expected, &accounting, &no_unknown()),
+            vec![1]
+        );
+        accounting.get_mut(&1).unwrap().missing_metadata = false;
+        assert!(jobs_needing_resync(&expected, &accounting, &no_unknown()).is_empty());
+    }
+
+    #[test]
+    fn a_missing_or_stale_start_time_requires_repair() {
+        let mut job = test_job(1, JobState::Cancelled);
+        let mut row = synced_row("CANCELLED");
+        row.has_start_time = false;
+        assert!(needs_metadata_backfill(&job, &row));
+        job.start_time = None;
+        row.has_start_time = true;
+        assert!(needs_metadata_backfill(&job, &row));
+    }
+
+    #[test]
     fn jobs_needing_resync_flags_missing_job() {
-        let expected = vec![(1, "RUNNING".to_string())];
+        let expected = vec![test_job(1, JobState::Running)];
         let accounting = HashMap::new();
 
         let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
@@ -327,7 +346,7 @@ mod tests {
 
     #[test]
     fn jobs_needing_resync_flags_stale_state() {
-        let expected = vec![(1, "COMPLETED".to_string())];
+        let expected = vec![test_job(1, JobState::Completed)];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -338,7 +357,7 @@ mod tests {
 
     #[test]
     fn jobs_needing_resync_ignores_job_in_sync() {
-        let expected = vec![(1, "RUNNING".to_string())];
+        let expected = vec![test_job(1, JobState::Running)];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -350,9 +369,9 @@ mod tests {
     #[test]
     fn jobs_needing_resync_handles_mixed_batch() {
         let expected = vec![
-            (1, "RUNNING".to_string()),
-            (2, "COMPLETED".to_string()),
-            (3, "FAILED".to_string()),
+            test_job(1, JobState::Running),
+            test_job(2, JobState::Completed),
+            test_job(3, JobState::Failed),
         ];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING")); // in sync
@@ -370,13 +389,14 @@ mod tests {
     // must still be flagged, or the gap is permanent.
     #[test]
     fn jobs_needing_resync_flags_bare_row_even_when_state_matches() {
-        let expected = vec![(1, "COMPLETED".to_string())];
+        let expected = vec![test_job(1, JobState::Completed)];
         let mut accounting = HashMap::new();
         accounting.insert(
             1,
             AccountingRowState {
                 state: "COMPLETED".to_string(),
-                needs_start_backfill: true,
+                missing_metadata: true,
+                has_start_time: false,
                 total_gpus: 0,
             },
         );
@@ -392,7 +412,10 @@ mod tests {
     // conflating them can clobber a correct finalized record via write_start.
     #[test]
     fn jobs_needing_resync_skips_jobs_with_unknown_read_status() {
-        let expected = vec![(1, "COMPLETED".to_string()), (2, "RUNNING".to_string())];
+        let expected = vec![
+            test_job(1, JobState::Completed),
+            test_job(2, JobState::Running),
+        ];
         let accounting = HashMap::new();
         let mut unknown = HashSet::new();
         unknown.insert(1);
@@ -467,7 +490,7 @@ mod tests {
     #[test]
     fn jobs_needing_resync_leaves_a_preempted_row_of_a_preempt_cancel_alone() {
         let job = preempt_cancelled(1, JobState::Cancelled);
-        let expected = vec![(1, accounting_state(&job).display().to_owned())];
+        let expected = vec![job];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("PREEMPTED"));
 
@@ -480,12 +503,7 @@ mod tests {
         // pre-fix behavior, since is_terminal() excluded Preempted from ever
         // getting write_end'd) must be flagged for resync so it converges on
         // PREEMPTED rather than being ignored forever.
-        let expected = vec![(
-            1,
-            accounting_state(&test_job(1, JobState::Preempted))
-                .display()
-                .to_owned(),
-        )];
+        let expected = vec![test_job(1, JobState::Preempted)];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -496,12 +514,7 @@ mod tests {
 
     #[test]
     fn jobs_needing_resync_ignores_suspended_job_matching_running_row() {
-        let expected = vec![(
-            1,
-            accounting_state(&test_job(1, JobState::Suspended))
-                .display()
-                .to_owned(),
-        )];
+        let expected = vec![test_job(1, JobState::Suspended)];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -561,6 +574,7 @@ mod tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
+            unstarted: None,
         }
     }
 
@@ -597,11 +611,11 @@ mod tests {
             .await?
             .remove(&job_id)
             .expect("bare row exists");
-        assert!(bare.needs_start_backfill);
+        assert!(bare.missing_metadata);
         assert_eq!(bare.state, "COMPLETED");
 
         // The diff must flag this job even though state already matches.
-        let expected = vec![(job_id, accounting_state(&job).display().to_owned())];
+        let expected = vec![job.clone()];
         let mut accounting = HashMap::new();
         accounting.insert(job_id, bare);
         let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
@@ -687,10 +701,7 @@ mod tests {
             .await?
             .remove(&job_id)
             .expect("row exists");
-        let expected = vec![(
-            job_id,
-            accounting_state(&suspended_job).display().to_owned(),
-        )];
+        let expected = vec![suspended_job];
         let mut accounting = HashMap::new();
         accounting.insert(job_id, row);
 
