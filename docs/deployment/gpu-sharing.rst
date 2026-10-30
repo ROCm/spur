@@ -568,19 +568,24 @@ Validation scope
 ----------------
 
 Single-node SPX testing with eight MI325X virtual-function GPUs, k0s 1.36.2,
-gpu-operator 1.5.1 and DRA driver 1.0.1 covered:
+DRA driver 1.0.1 and a bridge covered:
 
-- Explicit claims and generated claims from ``amd.com/gpu`` requests.
-- AIM inference with unchanged GPU requests, using aim-engine 0.2.6.
-- Concurrent Spur and AIM workloads on different GPUs, in both start orders.
-- Exhaustion, waiting for a free GPU, and allocation release.
+- The GPU in the pod has the PCI address of the GPU that Spur allocated to the
+  bridge job.
+- Spur jobs and bridge pods on different GPUs, in both start orders, and
+  waiting for a free GPU.
+- Preemption, ``scancel`` and ``scontrol requeue`` of a bridge job, and
+  ``scancel`` while ``spurd`` was stopped, with a pod grace period of 60
+  seconds. In each case, the next Spur job got a GPU of the pod only after
+  DRA released the claim.
 
-The device-plugin migration check required removal of stale node status
-fields. It did not establish that switching drivers with live workloads is
-safe. These results cover this configuration, not every supported topology.
+The test pods had the scheduling gate and the claim in their manifest. A
+mutating admission policy that adds them made kube-apiserver 1.36.2 panic.
+These results cover this configuration, not every supported topology.
 
 The following checks remain pending:
 
+- Pods that request ``amd.com/gpu``, and AIM inference, through a bridge.
 - CPX partition identity and allocation on hardware.
 - Multi-node operation and the worker-credential path.
 - A real ArgoCD deployment and migration of an existing chart-owned
