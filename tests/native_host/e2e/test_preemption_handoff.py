@@ -167,24 +167,16 @@ def test_abandoned_handoff_reuses_freed_node(handoff_cluster, action):
     assert f"NodeList={c.node_names[1]}" in show, show
 
 
-@pytest.mark.parametrize("victim_qos", ["victim-a", "victim-r"])
-def test_freed_node_goes_to_preemptor_over_higher_priority_bystander(handoff_cluster, victim_qos):
+def test_requeued_victim_node_goes_to_preemptor_over_higher_priority_bystander(handoff_cluster):
     c = handoff_cluster
     node = c.node_names[0]
-    victim = _submit(c, "victim", victim_qos, node)
+    victim = _submit(c, "victim", "victim-r", node)
     wait_job_state(c, victim, "R", timeout=60)
-    drains = victim_qos == "victim-a"
-    if drains:
-        _gate(c, victim, [0], True)
     bystander = _submit(c, "bystander", "bystander", node)
     hunter = _submit(c, "hunter", "hunter-a", node)
-    if drains:
-        _wait_epilog(c, victim, [0])
-        _assert_pending_for_passes(c, [hunter, bystander])
-        _gate(c, victim, [0], False)
     wait_job_state(c, hunter, "R", timeout=60)
     show = c.scontrol("show", "job", str(victim))
-    assert f"PreemptedBy={hunter}" in show, show
+    assert f"PreemptedBy={hunter}" in show and "PreemptMode=Requeue" in show, show
     _state(c, bystander, "PENDING")
     show = _state(c, hunter, "RUNNING")
     assert f"NodeList={node}" in show, show

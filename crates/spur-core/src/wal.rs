@@ -222,7 +222,7 @@ pub enum WalOperation {
         /// `None` (every pre-upgrade entry) applies to whichever run is current.
         #[serde(default)]
         run_attempt: Option<u32>,
-        /// Reclaim shares this operation but must return capacity to the general pool.
+        /// Pending preemptor the freed nodes are handed to; `None` for reclaim.
         #[serde(default)]
         handoff_to: Option<JobId>,
     },
