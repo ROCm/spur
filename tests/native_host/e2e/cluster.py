@@ -106,6 +106,41 @@ def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_
         controller.exec_allow_fail(f"sudo iptables -D OUTPUT {rule_args}")
 
 
+@contextlib.contextmanager
+def block_heartbeats_from(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
+    """Drop one node's outbound traffic to every controller's client port.
+
+    The node's agent can no longer heartbeat anywhere, while controllers can
+    still reach the agent: the shape of a broken heartbeat path on a live node.
+    Always removes the rule on exit, including when the body raises.
+    """
+    node = cluster.nodes[node_index]
+    rule_args = f"-p tcp --dport {port} -j DROP"
+    node.exec(f"sudo iptables -I OUTPUT {rule_args}")
+    try:
+        yield
+    finally:
+        node.exec_allow_fail(f"sudo iptables -D OUTPUT {rule_args}")
+
+
+@contextlib.contextmanager
+def block_controller_port(cluster: "SpurCluster", node_index: int, port: int = CONTROLLER_PORT):
+    """Drop inbound traffic to one controller's client port from every node.
+
+    Raft and the controller's own calls to agents keep working, so it stays
+    leader and can reach every agent, but no heartbeat reaches it, directly or
+    forwarded by a follower. Always removes the rules on exit.
+    """
+    controller = cluster.nodes[node_index]
+    sources = ",".join(node.host for node in cluster.nodes)
+    rule_args = f"-p tcp --dport {port} -s {sources} -j DROP"
+    controller.exec(f"sudo iptables -I INPUT {rule_args}")
+    try:
+        yield
+    finally:
+        controller.exec_allow_fail(f"sudo iptables -D INPUT {rule_args}")
+
+
 class SshNode:
     """SSH connection to a single test node."""
 
@@ -1719,6 +1754,12 @@ tar -C "$R" -czf '{local_tar}' .
     def signal_controller(self, index: int, sig: str):
         """Send *sig* (e.g. ``STOP``/``CONT``) to the spurctld on nodes[index]."""
         self._pkill(self.nodes[index], f"{self.bin_dir}/spurctld", sig=sig)
+
+    def signal_agent(self, index: int, sig: str):
+        """Send *sig* (e.g. ``KILL``) to the spurd on nodes[index]."""
+        self._pkill(
+            self.nodes[index], f"{self.bin_dir}/spurd", use_sudo=self.agent_as_root, sig=sig
+        )
 
     def _kill_mint(self):
         for node in self.nodes:
