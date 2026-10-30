@@ -8,6 +8,7 @@ buffered RunStep path, and the step it creates must reach a terminal state.
 """
 
 import re
+import shlex
 import threading
 import time
 
@@ -400,6 +401,59 @@ class TestSrunPtyStepSupervision:
         job_info = cluster.scontrol("show", "job", str(job_id))
         assert "JobState=COMPLETED" in job_info, job_info
         assert "JobState=CANCELLED" not in job_info, job_info
+
+    def test_standalone_pty_job_finishes_when_the_client_is_killed(self, cluster):
+        # The client reporting the exit is no longer load-bearing: SIGKILL it
+        # (a closed terminal, `kill -9`) and the controller must still finish
+        # the job from the node's own report when the shell exits, instead of
+        # leaving the allocation stuck in RUNNING.
+        node = cluster.nodes[0]
+        job_name = f"pty-client-killed-{time.time_ns()}"
+        log = f"{cluster.remote_dir}/{job_name}.log"
+        srun = f"{cluster.bin_dir}/srun"
+        env = " ".join(cluster._cli_env_assignments())
+        # Pinned so the session check below looks at the node the shell runs on.
+        # Ignoring SIGHUP keeps the shell alive through the hangup the lost client
+        # causes, so it exits 5 on its own; `script` gives srun a controlling tty
+        # without this backgrounded exec being one.
+        inner = (
+            f"{srun} -N 1 -w {cluster.node_names[0]} -t 0:05 -J {job_name} --pty "
+            "bash -c 'trap \"\" HUP; sleep 15; exit 5'"
+        )
+        node.exec(
+            f"setsid env {env} script -qefc {shlex.quote(inner)} /dev/null "
+            f"> {shlex.quote(log)} 2>&1 & echo started"
+        )
+
+        deadline = time.time() + 30
+        job_id = None
+        while time.time() < deadline:
+            ids = cluster.running_job_ids_by_name(job_name)
+            if ids:
+                job_id = ids[0]
+                break
+            time.sleep(1)
+        assert job_id, "the standalone pty job never reached RUNNING"
+        # RUNNING comes before srun opens the session; killing it in that gap
+        # would leave no shell to exit at all.
+        assert _wait_for_interactive_step_session(cluster, job_id), (
+            "the shell's interactive session never started"
+        )
+
+        # SIGKILL only this test's client, so it can neither report the exit nor
+        # cancel the job; the anchor skips the `script` wrapper around it.
+        node.exec_allow_fail(f"pkill -9 -f {shlex.quote(f'^[^ ]*/srun .*-J {job_name} ')}")
+
+        deadline = time.time() + 60
+        job_info = ""
+        while time.time() < deadline:
+            job_info = cluster.scontrol("show", "job", str(job_id))
+            state = re.search(r"JobState=([A-Z]+)", job_info)
+            if state and state.group(1) not in ("RUNNING", "PENDING", "COMPLETING"):
+                break
+            time.sleep(2)
+        assert "JobState=FAILED" in job_info, job_info
+        assert "ExitCode=5:0" in job_info, job_info
 
     def test_srun_pty_reconnects_after_the_agent_restarts(self, cluster):
         # A dropped mid-session stream (the agent restarting) must be

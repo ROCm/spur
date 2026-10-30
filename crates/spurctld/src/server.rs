@@ -1340,6 +1340,59 @@ impl ControllerService {
         }
         Ok(())
     }
+
+    /// A standalone `srun --pty` job ends when its shell does, without relying
+    /// on a client that may be gone. A rejected report reads as handled, since
+    /// spurd replays an error for its lifetime; a failed write is `Unavailable`,
+    /// so the node keeps the report and replays it.
+    fn finish_standalone_pty_on_report(&self, req: &ReportJobStatusRequest) -> Result<(), Status> {
+        if req.reporting_node.is_empty() || req.step_id != Some(spur_core::step::STEP_INTERACTIVE) {
+            return Ok(());
+        }
+        // Every session in a job shares the interactive step, so an agent too
+        // old to name its session's own step leaves the job to its client.
+        let Some(step_id) = req.pty_step_id else {
+            return Ok(());
+        };
+        if self
+            .verify_node_identity(&req.reporting_node, &req.node_token)
+            .is_err()
+        {
+            warn!(
+                job_id = req.job_id,
+                node = %req.reporting_node,
+                "interactive session report failed node identity; leaving the job to its client"
+            );
+            return Ok(());
+        }
+        let exit = crate::cluster::PtySessionExit {
+            job_id: req.job_id,
+            run_attempt: req.run_attempt,
+            step_id,
+            node: &req.reporting_node,
+            exit_code: req.exit_code,
+            signal: req.signal,
+        };
+        let outcome = self.cluster.finish_standalone_pty(exit).map_err(|e| {
+            warn!(
+                job_id = req.job_id,
+                step_id,
+                error = %e,
+                "failed to record an interactive session's exit; the node will retry"
+            );
+            Status::unavailable(format!(
+                "failed to record the exit of step {}.{step_id}: {e}",
+                req.job_id
+            ))
+        })?;
+        if let crate::cluster::PtyExitOutcome::JobFinished(job) = outcome {
+            let cluster = self.cluster.clone();
+            tokio::spawn(async move {
+                crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job).await;
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Whether a runtime recovery report came from a node that proved its identity.
@@ -1710,7 +1763,7 @@ impl SlurmController for ControllerService {
         let __identity = Self::verified_identity(&request).cloned();
         let mut req = request.into_inner();
         Self::authoritative_user(&mut req.user, __identity.as_ref());
-        let job = self
+        let completion = self
             .cluster
             .finish_srun_job_for(
                 req.job_id,
@@ -1730,9 +1783,6 @@ impl SlurmController for ControllerService {
                         "job {id} does not use native step dispatch"
                     ))
                 }
-                crate::cluster::SrunCompleteError::AlreadyTerminal { job_id, state } => {
-                    Status::failed_precondition(format!("job {job_id} is already {state:?}"))
-                }
                 crate::cluster::SrunCompleteError::NotOwner { job_id, user } => {
                     Status::permission_denied(format!(
                         "user {user} is not permitted to complete job {job_id}"
@@ -1743,10 +1793,15 @@ impl SlurmController for ControllerService {
                 }
             })?;
 
-        let cluster = self.cluster.clone();
-        tokio::spawn(async move {
-            crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job).await;
-        });
+        // Only a fresh completion releases the allocation. An already-terminal
+        // job (the server-side PTY path or an earlier call won the race) is a
+        // no-op, so the client's own CompleteJob stays quiet.
+        if let crate::cluster::SrunCompletion::Finished(job) = completion {
+            let cluster = self.cluster.clone();
+            tokio::spawn(async move {
+                crate::scheduler_loop::release_srun_allocation_on_agents(&cluster, &job).await;
+            });
+        }
 
         Ok(Response::new(()))
     }
@@ -2517,6 +2572,9 @@ impl SlurmController for ControllerService {
             None
         };
 
+        // Surfaced only after the drain below, so a failed write cannot hold it up.
+        let pty_exit = self.finish_standalone_pty_on_report(&req);
+
         if req.drain_node && !req.reporting_node.is_empty() {
             warn!(
                 node = %req.reporting_node,
@@ -2539,6 +2597,8 @@ impl SlurmController for ControllerService {
                 );
             }
         }
+
+        pty_exit?;
 
         use crate::cluster::NodeCompleteResult;
 
@@ -3007,6 +3067,8 @@ impl SlurmController for ControllerService {
             start_time: Some(chrono::Utc::now()),
             end_time: None,
             exit_code: None,
+            pty: req.pty,
+            job_shell: req.job_shell && req.pty && job.is_standalone_pty(),
         };
 
         self.cluster
@@ -7630,6 +7692,199 @@ mod tests {
         assert_eq!(error.code(), Code::PermissionDenied);
     }
 
+    /// A running standalone `srun --pty` job on n1 with its shell's PTY step.
+    /// Returns the job id and the run attempt the node reports under.
+    async fn running_standalone_pty_job(svc: &ControllerService) -> (u32, u32) {
+        use spur_core::resource::ResourceAllocations;
+
+        point_node_at_probe_agent(svc, "n1", 6818).await;
+        let spec = spur_core::job::JobSpec {
+            name: "pty".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            srun_job: true,
+            pty: true,
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> =
+            [("n1".to_string(), res.clone())].into_iter().collect();
+        let run_attempt = svc
+            .cluster
+            .start_job_impl(job_id, vec!["n1".into()], res, per_node, true, false)
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        svc.cluster
+            .create_step(spur_core::step::JobStep {
+                job_id,
+                step_id: 0,
+                name: "bash".into(),
+                state: spur_core::step::StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty: true,
+                job_shell: true,
+            })
+            .unwrap();
+        (job_id, run_attempt)
+    }
+
+    /// n1's report that the job's shell (step 0) exited cleanly.
+    fn shell_exit_report(
+        job_id: u32,
+        run_attempt: u32,
+        node_token: String,
+    ) -> ReportJobStatusRequest {
+        ReportJobStatusRequest {
+            job_id,
+            state: JobState::Completed.to_proto_i32(),
+            reporting_node: "n1".into(),
+            run_attempt,
+            step_id: Some(spur_core::step::STEP_INTERACTIVE),
+            node_token,
+            pty_step_id: Some(0),
+            ..Default::default()
+        }
+    }
+
+    // Under token admission a session-exit report acts only on the reporting
+    // node's own credential; a rejected one must still read as handled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_keyed_token_cluster_acts_on_a_pty_exit_report_only_with_its_nodes_credential() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_token_admission(&dir).await;
+        let (job_id, run_attempt) = running_standalone_pty_job(&svc).await;
+        let report = |node_token: String| shell_exit_report(job_id, run_attempt, node_token);
+
+        let other = spur_core::admission::generate_node_token("n2", svc.jwt_key.as_bytes())
+            .expect("node token");
+        for token in [String::new(), "garbage".to_string(), other] {
+            svc.report_job_status(Request::new(report(token)))
+                .await
+                .expect("a rejected report is not an error, or spurd replays it forever");
+            assert_eq!(
+                svc.cluster.get_job(job_id).map(|j| j.state),
+                Some(JobState::Running),
+                "a report without the node's own credential must not finish the job"
+            );
+        }
+
+        let own = spur_core::admission::generate_node_token("n1", svc.jwt_key.as_bytes())
+            .expect("node token");
+        svc.report_job_status(Request::new(report(own)))
+            .await
+            .expect("report");
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Completed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            svc.cluster.get_job(job_id).map(|j| j.state),
+            Some(JobState::Completed)
+        );
+    }
+
+    // Every session in a job reports under the interactive step, so a report
+    // that cannot say which one exited must not end the job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pty_exit_report_without_its_step_is_left_to_the_client() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (job_id, run_attempt) = running_standalone_pty_job(&svc).await;
+
+        svc.report_job_status(Request::new(ReportJobStatusRequest {
+            pty_step_id: None,
+            ..shell_exit_report(job_id, run_attempt, String::new())
+        }))
+        .await
+        .expect("a legacy agent's report is not an error");
+
+        assert_eq!(
+            svc.cluster.get_job(job_id).map(|j| j.state),
+            Some(JobState::Running)
+        );
+        let shell = svc.cluster.get_step(job_id, 0).expect("shell step");
+        assert!(!shell.state.is_terminal());
+    }
+
+    // spurd keeps a report only while the controller answers with an error, so
+    // a write the controller could not commit must not read as handled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pty_exit_report_whose_write_fails_is_retryable() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (job_id, run_attempt) = running_standalone_pty_job(&svc).await;
+        svc.raft.raft.shutdown().await.expect("stop raft");
+
+        let error = svc
+            .finish_standalone_pty_on_report(&shell_exit_report(job_id, run_attempt, String::new()))
+            .expect_err("the write cannot commit");
+
+        assert_eq!(error.code(), Code::Unavailable);
+        assert!(spur_proto::controller_rpc_retryable(&error));
+        assert_eq!(
+            svc.cluster.get_job(job_id).map(|j| j.state),
+            Some(JobState::Running)
+        );
+    }
+
+    // A step marked as the job's shell ends the job when its session exits, so
+    // the mark only sticks on a standalone `srun --pty` job's PTY step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_marks_the_job_shell_only_on_a_standalone_pty_step() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let other = running_job_owned_by(&svc, "u").await;
+        let (standalone, _) = running_standalone_pty_job(&svc).await;
+
+        for (case, job_id, pty, marked) in [
+            ("a standalone PTY job's PTY step", standalone, true, true),
+            (
+                "a standalone PTY job's non-PTY step",
+                standalone,
+                false,
+                false,
+            ),
+            ("another job's PTY step", other, true, false),
+        ] {
+            let step_id = svc
+                .create_job_step(Request::new(CreateJobStepRequest {
+                    job_id,
+                    command: vec!["bash".into()],
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    overlap: true,
+                    pty,
+                    user: "u".into(),
+                    job_shell: true,
+                    ..Default::default()
+                }))
+                .await
+                .expect("create the step")
+                .into_inner()
+                .step_id;
+            let step = svc.cluster.get_step(job_id, step_id).expect("created step");
+            assert_eq!(step.job_shell, marked, "{case}");
+        }
+    }
+
     // The positive case uses the credential registration actually handed back, so
     // a minter and verifier that disagreed could not both pass.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9714,6 +9969,7 @@ mod tests {
                 container: None,
                 num_nodes: 0,
                 nodelist: String::new(),
+                job_shell: false,
             }))
             .await
             .expect("uid match must authorize step creation despite username mismatch");
@@ -9957,6 +10213,8 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: false,
+                job_shell: false,
             })
             .expect("test setup: seed step");
         svc.cluster
@@ -10209,6 +10467,8 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: false,
+                job_shell: false,
             })
             .expect("test setup: seed step with stale nodes");
 
@@ -10323,6 +10583,8 @@ mod tests {
                 start_time: Some(chrono::Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: false,
+                job_shell: false,
             })
             .expect("test setup: seed step for run_step");
 

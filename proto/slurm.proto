@@ -1609,6 +1609,15 @@ message ReportJobStatusRequest {
   // Step whose supervisor is reporting. Absent from a legacy agent, and from a
   // report that speaks for the whole node rather than one step.
   optional uint32 step_id = 10;
+  // Node identity token, as sent on Heartbeat. The controller verifies it only
+  // when node-identity enforcement is on, and only for the server-side
+  // standalone-PTY completion path; empty from a legacy agent.
+  string node_token = 11;
+  // For an interactive session's report (step_id = the interactive step), the
+  // numbered step its `srun --pty` invocation created. Every invocation in a
+  // job shares the interactive step id, so this names which one exited.
+  // Absent from a legacy agent.
+  optional uint32 pty_step_id = 12;
 }
 
 // ============================================================
@@ -1836,6 +1845,9 @@ message CreateJobStepRequest {
   ContainerSpec container = 11;  // Step's own container request (empty image = none/inherit)
   uint32 num_nodes = 12;       // Explicit step node count (-N); 0 = use all allocated nodes
   string nodelist = 13;        // Exact step node subset (-w); empty = derive from num_nodes/allocation
+  // Set only by a standalone `srun --pty` for its own shell, whose exit then
+  // ends the job. An extra `srun --jobid <id> --pty` session leaves it unset.
+  bool job_shell = 14;
 }
 
 message CreateJobStepResponse {

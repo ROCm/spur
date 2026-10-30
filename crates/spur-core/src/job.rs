@@ -1209,6 +1209,12 @@ impl Job {
         self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
     }
 
+    /// A standalone `srun --pty` allocation, whose shell is its workload. A salloc
+    /// parent (interactive) or a batch parent keeps its own lifecycle instead.
+    pub fn is_standalone_pty(&self) -> bool {
+        self.spec.srun_job && self.spec.pty && !self.spec.interactive && self.srun_step_dispatch
+    }
+
     /// Whether a placement is already charged. `reserve_placement` charges while still
     /// `Pending`, before dispatch, so "yes" here means a second placement would double-charge.
     pub fn holds_a_placement(&self) -> bool {

@@ -308,6 +308,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 node,
                 &user,
                 container_spec_from_srun_args(&args),
+                PtySession::Extra,
             )
             .await?;
             std::process::exit(exit_code);
@@ -901,6 +902,7 @@ async fn dispatch_step(
             container: container_spec_from_srun_args(args),
             num_nodes: params.explicit_num_nodes.unwrap_or(0),
             nodelist: params.requested_nodelist.unwrap_or_default().to_string(),
+            job_shell: false,
         })
         .await
         .context("failed to create job step")?
@@ -1034,37 +1036,40 @@ async fn run_step_with_retry(
     )
 }
 
+/// Bounds the client's terminal RPCs so a stuck controller cannot hang the
+/// user's shell. Giving up does not strand a standalone PTY job: the controller
+/// finishes it when its shell exits. Any other allocation is left to
+/// InactiveLimit, when that is enabled.
+const TERMINAL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn release_srun_allocation(
     client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     user: &str,
     exit_code: i32,
 ) {
-    if let Err(e) = client
-        .complete_job(CompleteJobRequest {
-            job_id,
-            exit_code,
-            user: user.to_string(),
-        })
-        .await
-    {
-        eprintln!(
-            "srun: warning: failed to release allocation for job {}: {}",
-            job_id, e
-        );
-        if let Err(ce) = client
-            .cancel_job(CancelJobRequest {
-                job_id,
-                signal: 2,
-                user: user.to_string(),
-            })
-            .await
-        {
-            eprintln!(
-                "srun: warning: failed to cancel job {} after CompleteJob failure: {}",
-                job_id, ce
-            );
-        }
+    let complete = client.complete_job(CompleteJobRequest {
+        job_id,
+        exit_code,
+        user: user.to_string(),
+    });
+    let complete_err = match tokio::time::timeout(TERMINAL_RPC_TIMEOUT, complete).await {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => "timed out".to_string(),
+    };
+    eprintln!("srun: warning: failed to release allocation for job {job_id}: {complete_err}");
+    let cancel = client.cancel_job(CancelJobRequest {
+        job_id,
+        signal: 2,
+        user: user.to_string(),
+    });
+    match tokio::time::timeout(TERMINAL_RPC_TIMEOUT, cancel).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(ce)) => eprintln!(
+            "srun: warning: failed to cancel job {job_id} after CompleteJob failure: {ce}"
+        ),
+        Err(_) => eprintln!("srun: warning: timed out cancelling job {job_id}"),
     }
 }
 
@@ -1079,13 +1084,12 @@ async fn conclude_pty_session(
     match result {
         Ok(exit_code) => release_srun_allocation(client, job_id, owner, *exit_code).await,
         Err(_) => {
-            let _ = client
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 0,
-                    user: owner.to_string(),
-                })
-                .await;
+            let cancel = client.cancel_job(CancelJobRequest {
+                job_id,
+                signal: 0,
+                user: owner.to_string(),
+            });
+            let _ = tokio::time::timeout(TERMINAL_RPC_TIMEOUT, cancel).await;
         }
     }
 }
@@ -1163,6 +1167,7 @@ async fn run_standalone_srun(
             String::new(),
             &owner,
             container_spec_from_srun_args(args),
+            PtySession::JobShell,
         )
         .await;
         conclude_pty_session(&mut client, job_id, &owner, &result).await;
@@ -1700,6 +1705,15 @@ fn reconnect_setup_timeout() -> std::time::Duration {
     RECONNECT_SETUP_TIMEOUT
 }
 
+/// What a PTY session is to its job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtySession {
+    /// A standalone `srun --pty`'s own shell: its exit ends the job.
+    JobShell,
+    /// An extra session in a job that runs on without it.
+    Extra,
+}
+
 async fn run_interactive_pty(
     ctrl: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
@@ -1707,6 +1721,7 @@ async fn run_interactive_pty(
     node: String,
     user: &str,
     container: Option<ContainerSpec>,
+    session: PtySession,
 ) -> Result<i32> {
     let winsize = crate::interactive::get_terminal_size();
 
@@ -1744,6 +1759,7 @@ async fn run_interactive_pty(
                         container: container.clone(),
                         num_nodes: 0,
                         nodelist: String::new(),
+                        job_shell: session == PtySession::JobShell,
                     })
                     .await
                 {
@@ -2009,6 +2025,7 @@ async fn run_as_step(
             node,
             &user,
             container_spec_from_srun_args(args),
+            PtySession::Extra,
         )
         .await;
         // Runs before `?` so a failed session still pairs the prolog. Not
@@ -3276,6 +3293,7 @@ mod tests {
             String::new(),
             "tester",
             None,
+            PtySession::Extra,
         )
         .await
         .expect_err("mock returns no node address, so the session cannot open");
@@ -3305,6 +3323,7 @@ mod tests {
             String::new(),
             "tester",
             None,
+            PtySession::Extra,
         )
         .await
         .expect_err("CreateJobStep was rejected");
@@ -3313,6 +3332,32 @@ mod tests {
             capture.complete_step_calls().is_empty(),
             "no step exists, so nothing may be reported complete"
         );
+    }
+
+    // An extra session marked as the job's shell would end the job, and kill the
+    // real shell, when it exits.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn only_the_job_shell_marks_its_step_as_the_job_shell() {
+        let _env = EnvGuard::new();
+        for (session, marked) in [(PtySession::JobShell, true), (PtySession::Extra, false)] {
+            let (addr, capture) = crate::mock_controller::spawn().await;
+            let mut client = crate::mock_controller::client(addr).await;
+
+            run_interactive_pty(
+                &mut client,
+                1,
+                vec!["bash".into()],
+                String::new(),
+                "tester",
+                None,
+                session,
+            )
+            .await
+            .expect_err("mock returns no node address, so the session cannot open");
+
+            assert_eq!(capture.create_step_job_shell(), marked, "{session:?}");
+        }
     }
 
     /// Job-level counterpart to `run_interactive_pty`'s step completion — the
@@ -3422,6 +3467,7 @@ mod tests {
             String::new(),
             "tester",
             None,
+            PtySession::Extra,
         )
         .await
         .expect("the dropped stream must be retried, not reported as a failure");
@@ -3465,6 +3511,7 @@ mod tests {
             String::new(),
             "tester",
             None,
+            PtySession::Extra,
         )
         .await
         .expect_err("a permanently dead stream must give up, not retry forever");
@@ -3505,6 +3552,7 @@ mod tests {
             String::new(),
             "tester",
             None,
+            PtySession::Extra,
         )
         .await
         .expect("the second attempt must succeed after the first times out");
@@ -3541,6 +3589,7 @@ mod tests {
             String::new(),
             "tester",
             None,
+            PtySession::Extra,
         )
         .await
         .expect("the second attempt must succeed after the first reports already_exists");
