@@ -152,9 +152,19 @@ pub enum CapacityChange {
 #[derive(Debug, Clone)]
 pub struct NodeAllocation {
     pub node_name: String,
-    /// Total CPUs on this node.
+    /// Total CPUs on this node (same as `cpu_ids.len()`).
     pub total_cpus: u32,
-    /// Bitmap of allocated CPUs (bit N = core N).
+    /// The node's real, online CPU IDs this ledger indexes, sorted ascending.
+    /// From `resources.topology` when present (so a non-contiguous online set,
+    /// e.g. `0-63,128-191`, is indexed by its actual IDs); falls back to a
+    /// synthetic `0..resources.cpus` when there is no topology (an old agent
+    /// build), which is today's behavior. Position `i` here is
+    /// `allocated_cpus[i]`'s subject.
+    cpu_ids: Vec<u32>,
+    /// Real CPU ID → its position in `cpu_ids`, for O(1) lookups.
+    cpu_index: HashMap<u32, usize>,
+    /// Bitmap of allocated CPUs, aligned with `cpu_ids` by position (not by
+    /// raw CPU ID — see `cpu_ids`).
     pub allocated_cpus: Vec<bool>,
     /// Total memory in MB.
     pub total_memory_mb: u64,
@@ -173,13 +183,35 @@ pub struct NodeAllocation {
     launching: HashMap<u32, Instant>,
 }
 
+/// The node's real, online CPU IDs this ledger should index, sorted ascending.
+/// `resources.topology` carries the agent's reported topology (present once
+/// SPUR-386's topology-discovery lands); with none, falls back to a synthetic
+/// `0..resources.cpus`, i.e. today's behavior — offline IDs are never part of
+/// either set, so they are never handed out.
+fn online_cpu_ids(resources: &ResourceSet) -> Vec<u32> {
+    resources
+        .topology
+        .as_ref()
+        .map(|t| t.online_cpus())
+        .unwrap_or_else(|| (0..resources.cpus).collect())
+}
+
+/// Real CPU ID → its position in `cpu_ids`.
+fn index_cpu_ids(cpu_ids: &[u32]) -> HashMap<u32, usize> {
+    cpu_ids.iter().enumerate().map(|(i, &c)| (c, i)).collect()
+}
+
 impl NodeAllocation {
     pub fn new(name: String, resources: &ResourceSet) -> Self {
         let num_gpus = resources.gpus.len();
+        let cpu_ids = online_cpu_ids(resources);
+        let cpu_index = index_cpu_ids(&cpu_ids);
         Self {
             node_name: name,
-            total_cpus: resources.cpus,
-            allocated_cpus: vec![false; resources.cpus as usize],
+            total_cpus: cpu_ids.len() as u32,
+            allocated_cpus: vec![false; cpu_ids.len()],
+            cpu_ids,
+            cpu_index,
             total_memory_mb: resources.memory_mb,
             allocated_memory_mb: 0,
             gpu_allocated: vec![false; num_gpus],
@@ -189,12 +221,28 @@ impl NodeAllocation {
         }
     }
 
+    /// Mark specific real CPU IDs as permanently unavailable (spec cores): never
+    /// handed to a job, and excluded from `free_cpus`. A no-op for an ID this
+    /// ledger does not index (offline, or not part of the current topology).
+    /// Idempotent. Not persisted across `update_capacity` — a caller that
+    /// derives spec CPUs from a `CoreLayout` must re-apply this after every
+    /// `update_capacity` call, the same way GPU ownership is re-derived there.
+    pub fn mark_cpus_unavailable(&mut self, cpu_ids: &[u32]) {
+        for &cpu in cpu_ids {
+            if let Some(&pos) = self.cpu_index.get(&cpu) {
+                self.allocated_cpus[pos] = true;
+            }
+        }
+    }
+
     /// Apply a freshly-discovered inventory to this node's live allocation.
     /// Rebuilds capacity when every live-held GPU is still present; otherwise
     /// reports the lost devices and leaves capacity untouched so the caller
     /// can drive policy (drain/fail) before anything is mutated.
     pub fn update_capacity(&mut self, fresh: &ResourceSet) -> CapacityChange {
         let fresh_ids: HashSet<u64> = fresh.gpus.iter().map(|g| g.stable_id).collect();
+        let fresh_cpu_ids = online_cpu_ids(fresh);
+        let fresh_cpu_index = index_cpu_ids(&fresh_cpu_ids);
 
         // Which live-owned stable ids are gone in the fresh set?
         let mut lost: Vec<(u32, Vec<u64>)> = self
@@ -211,11 +259,16 @@ impl NodeAllocation {
                 (!gone.is_empty()).then_some((*job, gone))
             })
             .collect();
-        // A held core above the new cpu count would be truncated by the resize,
-        // freeing a bit its owner still holds. Defer like the GPU case; entries
-        // carry an empty device list since the loss is a CPU id, not a stable_id.
+        // A held core no longer in the fresh online set would silently free the
+        // bit its owner still holds. Defer like the GPU case; entries carry an
+        // empty device list since the loss is a CPU id, not a stable_id.
         for (job, owned) in &self.owners {
-            if owned.result.cpu_ids.iter().any(|&c| c >= fresh.cpus) {
+            if owned
+                .result
+                .cpu_ids
+                .iter()
+                .any(|c| !fresh_cpu_index.contains_key(c))
+            {
                 lost.push((*job, Vec::new()));
             }
         }
@@ -225,13 +278,22 @@ impl NodeAllocation {
         }
 
         // Safe to rebuild: no held device disappeared. Preserve allocation
-        // bitmaps by re-deriving them from owners against the new gpu table.
-        self.total_cpus = fresh.cpus;
-        self.allocated_cpus.resize(fresh.cpus as usize, false);
+        // bitmaps by re-deriving them from owners against the new cpu/gpu
+        // tables — positions can shift between topology snapshots, so this
+        // rebuilds by real ID rather than assuming an index is stable.
+        self.total_cpus = fresh_cpu_ids.len() as u32;
+        self.allocated_cpus = vec![false; fresh_cpu_ids.len()];
+        self.cpu_ids = fresh_cpu_ids;
+        self.cpu_index = fresh_cpu_index;
         self.total_memory_mb = fresh.memory_mb;
         self.gpus = fresh.gpus.clone();
         self.gpu_allocated = vec![false; self.gpus.len()];
         for owned in self.owners.values() {
+            for &cpu in &owned.result.cpu_ids {
+                if let Some(&pos) = self.cpu_index.get(&cpu) {
+                    self.allocated_cpus[pos] = true;
+                }
+            }
             for &sid in &owned.result.gpu_ids {
                 if let Some(idx) = self.gpus.iter().position(|g| g.stable_id == sid) {
                     self.gpu_allocated[idx] = true;
@@ -311,8 +373,8 @@ impl NodeAllocation {
     /// `allocate_for_job` records them.
     fn release(&mut self, alloc: &AllocationResult) {
         for &cpu in &alloc.cpu_ids {
-            if let Some(a) = self.allocated_cpus.get_mut(cpu as usize) {
-                *a = false;
+            if let Some(&pos) = self.cpu_index.get(&cpu) {
+                self.allocated_cpus[pos] = false;
             }
         }
         self.allocated_memory_mb = self.allocated_memory_mb.saturating_sub(alloc.memory_mb);
@@ -370,7 +432,7 @@ impl NodeAllocation {
         for (i, allocated) in self.allocated_cpus.iter_mut().enumerate() {
             if !*allocated && cpu_ids.len() < cpus as usize {
                 *allocated = true;
-                cpu_ids.push(i as u32);
+                cpu_ids.push(self.cpu_ids[i]);
             }
         }
 
@@ -398,8 +460,9 @@ impl NodeAllocation {
     /// On this node, and either free or already this job's. Narrowing and the
     /// replay check share it so the two can never disagree about one core.
     fn cpu_is_claimable(&self, held: &[u32], cpu: u32) -> bool {
-        self.allocated_cpus
-            .get(cpu as usize)
+        self.cpu_index
+            .get(&cpu)
+            .and_then(|&pos| self.allocated_cpus.get(pos))
             .is_some_and(|&taken| !taken || held.contains(&cpu))
     }
 
@@ -459,7 +522,9 @@ impl NodeAllocation {
         self.release_job(job_id);
 
         for &cpu in cpu_ids {
-            self.allocated_cpus[cpu as usize] = true;
+            if let Some(&pos) = self.cpu_index.get(&cpu) {
+                self.allocated_cpus[pos] = true;
+            }
         }
         self.allocated_memory_mb += memory_mb;
         for &idx in &gpu_indices {
@@ -611,10 +676,36 @@ impl AllocationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spur_core::cpu_topology::{CpuRecord, CpuTopology};
     use spur_core::resource::GpuLinkType;
 
     fn make_node(cpus: u32, mem: u64, num_gpus: usize, gpu_type: &str) -> NodeAllocation {
         make_node_with_ids(cpus, mem, (0..num_gpus as u32).collect(), gpu_type)
+    }
+
+    /// A node whose online CPUs are exactly `online_ids` (e.g. non-contiguous,
+    /// `0-3,8-11`), one CPU per physical core, single socket, no NUMA.
+    fn make_node_with_topology(online_ids: &[u32], mem: u64) -> NodeAllocation {
+        let topology = CpuTopology::from_cpus(
+            &online_ids
+                .iter()
+                .enumerate()
+                .map(|(core_id, &cpu)| CpuRecord {
+                    cpu,
+                    socket: 0,
+                    core_id: core_id as u32,
+                    numa_node: None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let resources = ResourceSet {
+            cpus: online_ids.len() as u32,
+            memory_mb: mem,
+            gpus: vec![],
+            topology: Some(topology),
+            ..Default::default()
+        };
+        NodeAllocation::new("node001".into(), &resources)
     }
 
     fn make_node_with_ids(
@@ -1334,5 +1425,123 @@ mod tests {
         // release by the same stable id frees it
         assert!(node.release_job(7));
         assert_eq!(node.free_gpus(None), 3);
+    }
+
+    #[test]
+    fn ledger_indexes_a_non_contiguous_online_set_by_real_cpu_id() {
+        // Design review (SPUR-369 core/mem reservation): the ledger must be
+        // indexed by real CPU IDs, not a synthetic 0..n — a node whose online
+        // CPUs are 0-3,8-11 (a gap at 4-7, e.g. a partially-populated socket)
+        // must never hand out 4-7, and must hand out real ids from 0-3,8-11.
+        let online: Vec<u32> = vec![0, 1, 2, 3, 8, 9, 10, 11];
+        let mut node = make_node_with_topology(&online, 64_000);
+        assert_eq!(node.free_cpus(), 8);
+
+        let alloc = node.allocate_for_job(1, 1, 8, 8_000, &[]).unwrap();
+        let mut got = alloc.cpu_ids.clone();
+        got.sort_unstable();
+        assert_eq!(got, online, "every online id handed out, none from the gap");
+    }
+
+    #[test]
+    fn offline_cpu_ids_are_never_handed_out_even_when_requested_fewer_than_total() {
+        let online: Vec<u32> = vec![0, 1, 2, 3, 8, 9, 10, 11];
+        let mut node = make_node_with_topology(&online, 64_000);
+
+        let alloc = node.allocate_for_job(1, 1, 4, 8_000, &[]).unwrap();
+        assert_eq!(alloc.cpu_ids.len(), 4);
+        for id in &alloc.cpu_ids {
+            assert!(online.contains(id), "handed out {id}, which is not online");
+        }
+    }
+
+    #[test]
+    fn restore_for_job_rejects_an_id_outside_the_reported_topology() {
+        let online: Vec<u32> = vec![0, 1, 2, 3];
+        let mut node = make_node_with_topology(&online, 64_000);
+
+        // CPU 4 is offline (not part of the reported topology): a replayed
+        // descriptor naming it must be rejected, the same as a core the node
+        // no longer has in the no-topology (synthetic 0..n) path.
+        assert_eq!(
+            node.restore_for_job(1, 1, &[2, 4], 8_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(node.free_cpus(), 4, "rejected replay changed the ledger");
+    }
+
+    #[test]
+    fn mark_cpus_unavailable_permanently_excludes_spec_cores() {
+        let online: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let mut node = make_node_with_topology(&online, 64_000);
+
+        // Spec cores 6 and 7 (e.g. core_spec_count's pick) are never handed to
+        // any job, and never counted free, regardless of any job's lifecycle.
+        node.mark_cpus_unavailable(&[6, 7]);
+        assert_eq!(node.free_cpus(), 6);
+
+        let alloc = node.allocate_for_job(1, 1, 6, 8_000, &[]).unwrap();
+        let mut got = alloc.cpu_ids.clone();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![0, 1, 2, 3, 4, 5],
+            "spec cores 6,7 never handed out"
+        );
+
+        assert!(node.release_job(1));
+        assert_eq!(
+            node.free_cpus(),
+            6,
+            "releasing a job must not resurrect a spec core"
+        );
+
+        // An unknown/offline id is a no-op, not a panic.
+        node.mark_cpus_unavailable(&[99]);
+        assert_eq!(node.free_cpus(), 6);
+    }
+
+    #[test]
+    fn update_capacity_rebuilds_the_real_id_set_and_preserves_held_cores() {
+        // Topology changes between snapshots (e.g. a CPU flips offline and a
+        // different one comes online) must not corrupt a held job's cpuset by
+        // reusing stale positions — ownership is tracked by real CPU id.
+        let mut node = make_node_with_topology(&[0, 1, 2, 3], 64_000);
+        let alloc = node.allocate_for_job(1, 1, 2, 8_000, &[]).unwrap();
+        let held: Vec<u32> = alloc.cpu_ids.clone();
+
+        let grown = ResourceSet {
+            cpus: 6,
+            memory_mb: 64_000,
+            gpus: vec![],
+            topology: Some(CpuTopology::from_cpus(
+                &[0, 1, 2, 3, 4, 5]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &cpu)| CpuRecord {
+                        cpu,
+                        socket: 0,
+                        core_id: i as u32,
+                        numa_node: None,
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            ..Default::default()
+        };
+        let change = node.update_capacity(&grown);
+        assert!(matches!(change, CapacityChange::Applied));
+        assert_eq!(node.free_cpus(), 4, "6 total - 2 still held");
+        for id in &held {
+            assert_eq!(
+                node.claimable_cpu_ids(1, std::slice::from_ref(id)),
+                vec![*id],
+                "job 1's held id {id} must still read as its own"
+            );
+            assert!(
+                node.claimable_cpu_ids(2, std::slice::from_ref(id))
+                    .is_empty(),
+                "held id {id} must not read as free for a different job"
+            );
+        }
     }
 }
