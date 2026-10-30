@@ -1184,16 +1184,38 @@ impl ClusterManager {
             .controller
             .heartbeat_timeout_secs
             .unwrap_or(90);
+        let charged = self.charged_gpus();
+        let none = HashSet::new();
         let holds = self.gpu_holds.read();
         let now = Utc::now();
         nodes
             .iter()
             .filter(|n| n.shares_gpus())
             .map(|n| {
-                let ids = held_gpu_ids(n, holds.get(&n.name), now, timeout);
+                let report = holds.get(&n.name);
+                let charged = charged.get(&n.name).unwrap_or(&none);
+                let ids = held_gpu_ids(n, report, charged, now, timeout);
                 (n.name.clone(), ids)
             })
             .collect()
+    }
+
+    /// `(job, GPU)` pairs per node, for every GPU a running job still holds.
+    fn charged_gpus(&self) -> HashMap<String, HashSet<(JobId, u64)>> {
+        let jobs = self.jobs.read();
+        let mut charged: HashMap<String, HashSet<(JobId, u64)>> = HashMap::new();
+        let running = jobs.values().filter(|job| job.state.is_active());
+        for job in running {
+            for (node, alloc) in &job.per_node_alloc {
+                let gpus = alloc.device_ids("gpu");
+                if gpus.is_empty() || !job.is_held_on(node) {
+                    continue;
+                }
+                let pairs = gpus.into_iter().map(|gpu| (job.job_id, gpu));
+                charged.entry(node.clone()).or_default().extend(pairs);
+            }
+        }
+        charged
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -10209,9 +10231,14 @@ pub enum MarkDownPolicy {
 /// or held by a Spur job. With no fresh report for the current inventory, or a
 /// node that cannot share yet, every GPU is held, so Spur never places on a GPU
 /// that Kubernetes may already have given to a pod.
+///
+/// A pod GPU whose owner job still holds that GPU's allocation counts as that
+/// allocation, so preemption can free it. After the job ends, the GPU stays held
+/// until the claim goes: that fences the next job from the stopping pod.
 fn held_gpu_ids(
     node: &Node,
     report: Option<&(GpuHoldReport, DateTime<Utc>)>,
+    charged: &HashSet<(JobId, u64)>,
     now: DateTime<Utc>,
     timeout_secs: u64,
 ) -> Vec<u64> {
@@ -10224,11 +10251,10 @@ fn held_gpu_ids(
         .map(|(r, _)| {
             r.gpus
                 .iter()
-                .filter(|g| {
-                    matches!(
-                        GpuHoldState::try_from(g.state),
-                        Ok(GpuHoldState::GpuHoldFree | GpuHoldState::GpuHoldSpurJob)
-                    )
+                .filter(|g| match GpuHoldState::try_from(g.state) {
+                    Ok(GpuHoldState::GpuHoldFree | GpuHoldState::GpuHoldSpurJob) => true,
+                    Ok(GpuHoldState::GpuHoldK8s) => charged.contains(&(g.job_id, g.stable_id)),
+                    _ => false,
                 })
                 .map(|g| g.stable_id)
                 .collect()
@@ -27119,8 +27145,12 @@ mod tests {
 
     #[test]
     fn a_fresh_report_holds_the_gpus_kubernetes_owns() {
-        let node = shared_gpu_node(5);
+        let node = shared_gpu_node(7);
         let now = Utc::now();
+        let pod_of_job = |stable_id, job_id| spur_proto::proto::GpuHold {
+            job_id,
+            ..gpu_hold(stable_id, GpuHoldState::GpuHoldK8s)
+        };
         let report = hold_report(
             7,
             vec![
@@ -27129,12 +27159,19 @@ mod tests {
                 gpu_hold(2, GpuHoldState::GpuHoldK8s),
                 gpu_hold(3, GpuHoldState::GpuHoldConflict),
                 gpu_hold(4, GpuHoldState::GpuHoldUnshareable),
+                pod_of_job(5, 12),
+                pod_of_job(6, 13),
             ],
         );
+        let charged = HashSet::from([(12, 5), (13, 5)]);
 
-        let held = held_gpu_ids(&node, Some(&(report, now)), now, 90);
+        let held = held_gpu_ids(&node, Some(&(report, now)), &charged, now, 90);
 
-        assert_eq!(held, vec![2, 3, 4]);
+        assert_eq!(
+            held,
+            vec![2, 3, 4, 6],
+            "job 13 holds no allocation on GPU 6"
+        );
     }
 
     #[test]
@@ -27143,7 +27180,10 @@ mod tests {
         let now = Utc::now();
         let report = hold_report(7, vec![gpu_hold(0, GpuHoldState::GpuHoldFree)]);
 
-        assert_eq!(held_gpu_ids(&node, Some(&(report, now)), now, 90), vec![1]);
+        assert_eq!(
+            held_gpu_ids(&node, Some(&(report, now)), &HashSet::new(), now, 90),
+            vec![1]
+        );
     }
 
     #[test]
@@ -27163,10 +27203,13 @@ mod tests {
         unshareable.unshareable_reason = "no ResourceSlice from gpu.amd.com".into();
 
         for report in [None, Some(&stale), Some(&other_generation)] {
-            assert_eq!(held_gpu_ids(&node, report, now, 90), vec![0, 1]);
+            assert_eq!(
+                held_gpu_ids(&node, report, &HashSet::new(), now, 90),
+                vec![0, 1]
+            );
         }
         assert_eq!(
-            held_gpu_ids(&node, Some(&(unshareable, now)), now, 90),
+            held_gpu_ids(&node, Some(&(unshareable, now)), &HashSet::new(), now, 90),
             vec![0, 1]
         );
     }
@@ -27188,6 +27231,61 @@ mod tests {
         wait_for("gpu sharing set", || {
             cm.get_node("n1").is_some_and(|n| n.shares_gpus())
         });
+    }
+
+    fn gpu_job_spec(name: &str, gpus: u64) -> JobSpec {
+        let mut spec = basic_spec(name);
+        spec.gres = vec![format!("gpu:{gpus}")];
+        spec
+    }
+
+    fn start_with_gpus(cm: &ClusterManager, job_id: JobId, node: &str, gpus: &[u64]) {
+        let mut res = scalar_alloc(1, 1000);
+        res.add(&ResourceAllocations::from_device_ids("gpu", gpus));
+        cm.start_job(
+            job_id,
+            vec![node.into()],
+            res.clone(),
+            per_node_for(&[node], res),
+        )
+        .unwrap();
+        settle(cm, job_id, JobState::Running);
+    }
+
+    fn pod_holds(generation: u64, owner: JobId, gpus: &[u64]) -> GpuHoldReport {
+        let pod = |stable_id| spur_proto::proto::GpuHold {
+            job_id: owner,
+            ..gpu_hold(stable_id, GpuHoldState::GpuHoldK8s)
+        };
+        hold_report(generation, gpus.iter().copied().map(pod).collect())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pod_gpu_counts_as_its_running_job_and_is_held_after_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        enroll_shared_gpu_node(&cm, 2);
+        let generation = cm.get_node("n1").unwrap().total_resources.generation;
+        let job_id = submit_and_wait(&cm, gpu_job_spec("pod-owner", 1));
+        start_with_gpus(&cm, job_id, "n1", &[0]);
+
+        cm.record_gpu_holds("n1", pod_holds(generation, job_id, &[0, 1]));
+        assert_eq!(
+            cm.held_gpus(&cm.get_nodes())["n1"],
+            vec![1],
+            "GPU 0 is the job's own allocation; GPU 1 is not"
+        );
+
+        cm.complete_job(job_id, 0, JobState::Completed).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+        assert_eq!(cm.held_gpus(&cm.get_nodes())["n1"], vec![0, 1]);
+
+        let free = vec![
+            gpu_hold(0, GpuHoldState::GpuHoldFree),
+            gpu_hold(1, GpuHoldState::GpuHoldFree),
+        ];
+        cm.record_gpu_holds("n1", hold_report(generation, free));
+        assert!(cm.held_gpus(&cm.get_nodes())["n1"].is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

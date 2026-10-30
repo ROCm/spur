@@ -1708,8 +1708,8 @@ fn satisfiable_victim_set(
     // Total rather than currently-free resources: an evacuated node is empty, so
     // what matters is whether the whole node can host the job. Same suitability
     // rules the scheduler applies, so reclaim cannot free a node placement would
-    // then refuse — including reservations and the k0s gate. Eviction frees no
-    // GPU that a Kubernetes pod holds on a shared node.
+    // then refuse — including reservations and the k0s gate. Eviction frees a pod
+    // GPU on a shared node only while the owner job of the pod holds it.
     let suitable = |node: &spur_core::node::Node| {
         let held = held_gpus
             .get(&node.name)
