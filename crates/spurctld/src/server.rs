@@ -2508,7 +2508,7 @@ impl SlurmController for ControllerService {
         let req = request.into_inner();
         let mut resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
         // Carry the agent's reported CPU topology into the inventory so the
-        // controller can compute this node's core layout (SPUR-386). Absent
+        // controller can compute this node's core layout. Absent
         // from agents that predate topology reporting.
         if let Some(topology) = req.topology {
             resources.topology = Some(topology.into());
@@ -2544,7 +2544,7 @@ impl SlurmController for ControllerService {
             .map_err(register_node_rpc_status)?;
 
         // Deliver the node's freshly computed layout so the agent can enforce
-        // spec cores/memory immediately, before its first heartbeat (SPUR-386).
+        // spec cores/memory immediately, before its first heartbeat.
         let core_layout = self.cluster.get_node(&req.hostname).and_then(|n| {
             n.core_layout
                 .as_ref()
@@ -5500,7 +5500,7 @@ fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec
 }
 
 fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
-    // Core/memory specialization display fields (SPUR-386), derived from the
+    // Core/memory specialization display fields, derived from the
     // node's computed layout. Empty/zero unless spec cores are set.
     let (spec_cpus_display, spec_core_count, spec_mem_mb) = match &node.core_layout {
         Some(layout) if !layout.spec_cpus.is_empty() => {

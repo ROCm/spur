@@ -8762,7 +8762,7 @@ impl ClusterManager {
     }
 
     /// Recompute a node's core/memory specialization layout from its reported
-    /// CPU topology and the matching `NodeConfig` (SPUR-386). A layout the
+    /// CPU topology and the matching `NodeConfig`. A layout the
     /// settings cannot satisfy — spec cores exceeding the node, or a node that
     /// sets spec cores but has not reported topology — leaves `core_layout`
     /// absent and records a `layout_error`, which makes the node unschedulable.

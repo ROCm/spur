@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Node-level core and memory specialization enforcement (SPUR-386).
+//! Node-level core and memory specialization enforcement.
 //!
 //! The controller computes a [`CoreLayout`] and delivers it to the agent; this
 //! module turns a held layout into the writes the `spur/` cgroup root needs so
@@ -27,8 +27,7 @@ use spur_core::core_layout::CoreLayout;
 ///
 /// Confinement is only meaningful once spec CPUs exist; callers gate the root
 /// write on `!layout.spec_cpus.is_empty()` and otherwise leave the root to
-/// inherit (a reserved-only SPUR-369 layout enforces its pools per job, not at
-/// the root).
+/// inherit (a reserved-only layout enforces its pools per job, not at the root).
 pub fn root_cpuset(layout: &CoreLayout) -> Vec<u32> {
     let mut cpus: BTreeSet<u32> = layout.general_cpus.iter().copied().collect();
     for gpu in &layout.gpu_reserved {
@@ -43,8 +42,7 @@ pub fn root_cpuset(layout: &CoreLayout) -> Vec<u32> {
 /// parent's as if the child's cpuset were empty, and *widens* the child to
 /// inherit the parent — the opposite of isolation. So a CPU that `desired`
 /// would drop is kept in the root while any live job's cpuset would otherwise
-/// be left with an empty intersection; it is released only once that job exits
-/// (design review finding 3).
+/// be left with an empty intersection; it is released only once that job exits.
 ///
 /// Returns the set to actually write, sorted. A CPU in neither `desired` nor
 /// any blocking job's cpuset is removed immediately.
@@ -87,7 +85,7 @@ pub struct MemDecision {
     pub state: MemReservation,
 }
 
-/// Sequence the root's memory tightening (design review finding 5).
+/// Sequence the root's memory tightening.
 ///
 /// `target_mb` is total node memory minus the reserved amount, present only
 /// when spec cores are set. `current_mb` is the live `memory.current` of the
@@ -170,8 +168,8 @@ impl SpecEnforcer {
     /// Adopt a delivered layout. `None` clears the held layout (the controller
     /// dropped the node's spec settings). A `Some` layout is rejected when its
     /// generation is older than the held one — a late launch must not overwrite
-    /// a newer layout adopted from a registration reply (finding 6) — and is a
-    /// no-op when its content matches what is already held. Returns true when the
+    /// a newer layout adopted from a registration reply — and is a no-op when
+    /// its content matches what is already held. Returns true when the
     /// held layout changed, so the caller re-applies and re-reports.
     pub fn adopt(&mut self, incoming: Option<CoreLayout>) -> bool {
         match (incoming, &self.held) {

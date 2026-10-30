@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for core and memory specialization (SPUR-386).
+"""E2E tests for core and memory specialization.
 
 Reserve a CPU for node services via ``cpu_spec_list`` on a rootful cluster, then
 prove the controller computed the layout and spurd enforced it on the ``spur``

@@ -1974,7 +1974,7 @@ struct AgentDispatchParams<'a> {
     pmix_prepared: bool,
     execution_credential: &'a str,
     /// The target node's current core layout, so a job launched between
-    /// re-registrations still lands under enforced spec cores (SPUR-386).
+    /// re-registrations still lands under enforced spec cores.
     core_layout: Option<spur_proto::proto::CoreLayout>,
 }
 

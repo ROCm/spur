@@ -5198,7 +5198,7 @@ impl SlurmAgent for AgentService {
         Self::require_controller(&request)?;
         let mut req = request.into_inner();
         // A launch may carry a layout newer than our last registration adopted;
-        // take it so this job lands under current spec enforcement (SPUR-386).
+        // take it so this job lands under current spec enforcement.
         self.reporter.adopt_core_layout(req.core_layout.take());
         let spec = req
             .spec

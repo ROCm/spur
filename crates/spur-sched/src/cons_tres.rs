@@ -191,7 +191,7 @@ pub struct NodeAllocation {
 
 /// The node's real, online CPU IDs this ledger should index, sorted ascending.
 /// `resources.topology` carries the agent's reported topology (present once
-/// SPUR-386's topology-discovery lands); with none, falls back to a synthetic
+/// the agent reports it); with none, falls back to a synthetic
 /// `0..resources.cpus`, i.e. today's behavior — offline IDs are never part of
 /// either set, so they are never handed out.
 fn online_cpu_ids(resources: &ResourceSet) -> Vec<u32> {
@@ -1466,8 +1466,8 @@ mod tests {
 
     #[test]
     fn ledger_indexes_a_non_contiguous_online_set_by_real_cpu_id() {
-        // Design review (SPUR-369 core/mem reservation): the ledger must be
-        // indexed by real CPU IDs, not a synthetic 0..n — a node whose online
+        // The ledger must be indexed by real CPU IDs, not a synthetic 0..n — a
+        // node whose online
         // CPUs are 0-3,8-11 (a gap at 4-7, e.g. a partially-populated socket)
         // must never hand out 4-7, and must hand out real ids from 0-3,8-11.
         let online: Vec<u32> = vec![0, 1, 2, 3, 8, 9, 10, 11];

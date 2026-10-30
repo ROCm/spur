@@ -464,7 +464,7 @@ impl Node {
 
     /// Whether this node can accept new work. A node whose core settings cannot
     /// yield a valid layout is excluded until the settings are fixed, so jobs
-    /// never land on a node that cannot enforce its spec cores (SPUR-386).
+    /// never land on a node that cannot enforce its spec cores.
     pub fn is_schedulable(&self) -> bool {
         self.state.is_available() && self.layout_error.is_none()
     }

@@ -106,7 +106,7 @@ pub struct NodeReporter {
     /// Endpoint a dial/RPC most recently failed against, and until when to prefer a
     /// different one. Left stale once the cooldown lapses; never read past then.
     last_failed_endpoint: std::sync::Mutex<Option<(String, Instant)>>,
-    /// Node core/memory specialization enforcer (SPUR-386). Holds the layout the
+    /// Node core/memory specialization enforcer. Holds the layout the
     /// controller delivers via the registration reply and launch requests, and
     /// applies it to the cgroup root on each heartbeat.
     spec: std::sync::Mutex<crate::spec::SpecEnforcer>,
@@ -367,7 +367,7 @@ impl NodeReporter {
                 *write_recover(&self.node_token) = inner.node_token;
             }
             // The registration reply is the authoritative layout source; adopt it
-            // so spec enforcement starts before the first heartbeat (SPUR-386).
+            // so spec enforcement starts before the first heartbeat.
             self.adopt_core_layout(inner.core_layout);
             info!("registered with controller");
         } else {
@@ -784,7 +784,7 @@ fn discover_cpus() -> u32 {
 }
 
 /// Read this node's online CPUs grouped by physical core from sysfs, for the
-/// controller to compute the core layout (SPUR-386). The `/sys` root is a
+/// controller to compute the core layout. The `/sys` root is a
 /// parameter so tests exercise fixture trees. Returns `None` when the online
 /// set or a CPU's `core_id` is unreadable; the controller then fails the layout
 /// only if the node's settings need it.
