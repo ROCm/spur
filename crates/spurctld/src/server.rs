@@ -12204,7 +12204,7 @@ mod tests {
 
     #[test]
     fn proto_to_job_spec_defaults_absent_ntasks_to_nodes() {
-        // C1: num_tasks=0 (unset over the wire) defaults to one task per node,
+        // num_tasks=0 (unset over the wire) defaults to one task per node,
         // not 1, so the node count is not silently collapsed.
         let spec = spur_proto::proto::JobSpec {
             num_nodes: 4,
@@ -12231,7 +12231,7 @@ mod tests {
 
     #[test]
     fn proto_to_job_spec_defers_gpu_validation() {
-        // C3: proto_to_job_spec no longer rejects -N4 -n1 --gpus=2. GPU demand
+        // `proto_to_job_spec` does not reject -N4 -n1 --gpus=2. GPU demand
         // is validated in submit_job against the normalized (1) node count.
         let spec = spur_proto::proto::JobSpec {
             num_nodes: 4,

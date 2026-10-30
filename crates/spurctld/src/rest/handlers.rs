@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn rest_effective_ntasks_defaults_absent_to_nodes() {
-        // C1 (REST): absent ntasks -> one task per node, not 1.
+        // Absent ntasks -> one task per node, not 1.
         assert_eq!(rest_effective_ntasks(None, Some(4)), 4);
         // Zero is treated as unset.
         assert_eq!(rest_effective_ntasks(Some(0), Some(4)), 4);

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for containerized srun job steps on bare-metal nodes (issue #777).
+"""E2E tests for containerized srun job steps on bare-metal nodes.
 
 Two dispatch paths exist for a containerized step, and they are tested
 separately because they are reached by genuinely different setups:

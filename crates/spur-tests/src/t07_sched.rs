@@ -548,11 +548,11 @@ mod tests {
         assert!(cfg_on.resume_command.is_some());
     }
 
-    // ── T07.24–26: Reservation enforcement (#27) ──────────────────
+    // ── T07.24–26: Reservation enforcement ────────────────────────
 
     #[test]
     fn t07_24_unreserved_job_skips_reserved_nodes() {
-        // Regression: reserved nodes were allocated to non-reservation jobs (#27).
+        // Regression: reserved nodes were allocated to non-reservation jobs.
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000);
         let partitions = vec![make_partition("default", 2)];
@@ -643,11 +643,11 @@ mod tests {
         assert_eq!(assignments.len(), 1);
     }
 
-    // ── Issue #56: edge cases that could crash the scheduler ─────
+    // ── Edge cases that could crash the scheduler ─────────────────
 
     #[test]
     fn t07_27_num_nodes_zero_does_not_panic() {
-        // Issue #56: A job with num_nodes=0 should be handled safely
+        // A job with num_nodes=0 should be handled safely
         // instead of panicking on .max().unwrap() with empty iterator.
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000);
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn t07_28_single_idle_node_schedules_immediately() {
-        // Issue #56 regression: A single idle node with a single pending
+        // Regression: a single idle node with a single pending
         // job should result in immediate scheduling (no Reason=Priority).
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(1, 64, 256_000);
@@ -695,7 +695,7 @@ mod tests {
 
     #[test]
     fn t07_29_constraint_mismatch_not_scheduled() {
-        // Issue #56: A job with --constraint=gpu should NOT be scheduled
+        // A job with --constraint=gpu should NOT be scheduled
         // on a node without the "gpu" feature.
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2, 64, 256_000); // nodes have NO features
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn t07_30_exclusive_job_needs_idle_node() {
-        // Issue #56: An exclusive job should only schedule on a node
+        // An exclusive job should only schedule on a node
         // with zero current allocations.
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(2, 64, 256_000);
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn t07_31_fully_allocated_nodes_not_scheduled() {
-        // Issue #65: Jobs stuck PENDING with Reason=Priority when nodes
+        // Jobs could get stuck PENDING with Reason=Priority when nodes
         // are fully allocated. Verify that a job requiring more resources
         // than available (total - alloc) is NOT scheduled.
         let mut sched = BackfillScheduler::new(100);
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn t07_32_partially_allocated_node_accepts_fitting_job() {
-        // Issue #65 counterpart: a job that fits in the remaining resources
+        // Counterpart: a job that fits in the remaining resources
         // should still schedule.
         let mut sched = BackfillScheduler::new(100);
         let mut nodes = make_nodes(1, 64, 256_000);
@@ -1005,7 +1005,7 @@ mod tests {
 
     #[test]
     fn t07_50_issue90_initial_pending_reason_is_none() {
-        // Issue #90: New jobs should have PendingReason::None, not Priority.
+        // New jobs should have PendingReason::None, not Priority.
         // The scheduler loop's update_pending_reasons() sets the actual reason.
         let job = make_job("test-90");
         assert_eq!(

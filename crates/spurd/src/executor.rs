@@ -960,7 +960,7 @@ async fn spawn_job_process(
             }
         }
 
-        // Issue #99, #107: Run job as the submitting user (not root).
+        // Run job as the submitting user (not root).
         // Must set supplementary groups (video, render) so the process can
         // access GPU device nodes.
         //
@@ -982,7 +982,7 @@ async fn spawn_job_process(
             }
         }
 
-        // Issue #99: Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
+        // Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
         let enable_seccomp = std::env::var("SPUR_SECCOMP")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
@@ -997,7 +997,7 @@ async fn spawn_job_process(
             }
         }
 
-        // Issue #99: Apply Landlock filesystem restrictions (opt-in via SPUR_LANDLOCK=1).
+        // Apply Landlock filesystem restrictions (opt-in via SPUR_LANDLOCK=1).
         let work_dir_for_landlock = work_dir.to_string();
         let enable_landlock = std::env::var("SPUR_LANDLOCK")
             .map(|v| v == "1" || v == "true")
@@ -2537,7 +2537,7 @@ async fn launch_container_job(
 /// place, it drops privilege via `setpriv --init-groups` and exec's the user
 /// script.
 ///
-/// Issue #128: previously the priv drop happened in `Command::pre_exec` before
+/// Previously the priv drop happened in `Command::pre_exec` before
 /// exec'ing unshare, which made the unshare(2) syscall fail with EPERM and
 /// the mounts silently no-op. Doing the drop inside the wrapper (after the
 /// mounts) keeps the unshare and mounts privileged while still landing the
@@ -3887,7 +3887,7 @@ mod tests {
         assert_eq!(wrapped, script);
     }
 
-    /// Issue #128: when uid > 0, the wrapper must drop privilege via setpriv
+    /// When uid > 0, the wrapper must drop privilege via setpriv
     /// *after* the mounts (which need CAP_SYS_ADMIN). Dropping priv before
     /// unshare would cause unshare(2) to fail with EPERM.
     #[test]
