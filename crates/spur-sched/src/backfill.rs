@@ -936,7 +936,7 @@ mod tests {
             preemption_handoffs: &handoffs,
         };
         let mut scheduler = BackfillScheduler::new(100);
-        assert!(state.nodes_for_handoff(&competitor).is_empty());
+        assert!(!state.handoff_allows(&competitor, "node001"));
         assert!(scheduler.schedule(&[competitor.clone()], &state).is_empty());
         let assignments = scheduler.schedule(&[competitor, owner], &state);
         assert_eq!(assignments.len(), 1);
@@ -957,7 +957,7 @@ mod tests {
             preemption_handoffs: &HashMap::from([("node001".into(), 1)]),
         };
         let mut scheduler = BackfillScheduler::new(100);
-        assert!(state.nodes_for_handoff(&competitor).is_empty());
+        assert!(state.listed_node_handed_off(&competitor, &NodePlacement::new(&competitor)));
         assert!(scheduler.schedule(&[competitor], &state).is_empty());
     }
 

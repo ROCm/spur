@@ -1006,8 +1006,17 @@ impl ClusterManager {
 
     /// Publish the beneficiary before releasing the jobs/nodes locks, so placement
     /// cannot observe freed capacity without its handoff.
-    fn record_preempt_freed_nodes(&self, freed_nodes: &[String], preemptor: JobId) {
-        if freed_nodes.is_empty() {
+    fn record_preempt_freed_nodes(
+        &self,
+        jobs: &HashMap<JobId, Job>,
+        freed_nodes: &[String],
+        preemptor: JobId,
+    ) {
+        // A placed owner never ages out on followers, so it must not be recorded at all.
+        let owner_waiting = jobs
+            .get(&preemptor)
+            .is_some_and(|j| j.state == JobState::Pending && !j.holds_a_placement());
+        if freed_nodes.is_empty() || !owner_waiting {
             return;
         }
         let mut earmarks = self.preempt_freed_nodes.write();
@@ -1032,7 +1041,7 @@ impl ClusterManager {
     /// the node for no one's benefit.
     ///
     /// The bounded post-drain budget only starts once the preemptor has its full
-    /// allocation: while any victim it preempted is still draining (Completing),
+    /// allocation: while any cancel-mode victim it preempted is still draining,
     /// the earmark is refreshed rather than aged. A multi-node preemptor whose
     /// victims' nodes free at different times would otherwise spend the whole
     /// budget on an early-freeing node while still waiting — unplaceable — for a
@@ -2951,7 +2960,7 @@ impl ClusterManager {
                         .map_or(hold, |user_begin| user_begin.max(hold))
                 };
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
-                    handoff_to: preempted_by.filter(|_| earmark_freed),
+                    handoff: earmark_freed && preempted_by.is_some(),
                     job_id,
                     begin_time,
                     preempted_by,
@@ -4994,7 +5003,7 @@ impl ClusterManager {
         drop(partitions);
 
         // Queue precedence offers a preemptor placement before ordinary bystanders;
-        // node handoffs separately keep competing preemptors from taking its capacity.
+        // node handoffs separately keep every other job off its released capacity.
         let hoisted: HashSet<JobId> = {
             let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
             for job in jobs.values() {
@@ -7345,7 +7354,7 @@ impl ClusterManager {
             WalOperation::JobPreemptRequeue {
                 job_id,
                 begin_time,
-                handoff_to,
+                handoff,
                 preempted_by,
                 preempt_qos,
                 ..
@@ -7412,8 +7421,8 @@ impl ClusterManager {
                     &[],
                     *job_id,
                 );
-                if let Some(preemptor) = handoff_to {
-                    self.record_preempt_freed_nodes(&freed_nodes, *preemptor);
+                if let Some(preemptor) = preempted_by.filter(|_| *handoff) {
+                    self.record_preempt_freed_nodes(&jobs, &freed_nodes, preemptor);
                 }
                 drop(jobs);
                 drop(nodes);
@@ -7668,7 +7677,7 @@ impl ClusterManager {
                     response.jobs_finalized.push(fin);
                 }
                 for (preemptor, freed) in freed_for_preemptor {
-                    self.record_preempt_freed_nodes(&freed, preemptor);
+                    self.record_preempt_freed_nodes(&jobs, &freed, preemptor);
                 }
             }
             WalOperation::JobLaunchFailureDetail { job_id, detail } => {
@@ -7870,7 +7879,11 @@ impl ClusterManager {
                 };
 
                 if let Some(preemptor) = freed_for_preemptor {
-                    self.record_preempt_freed_nodes(std::slice::from_ref(node_name), preemptor);
+                    self.record_preempt_freed_nodes(
+                        &jobs,
+                        std::slice::from_ref(node_name),
+                        preemptor,
+                    );
                 }
 
                 if let Some(finalized) = finalized {
@@ -8008,7 +8021,7 @@ impl ClusterManager {
                         .filter(|n| !already_deallocated.contains(n))
                         .cloned()
                         .collect();
-                    self.record_preempt_freed_nodes(&newly_freed, preemptor);
+                    self.record_preempt_freed_nodes(&jobs, &newly_freed, preemptor);
                 }
                 drop(jobs);
                 drop(nodes);
@@ -8287,7 +8300,7 @@ impl ClusterManager {
                         &mut freed_for_preemptor,
                     );
                     for (preemptor, freed) in freed_for_preemptor {
-                        self.record_preempt_freed_nodes(&freed, preemptor);
+                        self.record_preempt_freed_nodes(&jobs, &freed, preemptor);
                     }
                 }
             }
@@ -8337,7 +8350,7 @@ impl ClusterManager {
                     &mut freed_for_preemptor,
                 );
                 for (preemptor, freed) in freed_for_preemptor {
-                    self.record_preempt_freed_nodes(&freed, preemptor);
+                    self.record_preempt_freed_nodes(&jobs, &freed, preemptor);
                 }
                 if let Some(node) = nodes.get(name) {
                     if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
@@ -14922,7 +14935,7 @@ mod tests {
             at: None,
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
-            handoff_to: None,
+            handoff: false,
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
             preempted_by: Some(2),
@@ -15809,7 +15822,7 @@ mod tests {
         let job_id = run_job_on(&cm, "preempt-kind", "worker1");
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
-            handoff_to: None,
+            handoff: false,
             job_id,
             begin_time: Utc::now(),
             preempted_by: Some(job_id + 1),
@@ -16033,7 +16046,7 @@ mod tests {
         let job_id = run_job_on(&cm, "preempt-requeue", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
-            handoff_to: None,
+            handoff: false,
             job_id,
             begin_time: Utc::now(),
             preempted_by: Some(job_id + 1),
@@ -18268,7 +18281,7 @@ mod tests {
         // Apply without provenance fields — simulates a WAL entry written by an
         // older controller; new fields default to None and must not panic.
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
-            handoff_to: None,
+            handoff: false,
             job_id: 1,
             begin_time,
             preempted_by: None,
@@ -18292,7 +18305,7 @@ mod tests {
 
         // Replay the identical entry: job is already Pending -> NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
-            handoff_to: None,
+            handoff: false,
             job_id: 1,
             begin_time,
             preempted_by: None,
@@ -20540,7 +20553,7 @@ mod tests {
         bystander.exclusive = true;
         let bystander_id = submit_and_wait(&cm, bystander);
 
-        for pass in 1..=ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
+        for pass in 1..=ClusterManager::PREEMPT_FREED_EARMARK_PASSES + 2 {
             cm.tick_preempt_freed_earmarks();
             for victim in [victim_a_id, victim_b_id] {
                 assert_eq!(cm.get_job(victim).unwrap().state, JobState::Completing);
@@ -20558,18 +20571,18 @@ mod tests {
                 .into_iter()
                 .map(|(n, (id, _))| (n, id))
                 .collect::<HashMap<_, _>>();
-            if pass < ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
-                assert_eq!(earmarks.get("n2"), Some(&pinned_id));
-            }
+            assert_eq!(
+                earmarks.get("n2"),
+                Some(&pinned_id),
+                "pass {pass}: drain must refresh n2"
+            );
 
             let assignments = run_one_scheduling_pass(&cm);
             let n2_owner = assignments
                 .iter()
                 .find(|assignment| assignment.nodes.iter().any(|node| node == "n2"))
                 .map(|assignment| assignment.job_id);
-            if pass < ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
-                assert!(assignments.is_empty(), "pass {pass} must protect n2");
-            }
+            assert!(assignments.is_empty(), "pass {pass} must protect n2");
             assert_ne!(
                 n2_owner,
                 Some(flex_id),
@@ -20727,7 +20740,7 @@ mod tests {
             preempted_by: Some(owner),
             preempt_qos: None,
             at: Some(Utc::now()),
-            handoff_to: Some(owner),
+            handoff: true,
         });
         assert_eq!(cm.preempt_freed_nodes_raw()["n1"].0, owner);
         owner
@@ -20766,12 +20779,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn placed_owner_records_no_earmark() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        for node in ["n1", "n2"] {
+            register_node(&cm, node, 8, 16000);
+        }
+        let victim = run_job_on(&cm, "victim", "n1");
+        let owner = run_job_on(&cm, "owner", "n2");
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: victim,
+            begin_time: Utc::now() + chrono::Duration::hours(1),
+            preempted_by: Some(owner),
+            preempt_qos: None,
+            at: Some(Utc::now()),
+            handoff: true,
+        });
+        assert_eq!(cm.get_job(victim).unwrap().state, JobState::Pending);
+        assert!(cm.preempt_freed_nodes_raw().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_outside_an_active_reservation_gets_no_handoff() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        requeue_into_earmark(&cm);
+        let handoffs =
+            || cm.preemption_handoffs(&cm.pending_jobs(), &cm.get_nodes(), &cm.get_reservations());
+        assert!(!handoffs().is_empty());
+        let now = Utc::now();
+        cm.create_reservation(Reservation {
+            name: "others".into(),
+            start_time: now - chrono::Duration::minutes(1),
+            end_time: now + chrono::Duration::hours(1),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        })
+        .unwrap();
+        assert!(handoffs().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn draining_suspend_victim_hands_off_nothing() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster_with_config(&dir, preempting_config()).await;
         register_node(&cm, "n1", 8, 16000);
         let victim = run_job_on(&cm, "victim", "n1");
-        let owner = submit_and_wait(&cm, basic_spec("owner"));
+        let mut owner = basic_spec("owner");
+        owner.nodelist = Some("n1".into());
+        let owner = submit_and_wait(&cm, owner);
+        let bystander = submit_bystander(&cm, "n1");
         cm.apply_operation(&WalOperation::JobSuspend {
             job_id: victim,
             at: Utc::now(),
@@ -20787,6 +20848,11 @@ mod tests {
         assert!(cm
             .preemption_handoffs(&pending, &cm.get_nodes(), &cm.get_reservations())
             .is_empty());
+        assert_eq!(
+            pending[0].job_id, bystander,
+            "a suspend victim must not hoist its owner"
+        );
+        assert!(pending.iter().any(|j| j.job_id == owner));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -21290,9 +21356,10 @@ mod tests {
             id
         };
 
-        // Reclaim path: no earmark is recorded for the reclaimer (job 777).
+        // Reclaim path: no earmark is recorded for the reclaimer.
+        let owner = submit_and_wait(&cm, basic_spec("owner"));
         let v1 = run_victim_on_n1("borrowed");
-        cm.reclaim_job_with_provenance(v1, PreemptMode::Requeue, Some(777), None)
+        cm.reclaim_job_with_provenance(v1, PreemptMode::Requeue, Some(owner), None)
             .unwrap();
         assert!(
             cm.preempt_freed_nodes_raw().is_empty(),
@@ -21301,11 +21368,11 @@ mod tests {
 
         // Genuine preemption path: the freed node IS earmarked for the preemptor.
         let v2 = run_victim_on_n1("victim2");
-        cm.preempt_job_with_provenance(v2, PreemptMode::Requeue, Some(888), None)
+        cm.preempt_job_with_provenance(v2, PreemptMode::Requeue, Some(owner), None)
             .unwrap();
         assert_eq!(
             cm.preempt_freed_nodes_raw().get("n1").map(|(p, _)| *p),
-            Some(888),
+            Some(owner),
             "a genuine requeue-preemption must earmark the freed node for its preemptor"
         );
     }
