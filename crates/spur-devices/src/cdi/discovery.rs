@@ -313,8 +313,6 @@ pub struct SharingIdentity {
     pub stable_id: u64,
     pub render_minor: u32,
     pub card_id: Option<u32>,
-    /// The `resource.kubernetes.io/pciBusID` a claim selects this device by.
-    pub selector_bdf: String,
 }
 
 impl SharingIdentity {
@@ -352,24 +350,8 @@ pub fn sharing_identities_from(kfd_root: &Path, drm_root: &Path) -> Vec<SharingI
             ),
             render_minor: node.render_minor,
             card_id: find_card_in(drm_root, node.render_minor),
-            selector_bdf: selector_bdf(node, &nodes),
         })
         .collect()
-}
-
-/// The BDF a `ResourceClaim` selects a device by. The kernel ORs a partition's
-/// KFD node id into the PCI function bits of `location_id`, so a partitioned
-/// device gets function 0, the parent GPU's address the DRA driver publishes.
-// ponytail: collapses to `bdf_from_location_id` once the kernel decode is fixed upstream.
-fn selector_bdf(node: &KfdGpuNode, nodes: &[KfdGpuNode]) -> String {
-    let parent = |n: &KfdGpuNode| (n.domain, n.location_id >> 3);
-    let siblings = nodes.iter().filter(|n| parent(n) == parent(node)).count();
-    let location_id = if siblings > 1 {
-        node.location_id & !0x07
-    } else {
-        node.location_id
-    };
-    bdf_from_location_id(location_id, node.domain)
 }
 
 fn format_unique_id(unique_id: u64) -> String {
@@ -1261,7 +1243,6 @@ mod tests {
         let gpu = ids.iter().find(|g| g.render_minor == 136).unwrap();
         assert_eq!(gpu.card_id, Some(9));
         assert_eq!(gpu.dra_device_name().as_deref(), Some("gpu-9-136"));
-        assert_eq!(gpu.selector_bdf, "0000:2f:00.0");
         assert_eq!(gpu.stable_id, encode_stable_id(0x2f00, 0, 0));
         assert_eq!(gpu.unshareable_reason(), None);
         let names: Vec<String> = ids.iter().filter_map(|g| g.dra_device_name()).collect();
@@ -1285,10 +1266,10 @@ mod tests {
     }
 
     /// Values measured on an MI300X at 0000:11:00.0 in CPX: the kernel ORs the
-    /// partition node id into location_id (0x1100..0x1107) while lspci lists
-    /// function 0 only. The SPX GPU at 0000:2f:00.0 is the control.
+    /// partition node id into location_id (0x1100..0x1107). The SPX GPU at
+    /// 0000:2f:00.0 is the control.
     #[test]
-    fn sharing_identity_cpx_selects_parent_bdf_with_function_zero() {
+    fn sharing_identity_cpx_names_each_partition() {
         let kfd = tempfile::tempdir().unwrap();
         let drm = tempfile::tempdir().unwrap();
         for i in 0u32..8 {
@@ -1303,16 +1284,11 @@ mod tests {
         assert_eq!(ids.len(), 9);
         for (i, gpu) in ids.iter().take(8).enumerate() {
             assert_eq!(
-                gpu.selector_bdf, "0000:11:00.0",
-                "renderD{}",
-                gpu.render_minor
-            );
-            assert_eq!(
                 gpu.dra_device_name(),
                 Some(format!("gpu-{}-{}", 1 + i, 128 + i))
             );
         }
-        assert_eq!(ids[8].selector_bdf, "0000:2f:00.0");
+        assert_eq!(ids[8].dra_device_name().as_deref(), Some("gpu-9-136"));
         let sids: std::collections::HashSet<u64> = ids.iter().map(|g| g.stable_id).collect();
         assert_eq!(sids.len(), 9);
     }

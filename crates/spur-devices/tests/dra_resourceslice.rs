@@ -127,20 +127,14 @@ fn sharing_identities_match_dra_driver_resourceslices() {
         let drm = tempfile::tempdir().unwrap();
         write_sysfs(&devices, kfd.path(), drm.path());
 
-        let discovered: BTreeSet<(String, String)> =
-            sharing_identities_from(kfd.path(), drm.path())
-                .into_iter()
-                .map(|g| (g.dra_device_name().unwrap(), g.selector_bdf))
-                .collect();
-
-        let published: BTreeSet<(String, String)> = devices
+        let discovered: BTreeSet<String> = sharing_identities_from(kfd.path(), drm.path())
             .iter()
-            .map(|d| {
-                (
-                    format!("gpu-{}-{}", d.card, d.render_minor),
-                    d.pci_bus_id.clone(),
-                )
-            })
+            .map(|g| g.dra_device_name().unwrap())
+            .collect();
+
+        let published: BTreeSet<String> = devices
+            .iter()
+            .map(|d| format!("gpu-{}-{}", d.card, d.render_minor))
             .collect();
         assert_eq!(discovered, published, "{}", path.display());
     }
