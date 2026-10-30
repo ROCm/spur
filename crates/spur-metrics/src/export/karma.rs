@@ -53,7 +53,7 @@ const COUNTERS: &[CounterDef] = &[
     },
     CounterDef {
         name: "spur_karma_jobs_cancelled",
-        help: "Total jobs cancelled by user",
+        help: "Total jobs that reached Cancelled state",
         value: |u| u.cancelled,
     },
     CounterDef {
@@ -73,7 +73,7 @@ const COUNTERS: &[CounterDef] = &[
     },
     CounterDef {
         name: "spur_karma_walltime_actual_seconds",
-        help: "Total actual wall time consumed in seconds across all terminal jobs",
+        help: "Total actual wall time consumed in seconds across all finalized runs",
         value: |u| u.walltime_actual_secs,
     },
 ];
