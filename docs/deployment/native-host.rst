@@ -393,7 +393,9 @@ directly before acting:
 - **Many nodes go silent at once.** When more than ``controller.max_stale_node_fraction``
   (default half) of the watched nodes go silent in the same pass, the leader assumes the
   fault is on its side, marks none of them ``DOWN``, and logs ``suspecting the control
-  plane`` at error level. If the nodes really are gone, mark them down by hand with
+  plane`` at error level. Watched nodes are those not already ``DOWN`` or drained, so
+  draining part of the cluster lowers the number of silent nodes it takes. If the nodes
+  really are gone, mark them down by hand with
   ``scontrol update nodename=<node> state=down``.
 
 Nodes managed by the Kubernetes operator are not checked this way; they are marked ``DOWN``
