@@ -383,8 +383,10 @@ bound the controller's connections to agents instead.
      - ``60``
      - How long a controller endpoint that just failed to dial or answer is
        deprioritized in favor of another configured endpoint, so it can't
-       "recapture" every reconnect attempt before the next one is due. Range
-       0-86400; ``0`` disables the cooldown.
+       "recapture" every reconnect attempt before the next one is due. A
+       heartbeat that fails this way is retried at once on the next endpoint,
+       so one broken controller does not cost the node a beat. Range 0-86400;
+       ``0`` disables the cooldown and that retry.
    * - ``native_mint_timeout_secs``
      - integer
      - ``5``
