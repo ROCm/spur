@@ -21,6 +21,7 @@ import time
 import pytest
 
 from cluster import SpurCluster, make_remote_dir, parse_job_id, job_state, wait_job
+from conftest import _reset_k0s_all_nodes
 
 pytestmark = [pytest.mark.k0s, pytest.mark.gpu]
 
@@ -95,6 +96,7 @@ def _teardown(c: SpurCluster) -> None:
     except Exception:
         pass
     c.teardown()
+    _reset_k0s_all_nodes(c)
     c.nodes[0].exec_allow_fail(f"{sudo}rm -f {KUBECONFIG}")
 
 
