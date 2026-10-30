@@ -1200,6 +1200,26 @@ impl ClusterManager {
             .collect()
     }
 
+    /// Per preemptor, the nodes where a pod claim still names a job it preempted.
+    /// The pod keeps those GPUs after its job ended, until the pod stops.
+    pub fn nodes_of_preempted_pods(&self) -> HashMap<JobId, Vec<String>> {
+        let jobs = self.jobs.read();
+        let holds = self.gpu_holds.read();
+        let mut nodes: HashMap<JobId, Vec<String>> = HashMap::new();
+        for (node, (report, _)) in holds.iter() {
+            let preemptors: HashSet<JobId> = report
+                .gpus
+                .iter()
+                .filter(|g| g.state == GpuHoldState::GpuHoldK8s as i32)
+                .filter_map(|g| jobs.get(&g.job_id)?.preempted_by)
+                .collect();
+            for preemptor in preemptors {
+                nodes.entry(preemptor).or_default().push(node.clone());
+            }
+        }
+        nodes
+    }
+
     /// `(job, GPU)` pairs per node, for every GPU a running job still holds.
     fn charged_gpus(&self) -> HashMap<String, HashSet<(JobId, u64)>> {
         let jobs = self.jobs.read();
@@ -27286,6 +27306,77 @@ mod tests {
         ];
         cm.record_gpu_holds("n1", hold_report(generation, free));
         assert!(cm.held_gpus(&cm.get_nodes())["n1"].is_empty());
+    }
+
+    async fn preempt_once(cm: &Arc<ClusterManager>, job_id: JobId) {
+        let job = cm.get_job(job_id).unwrap();
+        crate::scheduler_loop::try_preempt(
+            cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&job],
+            &cm.config().scheduler,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_waits_for_the_pod_of_its_finished_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        for (name, priority) in [("low", 100), ("mid", 200)] {
+            cm.qos_cache().insert(Qos {
+                name: name.into(),
+                priority,
+                ..Default::default()
+            });
+        }
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 10_000,
+            preempt: vec!["low".into(), "mid".into()],
+            ..Default::default()
+        });
+        enroll_shared_gpu_node(&cm, 2);
+        register_gpu_node(&cm, "n2", vec![gpu_resource(0, 0), gpu_resource(1, 1)]);
+        let generation = cm.get_node("n1").unwrap().total_resources.generation;
+        let submit = |name: &str, qos: &str| {
+            let mut spec = gpu_job_spec(name, 2);
+            spec.qos = Some(qos.into());
+            submit_and_wait(&cm, spec)
+        };
+        let pod_owner = submit("pod-owner", "low");
+        start_with_gpus(&cm, pod_owner, "n1", &[0, 1]);
+        let native = submit("native", "mid");
+        start_with_gpus(&cm, native, "n2", &[0, 1]);
+        cm.record_gpu_holds("n1", pod_holds(generation, pod_owner, &[0, 1]));
+        let hunter = submit("hunter", "high");
+
+        preempt_once(&cm, hunter).await;
+        assert_eq!(
+            cm.get_job(pod_owner).unwrap().state,
+            JobState::Completing,
+            "preemption frees the pod GPUs of the cheapest victim"
+        );
+        report_nodes_released(&cm, pod_owner);
+        settle(&cm, pod_owner, JobState::Cancelled);
+
+        for _ in 0..3 {
+            preempt_once(&cm, hunter).await;
+        }
+        assert_eq!(
+            cm.get_job(native).unwrap().state,
+            JobState::Running,
+            "the pod of the first victim still stops"
+        );
+
+        cm.record_gpu_holds("n1", pod_holds(generation, 0, &[0, 1]));
+        preempt_once(&cm, hunter).await;
+        assert_ne!(
+            cm.get_job(native).unwrap().state,
+            JobState::Running,
+            "a pod of no victim does not make the preemptor wait"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
