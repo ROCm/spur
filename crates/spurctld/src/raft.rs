@@ -85,7 +85,7 @@ pub struct JobFinalized {
     #[serde(skip)]
     pub ended_by: Option<CancelProvenance>,
     #[serde(skip)]
-    pub unstarted: Option<crate::accounting::db::UnstartedJobRecord>,
+    pub accounting: Option<crate::accounting::db::JobEndRecord>,
 }
 
 impl JobFinalized {
@@ -103,29 +103,9 @@ impl JobFinalized {
             reason,
             reason_detail,
             ended_by: job.ended_by(reason).cloned(),
-            unstarted: crate::accounting::db::UnstartedJobRecord::for_job(job),
-        }
-    }
-
-    /// Like `for_job` but with a pre-computed elapsed time. Used by requeue
-    /// paths that clear timestamps before constructing the finalized record.
-    pub fn for_job_with_elapsed(
-        job: &Job,
-        state: JobState,
-        exit_code: i32,
-        elapsed_secs: u64,
-    ) -> Self {
-        let (reason, reason_detail) = job.end_reason(state);
-        Self {
-            job_id: job.job_id,
-            state,
-            exit_code,
-            actual_secs: elapsed_secs,
-            reason,
-            reason_detail,
-            ended_by: job.ended_by(reason).cloned(),
-            // Requeue may already have cleared the ended run's start time.
-            unstarted: None,
+            accounting: Some(crate::accounting::db::JobEndRecord::for_job(
+                job, state, exit_code,
+            )),
         }
     }
 }
@@ -1359,15 +1339,15 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn old_finalized_response_has_no_unstarted_metadata() {
+    fn old_finalized_response_has_no_accounting_snapshot() {
         let finalized: super::JobFinalized =
             serde_json::from_str(r#"{"job_id":1,"state":"CANCELLED","exit_code":-1}"#).unwrap();
-        assert!(finalized.unstarted.is_none());
+        assert!(finalized.accounting.is_none());
         assert!(!serde_json::to_value(finalized)
             .unwrap()
             .as_object()
             .unwrap()
-            .contains_key("unstarted"));
+            .contains_key("accounting"));
     }
 
     use super::*;

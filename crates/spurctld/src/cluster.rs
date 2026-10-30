@@ -41,8 +41,7 @@ use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::{
-    txn, AccountingNotifier, JobEndRecord, JobStartRecord, TxnAction, TxnEntity, TxnOutcome,
-    TxnRecord, TxnSource,
+    txn, AccountingNotifier, JobStartRecord, TxnAction, TxnEntity, TxnOutcome, TxnRecord, TxnSource,
 };
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
@@ -2601,6 +2600,7 @@ impl ClusterManager {
         if let Some(ref notifier) = *self.accounting.read() {
             notifier.notify_job_start(JobStartRecord {
                 job_id,
+                run_attempt: Some(run_attempt),
                 name: spec_for_notify.name.clone(),
                 user: spec_for_notify.user.clone(),
                 account: spec_for_notify.account.clone().unwrap_or_default(),
@@ -3286,41 +3286,8 @@ impl ClusterManager {
             }
         }
 
-        if let Some(ref notifier) = *self.accounting.read() {
-            let (exit_signal, derived_exit_code, preempted_by, preempt_mode, preempt_qos) = self
-                .jobs
-                .read()
-                .get(&job_id)
-                .map(|j| {
-                    (
-                        j.exit_signal,
-                        j.derived_exit_code,
-                        j.preempted_by,
-                        j.preempt_mode.clone(),
-                        j.preempt_qos.clone(),
-                    )
-                })
-                .unwrap_or((0, 0, None, None, None));
-            notifier.notify_job_end(JobEndRecord {
-                job_id,
-                unstarted: finalized.unstarted.clone(),
-                state: state.display().to_owned(),
-                exit_code: finalized.exit_code,
-                end_time: Utc::now(),
-                exit_signal,
-                derived_exit_code,
-                preempted_by,
-                preempt_mode: preempt_mode.unwrap_or_default(),
-                preempt_qos: preempt_qos.unwrap_or_default(),
-                reason: Some(finalized.reason),
-                reason_detail: finalized.reason_detail.clone().unwrap_or_default(),
-                ended_by: finalized
-                    .ended_by
-                    .as_ref()
-                    .map(|c| c.user.clone())
-                    .unwrap_or_default(),
-                ended_by_uid: finalized.ended_by.as_ref().and_then(|c| c.uid),
-            });
+        if let (Some(notifier), Some(record)) = (&*self.accounting.read(), &finalized.accounting) {
+            notifier.notify_job_end(record.clone());
         }
 
         // Preempted excluded: preempt_job owns its requeue (with hold).
@@ -7380,12 +7347,10 @@ impl ClusterManager {
                     per_node_map = job.per_node_alloc.clone();
                     job.node_completions.clear();
 
-                    // Capture run_time before reset clears start_time.
-                    // run_time() excludes suspended intervals.
-                    let elapsed = job
-                        .run_time()
-                        .map(|d| d.num_seconds().max(0) as u64)
-                        .unwrap_or(0);
+                    job.preempted_by = *preempted_by;
+                    job.preempt_mode = Some("Requeue".to_string());
+                    job.preempt_qos = preempt_qos.clone();
+                    finalized = JobFinalized::for_job(job, JobState::Preempted, -1);
 
                     if let Err(e) = job.transition(JobState::Pending) {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
@@ -7398,8 +7363,6 @@ impl ClusterManager {
                     job.preempted_by = *preempted_by;
                     job.preempt_mode = Some("Requeue".to_string());
                     job.preempt_qos = preempt_qos.clone();
-                    finalized =
-                        JobFinalized::for_job_with_elapsed(job, JobState::Preempted, -1, elapsed);
                     let desc = spur_core::end_reason::preemption_summary(
                         *preempted_by,
                         preempt_qos.as_deref(),
@@ -7453,16 +7416,7 @@ impl ClusterManager {
                             // gives elapsed excluding suspended intervals.
                             job.end_time = Some(timestamp);
                             job.end_suspension(timestamp);
-                            let elapsed = job
-                                .run_time()
-                                .map(|d| d.num_seconds().max(0) as u64)
-                                .unwrap_or(0);
-                            finalized = Some(JobFinalized::for_job_with_elapsed(
-                                job,
-                                JobState::Requeued,
-                                -1,
-                                elapsed,
-                            ));
+                            finalized = Some(JobFinalized::for_job(job, JobState::Requeued, -1));
                             // The live run still holds its allocation; capture it
                             // to free below (reset clears node_completions).
                             freed_nodes = job.allocated_nodes.clone();
@@ -15642,7 +15596,13 @@ mod tests {
             CancelProvenance::system(),
         ));
         let finalized = &response.jobs_finalized[0];
-        let metadata = finalized.unstarted.as_ref().unwrap();
+        let metadata = finalized
+            .accounting
+            .as_ref()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap();
         assert_eq!(metadata.name, "pending-metadata");
         assert_eq!(metadata.user, submitted.spec.user);
         assert_eq!(metadata.account, submitted.spec.account.unwrap_or_default());
@@ -15681,6 +15641,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
         let job_id = run_job_on(&cm, "requeue-metadata", "worker1");
+        let running = cm.get_job(job_id).unwrap();
         let response = cm.apply_operation(&WalOperation::JobPreemptRequeue {
             job_id,
             begin_time: Utc::now() + chrono::Duration::minutes(1),
@@ -15691,7 +15652,13 @@ mod tests {
         assert!(cm.get_job(job_id).unwrap().start_time.is_none());
         let finalized = &response.jobs_finalized[0];
         assert_eq!(finalized.state, JobState::Preempted);
-        assert!(finalized.unstarted.is_none());
+        let record = finalized.accounting.as_ref().unwrap();
+        let metadata = record.metadata.as_ref().unwrap();
+        assert_eq!(metadata.start_time, running.start_time);
+        assert_eq!(metadata.run_attempt, running.run_attempt);
+        assert_eq!(metadata.nodelist, "worker1");
+        assert_eq!(record.preempt_mode, "Requeue");
+        assert_eq!(record.reason, Some(EndReason::Preempted));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

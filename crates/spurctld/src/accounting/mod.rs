@@ -8,7 +8,7 @@ mod notifier;
 mod reconcile;
 pub(crate) mod txn;
 
-pub use db::{JobEndRecord, JobStartRecord};
+pub use db::JobStartRecord;
 pub(crate) use grpc::{accounting_server, AccountingService};
 pub use notifier::AccountingNotifier;
 pub use reconcile::spawn_loop as spawn_reconcile_loop;

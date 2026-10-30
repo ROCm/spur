@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
-use sqlx::{PgPool, QueryBuilder, Row};
+use sqlx::{Connection, PgPool, QueryBuilder, Row};
 
 use spur_core::end_reason::EndReason;
 use spur_core::job::{effective_gpus, effective_memory_mb, Job, JobId};
@@ -207,6 +207,20 @@ BEGIN
     END LOOP;
 END $$;
 
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS run_attempt BIGINT;
+-- A pending cancellation follows the ended run without advancing run_attempt.
+-- Order start < started-end < unstarted-end within each attempt.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS accounting_phase SMALLINT NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS job_usage_runs (
+    job_id BIGINT NOT NULL,
+    submit_time TIMESTAMPTZ NOT NULL,
+    run_attempt BIGINT,
+    start_time TIMESTAMPTZ NOT NULL,
+    UNIQUE (job_id, submit_time, run_attempt)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_legacy_job_usage_run
+    ON job_usage_runs (job_id, submit_time, start_time) WHERE run_attempt IS NULL;
+
 -- Restore the true id of a row a pre-fix controller narrowed: the u32 wrapped to a
 -- negative int4, so add 2^32 back. Skip a row whose true id already exists so the
 -- rewrite can never violate the primary key. No-op (and cheap on the PK) once clean.
@@ -289,6 +303,7 @@ END $$;
 /// silently and mis-attribute the job.
 pub struct JobStartRecord {
     pub job_id: JobId,
+    pub run_attempt: Option<u32>,
     pub name: String,
     pub user: String,
     pub account: String,
@@ -313,19 +328,39 @@ pub struct JobStartRecord {
     pub time_limit_secs: Option<i64>,
 }
 
+async fn lock_accounting_job(conn: &mut PgConnection, job_id: JobId) -> anyhow::Result<()> {
+    // Separate from schema and user locks; all writers, including repair, share this lock.
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(0x5341_4343_i32)
+        .bind(job_id as i32)
+        .execute(&mut *conn)
+        .await?;
+    // Preserve pre-upgrade charges before the latest-job row can be replaced.
+    sqlx::query(
+        "INSERT INTO job_usage_runs (job_id, submit_time, start_time)
+         SELECT job_id, submit_time, start_time FROM jobs
+         WHERE job_id = $1 AND run_attempt IS NULL AND usage_recorded AND start_time IS NOT NULL
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(i64::from(job_id))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Record a job start in the database.
 ///
 /// Takes a `&mut PgConnection` (not a hard `&PgPool`) so callers can either
 /// acquire a standalone connection from a pool (as the notifier does) or pass
 /// one borrowed from an open `Transaction` (`Transaction` derefs to
-/// `PgConnection`) to run this alongside other writes atomically, as
-/// reconciliation's backfill-then-finalize does.
+/// `PgConnection`) to compose this write with other transactional work.
 pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> anyhow::Result<()> {
-    // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
+    let mut tx = conn.begin().await?;
+    lock_accounting_job(&mut tx, rec.job_id).await?;
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill, nodelist, time_limit_secs)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15, $16, $17)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation, idle_fill, nodelist, time_limit_secs, run_attempt, accounting_phase)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14, $15, $16, $17, $18, 1)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -358,7 +393,16 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             reason = '',
             reason_detail = '',
             ended_by = '',
-            ended_by_uid = NULL
+            ended_by_uid = NULL,
+            run_attempt = EXCLUDED.run_attempt,
+            accounting_phase = 1
+        WHERE $18 IS NULL
+           OR (jobs.run_attempt IS NULL AND
+               (jobs.user_name = '' OR jobs.submit_time < EXCLUDED.submit_time
+                OR (jobs.submit_time = EXCLUDED.submit_time
+                    AND (jobs.end_time IS NULL OR jobs.end_time < EXCLUDED.start_time))))
+           OR (jobs.submit_time, jobs.run_attempt, jobs.accounting_phase)
+              <= (EXCLUDED.submit_time, EXCLUDED.run_attempt, 1)
         "#,
     )
     .bind(rec.job_id as i64)
@@ -378,28 +422,20 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.idle_fill)
     .bind(&rec.nodelist)
     .bind(rec.time_limit_secs)
-    .execute(&mut *conn)
+    .bind(rec.run_attempt.map(i64::from))
+    .execute(&mut *tx)
     .await?;
 
-    // If end_time is already set, the end notification arrived first and skipped
-    // usage computation (start_time was NULL at that point). Compute it now.
-    let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
-    )
-    .bind(rec.job_id as i64)
-    .fetch_one(&mut *conn)
-    .await?;
-
-    let end_time: Option<DateTime<Utc>> = row.get("end_time");
-    if let Some(end_time) = end_time {
-        update_usage(conn, row, end_time, rec.job_id as i64).await?;
-    }
-
+    tx.commit().await?;
     Ok(())
 }
 
 #[derive(Debug, Clone)]
-pub struct UnstartedJobRecord {
+pub struct JobMetadata {
+    pub run_attempt: u32,
+    pub start_time: Option<DateTime<Utc>>,
+    pub nodelist: String,
+    pub idle_fill: bool,
     pub name: String,
     pub user: String,
     pub account: String,
@@ -415,13 +451,14 @@ pub struct UnstartedJobRecord {
     pub time_limit_secs: Option<i64>,
 }
 
-impl UnstartedJobRecord {
-    pub fn for_job(job: &Job) -> Option<Self> {
-        if job.start_time.is_some() {
-            return None;
-        }
+impl JobMetadata {
+    pub fn for_job(job: &Job) -> Self {
         let spec = &job.spec;
-        Some(Self {
+        Self {
+            run_attempt: job.run_attempt,
+            start_time: job.start_time,
+            nodelist: spur_core::hostlist::compress(&job.allocated_nodes),
+            idle_fill: job.idle_fill,
             name: spec.name.clone(),
             user: spec.user.clone(),
             account: spec.account.clone().unwrap_or_default(),
@@ -431,11 +468,15 @@ impl UnstartedJobRecord {
             num_tasks: spec.num_tasks,
             cpus_per_task: spec.cpus_per_task,
             total_gpus: effective_gpus(spec, spec.num_nodes) as u32,
-            memory_mb: effective_memory_mb(spec, spec.num_nodes),
+            memory_mb: job
+                .allocated_resources
+                .as_ref()
+                .map(|r| r.memory_mb)
+                .unwrap_or_else(|| effective_memory_mb(spec, spec.num_nodes)),
             submit_time: job.submit_time,
             reservation: spec.reservation.clone().unwrap_or_default(),
             time_limit_secs: spec.time_limit.map(|limit| limit.num_seconds()),
-        })
+        }
     }
 }
 
@@ -444,7 +485,7 @@ impl UnstartedJobRecord {
 #[derive(Debug, Clone)]
 pub struct JobEndRecord {
     pub job_id: JobId,
-    pub unstarted: Option<UnstartedJobRecord>,
+    pub metadata: Option<JobMetadata>,
     /// Accounting state string; the legacy `RecordJobEnd` RPC maps its own
     /// proto values (including `UNKNOWN`), so this is not a `JobState`.
     pub state: String,
@@ -464,22 +505,51 @@ pub struct JobEndRecord {
     pub ended_by_uid: Option<u32>,
 }
 
+impl JobEndRecord {
+    pub fn for_job(job: &Job, state: spur_core::job::JobState, exit_code: i32) -> Self {
+        let (reason, reason_detail) = job.end_reason(state);
+        let ended_by = job.ended_by(reason);
+        Self {
+            job_id: job.job_id,
+            metadata: Some(JobMetadata::for_job(job)),
+            state: state.display().to_owned(),
+            exit_code,
+            end_time: job.end_time.unwrap_or_else(Utc::now),
+            exit_signal: job.exit_signal,
+            derived_exit_code: job.derived_exit_code,
+            preempted_by: job.preempted_by,
+            preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
+            preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
+            reason: Some(reason),
+            reason_detail: reason_detail.unwrap_or_default(),
+            ended_by: ended_by.map(|c| c.user.clone()).unwrap_or_default(),
+            ended_by_uid: ended_by.and_then(|c| c.uid),
+        }
+    }
+}
+
 /// Record a job completion in the database. See `record_job_start` for why
 /// this takes a `&mut PgConnection` rather than a `&PgPool`.
 pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyhow::Result<()> {
-    let unstarted = rec.unstarted.as_ref();
-    // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
+    let metadata = rec.metadata.as_ref();
+    let mut tx = conn.begin().await?;
+    lock_accounting_job(&mut tx, rec.job_id).await?;
+    if let Some(metadata) = metadata {
+        record_run_usage(&mut tx, rec, metadata).await?;
+    }
     let row = sqlx::query(
         r#"
         INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code,
                           preempted_by, preempt_mode, preempt_qos, reason, reason_detail,
                           ended_by, ended_by_uid, name, account, partition_name, qos,
                           num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb,
-                          submit_time, reservation, time_limit_secs)
+                          submit_time, reservation, time_limit_secs, start_time, nodelist, idle_fill, run_attempt, accounting_phase, usage_recorded)
         VALUES ($1, COALESCE($15, ''), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                 COALESCE($14, ''), COALESCE($16, ''), COALESCE($17, ''), COALESCE($18, ''),
                 COALESCE($19, 1), COALESCE($20, 1), COALESCE($21, 1), COALESCE($22, 0),
-                COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26)
+                COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26, $27,
+                COALESCE($28, ''), COALESCE($29, FALSE), $30,
+                CASE WHEN $27 IS NULL THEN 3 ELSE 2 END, $27 IS NOT NULL)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
@@ -506,11 +576,20 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
             submit_time = COALESCE($24, jobs.submit_time),
             reservation = COALESCE($25, jobs.reservation),
             time_limit_secs = CASE WHEN $14 IS NOT NULL THEN $26 ELSE jobs.time_limit_secs END,
-            start_time = CASE WHEN $14 IS NOT NULL THEN NULL ELSE jobs.start_time END,
-            nodelist = CASE WHEN $14 IS NOT NULL THEN '' ELSE jobs.nodelist END,
-            idle_fill = CASE WHEN $14 IS NOT NULL THEN FALSE ELSE jobs.idle_fill END,
-            usage_recorded = CASE WHEN $14 IS NOT NULL THEN FALSE ELSE jobs.usage_recorded END
-        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
+            start_time = CASE WHEN $14 IS NOT NULL THEN $27 ELSE jobs.start_time END,
+            nodelist = CASE WHEN $14 IS NOT NULL THEN $28 ELSE jobs.nodelist END,
+            idle_fill = CASE WHEN $14 IS NOT NULL THEN $29 ELSE jobs.idle_fill END,
+            usage_recorded = CASE WHEN $14 IS NOT NULL THEN $27 IS NOT NULL ELSE jobs.usage_recorded END,
+            run_attempt = COALESCE($30, jobs.run_attempt),
+            accounting_phase = CASE WHEN $30 IS NOT NULL THEN EXCLUDED.accounting_phase ELSE jobs.accounting_phase END
+        WHERE $30 IS NULL
+           OR (jobs.run_attempt IS NULL AND (jobs.user_name = ''
+               OR jobs.submit_time < EXCLUDED.submit_time
+               OR (jobs.submit_time = EXCLUDED.submit_time
+                   AND COALESCE(jobs.end_time, jobs.start_time) <= EXCLUDED.end_time)))
+           OR (jobs.submit_time, jobs.run_attempt, jobs.accounting_phase, COALESCE(jobs.end_time, jobs.start_time))
+              <= (EXCLUDED.submit_time, EXCLUDED.run_attempt, EXCLUDED.accounting_phase, EXCLUDED.end_time)
+        RETURNING user_name, account, submit_time, run_attempt, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
         "#,
     )
     .bind(rec.job_id as i64)
@@ -526,23 +605,32 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     .bind(&rec.reason_detail)
     .bind(&rec.ended_by)
     .bind(rec.ended_by_uid.map(i64::from))
-    .bind(unstarted.map(|job| &job.name))
-    .bind(unstarted.map(|job| &job.user))
-    .bind(unstarted.map(|job| &job.account))
-    .bind(unstarted.map(|job| &job.partition))
-    .bind(unstarted.map(|job| &job.qos))
-    .bind(unstarted.map(|job| job.num_nodes as i32))
-    .bind(unstarted.map(|job| job.num_tasks as i32))
-    .bind(unstarted.map(|job| job.cpus_per_task as i32))
-    .bind(unstarted.map(|job| job.total_gpus as i32))
-    .bind(unstarted.map(|job| job.memory_mb as i64))
-    .bind(unstarted.map(|job| job.submit_time))
-    .bind(unstarted.map(|job| &job.reservation))
-    .bind(unstarted.and_then(|job| job.time_limit_secs))
-    .fetch_one(&mut *conn)
+    .bind(metadata.map(|job| &job.name))
+    .bind(metadata.map(|job| &job.user))
+    .bind(metadata.map(|job| &job.account))
+    .bind(metadata.map(|job| &job.partition))
+    .bind(metadata.map(|job| &job.qos))
+    .bind(metadata.map(|job| job.num_nodes as i32))
+    .bind(metadata.map(|job| job.num_tasks as i32))
+    .bind(metadata.map(|job| job.cpus_per_task as i32))
+    .bind(metadata.map(|job| job.total_gpus as i32))
+    .bind(metadata.map(|job| job.memory_mb as i64))
+    .bind(metadata.map(|job| job.submit_time))
+    .bind(metadata.map(|job| &job.reservation))
+    .bind(metadata.and_then(|job| job.time_limit_secs))
+    .bind(metadata.and_then(|job| job.start_time))
+    .bind(metadata.map(|job| &job.nodelist))
+    .bind(metadata.map(|job| job.idle_fill))
+    .bind(metadata.map(|job| i64::from(job.run_attempt)))
+    .fetch_optional(&mut *tx)
     .await?;
 
-    update_usage(conn, row, rec.end_time, rec.job_id as i64).await?;
+    if metadata.is_none() {
+        if let Some(row) = row {
+            update_usage(&mut tx, row, rec.end_time, rec.job_id as i64).await?;
+        }
+    }
+    tx.commit().await?;
 
     Ok(())
 }
@@ -550,6 +638,7 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
 /// A job row's accounting state, as seen by the reconciliation pass.
 pub struct AccountingRowState {
     pub state: String,
+    pub run_attempt: Option<u32>,
     /// An end-only row needs its submission backfilled even if the state matches.
     pub missing_metadata: bool,
     pub has_start_time: bool,
@@ -568,7 +657,7 @@ pub async fn job_accounting_states(
     }
     let stored: Vec<i64> = job_ids.iter().map(|&id| id as i64).collect();
     let rows = sqlx::query(
-        "SELECT job_id, state, user_name, start_time, total_gpus FROM jobs WHERE job_id = ANY($1)",
+        "SELECT job_id, state, user_name, start_time, total_gpus, run_attempt FROM jobs WHERE job_id = ANY($1)",
     )
     .bind(&stored)
     .fetch_all(pool)
@@ -583,6 +672,7 @@ pub async fn job_accounting_states(
             let total_gpus = r.get::<i32, _>("total_gpus").max(0) as u32;
             let row = AccountingRowState {
                 state: r.get("state"),
+                run_attempt: r.get::<Option<i64>, _>("run_attempt").map(|n| n as u32),
                 missing_metadata: user_name.is_empty(),
                 has_start_time: start_time.is_some(),
                 total_gpus,
@@ -625,18 +715,121 @@ async fn update_usage(
         return Ok(());
     }
 
-    let num_tasks: i32 = row.get("num_tasks");
-    let cpus_per_task: i32 = row.get("cpus_per_task");
-    let total_gpus: i32 = row.get("total_gpus");
-    let qos_name: String = row.get("qos");
+    if let Some(attempt) = row.get::<Option<i64>, _>("run_attempt") {
+        let claimed = sqlx::query(
+            "INSERT INTO job_usage_runs (job_id, submit_time, run_attempt, start_time)
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(job_id)
+        .bind(row.get::<DateTime<Utc>, _>("submit_time"))
+        .bind(attempt)
+        .bind(start_time)
+        .execute(&mut *conn)
+        .await?;
+        if claimed.rows_affected() == 0 {
+            return Ok(());
+        }
+    }
 
+    add_usage(
+        conn,
+        &UsageCharge {
+            user: &user,
+            account: &account,
+            start_time,
+            num_tasks: row.get("num_tasks"),
+            cpus_per_task: row.get("cpus_per_task"),
+            total_gpus: row.get("total_gpus"),
+            qos_name: row.get::<String, _>("qos").as_str(),
+        },
+        end_time,
+    )
+    .await
+}
+
+struct UsageCharge<'a> {
+    user: &'a str,
+    account: &'a str,
+    start_time: DateTime<Utc>,
+    num_tasks: i32,
+    cpus_per_task: i32,
+    total_gpus: i32,
+    qos_name: &'a str,
+}
+
+async fn record_run_usage(
+    conn: &mut PgConnection,
+    rec: &JobEndRecord,
+    metadata: &JobMetadata,
+) -> anyhow::Result<()> {
+    let Some(start_time) = metadata.start_time else {
+        return Ok(());
+    };
+    if metadata.idle_fill && rec.state == "PREEMPTED" {
+        return Ok(());
+    }
+    // Old start notifications used delivery time, potentially later than the
+    // controller's start, so pre-upgrade charges are matched within the run.
+    let already_charged: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM job_usage_runs WHERE job_id = $1 AND submit_time = $2
+         AND run_attempt IS NULL AND start_time >= $3 AND start_time <= $4)",
+    )
+    .bind(i64::from(rec.job_id))
+    .bind(metadata.submit_time)
+    .bind(start_time)
+    .bind(rec.end_time)
+    .fetch_one(&mut *conn)
+    .await?;
+    let claimed = sqlx::query(
+        "INSERT INTO job_usage_runs (job_id, submit_time, run_attempt, start_time) VALUES ($1, $2, $3, $4)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(i64::from(rec.job_id))
+    .bind(metadata.submit_time)
+    .bind(i64::from(metadata.run_attempt))
+    .bind(start_time)
+    .execute(&mut *conn)
+    .await?;
+    if already_charged || claimed.rows_affected() == 0 {
+        return Ok(());
+    }
+    add_usage(
+        conn,
+        &UsageCharge {
+            user: &metadata.user,
+            account: &metadata.account,
+            start_time,
+            num_tasks: metadata.num_tasks as i32,
+            cpus_per_task: metadata.cpus_per_task as i32,
+            total_gpus: metadata.total_gpus as i32,
+            qos_name: &metadata.qos,
+        },
+        rec.end_time,
+    )
+    .await
+}
+
+async fn add_usage(
+    conn: &mut PgConnection,
+    charge: &UsageCharge<'_>,
+    end_time: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let UsageCharge {
+        user,
+        account,
+        start_time,
+        num_tasks,
+        cpus_per_task,
+        total_gpus,
+        qos_name,
+    } = *charge;
     let duration_secs = (end_time - start_time).num_seconds().max(0);
     let cpu_seconds = duration_secs * (num_tasks as i64) * (cpus_per_task as i64);
     let gpu_seconds = duration_secs * (total_gpus as i64);
 
     let usage_factor: f64 = if !qos_name.is_empty() {
         sqlx::query_scalar("SELECT usage_factor FROM qos WHERE name = $1")
-            .bind(&qos_name)
+            .bind(qos_name)
             .fetch_optional(&mut *conn)
             .await?
             .map(|v: f32| (v as f64).clamp(0.0, 1000.0))
@@ -651,7 +844,7 @@ async fn update_usage(
     let period_start = start_time
         .date_naive()
         .and_hms_opt(start_time.hour(), 0, 0)
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("invalid accounting period start"))?
         .and_utc();
     let period_end = period_start + chrono::Duration::hours(1);
 
@@ -665,8 +858,8 @@ async fn update_usage(
             job_count = usage.job_count + 1
         "#,
     )
-    .bind(&user)
-    .bind(&account)
+    .bind(user)
+    .bind(account)
     .bind(period_start)
     .bind(period_end)
     .bind(cpu_seconds)
@@ -1923,6 +2116,7 @@ mod job_history_tests {
             &mut conn,
             &JobStartRecord {
                 job_id,
+                run_attempt: None,
                 name: name.to_string(),
                 user: user.to_string(),
                 account: account.to_string(),
@@ -1981,7 +2175,7 @@ mod job_history_tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
-            unstarted: None,
+            metadata: None,
         }
     }
 
@@ -1999,6 +2193,7 @@ mod job_history_tests {
             conn,
             &JobStartRecord {
                 job_id,
+                run_attempt: None,
                 name: "fixture".to_string(),
                 user: "root".to_string(),
                 account: String::new(),
@@ -2021,6 +2216,247 @@ mod job_history_tests {
         if let Some(end_time) = end {
             record_job_end(conn, &end_record(job_id, "COMPLETED", end_time)).await?;
         }
+        Ok(())
+    }
+
+    fn run_fixture(job_id: JobId, attempt: u32) -> Job {
+        let submit = DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut job = Job::new(
+            job_id,
+            spur_core::job::JobSpec {
+                name: "ordered-accounting".into(),
+                user: format!("ordered-{job_id}"),
+                account: Some("ordered".into()),
+                num_tasks: 2,
+                cpus_per_task: 3,
+                ..Default::default()
+            },
+        );
+        job.submit_time = submit;
+        job.run_attempt = attempt;
+        job.start_time = Some(submit + Duration::minutes(i64::from(attempt)));
+        job.end_time = Some(job.start_time.unwrap() + Duration::seconds(10));
+        job.state = spur_core::job::JobState::Completed;
+        job
+    }
+
+    async fn assert_run_usage(conn: &mut PgConnection, job: &Job, runs: i64) -> anyhow::Result<()> {
+        let row = sqlx::query("SELECT COALESCE(SUM(cpu_seconds),0)::BIGINT AS cpu, COALESCE(SUM(job_count),0)::BIGINT AS count FROM usage WHERE user_name = $1")
+            .bind(&job.spec.user).fetch_one(conn).await?;
+        assert_eq!(row.get::<i64, _>("cpu"), runs * 60);
+        assert_eq!(row.get::<i64, _>("count"), runs);
+        Ok(())
+    }
+
+    async fn assert_current_run(conn: &mut PgConnection, job: &Job) -> anyhow::Result<()> {
+        let row = sqlx::query("SELECT state, run_attempt, start_time, end_time, usage_recorded FROM jobs WHERE job_id = $1")
+            .bind(i64::from(job.job_id)).fetch_one(conn).await?;
+        assert_eq!(row.get::<String, _>("state"), job.state.display());
+        assert_eq!(row.get::<i64, _>("run_attempt"), i64::from(job.run_attempt));
+        assert_eq!(
+            row.get::<Option<DateTime<Utc>>, _>("start_time"),
+            job.start_time
+        );
+        assert_eq!(
+            row.get::<Option<DateTime<Utc>>, _>("end_time"),
+            job.end_time
+        );
+        assert_eq!(
+            row.get::<bool, _>("usage_recorded"),
+            job.start_time.is_some()
+        );
+        Ok(())
+    }
+
+    fn cancelled_between_runs(job: &Job) -> Job {
+        let mut cancelled = job.clone();
+        cancelled.start_time = None;
+        cancelled.end_time = job.end_time.map(|t| t + Duration::seconds(1));
+        cancelled.state = spur_core::job::JobState::Cancelled;
+        cancelled
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn delayed_pending_cancel_cannot_erase_or_recharge_a_newer_run() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let previous = run_fixture(9_800_401, 1);
+        let cancelled = cancelled_between_runs(&previous);
+        let latest = run_fixture(previous.job_id, 2);
+        let previous_end = JobEndRecord::for_job(&previous, previous.state, 0);
+        let latest_end = JobEndRecord::for_job(&latest, latest.state, 0);
+        record_job_end(&mut tx, &previous_end).await?;
+        record_job_end(&mut tx, &latest_end).await?;
+        record_job_end(
+            &mut tx,
+            &JobEndRecord::for_job(&cancelled, cancelled.state, -1),
+        )
+        .await?;
+        record_job_end(&mut tx, &latest_end).await?;
+        record_job_end(&mut tx, &previous_end).await?;
+        assert_current_run(&mut tx, &latest).await?;
+        assert_run_usage(&mut tx, &latest, 2).await?;
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn pending_cancel_before_previous_end_preserves_previous_usage() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let previous = run_fixture(9_800_402, 1);
+        start_run_fixture(&mut tx, &previous, Some(previous.run_attempt)).await?;
+        let cancelled = cancelled_between_runs(&previous);
+        let previous_end = JobEndRecord::for_job(&previous, previous.state, 0);
+        record_job_end(
+            &mut tx,
+            &JobEndRecord::for_job(&cancelled, cancelled.state, -1),
+        )
+        .await?;
+        assert_run_usage(&mut tx, &previous, 0).await?;
+        record_job_end(&mut tx, &previous_end).await?;
+        record_job_end(&mut tx, &previous_end).await?;
+        assert_current_run(&mut tx, &cancelled).await?;
+        assert_run_usage(&mut tx, &previous, 1).await?;
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    async fn start_run_fixture(
+        conn: &mut PgConnection,
+        job: &Job,
+        attempt: Option<u32>,
+    ) -> anyhow::Result<()> {
+        record_job_start(
+            conn,
+            &JobStartRecord {
+                job_id: job.job_id,
+                run_attempt: attempt,
+                name: job.spec.name.clone(),
+                user: job.spec.user.clone(),
+                account: "ordered".into(),
+                partition: String::new(),
+                qos: String::new(),
+                num_nodes: 1,
+                num_tasks: 2,
+                cpus_per_task: 3,
+                total_gpus: 0,
+                memory_mb: 0,
+                submit_time: job.submit_time,
+                start_time: job.start_time.unwrap(),
+                reservation: None,
+                nodelist: String::new(),
+                idle_fill: false,
+                time_limit_secs: None,
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn delayed_start_cannot_replace_a_finalized_run() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = run_fixture(9_800_403, 1);
+        record_job_end(&mut tx, &JobEndRecord::for_job(&job, job.state, 0)).await?;
+        start_run_fixture(&mut tx, &job, Some(job.run_attempt)).await?;
+        assert_current_run(&mut tx, &job).await?;
+        assert_run_usage(&mut tx, &job, 1).await?;
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn upgrading_a_charged_legacy_run_does_not_charge_again() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = run_fixture(9_800_404, 1);
+        start_run_fixture(&mut tx, &job, None).await?;
+        record_job_end(
+            &mut tx,
+            &end_record(job.job_id, "COMPLETED", job.end_time.unwrap()),
+        )
+        .await?;
+        assert_run_usage(&mut tx, &job, 1).await?;
+        record_job_end(&mut tx, &JobEndRecord::for_job(&job, job.state, 0)).await?;
+        record_job_end(&mut tx, &JobEndRecord::for_job(&job, job.state, 0)).await?;
+        assert_run_usage(&mut tx, &job, 1).await?;
+        assert_current_run(&mut tx, &job).await?;
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn cancellation_preserves_a_legacy_charge_for_delayed_repair() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = run_fixture(9_800_405, 1);
+        start_run_fixture(&mut tx, &job, None).await?;
+        record_job_end(
+            &mut tx,
+            &end_record(job.job_id, "COMPLETED", job.end_time.unwrap()),
+        )
+        .await?;
+        let cancelled = cancelled_between_runs(&job);
+        record_job_end(
+            &mut tx,
+            &JobEndRecord::for_job(&cancelled, cancelled.state, -1),
+        )
+        .await?;
+        record_job_end(&mut tx, &JobEndRecord::for_job(&job, job.state, 0)).await?;
+        assert_current_run(&mut tx, &cancelled).await?;
+        assert_run_usage(&mut tx, &job, 1).await?;
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn failed_usage_write_rolls_back_the_run_claim_and_job_row() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = run_fixture(9_800_406, 1);
+        sqlx::query("INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count)
+            VALUES ($1, 'ordered', $2, $2 + INTERVAL '1 hour', 9223372036854775807, 0, 0)")
+            .bind(&job.spec.user).bind(job.submit_time).execute(&mut *tx).await?;
+        let rec = JobEndRecord::for_job(&job, job.state, 0);
+        assert!(record_job_end(&mut tx, &rec).await.is_err());
+        let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM jobs WHERE job_id=$1), (SELECT COUNT(*) FROM job_usage_runs WHERE job_id=$1)")
+            .bind(i64::from(job.job_id)).fetch_one(&mut *tx).await?;
+        assert_eq!(counts, (0, 0));
+        sqlx::query("UPDATE usage SET cpu_seconds=0 WHERE user_name=$1")
+            .bind(&job.spec.user)
+            .execute(&mut *tx)
+            .await?;
+        record_job_end(&mut tx, &rec).await?;
+        assert_run_usage(&mut tx, &job, 1).await?;
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn legacy_end_of_a_versioned_run_does_not_double_charge() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = run_fixture(9_800_407, 1);
+        start_run_fixture(&mut tx, &job, Some(job.run_attempt)).await?;
+        record_job_end(
+            &mut tx,
+            &end_record(job.job_id, "COMPLETED", job.end_time.unwrap()),
+        )
+        .await?;
+        record_job_end(&mut tx, &JobEndRecord::for_job(&job, job.state, 0)).await?;
+        assert_run_usage(&mut tx, &job, 1).await?;
+        assert_current_run(&mut tx, &job).await?;
+        tx.rollback().await?;
         Ok(())
     }
 
@@ -2301,6 +2737,7 @@ mod job_history_tests {
         let t0 = Utc::now() - Duration::hours(1);
         let record = |nodelist: &str| JobStartRecord {
             job_id: id,
+            run_attempt: None,
             name: "nodelist".to_string(),
             user: format!("spur_nodelist_{}", std::process::id()),
             account: String::new(),
@@ -4350,6 +4787,7 @@ mod job_history_tests {
             &mut conn,
             &JobStartRecord {
                 job_id: timed,
+                run_attempt: None,
                 name: "timed".to_string(),
                 user: "karma-test".to_string(),
                 account: String::new(),
@@ -4376,6 +4814,7 @@ mod job_history_tests {
             &mut conn,
             &JobStartRecord {
                 job_id: unlimited,
+                run_attempt: None,
                 name: "unlimited".to_string(),
                 user: "karma-test".to_string(),
                 account: String::new(),

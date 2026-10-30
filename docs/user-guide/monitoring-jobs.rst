@@ -580,6 +580,14 @@ older controllers are repaired by accounting reconciliation while the job is
 still retained by the controller; records already evicted cannot be reconstructed
 from accounting alone.
 
+Accounting notifications from the controller identify the submission and run
+attempt. Delayed notifications and reconciliation cannot replace a newer run's
+record, and usage charges are retained per run even when the latest job record
+is a cancellation before its next start. The database upgrade adds accounting
+columns and a usage ledger automatically. Older controllers and legacy external
+accounting RPCs do not carry run identities and retain their existing ordering
+limitations.
+
 Time arguments accept an absolute date (``YYYY-MM-DD`` or
 ``YYYY-MM-DDTHH:MM:SS``) or a relative offset (``now-7days``, ``now-6hours``).
 

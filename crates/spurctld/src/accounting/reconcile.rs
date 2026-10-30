@@ -116,12 +116,7 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
     );
 
     for job in candidates.iter().filter(|j| stale.contains(&j.job_id)) {
-        let row = accounting_states.get(&job.job_id);
-        let row_missing = row.is_none();
-        let missing_metadata = row
-            .map(|r| needs_metadata_backfill(job, r))
-            .unwrap_or(false);
-        resync_job(pool, job, row_missing, missing_metadata).await;
+        resync_job(pool, job).await;
     }
 }
 
@@ -132,6 +127,9 @@ fn is_accounted_job(job: &Job) -> bool {
 fn needs_metadata_backfill(job: &Job, row: &AccountingRowState) -> bool {
     let expected_gpus = spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32;
     row.missing_metadata
+        || row
+            .run_attempt
+            .is_some_and(|attempt| attempt != job.run_attempt)
         || (job.start_time.is_some() != row.has_start_time)
         || (expected_gpus > 0 && row.total_gpus == 0)
 }
@@ -180,14 +178,12 @@ fn jobs_needing_resync(
 
 /// Keep metadata repair and finalization atomic so a failed end write cannot
 /// leave a finished job appearing to run or charge usage for a partial repair.
-async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, missing_metadata: bool) {
-    // A never-started job must be repaired without inventing an execution start.
-    let needs_start = row_missing || missing_metadata || !job.state.is_finalized();
+async fn resync_job(pool: &PgPool, job: &Job) {
     let is_finalized = job.state.is_finalized();
 
     let attempt = async {
         let mut tx = pool.begin().await?;
-        if needs_start && job.start_time.is_some() {
+        if !is_finalized && job.start_time.is_some() {
             write_start(&mut tx, job).await?;
         }
         if is_finalized {
@@ -225,6 +221,7 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
         conn,
         &db::JobStartRecord {
             job_id: job.job_id,
+            run_attempt: Some(job.run_attempt),
             name: spec.name.clone(),
             user: spec.user.clone(),
             account: spec.account.clone().unwrap_or_default(),
@@ -251,26 +248,9 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
 
 async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<()> {
     let state = accounting_state(job);
-    let (reason, reason_detail) = job.end_reason(state);
-    let ended_by = job.ended_by(reason);
     db::record_job_end(
         conn,
-        &db::JobEndRecord {
-            job_id: job.job_id,
-            unstarted: db::UnstartedJobRecord::for_job(job),
-            state: state.display().to_owned(),
-            exit_code: job.exit_code.unwrap_or(0),
-            end_time: job.end_time.unwrap_or_else(Utc::now),
-            exit_signal: job.exit_signal,
-            derived_exit_code: job.derived_exit_code,
-            preempted_by: job.preempted_by,
-            preempt_mode: job.preempt_mode.clone().unwrap_or_default(),
-            preempt_qos: job.preempt_qos.clone().unwrap_or_default(),
-            reason: Some(reason),
-            reason_detail: reason_detail.unwrap_or_default(),
-            ended_by: ended_by.map(|c| c.user.clone()).unwrap_or_default(),
-            ended_by_uid: ended_by.and_then(|c| c.uid),
-        },
+        &db::JobEndRecord::for_job(job, state, job.exit_code.unwrap_or(0)),
     )
     .await
 }
@@ -284,6 +264,7 @@ mod tests {
     fn synced_row(state: &str) -> AccountingRowState {
         AccountingRowState {
             state: state.to_string(),
+            run_attempt: Some(0),
             missing_metadata: false,
             has_start_time: true,
             total_gpus: 0,
@@ -332,6 +313,17 @@ mod tests {
         job.start_time = None;
         row.has_start_time = true;
         assert!(needs_metadata_backfill(&job, &row));
+    }
+
+    #[test]
+    fn reconciliation_detects_a_different_run_with_the_same_state() {
+        let mut job = test_job(1, JobState::Completed);
+        job.run_attempt = 2;
+        let mut row = synced_row("COMPLETED");
+        row.run_attempt = Some(1);
+        assert!(needs_metadata_backfill(&job, &row));
+        row.run_attempt = Some(2);
+        assert!(!needs_metadata_backfill(&job, &row));
     }
 
     #[test]
@@ -394,6 +386,7 @@ mod tests {
         accounting.insert(
             1,
             AccountingRowState {
+                run_attempt: Some(0),
                 state: "COMPLETED".to_string(),
                 missing_metadata: true,
                 has_start_time: false,
@@ -574,7 +567,7 @@ mod tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
-            unstarted: None,
+            metadata: None,
         }
     }
 
@@ -583,6 +576,87 @@ mod tests {
             .bind(job_id as i64)
             .execute(pool)
             .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn reconciliation_preserves_usage_across_out_of_order_runs() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let job_id = 9_800_408;
+        let user = "reconcile-run-order";
+        for sql in [
+            "DELETE FROM jobs WHERE job_id=$1",
+            "DELETE FROM job_usage_runs WHERE job_id=$1",
+        ] {
+            sqlx::query(sql)
+                .bind(i64::from(job_id))
+                .execute(&pool)
+                .await?;
+        }
+        sqlx::query("DELETE FROM usage WHERE user_name=$1")
+            .bind(user)
+            .execute(&pool)
+            .await?;
+        let submit =
+            chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")?.with_timezone(&Utc);
+        let mut previous = Job::new(
+            job_id,
+            JobSpec {
+                user: user.into(),
+                num_tasks: 2,
+                cpus_per_task: 3,
+                ..Default::default()
+            },
+        );
+        previous.submit_time = submit;
+        previous.start_time = Some(submit + chrono::Duration::minutes(1));
+        previous.end_time = Some(submit + chrono::Duration::seconds(70));
+        previous.run_attempt = 1;
+        previous.state = JobState::Completed;
+        let mut cancelled = previous.clone();
+        cancelled.state = JobState::Cancelled;
+        cancelled.start_time = None;
+        cancelled.end_time = Some(submit + chrono::Duration::seconds(71));
+        resync_job(&pool, &cancelled).await;
+        resync_job(&pool, &previous).await;
+        let mut latest = previous.clone();
+        latest.run_attempt = 2;
+        latest.start_time = Some(submit + chrono::Duration::minutes(2));
+        latest.end_time = Some(submit + chrono::Duration::seconds(130));
+        resync_job(&pool, &latest).await;
+        resync_job(&pool, &cancelled).await;
+        resync_job(&pool, &latest).await;
+        let row = sqlx::query("SELECT state, start_time, run_attempt FROM jobs WHERE job_id=$1")
+            .bind(i64::from(job_id))
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.get::<String, _>("state"), "COMPLETED");
+        assert_eq!(
+            row.get::<Option<chrono::DateTime<Utc>>, _>("start_time"),
+            latest.start_time
+        );
+        assert_eq!(row.get::<i64, _>("run_attempt"), 2);
+        let usage: (i64, i64) = sqlx::query_as(
+            "SELECT SUM(cpu_seconds)::BIGINT, SUM(job_count)::BIGINT FROM usage WHERE user_name=$1",
+        )
+        .bind(user)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(usage, (120, 2));
+        for sql in [
+            "DELETE FROM jobs WHERE job_id=$1",
+            "DELETE FROM job_usage_runs WHERE job_id=$1",
+        ] {
+            sqlx::query(sql)
+                .bind(i64::from(job_id))
+                .execute(&pool)
+                .await?;
+        }
+        sqlx::query("DELETE FROM usage WHERE user_name=$1")
+            .bind(user)
+            .execute(&pool)
+            .await?;
+        Ok(())
     }
 
     // End to end: simulate record_job_start's retries exhausting (only
@@ -621,7 +695,7 @@ mod tests {
         let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
         assert_eq!(stale, vec![job_id]);
 
-        resync_job(&pool, &job, false, true).await;
+        resync_job(&pool, &job).await;
 
         let row = sqlx::query("SELECT user_name, start_time, state FROM jobs WHERE job_id = $1")
             .bind(job_id as i64)
@@ -667,7 +741,7 @@ mod tests {
         // Its own user, so the usage cleanup below cannot race the backfill test's.
         job.spec.user = format!("spur_reconcile_preempt_{}", std::process::id());
 
-        resync_job(&pool, &job, true, false).await;
+        resync_job(&pool, &job).await;
 
         let state: String = sqlx::query("SELECT state FROM jobs WHERE job_id = $1")
             .bind(job_id as i64)
@@ -694,7 +768,7 @@ mod tests {
         delete_job(&pool, job_id).await;
 
         let running_job = test_job(job_id, JobState::Running);
-        resync_job(&pool, &running_job, true, false).await;
+        resync_job(&pool, &running_job).await;
 
         let suspended_job = test_job(job_id, JobState::Suspended);
         let row = db::job_accounting_states(&pool, &[job_id])
@@ -745,6 +819,7 @@ mod tests {
                 &mut conn,
                 &db::JobStartRecord {
                     job_id,
+                    run_attempt: None,
                     name: job.spec.name.clone(),
                     user: job.spec.user.clone(),
                     account: String::new(),
@@ -771,10 +846,11 @@ mod tests {
             .await?;
         }
 
-        // Run write_start (the real function resync_job calls) inside a
-        // transaction of our own, the same way resync_job's fix does.
+        let mut next_run = job.clone();
+        next_run.run_attempt += 1;
+        next_run.start_time = Some(job.end_time.unwrap() + chrono::Duration::seconds(1));
         let mut tx = pool.begin().await?;
-        write_start(&mut tx, &job).await?;
+        write_start(&mut tx, &next_run).await?;
 
         // Within the uncommitted transaction, the row is now exactly the
         // corrupted shape the pre-fix bug used to leave committed: RUNNING
