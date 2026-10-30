@@ -269,11 +269,12 @@ async fn main() -> anyhow::Result<()> {
             else {
                 continue;
             };
-            // Failed probes and not-responding flags from another term were
-            // judged by another leadership.
+            // Failed probes, not-responding flags, and recovery holds from
+            // another term were judged by another leadership.
             if liveness_term != Some(live_term) {
                 liveness.reset();
                 health_cluster.clear_not_responding();
+                health_cluster.reset_recovery_holds();
                 liveness_term = Some(live_term);
             }
             let evicted = liveness
