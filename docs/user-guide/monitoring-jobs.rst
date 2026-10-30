@@ -570,7 +570,23 @@ is leader keeps the reason of its previous run, and a run the older controller
 force-finished reads ``NonZeroExitCode`` rather than ``CompletingTimeout``.
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
-NNodes ExitCode``.
+NNodes ExitCode Reason``. Use ``--brief`` for just ``JobID State ExitCode`` or
+``--format`` to select a fixed set of columns for scripts.
+
+Jobs cancelled or expired before their first start retain their submitted name,
+user, account, partition, and requested resources in accounting. Their ``Start``
+remains ``Unknown`` and they accrue no execution usage. Incomplete records from
+older controllers are repaired by accounting reconciliation while the job is
+still retained by the controller; records already evicted cannot be reconstructed
+from accounting alone.
+
+Accounting notifications from the controller identify the submission and run
+attempt. Delayed notifications and reconciliation cannot replace a newer run's
+record, and usage charges are retained per run even when the latest job record
+is a cancellation before its next start. The database upgrade adds accounting
+columns and a usage ledger automatically. Older controllers and legacy external
+accounting RPCs do not carry run identities and retain their existing ordering
+limitations.
 
 Time arguments accept an absolute date (``YYYY-MM-DD`` or
 ``YYYY-MM-DDTHH:MM:SS``) or a relative offset (``now-7days``, ``now-6hours``).

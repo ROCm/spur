@@ -308,6 +308,7 @@ impl SlurmAccounting for AccountingService {
             &mut conn,
             &db::JobStartRecord {
                 job_id: req.job_id,
+                run_attempt: None,
                 name: req.name,
                 user: req.user,
                 account: req.account,
@@ -365,6 +366,7 @@ impl SlurmAccounting for AccountingService {
             &mut tx,
             &db::JobEndRecord {
                 job_id: req.job_id,
+                metadata: None,
                 state: state_str.to_string(),
                 exit_code: req.exit_code,
                 end_time,

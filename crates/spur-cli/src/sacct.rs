@@ -93,7 +93,7 @@ impl SacctArgs {
     }
 }
 
-const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
+const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %18r";
 const SACCT_LONG_FORMAT: &str =
     "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q %18r";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
@@ -412,6 +412,25 @@ mod tests {
     #[test]
     fn long_format_ends_with_reason() {
         assert!(SACCT_LONG_FORMAT.ends_with("%18r"));
+    }
+
+    #[test]
+    fn default_output_identifies_cancellation_causes() {
+        let args = SacctArgs::try_parse_from(["sacct"]).unwrap();
+        let fields = format_engine::parse_format(SACCT_DEFAULT_FORMAT, &sacct_header);
+        for reason in [
+            "UserCancel",
+            "AdminCancel",
+            "SystemCancel",
+            "Preempted",
+            "Cancelled",
+        ] {
+            let mut job = job(-1, 0, 0);
+            job.end_reason = reason.into();
+            let lines = render(args.output_style(), &fields, &[job]);
+            assert_eq!(lines[0].split_whitespace().last(), Some("Reason"));
+            assert_eq!(lines[2].split_whitespace().last(), Some(reason));
+        }
     }
 
     #[test]
