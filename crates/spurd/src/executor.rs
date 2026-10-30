@@ -595,7 +595,6 @@ async fn spawn_job_process(
         ref work_dir,
         ref environment,
         ref stdout_path,
-        ref stderr_path,
         ref stdin_path,
         cpus,
         memory_mb,
@@ -653,7 +652,7 @@ async fn spawn_job_process(
     } else {
         (
             resolve_output_path(cfg, work_dir, stdout_path),
-            resolve_output_path(cfg, work_dir, stderr_path),
+            resolve_stderr_path(cfg, work_dir),
         )
     };
 
@@ -2308,6 +2307,16 @@ pub(crate) fn resolve_output_path(cfg: &JobLaunchConfig, work_dir: &str, pattern
     )
 }
 
+/// Without a stderr path of its own, stderr shares the stdout file, as in Slurm.
+pub(crate) fn resolve_stderr_path(cfg: &JobLaunchConfig, work_dir: &str) -> String {
+    let pattern = if cfg.stderr_path.is_empty() {
+        &cfg.stdout_path
+    } else {
+        &cfg.stderr_path
+    };
+    resolve_output_path(cfg, work_dir, pattern)
+}
+
 /// Launch a containerized job via explicit fork() + container_init().
 ///
 /// The child process does all container setup (namespaces, mounts, pivot_root,
@@ -3804,6 +3813,24 @@ mod tests {
     }
 
     #[test]
+    fn stderr_follows_stdout_unless_set() {
+        let cfg = launch_cfg_for_paths(42, "train", "alice", "node7");
+        assert_eq!(resolve_stderr_path(&cfg, "/work"), "/work/spur-42.out");
+
+        let cfg = JobLaunchConfig {
+            stdout_path: "out-%j.log".into(),
+            ..cfg
+        };
+        assert_eq!(resolve_stderr_path(&cfg, "/work"), "/work/out-42.log");
+
+        let cfg = JobLaunchConfig {
+            stderr_path: "err-%j.log".into(),
+            ..cfg
+        };
+        assert_eq!(resolve_stderr_path(&cfg, "/work"), "/work/err-42.log");
+    }
+
+    #[test]
     fn cgroup_oom_killed_parses_memory_events() {
         let dir = tempfile::tempdir().unwrap();
         // Missing file (no cgroup isolation) -> not OOM.
@@ -4180,6 +4207,38 @@ mod tests {
             captured.contains("SPUR_TEST_OWN_VAR=present"),
             "the launch's own assembled environment must still reach the workload: {captured}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_launch_without_a_stderr_path_writes_stderr_to_the_stdout_file() {
+        let work_dir = tempfile::tempdir().expect("work dir");
+        let cfg = JobLaunchConfig {
+            script: "echo to-stdout\necho to-stderr >&2\n".to_string(),
+            work_dir: work_dir.path().to_string_lossy().into_owned(),
+            stdout_path: "out-%j.log".to_string(),
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            ..launch_cfg_for_paths(90003, "stderr-follows", "u", "node")
+        };
+
+        let mut result = match launch_job(&cfg, None).await {
+            Ok(result) => result,
+            Err(error) => panic!("file launch: {error}"),
+        };
+        match result.job {
+            RunningJob::Managed { ref mut child } => {
+                child.wait().await.expect("wait for the script to finish");
+            }
+            _ => panic!("a non-container file launch must produce a Managed child"),
+        }
+
+        let output = std::fs::read_to_string(work_dir.path().join("out-90003.log"))
+            .expect("read the job's output file");
+        assert!(
+            output.contains("to-stdout") && output.contains("to-stderr"),
+            "stdout and stderr must share the --output file: {output:?}"
+        );
+        assert!(!work_dir.path().join("spur-90003.out").exists());
     }
 
     #[tokio::test]
