@@ -197,6 +197,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .jobs
         .as_deref()
         .map(crate::job_id_arg::parse_job_ids)
+        .transpose()?
         .unwrap_or_default();
 
     // Expand the -w node filter before any network I/O so a bad hostlist
