@@ -22,6 +22,10 @@ pub struct CoreLayout {
     pub gpu_reserved: Vec<GpuReservedCpus>,
     pub general_cpus: Vec<u32>,
     pub daemons_off_spec: bool,
+    /// Node inventory generation this layout was computed under. Not part of
+    /// [`CoreLayout::fingerprint`] (a pure generation bump is not a content
+    /// change); used only to order deliveries for the agent's adoption guard.
+    pub generation: u64,
 }
 
 /// The `[[nodes]]` settings that shape a node's core layout.
@@ -108,6 +112,7 @@ impl CoreLayout {
             gpu_reserved: Vec::new(),
             general_cpus,
             daemons_off_spec: settings.daemons_off_spec,
+            generation: 0,
         }))
     }
 
@@ -291,6 +296,7 @@ impl From<&CoreLayout> for spur_proto::proto::CoreLayout {
                 .collect(),
             general_cpus: l.general_cpus.clone(),
             daemons_off_spec: l.daemons_off_spec,
+            generation: l.generation,
         }
     }
 }
@@ -310,6 +316,7 @@ impl From<spur_proto::proto::CoreLayout> for CoreLayout {
                 .collect(),
             general_cpus: l.general_cpus,
             daemons_off_spec: l.daemons_off_spec,
+            generation: l.generation,
         }
     }
 }

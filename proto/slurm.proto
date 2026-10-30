@@ -76,6 +76,11 @@ message CoreLayout {
   repeated GpuReservedCpus gpu_reserved = 3;
   repeated uint32 general_cpus = 4;
   bool daemons_off_spec = 5;
+  // Node inventory generation this layout was computed under. The agent adopts
+  // a delivered layout only when its generation is not older than the one it
+  // currently holds, so a late launch carrying a stale layout cannot overwrite
+  // a newer one adopted from a registration reply.
+  uint64 generation = 6;
 }
 
 enum JobState {

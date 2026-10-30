@@ -382,6 +382,18 @@ pub struct Node {
     /// Why this node blocked convergence when the cluster went `degraded` (surfaced in status).
     #[serde(default)]
     pub k0s_last_error: Option<String>,
+
+    /// Controller-derived core/memory layout (spec/reserved/general CPU split),
+    /// recomputed from `detected_resources.topology` and the matching
+    /// `NodeConfig`. Derived state, never persisted; absent until the agent has
+    /// reported topology and a layout is computed.
+    #[serde(skip)]
+    pub core_layout: Option<crate::core_layout::CoreLayout>,
+    /// Set when the node's core settings cannot yield a valid layout (spec cores
+    /// exceed the node, topology missing, etc.). Makes the node unschedulable
+    /// with a `core-layout:` reason. Derived state, never persisted.
+    #[serde(skip)]
+    pub layout_error: Option<String>,
 }
 
 fn default_weight() -> u32 {
@@ -426,6 +438,8 @@ impl Node {
             k0s_mesh_ip: None,
             k0s_pod_cidr: None,
             k0s_last_error: None,
+            core_layout: None,
+            layout_error: None,
         }
     }
 
