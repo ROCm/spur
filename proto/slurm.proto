@@ -467,7 +467,7 @@ service SlurmController {
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportStepdRecovery(StepdRecoveryRequest) returns (StepdRecoveryResponse);
-  // Kubernetes credential of a k0s worker for GPU sharing (node label, holds, placeholders).
+  // Kubernetes credential of a k0s worker for GPU sharing (node label, holds).
   rpc GetGpuSharingKubeconfig(GetGpuSharingKubeconfigRequest) returns (GetGpuSharingKubeconfigResponse);
 
   // Admission token management
@@ -948,16 +948,16 @@ message HeartbeatRequest {
 
 enum GpuHoldState {
   GPU_HOLD_FREE = 0;
-  GPU_HOLD_SPUR_JOB = 1;     // a Spur job's placeholder holds it in Kubernetes
-  GPU_HOLD_K8S = 2;          // an allocated ResourceClaim of a non-placeholder pod names it
-  GPU_HOLD_CONFLICT = 3;     // a Spur job uses it but its placeholder lost it to a pod
+  GPU_HOLD_SPUR_JOB = 1;     // a Spur job uses it and no allocated ResourceClaim names it
+  GPU_HOLD_K8S = 2;          // an allocated ResourceClaim names it, and no Spur job other than the claim's owner uses it
+  GPU_HOLD_CONFLICT = 3;     // a Spur job uses it and an allocated ResourceClaim of another owner names it
   GPU_HOLD_UNSHAREABLE = 4;  // not in the Kubernetes ledger (see reason); Spur must not place on it
 }
 
 message GpuHold {
   uint64 stable_id = 1;
   GpuHoldState state = 2;
-  uint32 job_id = 3;          // SPUR_JOB and CONFLICT
+  uint32 job_id = 3;          // SPUR_JOB and CONFLICT: the Spur job on the GPU. K8S: the claim's spur.amd.com/job-id owner, 0 if none
   string pod_namespace = 4;   // K8S and CONFLICT
   string pod_name = 5;
   string claim_name = 6;

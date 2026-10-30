@@ -1236,6 +1236,9 @@ fn gpu_hold_line(hold: &spur_proto::proto::GpuHold) -> String {
     let state = match hold.state() {
         GpuHoldState::GpuHoldFree => "free".to_string(),
         GpuHoldState::GpuHoldSpurJob => format!("job {}", hold.job_id),
+        GpuHoldState::GpuHoldK8s if hold.job_id != 0 => {
+            format!("job {} held {pod} (claim {})", hold.job_id, hold.claim_name)
+        }
         GpuHoldState::GpuHoldK8s => format!("held {pod} (claim {})", hold.claim_name),
         GpuHoldState::GpuHoldConflict => format!("conflict job {} vs {pod}", hold.job_id),
         GpuHoldState::GpuHoldUnshareable => format!("unshareable ({})", hold.reason),
@@ -2840,6 +2843,13 @@ mod tests {
                         ..hold(0x1b_0000, "gpu-3-130", GpuHoldState::GpuHoldK8s)
                     },
                     GpuHold {
+                        job_id: 12,
+                        pod_namespace: "aim".into(),
+                        pod_name: "llama-2".into(),
+                        claim_name: "llama-2-gpu".into(),
+                        ..hold(0x1e_0000, "gpu-5-133", GpuHoldState::GpuHoldK8s)
+                    },
+                    GpuHold {
                         job_id: 7,
                         pod_namespace: "aim".into(),
                         pod_name: "llama-1".into(),
@@ -2861,6 +2871,7 @@ mod tests {
                 "Gpu=0x190000 Device=gpu-1-128 State=free",
                 "Gpu=0x1a0000 Device=gpu-2-129 State=job 42",
                 "Gpu=0x1b0000 Device=gpu-3-130 State=held aim/llama-0 (claim llama-0-gpu)",
+                "Gpu=0x1e0000 Device=gpu-5-133 State=job 12 held aim/llama-2 (claim llama-2-gpu)",
                 "Gpu=0x1c0000 Device=gpu-4-131 State=conflict job 7 vs aim/llama-1",
                 "Gpu=0x1d0000 Device=- State=unshareable (no DRM card for renderD132)",
             ]
