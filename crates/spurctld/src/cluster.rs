@@ -33429,12 +33429,18 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_pty_spec("pty-reaped"));
         start_pty_job(&cm, id, &["n1"], 1);
-        add_pty_step(&cm, id, 0, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
 
         // The InactiveLimit reaper records the run as timed out before its
         // SIGTERM; a shell that dies on it must not read as FAILED 143.
         cm.signal_time_limit(id, Utc::now()).unwrap();
-        let outcome = cm.finish_standalone_pty(id, "n1", 0, 15, 1);
+        let outcome = finish_pty(
+            &cm,
+            PtySessionExit {
+                signal: 15,
+                ..session_exit(id, 0, "n1")
+            },
+        );
         assert!(matches!(outcome, PtyExitOutcome::JobFinished(_)));
         settle(&cm, id, JobState::Timeout);
         assert_eq!(cm.get_job(id).unwrap().exit_code, Some(128 + 15));
