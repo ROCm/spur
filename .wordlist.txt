@@ -378,3 +378,6 @@ NaN
 PromQL
 deduplication
 failovers
+handoff
+handoffs
+preemptors

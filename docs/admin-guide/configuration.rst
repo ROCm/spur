@@ -661,14 +661,32 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    With those policy settings in place, a pending job that cannot find free
    capacity can preempt an eligible lower-QOS job holding the capacity it needs.
 
-   A node freed by a preemption is held for the job that triggered it: while the
-   victim drains and for the cycle it finally frees the node, the preemptor is
-   placed at the front of the pending queue so the backfill scheduler reserves
-   that node for it. A different pending job with a higher effective priority
-   (for instance, a larger fair-share) but no right to evict the victim cannot
-   take the node the preemption just freed. Eviction eligibility is decided on
-   QOS rank alone (allow-list plus ``priority``); fair-share and age order the
-   rest of the queue but neither authorizes nor redirects a preemption.
+   Cancel and requeue preemption hand the freed nodes to the job that
+   triggered the eviction; suspend preemption frees nothing and hands nothing
+   off. While the victims drain, and for at least two scheduling passes after
+   the last one releases its resources, other pending jobs, including competing
+   preemptors, cannot be placed on those nodes. A pass runs every
+   ``interval_secs``, or sooner when a job is submitted, so the post-release
+   window can be well under ``interval_secs``. This protects a multi-node
+   preemptor whose victims finish at different times.
+
+   The handoff is held for the whole node, not only the released resources.
+   On nodes shared by several jobs, capacity left over beside the victim stays
+   unused until the preemptor is placed or the handoff ends.
+
+   A handoff ends when its preemptor starts, is cancelled or held, or is still
+   unplaced after the post-release passes. It is skipped for any pass in which
+   the preemptor is over its QOS group node quota or no longer fits the node. A
+   node in an active reservation is handed off only to a preemptor allowed to
+   use that reservation, and idle-fill reclaim creates no handoff.
+
+   A handoff whose victims are still draining survives a controller restart.
+   Post-release handoffs are kept in controller memory, so a restart or leader
+   change can drop one, or renew it for two more passes (longer if the
+   preemptor still has other victims draining).
+
+   Eviction eligibility uses the QOS allow-list and priority. Fair-share and
+   age only order the queue; they never make a job eligible to preempt.
 
 .. note::
 

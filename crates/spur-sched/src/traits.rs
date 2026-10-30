@@ -30,6 +30,31 @@ pub struct ClusterState<'a> {
     /// Node name -> real time its last currently-running job is expected to
     /// end. Absent entries fall back to a conservative placeholder.
     pub busy_until: &'a HashMap<String, DateTime<Utc>>,
+    /// Node name -> pending preemptor its victims' released capacity is held for.
+    pub preemption_handoffs: &'a HashMap<String, JobId>,
+}
+
+impl ClusterState<'_> {
+    /// Whether `job` may use `node`; reservation rules already shaped who owns its handoff.
+    pub fn handoff_allows(&self, job: &Job, node: &str) -> bool {
+        self.preemption_handoffs
+            .get(node)
+            .is_none_or(|owner| *owner == job.job_id)
+    }
+
+    /// An additive `--nodelist` needs every listed node, so one handed-off node blocks the job.
+    pub fn listed_node_handed_off(
+        &self,
+        job: &Job,
+        placement: &crate::node_match::NodePlacement,
+    ) -> bool {
+        !self.preemption_handoffs.is_empty()
+            && placement.nodelist_is_additive()
+            && self
+                .nodes
+                .iter()
+                .any(|n| placement.is_listed(&n.name) && !self.handoff_allows(job, &n.name))
+    }
 }
 
 /// Trait for pluggable scheduler implementations.

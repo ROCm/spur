@@ -201,6 +201,9 @@ pub enum WalOperation {
         /// When the preempted run ended, distinct from `begin_time`'s future hold.
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Hand the freed nodes to `preempted_by`; false for reclaim and pre-handoff entries.
+        #[serde(default)]
+        handoff: bool,
     },
     /// Preempt a running job with cancel. The job transitions Running →
     /// Preempted → Cancelled: Preempted is reported to accounting so the
@@ -1584,6 +1587,7 @@ mod suspend_wal_tests {
     fn preempt_requeue_op_round_trips() {
         let begin_time = chrono::Utc::now();
         let op = WalOperation::JobPreemptRequeue {
+            handoff: true,
             job_id: 42,
             begin_time,
             preempted_by: Some(7),
@@ -1598,8 +1602,10 @@ mod suspend_wal_tests {
                 begin_time: b,
                 preempted_by,
                 preempt_qos,
+                handoff,
                 ..
             } => {
+                assert!(handoff);
                 assert_eq!(job_id, 42);
                 assert_eq!(b, begin_time);
                 assert_eq!(preempted_by, Some(7));
@@ -1615,13 +1621,29 @@ mod suspend_wal_tests {
             WalOperation::JobPreemptRequeue {
                 preempted_by,
                 preempt_qos,
+                handoff,
                 ..
             } => {
+                assert!(!handoff, "legacy entry hands nothing off");
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn preempt_requeue_legacy_provenance_decodes_without_handoff() {
+        let json = r#"{"JobPreemptRequeue":{"job_id":42,"begin_time":"2026-01-01T00:00:00Z","preempted_by":7,"preempt_qos":"highprio","at":null}}"#;
+        let op: WalOperation = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobPreemptRequeue {
+                preempted_by: Some(7),
+                handoff: false,
+                ..
+            }
+        ));
     }
 
     #[test]
