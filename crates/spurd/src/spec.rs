@@ -13,10 +13,12 @@
 //! rule that a child whose cpuset stops intersecting its parent's *widens*
 //! rather than empties (so a CPU is kept in the root until the last job holding
 //! it exits), and [`mem_decision`] sequences `memory.high` before `memory.max`
-//! so tightening never races a job into the OOM killer. The impure applier that
-//! writes these to `/sys/fs/cgroup/spur` lives alongside the agent.
+//! so tightening never races a job into the OOM killer. [`SpecEnforcer`] holds
+//! the adopted layout and applies it to the real cgroup root.
 
 use std::collections::BTreeSet;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use spur_core::core_layout::CoreLayout;
 
@@ -135,6 +137,127 @@ pub fn daemon_cpuset(layout: &CoreLayout) -> Option<Vec<u32>> {
     Some(root_cpuset(layout))
 }
 
+/// Holds the layout the controller last delivered and applies it to the
+/// `spur/` cgroup root. One per agent; the registration reply, launch requests,
+/// and the heartbeat loop all drive it.
+pub struct SpecEnforcer {
+    root: PathBuf,
+    held: Option<CoreLayout>,
+    /// Whether `memory.max` has already been tightened to the target, so a later
+    /// usage spike cannot loosen the reservation back to pending.
+    max_tight: bool,
+    /// Whether root cpuset/memory have been written and so must be reset when the
+    /// layout is cleared. Nodes that never set spec cores never touch the root.
+    active: bool,
+}
+
+impl SpecEnforcer {
+    pub fn new(root: PathBuf) -> Self {
+        SpecEnforcer {
+            root,
+            held: None,
+            max_tight: false,
+            active: false,
+        }
+    }
+
+    /// The fingerprint of the held layout, or 0 when none is held — exactly what
+    /// the heartbeat reports so the controller knows whether to redeliver.
+    pub fn held_fingerprint(&self) -> u64 {
+        self.held.as_ref().map(CoreLayout::fingerprint).unwrap_or(0)
+    }
+
+    /// Adopt a delivered layout. `None` clears the held layout (the controller
+    /// dropped the node's spec settings). A `Some` layout is rejected when its
+    /// generation is older than the held one — a late launch must not overwrite
+    /// a newer layout adopted from a registration reply (finding 6) — and is a
+    /// no-op when its content matches what is already held. Returns true when the
+    /// held layout changed, so the caller re-applies and re-reports.
+    pub fn adopt(&mut self, incoming: Option<CoreLayout>) -> bool {
+        match (incoming, &self.held) {
+            (None, None) => false,
+            (None, Some(_)) => {
+                self.held = None;
+                self.max_tight = false;
+                true
+            }
+            (Some(new), Some(held)) if new.generation < held.generation => false,
+            (Some(new), Some(held)) if new.fingerprint() == held.fingerprint() => false,
+            (Some(new), _) => {
+                self.max_tight = false;
+                self.held = Some(new);
+                true
+            }
+        }
+    }
+
+    /// Apply the held layout to the cgroup root. `live_job_cpusets` are the
+    /// current `cpuset.cpus` of each live job cgroup, `total_mem_mb` the node's
+    /// memory, `current_mem_mb` the root's live `memory.current`. Returns the
+    /// memory reservation state; any write error bubbles up and makes the node
+    /// unschedulable. A no-op for a node that has never held spec cores.
+    pub fn apply(
+        &mut self,
+        live_job_cpusets: &[Vec<u32>],
+        total_mem_mb: u64,
+        current_mem_mb: u64,
+    ) -> io::Result<MemReservation> {
+        let enforce = self.held.as_ref().is_some_and(|l| !l.spec_cpus.is_empty());
+        if !enforce {
+            if self.active {
+                self.reset_root()?;
+                self.active = false;
+            }
+            return Ok(MemReservation::Inactive);
+        }
+        let layout = self.held.as_ref().expect("enforce implies held");
+        let desired = root_cpuset(layout);
+        let effective = reconcile_root_cpuset(&desired, live_job_cpusets);
+        write_cgroup(&self.root, "cpuset.cpus", &cpu_list(&effective))?;
+        let target = total_mem_mb.saturating_sub(layout.mem_spec_mb);
+        let decision = mem_decision(Some(target), current_mem_mb, self.max_tight);
+        if let Some(high) = decision.memory_high_mb {
+            write_cgroup(&self.root, "memory.high", &(high * 1024 * 1024).to_string())?;
+        }
+        match decision.memory_max_mb {
+            Some(max) => {
+                write_cgroup(&self.root, "memory.max", &(max * 1024 * 1024).to_string())?;
+                self.max_tight = true;
+            }
+            None => write_cgroup(&self.root, "memory.max", "max")?,
+        }
+        self.active = true;
+        Ok(decision.state)
+    }
+
+    /// The CPU set `spurd` and each `spurstepd` should be pinned to right now, or
+    /// `None` to widen back to every online CPU (no spec cores, or the setting is
+    /// off). Thin wrapper over [`daemon_cpuset`] on the held layout.
+    pub fn daemon_cpuset(&self) -> Option<Vec<u32>> {
+        self.held.as_ref().and_then(daemon_cpuset)
+    }
+
+    /// Return the root to inherited CPUs and uncapped memory when spec settings
+    /// are removed.
+    fn reset_root(&self) -> io::Result<()> {
+        write_cgroup(&self.root, "cpuset.cpus", "")?;
+        write_cgroup(&self.root, "memory.high", "max")?;
+        write_cgroup(&self.root, "memory.max", "max")?;
+        Ok(())
+    }
+}
+
+fn cpu_list(cpus: &[u32]) -> String {
+    cpus.iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn write_cgroup(root: &Path, file: &str, value: &str) -> io::Result<()> {
+    std::fs::write(root.join(file), value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +276,7 @@ mod tests {
                 .collect(),
             general_cpus: general.to_vec(),
             daemons_off_spec: false,
+            generation: 0,
         }
     }
 
@@ -243,5 +367,114 @@ mod tests {
         assert_eq!(daemon_cpuset(&l), Some(vec![0, 1]));
         l.spec_cpus.clear();
         assert_eq!(daemon_cpuset(&l), None); // no spec cores -> widen
+    }
+
+    fn gen_layout(spec: &[u32], general: &[u32], mem_mb: u64, generation: u64) -> CoreLayout {
+        let mut l = layout(spec, general, &[], mem_mb);
+        l.generation = generation;
+        l
+    }
+
+    #[test]
+    fn adopt_holds_and_reports_fingerprint() {
+        let mut e = SpecEnforcer::new(PathBuf::from("/unused"));
+        assert_eq!(e.held_fingerprint(), 0);
+        let l = gen_layout(&[127], &[0, 1], 1024, 5);
+        assert!(e.adopt(Some(l.clone())));
+        assert_eq!(e.held_fingerprint(), l.fingerprint());
+    }
+
+    #[test]
+    fn adopt_rejects_an_older_generation_but_takes_a_newer_one() {
+        let mut e = SpecEnforcer::new(PathBuf::from("/unused"));
+        e.adopt(Some(gen_layout(&[127], &[0, 1], 1024, 5)));
+        // A late launch carrying generation 4 (older) must not overwrite.
+        assert!(!e.adopt(Some(gen_layout(&[63], &[0, 2], 1024, 4))));
+        assert_eq!(
+            e.held_fingerprint(),
+            gen_layout(&[127], &[0, 1], 1024, 5).fingerprint()
+        );
+        // A newer generation is adopted.
+        assert!(e.adopt(Some(gen_layout(&[63], &[0, 2], 1024, 6))));
+        assert_eq!(
+            e.held_fingerprint(),
+            gen_layout(&[63], &[0, 2], 1024, 6).fingerprint()
+        );
+    }
+
+    #[test]
+    fn adopt_ignores_identical_content_and_clears_on_none() {
+        let mut e = SpecEnforcer::new(PathBuf::from("/unused"));
+        let l = gen_layout(&[127], &[0, 1], 1024, 5);
+        assert!(e.adopt(Some(l.clone())));
+        assert!(!e.adopt(Some(l.clone()))); // same content, no change
+        assert!(e.adopt(None)); // clear
+        assert_eq!(e.held_fingerprint(), 0);
+        assert!(!e.adopt(None)); // already clear
+    }
+
+    fn read(root: &Path, file: &str) -> Option<String> {
+        std::fs::read_to_string(root.join(file)).ok()
+    }
+
+    #[test]
+    fn apply_writes_root_cpuset_and_sequences_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = SpecEnforcer::new(dir.path().to_path_buf());
+        e.adopt(Some(gen_layout(&[127, 255], &[0, 1, 2], 1024, 1)));
+
+        // Usage over target (7168): high throttles, max stays uncapped, pending.
+        let state = e.apply(&[], 8192, 7500).unwrap();
+        assert_eq!(state, MemReservation::Pending);
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("0,1,2"));
+        assert_eq!(
+            read(dir.path(), "memory.high").as_deref(),
+            Some(((8192u64 - 1024) * 1024 * 1024).to_string().as_str())
+        );
+        assert_eq!(read(dir.path(), "memory.max").as_deref(), Some("max"));
+
+        // Usage settles under target: max tightens, active.
+        let state = e.apply(&[], 8192, 1000).unwrap();
+        assert_eq!(state, MemReservation::Active);
+        assert_eq!(
+            read(dir.path(), "memory.max").as_deref(),
+            Some(((8192u64 - 1024) * 1024 * 1024).to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn apply_defers_a_cpu_a_live_job_sits_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = SpecEnforcer::new(dir.path().to_path_buf());
+        // Spec just took cores {2,3}; a running job is pinned entirely to them,
+        // so dropping the root to {0,1} would empty its intersection and widen
+        // it — 2 and 3 are kept until the job exits.
+        e.adopt(Some(gen_layout(&[2, 3], &[0, 1], 0, 1)));
+        e.apply(&[vec![2, 3]], 4096, 10).unwrap();
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("0,1,2,3"));
+    }
+
+    #[test]
+    fn apply_resets_the_root_when_spec_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = SpecEnforcer::new(dir.path().to_path_buf());
+        e.adopt(Some(gen_layout(&[127], &[0, 1], 1024, 1)));
+        e.apply(&[], 8192, 100).unwrap();
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some("0,1"));
+
+        e.adopt(None);
+        e.apply(&[], 8192, 100).unwrap();
+        assert_eq!(read(dir.path(), "cpuset.cpus").as_deref(), Some(""));
+        assert_eq!(read(dir.path(), "memory.max").as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn apply_never_touches_the_root_without_spec_cores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = SpecEnforcer::new(dir.path().to_path_buf());
+        // No layout held at all.
+        assert_eq!(e.apply(&[], 8192, 100).unwrap(), MemReservation::Inactive);
+        assert_eq!(read(dir.path(), "cpuset.cpus"), None);
+        assert_eq!(read(dir.path(), "memory.max"), None);
     }
 }
