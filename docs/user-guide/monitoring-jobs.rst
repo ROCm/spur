@@ -1200,6 +1200,11 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 (or ``-s KILL``) and is not reported. With another signal it fails, and
 ``--quiet``/``-Q`` hides the report but not the exit status.
 
+Without ``--signal``, a cancel sends ``SIGTERM`` to the running job and ``SIGKILL``
+5 seconds later if it has not exited. The job shows as cancelled at once, and
+its resources go back to the scheduler. A new job that the scheduler puts on
+the GPUs of the cancelled job starts when the cancelled job has exited.
+
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
 .. code-block:: bash
