@@ -877,10 +877,6 @@ async fn start_one_agent(
     let attempt = async {
         let mut client = crate::agent_client::connect(agent_addr.clone())
             .await
-            .map(|c| {
-                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
-            })
             .ok()?;
         client
             .start_job(AgentStartJobRequest {
@@ -2069,9 +2065,7 @@ async fn dispatch_to_agent(
     );
     let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
-        .map_err(|e| DispatchError::Unreachable(e.into()))?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+        .map_err(|e| DispatchError::Unreachable(e.into()))?;
 
     let spec = params.spec;
 
@@ -2328,9 +2322,7 @@ async fn register_allocation_to_agent(
 ) -> Result<(), RegisterError> {
     let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
-        .map_err(|e| RegisterError::Failed(e.into()))?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+        .map_err(|e| RegisterError::Failed(e.into()))?;
 
     let response = client
         .register_job_allocation(RegisterJobAllocationRequest {
@@ -3560,12 +3552,7 @@ async fn cancel_one_step_agent(
     use spur_proto::proto::CancelStepRequest;
 
     let attempt = async {
-        match crate::agent_client::connect(agent_addr.clone())
-            .await
-            .map(|c| {
-                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
-            }) {
+        match crate::agent_client::connect(agent_addr.clone()).await {
             Ok(mut client) => {
                 if let Err(e) = client
                     .cancel_step(CancelStepRequest {
@@ -3655,12 +3642,7 @@ async fn cancel_one_agent(
     signal: i32,
 ) {
     let attempt = async {
-        match crate::agent_client::connect(agent_addr.clone())
-            .await
-            .map(|c| {
-                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
-            }) {
+        match crate::agent_client::connect(agent_addr.clone()).await {
             Ok(mut client) => {
                 if let Err(e) = client
                     .cancel_job(AgentCancelJobRequest {
@@ -3728,12 +3710,7 @@ pub async fn send_suspend_to_agents(
         };
         let job_id = job.job_id;
         tokio::spawn(async move {
-            match crate::agent_client::connect(agent_addr.clone())
-                .await
-                .map(|c| {
-                    c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
-                }) {
+            match crate::agent_client::connect(agent_addr.clone()).await {
                 Ok(mut client) => {
                     if let Err(e) = client
                         .suspend_job(AgentSuspendJobRequest { job_id, resume })

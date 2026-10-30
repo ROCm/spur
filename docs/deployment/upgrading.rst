@@ -276,13 +276,16 @@ Two further consequences of not draining:
 
 .. note::
 
-   What survives is the *job*, not necessarily an attached client. ``sbatch`` work — plain,
-   containerised and multi-node — rides the swap untouched. A client-driven ``srun`` step
-   keeps running on the node, but the ``srun`` **client** can lose its connection when the
-   controller it is attached to restarts; the job then sits ``RUNNING`` with a live but
-   unattached payload, which ``scancel`` reaps cleanly. This is much likelier on a
-   single-controller cluster, where the restart is a full API outage with no peer to fail
-   over to, and it is not specific to this mode.
+   ``sbatch`` work — plain, containerised and multi-node — rides the swap
+   untouched. A buffered ``srun`` client reconnects after a controller restart
+   while its allocation remains active, making up to 30 attempts with a two-second
+   backoff (roughly a minute, plus connection and RPC time). If the controller
+   returns within that retry window, the client resumes waiting for the step
+   or retrieves its recorded result. A longer outage can exhaust the retries
+   and leave a live payload without its client; ``scancel`` reaps it cleanly.
+   This is more likely on a single-controller cluster, where there is no peer
+   to fail over to. See :ref:`srun-controller-restart` for output retention and
+   replay limits.
 
 .. _upgrading-leader-last:
 

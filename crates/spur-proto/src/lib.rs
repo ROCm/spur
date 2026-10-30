@@ -106,6 +106,38 @@ pub fn accounting_server<T: proto::slurm_accounting_server::SlurmAccounting>(
 #[cfg(test)]
 mod tests {
     use super::controller_rpc_retryable;
+    use prost::Message;
+
+    #[test]
+    fn run_step_warnings_preserve_wire_compatibility() {
+        #[derive(Clone, PartialEq, Message)]
+        struct LegacyRunStepResponse {
+            #[prost(int32, tag = "1")]
+            exit_code: i32,
+            #[prost(string, tag = "2")]
+            stdout: String,
+            #[prost(string, tag = "3")]
+            stderr: String,
+            #[prost(string, tag = "4")]
+            node: String,
+        }
+
+        let old_wire = b"\x08\x07\x12\x04out\n\x1a\x04err\n\x22\x02n1";
+        let mut response = super::RunStepResponse::decode(old_wire.as_slice()).unwrap();
+        assert_eq!(response.exit_code, 7);
+        assert_eq!(response.stdout, "out\n");
+        assert_eq!(response.stderr, "err\n");
+        assert_eq!(response.node, "n1");
+        assert!(response.warnings.is_empty());
+
+        response.warnings = vec!["output from n1 is no longer available".into()];
+        let new_wire = response.encode_to_vec();
+        let old_response = LegacyRunStepResponse::decode(new_wire.as_slice()).unwrap();
+        assert_eq!(
+            old_response,
+            LegacyRunStepResponse::decode(old_wire.as_slice()).unwrap()
+        );
+    }
 
     #[test]
     fn a_spec_rejection_is_not_retried() {

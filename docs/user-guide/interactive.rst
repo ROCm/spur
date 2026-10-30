@@ -192,6 +192,36 @@ the local login name, matching step-mode ``srun`` under JWT authentication.
    sattach 1024
    sattach 1024 --output-only --output stderr
 
+.. _srun-controller-restart:
+
+Surviving a Controller Restart
+------------------------------
+
+Buffered ``srun`` steps, including steps inside ``sbatch`` scripts and
+multi-node ``mpirun`` daemon placement, survive a controller restart while
+their allocation remains active. ``srun`` makes up to 30 attempts to reach the
+controller with a two-second backoff (roughly a minute, plus connection and RPC
+time). Agents join an existing step rather than launching it again.
+
+If completion was already recorded, the controller returns its recorded exit
+code and attempts to retrieve the original output from the agents, allowing
+up to ten seconds per agent in parallel. Settled agent completion records are
+retained for up to ten minutes, subject to capacity limits, and output replay
+also requires the agent's spool files. An agent restart can recover completion
+from its retained on-disk record.
+
+If an output fetch fails, the recorded exit code and any output returned by
+other agents are preserved. ``srun`` reports each unavailable node on standard error
+as ``srun: output from <node> is no longer available``. Authorization failures
+still reject the request. Once the client exhausts its reconnect attempts, it
+exits with an error; the payload can remain running until it finishes or is
+cancelled with ``scancel``.
+
+These diagnostics are displayed even when workload output was streamed live
+or redirected with ``--output`` or ``--error``. They require an updated client
+and controller; older clients still receive the recorded exit code and available
+workload output.
+
 Surviving an Agent Restart
 --------------------------
 

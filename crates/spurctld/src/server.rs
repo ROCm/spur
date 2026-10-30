@@ -348,6 +348,7 @@ async fn replay_completed_step(
 
     let mut stdout = String::new();
     let mut stderr = String::new();
+    let mut warnings = Vec::new();
     while let Some(result) = set.join_next().await {
         let (node, response) = result
             .map_err(|error| Status::internal(format!("step replay task failed: {error}")))?;
@@ -357,16 +358,18 @@ async fn replay_completed_step(
                 stderr.push_str(&response.stderr);
             }
             Err(error)
-                if is_agent_connection_loss(&error)
-                    || matches!(
-                        error.code(),
-                        tonic::Code::NotFound | tonic::Code::DeadlineExceeded
-                    ) =>
+                if matches!(
+                    error.code(),
+                    tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+                ) =>
             {
+                return Err(error);
+            }
+            Err(error) => {
                 warn!(job_id = step.job_id, step_id = step.step_id, %node, %error,
                     "completed step output unavailable; preserving recorded exit code");
+                warnings.push(format!("output from {node} is no longer available"));
             }
-            Err(error) => return Err(error),
         }
     }
 
@@ -375,6 +378,7 @@ async fn replay_completed_step(
         stdout,
         stderr,
         node: step.nodes.join(","),
+        warnings,
     })
 }
 
@@ -3549,9 +3553,7 @@ impl SlurmController for ControllerService {
             .await
             .map_err(|e| {
                 Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
-            })?
-            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+            })?;
 
         let resp = agent
             .exec_in_job(ExecInJobRequest {
@@ -3625,30 +3627,12 @@ impl SlurmController for ControllerService {
                 Status::not_found(format!("step {} not found for job {}", req.step_id, job_id))
             })?;
 
-        if matches!(
-            step.state,
-            spur_core::step::StepState::Completed | spur_core::step::StepState::Failed
-        ) {
+        if step.state.is_terminal() {
             return replay_completed_step(&self.cluster, &job, &step)
                 .await
                 .map(Response::new);
         }
 
-        if step.state.is_terminal() {
-            let exit_code = step.exit_code.unwrap_or(0);
-            info!(
-                job_id,
-                step_id = req.step_id,
-                exit_code,
-                "step already completed; returning recorded exit code"
-            );
-            return Ok(Response::new(RunStepResponse {
-                exit_code,
-                stdout: String::new(),
-                stderr: String::new(),
-                node: step.nodes.join(","),
-            }));
-        }
         validate_step_nodes_for_run(
             job_id,
             req.step_id,
@@ -3851,9 +3835,7 @@ impl SlurmController for ControllerService {
                     .await
                     .map_err(|e| {
                         Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
-                    })?
-                    .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+                    })?;
 
                 let launched = agent
                     .run_command(RunCommandRequest {
@@ -3983,6 +3965,7 @@ impl SlurmController for ControllerService {
             stdout,
             stderr,
             node: ran_nodes.join(","),
+            warnings: Vec::new(),
         }))
     }
 
@@ -10013,6 +9996,7 @@ mod tests {
         assert_eq!(resp.exit_code, 7, "recorded exit code must be returned");
         assert_eq!(resp.stdout, original_stdout);
         assert_eq!(resp.stderr, "original stderr\n");
+        assert!(resp.warnings.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10022,10 +10006,20 @@ mod tests {
         for exit_code in [0, 7] {
             let job_id = completed_step_owned_by(&svc, exit_code).await;
             for code in [
+                Code::Internal,
+                Code::Cancelled,
+                Code::InvalidArgument,
                 Code::NotFound,
                 Code::Unavailable,
                 Code::Unknown,
                 Code::DeadlineExceeded,
+                Code::AlreadyExists,
+                Code::ResourceExhausted,
+                Code::FailedPrecondition,
+                Code::Aborted,
+                Code::OutOfRange,
+                Code::Unimplemented,
+                Code::DataLoss,
             ] {
                 let agent = spawn_probe_agent_with_step_response(
                     false,
@@ -10046,20 +10040,21 @@ mod tests {
                 assert_eq!(response.exit_code, exit_code, "{code:?}");
                 assert!(response.stdout.is_empty(), "{code:?}");
                 assert!(response.stderr.is_empty(), "{code:?}");
+                assert_eq!(
+                    response.warnings,
+                    ["output from n1 is no longer available"],
+                    "{code:?}"
+                );
             }
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_step_replay_preserves_agent_rejections() {
+    async fn run_step_replay_preserves_agent_authorization_rejections() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let job_id = completed_step_owned_by(&svc, 0).await;
-        for code in [
-            Code::PermissionDenied,
-            Code::Unauthenticated,
-            Code::FailedPrecondition,
-        ] {
+        for code in [Code::PermissionDenied, Code::Unauthenticated] {
             let agent = spawn_probe_agent_with_step_response(
                 false,
                 Some(Err(Status::new(code, "replay refused"))),
@@ -10074,7 +10069,7 @@ mod tests {
                     ..Default::default()
                 }))
                 .await
-                .expect_err("an agent rejection must not become a successful replay");
+                .expect_err("an authorization rejection must not become a successful replay");
             assert_eq!(error.code(), code);
         }
     }
@@ -10142,6 +10137,54 @@ mod tests {
         assert_eq!(response.exit_code, 7);
         assert_eq!(response.stdout, "retained stdout");
         assert_eq!(response.stderr, "retained stderr");
+        let mut warnings = response.warnings;
+        warnings.sort_unstable();
+        assert_eq!(
+            warnings,
+            [
+                "output from n2 is no longer available",
+                "output from unregistered is no longer available",
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_replays_cancelled_step_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = completed_step_owned_by(&svc, 137).await;
+        let mut step = svc.cluster.get_step(job_id, 0).unwrap();
+        step.step_id = 1;
+        step.state = spur_core::step::StepState::Cancelled;
+        svc.cluster.create_step(step).expect("seed cancelled step");
+        assert_eq!(
+            svc.cluster.get_step(job_id, 1).unwrap().state,
+            spur_core::step::StepState::Cancelled
+        );
+        let agent = spawn_probe_agent_with_step_response(
+            false,
+            Some(Ok(spur_proto::RunCommandResponse {
+                exit_code: 99,
+                stdout: "output before cancellation\n".into(),
+                stderr: "stderr before cancellation\n".into(),
+            })),
+        )
+        .await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+
+        let response = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                step_id: 1,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("a cancelled step replays its recorded result")
+            .into_inner();
+        assert_eq!(response.exit_code, 137);
+        assert_eq!(response.stdout, "output before cancellation\n");
+        assert_eq!(response.stderr, "stderr before cancellation\n");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

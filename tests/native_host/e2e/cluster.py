@@ -1630,7 +1630,7 @@ tar -C "$R" -czf '{local_tar}' .
             cached, _ = node.exec_with_exit(f"docker image inspect {image}")
             if cached == 0:
                 break
-            exit_code, output = node.exec_with_exit(f"docker pull {image}")
+            exit_code, output = node.exec_with_exit(f"docker pull {image}", timeout=300)
             if exit_code == 0:
                 break
             logger.warning("Postgres image pull failed from %s: %s", image, output.strip())
