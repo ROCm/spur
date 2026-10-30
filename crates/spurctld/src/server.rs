@@ -7854,10 +7854,15 @@ mod tests {
         let other = running_job_owned_by(&svc, "u").await;
         let (standalone, _) = running_standalone_pty_job(&svc).await;
 
-        for (job_id, pty, marked) in [
-            (standalone, true, true),
-            (standalone, false, false),
-            (other, true, false),
+        for (case, job_id, pty, marked) in [
+            ("a standalone PTY job's PTY step", standalone, true, true),
+            (
+                "a standalone PTY job's non-PTY step",
+                standalone,
+                false,
+                false,
+            ),
+            ("another job's PTY step", other, true, false),
         ] {
             let step_id = svc
                 .create_job_step(Request::new(CreateJobStepRequest {
@@ -7876,7 +7881,7 @@ mod tests {
                 .into_inner()
                 .step_id;
             let step = svc.cluster.get_step(job_id, step_id).expect("created step");
-            assert_eq!(step.job_shell, marked, "job {job_id}, pty={pty}");
+            assert_eq!(step.job_shell, marked, "{case}");
         }
     }
 
