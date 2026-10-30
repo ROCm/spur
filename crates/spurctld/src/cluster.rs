@@ -10592,6 +10592,8 @@ pub(crate) fn monitored_node_count(nodes: &[&Node]) -> usize {
         .count()
 }
 
+const HOLD_RELEASE_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Withholds recovery from nodes still reporting jobs the controller ended, so
 /// nothing new lands beside them before the reclaim cancel does. `holds` keeps
 /// when each hold began; past `cap` the node recovers anyway, so a job that
@@ -10612,7 +10614,9 @@ pub(crate) fn withhold_recoveries(
             return true;
         }
         let held_for = now.saturating_duration_since(*holds.entry(name.clone()).or_insert(now));
-        if held_for < cap {
+        // Passes land on a fixed tick, so the one due exactly at the cap can run a
+        // hair early; the slack keeps the release from slipping a whole pass.
+        if held_for + HOLD_RELEASE_SLACK < cap {
             info!(node = %name, "holding node recovery until it releases jobs the controller ended");
             return false;
         }
@@ -30171,6 +30175,25 @@ state = "UP"
             "the hold lasts until the cap"
         );
         assert_eq!(pass(&mut holds, started + cap), vec![recover("stuck")]);
+    }
+
+    #[test]
+    fn a_pass_due_at_the_hold_cap_releases_even_if_it_runs_a_hair_early() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(45);
+        let reporting = HashSet::from(["stuck".to_string()]);
+        let mut holds = HashMap::from([("stuck".to_string(), started)]);
+        let mut actions = vec![recover("stuck")];
+
+        super::withhold_recoveries(
+            &mut actions,
+            &reporting,
+            &mut holds,
+            cap,
+            started + cap - std::time::Duration::from_micros(180),
+        );
+
+        assert_eq!(actions, vec![recover("stuck")]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
