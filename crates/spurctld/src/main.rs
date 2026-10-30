@@ -16,6 +16,7 @@ mod limits_cache;
 mod metrics_proto;
 mod metrics_server;
 mod native_keys;
+mod node_liveness;
 mod pmix_dispatch;
 mod raft;
 mod raft_server;
@@ -238,17 +239,23 @@ async fn main() -> anyhow::Result<()> {
     // Start node health checker (only on leader).
     let health_tick_secs = config.controller.health_tick_secs;
     let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
+    let max_stale_fraction = config.controller.max_stale_node_fraction;
     let health_cluster = cluster.clone();
     let health_raft = raft_handle.clone();
     let leader_since_rx = raft_handle.spawn_leadership_watcher();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(health_tick_secs));
+        // A pass that probes many nodes can outlast a tick; catching up in a
+        // burst would land a node's two failed probes moments apart.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Floored at one tick: health still runs once per tick, so a shorter
         // grace could elapse before the first post-election check runs.
         let grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(
             hb_timeout.max(health_tick_secs),
         ));
+        let mut liveness = node_liveness::NodeLiveness::new(max_stale_fraction);
+        let mut liveness_term = None;
         loop {
             interval.tick().await;
             // Two snapshots: the watcher can lag a just-won election, so the
@@ -259,7 +266,21 @@ async fn main() -> anyhow::Result<()> {
             else {
                 continue;
             };
-            let evicted = health_cluster.check_node_health(hb_timeout, mark_down);
+            // Failed probes and recovery holds from another term were judged by
+            // another leadership.
+            if liveness_term != Some(live_term) {
+                liveness.reset();
+                health_cluster.reset_recovery_holds();
+                liveness_term = Some(live_term);
+            }
+            let evicted = liveness
+                .sweep(
+                    &health_cluster,
+                    hb_timeout,
+                    mark_down,
+                    &node_liveness::AgentProbe,
+                )
+                .await;
             for fin in &evicted {
                 if let Some(job) = health_cluster.get_job(fin.job_id) {
                     let c = health_cluster.clone();

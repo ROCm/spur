@@ -316,8 +316,9 @@ pub struct ControllerConfig {
     #[serde(default = "default_raft_listen_addr")]
     pub raft_listen_addr: String,
 
-    /// Seconds without a heartbeat before a node is marked Down.
-    /// Defaults to 90 when absent.
+    /// Seconds without a heartbeat before the leader checks on a node. A node
+    /// whose agent still answers is kept; one that fails two checks a health
+    /// pass apart is marked Down. Defaults to 90 when absent.
     #[serde(default)]
     pub heartbeat_timeout_secs: Option<u64>,
 
@@ -325,6 +326,13 @@ pub struct ControllerConfig {
     /// `[controller] health_tick_secs` (default: 30).
     #[serde(default = "default_health_tick_secs")]
     pub health_tick_secs: u64,
+
+    /// Largest fraction of watched nodes that may go silent in one health pass
+    /// before the leader suspects its own connectivity and marks none of them
+    /// Down. Configured in TOML as `[controller] max_stale_node_fraction`
+    /// (default: 0.5; 1.0 disables the check).
+    #[serde(default = "default_max_stale_node_fraction")]
+    pub max_stale_node_fraction: f64,
 
     /// Maximum automatic requeues (excluding preemption) before a job is held
     /// with `JobHoldMaxRequeue`. Configured in TOML as `[controller] max_batch_requeue` (default: 5).
@@ -386,6 +394,10 @@ fn default_max_batch_requeue() -> u32 {
 
 fn default_health_tick_secs() -> u64 {
     30
+}
+
+fn default_max_stale_node_fraction() -> f64 {
+    0.5
 }
 
 fn default_terminal_job_retention_secs() -> u64 {
@@ -476,6 +488,7 @@ impl Default for ControllerConfig {
             raft_listen_addr: "[::]:6821".into(),
             heartbeat_timeout_secs: None,
             health_tick_secs: default_health_tick_secs(),
+            max_stale_node_fraction: default_max_stale_node_fraction(),
             max_batch_requeue: default_max_batch_requeue(),
             max_launch_backoff_secs: default_max_launch_backoff_secs(),
             hold_on_prolog_fail: default_hold_on_prolog_fail(),
@@ -2117,6 +2130,16 @@ impl SlurmConfig {
             return Err(ConfigError::InvalidValue {
                 field: "controller.heartbeat_timeout_secs".into(),
                 value: "0 (must be at least 1)".into(),
+            });
+        }
+        // Phrased as a positive range test so NaN, which fails every
+        // comparison, is rejected along with values outside (0, 1].
+        let fraction = self.controller.max_stale_node_fraction;
+        let fraction_in_range = fraction > 0.0 && fraction <= 1.0;
+        if !fraction_in_range {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.max_stale_node_fraction".into(),
+                value: format!("{fraction} (must be greater than 0 and at most 1)"),
             });
         }
         // Zero would clamp every launch-failure hold to zero, restoring the tight
@@ -4925,6 +4948,33 @@ heartbeat_timeout_secs = 120
     }
 
     #[test]
+    fn controller_config_max_stale_node_fraction_defaults_and_parses() {
+        let config = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(config.controller.max_stale_node_fraction, 0.5);
+
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[controller]\nmax_stale_node_fraction = 1.0\n",
+        )
+        .unwrap();
+        assert_eq!(config.controller.max_stale_node_fraction, 1.0);
+    }
+
+    #[test]
+    fn controller_config_rejects_an_out_of_range_max_stale_node_fraction() {
+        for bad in ["0.0", "-0.5", "1.5", "nan"] {
+            let err = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[controller]\nmax_stale_node_fraction = {bad}\n"
+            ))
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("controller.max_stale_node_fraction"),
+                "{bad}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn controller_config_rejects_a_zero_health_tick() {
         let err = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n[controller]\nhealth_tick_secs = 0\n",
@@ -4972,6 +5022,7 @@ max_batch_requeue = 5
         .expect("a pre-upgrade config must still validate");
         assert_eq!(config.controller.health_tick_secs, 30);
         assert_eq!(config.controller.heartbeat_timeout_secs, None);
+        assert_eq!(config.controller.max_stale_node_fraction, 0.5);
     }
 
     #[test]

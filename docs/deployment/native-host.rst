@@ -371,6 +371,43 @@ to the current leader.
 Each controller writes its Raft snapshot atomically, so ``state_dir`` needs free space for
 about two copies of ``raft/snapshot.json`` (the current file plus the new temporary one).
 
+.. _node-liveness:
+
+Node Liveness
+~~~~~~~~~~~~~
+
+Each agent sends a heartbeat every 30 seconds, and only the Raft leader records them. A
+silent node is not always a dead one: in an HA cluster heartbeats often reach the leader
+through a follower, and a broken forward or an overloaded leader looks the same as a dead
+host. So when a node's heartbeats stop reaching the leader for
+``controller.heartbeat_timeout_secs`` (default 90), the leader asks the node's agent
+directly before acting:
+
+- **The agent answers.** The node and its jobs are kept, and the leader logs a warning that
+  the node's heartbeats stop reaching it but its agent answers. Look for ``heartbeat
+  failed`` in the agent's log to find the broken path.
+- **The agent does not answer on two consecutive health passes**
+  (``controller.health_tick_secs``, default 30). The node is marked ``DOWN`` with reason
+  ``Not responding``, and its jobs end ``NODE_FAIL``, or are requeued if they were
+  submitted with ``--requeue``.
+- **Many nodes go silent at once.** When more than ``controller.max_stale_node_fraction``
+  (default half) of the watched nodes go silent in the same pass, the leader assumes the
+  fault is on its side, marks none of them ``DOWN``, and logs ``suspecting the control
+  plane`` at error level. Watched nodes are those not already ``DOWN`` or drained, so
+  draining part of the cluster lowers the number of silent nodes it takes. If the nodes
+  really are gone, mark them down by hand with
+  ``scontrol update nodename=<node> state=down``.
+
+Nodes managed by the Kubernetes operator are not checked this way; they are marked ``DOWN``
+on the heartbeat timeout alone.
+
+A node marked ``DOWN`` for not responding returns to service on the next health pass after
+its heartbeats resume. If it still runs jobs the controller already ended, for example
+because it was unreachable when they ended, the controller cancels them again and keeps the
+node ``DOWN`` until it stops reporting them, so no new job lands beside them. The hold lasts at most
+``controller.heartbeat_timeout_secs``; after that the node returns anyway and the leader
+logs ``recovering it after the hold cap``.
+
 Joining Worker Nodes
 --------------------
 

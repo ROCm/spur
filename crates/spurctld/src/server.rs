@@ -815,8 +815,7 @@ impl ControllerService {
     /// Re-send a cancel to a node still holding an allocation the controller no
     /// longer believes belongs to it there — job finished, job moved to
     /// another node, or an id older than any this controller issued. Best-effort.
-    fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
-        let stale = stale_reported_jobs(&self.cluster, node, reported);
+    fn reclaim_stale_agent_jobs(&self, node: &str, stale: Vec<u32>) {
         if stale.is_empty() {
             return;
         }
@@ -2680,6 +2679,11 @@ impl SlurmController for ControllerService {
 
         self.verify_node_identity(&req.hostname, &req.node_token)?;
 
+        // Noted before the heartbeat lands, so a health pass never sees the node
+        // back without also seeing that it still holds jobs the controller ended.
+        let stale_jobs = stale_reported_jobs(&self.cluster, &req.hostname, &req.running_jobs);
+        self.cluster
+            .record_stale_report(&req.hostname, !stale_jobs.is_empty());
         if self
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
@@ -2700,7 +2704,7 @@ impl SlurmController for ControllerService {
                 self.cluster
                     .reconcile_node_gpu_allocations(&req.hostname, &reported_gpu_ids);
             }
-            self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
+            self.reclaim_stale_agent_jobs(&req.hostname, stale_jobs);
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
@@ -7941,6 +7945,58 @@ mod tests {
             svc.cluster.get_node("n1").is_some(),
             "the unauthenticated call must not have removed the node"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_records_whether_the_node_still_reports_ended_jobs() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                svc.cluster.as_ref(),
+                op,
+            );
+        };
+        apply(&WalOperation::JobSubmit {
+            job_id: 30,
+            spec: Box::new(spur_core::job::JobSpec {
+                name: "ended".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        apply(&WalOperation::job_state_change(
+            30,
+            JobState::Pending,
+            JobState::Cancelled,
+        ));
+        let beat = |running: &[u32]| {
+            Request::new(HeartbeatRequest {
+                hostname: "n1".into(),
+                running_jobs: running
+                    .iter()
+                    .map(|&job_id| RunningJobStatus {
+                        job_id,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        };
+
+        svc.heartbeat(beat(&[30])).await.expect("heartbeat");
+        assert!(svc.cluster.reports_stale_jobs("n1"));
+
+        svc.heartbeat(beat(&[])).await.expect("heartbeat");
+        assert!(!svc.cluster.reports_stale_jobs("n1"));
     }
 
     // Open admission issues no credential whether or not a key is configured, so
