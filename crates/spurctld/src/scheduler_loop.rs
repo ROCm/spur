@@ -1347,6 +1347,8 @@ pub(crate) async fn try_preempt(
         .filter(|j| preemptor_awaiting_release(j).is_some())
         .cloned()
         .collect();
+    // A victim's pod keeps its GPUs after the victim ends, until the pod stops.
+    let preempted_pods = cluster.nodes_of_preempted_pods();
 
     for pending in unscheduled {
         // Scoped to the nodes this job could actually use: a victim wedged
@@ -1354,7 +1356,9 @@ pub(crate) async fn try_preempt(
         let waiting_on_release = draining_victims.iter().any(|victim| {
             preemptor_awaiting_release(victim) == Some(pending.job_id)
                 && preempt_overlaps_pending_nodes(pending, victim, cluster_nodes)
-        });
+        }) || preempted_pods
+            .get(&pending.job_id)
+            .is_some_and(|pods| pending_could_use_any(pending, pods, cluster_nodes));
         if waiting_on_release {
             continue;
         }
@@ -2119,14 +2123,19 @@ pub(crate) fn preempt_overlaps_pending_nodes(
     candidate: &spur_core::job::Job,
     nodes: &[spur_core::node::Node],
 ) -> bool {
-    if candidate.allocated_nodes.is_empty() {
+    pending_could_use_any(pending, &candidate.allocated_nodes, nodes)
+}
+
+/// True when the pending job could target one of `occupied`.
+fn pending_could_use_any(
+    pending: &spur_core::job::Job,
+    occupied: &[String],
+    nodes: &[spur_core::node::Node],
+) -> bool {
+    if occupied.is_empty() {
         return false;
     }
-    let occupied: HashSet<&str> = candidate
-        .allocated_nodes
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let occupied: HashSet<&str> = occupied.iter().map(String::as_str).collect();
 
     if let Some(ref nodelist) = pending.spec.nodelist {
         return nodelist
