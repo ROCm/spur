@@ -2623,16 +2623,18 @@ impl ClusterManager {
             });
         }
 
-        self.karma_stats.record_started(
-            job_id,
-            &spec_for_notify.user,
-            effective_gpus(&spec_for_notify, spec_for_notify.num_nodes) as u64,
-            spec_for_notify
-                .time_limit
-                .map(|d| d.num_seconds().max(0) as u64)
-                .unwrap_or(0),
-            idle_fill,
-        );
+        if !spec_for_notify.name.starts_with(HEALTH_JOB_PREFIX) {
+            self.karma_stats.record_started(
+                job_id,
+                &spec_for_notify.user,
+                effective_gpus(&spec_for_notify, spec_for_notify.num_nodes) as u64,
+                spec_for_notify
+                    .time_limit
+                    .map(|d| d.num_seconds().max(0) as u64)
+                    .unwrap_or(0),
+                idle_fill,
+            );
+        }
 
         debug!(job_id, "job activated");
         Ok(run_attempt)
@@ -2967,11 +2969,13 @@ impl ClusterManager {
         {
             let jobs = self.jobs.read();
             if let Some(job) = jobs.get(&finalized.job_id) {
-                self.karma_stats.record_finalized(
-                    &job.spec.user,
-                    finalized.state,
-                    finalized.actual_secs,
-                );
+                if !job.spec.name.starts_with(HEALTH_JOB_PREFIX) {
+                    self.karma_stats.record_finalized(
+                        &job.spec.user,
+                        finalized.state,
+                        finalized.actual_secs,
+                    );
+                }
             }
         }
         self.run_epilog_slurmctld(finalized.job_id);

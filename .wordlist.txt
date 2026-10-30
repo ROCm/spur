@@ -376,5 +376,6 @@ RBD
 DME
 NaN
 PromQL
+deduplicated
 deduplication
 failovers
