@@ -253,8 +253,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        with ``--requeue`` goes back to the queue, and is held there after
        ``max_batch_requeue`` requeues. Any run the job's nodes kept going is
        stopped when they heartbeat again, or when the job is relaunched there
-       (see :ref:`requeued-run-upgrade-notes` for older agents). See
-       :ref:`node-liveness`.
+       (see :ref:`requeued-run-upgrade-notes` for older agents). Also caps how
+       long a returning node stays Down while it still reports jobs the
+       controller ended. See :ref:`node-liveness`.
    * - ``health_tick_secs``
      - integer
      - ``30``

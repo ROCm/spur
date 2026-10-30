@@ -330,6 +330,7 @@ impl NodeLiveness {
         cluster.clear_not_responding();
         cluster.set_liveness_breaker_tripped(false);
         cluster.set_silent_answering_nodes(0);
+        cluster.reset_recovery_holds();
         self.term = leading_term;
     }
 

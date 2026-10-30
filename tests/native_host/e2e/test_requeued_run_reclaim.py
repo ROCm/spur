@@ -20,6 +20,8 @@ HEARTBEAT_TIMEOUT_SECS = 40
 NODE_DOWN_BOUND = 180
 # Up to one 30s heartbeat interval (the first may fail on the dead connection) plus the 30s health tick.
 RECLAIM_BOUND = 90
+# The node stays Down until a heartbeat reports the old run gone, one more 30s interval.
+NODE_RECOVERY_BOUND = RECLAIM_BOUND + 30
 
 
 def pid_alive(node, pid):
@@ -76,7 +78,7 @@ class TestRequeuedRunReclaim:
                 cluster.scontrol("hold", str(job_id))
                 assert pid_alive(node, old_pid), "the run outlives its node going Down"
 
-            wait_node_state(cluster, name, ["idle", "mix", "alloc"], timeout=RECLAIM_BOUND)
+            wait_node_state(cluster, name, ["idle", "mix", "alloc"], timeout=NODE_RECOVERY_BOUND)
             wait_until(
                 lambda: not pid_alive(node, old_pid),
                 timeout_s=RECLAIM_BOUND, desc="the requeued job's old run to be stopped",
@@ -126,7 +128,7 @@ class TestRequeuedRunReclaim:
                 assert pid_alive(node, old_step), "the step outlives its node going Down"
 
             # Pinned to this node, the job runs here again; the old run must not run beside it.
-            wait_job_state(cluster, job_id, "R", timeout=RECLAIM_BOUND + 60)
+            wait_job_state(cluster, job_id, "R", timeout=NODE_RECOVERY_BOUND + 60)
             new_batch = read_pid(node, batch_pid, "the new run's batch pid")
             assert new_batch != old_batch
             for pid, what in ((old_batch, "batch script"), (old_step, "srun step")):
