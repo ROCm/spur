@@ -538,8 +538,24 @@ mod tests {
             gpu_reserved: vec![],
             general_cpus: vec![0, 1],
             daemons_off_spec: true,
+            generation: 0,
         };
         assert_eq!(layout.fingerprint(), GOLDEN_FINGERPRINT);
+    }
+
+    #[test]
+    fn generation_does_not_change_the_fingerprint() {
+        let mut layout = CoreLayout {
+            spec_cpus: vec![127, 255],
+            mem_spec_mb: 16384,
+            gpu_reserved: vec![],
+            general_cpus: vec![0, 1],
+            daemons_off_spec: true,
+            generation: 0,
+        };
+        let base = layout.fingerprint();
+        layout.generation = 99;
+        assert_eq!(layout.fingerprint(), base);
     }
 
     #[test]
@@ -559,6 +575,7 @@ mod tests {
             }],
             general_cpus: vec![1, 129],
             daemons_off_spec: false,
+            generation: 9,
         };
         let wire = spur_proto::proto::CoreLayout::from(&layout);
         assert_eq!(CoreLayout::from(wire), layout);

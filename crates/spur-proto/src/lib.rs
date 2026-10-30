@@ -197,6 +197,7 @@ mod tests {
             }],
             general_cpus: vec![32, 33],
             daemons_off_spec: true,
+            generation: 42,
         };
         let resp = crate::proto::RegisterAgentResponse {
             accepted: true,
