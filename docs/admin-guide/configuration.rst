@@ -2631,7 +2631,9 @@ own startup. Only ``allow_admin_kubeconfig`` is reloadable.
      - ``false``
      - Restart
      - Enable the Spur-managed k0s cluster. Requires restarting the controller
-       **and** every agent.
+       **and** every agent. A controller started with it off refuses
+       ``spur k8s up`` and ``add-nodes``, and ``down`` while any node holds a
+       k0s role.
    * - ``distro``
      - string
      - ``"k0s"``
