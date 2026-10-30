@@ -378,3 +378,6 @@ NaN
 PromQL
 deduplication
 failovers
+WEKA
+WEKA's
+frontend
