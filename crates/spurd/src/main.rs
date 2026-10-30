@@ -663,6 +663,13 @@ async fn main() -> anyhow::Result<()> {
     if let Some(config) = config.as_ref() {
         agent_service.apply_auth_policy(&config.auth);
     }
+    if cluster_config.enabled {
+        // Stays inactive, with no Kubernetes client, until the controller marks the node shared.
+        let gpu_sharing =
+            spurd::gpu_sharing::GpuSharing::new(&hostname, agent_service.k0s(), &reporter);
+        reporter.set_gpu_sharing(gpu_sharing.clone());
+        tokio::spawn(gpu_sharing.converge_loop());
+    }
     // Give the reporter the live allocation so heartbeats carry each held job's
     // translated GPU stable_ids. Wired before the replay below records adopted
     // jobs; the OnceLock only shares the handle, so the ordering is immaterial.

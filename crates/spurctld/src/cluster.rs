@@ -39,6 +39,7 @@ use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
+use spur_proto::proto::{GpuHoldReport, GpuHoldState};
 
 use crate::accounting::{
     txn, AccountingNotifier, JobEndRecord, JobStartRecord, TxnAction, TxnEntity, TxnOutcome,
@@ -654,6 +655,10 @@ pub struct ClusterManager {
     /// persisted; on failover the earmark is lost and the original one-cycle race
     /// is possible for that one node — an accepted degradation.
     preempt_freed_nodes: RwLock<HashMap<String, (JobId, u32)>>,
+    /// Latest GPU hold report per shared node and when it arrived. Leader-local
+    /// and transient like `node_dispatch_cooldowns`: every agent re-reports on
+    /// its next heartbeat, and a missing report holds every GPU of the node.
+    gpu_holds: RwLock<HashMap<String, (GpuHoldReport, DateTime<Utc>)>>,
     /// When each (check index, node name) last completed a check, so the pass
     /// knows when the next one is due. Leader-local and transient (like
     /// `node_dispatch_cooldowns`): reset on failover, which at worst re-runs one
@@ -955,6 +960,7 @@ impl ClusterManager {
             pinged_this_term: RwLock::new(HashSet::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             preempt_freed_nodes: RwLock::new(HashMap::new()),
+            gpu_holds: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
         };
@@ -1135,6 +1141,101 @@ impl ClusterManager {
     #[cfg(test)]
     pub(crate) fn preempt_freed_nodes_raw(&self) -> HashMap<String, (JobId, u32)> {
         self.preempt_freed_nodes.read().clone()
+    }
+
+    /// Record a shared node's GPU hold report. Returns false, and keeps nothing, for
+    /// an unknown node or a report built against another inventory generation.
+    pub fn record_gpu_holds(&self, name: &str, report: GpuHoldReport) -> bool {
+        let current = self
+            .nodes
+            .read()
+            .get(name)
+            .map(|n| n.total_resources.generation);
+        if current != Some(report.generation) {
+            return false;
+        }
+        self.gpu_holds
+            .write()
+            .insert(name.to_string(), (report, Utc::now()));
+        true
+    }
+
+    /// The latest hold report of a node that shares its GPUs, for display.
+    pub fn gpu_hold_report(&self, node: &Node) -> Option<GpuHoldReport> {
+        if !node.shares_gpus() {
+            return None;
+        }
+        self.gpu_holds
+            .read()
+            .get(&node.name)
+            .map(|(r, _)| r.clone())
+    }
+
+    /// Drop every hold report on leadership change: a follower receives no
+    /// heartbeats, so what it kept from an earlier term is stale.
+    pub(crate) fn clear_gpu_holds(&self) {
+        self.gpu_holds.write().clear();
+    }
+
+    /// GPUs the scheduler must treat as allocated, per shared node.
+    pub fn held_gpus(&self, nodes: &[Node]) -> HashMap<String, Vec<u64>> {
+        let timeout = self
+            .config()
+            .controller
+            .heartbeat_timeout_secs
+            .unwrap_or(90);
+        let charged = self.charged_gpus();
+        let none = HashSet::new();
+        let holds = self.gpu_holds.read();
+        let now = Utc::now();
+        nodes
+            .iter()
+            .filter(|n| n.shares_gpus())
+            .map(|n| {
+                let report = holds.get(&n.name);
+                let charged = charged.get(&n.name).unwrap_or(&none);
+                let ids = held_gpu_ids(n, report, charged, now, timeout);
+                (n.name.clone(), ids)
+            })
+            .collect()
+    }
+
+    /// Per preemptor, the nodes where a pod claim still names a job it preempted.
+    /// The pod keeps those GPUs after its job ended, until the pod stops.
+    pub fn nodes_of_preempted_pods(&self) -> HashMap<JobId, Vec<String>> {
+        let jobs = self.jobs.read();
+        let holds = self.gpu_holds.read();
+        let mut nodes: HashMap<JobId, Vec<String>> = HashMap::new();
+        for (node, (report, _)) in holds.iter() {
+            let preemptors: HashSet<JobId> = report
+                .gpus
+                .iter()
+                .filter(|g| g.state == GpuHoldState::GpuHoldK8s as i32)
+                .filter_map(|g| jobs.get(&g.job_id)?.preempted_by)
+                .collect();
+            for preemptor in preemptors {
+                nodes.entry(preemptor).or_default().push(node.clone());
+            }
+        }
+        nodes
+    }
+
+    /// `(job, GPU)` pairs per node, for every GPU a running job still holds.
+    fn charged_gpus(&self) -> HashMap<String, HashSet<(JobId, u64)>> {
+        let jobs = self.jobs.read();
+        let mut charged: HashMap<String, HashSet<(JobId, u64)>> = HashMap::new();
+        let running = jobs.values().filter(|job| job.state.is_active());
+        for job in running {
+            for (node, alloc) in &job.per_node_alloc {
+                let gpus = alloc.device_ids("gpu");
+                if gpus.is_empty() || !job.is_held_on(node) {
+                    continue;
+                }
+                let pairs = gpus.into_iter().map(|gpu| (job.job_id, gpu));
+                charged.entry(node.clone()).or_default().extend(pairs);
+            }
+        }
+        charged
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -4420,6 +4521,46 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Opt a k0s-enrolled node in or out of GPU-level sharing with Kubernetes
+    /// (replicated via Raft). Opt-out is always accepted; running jobs finish.
+    pub fn set_node_gpu_sharing(&self, name: &str, enabled: bool) -> anyhow::Result<()> {
+        use spur_core::k0s::K0sRole;
+        let role = self.nodes.read().get(name).map(|n| n.k0s_role);
+        if enabled && !matches!(role, None | Some(Some(K0sRole::Worker | K0sRole::Single))) {
+            anyhow::bail!(
+                "node {name} is not a k0s worker; only a worker enrolled with `spur k8s up` can share its GPUs"
+            );
+        }
+        self.propose_node_gpu_sharing(name, enabled)
+    }
+
+    /// [`Self::set_node_gpu_sharing`] without the role check, for enrolment, which sets the flag
+    /// before the reconciler assigns the worker role.
+    pub(crate) fn propose_node_gpu_sharing(&self, name: &str, enabled: bool) -> anyhow::Result<()> {
+        if !self.nodes.read().contains_key(name) {
+            anyhow::bail!("node {name} not found");
+        }
+        if enabled {
+            if let Some(res) = self
+                .reservations
+                .read()
+                .iter()
+                .find(|r| r.nodes.iter().any(|n| n == name))
+            {
+                anyhow::bail!(
+                    "node {name} is in reservation '{}'; a node that shares its GPUs cannot be reserved",
+                    res.name
+                );
+            }
+        }
+        self.propose(WalOperation::NodeGpuSharingSet {
+            name: name.to_string(),
+            enabled,
+        })?;
+        info!(node = %name, enabled, "node GPU sharing set");
+        Ok(())
+    }
+
     /// set the cluster-wide k0s phase. A `None`/empty control-plane or `member_nodes` leaves the
     /// persisted value untouched; the `Down` phase clears the member scope + control-plane set.
     pub fn set_k0s_phase(
@@ -5875,6 +6016,7 @@ impl ClusterManager {
         }
         let known: std::collections::HashSet<String> = self.nodes.read().keys().cloned().collect();
         res.nodes = normalize_node_list(&res.nodes, &known).map_err(ReservationError::invalid)?;
+        self.reject_gpu_sharing_nodes(&res.nodes)?;
         self.validate_reservation_job_overlap(&res, None)
             .map_err(|e| ReservationError::invalid(e.to_string()))?;
         self.validate_reservation_storage_overlap(&res, None)
@@ -5936,6 +6078,7 @@ impl ClusterManager {
                     .map_err(ReservationError::invalid)?,
             );
         }
+        self.reject_gpu_sharing_nodes(&add_expanded)?;
         for node in &add_expanded {
             if !preview.nodes.contains(node) {
                 preview.nodes.push(node.clone());
@@ -5972,6 +6115,20 @@ impl ClusterManager {
         })
         .map_err(|e| ReservationError::raft(e.to_string()))?;
         Ok(())
+    }
+
+    /// A reservation would promise GPUs that Kubernetes may hold at any time.
+    fn reject_gpu_sharing_nodes(&self, names: &[String]) -> Result<(), ReservationError> {
+        let nodes = self.nodes.read();
+        match names
+            .iter()
+            .find(|n| nodes.get(n.as_str()).is_some_and(|node| node.gpu_sharing))
+        {
+            Some(name) => Err(ReservationError::invalid(format!(
+                "node '{name}' shares its GPUs with Kubernetes; reservations are not allowed on a shared node"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Delete a reservation by name (persisted via Raft). Authorization is the RPC boundary's
@@ -6380,7 +6537,15 @@ impl ClusterManager {
             // Fewer nodes free (schedulable, available resources) than needed →
             // Resources; otherwise queued behind higher priority.
             let has_capacity = |n: &spur_core::node::Node| {
-                n.has_free_cpu_capacity() && n.can_satisfy_request(&required)
+                let mut alloc = n.alloc_resources.clone();
+                if let Some(held) = cluster_state.held_gpus.get(&n.name) {
+                    let held = ResourceAllocations::from_device_ids("gpu", held);
+                    alloc.subtract(&held);
+                    alloc.add(&held);
+                }
+                n.has_free_cpu_capacity()
+                    && n.total_resources
+                        .can_satisfy_with_allocated(&alloc, &required)
             };
             let free_now = eligible
                 .iter()
@@ -8610,6 +8775,12 @@ impl ClusterManager {
                     node.k0s_mesh_ip = None;
                     node.k0s_pod_cidr = None;
                     node.k0s_last_error = None;
+                    node.gpu_sharing = false;
+                }
+            }
+            WalOperation::NodeGpuSharingSet { name, enabled } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.gpu_sharing = *enabled;
                 }
             }
             WalOperation::NodeK0sSetError { name, error } => {
@@ -10074,6 +10245,47 @@ pub(crate) fn node_config_matches(
 pub enum MarkDownPolicy {
     Allowed,
     Suppressed,
+}
+
+/// Held GPUs of a shared node: every GPU the latest report does not name as free
+/// or held by a Spur job. With no fresh report for the current inventory, or a
+/// node that cannot share yet, every GPU is held, so Spur never places on a GPU
+/// that Kubernetes may already have given to a pod.
+///
+/// A pod GPU whose owner job still holds that GPU's allocation counts as that
+/// allocation, so preemption can free it. After the job ends, the GPU stays held
+/// until the claim goes: that fences the next job from the stopping pod.
+fn held_gpu_ids(
+    node: &Node,
+    report: Option<&(GpuHoldReport, DateTime<Utc>)>,
+    charged: &HashSet<(JobId, u64)>,
+    now: DateTime<Utc>,
+    timeout_secs: u64,
+) -> Vec<u64> {
+    let placeable: HashSet<u64> = report
+        .filter(|(r, at)| {
+            r.generation == node.total_resources.generation
+                && r.unshareable_reason.is_empty()
+                && now.signed_duration_since(*at).num_seconds() <= timeout_secs as i64
+        })
+        .map(|(r, _)| {
+            r.gpus
+                .iter()
+                .filter(|g| match GpuHoldState::try_from(g.state) {
+                    Ok(GpuHoldState::GpuHoldFree | GpuHoldState::GpuHoldSpurJob) => true,
+                    Ok(GpuHoldState::GpuHoldK8s) => charged.contains(&(g.job_id, g.stable_id)),
+                    _ => false,
+                })
+                .map(|g| g.stable_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    node.total_resources
+        .gpus
+        .iter()
+        .map(|g| g.stable_id)
+        .filter(|id| !placeable.contains(id))
+        .collect()
 }
 
 /// Withholds DOWN marking for `grace` after leadership is won: a non-leader
@@ -17672,6 +17884,7 @@ mod tests {
         // otherwise force Resources/NodeDown.
         let empty_state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
             reservations: &[],
@@ -17710,6 +17923,7 @@ mod tests {
 
         let empty_state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
             reservations: &[],
@@ -18469,6 +18683,7 @@ mod tests {
         }
         let empty_state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
             reservations: &[],
@@ -18500,6 +18715,7 @@ mod tests {
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -18517,6 +18733,7 @@ mod tests {
         let nodes = vec![down];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -18546,6 +18763,7 @@ mod tests {
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -18566,6 +18784,7 @@ mod tests {
         let nodes = vec![busy];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -18604,6 +18823,7 @@ mod tests {
         let nodes = vec![n1, n2];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -18639,6 +18859,7 @@ mod tests {
         ];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -18678,6 +18899,7 @@ mod tests {
         ];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -18728,6 +18950,7 @@ mod tests {
         }];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &reservations,
@@ -18778,6 +19001,7 @@ mod tests {
         }];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &reservations,
@@ -18809,6 +19033,7 @@ mod tests {
         let nodes = vec![cm.get_node("n1").unwrap(), cm.get_node("n2").unwrap()];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -18837,6 +19062,7 @@ mod tests {
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -19014,6 +19240,7 @@ mod tests {
         // An empty cluster forces a real wait reason, which must win.
         let empty_state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
             reservations: &[],
@@ -20281,6 +20508,7 @@ mod tests {
             reservations: &reservations,
             topology: None,
             busy_until: &busy_until,
+            held_gpus: &std::collections::HashMap::new(),
         };
         let mut scheduler =
             BackfillScheduler::new(cm.config().scheduler.max_jobs_per_cycle as usize);
@@ -23157,6 +23385,7 @@ mod tests {
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -23257,6 +23486,7 @@ mod tests {
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            held_gpus: &std::collections::HashMap::new(),
         };
         let mut scheduler = spur_sched::backfill::BackfillScheduler::new(10);
         crate::scheduler_loop::claimed_assignments(
@@ -23747,6 +23977,7 @@ mod tests {
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -23826,6 +24057,7 @@ mod tests {
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &reservations,
@@ -26474,6 +26706,7 @@ mod tests {
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
             busy_until: &std::collections::HashMap::new(),
+            held_gpus: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
             reservations: &[],
@@ -26898,6 +27131,463 @@ mod tests {
 
         assert_eq!(cm.k0s_state().phase, K0sPhase::Provisioning);
         assert!(cm.get_node("node-a").unwrap().k0s_last_error.is_none());
+    }
+
+    fn gpu_hold(stable_id: u64, state: GpuHoldState) -> spur_proto::proto::GpuHold {
+        spur_proto::proto::GpuHold {
+            stable_id,
+            state: state as i32,
+            ..Default::default()
+        }
+    }
+
+    fn hold_report(generation: u64, gpus: Vec<spur_proto::proto::GpuHold>) -> GpuHoldReport {
+        GpuHoldReport {
+            generation,
+            gpus,
+            unshareable_reason: String::new(),
+        }
+    }
+
+    fn shared_gpu_node(gpus: u64) -> Node {
+        let mut node = Node::new(
+            "n1".into(),
+            ResourceSet {
+                gpus: (0..gpus).map(|i| gpu_resource(i as u32, i)).collect(),
+                generation: 7,
+                ..Default::default()
+            },
+        );
+        node.k0s_role = Some(spur_core::k0s::K0sRole::Worker);
+        node.gpu_sharing = true;
+        node
+    }
+
+    #[test]
+    fn a_fresh_report_holds_the_gpus_kubernetes_owns() {
+        let node = shared_gpu_node(7);
+        let now = Utc::now();
+        let pod_of_job = |stable_id, job_id| spur_proto::proto::GpuHold {
+            job_id,
+            ..gpu_hold(stable_id, GpuHoldState::GpuHoldK8s)
+        };
+        let report = hold_report(
+            7,
+            vec![
+                gpu_hold(0, GpuHoldState::GpuHoldFree),
+                gpu_hold(1, GpuHoldState::GpuHoldSpurJob),
+                gpu_hold(2, GpuHoldState::GpuHoldK8s),
+                gpu_hold(3, GpuHoldState::GpuHoldConflict),
+                gpu_hold(4, GpuHoldState::GpuHoldUnshareable),
+                pod_of_job(5, 12),
+                pod_of_job(6, 13),
+            ],
+        );
+        let charged = HashSet::from([(12, 5), (13, 5)]);
+
+        let held = held_gpu_ids(&node, Some(&(report, now)), &charged, now, 90);
+
+        assert_eq!(
+            held,
+            vec![2, 3, 4, 6],
+            "job 13 holds no allocation on GPU 6"
+        );
+    }
+
+    #[test]
+    fn a_gpu_missing_from_the_report_is_held() {
+        let node = shared_gpu_node(2);
+        let now = Utc::now();
+        let report = hold_report(7, vec![gpu_hold(0, GpuHoldState::GpuHoldFree)]);
+
+        assert_eq!(
+            held_gpu_ids(&node, Some(&(report, now)), &HashSet::new(), now, 90),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn every_gpu_is_held_without_a_usable_report() {
+        let node = shared_gpu_node(2);
+        let now = Utc::now();
+        let free = vec![
+            gpu_hold(0, GpuHoldState::GpuHoldFree),
+            gpu_hold(1, GpuHoldState::GpuHoldFree),
+        ];
+        let stale = (
+            hold_report(7, free.clone()),
+            now - chrono::Duration::seconds(91),
+        );
+        let other_generation = (hold_report(6, free.clone()), now);
+        let mut unshareable = hold_report(7, free);
+        unshareable.unshareable_reason = "no ResourceSlice from gpu.amd.com".into();
+
+        for report in [None, Some(&stale), Some(&other_generation)] {
+            assert_eq!(
+                held_gpu_ids(&node, report, &HashSet::new(), now, 90),
+                vec![0, 1]
+            );
+        }
+        assert_eq!(
+            held_gpu_ids(&node, Some(&(unshareable, now)), &HashSet::new(), now, 90),
+            vec![0, 1]
+        );
+    }
+
+    fn enroll_shared_gpu_node(cm: &ClusterManager, gpus: u64) {
+        register_gpu_node(
+            cm,
+            "n1",
+            (0..gpus).map(|i| gpu_resource(i as u32, i)).collect(),
+        );
+        cm.assign_node_k0s(
+            "n1",
+            spur_core::k0s::K0sRole::Worker,
+            "10.44.0.2",
+            "10.42.2.0/24",
+        )
+        .unwrap();
+        cm.set_node_gpu_sharing("n1", true).unwrap();
+        wait_for("gpu sharing set", || {
+            cm.get_node("n1").is_some_and(|n| n.shares_gpus())
+        });
+    }
+
+    fn gpu_job_spec(name: &str, gpus: u64) -> JobSpec {
+        let mut spec = basic_spec(name);
+        spec.gres = vec![format!("gpu:{gpus}")];
+        spec
+    }
+
+    fn start_with_gpus(cm: &ClusterManager, job_id: JobId, node: &str, gpus: &[u64]) {
+        let mut res = scalar_alloc(1, 1000);
+        res.add(&ResourceAllocations::from_device_ids("gpu", gpus));
+        cm.start_job(
+            job_id,
+            vec![node.into()],
+            res.clone(),
+            per_node_for(&[node], res),
+        )
+        .unwrap();
+        settle(cm, job_id, JobState::Running);
+    }
+
+    fn pod_holds(generation: u64, owner: JobId, gpus: &[u64]) -> GpuHoldReport {
+        let pod = |stable_id| spur_proto::proto::GpuHold {
+            job_id: owner,
+            ..gpu_hold(stable_id, GpuHoldState::GpuHoldK8s)
+        };
+        hold_report(generation, gpus.iter().copied().map(pod).collect())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pod_gpu_counts_as_its_running_job_and_is_held_after_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        enroll_shared_gpu_node(&cm, 2);
+        let generation = cm.get_node("n1").unwrap().total_resources.generation;
+        let job_id = submit_and_wait(&cm, gpu_job_spec("pod-owner", 1));
+        start_with_gpus(&cm, job_id, "n1", &[0]);
+
+        cm.record_gpu_holds("n1", pod_holds(generation, job_id, &[0, 1]));
+        assert_eq!(
+            cm.held_gpus(&cm.get_nodes())["n1"],
+            vec![1],
+            "GPU 0 is the job's own allocation; GPU 1 is not"
+        );
+
+        cm.complete_job(job_id, 0, JobState::Completed).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+        assert_eq!(cm.held_gpus(&cm.get_nodes())["n1"], vec![0, 1]);
+
+        let free = vec![
+            gpu_hold(0, GpuHoldState::GpuHoldFree),
+            gpu_hold(1, GpuHoldState::GpuHoldFree),
+        ];
+        cm.record_gpu_holds("n1", hold_report(generation, free));
+        assert!(cm.held_gpus(&cm.get_nodes())["n1"].is_empty());
+    }
+
+    async fn preempt_once(cm: &Arc<ClusterManager>, job_id: JobId) {
+        let job = cm.get_job(job_id).unwrap();
+        crate::scheduler_loop::try_preempt(
+            cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&job],
+            &cm.config().scheduler,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemptor_waits_for_the_pod_of_its_finished_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        for (name, priority) in [("low", 100), ("mid", 200)] {
+            cm.qos_cache().insert(Qos {
+                name: name.into(),
+                priority,
+                ..Default::default()
+            });
+        }
+        cm.qos_cache().insert(Qos {
+            name: "high".into(),
+            priority: 10_000,
+            preempt: vec!["low".into(), "mid".into()],
+            ..Default::default()
+        });
+        enroll_shared_gpu_node(&cm, 2);
+        register_gpu_node(&cm, "n2", vec![gpu_resource(0, 0), gpu_resource(1, 1)]);
+        let generation = cm.get_node("n1").unwrap().total_resources.generation;
+        let submit = |name: &str, qos: &str| {
+            let mut spec = gpu_job_spec(name, 2);
+            spec.qos = Some(qos.into());
+            submit_and_wait(&cm, spec)
+        };
+        let pod_owner = submit("pod-owner", "low");
+        start_with_gpus(&cm, pod_owner, "n1", &[0, 1]);
+        let native = submit("native", "mid");
+        start_with_gpus(&cm, native, "n2", &[0, 1]);
+        cm.record_gpu_holds("n1", pod_holds(generation, pod_owner, &[0, 1]));
+        let hunter = submit("hunter", "high");
+
+        preempt_once(&cm, hunter).await;
+        assert_eq!(
+            cm.get_job(pod_owner).unwrap().state,
+            JobState::Completing,
+            "preemption frees the pod GPUs of the cheapest victim"
+        );
+        report_nodes_released(&cm, pod_owner);
+        settle(&cm, pod_owner, JobState::Cancelled);
+
+        for _ in 0..3 {
+            preempt_once(&cm, hunter).await;
+        }
+        assert_eq!(
+            cm.get_job(native).unwrap().state,
+            JobState::Running,
+            "the pod of the first victim still stops"
+        );
+
+        cm.record_gpu_holds("n1", pod_holds(generation, 0, &[0, 1]));
+        preempt_once(&cm, hunter).await;
+        assert_ne!(
+            cm.get_job(native).unwrap().state,
+            JobState::Running,
+            "a pod of no victim does not make the preemptor wait"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gpu_sharing_opt_in_needs_a_k0s_worker() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_gpu_node(&cm, "n1", vec![gpu_resource(0, 0)]);
+
+        assert!(cm.set_node_gpu_sharing("n1", true).is_err());
+        assert!(cm.set_node_gpu_sharing("nope", true).is_err());
+        cm.assign_node_k0s(
+            "n1",
+            spur_core::k0s::K0sRole::Controller,
+            "10.44.0.1",
+            "10.42.1.0/24",
+        )
+        .unwrap();
+        wait_for("role assigned", || {
+            cm.get_node("n1").is_some_and(|n| n.k0s_role.is_some())
+        });
+        assert!(cm.set_node_gpu_sharing("n1", true).is_err());
+        cm.set_node_gpu_sharing("n1", false).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shared_node_is_placeable_and_k0s_clear_ends_sharing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        enroll_shared_gpu_node(&cm, 1);
+        assert!(!cm.get_node("n1").unwrap().is_k0s_reserved());
+
+        cm.clear_node_k0s("n1").unwrap();
+
+        wait_for("sharing cleared", || {
+            cm.get_node("n1").is_some_and(|n| !n.gpu_sharing)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reservations_and_gpu_sharing_exclude_each_other() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        enroll_shared_gpu_node(&cm, 1);
+        register_node(&cm, "n2", 8, 16000);
+        let now = Utc::now();
+        let reservation = |name: &str, node: &str| Reservation {
+            name: name.into(),
+            start_time: now,
+            end_time: now + chrono::Duration::hours(2),
+            nodes: vec![node.into()],
+            accounts: Vec::new(),
+            users: vec!["alice".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        };
+
+        let err = cm.create_reservation(reservation("r1", "n1")).unwrap_err();
+        assert!(err.to_string().contains("shares its GPUs"), "got: {err}");
+
+        cm.create_reservation(reservation("r2", "n2")).unwrap();
+        let err = cm
+            .update_reservation("r2", 0, &["n1".into()], &[], &[], &[], &[], &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("shares its GPUs"), "got: {err}");
+
+        cm.assign_node_k0s(
+            "n2",
+            spur_core::k0s::K0sRole::Worker,
+            "10.44.0.3",
+            "10.42.3.0/24",
+        )
+        .unwrap();
+        wait_for("role assigned", || {
+            cm.get_node("n2").is_some_and(|n| n.k0s_role.is_some())
+        });
+        let err = cm.set_node_gpu_sharing("n2", true).unwrap_err();
+        assert!(err.to_string().contains("reservation 'r2'"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gpu_sharing_replays_from_the_wal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        cm.apply_operation(&WalOperation::NodeGpuSharingSet {
+            name: "n1".into(),
+            enabled: true,
+        });
+        assert!(cm.get_node("n1").unwrap().gpu_sharing);
+
+        cm.apply_operation(&WalOperation::NodeK0sClear { name: "n1".into() });
+        assert!(!cm.get_node("n1").unwrap().gpu_sharing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_report_for_another_generation_is_dropped() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        enroll_shared_gpu_node(&cm, 2);
+        let generation = cm.get_node("n1").unwrap().total_resources.generation;
+        let free = vec![
+            gpu_hold(0, GpuHoldState::GpuHoldFree),
+            gpu_hold(1, GpuHoldState::GpuHoldFree),
+        ];
+
+        assert!(!cm.record_gpu_holds("n1", hold_report(generation + 1, free.clone())));
+        assert!(!cm.record_gpu_holds("nope", hold_report(generation, free.clone())));
+        let nodes = cm.get_nodes();
+        assert_eq!(cm.held_gpus(&nodes)["n1"], vec![0, 1]);
+
+        assert!(cm.record_gpu_holds("n1", hold_report(generation, free)));
+        assert!(cm.held_gpus(&nodes)["n1"].is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_holds_on_leader_change_holds_everything_until_a_re_report() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        enroll_shared_gpu_node(&cm, 2);
+        register_gpu_node(&cm, "n2", vec![gpu_resource(0, 0)]);
+        let generation = cm.get_node("n1").unwrap().total_resources.generation;
+        let report = hold_report(
+            generation,
+            vec![
+                gpu_hold(0, GpuHoldState::GpuHoldK8s),
+                gpu_hold(1, GpuHoldState::GpuHoldFree),
+            ],
+        );
+        cm.record_gpu_holds("n1", report.clone());
+        let nodes = cm.get_nodes();
+        assert_eq!(cm.held_gpus(&nodes)["n1"], vec![0]);
+        assert!(
+            !cm.held_gpus(&nodes).contains_key("n2"),
+            "a node that does not share holds nothing"
+        );
+
+        cm.clear_gpu_holds();
+        assert_eq!(cm.held_gpus(&nodes)["n1"], vec![0, 1]);
+        assert!(cm.gpu_hold_report(&cm.get_node("n1").unwrap()).is_none());
+
+        cm.record_gpu_holds("n1", report.clone());
+        assert_eq!(cm.held_gpus(&nodes)["n1"], vec![0]);
+        assert_eq!(
+            cm.gpu_hold_report(&cm.get_node("n1").unwrap()),
+            Some(report)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_gpu_makes_a_gpu_job_wait_for_resources_until_released() {
+        use spur_sched::traits::Scheduler as _;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        enroll_shared_gpu_node(&cm, 2);
+        let generation = cm.get_node("n1").unwrap().total_resources.generation;
+        let mut spec = basic_spec("wants-a-gpu");
+        spec.gres = vec!["gpu:1".into()];
+        let job_id = submit_and_wait(&cm, spec);
+        let job = cm.get_job(job_id).unwrap();
+        let nodes = cm.get_nodes();
+        let schedule = |cm: &ClusterManager| {
+            let held_gpus = cm.held_gpus(&nodes);
+            let state = spur_sched::traits::ClusterState {
+                busy_until: &HashMap::new(),
+                held_gpus: &held_gpus,
+                nodes: &nodes,
+                partitions: &[],
+                reservations: &[],
+                topology: None,
+            };
+            let assignments = spur_sched::backfill::BackfillScheduler::new(10)
+                .schedule(std::slice::from_ref(&job), &state);
+            if assignments.is_empty() {
+                cm.update_pending_reasons(&[&job], &state);
+            }
+            assignments
+        };
+
+        cm.record_gpu_holds(
+            "n1",
+            hold_report(
+                generation,
+                vec![
+                    gpu_hold(0, GpuHoldState::GpuHoldK8s),
+                    gpu_hold(1, GpuHoldState::GpuHoldK8s),
+                ],
+            ),
+        );
+        assert!(schedule(&cm).is_empty());
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Resources
+        );
+
+        cm.record_gpu_holds(
+            "n1",
+            hold_report(
+                generation,
+                vec![
+                    gpu_hold(0, GpuHoldState::GpuHoldK8s),
+                    gpu_hold(1, GpuHoldState::GpuHoldFree),
+                ],
+            ),
+        );
+        let assignments = schedule(&cm);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            assignments[0].per_node_alloc["n1"].device_ids("gpu"),
+            vec![1]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

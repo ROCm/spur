@@ -1213,8 +1213,8 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
 ``Account=``, ``Comment=``, ``QOS=``, and ``ExcNodeList=`` (also spelled
-``ExcludedNodes=``). Node updates need ``NodeName=`` and accept ``State=`` and
-``Reason=``.
+``ExcludedNodes=``). Node updates need ``NodeName=`` and accept ``State=``,
+``Reason=`` and ``GpuSharing=yes|no`` (see :doc:`/deployment/gpu-sharing`).
 
 ``ExcNodeList=`` takes a hostlist expression and replaces the job's excluded
 nodes, the list ``sbatch -x`` sets; an empty or blank value clears it, and an
