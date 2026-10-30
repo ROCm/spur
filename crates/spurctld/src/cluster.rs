@@ -4521,8 +4521,10 @@ impl ClusterManager {
         )
     }
 
-    /// Marks stale nodes Down unless `mark_down` is `Suppressed`, and recovers
-    /// nodes whose heartbeat resumed. Returns finalized jobs for cancel RPCs.
+    /// Marks stale nodes Down as `mark_down` allows, and recovers nodes whose
+    /// heartbeat resumed. Staleness is judged here, when the pass applies, so a
+    /// node confirmed gone that has heartbeated since is kept. Returns finalized
+    /// jobs for cancel RPCs.
     pub fn check_node_health(
         &self,
         timeout_secs: u64,
@@ -4533,18 +4535,43 @@ impl ClusterManager {
             let refs: Vec<&Node> = nodes.values().collect();
             evaluate_node_health(&refs, Utc::now(), timeout_secs)
         };
-        if mark_down == MarkDownPolicy::Suppressed {
-            let before = actions.len();
-            actions.retain(|a| !matches!(a, HealthAction::MarkDown { .. }));
-            let deferred = before - actions.len();
-            if deferred > 0 {
-                info!(
-                    nodes = deferred,
-                    "deferring node DOWN during leadership grace period"
-                );
+        match &mark_down {
+            MarkDownPolicy::Allowed => {}
+            MarkDownPolicy::Suppressed => {
+                let before = actions.len();
+                actions.retain(|a| !matches!(a, HealthAction::MarkDown { .. }));
+                let deferred = before - actions.len();
+                if deferred > 0 {
+                    info!(
+                        nodes = deferred,
+                        "deferring node DOWN during leadership grace period"
+                    );
+                }
             }
+            MarkDownPolicy::Only(confirmed) => actions.retain(|a| match a {
+                HealthAction::MarkDown { name, .. } => confirmed.contains(name),
+                HealthAction::Recover { .. } => true,
+            }),
         }
         self.apply_health_actions(actions)
+    }
+
+    /// The stale nodes a health pass would mark Down, read before anything is
+    /// applied so they can be confirmed first.
+    pub(crate) fn stale_nodes(&self, timeout_secs: u64) -> StaleNodes {
+        let nodes = self.nodes.read();
+        let refs: Vec<&Node> = nodes.values().collect();
+        let names = evaluate_node_health(&refs, Utc::now(), timeout_secs)
+            .into_iter()
+            .filter_map(|action| match action {
+                HealthAction::MarkDown { name, .. } => Some(name),
+                HealthAction::Recover { .. } => None,
+            })
+            .collect();
+        StaleNodes {
+            names,
+            monitored: monitored_node_count(&refs),
+        }
     }
 
     fn apply_health_actions(&self, actions: Vec<HealthAction>) -> Vec<JobFinalized> {
@@ -10070,10 +10097,19 @@ pub(crate) fn node_config_matches(
     matches_names || matches_selector
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkDownPolicy {
     Allowed,
     Suppressed,
+    /// Only these stale nodes may be marked Down this pass.
+    Only(HashSet<String>),
+}
+
+/// The nodes one health pass would mark Down, and how many nodes it watches.
+#[derive(Debug)]
+pub(crate) struct StaleNodes {
+    pub(crate) names: Vec<String>,
+    pub(crate) monitored: usize,
 }
 
 /// Withholds DOWN marking for `grace` after leadership is won: a non-leader
@@ -10164,6 +10200,21 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
     recovered.state = NodeState::Idle;
     recovered.update_state_from_alloc();
     recovered.state
+}
+
+/// Nodes a heartbeat timeout could still move to Down: a heartbeat is on
+/// record and the node is not already Down or held in Drain.
+pub(crate) fn monitored_node_count(nodes: &[&Node]) -> usize {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.last_heartbeat.is_some()
+                && node
+                    .state
+                    .transition(&NodeEvent::HeartbeatTimeout, node.admin_locked)
+                    .is_some()
+        })
+        .count()
 }
 
 pub(crate) fn evaluate_node_health(
@@ -10612,7 +10663,7 @@ pub(crate) mod gated {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
@@ -10712,7 +10763,7 @@ mod tests {
         }
     }
 
-    async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
+    pub(crate) async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
         test_cluster_with_config(dir, test_config()).await
     }
 
@@ -11211,7 +11262,7 @@ mod tests {
     /// has finished its initial self-election, causing `client_write` to
     /// fail silently. This helper retries until the election completes
     /// and the mutation is applied.
-    fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
+    pub(crate) fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
         for _ in 0..200 {
             if f() {
                 return;
@@ -11245,7 +11296,13 @@ mod tests {
         )
     }
 
-    fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
+    pub(crate) fn set_last_heartbeat(cm: &ClusterManager, name: &str, at: Option<DateTime<Utc>>) {
+        if let Some(node) = cm.nodes.write().get_mut(name) {
+            node.last_heartbeat = at;
+        }
+    }
+
+    pub(crate) fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
         try_register_node(cm, name, cpus, mem).unwrap();
         let n = name.to_string();
         wait_for(&format!("node '{n}' registered"), || {
@@ -28937,6 +28994,65 @@ mod tests {
         assert_eq!(
             cm.get_job(id).unwrap().allocated_nodes,
             vec!["n1".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_policy_marks_down_just_the_listed_stale_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "gone", 4, 8000);
+        register_node(&cm, "kept", 4, 8000);
+        for name in ["gone", "kept"] {
+            set_last_heartbeat(&cm, name, Some(Utc::now() - chrono::Duration::seconds(200)));
+        }
+
+        let confirmed = HashSet::from(["gone".to_string()]);
+        cm.check_node_health(90, super::MarkDownPolicy::Only(confirmed));
+        wait_for("confirmed node marked down", || {
+            cm.get_node("gone")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        assert_eq!(cm.get_node("kept").unwrap().state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_policy_spares_a_listed_node_whose_heartbeat_returned() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.update_heartbeat("back", 0, 8000);
+
+        let confirmed = HashSet::from(["back".to_string()]);
+        let evicted = cm.check_node_health(90, super::MarkDownPolicy::Only(confirmed));
+        assert!(evicted.is_empty());
+        assert_eq!(cm.get_node("back").unwrap().state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_nodes_counts_only_nodes_a_timeout_would_mark_down() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["fresh", "stale", "drained", "down"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        let old = Utc::now() - chrono::Duration::seconds(200);
+        {
+            let mut nodes = cm.nodes.write();
+            nodes.get_mut("stale").unwrap().last_heartbeat = Some(old);
+            let drained = nodes.get_mut("drained").unwrap();
+            drained.state = NodeState::Drain;
+            drained.last_heartbeat = Some(old);
+            let down = nodes.get_mut("down").unwrap();
+            down.state = NodeState::Down;
+            down.last_heartbeat = None;
+        }
+
+        let stale = cm.stale_nodes(90);
+        assert_eq!(stale.names, vec!["stale".to_string()]);
+        assert_eq!(
+            stale.monitored, 2,
+            "fresh and stale are watched; a drained or down node is not"
         );
     }
 
