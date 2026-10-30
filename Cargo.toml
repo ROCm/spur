@@ -20,6 +20,7 @@ members = [
     "crates/spur-update",
     "crates/spur-devices",
     "crates/spurauthd",
+    "crates/spur-fabric-check",
 ]
 
 [workspace.package]

@@ -23,6 +23,7 @@ subtrees:
               - file: admin-guide/idle-fill-scheduling
               - file: admin-guide/dme-integration
               - file: admin-guide/karma-scoring
+              - file: admin-guide/fabric-health-check
       - file: deployment/index
         subtrees:
           - entries:
