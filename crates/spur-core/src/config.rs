@@ -659,6 +659,12 @@ pub struct SchedulerConfig {
     /// `PreemptExemptTime`.
     #[serde(default)]
     pub preempt_exempt_time: u32,
+    /// Secondary order among preemption victims of equal QOS priority, as a list
+    /// of keys in precedence order (`fewest_jobs`, `least_work`, `requeue_count`,
+    /// `hash`). Applied after QOS priority and before node name, to candidates that
+    /// are already eligible. An empty list ranks by node name alone.
+    #[serde(default = "default_preempt_victim_order")]
+    pub preempt_victim_order: Vec<crate::partition::VictimOrderKey>,
     /// Master switch for idle-fill scheduling. `false` (default) means no
     /// behavior change anywhere: an over-quota job never borrows spare capacity.
     #[serde(default)]
@@ -711,6 +717,9 @@ fn default_max_user_priority() -> u32 {
 fn default_idle_fill_exempt_secs() -> u32 {
     60
 }
+fn default_preempt_victim_order() -> Vec<crate::partition::VictimOrderKey> {
+    crate::partition::DEFAULT_VICTIM_ORDER.to_vec()
+}
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -727,6 +736,7 @@ impl Default for SchedulerConfig {
             max_user_priority: default_max_user_priority(),
             preempt_type: PreemptType::None,
             preempt_exempt_time: 0,
+            preempt_victim_order: default_preempt_victim_order(),
             idle_fill_enabled: false,
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
             idle_fill_max_borrow_factor: 0.0,
@@ -2315,6 +2325,18 @@ impl SlurmConfig {
                     "{inactive} (0 disables reaping; otherwise must be >= {})",
                     2 * KEEPALIVE_INTERVAL_SECS
                 ),
+            });
+        }
+        // A repeated key would be silently redundant in a precedence list.
+        let order = &self.scheduler.preempt_victim_order;
+        if let Some(dup) = order
+            .iter()
+            .enumerate()
+            .find_map(|(i, key)| order[..i].contains(key).then_some(key))
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.preempt_victim_order".into(),
+                value: format!("{dup:?} listed more than once"),
             });
         }
         // `plugin` used to be parsed and never read, so an operator could set "munge" (or a typo)
@@ -4287,6 +4309,48 @@ inactive_limit_secs = 20
             "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 60\n",
         )
         .expect("a value at the floor must be accepted");
+    }
+
+    #[test]
+    fn preempt_victim_order_has_a_default_and_parses_a_key_list() {
+        use crate::partition::VictimOrderKey::*;
+        let unset = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(
+            unset.scheduler.preempt_victim_order,
+            [FewestJobs, LeastWork, RequeueCount, Hash]
+        );
+        assert_eq!(
+            SchedulerConfig::default().preempt_victim_order,
+            unset.scheduler.preempt_victim_order
+        );
+
+        let parse = |value: &str| {
+            SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[scheduler]\npreempt_victim_order = {value}\n"
+            ))
+            .unwrap()
+            .scheduler
+            .preempt_victim_order
+        };
+        assert_eq!(parse("[\"hash\", \"least_work\"]"), [Hash, LeastWork]);
+        assert!(parse("[]").is_empty(), "an empty list is node-name order");
+    }
+
+    #[test]
+    fn preempt_victim_order_rejects_unknown_and_repeated_keys() {
+        for (value, needle) in [
+            ("[\"fewest_job\"]", "fewest_job"),
+            (
+                "[\"hash\", \"least_work\", \"hash\"]",
+                "preempt_victim_order",
+            ),
+        ] {
+            let err = SlurmConfig::load_from_str(&format!(
+                "cluster_name = \"test\"\n[scheduler]\npreempt_victim_order = {value}\n"
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains(needle), "unexpected error: {err}");
+        }
     }
 
     #[test]

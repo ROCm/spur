@@ -25,6 +25,7 @@ mod rpc_stats;
 mod sched_stats;
 mod scheduler_loop;
 mod server;
+mod victim_order;
 
 use std::path::PathBuf;
 use std::sync::Arc;

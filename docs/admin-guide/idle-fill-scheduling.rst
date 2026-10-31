@@ -177,6 +177,10 @@ that needs nodes can reclaim from an ``idlefillpreemptable`` QOS of strictly low
 priority, so a high-priority idle-fill job outranks a low-priority burst job. The
 reverse is refused: a burst job never displaces a dearer borrowed run.
 
+Between runs of equal priority, reclaim ranks nodes with the keys of
+``scheduler.preempt_victim_order`` (fewest jobs, least work, fewest requeues, then a
+hash by default), and node name breaks any remaining tie; see :doc:`accounting`.
+
 The comparison is the QOS's ``priority``, not the job's computed priority. A job's
 priority folds in an age factor and climbs while it waits, so a long-queued burst job
 would otherwise outrank a freshly borrowed run and invert both rules. Standing within

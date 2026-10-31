@@ -22,6 +22,7 @@ use spur_sched::traits::{Assignment, ClusterState, Scheduler};
 use crate::cluster::{ClusterManager, JobEndFacts, JobFilter};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
+use crate::victim_order::{victim_facts, VictimOrder};
 
 /// Upper bound on a single CancelJob RPC (connect + call) when the caller
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
@@ -476,7 +477,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         &reclaimers,
                         &borrow_ids,
                         &cluster_state,
-                        sched_cfg.idle_fill_exempt_secs,
+                        &sched_cfg,
                     )
                     .await;
                     if !freed.is_empty() {
@@ -1255,6 +1256,8 @@ pub(crate) async fn try_preempt(
         .iter()
         .map(|(id, qos)| (*id, qos.priority))
         .collect();
+    let victim_keys = &sched.preempt_victim_order;
+    let facts = (!victim_keys.is_empty()).then(|| victim_facts(&running, now));
 
     // Pending job's QOS is resolved once per pending job; used for the
     // QosPriority hierarchy check.
@@ -1362,6 +1365,9 @@ pub(crate) async fn try_preempt(
                     occupants: &occupants,
                     priority: &victim_cost,
                     max_priority: None,
+                    order: facts
+                        .as_ref()
+                        .map(|facts| VictimOrder::new(victim_keys, facts, pending.job_id)),
                 },
                 cluster_nodes,
                 &reservations,
@@ -1499,7 +1505,7 @@ fn idle_fill_exempt_window(base_secs: u32, preempt_requeue_count: u32) -> i64 {
 /// Separate from `try_preempt`: the pool is borrowed runs, an opportunistic
 /// reclaimer sits under a QOS priority ceiling, and the eviction is always
 /// `Requeue`. Both prove the shortfall closes first (D2, §8.1).
-async fn reclaim_for_unplaced(
+pub(crate) async fn reclaim_for_unplaced(
     cluster: &Arc<ClusterManager>,
     unplaced: &[&spur_core::job::Job],
     // Pending jobs that are themselves opportunistic: the stamped borrow candidates.
@@ -1507,8 +1513,9 @@ async fn reclaim_for_unplaced(
     // recognised from its QOS rather than needing to be listed here.
     opportunistic: &HashSet<spur_core::job::JobId>,
     cluster_state: &ClusterState<'_>,
-    exempt_secs: u32,
+    sched: &spur_core::config::SchedulerConfig,
 ) -> (Vec<String>, Option<spur_core::job::JobId>) {
+    let exempt_secs = sched.idle_fill_exempt_secs;
     let now = Utc::now();
     let running = cluster.get_jobs(&JobFilter {
         states: &[spur_core::job::JobState::Running],
@@ -1582,6 +1589,8 @@ async fn reclaim_for_unplaced(
         reclaimable.iter().map(|r| r.job_id).collect();
     let victim_priority: HashMap<spur_core::job::JobId, i32> =
         reclaimable.iter().map(|r| (r.job_id, r.priority)).collect();
+    let victim_keys = &sched.preempt_victim_order;
+    let facts = (!victim_keys.is_empty()).then(|| victim_facts(&running, now));
 
     for reclaimer in unplaced {
         // An opportunistic reclaimer displaces only opportunistic work strictly
@@ -1598,6 +1607,9 @@ async fn reclaim_for_unplaced(
                 occupants: &occupants,
                 priority: &victim_priority,
                 max_priority: ceiling,
+                order: facts
+                    .as_ref()
+                    .map(|facts| VictimOrder::new(victim_keys, facts, reclaimer.job_id)),
             },
             cluster_state.nodes,
             cluster_state.reservations,
@@ -1677,6 +1689,8 @@ struct VictimPool<'a> {
     /// Set for an opportunistic reclaimer, which may only displace opportunistic
     /// work of strictly lower priority. `None` when `evictable` is already final.
     max_priority: Option<i32>,
+    /// Ranks nodes of equal cost before node name does. `None` is node-name order.
+    order: Option<VictimOrder<'a>>,
 }
 
 /// The set of evictable jobs whose removal would let `reclaimer` actually run, or
@@ -1706,18 +1720,18 @@ fn satisfiable_victim_set(
     };
 
     let needed = (reclaimer.spec.num_nodes as usize).max(1);
-    let mut have = 0usize;
+    // Already empty and suitable, yet the pass still could not place the job — so
+    // these alone are never enough, but they count toward the total.
+    let mut free = 0usize;
     let mut victims = HashSet::new();
-    let mut evacuable = Vec::new();
+    let mut evacuable: Vec<(&str, &[spur_core::job::JobId])> = Vec::new();
 
     for node in nodes {
         if !suitable(node) {
             continue;
         }
         match pool.occupants.get(node.name.as_str()) {
-            // Already empty and suitable, yet the pass still could not place the
-            // job — so these alone are never enough, but they count toward the total.
-            None => have += 1,
+            None => free += 1,
             Some(on_node)
                 if on_node.iter().all(|id| {
                     pool.evictable.contains(id)
@@ -1726,7 +1740,7 @@ fn satisfiable_victim_set(
                             .is_none_or(|bound| pool.priority.get(id).copied().unwrap_or(0) < bound)
                 }) =>
             {
-                evacuable.push((node.name.as_str(), on_node));
+                evacuable.push((node.name.as_str(), on_node.as_slice()));
             }
             Some(_) => {}
         }
@@ -1734,27 +1748,48 @@ fn satisfiable_victim_set(
 
     // Spend the cheapest opportunistic work first, and only climb to a more
     // valuable victim if that is still not enough. A node's cost is the highest
-    // priority it carries, since evacuating it forfeits every run on it, and
-    // ties break on node name so the choice is deterministic rather than
-    // dependent on registration order.
-    evacuable.sort_by_key(|(name, on_node)| {
-        let cost = on_node
+    // priority it carries, since evacuating it forfeits every run on it. Ties go to
+    // the configured order if any, then to node name, so the choice is
+    // deterministic rather than dependent on registration order.
+    let cost_of = |on_node: &[spur_core::job::JobId]| {
+        on_node
             .iter()
             .map(|id| pool.priority.get(id).copied().unwrap_or(0))
             .max()
-            .unwrap_or(0);
-        (cost, *name)
-    });
+            .unwrap_or(0)
+    };
+    while free < needed {
+        // What a node would add depends on the jobs already chosen, so the ranks
+        // are read again after every pick.
+        let ranks: Vec<_> = evacuable
+            .iter()
+            .map(|(name, jobs)| {
+                pool.order
+                    .as_ref()
+                    .map(|order| order.rank(name, jobs, &victims))
+            })
+            .collect();
+        let next = (0..evacuable.len()).min_by(|&a, &b| {
+            let ((name_a, jobs_a), (name_b, jobs_b)) = (evacuable[a], evacuable[b]);
+            cost_of(jobs_a)
+                .cmp(&cost_of(jobs_b))
+                .then_with(|| match (&pool.order, &ranks[a], &ranks[b]) {
+                    (Some(order), Some(rank_a), Some(rank_b)) => order.compare(rank_a, rank_b),
+                    _ => std::cmp::Ordering::Equal,
+                })
+                .then_with(|| name_a.cmp(name_b))
+        });
+        let Some(next) = next else { break };
+        victims.extend(evacuable[next].1.iter().copied());
 
-    for (_, on_node) in evacuable {
-        if have >= needed {
-            break;
-        }
-        have += 1;
-        victims.extend(on_node.iter().copied());
+        // A multi-node job already chosen empties every node it spans, so those
+        // nodes are free too: recount them instead of paying for each again.
+        let before = evacuable.len();
+        evacuable.retain(|(_, jobs)| !jobs.iter().all(|id| victims.contains(id)));
+        free += before - evacuable.len();
     }
 
-    (have >= needed && !victims.is_empty()).then_some(victims)
+    (free >= needed && !victims.is_empty()).then_some(victims)
 }
 
 /// True when `candidate` occupies a node the pending job could target.
@@ -4518,6 +4553,8 @@ mod tests {
 
     mod idle_fill_reclaim_tests {
         use super::*;
+        use crate::victim_order::VictimFacts;
+        use spur_core::partition::{VictimOrderKey, DEFAULT_VICTIM_ORDER};
 
         fn no_priorities() -> HashMap<spur_core::job::JobId, i32> {
             HashMap::new()
@@ -4566,6 +4603,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &no_priorities(),
                         max_priority: None,
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4586,6 +4624,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &no_priorities(),
                         max_priority: None,
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4613,6 +4652,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &no_priorities(),
                         max_priority: None,
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4634,6 +4674,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &no_priorities(),
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
@@ -4666,6 +4707,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &priorities,
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
@@ -4705,6 +4747,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &priorities,
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
@@ -4736,6 +4779,7 @@ mod tests {
                         priority: &priorities,
                         // An opportunistic reclaimer at burst priority.
                         max_priority: Some(1001),
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4756,6 +4800,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &priorities,
                         max_priority: None,
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4786,6 +4831,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &priorities,
                         max_priority: Some(6000),
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4804,6 +4850,7 @@ mod tests {
                         occupants: &occupants,
                         priority: &priorities,
                         max_priority: Some(1001),
+                        order: None,
                     },
                     &nodes,
                     &[],
@@ -4832,6 +4879,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &priorities,
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
@@ -4843,6 +4891,190 @@ mod tests {
                 [7].into_iter().collect(),
                 "ties break on node name, so n1's occupant goes even though n2 is listed first"
             );
+        }
+
+        fn facts(elapsed_secs: f64, nodes: u32, requeues: u32) -> VictimFacts {
+            VictimFacts {
+                elapsed_secs,
+                nodes,
+                requeues,
+            }
+        }
+
+        /// The victims a reclaimer with id `preemptor` that needs `needed` nodes evicts
+        /// from `layout`, where every job is evictable at `priorities` (100 when not
+        /// listed), under `keys`. Nodes are registered in reverse name order, so a
+        /// result that follows the names is not registration order.
+        fn choose(
+            keys: &[VictimOrderKey],
+            facts: &[(spur_core::job::JobId, VictimFacts)],
+            layout: &[(&str, &[spur_core::job::JobId])],
+            needed: u32,
+            preemptor: spur_core::job::JobId,
+            priorities: &[(spur_core::job::JobId, i32)],
+        ) -> Option<HashSet<spur_core::job::JobId>> {
+            let nodes: Vec<Node> = layout.iter().rev().map(|(name, _)| node(name, 4)).collect();
+            let occupants: HashMap<&str, Vec<spur_core::job::JobId>> = layout
+                .iter()
+                .map(|(name, jobs)| (*name, jobs.to_vec()))
+                .collect();
+            let evictable: HashSet<spur_core::job::JobId> = layout
+                .iter()
+                .flat_map(|(_, jobs)| jobs.iter().copied())
+                .collect();
+            let priority: HashMap<spur_core::job::JobId, i32> = evictable
+                .iter()
+                .map(|id| (*id, 100))
+                .chain(priorities.iter().copied())
+                .collect();
+            let facts: HashMap<_, _> = facts.iter().copied().collect();
+            let mut pending = reclaimer(needed, 1);
+            pending.job_id = preemptor;
+            satisfiable_victim_set(
+                &pending,
+                &VictimPool {
+                    evictable: &evictable,
+                    occupants: &occupants,
+                    priority: &priority,
+                    max_priority: None,
+                    order: Some(VictimOrder::new(keys, &facts, preemptor)),
+                },
+                &nodes,
+                &[],
+                Utc::now(),
+            )
+        }
+
+        fn ids(ids: &[spur_core::job::JobId]) -> HashSet<spur_core::job::JobId> {
+            ids.iter().copied().collect()
+        }
+
+        #[test]
+        fn a_multi_node_burst_job_already_chosen_is_credited_for_every_node_it_frees() {
+            // A 2-node job needs two nodes; two 4-node burst jobs fill the rest. One
+            // burst job frees four, so evicting both would destroy work for nothing.
+            // Which node a hash picks first depends on the preemptor, so every
+            // preemptor must still evict exactly one.
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[
+                ("n1", &[100]),
+                ("n2", &[100]),
+                ("n3", &[100]),
+                ("n4", &[100]),
+                ("n5", &[200]),
+                ("n6", &[200]),
+                ("n7", &[200]),
+                ("n8", &[200]),
+            ];
+            for keys in [
+                &[VictimOrderKey::Hash][..],
+                &[][..],
+                &DEFAULT_VICTIM_ORDER[..],
+            ] {
+                for preemptor in 1..=64 {
+                    let victims = choose(keys, &[], layout, 2, preemptor, &[])
+                        .expect("one burst job is enough");
+                    assert_eq!(victims.len(), 1, "preemptor {preemptor} under {keys:?}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_recount_stops_at_the_nodes_needed_and_still_takes_every_job_on_them() {
+            // Job 100 spans n1 and n2, and n2 also holds 101. Three nodes are needed, so
+            // n1+n2 (both jobs) and then n3 are taken: nothing is left behind on a node.
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[
+                ("n1", &[100]),
+                ("n2", &[100, 101]),
+                ("n3", &[200]),
+                ("n4", &[300]),
+            ];
+            let victims = choose(&[], &[], layout, 3, 1, &[]).unwrap();
+            assert_eq!(victims, ids(&[100, 101, 200]));
+        }
+
+        #[test]
+        fn fewest_jobs_takes_the_node_that_adds_fewer_jobs() {
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[("n1", &[7, 8]), ("n2", &[9])];
+            assert_eq!(
+                choose(&[], &[], layout, 1, 1, &[]),
+                Some(ids(&[7, 8])),
+                "control: without a key, node name picks n1"
+            );
+            assert_eq!(
+                choose(&[VictimOrderKey::FewestJobs], &[], layout, 1, 1, &[]),
+                Some(ids(&[9]))
+            );
+        }
+
+        #[test]
+        fn least_work_takes_the_cheaper_work_first() {
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[("n1", &[7]), ("n2", &[9])];
+            let facts = [(7, facts(3600.0, 1, 0)), (9, facts(60.0, 1, 0))];
+            assert_eq!(
+                choose(&[], &facts, layout, 1, 1, &[]),
+                Some(ids(&[7])),
+                "control: without a key, node name picks n1"
+            );
+            assert_eq!(
+                choose(&[VictimOrderKey::LeastWork], &facts, layout, 1, 1, &[]),
+                Some(ids(&[9]))
+            );
+        }
+
+        #[test]
+        fn requeue_count_protects_the_job_that_keeps_being_hit() {
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[("n1", &[7]), ("n2", &[9])];
+            let facts = [(7, facts(100.0, 1, 3)), (9, facts(100.0, 1, 0))];
+            assert_eq!(
+                choose(&[VictimOrderKey::RequeueCount], &facts, layout, 1, 1, &[]),
+                Some(ids(&[9]))
+            );
+        }
+
+        #[test]
+        fn a_hash_order_stops_favouring_the_lowest_node_name() {
+            // The pinned hash puts n2 ahead of n1 for preemptor 1, and n1 ahead for 2.
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[("n1", &[7]), ("n2", &[9])];
+            let keys = [VictimOrderKey::Hash];
+            assert_eq!(choose(&keys, &[], layout, 1, 1, &[]), Some(ids(&[9])));
+            assert_eq!(choose(&keys, &[], layout, 1, 2, &[]), Some(ids(&[7])));
+        }
+
+        #[test]
+        fn the_default_order_weighs_jobs_before_work_before_requeues() {
+            // n1 holds one old, much-requeued job; n2 two fresh ones. Fewer jobs wins.
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[("n2", &[8, 9]), ("n1", &[7])];
+            let facts = [
+                (7, facts(7200.0, 1, 5)),
+                (8, facts(10.0, 1, 0)),
+                (9, facts(10.0, 1, 0)),
+            ];
+            assert_eq!(
+                choose(&DEFAULT_VICTIM_ORDER, &facts, layout, 1, 1, &[]),
+                Some(ids(&[7]))
+            );
+        }
+
+        #[test]
+        fn qos_priority_still_outranks_every_key() {
+            // n1's single job is dearer, n2's two jobs are cheaper: the cheaper QOS is
+            // spent first even though fewer jobs would favour n1.
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[("n1", &[7]), ("n2", &[8, 9])];
+            assert_eq!(
+                choose(&DEFAULT_VICTIM_ORDER, &[], layout, 1, 1, &[(7, 200)]),
+                Some(ids(&[8, 9]))
+            );
+        }
+
+        #[test]
+        fn keys_with_nothing_to_separate_fall_back_to_node_name() {
+            let layout: &[(&str, &[spur_core::job::JobId])] = &[("n1", &[7]), ("n2", &[9])];
+            let keys = [
+                VictimOrderKey::FewestJobs,
+                VictimOrderKey::LeastWork,
+                VictimOrderKey::RequeueCount,
+            ];
+            assert_eq!(choose(&keys, &[], layout, 1, 1, &[]), Some(ids(&[7])));
         }
 
         #[test]
@@ -4861,6 +5093,7 @@ mod tests {
                     occupants: &occupants,
                     priority: &no_priorities(),
                     max_priority: None,
+                    order: None,
                 },
                 &nodes,
                 &[],
