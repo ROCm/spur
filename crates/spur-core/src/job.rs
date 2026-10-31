@@ -1284,9 +1284,12 @@ impl Job {
         self.resolve_path(self.spec.stdout_path.as_deref().unwrap_or("spur-%j.out"))
     }
 
-    /// Resolve stderr path.
+    /// Resolve stderr path. Unset, it shares the stdout file, as in Slurm.
     pub fn resolved_stderr(&self) -> String {
-        self.resolve_path(self.spec.stderr_path.as_deref().unwrap_or("spur-%j.out"))
+        match &self.spec.stderr_path {
+            Some(path) => self.resolve_path(path),
+            None => self.resolved_stdout(),
+        }
     }
 
     /// Resolve stdin path, if set. Absolute (anchored like stdout/stderr) and
@@ -1728,6 +1731,22 @@ mod tests {
             },
         );
         assert_eq!(job.resolved_stdout(), "/work/out-42.log");
+    }
+
+    #[test]
+    fn resolved_stderr_follows_stdout_unless_set() {
+        let mut job = Job::new(
+            42,
+            JobSpec {
+                work_dir: "/work".into(),
+                stdout_path: Some("out-%j.log".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job.resolved_stderr(), "/work/out-42.log");
+
+        job.spec.stderr_path = Some("err-%j.log".into());
+        assert_eq!(job.resolved_stderr(), "/work/err-42.log");
     }
 
     #[test]

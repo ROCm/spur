@@ -355,7 +355,7 @@ async fn launch_stepd(
         executor::LaunchResult {
             job: executor::RunningJob::AllocationOnly,
             stdout_path: executor::resolve_output_path(config, &work_dir, &config.stdout_path),
-            stderr_path: executor::resolve_output_path(config, &work_dir, &config.stderr_path),
+            stderr_path: executor::resolve_stderr_path(config, &work_dir),
             pty_master: None,
             // Not created until the job is released; steps read it live.
             cgroup_path: None,
