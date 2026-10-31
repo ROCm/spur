@@ -84,19 +84,32 @@ pub enum PreemptType {
     QosPriority,
 }
 
-/// One key of the optional secondary order among preemption victims of equal
-/// QOS priority (`scheduler.preempt_victim_order`). Keys only rank candidates
-/// that are already eligible; they never make a job preemptable or exempt.
+/// One key of the secondary order among preemption victims of equal QOS priority
+/// (`scheduler.preempt_victim_order`). Keys only rank candidates that are already
+/// eligible; they never make a job preemptable or exempt.
+///
+/// "New" jobs below are the node's jobs that the victim set being built does not
+/// already contain: a job already chosen costs nothing more to evict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VictimOrderKey {
-    /// Owner (account) whose recent usage is largest relative to its share goes first.
-    UsageShare,
-    /// Owner (account) that has lost the least work to preemption recently goes first.
-    PreemptBurden,
+    /// Fewest new jobs first, so the set evicts as few jobs as possible.
+    FewestJobs,
+    /// Least work lost first: the elapsed time times the nodes held by the new jobs.
+    LeastWork,
+    /// Lowest `preempt_requeue_count` first, so a job that keeps being hit ranks later.
+    RequeueCount,
     /// Stable hash of the preempting job and the node, so no node name is favoured.
     Hash,
 }
+
+/// The order applied when `scheduler.preempt_victim_order` is not set.
+pub const DEFAULT_VICTIM_ORDER: [VictimOrderKey; 4] = [
+    VictimOrderKey::FewestJobs,
+    VictimOrderKey::LeastWork,
+    VictimOrderKey::RequeueCount,
+    VictimOrderKey::Hash,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PreemptMode {

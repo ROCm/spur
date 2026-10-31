@@ -50,7 +50,6 @@ use crate::limits_cache::{consumed_minutes, GrpWallCache, QosCache};
 use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
-use crate::victim_order::OwnerStandingCache;
 
 /// Description shown for a job parked after a launch failure it would carry to
 /// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
@@ -618,7 +617,6 @@ pub struct ClusterManager {
     qos_cache: Arc<QosCache>,
     grp_wall_cache: Arc<GrpWallCache>,
     association_cache: Arc<AssociationCache>,
-    owner_standing_cache: Arc<OwnerStandingCache>,
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
@@ -918,7 +916,6 @@ impl ClusterManager {
         let qos_cache = Arc::new(QosCache::new());
         let grp_wall_cache = Arc::new(GrpWallCache::new());
         let association_cache = Arc::new(AssociationCache::new());
-        let owner_standing_cache = Arc::new(OwnerStandingCache::default());
 
         let cm = Self {
             config: RwLock::new(Arc::new(config)),
@@ -949,7 +946,6 @@ impl ClusterManager {
             qos_cache,
             grp_wall_cache,
             association_cache,
-            owner_standing_cache,
             scheduler_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
             karma_stats: Arc::new(crate::karma_stats::KarmaStatsCollector::new()),
@@ -6583,10 +6579,6 @@ impl ClusterManager {
 
     pub fn association_cache(&self) -> &Arc<AssociationCache> {
         &self.association_cache
-    }
-
-    pub(crate) fn owner_standing_cache(&self) -> &Arc<OwnerStandingCache> {
-        &self.owner_standing_cache
     }
 
     /// Whether accounting is configured. A cluster with no `database_url` never
@@ -21360,195 +21352,136 @@ mod tests {
         }
     }
 
-    /// Start two equal-priority victims, n1's owned by an account that has lost a
-    /// great deal to preemption recently and n2's by one that has lost nothing, then
-    /// run one preemption for a single-node hunter. Returns the (n1, n2) victims.
-    async fn preempt_one_of_two_accounts(cm: &Arc<ClusterManager>) -> (JobId, JobId) {
-        register_node(cm, "n1", 8, 16000);
-        register_node(cm, "n2", 8, 16000);
-        insert_preempting_qos_pair(cm, "low", "high");
-        cm.owner_standing_cache()
-            .set_for_test(crate::accounting::StandingSnapshot {
-                burden: [("burdened".to_string(), 90_000.0)].into_iter().collect(),
-                halflife_days: 14,
-                ..Default::default()
-            });
-
-        let mut victims = Vec::new();
-        for (name, node, account) in [("low-a", "n1", "burdened"), ("low-b", "n2", "fresh")] {
-            let mut low = basic_spec(name);
-            low.priority = Some(100);
-            low.qos = Some("low".into());
-            low.account = Some(account.into());
-            let id = submit_and_wait(cm, low);
-            let res = scalar_alloc(2, 4000);
-            cm.start_job(
-                id,
-                vec![node.into()],
-                res.clone(),
-                per_node_for(&[node], res),
-            )
-            .unwrap();
-            settle(cm, id, JobState::Running);
-            victims.push(id);
-        }
-
-        let mut high = basic_spec("high");
-        high.priority = Some(10_000);
-        high.qos = Some("high".into());
-        let high_id = submit_and_wait(cm, high);
-        let high_job = cm.get_job(high_id).unwrap();
-        let partitions = cm.get_partitions();
-        crate::scheduler_loop::try_preempt(
-            cm,
-            &partitions,
-            &cm.get_nodes(),
-            &[&high_job],
-            &cm.config().scheduler,
-        )
-        .await;
-        (victims[0], victims[1])
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preemption_takes_the_lowest_named_node_when_no_victim_order_is_set() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster_with_config(&dir, preempting_config()).await;
-
-        let (on_n1, on_n2) = preempt_one_of_two_accounts(&cm).await;
-
-        settle(&cm, on_n1, JobState::Completing);
-        assert_eq!(cm.get_job(on_n2).unwrap().state, JobState::Running);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preemption_spares_the_account_that_already_lost_the_most() {
-        let dir = TempDir::new().unwrap();
-        let mut config = preempting_config();
-        config.scheduler.preempt_victim_order =
-            vec![spur_core::partition::VictimOrderKey::PreemptBurden];
-        let cm = test_cluster_with_config(&dir, config).await;
-
-        let (on_n1, on_n2) = preempt_one_of_two_accounts(&cm).await;
-
-        settle(&cm, on_n2, JobState::Completing);
-        assert_eq!(cm.get_job(on_n1).unwrap().state, JobState::Running);
-    }
-
-    /// n1 holds a 1-cpu job of account "plain" in a QOS billed in full and n2 a 2-cpu
-    /// job of account "discounted" in a QOS billed at `factor`, both running for ten
-    /// hours at equal shares and equal QOS priority. Runs one single-node preemption
-    /// and returns the (n1, n2) jobs.
-    async fn preempt_with_qos_usage_factor(
+    /// Start one 1-cpu job in `qos` per `(node, hours running, preemption requeues)`
+    /// entry and return their ids in order. Every job in one call shares a single
+    /// clock reading, so equal hours really are equal elapsed time.
+    fn start_jobs_in_qos(
         cm: &Arc<ClusterManager>,
-        factor: f64,
-    ) -> (JobId, JobId) {
-        register_node(cm, "n1", 8, 16000);
-        register_node(cm, "n2", 8, 16000);
-        for (name, usage_factor) in [("plain-qos", 1.0), ("discounted-qos", factor)] {
-            cm.qos_cache().insert(Qos {
-                name: name.into(),
-                priority: 100,
-                usage_factor,
-                ..Default::default()
-            });
-        }
-        cm.qos_cache().insert(Qos {
-            name: "high".into(),
-            priority: 10_000,
-            preempt: vec!["plain-qos".into(), "discounted-qos".into()],
-            ..Default::default()
-        });
-        cm.owner_standing_cache()
-            .set_for_test(crate::accounting::StandingSnapshot {
-                shares: [("plain".to_string(), 0.5), ("discounted".to_string(), 0.5)]
-                    .into_iter()
-                    .collect(),
-                halflife_days: 14,
-                ..Default::default()
-            });
+        qos: &str,
+        jobs: &[(&str, i64, u32)],
+    ) -> Vec<JobId> {
+        let now = Utc::now();
+        jobs.iter()
+            .enumerate()
+            .map(|(i, (node, hours, requeues))| {
+                let mut spec = basic_spec(&format!("{qos}-{i}"));
+                spec.priority = Some(100);
+                spec.qos = Some(qos.into());
+                let id = submit_and_wait(cm, spec);
+                let res = scalar_alloc(1, 1000);
+                cm.start_job(
+                    id,
+                    vec![(*node).into()],
+                    res.clone(),
+                    per_node_for(&[node], res),
+                )
+                .unwrap();
+                settle(cm, id, JobState::Running);
+                let mut all = cm.jobs.write();
+                let job = all.get_mut(&id).unwrap();
+                job.start_time = Some(now - chrono::Duration::hours(*hours));
+                job.preempt_requeue_count = *requeues;
+                id
+            })
+            .collect()
+    }
 
-        let mut victims = Vec::new();
-        for (name, node, account, qos, cpus) in [
-            ("plain-job", "n1", "plain", "plain-qos", 1),
-            ("discounted-job", "n2", "discounted", "discounted-qos", 2),
-        ] {
-            let mut spec = basic_spec(name);
-            spec.priority = Some(100);
-            spec.qos = Some(qos.into());
-            spec.account = Some(account.into());
-            spec.cpus_per_task = cpus;
-            let id = submit_and_wait(cm, spec);
-            let res = scalar_alloc(cpus, 4000);
-            cm.start_job(
-                id,
-                vec![node.into()],
-                res.clone(),
-                per_node_for(&[node], res),
-            )
-            .unwrap();
-            settle(cm, id, JobState::Running);
-            cm.jobs.write().get_mut(&id).unwrap().start_time =
-                Some(Utc::now() - chrono::Duration::hours(10));
-            victims.push(id);
-        }
+    /// Two nodes, `jobs` running in "low", and one preemption for a single-node
+    /// "high" job. Waits for the jobs at the `expected` indexes to start draining and
+    /// checks that every other job is still running.
+    async fn preempt_among(
+        config: spur_core::config::SlurmConfig,
+        jobs: &[(&str, i64, u32)],
+        expected: &[usize],
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let ids = start_jobs_in_qos(&cm, "low", jobs);
 
         let mut high = basic_spec("high");
         high.priority = Some(10_000);
         high.qos = Some("high".into());
-        let high_id = submit_and_wait(cm, high);
+        let high_id = submit_and_wait(&cm, high);
         let high_job = cm.get_job(high_id).unwrap();
         let partitions = cm.get_partitions();
         crate::scheduler_loop::try_preempt(
-            cm,
+            &cm,
             &partitions,
             &cm.get_nodes(),
             &[&high_job],
             &cm.config().scheduler,
         )
         .await;
-        (victims[0], victims[1])
+
+        for (i, id) in ids.iter().enumerate() {
+            if expected.contains(&i) {
+                settle(&cm, *id, JobState::Completing);
+            } else {
+                assert_eq!(cm.get_job(*id).unwrap().state, JobState::Running, "job {i}");
+            }
+        }
+    }
+
+    fn config_with_victim_order(
+        keys: Vec<spur_core::partition::VictimOrderKey>,
+    ) -> spur_core::config::SlurmConfig {
+        let mut config = preempting_config();
+        config.scheduler.preempt_victim_order = keys;
+        config
+    }
+
+    // Each case lists its jobs as (node, hours running, preemption requeues), and runs
+    // twice with the nodes swapped. Node name and the hash both prefer the same node
+    // either way, so only the key under test can pass both orientations.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_default_order_evicts_the_node_with_fewest_jobs() {
+        // The single job has run longer, so least_work alone would take the other node.
+        let one_on_n2 = [("n1", 1, 0), ("n1", 1, 0), ("n2", 5, 0)];
+        let one_on_n1 = [("n1", 5, 0), ("n2", 1, 0), ("n2", 1, 0)];
+        preempt_among(preempting_config(), &one_on_n2, &[2]).await;
+        preempt_among(preempting_config(), &one_on_n1, &[0]).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_share_counts_a_qos_with_zero_usage_factor_in_full() {
-        let dir = TempDir::new().unwrap();
-        let mut config = preempting_config();
-        config.scheduler.preempt_victim_order =
-            vec![spur_core::partition::VictimOrderKey::UsageShare];
-        let cm = test_cluster_with_config(&dir, config).await;
-
-        let (plain, discounted) = preempt_with_qos_usage_factor(&cm, 0.0).await;
-
-        // Billed at zero, the discounted account would look idle and n1 would go.
-        settle(&cm, discounted, JobState::Completing);
-        assert_eq!(cm.get_job(plain).unwrap().state, JobState::Running);
+    async fn the_default_order_evicts_the_least_work_among_equal_job_counts() {
+        preempt_among(preempting_config(), &[("n1", 10, 0), ("n2", 1, 0)], &[1]).await;
+        preempt_among(preempting_config(), &[("n1", 1, 0), ("n2", 10, 0)], &[0]).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_share_counts_a_half_billed_qos_in_full() {
-        let dir = TempDir::new().unwrap();
-        let mut config = preempting_config();
-        config.scheduler.preempt_victim_order =
-            vec![spur_core::partition::VictimOrderKey::UsageShare];
-        let cm = test_cluster_with_config(&dir, config).await;
-
-        let (plain, discounted) = preempt_with_qos_usage_factor(&cm, 0.5).await;
-
-        // Halved, the two accounts would tie and node name would pick n1. In full the
-        // 2-cpu account has consumed twice as much, so it goes.
-        settle(&cm, discounted, JobState::Completing);
-        assert_eq!(cm.get_job(plain).unwrap().state, JobState::Running);
+    async fn the_default_order_spares_the_job_that_keeps_being_preempted() {
+        preempt_among(preempting_config(), &[("n1", 1, 2), ("n2", 1, 0)], &[1]).await;
+        preempt_among(preempting_config(), &[("n1", 1, 0), ("n2", 1, 2)], &[0]).await;
     }
 
-    /// n1 holds a 1-cpu borrowed run of account "plain" and n2 a 2-cpu one of account
-    /// "heavy", both in a QOS marked idle-fill preemptable and running for ten hours at
-    /// equal shares. Runs one reclaim for an in-quota job that needs one node and
-    /// returns the nodes it freed.
-    async fn reclaim_one_of_two_borrowed_runs(cm: &Arc<ClusterManager>) -> Vec<String> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_victim_order_takes_the_lowest_named_node() {
+        // The same layouts as the fewest-jobs case, where the default takes n2 first.
+        let config = || config_with_victim_order(Vec::new());
+        preempt_among(
+            config(),
+            &[("n1", 1, 0), ("n1", 1, 0), ("n2", 5, 0)],
+            &[0, 1],
+        )
+        .await;
+        preempt_among(config(), &[("n1", 5, 0), ("n2", 1, 0), ("n2", 1, 0)], &[0]).await;
+    }
+
+    /// Two nodes, `jobs` running in an idle-fill preemptable QOS, and one reclaim for
+    /// an in-quota job that needs one node. Returns the nodes it freed.
+    async fn reclaim_among(
+        config: spur_core::config::SlurmConfig,
+        jobs: &[(&str, i64, u32)],
+    ) -> HashSet<String> {
         use spur_sched::traits::ClusterState;
-        register_node(cm, "n1", 8, 16000);
-        register_node(cm, "n2", 8, 16000);
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
         cm.qos_cache().insert(Qos {
             name: "burst".into(),
             priority: 100,
@@ -21560,45 +21493,16 @@ mod tests {
             priority: 10_000,
             ..Default::default()
         });
-        cm.owner_standing_cache()
-            .set_for_test(crate::accounting::StandingSnapshot {
-                shares: [("plain".to_string(), 0.5), ("heavy".to_string(), 0.5)]
-                    .into_iter()
-                    .collect(),
-                halflife_days: 14,
-                ..Default::default()
-            });
-
-        for (name, node, account, cpus) in [
-            ("plain-run", "n1", "plain", 1),
-            ("heavy-run", "n2", "heavy", 2),
-        ] {
-            let mut spec = basic_spec(name);
-            spec.qos = Some("burst".into());
-            spec.account = Some(account.into());
-            spec.cpus_per_task = cpus;
-            let id = submit_and_wait(cm, spec);
-            let res = scalar_alloc(cpus, 4000);
-            cm.start_job(
-                id,
-                vec![node.into()],
-                res.clone(),
-                per_node_for(&[node], res),
-            )
-            .unwrap();
-            settle(cm, id, JobState::Running);
-            cm.jobs.write().get_mut(&id).unwrap().start_time =
-                Some(Utc::now() - chrono::Duration::hours(10));
-        }
+        start_jobs_in_qos(&cm, "burst", jobs);
 
         let mut claim = basic_spec("claim");
         claim.qos = Some("claim".into());
-        let claim_id = submit_and_wait(cm, claim);
+        let claim_id = submit_and_wait(&cm, claim);
         let claimer = cm.get_job(claim_id).unwrap();
         let nodes = cm.get_nodes();
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
-        let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
+        let busy_until = crate::scheduler_loop::running_jobs_busy_until(&cm);
         let state = ClusterState {
             nodes: &nodes,
             partitions: &partitions,
@@ -21607,7 +21511,7 @@ mod tests {
             busy_until: &busy_until,
         };
         let (freed, for_job) = crate::scheduler_loop::reclaim_for_unplaced(
-            cm,
+            &cm,
             &[&claimer],
             &HashSet::new(),
             &state,
@@ -21615,26 +21519,34 @@ mod tests {
         )
         .await;
         assert_eq!(for_job, Some(claim_id));
-        freed
+        freed.into_iter().collect()
+    }
+
+    fn node_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reclaim_takes_the_lowest_named_node_when_no_victim_order_is_set() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster_with_config(&dir, test_config()).await;
-
-        assert_eq!(reclaim_one_of_two_borrowed_runs(&cm).await, ["n1"]);
+    async fn reclaim_follows_the_default_order() {
+        // The single borrowed job has run longer, so only fewest_jobs frees its node.
+        let one_on_n2 = [("n1", 1, 0), ("n1", 1, 0), ("n2", 5, 0)];
+        let one_on_n1 = [("n1", 5, 0), ("n2", 1, 0), ("n2", 1, 0)];
+        assert_eq!(
+            reclaim_among(test_config(), &one_on_n2).await,
+            node_set(&["n2"])
+        );
+        assert_eq!(
+            reclaim_among(test_config(), &one_on_n1).await,
+            node_set(&["n1"])
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reclaim_follows_the_victim_order_when_it_is_set() {
-        let dir = TempDir::new().unwrap();
+    async fn reclaim_takes_the_lowest_named_node_when_the_order_is_empty() {
         let mut config = test_config();
-        config.scheduler.preempt_victim_order =
-            vec![spur_core::partition::VictimOrderKey::UsageShare];
-        let cm = test_cluster_with_config(&dir, config).await;
-
-        assert_eq!(reclaim_one_of_two_borrowed_runs(&cm).await, ["n2"]);
+        config.scheduler.preempt_victim_order = Vec::new();
+        let jobs = [("n1", 1, 0), ("n1", 1, 0), ("n2", 5, 0)];
+        assert_eq!(reclaim_among(config, &jobs).await, node_set(&["n1"]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

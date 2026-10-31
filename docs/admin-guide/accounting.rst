@@ -952,31 +952,38 @@ The guards decide who *may* be preempted; they do not decide who *is*. A pending
 job is placed on whole nodes, so the scheduler looks for the cheapest set of nodes
 it can empty entirely. A node counts only when every job on it is an eligible
 victim, and every job on a chosen node is preempted together, so a node shared with
-an ineligible job is never chosen. Nodes are taken in this order:
+an ineligible job is never chosen. The set is worked out in memory first, and
+nothing is evicted unless it frees enough nodes; then all of its jobs are evicted
+together. When no set is enough, nothing is evicted.
+
+Nodes are added to the set one at a time, in this order:
 
 1. The highest QOS ``priority`` among the jobs on the node, lowest first, so the
    least important work is spent first.
-2. The keys of ``scheduler.preempt_victim_order``, if set (below).
+2. The keys of ``scheduler.preempt_victim_order`` (below).
 3. Node name.
 
-Job ID, submit time and elapsed run time are not consulted. With
-``preempt_victim_order`` unset, victims of equal QOS priority are therefore taken
-from the lowest-named node first, whichever jobs happen to be there.
+After each node is added, the free nodes are counted again: a multi-node job that is
+already in the set empties every node it spans, so those nodes count as free
+without being added one by one. Without that, a 2-node job waiting behind two
+4-node burst jobs could evict both, when either alone frees enough.
 
-``preempt_victim_order`` is an opt-in list of keys that ranks nodes tied in step 1.
-It never makes a job preemptable or exempt: eligibility, QOS priority and
-``preempt_exempt_time`` are settled first and stay as described above. Unset, the
-default, keeps the node-name order exactly. Idle-fill reclaim (see
-:doc:`idle-fill-scheduling`) ranks its own victims the same way when it is set.
+Job ID and submit time are not consulted. ``preempt_victim_order`` ranks nodes that
+tie on QOS priority. It never makes a job preemptable or exempt: eligibility, QOS
+priority and ``preempt_exempt_time`` are settled first and stay as described above.
+Idle-fill reclaim (see :doc:`idle-fill-scheduling`) ranks its own victims the same
+way.
 
 .. code-block:: toml
 
    [scheduler]
-   preempt_victim_order = ["usage_share", "preempt_burden", "hash"]
-   preempt_burden_window_hours = 24
+   preempt_victim_order = ["fewest_jobs", "least_work", "requeue_count", "hash"]
 
+The keys above are the default, so the line is only needed to change the order.
 Keys apply in the order listed: the first that tells two nodes apart decides, and
-later keys only break ties, with node name last.
+later keys only break ties, with node name last. An empty list ``[]`` ranks by node
+name alone, which takes victims of equal QOS priority from the lowest-named node
+first, whichever jobs happen to be there.
 
 .. list-table::
    :header-rows: 1
@@ -984,27 +991,18 @@ later keys only break ties, with node name last.
 
    * - Key
      - Goes first
-   * - ``usage_share``
-     - The account whose recent usage is largest relative to its share. An
-       account's usage is the capacity it actually consumed, in every QOS: elapsed
-       seconds times allocated CPUs plus GPUs, summed over its finished runs with the
-       fair-share half-life and lookback, plus the elapsed time of its running jobs,
-       which accounting only learns of when they end. That is divided by all recent
-       usage and then by the account's effective share (the fair-share hierarchy),
-       so ``1.0`` is exactly at share. The raw ratio is used, not the capped
-       fair-share factor, which is highest for an account with no usage; an account
-       that has used nothing is the lightest, not the heaviest. An account with no
-       share, or none known, counts as exactly at share. QOS ``usage_factor`` is
-       deliberately ignored, see below. A job's accounting row is reused when it is
-       requeued and starts again, so only its latest run is on record.
-   * - ``preempt_burden``
-     - The account that has lost the least to preemption recently, so one that has
-       already lost a lot is the last to lose more. The figure is node-seconds of
-       runs that accounting records as ``PREEMPTED`` and that ended within
-       ``preempt_burden_window_hours`` (default 24), each weighted by recency: its
-       full length when it has just ended, falling linearly to zero at the edge of
-       the window. A job that was requeued and has started again no longer reads
-       ``PREEMPTED``, so its earlier loss is not counted.
+   * - ``fewest_jobs``
+     - The node that adds the fewest new jobs to the set, so as few jobs as possible
+       are evicted. A job the set already holds adds nothing.
+   * - ``least_work``
+     - The node whose new jobs have run the shortest, counting each job's elapsed
+       run time times the number of nodes it holds, so the work that is cheapest to
+       lose is spent first.
+   * - ``requeue_count``
+     - The node whose new jobs have been preempted and requeued the fewest times
+       (the job's ``preempt_requeue_count``), so a job that keeps being hit ranks
+       later. The count is kept with the job and is not reset by a requeue; it grows
+       each time a preemption requeues the job.
    * - ``hash``
      - The node with the lowest stable 64-bit hash of the preempting job's ID and
        the node name. This removes the bias towards low node names while keeping a
@@ -1013,29 +1011,13 @@ later keys only break ties, with node name last.
 
 A node is as protected as its most protected occupant, the same convention the QOS
 priority step uses, because emptying a node evicts everything on it: for
-``usage_share`` the node takes the figure of its lightest account, and for
-``preempt_burden`` that of its most burdened one.
+``requeue_count`` the node takes the highest count among its new jobs. None of the
+keys reads the accounting database or fair-share; they use only what the controller
+holds in memory.
 
-Both accounting-backed keys read a cache refreshed every
-``accounting.fairshare_refresh_secs``, and treat every account as unknown (neutral)
-until the first load, or when accounting is not configured, leaving the remaining
-keys and node name to decide. Enabling a key or changing the window applies from the
-next refresh. Fair-share itself is untouched: it still orders pending jobs and does
-not affect eligibility.
-
-``usage_share`` measures consumed capacity, not billed usage. QOS ``usage_factor``
-multiplies the usage stored for fair-share, so it remains a billing and pending-job
-priority setting, and the usage fair-share reads is unchanged. Discounting a QOS
-for billing therefore does not move the accounts that hold it back in the
-preemption order: a run counts for the capacity it used whatever its QOS bills.
-
-A preempted run did consume the capacity it used, so it counts toward
-``usage_share`` for the time it ran, and an account that keeps losing work also
-accrues usage. ``preempt_burden`` is the key that responds to those losses. Keep
-``usage_share`` first, as in the example: ``preempt_burden`` first would equalize
-absolute losses across accounts, so an account that only occasionally runs a small job
-that can be preempted would be preempted almost every time it appears, while the
-largest holders of spare capacity are protected once they have absorbed some losses.
+The default changes only the order among victims that already tie on QOS priority,
+which used to be node name. That order was never documented, and it concentrated
+preemption on the lowest-named nodes.
 
 **Comparison with Slurm**
 
@@ -1050,8 +1032,7 @@ largest holders of spare capacity are protected once they have absorbed some los
      - QOS ``preempt`` allow-list plus a strictly higher QOS priority
      - QOS ``Preempt=`` allow-list
    * - Does fair-share affect preemption?
-     - Not eligibility, which fair-share never touches. Optionally, with
-       ``preempt_victim_order``, the order among victims that are already eligible
+     - No — fair-share affects scheduling order only
      - No — fair-share affects scheduling order only
    * - Does job age affect preemption?
      - No

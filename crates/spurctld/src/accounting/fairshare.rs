@@ -7,22 +7,6 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::db::UsageRecord;
 
-/// The half-life actually applied: `0` means the default, and an extreme value is
-/// clamped so the decay window stays sane.
-pub(super) fn effective_halflife_days(halflife_days: u32) -> u32 {
-    if halflife_days == 0 {
-        14
-    } else {
-        halflife_days.clamp(1, 365)
-    }
-}
-
-/// Weight of usage that is `age_secs` old: halves every `halflife_days`.
-pub(super) fn decay_weight(age_secs: f64, halflife_days: u32) -> f64 {
-    let halflife_secs = Duration::days(halflife_days.max(1) as i64).num_seconds() as f64;
-    (-(2.0_f64.ln() / halflife_secs) * age_secs).exp()
-}
-
 /// Compute per-(user, account) fair-share factors using hierarchical BFS shares,
 /// per-user association weights, and decay-weighted CPU+GPU billable usage.
 pub(super) fn compute_fairshare(
@@ -41,11 +25,14 @@ pub(super) fn compute_fairshare(
         return HashMap::new();
     }
 
+    let halflife = Duration::days(halflife_days as i64);
+    let decay_rate = 2.0_f64.ln() / halflife.num_seconds() as f64;
+
     let mut user_usage: HashMap<(String, String), f64> = HashMap::new();
     for record in usage {
         let age = (now - record.period_start).num_seconds().max(0) as f64;
-        let billable =
-            (record.cpu_seconds + record.gpu_seconds) as f64 * decay_weight(age, halflife_days);
+        let decay = (-decay_rate * age).exp();
+        let billable = (record.cpu_seconds + record.gpu_seconds) as f64 * decay;
 
         *user_usage
             .entry((record.user_name.clone(), record.account.clone()))
@@ -122,9 +109,7 @@ pub(super) fn compute_fairshare(
 /// BFS from root accounts, splitting parent share proportionally by sibling weight.
 /// Accounts whose parent refers to a non-existent account are treated as roots
 /// so they still participate in fair-share rather than being silently excluded.
-pub(super) fn build_effective_shares(
-    accounts: &[super::db::AccountRecord],
-) -> HashMap<String, f64> {
+fn build_effective_shares(accounts: &[super::db::AccountRecord]) -> HashMap<String, f64> {
     let weight_map: HashMap<&str, i32> = accounts
         .iter()
         .map(|a| (a.name.as_str(), a.fairshare_weight))
@@ -217,29 +202,6 @@ mod tests {
             max_running_jobs: None,
             grp_tres: None,
         }
-    }
-
-    #[test]
-    fn the_half_life_is_defaulted_and_bounded() {
-        assert_eq!(effective_halflife_days(0), 14, "zero means the default");
-        assert_eq!(effective_halflife_days(7), 7);
-        assert_eq!(
-            effective_halflife_days(100_000),
-            365,
-            "an extreme value is clamped"
-        );
-    }
-
-    #[test]
-    fn decay_halves_every_half_life() {
-        let day = 86_400.0;
-        assert_eq!(decay_weight(0.0, 14), 1.0);
-        assert!((decay_weight(14.0 * day, 14) - 0.5).abs() < 1e-12);
-        assert!((decay_weight(28.0 * day, 14) - 0.25).abs() < 1e-12);
-        assert!(
-            decay_weight(day, 0).is_finite(),
-            "a zero half-life never divides by zero"
-        );
     }
 
     #[test]
