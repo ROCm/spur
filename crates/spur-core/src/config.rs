@@ -636,9 +636,12 @@ pub struct SchedulerConfig {
     #[serde(default)]
     pub resv_overrun_minutes: u32,
     /// Reap an interactive allocation (salloc/srun) whose client has sent no
-    /// keepalive for this many seconds. `0` (the default) disables reaping, so
-    /// abandoned allocations behave as before. Mirrors Slurm's `InactiveLimit`.
-    #[serde(default)]
+    /// keepalive for this many seconds. Defaults to `300`; `0` disables reaping,
+    /// so abandoned allocations behave as before. Only keepalive-capable
+    /// first-party clients are eligible (the K8s operator, third-party API
+    /// clients, and CLIs older than v0.9 are exempt). Mirrors Slurm's
+    /// `InactiveLimit`.
+    #[serde(default = "default_inactive_limit")]
     pub inactive_limit_secs: u32,
     /// Highest base priority a non-admin caller may request at submit (or via
     /// `scontrol update`). Requests above this are clamped, not rejected; at
@@ -713,6 +716,9 @@ fn default_time_limit() -> u32 {
 fn default_complete_wait() -> u32 {
     300
 }
+fn default_inactive_limit() -> u32 {
+    300
+}
 fn default_max_user_priority() -> u32 {
     crate::job::DEFAULT_PRIORITY
 }
@@ -734,7 +740,7 @@ impl Default for SchedulerConfig {
             enforce_part_limits: EnforcePartLimits::No,
             complete_wait_secs: 300,
             resv_overrun_minutes: 0,
-            inactive_limit_secs: 0,
+            inactive_limit_secs: default_inactive_limit(),
             max_user_priority: default_max_user_priority(),
             preempt_type: PreemptType::None,
             preempt_exempt_time: 0,
@@ -4312,10 +4318,11 @@ inactive_limit_secs = 20
     #[test]
     fn scheduler_config_accepts_disabled_or_ample_inactive_limit() {
         // 0 disables reaping and is always allowed.
-        SlurmConfig::load_from_str(
+        let off = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 0\n",
         )
         .expect("0 (disabled) must be accepted");
+        assert_eq!(off.scheduler.inactive_limit_secs, 0);
         // A value at the floor (2x the keepalive interval) is accepted.
         SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n[scheduler]\ninactive_limit_secs = 60\n",
@@ -4375,6 +4382,17 @@ inactive_limit_secs = 20
                 "unexpected error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn scheduler_config_defaults_inactive_limit_to_300() {
+        let no_scheduler = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(no_scheduler.scheduler.inactive_limit_secs, 300);
+        let other_scheduler_keys =
+            SlurmConfig::load_from_str("cluster_name = \"test\"\n[scheduler]\ninterval_secs = 2\n")
+                .unwrap();
+        assert_eq!(other_scheduler_keys.scheduler.inactive_limit_secs, 300);
+        assert_eq!(SchedulerConfig::default().inactive_limit_secs, 300);
     }
 
     #[test]

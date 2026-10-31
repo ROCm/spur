@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(result, DependencyResult::Waiting);
     }
 
-    // ── T56.17+: new dependency types / parsing (issue #259) ──────
+    // ── T56.17+: new dependency types / parsing ───────────────────
     // (Array-parent *resolution* tests live in t28_arrays.rs alongside the
     // other array coverage.)
 

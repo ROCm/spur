@@ -583,16 +583,22 @@ async fn main() -> anyhow::Result<()> {
         .map(session_identity)
         .collect();
     let reconciled_stepd_completions: std::collections::HashSet<_> =
-        agent_server::replay_unacknowledged_stepd_completions(&stepds, &args.controller, &hostname)
-            .await?
-            .into_iter()
-            .collect();
+        agent_server::replay_unacknowledged_stepd_completions(
+            &stepds,
+            &args.controller,
+            &hostname,
+            &reporter.node_token(),
+        )
+        .await?
+        .into_iter()
+        .collect();
     // Runs for the daemon's life, not just when this scan found something —
     // a push notification deferred later needs the same reconciliation.
     agent_server::retry_unacknowledged_stepd_completions(
         stepds.clone(),
         args.controller.clone(),
         hostname.clone(),
+        reporter.clone(),
     );
     // Housekeeping, and the periodic sweeper retries it; failing to read the
     // runtime root is not a reason to refuse to start.

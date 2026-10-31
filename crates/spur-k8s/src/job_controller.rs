@@ -395,6 +395,8 @@ async fn report_pod_released(ctx: &JobControllerCtx, job_id: u32, pod: &Pod) {
         drain_reason: String::new(),
         reporting_node,
         run_attempt: 0,
+        node_token: String::new(),
+        pty_step_id: None,
     };
     let result = ctx
         .ctrl_client
@@ -698,6 +700,8 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                     // K8s operator doesn't track run epochs; 0 disables the
                     // controller-side staleness check for this report.
                     run_attempt: 0,
+                    node_token: String::new(),
+                    pty_step_id: None,
                 };
                 if let Err(e) = ctrl
                     .call(|mut c| async move { c.report_job_status(req).await })
@@ -1038,6 +1042,9 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
         pty: spec.pty,
         initial_winsize: None,
         submit_line: spec.submit_line.clone().unwrap_or_default(),
+        // The operator submits non-interactive jobs; it is intentionally exempt
+        // from inactivity reaping.
+        client_keepalive: false,
     }
 }
 

@@ -134,13 +134,54 @@ impl std::fmt::Display for RegisterNodeError {
 
 impl std::error::Error for RegisterNodeError {}
 
+/// A node's report that one `srun --pty` session's shell exited.
+#[derive(Debug, Clone, Copy)]
+pub struct PtySessionExit<'a> {
+    pub job_id: JobId,
+    pub run_attempt: u32,
+    /// The numbered step the session's `srun --pty` invocation created.
+    pub step_id: u32,
+    pub node: &'a str,
+    pub exit_code: i32,
+    pub signal: i32,
+}
+
+/// What a session-exit report may still act on.
+struct PtyExitTarget {
+    step_open: bool,
+    ends_job: bool,
+}
+
+/// Outcome of a server-side standalone-PTY completion report
+/// ([`ClusterManager::finish_standalone_pty`]).
+#[derive(Debug)]
+pub enum PtyExitOutcome {
+    /// Not a running standalone PTY job, or a stale, misaddressed, or
+    /// already-settled report. The caller does nothing.
+    Ignored,
+    /// Only an overlapping (`--jobid ... --pty`) step was closed; the job lives on.
+    StepClosed,
+    /// The job's own interactive shell exited; the job was finished and its
+    /// allocations must be released on the agents.
+    JobFinished(Box<Job>),
+}
+
+/// A successful [`ClusterManager::finish_srun_job_for`] outcome.
+#[derive(Debug)]
+pub enum SrunCompletion {
+    /// The allocation was finished by this call; release it on the agents.
+    Finished(Box<Job>),
+    /// The job was already terminal (the server-side PTY path or an earlier call
+    /// got there first). Idempotent: nothing more to do.
+    AlreadyComplete,
+}
+
 /// Errors from completing a standalone srun allocation.
 #[derive(Debug)]
 pub enum SrunCompleteError {
     NotFound(JobId),
     NotSrunJob(JobId),
     NotStepDispatch(JobId),
-    AlreadyTerminal { job_id: JobId, state: JobState },
     NotOwner { job_id: JobId, user: String },
     Internal { job_id: JobId, message: String },
 }
@@ -155,9 +196,6 @@ impl std::fmt::Display for SrunCompleteError {
                     f,
                     "job {id} does not use native step dispatch (CompleteJob is not valid)"
                 )
-            }
-            Self::AlreadyTerminal { job_id, state } => {
-                write!(f, "job {job_id} is already {state:?}")
             }
             Self::NotOwner { job_id, user } => {
                 write!(f, "user {user} is not permitted to complete job {job_id}")
@@ -595,6 +633,11 @@ pub struct ClusterManager {
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
     interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
+    /// Allocations that have sent at least one keepalive this leadership term.
+    /// Makes an allocation reap-eligible even when its durable `client_keepalive`
+    /// flag is unset (a keepalive-sending client predating the flag). Reset on
+    /// leadership regain, like `interactive_last_seen`.
+    pinged_this_term: RwLock<HashSet<JobId>>,
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
@@ -913,6 +956,7 @@ impl ClusterManager {
             planned_reservations: RwLock::new(HashMap::new()),
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
+            pinged_this_term: RwLock::new(HashSet::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
@@ -2058,18 +2102,22 @@ impl ClusterManager {
         job_id: JobId,
         exit_code: i32,
         user: &str,
-    ) -> Result<Job, SrunCompleteError> {
+    ) -> Result<SrunCompletion, SrunCompleteError> {
         self.finish_srun_job_for(job_id, exit_code, user, false)
     }
 
     /// Like [`Self::finish_srun_job`], plus Operators/Administrators (`operates_jobs`).
+    ///
+    /// Idempotent for the owner: completing an already-terminal job returns
+    /// [`SrunCompletion::AlreadyComplete`] (not an error), so the client racing
+    /// the server-side PTY completion neither warns nor re-runs the release.
     pub fn finish_srun_job_for(
         &self,
         job_id: JobId,
         exit_code: i32,
         user: &str,
         operates_jobs: bool,
-    ) -> Result<Job, SrunCompleteError> {
+    ) -> Result<SrunCompletion, SrunCompleteError> {
         let job = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -2081,18 +2129,17 @@ impl ClusterManager {
             if !job.srun_step_dispatch {
                 return Err(SrunCompleteError::NotStepDispatch(job_id));
             }
-            if job.state.is_terminal() {
-                return Err(SrunCompleteError::AlreadyTerminal {
-                    job_id,
-                    state: job.state,
-                });
-            }
+            // Ownership before the terminal check, so a non-owner never learns
+            // whether the job finished and never gets a free idempotent Ok.
             Self::check_job_owner_for(user, &job.spec.user, "complete", operates_jobs).map_err(
                 |_| SrunCompleteError::NotOwner {
                     job_id,
                     user: user.to_string(),
                 },
             )?;
+            if job.state.is_terminal() {
+                return Ok(SrunCompletion::AlreadyComplete);
+            }
             job.clone()
         };
 
@@ -2108,7 +2155,110 @@ impl ClusterManager {
                 message: e.to_string(),
             }
         })?;
-        Ok(job)
+        Ok(SrunCompletion::Finished(Box::new(job)))
+    }
+
+    /// Finish a standalone `srun --pty` job when its interactive shell exits, so
+    /// a lost client cannot strand the allocation. Driven by the node's
+    /// completion report (reserved interactive step), not by the client.
+    ///
+    /// A rejected report is `Ok(Ignored)`: spurd replays an error for its
+    /// lifetime, and the client-driven path remains the fallback. An error
+    /// means a write failed, so the node's replay can still finish the job.
+    pub fn finish_standalone_pty(
+        &self,
+        exit: PtySessionExit<'_>,
+    ) -> anyhow::Result<PtyExitOutcome> {
+        let Some(target) = self.pty_exit_target(&exit) else {
+            return Ok(PtyExitOutcome::Ignored);
+        };
+
+        // spurstepd flags an OOM kill in the step's cgroup with a sentinel bit in
+        // the signal; strip it, and report the job as OOM like the per-node path.
+        let oom = exit.signal & spur_core::job::OOM_SIGNAL_FLAG != 0;
+        let signal = exit.signal & !spur_core::job::OOM_SIGNAL_FLAG;
+        // A signal death carries no exit code; report it the shell way (128 +
+        // signal), matching what the client records, so SIGHUP reads as 129 not 0.
+        let effective_exit = if signal != 0 {
+            128 + signal
+        } else {
+            exit.exit_code
+        };
+
+        // Close the step as the client's own CompleteJobStep would, so its exit
+        // reaches DerivedExitCode whichever report lands first.
+        if target.step_open {
+            self.record_step_complete(exit.job_id, exit.step_id, effective_exit)?;
+        }
+        if !target.ends_job {
+            return Ok(PtyExitOutcome::StepClosed);
+        }
+
+        let Some(job) = self.get_job(exit.job_id) else {
+            return Ok(PtyExitOutcome::Ignored);
+        };
+        let state = if oom {
+            JobState::OutOfMemory
+        } else if effective_exit == 0 {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
+        if let Err(e) = self.complete_job(exit.job_id, effective_exit, state) {
+            // The client's own CompleteJob or a cancel finished it first.
+            if self
+                .get_job(exit.job_id)
+                .is_some_and(|j| j.state.is_terminal())
+            {
+                return Ok(PtyExitOutcome::Ignored);
+            }
+            return Err(e);
+        }
+        Ok(PtyExitOutcome::JobFinished(Box::new(job)))
+    }
+
+    /// What a session-exit report may still act on, or `None` to drop it.
+    fn pty_exit_target(&self, exit: &PtySessionExit<'_>) -> Option<PtyExitTarget> {
+        let jobs = self.jobs.read();
+        let job = jobs.get(&exit.job_id)?;
+        if !job.is_standalone_pty() {
+            return None;
+        }
+        // Act only on the live run. COMPLETING (scancel), SUSPENDED, and a
+        // PENDING preempt-requeue (where run_attempt still matches) must not
+        // be force-finished here.
+        if job.state != JobState::Running {
+            return None;
+        }
+        if exit.run_attempt == 0 || exit.run_attempt != job.run_attempt {
+            return None;
+        }
+        if !job.allocated_nodes.iter().any(|n| n == exit.node) {
+            return None;
+        }
+
+        let steps = self.steps.read();
+        let step = steps.get(&(exit.job_id, exit.step_id))?;
+        // A PTY session runs on its step's first node (`create_job_step`
+        // dispatches it there), so no other node can report its exit.
+        if !step.pty || step.nodes.first().map(String::as_str) != Some(exit.node) {
+            return None;
+        }
+        // Any other PTY step is an extra `--jobid ... --pty` session, which closes
+        // on its own without ending the job. A shell step logged before the marker
+        // existed reads back unmarked, so that job is left to its client.
+        let ends_job = step.job_shell;
+        let step_open = !step.state.is_terminal();
+        // A closed overlapping step makes this a replay. A closed shell step on a
+        // running job does not: the job's own write failed, or the client closed
+        // the step and was lost before it finished the job.
+        if !step_open && !ends_job {
+            return None;
+        }
+        Some(PtyExitTarget {
+            step_open,
+            ends_job,
+        })
     }
 
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
@@ -2436,6 +2586,8 @@ impl ClusterManager {
                 start_time: Some(Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: false,
+                job_shell: false,
             };
             if let Err(e) = self.create_step(batch_step) {
                 warn!(job_id, error = %e, "failed to record batch step");
@@ -2619,12 +2771,12 @@ impl ClusterManager {
     ) -> anyhow::Result<()> {
         // A time-limit expiry has to win over the caller's outcome here, not
         // just in the per-node completion path. The marker is only ever set on
-        // a run the watchdog signalled, so any completion routed through this
-        // method — the completing-timeout force-finish and the srun path, both
-        // of which finalize without seeing node_completions — is a wall-time
-        // expiry that would otherwise be reported as an ordinary failure and
-        // skip the Timeout requeue. Cancelled (user cancel, preemption) and an
-        // already-correct Timeout pass through untouched.
+        // a run the time-limit watchdog or the InactiveLimit reaper signalled,
+        // so any completion routed through this method — the completing-timeout
+        // force-finish and the srun paths, which finalize without seeing
+        // node_completions — is a timeout that would otherwise be reported as an
+        // ordinary failure and skip the Timeout requeue. Cancelled (user cancel,
+        // preemption) and an already-correct Timeout pass through untouched.
         let state = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -3237,7 +3389,7 @@ impl ClusterManager {
     /// Unlike `maybe_requeue`, this is unconditional and doesn't require
     /// the requeue flag on the spec. Used when the agent rejects a job
     /// (e.g., container image not found) so it can be retried after the
-    /// user fixes the issue. (Issue #91)
+    /// user fixes the issue.
     pub fn requeue_job(&self, job_id: JobId) -> anyhow::Result<()> {
         self.requeue_after_launch_failure(job_id, false)
     }
@@ -3571,12 +3723,15 @@ impl ClusterManager {
 
     fn record_job_keepalive_at(&self, job_id: JobId, at: DateTime<Utc>) {
         self.interactive_last_seen.write().insert(job_id, at);
+        self.pinged_this_term.write().insert(job_id);
     }
 
     /// Clear keepalive last-seen on leadership (re)gain: a follower records
     /// none, so carried-over stale entries would otherwise reap live allocations.
+    /// Also drops the per-term ping set, which is likewise leader-local.
     pub(crate) fn reset_interactive_last_seen(&self) {
         self.interactive_last_seen.write().clear();
+        self.pinged_this_term.write().clear();
     }
 
     #[cfg(test)]
@@ -3589,15 +3744,23 @@ impl ClusterManager {
     /// (so a just-promoted leader or a newly-seen allocation gets a full window
     /// before it can be reaped). `limit_secs == 0` disables reaping: the map is
     /// still pruned, but nothing is returned.
+    ///
+    /// Only keepalive-capable allocations are reaped: those whose durable
+    /// `client_keepalive` flag is set (`keepalive_capable`) or that have pinged
+    /// this term. Others (the K8s operator, third-party clients, pre-v0.9 CLIs)
+    /// are seeded but never returned, so they behave as before.
     pub(crate) fn interactive_reap_candidates(
         &self,
         running_ids: &[JobId],
+        keepalive_capable: &HashSet<JobId>,
         now: DateTime<Utc>,
         limit_secs: u32,
     ) -> Vec<JobId> {
         let live: HashSet<JobId> = running_ids.iter().copied().collect();
         let mut seen = self.interactive_last_seen.write();
         seen.retain(|id, _| live.contains(id));
+        let mut pinged = self.pinged_this_term.write();
+        pinged.retain(|id| live.contains(id));
         if limit_secs == 0 {
             return Vec::new();
         }
@@ -3605,7 +3768,11 @@ impl ClusterManager {
         running_ids
             .iter()
             .copied()
-            .filter(|id| now - *seen.entry(*id).or_insert(now) > limit)
+            .filter(|id| {
+                // Seed every live allocation's timer, but only reap eligible ones.
+                let idle = now - *seen.entry(*id).or_insert(now) > limit;
+                idle && (keepalive_capable.contains(id) || pinged.contains(id))
+            })
             .collect()
     }
 
@@ -7803,9 +7970,12 @@ impl ClusterManager {
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
                     // Derived from the replicated entry, so every replica reports
-                    // the same reason for a job the watchdog had to force-kill.
-                    if *state == JobState::Timeout {
-                        job.set_pending_reason(PendingReason::TimeLimit);
+                    // the same reason for a job the watchdog had to force-kill or
+                    // that the kernel OOM-killed.
+                    match *state {
+                        JobState::Timeout => job.set_pending_reason(PendingReason::TimeLimit),
+                        JobState::OutOfMemory => job.set_pending_reason(PendingReason::OutOfMemory),
+                        _ => {}
                     }
                     if state.is_terminal() {
                         response.jobs_finalized.push(JobFinalized::for_job(
@@ -10572,19 +10742,29 @@ mod tests {
         cm
     }
 
+    fn capable(ids: &[JobId]) -> HashSet<JobId> {
+        ids.iter().copied().collect()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interactive_reap_candidates_reaps_only_idle_allocations() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1, 2]);
 
         // First sighting seeds each allocation's timer; nothing is reaped yet.
-        assert!(cm.interactive_reap_candidates(&[1, 2], t0, 60).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[1, 2], &flagged, t0, 60)
+            .is_empty());
 
         // Job 2 pings recently; job 1 stays silent past the limit.
         cm.record_job_keepalive_at(2, t0 + chrono::Duration::seconds(55));
         let later = t0 + chrono::Duration::seconds(61);
-        assert_eq!(cm.interactive_reap_candidates(&[1, 2], later, 60), vec![1]);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1, 2], &flagged, later, 60),
+            vec![1]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10592,22 +10772,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1]);
 
         // A stale entry exists, but with the limit disabled it is pruned (the
         // allocation is no longer running) rather than reaped.
         cm.record_job_keepalive_at(1, t0);
-        assert!(cm.interactive_reap_candidates(&[], t0, 0).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[], &flagged, t0, 0)
+            .is_empty());
         // The prune actually happened: job 1's timer is gone, not just skipped
         // by the disabled early return.
         assert!(
             cm.interactive_last_seen.read().is_empty(),
             "pruning must drop entries for allocations no longer running"
         );
+        assert!(
+            cm.pinged_this_term.read().is_empty(),
+            "pruning must drop the ping record of an allocation no longer running"
+        );
 
         // Because the old entry was pruned, job 1 reappearing reseeds to `now`
         // and is not immediately reaped despite the original stale timestamp.
         let later = t0 + chrono::Duration::seconds(3600);
-        assert!(cm.interactive_reap_candidates(&[1], later, 60).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[1], &flagged, later, 60)
+            .is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10615,6 +10804,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1]);
 
         // A prior stint's timestamp for a still-running allocation, frozen at
         // t0 because a follower records no keepalives.
@@ -10624,7 +10814,7 @@ mod tests {
         // it and the live allocation looks idle past the limit.
         let later = t0 + chrono::Duration::seconds(3600);
         assert_eq!(
-            cm.interactive_reap_candidates(&[1], later, 60),
+            cm.interactive_reap_candidates(&[1], &flagged, later, 60),
             vec![1],
             "a stale carried-over entry would reap a live allocation"
         );
@@ -10633,8 +10823,65 @@ mod tests {
         // check reseeds job 1 to `now` and exempts it.
         cm.reset_interactive_last_seen();
         assert!(
-            cm.interactive_reap_candidates(&[1], later, 60).is_empty(),
+            cm.interactive_reap_candidates(&[1], &flagged, later, 60)
+                .is_empty(),
             "after reset, a live allocation is reseeded and not reaped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_exempts_a_client_that_never_pings() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // No durable flag and no ping this term: the K8s operator, a third-party
+        // API client, or a pre-keepalive CLI. Silent forever, never reaped.
+        assert!(cm
+            .interactive_reap_candidates(&[1], &HashSet::new(), t0, 60)
+            .is_empty());
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60)
+                .is_empty(),
+            "a client that never opted in must not be reaped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_reaps_an_unflagged_client_that_pinged_this_term() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // A client that predates the flag but does send keepalives opts in by
+        // pinging; once it goes silent past the limit it is reaped.
+        cm.record_job_keepalive_at(1, t0);
+        let later = t0 + chrono::Duration::seconds(61);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60),
+            vec![1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_interactive_last_seen_forgets_this_terms_pings() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+        cm.record_job_keepalive_at(1, t0);
+
+        // A new term starts with no evidence the unflagged client pings, so it is
+        // exempt until it pings again.
+        cm.reset_interactive_last_seen();
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert!(cm
+            .interactive_reap_candidates(&[1], &HashSet::new(), t0, 60)
+            .is_empty());
+        assert!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60)
+                .is_empty(),
+            "the ping set must not be inferred from the reseeded last-seen map"
         );
     }
 
@@ -13119,6 +13366,8 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            pty: false,
+            job_shell: false,
         };
         cm.steps.write().insert((1, 0), step(1));
         cm.steps.write().insert((2, 0), step(2));
@@ -13779,7 +14028,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_accepts_gpu_after_node_reduction() {
-        // C3: -N4 -n1 --gpus=2 is valid once the node count is reduced to one;
+        // -N4 -n1 --gpus=2 is valid once the node count is reduced to one;
         // the pre-normalization guard used to reject it.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -13795,7 +14044,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_warns_when_node_count_reduced() {
-        // I2: a shrunk request returns a user-facing warning; an exact-fit
+        // A shrunk request returns a user-facing warning; an exact-fit
         // request returns none.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -13822,7 +14071,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_rejects_below_partition_min_nodes() {
-        // I1: -N4 -n1 on a MinNodes=4 partition is rejected at submit, not left
+        // -N4 -n1 on a MinNodes=4 partition is rejected at submit, not left
         // pending forever.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -13868,7 +14117,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_pmix_accepts_single_node_after_reduction() {
-        // I5: -N4 -n1 --mpi=pmix reduces to one node and is accepted.
+        // -N4 -n1 --mpi=pmix reduces to one node and is accepted.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -13894,7 +14143,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_keeps_full_node_count_for_total_gpus() {
-        // C2: -N4 --gpus=8 (ntasks defaulted to nodes) keeps all four nodes so
+        // -N4 --gpus=8 (ntasks defaulted to nodes) keeps all four nodes so
         // the eight GPUs spread across them instead of collapsing to one node.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -14319,6 +14568,8 @@ mod tests {
                 start_time: Some(Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: true,
+                job_shell: false,
             }),
         });
         cm.apply_operation(&WalOperation::JobStepComplete {
@@ -20046,8 +20297,8 @@ mod tests {
 
     /// A pending bystander with a lower QOS base than the hunter (6000 vs 11000)
     /// but a higher effective priority once fair-share and age are folded in
-    /// (~6000 x 3.0 x age). This is the #1095 shape: the bystander wins the
-    /// effective-priority axis but has no claim to the contested capacity.
+    /// (~6000 x 3.0 x age). The bystander wins the effective-priority axis but
+    /// has no claim to the contested capacity.
     fn submit_bystander(cm: &Arc<ClusterManager>, node: &str) -> JobId {
         cm.qos_cache().insert(Qos {
             name: "bystander-qos".into(),
@@ -20110,9 +20361,9 @@ mod tests {
         (victim_id, hunter_id)
     }
 
-    /// The #1095 example: a bystander with a lower QOS base but higher effective
-    /// priority (via fair-share) must not outrank the in-flight preemptor for the
-    /// node the preemptor is freeing. The preemptor is hoisted to the front of
+    /// A bystander with a lower QOS base but higher effective priority (via
+    /// fair-share) must not outrank the in-flight preemptor for the node the
+    /// preemptor is freeing. The preemptor is hoisted to the front of
     /// the pending list so backfill reserves that node for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inflight_preemptor_hoists_ahead_of_higher_effective_priority_bystander() {
@@ -20203,8 +20454,8 @@ mod tests {
 
     /// Abandonment: if the preemptor is cancelled mid-drain, the victim's
     /// `preempted_by` has nothing to anchor the hoist to once it finalizes, so
-    /// the freed node returns to the best current pending claimant — the
-    /// deliberate divergence from #1095's QOS-wide hold.
+    /// the freed node returns to the best current pending claimant. The node is
+    /// deliberately not held for the preemptor's QOS as a whole.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_preemption_returns_node_to_best_claimant() {
         let dir = TempDir::new().unwrap();
@@ -23644,9 +23895,8 @@ mod tests {
         // node (real becomes 2, well under its cap of 5). Instead, the
         // account's irrelevant credit poisons the QOS's own computation,
         // charging it 1 new node it doesn't need, and the job is wrongly
-        // blocked on QosGrpNodeLimit -- the exact under-utilization bug
-        // class issue #709 (and this whole PR) was meant to fix, now
-        // reintroduced via the interaction between the two gates.
+        // blocked on QosGrpNodeLimit -- an under-utilization bug caused by
+        // the interaction between the two gates.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 128000);
@@ -27578,6 +27828,8 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            pty: false,
+            job_shell: false,
         }
     }
 
@@ -28580,7 +28832,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_job_qos_rejects_unauthorized_association_qos() {
         // `scontrol update job qos=` must enforce the same per-association
-        // authorization as submission (SPUR-101).
+        // authorization as submission.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(Qos {
@@ -28649,7 +28901,7 @@ mod tests {
     async fn update_job_qos_rejects_bypass_via_unaffiliated_account() {
         // Pairing the QOS change with an account the user has no recorded
         // association for must not fall back to "nothing to check" — that
-        // was a live bypass of the authorization this PR adds.
+        // would bypass the per-association QOS authorization.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(Qos {
@@ -31138,7 +31390,7 @@ mod tests {
     #[test]
     fn apply_default_qos_explicit_unauthorized_qos_is_rejected() {
         // An explicit QOS that exists but isn't the association's own default
-        // must be rejected, not silently accepted (SPUR-101).
+        // must be rejected, not silently accepted.
         let assoc = AssociationCache::new();
         assoc.insert_default_qos("testuser", "research", "highprio");
         let qos = qos_cache_with(&["highprio", "other-teams-qos"]);
@@ -31201,7 +31453,7 @@ mod tests {
     fn apply_default_qos_explicit_rejects_other_accounts_qos() {
         // A user in two accounts, each pinned to its own QOS, must not be
         // able to borrow one account's QOS while submitting under the
-        // other — the exact cross-account confusion reported in SPUR-101.
+        // other.
         let assoc = AssociationCache::new();
         assoc.insert_default_qos("testuser", "hyperloom", "hyperloom-qos");
         assoc.insert_default_qos("testuser", "primus", "primus-qos");
@@ -33056,7 +33308,10 @@ mod tests {
         start_srun_job_on(&cm, id, "n1");
 
         let returned = cm.finish_srun_job(id, 0, "testuser").unwrap();
-        assert_eq!(returned.job_id, id);
+        assert!(
+            matches!(returned, SrunCompletion::Finished(ref job) if job.job_id == id),
+            "a live allocation is finished by this call"
+        );
         settle(&cm, id, JobState::Completed);
         assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
     }
@@ -33076,7 +33331,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn finish_srun_job_rejects_terminal_job() {
+    async fn finish_srun_job_is_idempotent_for_a_terminal_job() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
@@ -33085,12 +33340,11 @@ mod tests {
         cm.finish_srun_job(id, 0, "testuser").unwrap();
         settle(&cm, id, JobState::Completed);
 
+        // The owner completing an already-terminal job is a no-op, not an error,
+        // so a client racing the server-side PTY completion stays quiet.
         assert!(matches!(
             cm.finish_srun_job(id, 0, "testuser"),
-            Err(SrunCompleteError::AlreadyTerminal {
-                job_id,
-                state: JobState::Completed,
-            }) if job_id == id
+            Ok(SrunCompletion::AlreadyComplete)
         ));
     }
 
@@ -33117,7 +33371,10 @@ mod tests {
         start_srun_job_on(&cm, id, "n1");
 
         let returned = cm.finish_srun_job_for(id, 0, "ops", true).unwrap();
-        assert_eq!(returned.job_id, id);
+        assert!(
+            matches!(returned, SrunCompletion::Finished(ref job) if job.job_id == id),
+            "the operator flag finishes a non-owner's live allocation"
+        );
         settle(&cm, id, JobState::Completed);
     }
 
@@ -33143,6 +33400,593 @@ mod tests {
         assert!(matches!(
             cm.finish_srun_job(999, 0, "testuser"),
             Err(SrunCompleteError::NotFound(999))
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // Server-side standalone srun --pty completion
+    // ---------------------------------------------------------------
+
+    fn srun_pty_spec(name: &str) -> JobSpec {
+        let mut spec = srun_spec(name);
+        spec.pty = true;
+        spec
+    }
+
+    fn start_pty_job(cm: &ClusterManager, id: JobId, nodes: &[&str], run_attempt: u32) {
+        cm.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: id,
+            nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
+            resources: scalar_alloc(nodes.len() as u32, 1000 * nodes.len() as u64),
+            per_node_alloc: per_node_for(nodes, scalar_alloc(1, 1000)),
+            srun_step_dispatch: true,
+            run_attempt,
+            idle_fill: false,
+            at: None,
+        });
+    }
+
+    fn add_step(
+        cm: &ClusterManager,
+        id: JobId,
+        step_id: u32,
+        nodes: &[&str],
+        pty: bool,
+        job_shell: bool,
+    ) {
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(spur_core::step::JobStep {
+                job_id: id,
+                step_id,
+                name: "pty".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty,
+                job_shell,
+            }),
+        });
+    }
+
+    /// The standalone `srun --pty`'s own shell, marked as it creates its step.
+    fn add_shell_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, true, true);
+    }
+
+    /// An extra `srun --jobid ... --pty` session.
+    fn add_session_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, true, false);
+    }
+
+    /// A buffered `srun --jobid ... cmd` step, or one logged before either flag existed.
+    fn add_plain_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, false, false);
+    }
+
+    /// `node`'s report that step `step_id`'s session exited cleanly in run
+    /// attempt 1; a test overrides whatever it exercises.
+    fn session_exit(id: JobId, step_id: u32, node: &str) -> PtySessionExit<'_> {
+        PtySessionExit {
+            job_id: id,
+            run_attempt: 1,
+            step_id,
+            node,
+            exit_code: 0,
+            signal: 0,
+        }
+    }
+
+    fn finish_pty(cm: &ClusterManager, exit: PtySessionExit<'_>) -> PtyExitOutcome {
+        cm.finish_standalone_pty(exit)
+            .expect("the report's writes commit")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_completes_the_job_on_a_clean_shell_exit() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-clean"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        let outcome = finish_pty(&cm, session_exit(id, 0, "n1"));
+        assert!(
+            matches!(outcome, PtyExitOutcome::JobFinished(ref job) if job.job_id == id),
+            "a standalone PTY's shell exit finishes the job"
+        );
+        settle(&cm, id, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_encodes_a_signal_death_as_128_plus_signal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-signal"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        // A signal death reports exit_code 0 with the signal set; it must not read
+        // as COMPLETED 0.
+        let exit = PtySessionExit {
+            signal: 9,
+            ..session_exit(id, 0, "n1")
+        };
+        assert!(matches!(
+            finish_pty(&cm, exit),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Failed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(128 + 9));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_reports_an_oom_kill_as_out_of_memory() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        // The shell itself OOM-killed, then a shell that exits cleanly after a
+        // child was: the sentinel bit must never reach the recorded exit code.
+        let oom = spur_core::job::OOM_SIGNAL_FLAG;
+        for (signal, exit) in [(9 | oom, 128 + 9), (oom, 0)] {
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-oom"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_shell_step(&cm, id, 0, &["n1"]);
+
+            let report = PtySessionExit {
+                signal,
+                ..session_exit(id, 0, "n1")
+            };
+            assert!(matches!(
+                finish_pty(&cm, report),
+                PtyExitOutcome::JobFinished(_)
+            ));
+            settle(&cm, id, JobState::OutOfMemory);
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.exit_code, Some(exit));
+            assert_eq!(job.pending_reason, PendingReason::OutOfMemory);
+            assert_eq!(cm.get_step(id, 0).unwrap().exit_code, Some(exit));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_never_promotes_a_later_session_over_a_legacy_shell() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-legacy");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // The shell's step was logged before either flag existed, so it reads
+        // back unmarked; step 1 is a later `--jobid ... -w n2 --pty` session.
+        add_plain_step(&cm, id, 0, &["n1", "n2"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+
+        assert!(
+            matches!(
+                finish_pty(&cm, session_exit(id, 1, "n2")),
+                PtyExitOutcome::StepClosed
+            ),
+            "a later session must not stand in for the job's own shell"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(cm.get_step(id, 1).unwrap().state.is_terminal());
+
+        // The legacy shell itself is left to its client.
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_never_lets_a_session_holding_the_lowest_step_end_the_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-session-first");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // A `--jobid ... -w n2 --pty` attached while the job pended retries faster
+        // than srun polls for RUNNING, so it takes step 0 before the shell does.
+        add_session_step(&cm, id, 0, &["n2"]);
+        add_shell_step(&cm, id, 1, &["n1"]);
+
+        assert!(
+            matches!(
+                finish_pty(&cm, session_exit(id, 0, "n2")),
+                PtyExitOutcome::StepClosed
+            ),
+            "the extra session's exit must not end the job and kill the shell"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(!cm.get_step(id, 1).unwrap().state.is_terminal());
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 1, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_the_job_from_a_shell_behind_another_step() {
+        // Step 0 is a buffered `srun --jobid ... cmd` that ran before the shell's
+        // step existed, or the shell's own first CreateJobStep whose response was
+        // lost, so srun retried and its session runs as step 1.
+        type AddStep = fn(&ClusterManager, JobId, u32, &[&str]);
+        let step_zero: [(&str, AddStep); 2] = [
+            ("a buffered step", add_plain_step),
+            ("an orphaned shell step", add_shell_step),
+        ];
+        for (what, add_first) in step_zero {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 4, 8000);
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-shell-second"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_first(&cm, id, 0, &["n1"]);
+            add_shell_step(&cm, id, 1, &["n1"]);
+
+            let exit = PtySessionExit {
+                exit_code: 4,
+                ..session_exit(id, 1, "n1")
+            };
+            assert!(
+                matches!(finish_pty(&cm, exit), PtyExitOutcome::JobFinished(_)),
+                "the shell must end the job even with {what} at step 0"
+            );
+            settle(&cm, id, JobState::Failed);
+            assert_eq!(cm.get_job(id).unwrap().exit_code, Some(4));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_the_job_despite_a_stale_session_on_its_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-stale-session"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        // Step 1 is an abandoned `--jobid ... --pty` attempt the agent refused as
+        // already active; its record stays live on the shell's own node.
+        add_session_step(&cm, id, 1, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_feeds_derived_exit_code() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-derived"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        // The node's report usually beats the client's CompleteJobStep, which then
+        // finds the step closed; the step's exit must still reach the job.
+        let exit = PtySessionExit {
+            exit_code: 7,
+            ..session_exit(id, 0, "n1")
+        };
+        assert!(matches!(
+            finish_pty(&cm, exit),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Failed);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.exit_code, Some(7));
+        assert_eq!(job.derived_exit_code, 7);
+        let step = cm.get_step(id, 0).unwrap();
+        assert_eq!(step.exit_code, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finalizes_a_reaper_sigterm_as_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-reaped"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        // The InactiveLimit reaper records the run as timed out before its
+        // SIGTERM; a shell that dies on it must not read as FAILED 143.
+        cm.signal_time_limit(id, Utc::now()).unwrap();
+        let outcome = finish_pty(
+            &cm,
+            PtySessionExit {
+                signal: 15,
+                ..session_exit(id, 0, "n1")
+            },
+        );
+        assert!(matches!(outcome, PtyExitOutcome::JobFinished(_)));
+        settle(&cm, id, JobState::Timeout);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(128 + 15));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_salloc_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let mut spec = srun_pty_spec("salloc-like");
+        spec.interactive = true;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_non_pty_srun_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-nonpty"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_stale_run_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-stale"));
+        start_pty_job(&cm, id, &["n1"], 2);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        // A report for a superseded attempt (and the unset 0) is dropped.
+        for run_attempt in [1, 0] {
+            let exit = PtySessionExit {
+                run_attempt,
+                ..session_exit(id, 0, "n1")
+            };
+            assert!(matches!(finish_pty(&cm, exit), PtyExitOutcome::Ignored));
+        }
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_node_not_in_the_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-wrongnode"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n2")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_closes_only_an_overlapping_step() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-overlap");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // Step 0 is the standalone shell (primary), recorded with both nodes as
+        // `-N2 -w n1,n2` leaves it though its session runs on n1 only; step 1 is
+        // an overlapping `--jobid ... -w n2 --pty`.
+        add_shell_step(&cm, id, 0, &["n1", "n2"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+
+        let overlap = PtySessionExit {
+            exit_code: 2,
+            ..session_exit(id, 1, "n2")
+        };
+        assert!(
+            matches!(finish_pty(&cm, overlap), PtyExitOutcome::StepClosed),
+            "an overlapping PTY step closes without ending the job"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(cm.get_step(id, 1).unwrap().state.is_terminal());
+        assert!(!cm.get_step(id, 0).unwrap().state.is_terminal());
+
+        // A replay of n2's report must not fall through to the primary step.
+        assert!(matches!(finish_pty(&cm, overlap), PtyExitOutcome::Ignored));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+
+        // The primary shell's own exit, on its session node, ends the job.
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_applies_a_late_duplicate_only_to_its_own_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-late-duplicate");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // The shell runs on n1; two `--jobid ... -w n2 --pty` sessions then run
+        // one after the other on n2, sharing the job's run attempt.
+        add_shell_step(&cm, id, 0, &["n1"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+        let first = PtySessionExit {
+            exit_code: 3,
+            ..session_exit(id, 1, "n2")
+        };
+        assert!(matches!(finish_pty(&cm, first), PtyExitOutcome::StepClosed));
+        add_session_step(&cm, id, 2, &["n2"]);
+
+        assert!(
+            matches!(finish_pty(&cm, first), PtyExitOutcome::Ignored),
+            "a late duplicate of the first session's report must not close the second"
+        );
+        let second = cm.get_step(id, 2).unwrap();
+        assert!(!second.state.is_terminal());
+        assert_eq!(second.exit_code, None);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 2, "n2")),
+            PtyExitOutcome::StepClosed
+        ));
+        assert_eq!(cm.get_step(id, 2).unwrap().exit_code, Some(0));
+        assert_eq!(cm.get_step(id, 1).unwrap().exit_code, Some(3));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_step_that_is_not_the_nodes_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-misaddressed");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+        add_plain_step(&cm, id, 2, &["n1"]);
+
+        for (step_id, why) in [
+            (1, "another node's session"),
+            (2, "a step that is no PTY session"),
+            (9, "a step the job never created"),
+        ] {
+            assert!(
+                matches!(
+                    finish_pty(&cm, session_exit(id, step_id, "n1")),
+                    PtyExitOutcome::Ignored
+                ),
+                "n1 must not close {why}"
+            );
+        }
+        assert!(!cm.get_step(id, 1).unwrap().state.is_terminal());
+        assert!(!cm.get_step(id, 2).unwrap().state.is_terminal());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_a_job_whose_shell_step_already_closed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-step-closed"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+        // The shell's step closed but the job did not: the job's own write failed
+        // after the step's, or the client closed the step and was then lost.
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: id,
+            step_id: 0,
+            exit_code: 3,
+        });
+
+        let exit = PtySessionExit {
+            exit_code: 3,
+            ..session_exit(id, 0, "n1")
+        };
+        assert!(
+            matches!(finish_pty(&cm, exit), PtyExitOutcome::JobFinished(_)),
+            "the node's replay must still finish the job"
+        );
+        settle(&cm, id, JobState::Failed);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.exit_code, Some(3));
+        assert_eq!(job.derived_exit_code, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_returns_a_failed_write_as_an_error() {
+        // A live shell step fails on its own write; one that already closed
+        // fails on the job's, as on a leadership loss between the two.
+        for step_closed in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 4, 8000);
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-write-fails"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_shell_step(&cm, id, 0, &["n1"]);
+            if step_closed {
+                cm.apply_operation(&WalOperation::JobStepComplete {
+                    job_id: id,
+                    step_id: 0,
+                    exit_code: 0,
+                });
+            }
+            let raft = cm.raft.read().clone().expect("raft is set");
+            raft.shutdown().await.expect("stop raft");
+
+            assert!(
+                cm.finish_standalone_pty(session_exit(id, 0, "n1")).is_err(),
+                "a failed write must not read as a handled report, or the node drops it"
+            );
+            assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_is_idempotent_for_a_settled_step() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-dup"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+        // A replayed report for the now-terminal job is a no-op.
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
         ));
     }
 

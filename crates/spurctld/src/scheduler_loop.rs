@@ -398,7 +398,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
-        // the entire scheduling loop (issue #56).
+        // the entire scheduling loop.
         let sched_ref = &mut scheduler;
         let schedule_start = Instant::now();
         let assignments = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -878,10 +878,6 @@ async fn start_one_agent(
     let attempt = async {
         let mut client = crate::agent_client::connect(agent_addr.clone())
             .await
-            .map(|c| {
-                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
-            })
             .ok()?;
         client
             .start_job(AgentStartJobRequest {
@@ -1979,6 +1975,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         pty: s.pty,
         initial_winsize: None,
         submit_line: s.submit_line.clone().unwrap_or_default(),
+        client_keepalive: s.client_keepalive,
     }
 }
 
@@ -2098,9 +2095,7 @@ async fn dispatch_to_agent(
     );
     let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
-        .map_err(|e| DispatchError::Unreachable(e.into()))?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+        .map_err(|e| DispatchError::Unreachable(e.into()))?;
 
     let spec = params.spec;
 
@@ -2216,6 +2211,7 @@ async fn dispatch_to_agent(
         pty: spec.pty,
         initial_winsize: None,
         submit_line: spec.submit_line.clone().unwrap_or_default(),
+        client_keepalive: spec.client_keepalive,
     };
 
     let response = client
@@ -2357,9 +2353,7 @@ async fn register_allocation_to_agent(
 ) -> Result<(), RegisterError> {
     let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
-        .map_err(|e| RegisterError::Failed(e.into()))?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+        .map_err(|e| RegisterError::Failed(e.into()))?;
 
     let response = client
         .register_job_allocation(RegisterJobAllocationRequest {
@@ -3132,13 +3126,18 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
             .filter(|j| j.spec.interactive || j.spec.srun_job)
             .collect();
         let ids: Vec<JobId> = running.iter().map(|j| j.job_id).collect();
+        let keepalive_capable: HashSet<JobId> = running
+            .iter()
+            .filter(|j| j.spec.client_keepalive)
+            .map(|j| j.job_id)
+            .collect();
 
         // Prunes the keepalive map every tick; returns candidates only when
-        // the limit is enabled.
-        let stale = cluster.interactive_reap_candidates(&ids, now, limit_secs);
+        // the limit is enabled and the client is keepalive-capable.
+        let stale = cluster.interactive_reap_candidates(&ids, &keepalive_capable, now, limit_secs);
         let stale_set: HashSet<JobId> = stale.iter().copied().collect();
-        // Drop grace timers for jobs that recovered (pinged again) or are gone,
-        // so a client that comes back during the grace aborts the kill.
+        // Drop grace timers for jobs that pinged again or are gone, so the
+        // reaper never force-kills them itself.
         signaled.retain(|id, _| stale_set.contains(id));
 
         let by_id: HashMap<JobId, &spur_core::job::Job> =
@@ -3157,6 +3156,14 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
                         grace_secs = GRACE_PERIOD_SECS,
                         "interactive allocation idle past InactiveLimit — sending SIGTERM, grace period starts"
                     );
+                    // Record before signalling, as the time-limit watchdog does:
+                    // the agent ends a run it is sent this SIGTERM for, and a run
+                    // that exits on it must finalize as TIMEOUT on every path
+                    // rather than as a plain signal death.
+                    if let Err(e) = cluster.signal_time_limit(job_id, now) {
+                        warn!(job_id, error = %e, "failed to record InactiveLimit reap");
+                        continue;
+                    }
                     send_cancel_to_agents(&cluster, job, 15).await; // SIGTERM
                     signaled.insert(job_id, now);
                 }
@@ -3589,12 +3596,7 @@ async fn cancel_one_step_agent(
     use spur_proto::proto::CancelStepRequest;
 
     let attempt = async {
-        match crate::agent_client::connect(agent_addr.clone())
-            .await
-            .map(|c| {
-                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
-            }) {
+        match crate::agent_client::connect(agent_addr.clone()).await {
             Ok(mut client) => {
                 if let Err(e) = client
                     .cancel_step(CancelStepRequest {
@@ -3684,12 +3686,7 @@ async fn cancel_one_agent(
     signal: i32,
 ) {
     let attempt = async {
-        match crate::agent_client::connect(agent_addr.clone())
-            .await
-            .map(|c| {
-                c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
-            }) {
+        match crate::agent_client::connect(agent_addr.clone()).await {
             Ok(mut client) => {
                 if let Err(e) = client
                     .cancel_job(AgentCancelJobRequest {
@@ -3757,12 +3754,7 @@ pub async fn send_suspend_to_agents(
         };
         let job_id = job.job_id;
         tokio::spawn(async move {
-            match crate::agent_client::connect(agent_addr.clone())
-                .await
-                .map(|c| {
-                    c.max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE)
-                }) {
+            match crate::agent_client::connect(agent_addr.clone()).await {
                 Ok(mut client) => {
                     if let Err(e) = client
                         .suspend_job(AgentSuspendJobRequest { job_id, resume })
@@ -4051,7 +4043,7 @@ mod tests {
             .collect()
     }
 
-    // ── #147: --exclusive enforcement ─────────────────────────────
+    // ── --exclusive enforcement ───────────────────────────────────
     //
     // Repro of the reported bug: an exclusive job that requests 1 CPU
     // would only record 1 CPU as allocated against the node. Backfill's

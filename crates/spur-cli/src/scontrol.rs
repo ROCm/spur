@@ -566,10 +566,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 /// Render `scontrol show config` from a controller ping. The cluster name and
 /// version follow the live controller, not the login node's local config.
 fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> String {
-    format!(
+    let mut out = format!(
         "ClusterName={}\nSlurmctldAddr={}\nVersion={}\n",
         ping.cluster_name, controller, ping.version
-    )
+    );
+    // Omitted rather than shown as 0 when an older controller does not report it.
+    if let Some(secs) = ping.inactive_limit_secs {
+        out.push_str(&format!("InactiveLimit={secs}\n"));
+    }
+    out
 }
 
 /// The job's nodelist from the environment: `SLURM_JOB_NODELIST`, else
@@ -2447,6 +2452,21 @@ mod tests {
         assert!(!out.contains("ClusterName=spur"), "{out}");
         assert!(out.contains("SlurmctldAddr=http://ctld:6817"), "{out}");
         assert!(out.contains("Version=9.9.9"), "{out}");
+    }
+
+    #[test]
+    fn config_reports_the_controllers_inactive_limit() {
+        let ping = |limit| spur_proto::proto::PingResponse {
+            inactive_limit_secs: limit,
+            ..Default::default()
+        };
+        let out = format_config("http://ctld:6817", &ping(Some(300)));
+        assert!(out.contains("InactiveLimit=300\n"), "{out}");
+        let off = format_config("http://ctld:6817", &ping(Some(0)));
+        assert!(off.contains("InactiveLimit=0\n"), "{off}");
+        // An older controller does not report it; say nothing rather than 0.
+        let legacy = format_config("http://ctld:6817", &ping(None));
+        assert!(!legacy.contains("InactiveLimit"), "{legacy}");
     }
 
     #[test]

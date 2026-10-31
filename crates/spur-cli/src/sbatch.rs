@@ -978,6 +978,7 @@ pub(crate) fn build_sbatch_job_spec(
         pty: false,
         initial_winsize: None,
         submit_line: submit_line.to_string(),
+        client_keepalive: false,
     })
 }
 
@@ -1196,7 +1197,7 @@ mod tests {
     }
 
     /// --container-readonly is a no-op in the runtime today, so it is refused at
-    /// submission rather than silently ignored (the #777-class failure mode).
+    /// submission rather than silently ignored.
     #[test]
     fn build_sbatch_job_spec_rejects_container_readonly() {
         let argv = ["sbatch", "--container-readonly", "--wrap", "hostname"].map(String::from);
@@ -1253,7 +1254,7 @@ echo "hello world"
         );
     }
 
-    // --- #143: CLI args override #SBATCH directives ---
+    // --- CLI args override #SBATCH directives ---
     //
     // Regression: clap previously rejected duplicate scalar args with
     // "the argument '--nodes <NODES>' cannot be used multiple times".
@@ -1267,7 +1268,6 @@ echo "hello world"
 
     #[test]
     fn test_cli_overrides_directive_long_form() {
-        // Reproduces the exact scenario from #143.
         let args = parse_merged(&["--nodes=2"], &["sbatch", "--nodes=4"]);
         assert_eq!(args.nodes, 4, "CLI must override directive");
     }

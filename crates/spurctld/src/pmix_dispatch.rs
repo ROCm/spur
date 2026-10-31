@@ -83,9 +83,7 @@ async fn prepare_pmix_on_agent_inner(
 ) -> Result<(), String> {
     let mut client = crate::agent_client::connect(agent_addr.to_string())
         .await
-        .map_err(|e| format!("connect failed: {e}"))?
-        .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-        .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+        .map_err(|e| format!("connect failed: {e}"))?;
     let resp = client
         .prepare_pmix(PreparePmixRequest {
             job_id,
@@ -108,9 +106,7 @@ pub async fn release_pmix_on_agent(agent_addr: &str, job_id: u32) {
     let result = async {
         let mut client = crate::agent_client::connect(agent_addr.to_string())
             .await
-            .map_err(|e| tonic::Status::unavailable(e.to_string()))?
-            .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-            .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+            .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
         client.release_pmix(ReleasePmixRequest { job_id }).await?;
         Ok::<(), tonic::Status>(())
     };

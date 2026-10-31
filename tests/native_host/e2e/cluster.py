@@ -1199,9 +1199,6 @@ class SpurCluster:
             node.exec(build)
         return remote_bin
 
-    def mpi_plugin_dir(self) -> str:
-        return str(Path(self.bin_dir).parent / "lib" / "spur")
-
     def restart_agent(self, node_index: int = 0):
         """Restart spurd on one node without touching the controller."""
         node = self.nodes[node_index]
@@ -1630,7 +1627,7 @@ tar -C "$R" -czf '{local_tar}' .
             cached, _ = node.exec_with_exit(f"docker image inspect {image}")
             if cached == 0:
                 break
-            exit_code, output = node.exec_with_exit(f"docker pull {image}")
+            exit_code, output = node.exec_with_exit(f"docker pull {image}", timeout=300)
             if exit_code == 0:
                 break
             logger.warning("Postgres image pull failed from %s: %s", image, output.strip())
@@ -1778,9 +1775,6 @@ tar -C "$R" -czf '{local_tar}' .
                 pid,
                 self.agent_as_root,
             )
-
-    def _wait_all_idle(self, timeout: int):
-        self.wait_ready(timeout)
 
     def wait_ready(self, timeout: int = 120):
         """Poll sinfo until all provisioned nodes appear idle."""

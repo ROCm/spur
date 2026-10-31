@@ -383,7 +383,7 @@ pub enum PendingReason {
     // Slurm 25.11 reason-code parity additions; each maps to a WAIT_*/FAIL_*
     // reason, with the byte-exact Slurm string in display(). Only reasons with
     // a live emission path are landed here; the rest are added alongside their
-    // enforcement logic (see #307) to avoid dead variants accreting in the
+    // enforcement logic to avoid dead variants accreting in the
     // Raft-snapshot deserialization contract.
     Reservation,
     QosMaxCpuPerJobLimit,
@@ -711,6 +711,13 @@ pub struct JobSpec {
     /// boundaries survive. Client-asserted, so advisory rather than audit.
     #[serde(default)]
     pub submit_line: Option<String>,
+
+    /// The submitting client sends inactivity keepalives and accepts having its
+    /// allocation reaped once silent past `InactiveLimit`. First-party
+    /// srun/salloc set it; the operator, third-party clients, and pre-v0.9 CLIs
+    /// leave it false and stay exempt.
+    #[serde(default)]
+    pub client_keepalive: bool,
 }
 
 impl Default for JobSpec {
@@ -787,6 +794,7 @@ impl Default for JobSpec {
             open_mode: None,
             pty: false,
             submit_line: None,
+            client_keepalive: false,
         }
     }
 }
@@ -1048,7 +1056,7 @@ impl Job {
             // Start with None — the scheduler loop's update_pending_reasons()
             // will set the actual reason (Priority, Resources, etc.) on the
             // first cycle. This avoids showing a misleading "Priority" reason
-            // before the scheduler has evaluated the job. (Issue #90)
+            // before the scheduler has evaluated the job.
             PendingReason::None
         };
         Self {
@@ -1207,6 +1215,12 @@ impl Job {
     /// derived totals and the reconciled set cannot drift apart.
     pub fn is_held_on(&self, node: &str) -> bool {
         self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
+    }
+
+    /// A standalone `srun --pty` allocation, whose shell is its workload. A salloc
+    /// parent (interactive) or a batch parent keeps its own lifecycle instead.
+    pub fn is_standalone_pty(&self) -> bool {
+        self.spec.srun_job && self.spec.pty && !self.spec.interactive && self.srun_step_dispatch
     }
 
     /// Whether a placement is already charged. `reserve_placement` charges while still
@@ -1662,6 +1676,16 @@ mod tests {
         value.as_object_mut().unwrap().remove("pty");
         let spec: JobSpec = serde_json::from_value(value).unwrap();
         assert!(!spec.pty);
+    }
+
+    // A job logged by an older controller decodes as not keepalive-capable, so
+    // its allocation stays exempt from InactiveLimit reaping.
+    #[test]
+    fn job_spec_deserializes_without_client_keepalive_field() {
+        let mut value = serde_json::to_value(JobSpec::default()).unwrap();
+        value.as_object_mut().unwrap().remove("client_keepalive");
+        let spec: JobSpec = serde_json::from_value(value).unwrap();
+        assert!(!spec.client_keepalive);
     }
 
     #[test]

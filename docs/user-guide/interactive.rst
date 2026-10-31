@@ -192,6 +192,67 @@ the local login name, matching step-mode ``srun`` under JWT authentication.
    sattach 1024
    sattach 1024 --output-only --output stderr
 
+Standalone ``srun --pty`` Lifecycle
+-----------------------------------
+
+A standalone ``srun --pty`` shell is the job's workload. When that shell exits,
+the node reports it and the controller finishes the job with the shell's exit
+code: ``COMPLETED`` on ``0`` and ``FAILED`` otherwise, ``TIMEOUT`` if the
+shell was killed at its time limit or by the ``InactiveLimit`` reaper, and
+``OUT_OF_MEMORY`` if the kernel OOM killer took it. A signal death reports
+``128 + signal``, so a hangup is ``129``.
+This does not depend on the ``srun`` client: if the client is lost (closed
+terminal, ``kill -9``), the shell's exit still ends the job within seconds
+rather than leaving the allocation in ``RUNNING``. A live client reports the
+exit too; whichever report arrives first finishes the job and the other is a
+no-op. ``srun`` marks its shell's step for the controller when it opens the
+session, so a job started by an ``srun`` from an earlier release still ends
+only when that client reports the exit.
+
+Two cases behave differently, by design:
+
+- ``salloc``: exiting an attached ``srun --pty`` closes only that step. The
+  allocation stays until you exit the ``salloc`` shell, or until its client has
+  been gone past ``InactiveLimit`` (see :ref:`inactive-limit`).
+- ``srun --jobid <id> --pty``, an extra session in the job, even one attached
+  while the job was still pending: when its shell exits, the job keeps
+  running.
+
+If the client is gone *and* the shell keeps running (for example a shell that
+ignores the hangup), the ``InactiveLimit`` reaper reclaims the allocation once
+the client has been silent past the limit (see :ref:`inactive-limit`). With
+``inactive_limit_secs = 0`` the job runs until its time limit.
+
+.. _srun-controller-restart:
+
+Surviving a Controller Restart
+------------------------------
+
+Buffered ``srun`` steps, including steps inside ``sbatch`` scripts and
+multi-node ``mpirun`` daemon placement, survive a controller restart while
+their allocation remains active. ``srun`` makes up to 30 attempts to reach the
+controller with a two-second backoff (roughly a minute, plus connection and RPC
+time). Agents join an existing step rather than launching it again.
+
+If completion was already recorded, the controller returns its recorded exit
+code and attempts to retrieve the original output from the agents, allowing
+up to ten seconds per agent in parallel. Settled agent completion records are
+retained for up to ten minutes, subject to capacity limits, and output replay
+also requires the agent's spool files. An agent restart can recover completion
+from its retained on-disk record.
+
+If an output fetch fails, the recorded exit code and any output returned by
+other agents are preserved. ``srun`` reports each unavailable node on standard error
+as ``srun: output from <node> is no longer available``. Authorization failures
+still reject the request. Once the client exhausts its reconnect attempts, it
+exits with an error; the payload can remain running until it finishes or is
+cancelled with ``scancel``.
+
+These diagnostics are displayed even when workload output was streamed live
+or redirected with ``--output`` or ``--error``. They require an updated client
+and controller; older clients still receive the recorded exit code and available
+workload output.
+
 Surviving an Agent Restart
 --------------------------
 

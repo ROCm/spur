@@ -195,6 +195,12 @@ message JobSpec {
   // Submit command line as invoked, shell-quoted so word boundaries survive.
   // Client-asserted: the controller bounds and sanitizes it but cannot verify it.
   string submit_line = 85;
+
+  // The submitting client sends inactivity keepalives and is willing to have
+  // its allocation reaped once it goes silent past InactiveLimit. First-party
+  // srun/salloc set it; the K8s operator, third-party API clients, and CLIs
+  // older than v0.9 leave it false and stay exempt.
+  bool client_keepalive = 86;
 }
 
 message JobInfo {
@@ -740,6 +746,9 @@ message PingResponse {
   // into user-RPC credentials. Empty when `[auth] plugin` is not `spur`.
   string auth_audience = 6;
   uint64 auth_epoch = 7;
+  // InactiveLimit in effect on the controller, in seconds (0 = reaping off).
+  // Unset from a node agent or a controller predating the field.
+  optional uint32 inactive_limit_secs = 8;
 }
 
 message JobStateCount {
@@ -1147,6 +1156,8 @@ message RunStepResponse {
   string stdout = 2;     // Aggregated stdout from all tasks/nodes
   string stderr = 3;     // Aggregated stderr from all tasks/nodes
   string node = 4;       // Comma-separated hostnames that ran tasks
+  // Separate diagnostics so live output streaming cannot suppress them.
+  repeated string warnings = 5;
 }
 
 // -- Native cluster (k0s) lifecycle messages --
@@ -1607,6 +1618,15 @@ message ReportJobStatusRequest {
   // Step whose supervisor is reporting. Absent from a legacy agent, and from a
   // report that speaks for the whole node rather than one step.
   optional uint32 step_id = 10;
+  // Node identity token, as sent on Heartbeat. The controller verifies it only
+  // when node-identity enforcement is on, and only for the server-side
+  // standalone-PTY completion path; empty from a legacy agent.
+  string node_token = 11;
+  // For an interactive session's report (step_id = the interactive step), the
+  // numbered step its `srun --pty` invocation created. Every invocation in a
+  // job shares the interactive step id, so this names which one exited.
+  // Absent from a legacy agent.
+  optional uint32 pty_step_id = 12;
 }
 
 // ============================================================
@@ -1834,6 +1854,9 @@ message CreateJobStepRequest {
   ContainerSpec container = 11;  // Step's own container request (empty image = none/inherit)
   uint32 num_nodes = 12;       // Explicit step node count (-N); 0 = use all allocated nodes
   string nodelist = 13;        // Exact step node subset (-w); empty = derive from num_nodes/allocation
+  // Set only by a standalone `srun --pty` for its own shell, whose exit then
+  // ends the job. An extra `srun --jobid <id> --pty` session leaves it unset.
+  bool job_shell = 14;
 }
 
 message CreateJobStepResponse {

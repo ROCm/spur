@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """E2E: nodes claimed by the managed k8s cluster are excluded from Spur batch
-scheduling (SPUR-114).
+scheduling.
 
 Asserts the scheduler gate end-to-end: once `spur k8s up` assigns a node its
 k0s role, a job submitted through the real CLI -> gRPC -> scheduler path pends

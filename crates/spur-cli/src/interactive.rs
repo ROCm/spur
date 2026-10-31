@@ -24,12 +24,18 @@ impl Drop for KeepaliveGuard {
     }
 }
 
-/// Spawn the keepalive loop for `job_id`. `tool` prefixes the warning printed
-/// when a ping fails (e.g. "salloc", "srun"). A blocking client sends no other
-/// traffic, so without these pings the controller's InactiveLimit reaper would
-/// reclaim a live allocation.
+/// Bounds one keepalive ping, and one reconnect, well inside the ping interval
+/// so a hung controller connection cannot stall the loop.
+const KEEPALIVE_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawn the keepalive loop for `job_id`, pinging the controller at
+/// `controller`. `tool` prefixes the warning printed when a ping fails (e.g.
+/// "salloc", "srun"). A blocking client sends no other traffic, so without
+/// these pings the controller's InactiveLimit reaper would reclaim a live
+/// allocation.
 pub fn spawn_keepalive(
     client: SlurmControllerClient<crate::authclient::AuthChannel>,
+    controller: String,
     job_id: u32,
     user: String,
     tool: &'static str,
@@ -44,19 +50,12 @@ pub fn spawn_keepalive(
         let mut warned = false;
         loop {
             tick.tick().await;
-            match client
-                .job_keepalive(JobKeepaliveRequest {
-                    job_id,
-                    user: user.clone(),
-                })
-                .await
-            {
-                Ok(_) => warned = false,
+            match keepalive_once(&mut client, &controller, job_id, &user).await {
+                Ok(()) => warned = false,
                 Err(e) if !warned => {
                     eprintln!(
-                        "{tool}: warning: keepalive to controller failed ({}); \
-                         allocation may be reaped if this persists",
-                        e.message()
+                        "{tool}: warning: keepalive to controller failed ({e}); \
+                         allocation may be reaped if this persists"
                     );
                     warned = true;
                 }
@@ -65,6 +64,76 @@ pub fn spawn_keepalive(
         }
     });
     KeepaliveGuard(handle)
+}
+
+/// Ping the current client. On failure, walk every configured controller and
+/// keep the first rebuilt connection whose ping succeeds.
+///
+/// A client built at submit time never re-runs its auth handshake (a restarted
+/// controller has a new native auth epoch), never re-reads its JWT, and stays
+/// on the endpoint it first dialed. Rebuilding through `connect` on the whole
+/// list is not enough: that stops at the first endpoint that accepts a dial,
+/// and a follower that cannot forward to the leader still accepts one. Adopting
+/// it again would leave every later ping on the same cut-off controller until
+/// the reaper takes a live allocation.
+async fn keepalive_once(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    controller: &str,
+    job_id: u32,
+    user: &str,
+) -> Result<(), String> {
+    let first = match ping(client, job_id, user).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    let mut last_ping_err = None;
+    for endpoint in keepalive_endpoints(controller) {
+        let channel = match tokio::time::timeout(
+            KEEPALIVE_RPC_TIMEOUT,
+            crate::authclient::connect(&endpoint),
+        )
+        .await
+        {
+            Ok(Ok(channel)) => channel,
+            _ => continue,
+        };
+        let mut rebuilt = spur_proto::controller_client(channel);
+        match ping(&mut rebuilt, job_id, user).await {
+            Ok(()) => {
+                *client = rebuilt;
+                return Ok(());
+            }
+            Err(e) => last_ping_err = Some(e),
+        }
+    }
+    Err(last_ping_err.unwrap_or(first))
+}
+
+/// Controllers to try after a failed ping, in configured order. An empty list
+/// still yields the raw string so the dial fails visibly instead of skipping.
+fn keepalive_endpoints(controller: &str) -> Vec<String> {
+    let parsed = spur_client::parse_endpoints(controller);
+    if parsed.is_empty() {
+        vec![controller.to_string()]
+    } else {
+        parsed
+    }
+}
+
+async fn ping(
+    client: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
+    job_id: u32,
+    user: &str,
+) -> Result<(), String> {
+    let request = client.job_keepalive(JobKeepaliveRequest {
+        job_id,
+        user: user.to_string(),
+    });
+    match tokio::time::timeout(KEEPALIVE_RPC_TIMEOUT, request).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(status)) => Err(status.message().to_string()),
+        Err(_) => Err("timed out".to_string()),
+    }
 }
 
 /// The agent's own port, since a cluster may run it anywhere. A node that
@@ -418,6 +487,95 @@ mod tests {
     use crate::mock_controller;
     use serial_test::serial;
     use tonic::Code;
+
+    // A controller that stops accepting the client's credential, as a restarted
+    // one does under native auth, must not leave every later ping failing.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn a_rejected_keepalive_is_retried_on_a_rebuilt_client() {
+        let env = EnvGuard::new();
+        env.set("SPUR_AUTH_PLUGIN", "none");
+        let (addr, capture) = mock_controller::spawn().await;
+        let mut client = mock_controller::client(addr).await;
+        capture.fail_next_keepalives(1);
+
+        keepalive_once(&mut client, &format!("http://{addr}"), 55, "alice")
+            .await
+            .expect("the rebuilt client's ping is accepted");
+
+        let peers = capture.keepalive_peers();
+        assert_eq!(
+            peers.len(),
+            2,
+            "the failed ping is retried at once: {peers:?}"
+        );
+        assert_ne!(
+            peers[0], peers[1],
+            "the retry must go out on a rebuilt connection, not the stale one"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn a_keepalive_rejected_on_both_clients_reports_the_error() {
+        let env = EnvGuard::new();
+        env.set("SPUR_AUTH_PLUGIN", "none");
+        let (addr, capture) = mock_controller::spawn().await;
+        let mut client = mock_controller::client(addr).await;
+        capture.fail_next_keepalives(2);
+
+        let err = keepalive_once(&mut client, &format!("http://{addr}"), 55, "alice")
+            .await
+            .expect_err("both pings are rejected");
+        assert!(err.contains("stale credential"), "{err}");
+    }
+
+    // A follower that still accepts the dial but rejects the ping must not be
+    // selected again. The next configured controller has to receive the keepalive
+    // in the same attempt, or the reaper takes a live allocation once the limit
+    // expires.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn a_controller_that_accepts_the_dial_but_rejects_keepalive_is_skipped() {
+        let env = EnvGuard::new();
+        env.set("SPUR_AUTH_PLUGIN", "none");
+        let (blocked, blocked_capture) = mock_controller::spawn().await;
+        let (healthy, healthy_capture) = mock_controller::spawn().await;
+        blocked_capture.fail_next_keepalives(u32::MAX);
+        let mut client = mock_controller::client(blocked).await;
+        let endpoints = format!("http://{blocked},http://{healthy}");
+
+        keepalive_once(&mut client, &endpoints, 55, "alice")
+            .await
+            .expect("a later controller accepts the keepalive");
+
+        assert!(
+            !blocked_capture.keepalive_peers().is_empty(),
+            "the controller that rejected the ping was tried"
+        );
+        assert_eq!(
+            healthy_capture.keepalive_peers().len(),
+            1,
+            "the keepalive must land on the controller that can serve it"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn an_unreachable_controller_is_skipped_for_one_that_accepts_keepalive() {
+        let env = EnvGuard::new();
+        env.set("SPUR_AUTH_PLUGIN", "none");
+        let down = mock_controller::unreachable_addr().await;
+        let (up, capture) = mock_controller::spawn().await;
+        let mut client = mock_controller::lazy_client(down);
+        let endpoints = format!("http://{down},http://{up}");
+
+        keepalive_once(&mut client, &endpoints, 55, "alice")
+            .await
+            .expect("the reachable controller accepts the keepalive");
+
+        assert_eq!(capture.keepalive_peers().len(), 1);
+    }
 
     #[tokio::test]
     #[serial(env_injection)]

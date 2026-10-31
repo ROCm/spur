@@ -43,7 +43,7 @@ struct Args {
     /// Advertised address for spurctld to reach this operator.
     /// If unset, falls back to POD_IP env var, then hostname.
     /// In K8s, set this to the Service DNS name or use the Downward API
-    /// to inject the Pod IP (issue #51).
+    /// to inject the Pod IP.
     #[arg(long, env = "SPUR_OPERATOR_ADDRESS")]
     address: Option<String>,
 
@@ -136,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
     let operator_namespace = std::env::var("POD_NAMESPACE").unwrap_or_default();
 
     let listen_addr: SocketAddr = args.listen.parse()?;
-    // Issue #51: Use explicit --address flag, then POD_IP env var (K8s Downward
+    // Use explicit --address flag, then POD_IP env var (K8s Downward
     // API), then listen IP, then hostname. Pod hostnames are unroutable —
     // spurctld can't reach the operator at "spur-k8s-operator-abc123".
     let operator_ip = if let Some(ref addr) = args.address {
@@ -153,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
     let operator_port = listen_addr.port() as u32;
     info!(address = %operator_ip, port = operator_port, "operator will advertise this address to spurctld");
 
-    // Spawn health/readiness server (issue #52: retry on failure)
+    // Spawn health/readiness server (retry on failure)
     let health_addr: SocketAddr = args.health_addr.parse()?;
     let health_ctrl_addr = args.controller_addr.clone();
     let health_client = client.clone();
@@ -198,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    // Spawn job controller (issue #52: retry on failure)
+    // Spawn job controller (retry on failure)
     let jc_client = client.clone();
     let jc_ctrl_addr = args.controller_addr.clone();
     let jc_ns = operator_namespace.clone();
