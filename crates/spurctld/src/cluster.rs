@@ -4516,6 +4516,18 @@ impl ClusterManager {
         }
     }
 
+    pub fn quarantine_node(&self, name: &str, reason: &str) -> anyhow::Result<()> {
+        let held = self
+            .nodes
+            .read()
+            .get(name)
+            .is_some_and(|node| node.admin_locked && node.state.is_unavailable());
+        if held {
+            return Ok(());
+        }
+        self.update_node_state(name, NodeState::Drain, Some(reason.to_owned()), None)
+    }
+
     /// Update node state (admin: drain, resume, etc.)
     pub fn update_node_state(
         &self,

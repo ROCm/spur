@@ -1679,6 +1679,8 @@ const CPU_PERIOD_US: u64 = 100_000;
 /// the plugin selectors. Slurm defaults permissive here, Spur enforcing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CgroupConfig {
+    #[serde(default = "default_cgroup_cleanup_timeout")]
+    pub cleanup_timeout_secs: u32,
     /// Master switch. When false, spurd creates no cgroup and applies no limits.
     #[serde(default = "default_true_fn")]
     pub enabled: bool,
@@ -1727,6 +1729,10 @@ pub struct CgroupConfig {
     pub extra_device_paths: Vec<String>,
 }
 
+pub fn default_cgroup_cleanup_timeout() -> u32 {
+    20
+}
+
 fn default_min_ram_mb() -> u64 {
     30
 }
@@ -1738,6 +1744,7 @@ fn default_allowed_ram_percent() -> u32 {
 impl Default for CgroupConfig {
     fn default() -> Self {
         Self {
+            cleanup_timeout_secs: default_cgroup_cleanup_timeout(),
             enabled: true,
             required: false,
             constrain_cores: true,
@@ -2841,6 +2848,17 @@ pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn cgroup_cleanup_timeout_preserves_old_configs_and_accepts_overrides() {
+        let old: CgroupConfig = toml::from_str("enabled = true\nrequired = false\n").unwrap();
+        assert_eq!(old.cleanup_timeout_secs, 20);
+        for seconds in [0, 120] {
+            let config: CgroupConfig =
+                toml::from_str(&format!("cleanup_timeout_secs = {seconds}\n")).unwrap();
+            assert_eq!(config.cleanup_timeout_secs, seconds);
+        }
+    }
 
     #[test]
     fn node_config_parses_reserved_memory_mb() {

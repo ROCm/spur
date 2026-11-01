@@ -12,6 +12,10 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, trace, warn};
 
+#[cfg(test)]
+#[path = "cleanup_lifecycle_tests.rs"]
+mod cleanup_lifecycle_tests;
+
 use tokio_stream::wrappers::ReceiverStream;
 
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
@@ -799,15 +803,12 @@ fn unreported_durable_exit(
     run_attempt: u32,
     step_id: spur_core::step::StepId,
 ) -> bool {
-    store
-        .discover_unacknowledged_completions()
-        .map(|pending| {
-            pending.iter().any(|completion| {
-                completion.job_id == job_id
-                    && completion.run_attempt == run_attempt
-                    && completion.step_id == step_id
-            })
-        })
+    let session = store.session_dir(job_id, run_attempt, step_id);
+    if session.try_exists().is_ok_and(|exists| !exists) {
+        return false;
+    }
+    !store
+        .completion_reported(job_id, run_attempt, step_id)
         .unwrap_or(false)
 }
 
@@ -1017,6 +1018,7 @@ async fn run_completion_hooks_and_report(
     hooks: &HooksConfig,
     spank: &Option<SpankHost>,
     controller_addr: &str,
+    node_token: &str,
 ) {
     let mut drain_jobs: HashMap<u32, String> = HashMap::new();
 
@@ -1081,7 +1083,7 @@ async fn run_completion_hooks_and_report(
                 reporting_node: &local_hostname,
                 drain: drain.as_ref(),
                 step_id: None,
-                node_token: String::new(),
+                node_token: node_token.to_string(),
                 pty_step_id: None,
             },
         )
@@ -1115,6 +1117,7 @@ async fn wait_for_exit_and_teardown(
     hooks: Arc<HooksConfig>,
     spank: Arc<Option<SpankHost>>,
     controller_addr: String,
+    node_token: String,
 ) {
     let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
     loop {
@@ -1166,7 +1169,14 @@ async fn wait_for_exit_and_teardown(
         if let Some(c) = completed {
             teardown_completed_job(&c, lifecycle, running, allocation, mpi_host).await;
             tokio::spawn(async move {
-                run_completion_hooks_and_report(&[c], &hooks, &spank, &controller_addr).await;
+                run_completion_hooks_and_report(
+                    &[c],
+                    &hooks,
+                    &spank,
+                    &controller_addr,
+                    &node_token,
+                )
+                .await;
             });
             return;
         }
@@ -1581,6 +1591,29 @@ async fn release_stepd_tracking(
     descriptor: &crate::stepd::StepdDescriptor,
     reason: &'static str,
 ) -> bool {
+    if let Some(state_dir) = descriptor
+        .socket_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+    {
+        let store = crate::stepd::StepdStore::new(state_dir);
+        let cleaned = store.prepare_cleanup(descriptor).unwrap_or_else(|error| {
+            warn!(job_id = descriptor.job_id, %error, "cannot confirm cleanup before releasing tracking");
+            false
+        });
+        if !cleaned
+            && !store
+                .completion_reported(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                )
+                .unwrap_or(false)
+        {
+            return false;
+        }
+    }
     // The allocation outlives the individual steps drawing on it, so only the
     // job's last supervisor releases it. Held across the release so a step
     // claimed meanwhile cannot have its allocation torn down underneath it.
@@ -1763,16 +1796,13 @@ async fn settle_recovered_stepd(
         "runtime completion",
     )
     .await;
-    // The controller report this poll goes on to make does not reach a client
-    // that reattached to this step after the agent restarted.
-    completions
-        .complete(
-            descriptor.job_id,
-            descriptor.run_attempt,
-            descriptor.step_id,
-            crate::step_completion::StepOutcome { exit_code, signal },
-        )
-        .await;
+    deliver_runtime_completion(
+        store,
+        completions,
+        descriptor,
+        crate::step_completion::StepOutcome { exit_code, signal },
+    )
+    .await;
     let epilog_failed = store
         .epilog_failed(
             descriptor.job_id,
@@ -1888,7 +1918,8 @@ pub(crate) fn monitor_recovered_stepds(
             }
             let mut acknowledged = Vec::new();
             for completion in completed.values() {
-                if report_completion(
+                if report_runtime_completion(
+                    &store,
                     &controller_addr,
                     CompletionReport {
                         job_id: completion.job_id,
@@ -1906,16 +1937,28 @@ pub(crate) fn monitor_recovered_stepds(
                 )
                 .await
                 {
-                    if let Err(error) = store.acknowledge_completion(completion) {
-                        warn!(
-                            job_id = completion.job_id,
-                            run_attempt = completion.run_attempt,
-                            %error,
-                            "failed to acknowledge recovered runtime completion"
-                        );
-                    } else {
-                        acknowledged.push((completion.job_id, completion.step_id));
+                    if let Some(descriptor) = pending.get(&(completion.job_id, completion.step_id))
+                    {
+                        release_stepd_tracking(
+                            &running,
+                            &allocation,
+                            &stepds,
+                            descriptor,
+                            "recovered completion",
+                        )
+                        .await;
+                        deliver_runtime_completion(
+                            &store,
+                            &completions,
+                            descriptor,
+                            crate::step_completion::StepOutcome {
+                                exit_code: completion.exit_code,
+                                signal: completion.signal,
+                            },
+                        )
+                        .await;
                     }
+                    acknowledged.push((completion.job_id, completion.step_id));
                 }
             }
             for key in acknowledged {
@@ -1980,6 +2023,131 @@ async fn claim_stepd(
     }
 }
 
+fn runtime_completion_ready(
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> bool {
+    store
+        .completion_reported(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        )
+        .unwrap_or(false)
+        || store.prepare_cleanup(descriptor).unwrap_or(false)
+}
+
+async fn deliver_runtime_completion(
+    store: &crate::stepd::StepdStore,
+    completions: &crate::step_completion::StepCompletions,
+    descriptor: &crate::stepd::StepdDescriptor,
+    outcome: crate::step_completion::StepOutcome,
+) -> bool {
+    // A client can release its allocation immediately after receiving the exit.
+    if !runtime_completion_ready(store, descriptor) {
+        return false;
+    }
+    completions
+        .complete(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+            outcome,
+        )
+        .await
+}
+
+fn ensure_runtime_exit_ready(
+    store: &crate::stepd::StepdStore,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: u32,
+) -> Result<(), Status> {
+    let descriptor = if run_attempt == 0 {
+        let found = store
+            .discover_live()
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        found
+            .live
+            .into_iter()
+            .chain(found.stale)
+            .filter(|descriptor| descriptor.job_id == job_id && descriptor.step_id == step_id)
+            .filter(|descriptor| {
+                store
+                    .observed_exit(job_id, descriptor.run_attempt, step_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .max_by_key(|descriptor| descriptor.run_attempt)
+    } else {
+        match store.load_descriptor(&store.session_dir(job_id, run_attempt, step_id)) {
+            Ok(descriptor) => Some(descriptor),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(Status::unavailable(error.to_string())),
+        }
+    };
+    let ready = match descriptor {
+        Some(descriptor) => runtime_completion_ready(store, &descriptor),
+        None => store.ensure_cleanup_ready().is_ok(),
+    };
+    if !ready {
+        return Err(Status::unavailable(
+            "step cleanup or node quarantine is still pending",
+        ));
+    }
+    Ok(())
+}
+
+async fn report_runtime_completion(
+    store: &crate::stepd::StepdStore,
+    controller_addr: &str,
+    mut report: CompletionReport<'_>,
+) -> bool {
+    let step_id = report.step_id.unwrap_or(spur_core::step::STEP_BATCH);
+    let descriptor = match store.load_descriptor(&store.session_dir(
+        report.job_id,
+        report.run_attempt,
+        step_id,
+    )) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            warn!(job_id = report.job_id, %error, "cannot establish completion cleanup ownership");
+            return false;
+        }
+    };
+    let cleaned = store.prepare_cleanup(&descriptor).unwrap_or_else(|error| {
+        warn!(job_id = report.job_id, %error, "cannot confirm completion cleanup");
+        false
+    });
+    let drain = DrainRequest {
+        reason: crate::cgroup_cleanup::DRAIN_REASON.into(),
+    };
+    if !cleaned {
+        if !store.cleanup_expired(&descriptor).unwrap_or(false) {
+            return false;
+        }
+        report.drain = Some(&drain);
+    }
+    let completion = crate::stepd::PendingStepdCompletion {
+        job_id: report.job_id,
+        run_attempt: report.run_attempt,
+        step_id,
+        exit_code: report.exit_code,
+        signal: report.signal,
+        epilog_failed: false,
+        pty_step_id: report.pty_step_id,
+    };
+    if !report_completion(controller_addr, report).await {
+        return false;
+    }
+    if let Err(error) = store.acknowledge_completion(&completion) {
+        warn!(job_id = completion.job_id, %error, "cannot persist acknowledged runtime completion");
+        return false;
+    }
+    true
+}
+
 async fn fence_dead_stepd(
     context: &CompletionListenerContext,
     descriptor: crate::stepd::StepdDescriptor,
@@ -2035,23 +2203,11 @@ async fn fence_dead_stepd(
                 "failed to record synthetic exit for a dead stepd");
         }
     }
-    // The crashed supervisor was the cgroup's only owner, so its job process
-    // can outlive it as an orphan — reap it before releasing this node's ledger.
-    // No unit is left to retry stopping, so an unconfirmed cgroup still proceeds.
-    if !runtime_cgroup_reaped(&effective_cgroup_path(&descriptor)) {
-        warn!(
-            job_id = descriptor.job_id,
-            run_attempt = descriptor.run_attempt,
-            "could not confirm the crashed stepd's cgroup is empty; releasing tracking anyway"
-        );
-    }
-    // Release the local allocation before reporting, so the controller never
-    // dispatches a new job into this slot before it's actually free.
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
-
     // The supervisor cannot be recovered, but its death still has to reach the
     // controller: unreported, the job holds its allocation in Running forever.
-    let reported = report_completion(
+    let reported = report_runtime_completion(
+        store,
         controller_addr,
         CompletionReport {
             job_id: descriptor.job_id,
@@ -2066,14 +2222,8 @@ async fn fence_dead_stepd(
         },
     )
     .await;
-    if reported {
-        if let Err(error) =
-            obligations.append(&crate::stepd::StepdObligation::CompletionAcknowledged)
-        {
-            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
-                "failed to record the acknowledged completion of a dead stepd");
-        }
-    } else {
+    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+    if !reported {
         warn!(
             job_id = descriptor.job_id,
             run_attempt = descriptor.run_attempt,
@@ -2083,14 +2233,13 @@ async fn fence_dead_stepd(
 
     // The supervisor is gone, so no completion push is coming; without this the
     // RPC that launched this step stays parked for the agent's lifetime.
-    if completions
-        .complete(
-            descriptor.job_id,
-            descriptor.run_attempt,
-            descriptor.step_id,
-            crate::step_completion::StepOutcome { exit_code, signal },
-        )
-        .await
+    if deliver_runtime_completion(
+        store,
+        completions,
+        &descriptor,
+        crate::step_completion::StepOutcome { exit_code, signal },
+    )
+    .await
     {
         warn!(
             job_id = descriptor.job_id,
@@ -2198,12 +2347,14 @@ async fn handle_completion_notification(
 
     let response = match descriptor {
         Some(descriptor) if !claim_stepd(&context.stepds, &descriptor).await => {
-            // Already claimed elsewhere (the watchdog, or a concurrent duplicate push).
-            crate::stepd::AgentNotificationResponse::Acknowledged
+            // Another reporter may still be waiting for cleanup or controller approval.
+            if unreported_durable_exit(&context.stepds_store, job_id, run_attempt, step_id) {
+                crate::stepd::AgentNotificationResponse::Deferred
+            } else {
+                crate::stepd::AgentNotificationResponse::Acknowledged
+            }
         }
         Some(descriptor) => {
-            // Release the local allocation before reporting, so the controller
-            // never dispatches a new job into this slot before it's actually free.
             release_stepd_tracking(
                 &context.running,
                 &context.allocation,
@@ -2212,7 +2363,8 @@ async fn handle_completion_notification(
                 "runtime completion",
             )
             .await;
-            let reported = report_completion(
+            let reported = report_runtime_completion(
+                &context.stepds_store,
                 &context.controller_addr,
                 CompletionReport {
                     job_id,
@@ -2229,17 +2381,21 @@ async fn handle_completion_notification(
                 },
             )
             .await;
-            // A user step's exit ends the RPC that launched it, not the job, so
-            // the controller report above was a no-op and this is the delivery.
-            context
-                .step_completions
-                .complete(
-                    job_id,
-                    run_attempt,
-                    step_id,
-                    crate::step_completion::StepOutcome { exit_code, signal },
-                )
-                .await;
+            release_stepd_tracking(
+                &context.running,
+                &context.allocation,
+                &context.stepds,
+                &descriptor,
+                "runtime completion",
+            )
+            .await;
+            deliver_runtime_completion(
+                &context.stepds_store,
+                &context.step_completions,
+                &descriptor,
+                crate::step_completion::StepOutcome { exit_code, signal },
+            )
+            .await;
             if reported {
                 crate::stepd::AgentNotificationResponse::Acknowledged
             } else {
@@ -2280,9 +2436,31 @@ pub async fn replay_unacknowledged_stepd_completions(
     reporting_node: &str,
     node_token: &str,
 ) -> anyhow::Result<Vec<SessionIdentity>> {
+    Ok(
+        replay_runtime_completions(store, controller_addr, reporting_node, node_token)
+            .await?
+            .into_iter()
+            .map(|completion| {
+                (
+                    completion.job_id,
+                    completion.run_attempt,
+                    completion.step_id,
+                )
+            })
+            .collect(),
+    )
+}
+
+async fn replay_runtime_completions(
+    store: &crate::stepd::StepdStore,
+    controller_addr: &str,
+    reporting_node: &str,
+    node_token: &str,
+) -> anyhow::Result<Vec<crate::stepd::PendingStepdCompletion>> {
     let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
-        if report_completion(
+        if report_runtime_completion(
+            store,
             controller_addr,
             CompletionReport {
                 job_id: completion.job_id,
@@ -2300,15 +2478,46 @@ pub async fn replay_unacknowledged_stepd_completions(
         )
         .await
         {
-            store.acknowledge_completion(&completion)?;
-            reconciled.push((
-                completion.job_id,
-                completion.run_attempt,
-                completion.step_id,
-            ));
+            reconciled.push(completion);
         }
     }
     Ok(reconciled)
+}
+
+async fn settle_replayed_completions(
+    context: &CompletionListenerContext,
+    completions: &[crate::stepd::PendingStepdCompletion],
+) {
+    for completion in completions {
+        let session = context.stepds_store.session_dir(
+            completion.job_id,
+            completion.run_attempt,
+            completion.step_id,
+        );
+        if let Ok(descriptor) = context.stepds_store.load_descriptor(&session) {
+            release_stepd_tracking(
+                &context.running,
+                &context.allocation,
+                &context.stepds,
+                &descriptor,
+                "completion replay",
+            )
+            .await;
+        }
+        // Acknowledgement can prune the descriptor before a parked caller is answered.
+        context
+            .step_completions
+            .complete(
+                completion.job_id,
+                completion.run_attempt,
+                completion.step_id,
+                crate::step_completion::StepOutcome {
+                    exit_code: completion.exit_code,
+                    signal: completion.signal,
+                },
+            )
+            .await;
+    }
 }
 
 pub fn retry_unacknowledged_stepd_completions(
@@ -2316,11 +2525,12 @@ pub fn retry_unacknowledged_stepd_completions(
     controller_addr: String,
     reporting_node: String,
     reporter: Arc<NodeReporter>,
+    context: CompletionListenerContext,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match replay_unacknowledged_stepd_completions(
+            match replay_runtime_completions(
                 &store,
                 &controller_addr,
                 &reporting_node,
@@ -2329,6 +2539,7 @@ pub fn retry_unacknowledged_stepd_completions(
             .await
             {
                 Ok(reconciled) if !reconciled.is_empty() => {
+                    settle_replayed_completions(&context, &reconciled).await;
                     tracing::info!(
                         completions = reconciled.len(),
                         "reconciled durable runtime completions"
@@ -2338,6 +2549,37 @@ pub fn retry_unacknowledged_stepd_completions(
                 Err(error) => {
                     tracing::warn!(%error, "failed to replay durable runtime completions");
                 }
+            }
+            if let Ok(records) = store.cleanup_store().records() {
+                for record in records {
+                    let session =
+                        store.session_dir(record.job_id, record.run_attempt, record.step_id);
+                    if store.load_descriptor(&session).is_ok()
+                        || !store.cleanup_store().expired(&record).unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    report_completion(
+                        &controller_addr,
+                        CompletionReport {
+                            job_id: record.job_id,
+                            exit_code: 0,
+                            signal: nix::sys::signal::Signal::SIGKILL as i32,
+                            run_attempt: record.run_attempt,
+                            reporting_node: &reporting_node,
+                            drain: Some(&DrainRequest {
+                                reason: crate::cgroup_cleanup::DRAIN_REASON.into(),
+                            }),
+                            step_id: Some(record.step_id),
+                            node_token: reporter.node_token(),
+                            pty_step_id: None,
+                        },
+                    )
+                    .await;
+                }
+            }
+            if let Err(error) = store.retry_cleanup() {
+                warn!(%error, "failed to retry cgroup cleanup");
             }
             // A settled user step's record is held past its completion report so
             // a restart can still answer for it; nothing else sweeps it later.
@@ -3918,12 +4160,22 @@ impl AgentService {
         }
     }
 
-    /// A stale session's supervisor is confirmed dead, so nothing adopts it and
-    /// nothing else will ever speak for it: carry any exit it recorded to the
-    /// caller still waiting on the step, and release it so it can be pruned.
+    /// A dead supervisor may still hold an allocation through pending cleanup;
+    /// only cleaned or acknowledged sessions may release that recovered hold.
     pub async fn settle_stale_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
         let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
         for descriptor in descriptors {
+            if !store.prepare_cleanup(descriptor).unwrap_or(false)
+                && !store
+                    .completion_reported(
+                        descriptor.job_id,
+                        descriptor.run_attempt,
+                        descriptor.step_id,
+                    )
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             match durable_runtime_exit(&store, descriptor) {
                 Ok(Some((exit_code, signal))) => {
                     self.step_completions
@@ -3948,15 +4200,14 @@ impl AgentService {
                     );
                 }
             }
-            if let Err(error) = crate::stepd::record_resources_released(descriptor) {
-                warn!(
-                    job_id = descriptor.job_id,
-                    run_attempt = descriptor.run_attempt,
-                    step_id = descriptor.step_id,
-                    %error,
-                    "failed to record runtime resource release for a stale session"
-                );
-            }
+            release_stepd_tracking(
+                &self.running,
+                &self.allocation,
+                &self.stepds,
+                descriptor,
+                "stale session",
+            )
+            .await;
         }
     }
 
@@ -4374,6 +4625,7 @@ impl AgentService {
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
         let lifecycle = self.lifecycle.clone();
+        let reporter = self.reporter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -4443,7 +4695,14 @@ impl AgentService {
                     reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
                 }
 
-                run_completion_hooks_and_report(&completed, &hooks, &spank, &controller_addr).await;
+                run_completion_hooks_and_report(
+                    &completed,
+                    &hooks,
+                    &spank,
+                    &controller_addr,
+                    &reporter.node_token(),
+                )
+                .await;
             }
         });
     }
@@ -6398,6 +6657,9 @@ impl SlurmAgent for AgentService {
         }
 
         for descriptor in &gated {
+            crate::stepd::StepdStore::new(&self.stepd_state_dir)
+                .ensure_cleanup_ready()
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
             if descriptor.resources.fabric_binding.is_some()
                 || descriptor.resources.gpu_binding.is_some()
             {
@@ -6663,6 +6925,9 @@ impl SlurmAgent for AgentService {
             .await?;
 
         let entry = self.job_entry(req.job_id).await?;
+        crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_cleanup_ready()
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
@@ -6747,6 +7012,9 @@ impl SlurmAgent for AgentService {
         if req.job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
         }
+        crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_cleanup_ready()
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
         // Creates this id's cgroup, so it must not run while a prior run's teardown
         // still owns the directory.
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
@@ -7113,6 +7381,9 @@ impl SlurmAgent for AgentService {
             }
         }
         let req = request.into_inner();
+        crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_cleanup_ready()
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
         }
@@ -7232,6 +7503,7 @@ impl SlurmAgent for AgentService {
             if let Ok(Some((exit_code, signal))) =
                 store.observed_exit(job_id, step_run_attempt, step_id)
             {
+                ensure_runtime_exit_ready(&store, job_id, step_run_attempt, step_id)?;
                 info!(
                     job_id,
                     step_id, step_run_attempt, "step finished (durable); returning recorded result"
@@ -8221,6 +8493,7 @@ impl SlurmAgent for AgentService {
             let Some((exit_code, signal)) = settled else {
                 return Err(Status::not_found("this node is not running that step"));
             };
+            ensure_runtime_exit_ready(&store, req.job_id, req.run_attempt, req.step_id)?;
             return Ok(Response::new(
                 awaited_step_response(req.job_id, req.step_id, exit_code, signal).await,
             ));
@@ -8229,6 +8502,7 @@ impl SlurmAgent for AgentService {
         // A supervisor that finished while nobody was listening recorded its exit
         // durably; the rendezvous is in memory and does not survive a restart.
         if let Ok(Some((exit_code, signal))) = durable_runtime_exit(&store, &descriptor) {
+            ensure_runtime_exit_ready(&store, req.job_id, descriptor.run_attempt, req.step_id)?;
             return Ok(Response::new(
                 awaited_step_response(req.job_id, req.step_id, exit_code, signal).await,
             ));
@@ -8678,6 +8952,12 @@ impl SlurmAgent for AgentService {
                 }
             };
             if let Some((exit_code, signal)) = settled {
+                ensure_runtime_exit_ready(
+                    &crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                    init.job_id,
+                    run_attempt,
+                    step_id,
+                )?;
                 let shell_code = spur_core::process::shell_exit_code(&step_exit_status(
                     crate::step_completion::StepOutcome { exit_code, signal },
                 ));
@@ -9268,6 +9548,12 @@ impl AgentService {
         // The cgroup removal and the release below both key off the id, so a launch
         // reusing it must not interleave with them.
         let _lifecycle = self.lifecycle.acquire(job_id).await;
+        if crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_job_cleanup_ready(job_id, run_attempt)
+            .is_err()
+        {
+            return;
+        }
         // Scoped so the guard is gone before `cgroup` is dropped below: removing
         // a cgroup SIGKILLs its stragglers and then blocks retrying rmdir.
         let (removed, cgroup) = {
@@ -9453,6 +9739,9 @@ impl AgentService {
         cpus: u32,
         memory_mb: u64,
     ) -> Result<(AllocationResult, Vec<u64>), Status> {
+        crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_cleanup_ready()
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
         let controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -9745,6 +10034,7 @@ impl AgentService {
                 self.hooks.clone(),
                 self.spank.clone(),
                 self.reporter.controller_addr.clone(),
+                self.reporter.node_token(),
             )
             .await;
         }
@@ -9987,6 +10277,7 @@ impl AgentService {
             self.hooks.clone(),
             self.spank.clone(),
             self.reporter.controller_addr.clone(),
+            self.reporter.node_token(),
         )
         .await;
 
@@ -9997,6 +10288,7 @@ impl AgentService {
         let hooks = self.hooks.clone();
         let spank = self.spank.clone();
         let controller_addr = self.reporter.controller_addr.clone();
+        let reporter = self.reporter.clone();
         tokio::spawn(async move {
             // Timed from the signal, not from after the immediate wait above,
             // so a slow (or bounded-out) wait can't push escalation past ~5s.
@@ -10025,6 +10317,7 @@ impl AgentService {
                     hooks,
                     spank,
                     controller_addr,
+                    reporter.node_token(),
                 )
                 .await;
             }
@@ -12312,6 +12605,194 @@ mod tests {
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
     }
 
+    async fn pending_completion_delivery_fixture(
+        controller_addr: &str,
+        step_id: u32,
+    ) -> (
+        CompletionListenerContext,
+        tempfile::TempDir,
+        crate::stepd::StepdDescriptor,
+    ) {
+        let (context, _, sessions, state, _) =
+            completion_listener_fixture_for_step(controller_addr, step_id).await;
+        let cgroup = state.path().join("job_42_7");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.kill"), "").unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        let descriptor = {
+            let mut sessions = sessions.lock().await;
+            let descriptor = sessions.get_mut(&(42, step_id)).unwrap();
+            descriptor.cgroup_path = cgroup.clone();
+            descriptor.clone()
+        };
+        context.stepds_store.publish(&descriptor).unwrap();
+        context
+            .stepds_store
+            .obligations(42, 7, step_id)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 9,
+                signal: 0,
+            })
+            .unwrap();
+        context
+            .stepds_store
+            .cleanup_store()
+            .track(&crate::cgroup_cleanup::PendingCleanup {
+                job_id: 42,
+                run_attempt: 7,
+                step_id,
+                cgroup,
+                deadline_unix_ms: u64::MAX,
+            })
+            .unwrap();
+        (context, state, descriptor)
+    }
+
+    async fn push_pending_completion(context: &CompletionListenerContext, step_id: u32) {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let exchange = async {
+            let (reader, mut writer) = client.into_split();
+            let notification = crate::stepd::AgentNotification::StepdCompleted {
+                job_id: 42,
+                run_attempt: 7,
+                step_id,
+                exit_code: 9,
+                signal: 0,
+                epilog_failed: false,
+                capability: "test-capability".into(),
+            };
+            writer
+                .write_all(&serde_json::to_vec(&notification).unwrap())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
+            crate::stepd::read_line_bounded(&mut reader, &mut line)
+                .await
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<crate::stepd::AgentNotificationResponse>(&line).unwrap(),
+                crate::stepd::AgentNotificationResponse::Deferred
+            ));
+        };
+        let (handled, ()) = tokio::join!(handle_completion_notification(server, context), exchange);
+        handled.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_completion_delivery_waits_for_quarantine_and_replay_wakes_each_step() {
+        for step_id in [spur_core::step::STEP_INTERACTIVE, 3] {
+            let (address, reports, _) = spawn_mock_controller();
+            let (context, _state, descriptor) =
+                pending_completion_delivery_fixture(&address, step_id).await;
+            let mut waiter = context.step_completions.register(42, 7, step_id).await;
+            push_pending_completion(&context, step_id).await;
+            assert!(matches!(
+                waiter.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(reports.lock().unwrap().is_empty());
+            assert_eq!(
+                ensure_runtime_exit_ready(&context.stepds_store, 42, 7, step_id)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable
+            );
+            assert_eq!(
+                ensure_runtime_exit_ready(&context.stepds_store, 42, 0, step_id)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable
+            );
+
+            let record = crate::cgroup_cleanup::PendingCleanup {
+                job_id: 42,
+                run_attempt: 7,
+                step_id,
+                cgroup: descriptor.cgroup_path.clone(),
+                deadline_unix_ms: 0,
+            };
+            context
+                .stepds_store
+                .cleanup_store()
+                .finish(&record)
+                .unwrap();
+            context.stepds_store.cleanup_store().track(&record).unwrap();
+            let completed =
+                replay_runtime_completions(&context.stepds_store, &address, "test-node", "")
+                    .await
+                    .unwrap();
+            assert_eq!(completed.len(), 1);
+            settle_replayed_completions(&context, &completed).await;
+            assert_eq!(
+                waiter.try_recv().unwrap(),
+                crate::step_completion::StepOutcome {
+                    exit_code: 9,
+                    signal: 0
+                }
+            );
+            assert!(reports.lock().unwrap()[0].drain_node);
+            assert!(context.stepds_store.ensure_cleanup_ready().is_err());
+            ensure_runtime_exit_ready(&context.stepds_store, 42, 7, step_id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_completion_delivery_from_recovery_stays_parked_until_cleanup() {
+        let (context, _state, descriptor) =
+            pending_completion_delivery_fixture("http://127.0.0.1:1", 3).await;
+        let mut waiter = context.step_completions.register(42, 7, 3).await;
+        assert!(settle_recovered_stepd(
+            &context.running,
+            &context.allocation,
+            &context.stepds,
+            &context.step_completions,
+            &context.stepds_store,
+            &descriptor,
+            9,
+            0
+        )
+        .await
+        .is_some());
+        assert!(matches!(
+            waiter.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        std::fs::remove_dir_all(&descriptor.cgroup_path).unwrap();
+        assert!(
+            deliver_runtime_completion(
+                &context.stepds_store,
+                &context.step_completions,
+                &descriptor,
+                crate::step_completion::StepOutcome {
+                    exit_code: 9,
+                    signal: 0
+                }
+            )
+            .await
+        );
+        assert_eq!(waiter.try_recv().unwrap().exit_code, 9);
+    }
+
+    #[tokio::test]
+    async fn pending_completion_delivery_from_dead_supervisor_stays_parked() {
+        let (context, _state, descriptor) = pending_completion_delivery_fixture(
+            "http://127.0.0.1:1",
+            spur_core::step::STEP_INTERACTIVE,
+        )
+        .await;
+        let mut waiter = context
+            .step_completions
+            .register(42, 7, descriptor.step_id)
+            .await;
+        fence_dead_stepd(&context, descriptor).await;
+        assert!(matches!(
+            waiter.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
     async fn completion_listener_fixture_for_step(
         controller_addr: &str,
         step_id: spur_core::step::StepId,
@@ -12333,16 +12814,19 @@ mod tests {
             },
         )));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
         let mut descriptor = crate::stepd::StepdDescriptor::new(
             42,
             7,
             step_id,
             0,
             0,
-            std::path::PathBuf::from("/tmp/runtime.sock"),
+            store.session_dir(42, 7, step_id).join("runtime.sock"),
             std::path::PathBuf::new(),
         );
         descriptor.capability = "test-capability".into();
+        store.publish(&descriptor).expect("publish fixture session");
         allocation
             .lock()
             .await
@@ -12356,7 +12840,6 @@ mod tests {
             .lock()
             .await
             .insert(stepd_key(&descriptor), descriptor);
-        let state_dir = tempfile::tempdir().expect("state dir");
         let context = CompletionListenerContext {
             running: running.clone(),
             step_completions: completions.clone(),
@@ -13284,7 +13767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_push_arriving_after_the_watchdog_already_fenced_it_just_acks() {
+    async fn a_push_after_an_unacknowledged_watchdog_exit_stays_deferred() {
         let (context, running, sessions, _state_dir) =
             completion_listener_fixture("http://127.0.0.1:1").await;
         let descriptor = sessions
@@ -13293,9 +13776,7 @@ mod tests {
             .get(&(42, spur_core::step::STEP_BATCH))
             .cloned()
             .expect("fixture session");
-        let state = tempfile::tempdir().expect("runtime state directory");
-        let store = crate::stepd::StepdStore::new(state.path());
-        store.publish(&descriptor).expect("publish descriptor");
+        let store = context.stepds_store.clone();
 
         let allocation = Arc::new(Mutex::new(NodeAllocation::new(
             "test-node".into(),
@@ -13357,10 +13838,7 @@ mod tests {
             .expect("handler task")
             .expect("handle notification");
 
-        assert_eq!(
-            response,
-            crate::stepd::AgentNotificationResponse::Acknowledged
-        );
+        assert_eq!(response, crate::stepd::AgentNotificationResponse::Deferred);
     }
 
     #[tokio::test(start_paused = true)]
@@ -13371,6 +13849,12 @@ mod tests {
             .lock()
             .await
             .remove(&(42, spur_core::step::STEP_BATCH));
+        std::fs::remove_dir_all(context.stepds_store.session_dir(
+            42,
+            7,
+            spur_core::step::STEP_BATCH,
+        ))
+        .expect("session was already pruned");
         let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
         let handler =
             tokio::spawn(
@@ -13510,8 +13994,8 @@ mod tests {
 
         assert_eq!(
             response,
-            crate::stepd::AgentNotificationResponse::Acknowledged,
-            "a stale attempt's own report is harmless to acknowledge"
+            crate::stepd::AgentNotificationResponse::Deferred,
+            "a stale attempt must retain its unacknowledged completion"
         );
         assert!(
             running.lock().await.contains_key(&42),
@@ -18988,6 +19472,7 @@ mod tests {
             svc.hooks.clone(),
             svc.spank.clone(),
             svc.reporter.controller_addr.clone(),
+            svc.reporter.node_token(),
         )
         .await;
 

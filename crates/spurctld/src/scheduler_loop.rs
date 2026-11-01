@@ -3236,6 +3236,16 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         .cloned()
         .collect();
 
+    for node in &missing {
+        if let Err(error) = cluster.quarantine_node(
+            node,
+            "job cleanup was not confirmed before completion timeout",
+        ) {
+            warn!(job_id = job.job_id, node, %error, "cannot quarantine unreported node; retaining job resources");
+            return;
+        }
+    }
+
     // Empty when no nodes allocated; derived_completion falls back to worst completion.
     let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
     let (mut state, mut exit_code, _signal) =
@@ -4895,7 +4905,7 @@ mod tests {
     mod dispatch_trigger_tests {
         use super::*;
         use spur_core::config::SlurmConfig;
-        use spur_core::node::NodeSource;
+        use spur_core::node::{NodeSource, NodeState};
         use std::sync::atomic::{AtomicU32, Ordering};
         use tempfile::TempDir;
         use tonic::transport::server::TcpIncoming;
@@ -5849,6 +5859,10 @@ mod tests {
                 cm.get_job(job_id).unwrap().unreported_nodes,
                 vec!["n2".to_string()]
             );
+            let missing = cm.get_node("n2").unwrap();
+            assert_eq!(missing.state, NodeState::Drain);
+            assert!(missing.admin_locked);
+            assert!(cm.get_node("n1").unwrap().is_schedulable());
 
             wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
             assert_eq!(
@@ -5905,8 +5919,64 @@ mod tests {
 
             force_finish_completing_job(&cm, &job).await;
 
+            for name in ["n1", "n2"] {
+                let node = cm.get_node(name).unwrap();
+                assert_eq!(node.state, NodeState::Drain);
+                assert!(node.admin_locked);
+            }
             wait_for("n1 cancelled", || cancel1.load(Ordering::SeqCst) == 1);
             wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_retains_resources_when_quarantine_fails() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            register_node_at(&cm, "n2", addr);
+            let job_id = submit_and_wait(
+                &cm,
+                JobSpec {
+                    name: "completing-missing-node".into(),
+                    user: "testuser".into(),
+                    num_nodes: 3,
+                    num_tasks: 3,
+                    ..Default::default()
+                },
+            );
+            let nodes = vec![
+                "n1".to_string(),
+                "n2".to_string(),
+                "missing-node".to_string(),
+            ];
+            let per_node_allocs = nodes
+                .iter()
+                .map(|name| (name.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes,
+                    ResourceAllocations::with_scalar(3, 0),
+                    per_node_allocs,
+                )
+                .unwrap();
+            cm.node_complete(job_id, "n1", 0, 0, run_attempt).unwrap();
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Completing);
+            let allocated_cpus = cm.get_node("n2").unwrap().alloc_resources.cpus;
+            assert!(allocated_cpus > 0);
+
+            force_finish_completing_job(&cm, &job).await;
+
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completing);
+            assert_eq!(
+                cm.get_node("n2").unwrap().alloc_resources.cpus,
+                allocated_cpus
+            );
         }
 
         // A completion report for the unreported node landing mid-force-finish must

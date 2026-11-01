@@ -14,7 +14,7 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use spurd::reporter::NodeReporter;
-use spurd::{agent_server, auth_middleware, controller_auth, executor, reporter, stepd};
+use spurd::{agent_server, auth_middleware, controller_auth, reporter, stepd};
 
 /// Raise spurd's own `RLIMIT_MEMLOCK` as high as it is allowed to go.
 ///
@@ -241,19 +241,6 @@ fn sessions_needing_recovery_report(
         .collect()
 }
 
-/// The cgroup to reap for a stale session. A descriptor written before its
-/// cgroup was recorded still names the job, and the path follows from identity.
-fn stale_cgroup_path(descriptor: &stepd::StepdDescriptor) -> std::path::PathBuf {
-    if !descriptor.cgroup_path.as_os_str().is_empty() {
-        return descriptor.cgroup_path.clone();
-    }
-    executor::reapable_cgroup_path(
-        descriptor.job_id,
-        descriptor.run_attempt,
-        descriptor.step_id,
-    )
-}
-
 /// True when retrying a runtime-recovery report can never help: the
 /// controller has no jwt_key configured, or this node's own identity/token
 /// is invalid — none of which a retry loop can fix on its own.
@@ -378,17 +365,22 @@ async fn main() -> anyhow::Result<()> {
     for (path, reason) in unparseable_rejected {
         warn!(path = %path.display(), %reason, "ignoring unusable stepd descriptor");
     }
-    let recovered_stepds = discovered_sessions.live;
+    let mut recovered_stepds = discovered_sessions.live;
     let stale_stepds = discovered_sessions.stale;
-    // A stale session's supervisor is confirmed dead, but that alone doesn't
-    // kill its cgroup: if only the supervisor was killed (not the whole
-    // process tree), the job's own process survives as an unsupervised
-    // orphan. Reap it locally instead of leaving it running indefinitely.
+    // A dead supervisor can leave live descendants; recover their allocation
+    // until cleanup or a controller-confirmed quarantine permits release.
     for descriptor in &stale_stepds {
-        executor::cleanup_cgroup(&stale_cgroup_path(descriptor));
+        if !stepds.prepare_cleanup(descriptor)?
+            && !stepds.completion_reported(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )?
+        {
+            recovered_stepds.push(descriptor.clone());
+        }
     }
-    // The workload is reaped above but the controller still holds the job in
-    // Running; give the completion replay below an exit to report for it.
+    // Recording the exit lets replay resume after cleanup or confirmed quarantine.
     for descriptor in &stale_stepds {
         match stepds.record_lost_supervisor_exit(descriptor) {
             Ok(true) => warn!(
@@ -408,11 +400,15 @@ async fn main() -> anyhow::Result<()> {
     // A corrupted descriptor has no cgroup_path to read, but the path is
     // reconstructable from identity alone — reap it the same way.
     for &(job_id, run_attempt, step_id) in &corrupted_stepds {
-        executor::cleanup_cgroup(&executor::reapable_cgroup_path(
+        stepds.prepare_orphan_cleanup(
             job_id,
             run_attempt,
             step_id,
-        ));
+            config
+                .as_ref()
+                .map(|c| c.cgroup.cleanup_timeout_secs)
+                .unwrap_or_else(spur_core::config::default_cgroup_cleanup_timeout),
+        )?;
     }
     if !recovered_stepds.is_empty() {
         warn!(
@@ -598,14 +594,6 @@ async fn main() -> anyhow::Result<()> {
         .await?
         .into_iter()
         .collect();
-    // Runs for the daemon's life, not just when this scan found something —
-    // a push notification deferred later needs the same reconciliation.
-    agent_server::retry_unacknowledged_stepd_completions(
-        stepds.clone(),
-        args.controller.clone(),
-        hostname.clone(),
-        reporter.clone(),
-    );
     // Housekeeping, and the periodic sweeper retries it; failing to read the
     // runtime root is not a reason to refuse to start.
     match stepds.prune_finalized() {
@@ -694,6 +682,13 @@ async fn main() -> anyhow::Result<()> {
         agent_notify_listener,
         agent_service.completion_listener_context(),
     ));
+    agent_server::retry_unacknowledged_stepd_completions(
+        stepds.clone(),
+        args.controller.clone(),
+        hostname.clone(),
+        reporter.clone(),
+        agent_service.completion_listener_context(),
+    );
     agent_service.monitor_recovered_stepds(&recovered_stepds);
     agent_service.monitor_stepd_liveness();
     let stepd_recovery_cleanup = agent_service.stepd_recovery_cleanup();
@@ -857,8 +852,13 @@ async fn main() -> anyhow::Result<()> {
     );
     for (job_id, run_attempt, step_id) in unreportable_sessions {
         let recovery_reporter = reporter.clone();
+        let cleanup_store = stepds.clone();
         tokio::spawn(async move {
             loop {
+                if cleanup_store.ensure_cleanup_ready().is_err() {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
                 match recovery_reporter
                     .report_stepd_recovery(job_id, run_attempt, step_id, true)
                     .await
@@ -1195,15 +1195,15 @@ mod tests {
             std::path::PathBuf::new(),
         );
         assert_eq!(
-            stale_cgroup_path(&descriptor),
-            executor::expected_cgroup_path(7, 2),
+            descriptor.cleanup_cgroup_path(),
+            spurd::executor::expected_cgroup_path(7, 2),
             "an allocation session records no cgroup of its own, so its steps \
              would otherwise never be reaped"
         );
 
         descriptor.cgroup_path = std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2");
         assert_eq!(
-            stale_cgroup_path(&descriptor),
+            descriptor.cleanup_cgroup_path(),
             std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2")
         );
     }
@@ -1220,15 +1220,15 @@ mod tests {
             std::path::PathBuf::new(),
         );
         assert_eq!(
-            stale_cgroup_path(&descriptor),
-            executor::expected_step_cgroup_path(7, 2, 3),
+            descriptor.cleanup_cgroup_path(),
+            spurd::executor::expected_step_cgroup_path(7, 2, 3),
             "reaping recurses and SIGKILLs, so the job node would take this \
              step's live siblings with it"
         );
 
         descriptor.cgroup_path = std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2/step_3");
         assert_eq!(
-            stale_cgroup_path(&descriptor),
+            descriptor.cleanup_cgroup_path(),
             std::path::PathBuf::from("/sys/fs/cgroup/spur/job_7_2/step_3")
         );
     }

@@ -536,6 +536,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - ``300``
      - Live
      - Maximum seconds a job may sit in COMPLETING before it is force-finished.
+       Nodes that have not confirmed completion are drained before their
+       resources are released. If that drain cannot be committed, the job
+       retains its allocation and the controller retries.
    * - ``max_user_priority``
      - integer
      - ``1000``
@@ -2149,6 +2152,13 @@ cgroups.
      - Agent restart
      - Floor for the memory ceilings, in MiB. Guards against a tiny ``--mem``
        creating a cgroup so small the job dies during its own startup.
+   * - ``cleanup_timeout_secs``
+     - integer
+     - ``20``
+     - Agent restart (new jobs)
+     - Seconds to wait for job cgroup cleanup before requesting a node drain.
+       ``0`` requests a drain immediately if cleanup is incomplete. Cleanup
+       continues after the deadline; it does not authorize resource reuse.
    * - ``oom_kill_job``
      - bool
      - ``true``

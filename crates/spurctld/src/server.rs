@@ -2603,12 +2603,30 @@ impl SlurmController for ControllerService {
         let state = spur_core::job::JobState::from_proto_i32(req.state)
             .ok_or_else(|| Status::invalid_argument("invalid job state"))?;
 
+        if !req.reporting_node.is_empty() && reports_whole_job(req.step_id) {
+            validate_completion_report_state_for_rpc(state, req.exit_code)?;
+        }
+        if req.drain_node {
+            if req.reporting_node.is_empty() {
+                return Err(Status::invalid_argument(
+                    "a drain report requires reporting_node",
+                ));
+            }
+            self.verify_node_identity(&req.reporting_node, &req.node_token)?;
+            // Older controllers understand this separate entry too; a completion
+            // must never commit before the node's scheduling hold is durable.
+            self.cluster
+                .quarantine_node(&req.reporting_node, &req.drain_reason)
+                .map_err(|error| {
+                    Status::unavailable(format!("could not commit node drain: {error}"))
+                })?;
+        }
+
         // Non-empty `reporting_node` means a per-node completion report. The final
         // job outcome is still derived from aggregated exit codes in
         // `Job::derived_completion`.
         let completion_result = if !req.reporting_node.is_empty() && reports_whole_job(req.step_id)
         {
-            validate_completion_report_state_for_rpc(state, req.exit_code)?;
             Some(self.cluster.node_complete(
                 req.job_id,
                 &req.reporting_node,
@@ -2620,33 +2638,7 @@ impl SlurmController for ControllerService {
             None
         };
 
-        // Surfaced only after the drain below, so a failed write cannot hold it up.
-        let pty_exit = self.finish_standalone_pty_on_report(&req);
-
-        if req.drain_node && !req.reporting_node.is_empty() {
-            warn!(
-                node = %req.reporting_node,
-                reason = %req.drain_reason,
-                job_id = req.job_id,
-                "agent requested node drain"
-            );
-            if let Err(e) = self.cluster.update_node_state(
-                &req.reporting_node,
-                spur_core::node::NodeState::Drain,
-                Some(req.drain_reason),
-                // Unauthenticated RPC with client-supplied node/reason; render
-                // Unknown rather than attributing to root (uid 0).
-                None,
-            ) {
-                warn!(
-                    node = %req.reporting_node,
-                    error = %e,
-                    "failed to drain node on agent request"
-                );
-            }
-        }
-
-        pty_exit?;
+        self.finish_standalone_pty_on_report(&req)?;
 
         use crate::cluster::NodeCompleteResult;
 
@@ -7870,6 +7862,244 @@ mod tests {
             pty_step_id: Some(0),
             ..Default::default()
         }
+    }
+
+    fn cleanup_failure_report(job_id: u32, run_attempt: u32) -> ReportJobStatusRequest {
+        ReportJobStatusRequest {
+            job_id,
+            state: JobState::Completed.to_proto_i32(),
+            reporting_node: "n1".into(),
+            run_attempt,
+            step_id: Some(spur_core::step::STEP_BATCH),
+            drain_node: true,
+            drain_reason: "job cgroup cleanup incomplete".into(),
+            ..Default::default()
+        }
+    }
+
+    fn logged_operations(state_dir: &std::path::Path) -> Vec<(u64, spur_core::wal::WalOperation)> {
+        let mut operations: Vec<_> = std::fs::read_dir(state_dir.join("raft/log"))
+            .expect("raft log")
+            .map(|entry| entry.expect("log entry").path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .filter_map(|path| {
+                let bytes = std::fs::read(path).expect("read log entry");
+                let entry: openraft::Entry<crate::raft::SpurTypeConfig> =
+                    serde_json::from_slice(&bytes).expect("decode log entry");
+                match entry.payload {
+                    openraft::EntryPayload::Normal(operation) => {
+                        Some((entry.log_id.index, operation))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        operations.sort_by_key(|(index, _)| *index);
+        operations
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failure_commits_quarantine_before_batch_completion() {
+        use spur_core::node::NodeState;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "u").await;
+        let attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        svc.report_job_status(Request::new(cleanup_failure_report(job_id, attempt)))
+            .await
+            .unwrap();
+
+        let operations = logged_operations(dir.path());
+        let drain = operations.iter().position(|(_, op)| matches!(op,
+            WalOperation::NodeStateChange { name, new_state: NodeState::Draining, admin_locked: true, .. }
+                if name == "n1"
+        )).expect("durable quarantine");
+        let completion = operations
+            .iter()
+            .position(|(_, op)| {
+                matches!(op,
+                    WalOperation::JobNodeComplete { job_id: id, .. } if *id == job_id
+                )
+            })
+            .expect("durable completion");
+        assert!(
+            drain < completion,
+            "quarantine must precede resource release in the replicated log"
+        );
+        let node = svc.cluster.get_node("n1").unwrap();
+        assert_eq!(node.state, NodeState::Drain);
+        assert!(node.admin_locked);
+        assert_eq!(node.alloc_resources.cpus, 0);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Completed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failure_commits_quarantine_before_pty_completion() {
+        use spur_core::node::NodeState;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (job_id, attempt) = running_standalone_pty_job(&svc).await;
+        let report = ReportJobStatusRequest {
+            drain_node: true,
+            drain_reason: "job cgroup cleanup incomplete".into(),
+            ..shell_exit_report(job_id, attempt, String::new())
+        };
+        svc.report_job_status(Request::new(report)).await.unwrap();
+
+        let operations = logged_operations(dir.path());
+        let drain = operations.iter().position(|(_, op)| matches!(op,
+            WalOperation::NodeStateChange { name, new_state: NodeState::Draining, admin_locked: true, .. }
+                if name == "n1"
+        )).expect("durable quarantine");
+        let completion = operations.iter().position(|(_, op)| matches!(op,
+            WalOperation::JobStepComplete { job_id: id, .. } | WalOperation::JobComplete { job_id: id, .. }
+                if *id == job_id
+        )).expect("durable PTY completion");
+        assert!(
+            drain < completion,
+            "even the PTY step must stay active until quarantine commits"
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Completed
+        );
+        assert_eq!(svc.cluster.get_node("n1").unwrap().state, NodeState::Drain);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failure_without_a_quarantinable_node_is_not_acknowledged() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = svc
+            .cluster
+            .submit_job(spur_core::job::JobSpec {
+                name: "missing-node".into(),
+                user: "u".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .job_id;
+        let resources = ResourceAllocations::with_scalar(1, 1000);
+        let attempt = svc
+            .cluster
+            .start_job(
+                job_id,
+                vec!["n1".into()],
+                resources.clone(),
+                [("n1".into(), resources)].into_iter().collect(),
+            )
+            .unwrap();
+        assert!(svc.cluster.get_node("n1").is_none());
+
+        let error = svc
+            .report_job_status(Request::new(cleanup_failure_report(job_id, attempt)))
+            .await
+            .expect_err("an uncommitted drain cannot authorize completion");
+        assert_eq!(error.code(), Code::Unavailable);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Running
+        );
+        assert!(!logged_operations(dir.path())
+            .iter()
+            .any(|(_, op)| matches!(op,
+                WalOperation::JobNodeComplete { job_id: id, .. } if *id == job_id
+            )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failure_requires_the_reporting_nodes_credential() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let job_id = running_job_owned_by(&svc, "u").await;
+        let attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        let other =
+            spur_core::admission::generate_node_token("n2", svc.jwt_key.as_bytes()).unwrap();
+        for token in [String::new(), "invalid".into(), other] {
+            let mut report = cleanup_failure_report(job_id, attempt);
+            report.node_token = token;
+            let error = svc
+                .report_job_status(Request::new(report))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.code(),
+                Code::Unauthenticated | Code::PermissionDenied
+            ));
+            assert!(svc.cluster.get_node("n1").unwrap().is_schedulable());
+            assert_eq!(
+                svc.cluster.get_job(job_id).unwrap().state,
+                JobState::Running
+            );
+        }
+        let mut report = cleanup_failure_report(job_id, attempt);
+        report.node_token =
+            spur_core::admission::generate_node_token("n1", svc.jwt_key.as_bytes()).unwrap();
+        svc.report_job_status(Request::new(report)).await.unwrap();
+        assert!(!svc.cluster.get_node("n1").unwrap().is_schedulable());
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Completed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failure_quarantines_a_requeued_runs_node_without_finishing_the_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "u").await;
+        let attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        svc.cluster
+            .requeue_job_by_user(job_id, "u", false, false)
+            .unwrap();
+
+        svc.report_job_status(Request::new(cleanup_failure_report(job_id, attempt)))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Pending
+        );
+        let node = svc.cluster.get_node("n1").unwrap();
+        assert_eq!(node.state, spur_core::node::NodeState::Drain);
+        assert!(node.admin_locked);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failure_preserves_an_operators_existing_drain_reason() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "u").await;
+        let attempt = svc.cluster.get_job(job_id).unwrap().run_attempt;
+        svc.cluster
+            .update_node_state(
+                "n1",
+                spur_core::node::NodeState::Drain,
+                Some("operator maintenance".into()),
+                Some(1234),
+            )
+            .unwrap();
+
+        svc.report_job_status(Request::new(cleanup_failure_report(job_id, attempt)))
+            .await
+            .unwrap();
+        let node = svc.cluster.get_node("n1").unwrap();
+        assert_eq!(node.state_reason.as_deref(), Some("operator maintenance"));
+        assert_eq!(node.reason_uid, Some(1234));
+        assert_eq!(node.state, spur_core::node::NodeState::Drain);
     }
 
     // Under token admission a session-exit report acts only on the reporting
