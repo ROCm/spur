@@ -23212,6 +23212,51 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn placed_handoff_owner_does_not_let_a_later_job_jump_a_wide_plan() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        for node in ["n1", "n2"] {
+            register_node(&cm, node, 8, 16000);
+        }
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let victim = run_job_on(&cm, "victim", "n1");
+        cm.jobs.write().get_mut(&victim).unwrap().spec.qos = Some("low".into());
+        let mut owner = basic_spec("owner");
+        owner.qos = Some("high".into());
+        owner.nodelist = Some("n1".into());
+        owner.time_limit = Some(chrono::Duration::minutes(1));
+        let owner = submit_and_wait(&cm, owner);
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&cm.get_job(owner).unwrap()],
+            &cm.config().scheduler,
+        )
+        .await;
+        settle(&cm, victim, JobState::Completing);
+        report_nodes_released(&cm, victim);
+        settle(&cm, victim, JobState::Cancelled);
+
+        let mut wide = basic_spec("wide");
+        wide.num_nodes = 2;
+        wide.num_tasks = 2;
+        wide.exclusive = true;
+        wide.priority = Some(50_000);
+        wide.time_limit = Some(chrono::Duration::hours(1));
+        submit_and_wait(&cm, wide);
+        let mut narrow = basic_spec("narrow");
+        narrow.priority = Some(10_000);
+        narrow.time_limit = Some(chrono::Duration::hours(1));
+        submit_and_wait(&cm, narrow);
+
+        cm.tick_preempt_freed_earmarks();
+        let assignments = run_one_scheduling_pass(&cm);
+        let placed: Vec<_> = assignments.iter().map(|a| (a.job_id, &a.nodes)).collect();
+        assert_eq!(placed, vec![(owner, &vec!["n1".to_string()])]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn draining_suspend_victim_hands_off_nothing() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster_with_config(&dir, preempting_config()).await;

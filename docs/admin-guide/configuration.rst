@@ -746,7 +746,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    preemptors, cannot be placed on those nodes. A pass runs every
    ``interval_secs``, or sooner when a job is submitted, so the post-release
    window can be well under ``interval_secs``. This protects a multi-node
-   preemptor whose victims finish at different times.
+   preemptor whose victims finish at different times. Jobs queued behind the
+   preemptor still plan future starts on those nodes once the preemptor has a
+   planned start, but none of them starts there before it.
 
    The handoff is held for the whole node, not only the released resources.
    On nodes shared by several jobs, capacity left over beside the victim stays

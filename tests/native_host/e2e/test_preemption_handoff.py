@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job_state
+from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job, wait_job_state
 
 
 @pytest.fixture
@@ -44,6 +44,7 @@ def handoff_cluster(ssh_nodes, remote_bin_dir):
             ("hunter-a", 10000, "victim-a,victim-r", "off"),
             ("hunter-b", 5000, "victim-b", "off"),
             ("bystander", 20000, "", "off"),
+            ("plain", 100, "", "off"),
         ]:
             args = ["add", "qos", f"name={name}", f"priority={priority}",
                     f"preemptmode={mode}"]
@@ -59,9 +60,9 @@ def handoff_cluster(ssh_nodes, remote_bin_dir):
         c.teardown()
 
 
-def _submit(c, name, qos, nodes=None, count=1):
-    script = c.write_file(f"{name}.sh", "#!/bin/bash\nsleep 600\n", all_nodes=True)
-    args = ["--exclusive", f"-N{count}", "-t", "10:00", "-J", name, "-q", qos]
+def _submit(c, name, qos, nodes=None, count=1, limit="10:00", sleep=600):
+    script = c.write_file(f"{name}.sh", f"#!/bin/bash\nsleep {sleep}\n", all_nodes=True)
+    args = ["--exclusive", f"-N{count}", "-t", limit, "-J", name, "-q", qos]
     if nodes:
         args.append(f"--nodelist={nodes}")
     jid = parse_job_id(c.sbatch(args + [script]))
@@ -181,3 +182,33 @@ def test_requeued_victim_node_goes_to_preemptor_over_higher_priority_bystander(h
     _state(c, bystander, "PENDING")
     show = _state(c, hunter, "RUNNING")
     assert f"NodeList={node}" in show, show
+
+
+def test_wide_job_behind_handoff_owner_keeps_its_planned_slot(handoff_cluster):
+    c = handoff_cluster
+    n1, n2, _ = c.node_names
+    victim = _submit(c, "victim", "victim-a", n1)
+    filler = _submit(c, "filler", "plain", n2)
+    for jid in (victim, filler):
+        wait_job_state(c, jid, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    owner = _submit(c, "owner", "hunter-a", n1, limit="1:00", sleep=20)
+    _wait_epilog(c, victim, [0])
+    show = _state(c, victim, "COMPLETING")
+    assert f"PreemptedBy={owner}" in show, show
+    wide = _submit(c, "wide", "hunter-b", f"{n1},{n2}", 2)
+    narrow = _submit(c, "narrow", "plain", n2, limit="30:00")
+    c.cli(["scancel", str(filler)])
+    wait_job(c, filler, timeout=60)
+    # The owner still waits on its victim; the narrow job must not jump the wide job's plan.
+    _assert_pending_for_passes(c, [owner, wide, narrow])
+    _gate(c, victim, [0], False)
+    wait_job_state(c, owner, "R", timeout=60)
+    assert f"NodeList={n1}" in _state(c, owner, "RUNNING")
+    deadline = time.monotonic() + 120
+    while "JobState=RUNNING" not in c.scontrol("show", "job", str(wide)):
+        _state(c, narrow, "PENDING")
+        assert time.monotonic() < deadline, "wide job never started after the owner"
+        time.sleep(0.5)
+    assert "NumNodes=2" in _state(c, wide, "RUNNING")
+    _state(c, narrow, "PENDING")

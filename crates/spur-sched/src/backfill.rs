@@ -100,6 +100,52 @@ struct ReservationCheck<'a> {
     reservations: &'a [Reservation],
 }
 
+/// Per-pass handoff view: a handed-off node is hidden from other jobs until its
+/// owner is planned, then only blocked for them until the owner's start.
+struct HandoffGate<'a> {
+    owners: &'a HashMap<String, JobId>,
+    held_until: HashMap<&'a str, chrono::DateTime<Utc>>,
+}
+
+impl<'a> HandoffGate<'a> {
+    fn new(owners: &'a HashMap<String, JobId>) -> Self {
+        Self {
+            owners,
+            held_until: HashMap::new(),
+        }
+    }
+
+    fn foreign_owner(&self, job: &Job, node: &str) -> bool {
+        self.owners.get(node).is_some_and(|o| *o != job.job_id)
+    }
+
+    fn hides(&self, job: &Job, node: &str) -> bool {
+        self.foreign_owner(job, node) && !self.held_until.contains_key(node)
+    }
+
+    /// Earliest time `job` may be planned on `node`.
+    fn floor(&self, job: &Job, node: &str, now: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
+        match self.held_until.get(node) {
+            Some(until) if self.foreign_owner(job, node) => (*until).max(now),
+            _ => now,
+        }
+    }
+
+    /// Once `owner` is planned, its picked nodes are held until `start`; the rest are freed.
+    fn owner_planned(
+        &mut self,
+        owner: JobId,
+        picked: impl Fn(&str) -> bool,
+        start: chrono::DateTime<Utc>,
+        now: chrono::DateTime<Utc>,
+    ) {
+        for (node, _) in self.owners.iter().filter(|(_, o)| **o == owner) {
+            let until = if picked(node) { start } else { now };
+            self.held_until.insert(node, until);
+        }
+    }
+}
+
 impl BackfillScheduler {
     pub fn new(max_jobs: usize) -> Self {
         Self {
@@ -272,6 +318,7 @@ impl BackfillScheduler {
         &self,
         job: &Job,
         cluster: &ClusterState,
+        handoffs: &HandoffGate,
         now: chrono::DateTime<Utc>,
     ) -> Vec<usize> {
         let nodes = cluster.nodes;
@@ -283,11 +330,19 @@ impl BackfillScheduler {
             if !placement.matches_for_reservation(node, reservations, now) {
                 return false;
             }
-            node.total_resources.can_satisfy(&required) && cluster.handoff_allows(job, &node.name)
+            node.total_resources.can_satisfy(&required) && !handoffs.hides(job, &node.name)
+        };
+        // An additive `--nodelist` needs every listed node, so one hidden node blocks the job.
+        let listed_node_hidden = || {
+            !handoffs.owners.is_empty()
+                && placement.nodelist_is_additive()
+                && nodes
+                    .iter()
+                    .any(|n| placement.is_listed(&n.name) && handoffs.hides(job, &n.name))
         };
 
         if placement.additive_listed_node_unavailable(nodes.iter(), reservations, now, &required)
-            || cluster.listed_node_handed_off(job, &placement)
+            || listed_node_hidden()
         {
             return Vec::new();
         }
@@ -712,6 +767,7 @@ impl BackfillScheduler {
 
         // Build a set of job indices to skip (part of a het group that can't fully schedule)
         let mut skip_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut handoffs = HandoffGate::new(cluster.preemption_handoffs);
 
         // Pre-check het groups: if any component can't find suitable nodes, skip all
         for indices in het_groups.values() {
@@ -728,7 +784,7 @@ impl BackfillScheduler {
             }
             let all_have_nodes = indices.iter().all(|&idx| {
                 let job = &pending[idx];
-                let suitable = self.find_suitable_nodes(job, cluster, now);
+                let suitable = self.find_suitable_nodes(job, cluster, &handoffs, now);
                 suitable.len() >= job.spec.num_nodes as usize
             });
             if !all_have_nodes {
@@ -773,6 +829,8 @@ impl BackfillScheduler {
             {
                 match self.plan_gpu_job(job, cluster, context, now) {
                     Some((assignment, start)) => {
+                        let picked = |node: &str| assignment.nodes.iter().any(|n| n == node);
+                        handoffs.owner_planned(job.job_id, picked, start, now);
                         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
                         for (node, allocation) in &assignment.per_node_alloc {
                             if let Some(index) = cluster.nodes.iter().position(|n| n.name == *node)
@@ -799,7 +857,7 @@ impl BackfillScheduler {
                 }
                 continue;
             }
-            let suitable = self.find_suitable_nodes(job, cluster, now);
+            let suitable = self.find_suitable_nodes(job, cluster, &handoffs, now);
             if suitable.is_empty() {
                 note(UnplacedKind::NoSuitableNodes, 0, None);
                 continue;
@@ -837,13 +895,20 @@ impl BackfillScheduler {
             let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
                 .iter()
                 .map(|&ni| {
+                    let node = &cluster.nodes[ni].name;
                     let res_check = ReservationCheck {
                         job,
-                        node: &cluster.nodes[ni].name,
+                        node,
                         reservations: cluster.reservations,
                     };
-                    let start =
-                        self.earliest_valid_start(ni, res_check, timing_request(ni), duration, now);
+                    let floor = handoffs.floor(job, node, now);
+                    let start = self.earliest_valid_start(
+                        ni,
+                        res_check,
+                        timing_request(ni),
+                        duration,
+                        floor,
+                    );
                     debug!(
                         job_id = job.job_id,
                         node = %cluster.nodes[ni].name,
@@ -1035,6 +1100,15 @@ impl BackfillScheduler {
                     };
                     per_node_alloc.insert(node.name.clone(), node_alloc);
                 }
+            }
+
+            if earliest <= now || !job.idle_fill {
+                let picked = |node: &str| {
+                    assigned_nodes
+                        .iter()
+                        .any(|(ni, _)| cluster.nodes[*ni].name == node)
+                };
+                handoffs.owner_planned(job.job_id, picked, earliest, now);
             }
 
             if earliest <= now {
@@ -1321,6 +1395,134 @@ mod tests {
         let mut scheduler = BackfillScheduler::new(100);
         assert!(state.listed_node_handed_off(&competitor, &NodePlacement::new(&competitor)));
         assert!(scheduler.schedule(&[competitor], &state).is_empty());
+    }
+
+    fn handoff_state<'a>(
+        nodes: &'a [Node],
+        busy_until: &'a HashMap<String, chrono::DateTime<Utc>>,
+        handoffs: &'a HashMap<String, JobId>,
+    ) -> ClusterState<'a> {
+        ClusterState {
+            fabric: None,
+            nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+            busy_until,
+            preemption_handoffs: handoffs,
+        }
+    }
+
+    fn job_for(id: u32, nodes: u32, limit: Duration) -> Job {
+        let mut job = make_job(id, nodes, 64);
+        job.spec.time_limit = Some(limit);
+        job
+    }
+
+    fn placed(assignments: &[Assignment]) -> Vec<(JobId, Vec<String>)> {
+        assignments
+            .iter()
+            .map(|a| (a.job_id, a.nodes.clone()))
+            .collect()
+    }
+
+    /// Sorted planned nodes and seconds from now until the planned start.
+    fn plan_of(sched: &BackfillScheduler, job_id: JobId) -> Option<(Vec<String>, i64)> {
+        sched
+            .planned_job_starts()
+            .remove(&job_id)
+            .map(|(mut n, at)| {
+                n.sort();
+                (n, (at - Utc::now()).num_seconds())
+            })
+    }
+
+    #[test]
+    fn placed_handoff_owner_leaves_its_node_in_later_jobs_forward_plans() {
+        let nodes = make_nodes(2);
+        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let busy_until = HashMap::new();
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let pending = [
+            job_for(1, 1, Duration::minutes(1)),
+            job_for(2, 2, Duration::hours(1)),
+            job_for(3, 1, Duration::hours(1)),
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&pending, &state);
+        assert_eq!(placed(&assignments), vec![(1, vec!["node001".into()])]);
+        let (b_nodes, b_in) = plan_of(&sched, 2).expect("job 2 holds a future slot");
+        assert_eq!(b_nodes, vec!["node001", "node002"]);
+        assert!((55..=60).contains(&b_in), "job 2 planned in {b_in}s");
+        assert!(plan_of(&sched, 3).is_some_and(|(_, at)| at >= 3600));
+    }
+
+    #[test]
+    fn short_work_still_backfills_before_a_plan_built_on_a_released_handoff() {
+        let nodes = make_nodes(2);
+        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let busy_until = HashMap::new();
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let pending = [
+            job_for(1, 1, Duration::minutes(1)),
+            job_for(2, 2, Duration::hours(1)),
+            job_for(4, 1, Duration::seconds(30)),
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&pending, &state);
+        assert_eq!(
+            placed(&assignments),
+            vec![(1, vec!["node001".into()]), (4, vec!["node002".into()])]
+        );
+        assert!(plan_of(&sched, 2).is_some_and(|(_, at)| (55..=60).contains(&at)));
+    }
+
+    #[test]
+    fn waiting_handoff_owner_blocks_its_nodes_only_until_its_planned_start() {
+        let mut nodes = make_nodes(3);
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let handoffs = HashMap::from([("node001".to_string(), 1), ("node002".to_string(), 1)]);
+        let busy_until =
+            HashMap::from([("node002".to_string(), Utc::now() + Duration::minutes(5))]);
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let mut owner = job_for(1, 2, Duration::hours(1));
+        owner.spec.nodelist = Some("node001,node002".into());
+        let mut gap_filler = job_for(5, 1, Duration::minutes(1));
+        gap_filler.spec.nodelist = Some("node001".into());
+        let pending = [
+            owner,
+            job_for(2, 2, Duration::hours(1)),
+            job_for(3, 1, Duration::minutes(1)),
+            gap_filler,
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&pending, &state);
+        assert_eq!(placed(&assignments), vec![(3, vec!["node003".into()])]);
+        let (owner_nodes, owner_in) = plan_of(&sched, 1).expect("owner holds a future slot");
+        assert_eq!(owner_nodes, vec!["node001", "node002"]);
+        assert!(
+            (295..=300).contains(&owner_in),
+            "owner planned in {owner_in}s"
+        );
+        let (b_nodes, b_in) = plan_of(&sched, 2).expect("job 2 plans past the owner");
+        assert_eq!(b_nodes, vec!["node001", "node003"]);
+        assert!(b_in >= 300 + 3600 - 5, "job 2 planned in {b_in}s");
+        assert!(plan_of(&sched, 5).is_some_and(|(_, at)| at > b_in));
+    }
+
+    #[test]
+    fn unplaceable_handoff_owner_keeps_its_node_hidden() {
+        let nodes = make_nodes(2);
+        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let busy_until = HashMap::new();
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let pending = [
+            job_for(1, 3, Duration::hours(1)),
+            job_for(2, 2, Duration::minutes(1)),
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        assert!(sched.schedule(&pending, &state).is_empty());
+        assert!(plan_of(&sched, 2).is_none());
     }
 
     #[test]

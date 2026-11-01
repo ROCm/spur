@@ -5543,6 +5543,7 @@ mod tests {
             handoffs: &HashMap<String, spur_core::job::JobId>,
         ) -> Option<HashSet<spur_core::job::JobId>> {
             let state = ClusterState {
+                fabric: None,
                 nodes,
                 partitions: &[],
                 reservations: &[],
@@ -5561,6 +5562,7 @@ mod tests {
             now: DateTime<Utc>,
         ) -> Option<HashSet<spur_core::job::JobId>> {
             let state = ClusterState {
+                fabric: None,
                 nodes,
                 partitions: &[],
                 reservations,
