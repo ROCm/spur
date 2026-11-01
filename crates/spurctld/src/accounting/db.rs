@@ -8,7 +8,7 @@ use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, QueryBuilder, Row};
 
 use spur_core::end_reason::EndReason;
-use spur_core::job::JobId;
+use spur_core::job::{effective_gpus, effective_memory_mb, Job, JobId};
 
 /// Apply the database schema, serialized across controllers by a fixed advisory
 /// lock: migrate now also rewrites data (default-account dedup) and builds a
@@ -420,18 +420,66 @@ pub struct JobEndRecord {
     /// Who cancelled the run; empty unless `reason` is a cancel code.
     pub ended_by: String,
     pub ended_by_uid: Option<u32>,
+    /// Written only when this end creates the row, as for a job that never started.
+    /// `None` only for the external `RecordJobEnd` RPC.
+    pub submission: Option<JobSubmission>,
+}
+
+/// What a job requested at submission.
+#[derive(Debug, Clone)]
+pub struct JobSubmission {
+    pub name: String,
+    pub user: String,
+    pub account: String,
+    pub partition: String,
+    pub qos: String,
+    pub num_nodes: u32,
+    pub num_tasks: u32,
+    pub cpus_per_task: u32,
+    pub total_gpus: u32,
+    pub memory_mb: u64,
+    pub submit_time: DateTime<Utc>,
+    pub reservation: String,
+    pub time_limit_secs: Option<i64>,
+}
+
+impl JobSubmission {
+    pub fn for_job(job: &Job) -> Self {
+        let spec = &job.spec;
+        Self {
+            name: spec.name.clone(),
+            user: spec.user.clone(),
+            account: spec.account.clone().unwrap_or_default(),
+            partition: spec.partition.clone().unwrap_or_default(),
+            qos: spec.qos.clone().unwrap_or_default(),
+            num_nodes: spec.num_nodes,
+            num_tasks: spec.num_tasks,
+            cpus_per_task: spec.cpus_per_task,
+            total_gpus: effective_gpus(spec, spec.num_nodes) as u32,
+            memory_mb: effective_memory_mb(spec, spec.num_nodes),
+            submit_time: job.submit_time,
+            reservation: spec.reservation.clone().unwrap_or_default(),
+            time_limit_secs: spec.time_limit.map(|limit| limit.num_seconds()),
+        }
+    }
 }
 
 /// Record a job completion in the database. See `record_job_start` for why
 /// this takes a `&mut PgConnection` rather than a `&PgPool`.
 pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyhow::Result<()> {
+    let sub = rec.submission.as_ref();
     // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
     let row = sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code,
+        INSERT INTO jobs (job_id, state, exit_code, end_time, exit_signal, derived_exit_code,
                           preempted_by, preempt_mode, preempt_qos, reason, reason_detail,
-                          ended_by, ended_by_uid)
-        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                          ended_by, ended_by_uid, name, user_name, account, partition_name, qos,
+                          num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb,
+                          submit_time, reservation, time_limit_secs)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                COALESCE($14, ''), COALESCE($15, ''), COALESCE($16, ''), COALESCE($17, ''),
+                COALESCE($18, ''), COALESCE($19, 1), COALESCE($20, 1), COALESCE($21, 1),
+                COALESCE($22, 0), COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
@@ -461,6 +509,19 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     .bind(&rec.reason_detail)
     .bind(&rec.ended_by)
     .bind(rec.ended_by_uid.map(i64::from))
+    .bind(sub.map(|s| &s.name))
+    .bind(sub.map(|s| &s.user))
+    .bind(sub.map(|s| &s.account))
+    .bind(sub.map(|s| &s.partition))
+    .bind(sub.map(|s| &s.qos))
+    .bind(sub.map(|s| s.num_nodes as i32))
+    .bind(sub.map(|s| s.num_tasks as i32))
+    .bind(sub.map(|s| s.cpus_per_task as i32))
+    .bind(sub.map(|s| s.total_gpus as i32))
+    .bind(sub.map(|s| s.memory_mb as i64))
+    .bind(sub.map(|s| s.submit_time))
+    .bind(sub.map(|s| &s.reservation))
+    .bind(sub.and_then(|s| s.time_limit_secs))
     .fetch_one(&mut *conn)
     .await?;
 
@@ -1905,6 +1966,7 @@ mod job_history_tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
+            submission: None,
         }
     }
 
@@ -1944,6 +2006,93 @@ mod job_history_tests {
         if let Some(end_time) = end {
             record_job_end(conn, &end_record(job_id, "COMPLETED", end_time)).await?;
         }
+        Ok(())
+    }
+
+    fn submitted_job(job_id: JobId) -> Job {
+        let mut job = Job::new(
+            job_id,
+            spur_core::job::JobSpec {
+                name: "never-started".into(),
+                user: format!("spur_unstarted_{job_id}"),
+                account: Some("proj".into()),
+                partition: Some("gpu".into()),
+                qos: Some("normal".into()),
+                num_tasks: 6,
+                cpus_per_task: 2,
+                memory_per_node_mb: Some(256),
+                time_limit: Some(Duration::seconds(90)),
+                ..Default::default()
+            },
+        );
+        job.submit_time = Utc::now() - Duration::hours(1);
+        job
+    }
+
+    fn cancel_record(job: &Job) -> JobEndRecord {
+        JobEndRecord {
+            submission: Some(JobSubmission::for_job(job)),
+            ..end_record(job.job_id, "CANCELLED", Utc::now())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn a_job_cancelled_before_it_starts_keeps_its_submission() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = submitted_job(9_800_501);
+        record_job_end(&mut tx, &cancel_record(&job)).await?;
+
+        let row = sqlx::query(
+            "SELECT name, user_name, account, partition_name, qos, num_tasks, cpus_per_task,
+                    memory_mb, submit_time, time_limit_secs, start_time, state, usage_recorded
+             FROM jobs WHERE job_id = $1",
+        )
+        .bind(i64::from(job.job_id))
+        .fetch_one(&mut *tx)
+        .await?;
+        assert_eq!(row.get::<String, _>("name"), "never-started");
+        assert_eq!(row.get::<String, _>("user_name"), job.spec.user);
+        assert_eq!(row.get::<String, _>("account"), "proj");
+        assert_eq!(row.get::<String, _>("partition_name"), "gpu");
+        assert_eq!(row.get::<String, _>("qos"), "normal");
+        assert_eq!(row.get::<i32, _>("num_tasks"), 6);
+        assert_eq!(row.get::<i32, _>("cpus_per_task"), 2);
+        assert_eq!(row.get::<i64, _>("memory_mb"), 256);
+        assert_eq!(
+            row.get::<DateTime<Utc>, _>("submit_time")
+                .timestamp_micros(),
+            job.submit_time.timestamp_micros()
+        );
+        assert_eq!(row.get::<Option<i64>, _>("time_limit_secs"), Some(90));
+        assert_eq!(row.get::<Option<DateTime<Utc>>, _>("start_time"), None);
+        assert_eq!(row.get::<String, _>("state"), "CANCELLED");
+        assert!(!row.get::<bool, _>("usage_recorded"));
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn an_end_does_not_rewrite_a_started_jobs_submission() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job_id = 9_800_502;
+        let started = Utc::now() - Duration::minutes(5);
+        seed_job(&mut tx, job_id, "", started, None).await?;
+        record_job_end(&mut tx, &cancel_record(&submitted_job(job_id))).await?;
+
+        let row =
+            sqlx::query("SELECT name, user_name, start_time, state FROM jobs WHERE job_id = $1")
+                .bind(i64::from(job_id))
+                .fetch_one(&mut *tx)
+                .await?;
+        assert_eq!(row.get::<String, _>("name"), "fixture");
+        assert_eq!(row.get::<String, _>("user_name"), "root");
+        assert!(row.get::<Option<DateTime<Utc>>, _>("start_time").is_some());
+        assert_eq!(row.get::<String, _>("state"), "CANCELLED");
+        tx.rollback().await?;
         Ok(())
     }
 

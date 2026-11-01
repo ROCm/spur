@@ -573,6 +573,10 @@ The default columns are ``JobID JobName User Account Partition State Elapsed
 NNodes ExitCode Reason``. Scripts that read columns by position should select
 them with ``--format``.
 
+A job cancelled or expired before it starts keeps its name, user, account,
+partition, and requested resources in accounting. Its ``Start`` is ``Unknown``
+and it is charged no usage.
+
 Time arguments accept an absolute date (``YYYY-MM-DD`` or
 ``YYYY-MM-DDTHH:MM:SS``) or a relative offset (``now-7days``, ``now-6hours``).
 
