@@ -66,24 +66,10 @@ impl GpuBinding {
                 "GPU property binding has an invalid node or unsupported agent capability".into(),
             );
         }
-        if self.generation == 0
-            || self.generation != inventory.generation
-            || self.generation != allocation.generation
-        {
+        if !binding_generation_matches(self.generation, inventory, allocation) {
             return Err("stale GPU property binding inventory generation".into());
         }
-        let devices = allocation
-            .devices
-            .get("gpu")
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let ids: BTreeSet<_> = devices.iter().map(|d| d.device_id).collect();
-        let bound: BTreeSet<_> = self.gpus.iter().map(|g| g.stable_id).collect();
-        if ids != bound
-            || ids.len() != devices.len()
-            || bound.len() != self.gpus.len()
-            || devices.iter().any(|d| d.count != 1)
-        {
+        if !binding_gpu_ids_match(allocation, self.gpus.iter().map(|gpu| gpu.stable_id)) {
             return Err("GPU property binding does not match exact allocated devices".into());
         }
         for expected in &self.gpus {
@@ -99,6 +85,35 @@ impl GpuBinding {
         }
         Ok(())
     }
+}
+
+pub(crate) fn binding_generation_matches(
+    generation: u64,
+    inventory: &ResourceSet,
+    allocation: &ResourceAllocations,
+) -> bool {
+    generation != 0 && generation == inventory.generation && generation == allocation.generation
+}
+
+pub(crate) fn binding_gpu_ids_match(
+    allocation: &ResourceAllocations,
+    bound_ids: impl Iterator<Item = u64>,
+) -> bool {
+    let devices = allocation
+        .devices
+        .get("gpu")
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let allocated: BTreeSet<_> = devices.iter().map(|device| device.device_id).collect();
+    let mut bound = BTreeSet::new();
+    for id in bound_ids {
+        if !bound.insert(id) {
+            return false;
+        }
+    }
+    allocated == bound
+        && allocated.len() == devices.len()
+        && devices.iter().all(|device| device.count == 1)
 }
 
 pub fn to_proto(binding: &GpuBinding) -> spur_proto::proto::GpuPropertyBinding {

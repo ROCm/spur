@@ -40,7 +40,8 @@ pub enum ObservationStatus {
     #[default]
     Unknown,
     /// Attributes were read consistently; this does not assert fabric readiness.
-    Observed,
+    #[serde(rename = "observed")]
+    Consistent,
     Incomplete,
     Inconsistent,
     Unavailable,

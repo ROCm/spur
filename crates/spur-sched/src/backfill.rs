@@ -427,9 +427,12 @@ impl BackfillScheduler {
             a.map(|b| (b.members.len(), &b.key))
                 .cmp(&b.map(|b| (b.members.len(), &b.key)))
         });
+        let mut nodes = cluster.nodes.to_vec();
         for block in blocks {
-            let mut groups: std::collections::BTreeMap<Vec<String>, BTreeSet<(String, u64)>> =
-                Default::default();
+            let mut groups: std::collections::BTreeMap<
+                Vec<String>,
+                std::collections::BTreeMap<&str, BTreeSet<u64>>,
+            > = Default::default();
             for node in cluster.nodes {
                 for gpu in &node.total_resources.gpus {
                     if !constraints.matches_gpu(gpu)
@@ -447,16 +450,23 @@ impl BackfillScheduler {
                     groups
                         .entry(key)
                         .or_default()
-                        .insert((node.name.clone(), gpu.stable_id));
+                        .entry(&node.name)
+                        .or_default()
+                        .insert(gpu.stable_id);
                 }
             }
             for allowed in groups.values() {
-                let mut nodes = cluster.nodes.to_vec();
-                for node in &mut nodes {
-                    let original_count = node.total_resources.gpus.len();
-                    node.total_resources
+                for (node, original) in nodes.iter_mut().zip(cluster.nodes) {
+                    node.state = original.state;
+                    let original_count = original.total_resources.gpus.len();
+                    let ids = allowed.get(node.name.as_str());
+                    node.total_resources.gpus = original
+                        .total_resources
                         .gpus
-                        .retain(|gpu| allowed.contains(&(node.name.clone(), gpu.stable_id)));
+                        .iter()
+                        .filter(|gpu| ids.is_some_and(|ids| ids.contains(&gpu.stable_id)))
+                        .cloned()
+                        .collect();
                     let capability = if properties {
                         spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY
                     } else {

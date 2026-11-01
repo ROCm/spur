@@ -395,7 +395,7 @@ mod tests {
                                     pci_bdf: Some(format!("000{}:04:00.0", g + 1)),
                                     fabric: Some(crate::fabric::FabricObservation {
                                         source: "test".into(),
-                                        status: crate::fabric::ObservationStatus::Observed,
+                                        status: crate::fabric::ObservationStatus::Consistent,
                                         physical_domain_id: Some("rack".into()),
                                         fabric_domain_id: Some((i / 2).to_string()),
                                         endpoint_id: Some((i * 2 + g).to_string()),

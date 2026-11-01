@@ -39,7 +39,7 @@ fn nodes(count: usize) -> Vec<Node> {
                                     pci_bdf: Some(format!("000{}:04:00.0", local + 1)),
                                     fabric: Some(spur_core::fabric::FabricObservation {
                                         source: "test".into(),
-                                        status: spur_core::fabric::ObservationStatus::Observed,
+                                        status: spur_core::fabric::ObservationStatus::Consistent,
                                         physical_domain_id: Some(format!("rack-{}", index / 2)),
                                         fabric_domain_id: Some("7".into()),
                                         endpoint_id: Some(endpoint),
@@ -740,6 +740,35 @@ fn gpu_root_and_numa_selection_enforce_scope_and_unknowns() {
             }
         }
         assert!(property_run(&nodes, &[request]).1.is_empty());
+    }
+}
+
+#[test]
+fn property_projection_restores_nodes_between_candidate_groups() {
+    let mut nodes = property_nodes(2);
+    nodes[0].total_resources.gpus[1]
+        .topology
+        .as_mut()
+        .unwrap()
+        .pci_root = Some("pci0002:00".into());
+    for containment in [false, true] {
+        let mut request = job(1, 1, 2);
+        request.spec.exclusive = true;
+        request.spec.constraint = Some(if containment {
+            "same(gpu.pcie_root_id)&same(gpu.vpod_id)".into()
+        } else {
+            "same(gpu.pcie_root_id)".into()
+        });
+        let (_, assignments) = property_run(&nodes, &[request.clone()]);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes, ["n1"]);
+        assert_eq!(
+            assignments[0].per_node_alloc["n1"].device_ids("gpu"),
+            [42, 43]
+        );
+        let mut unavailable = nodes.clone();
+        unavailable[1].state = spur_core::node::NodeState::Down;
+        assert!(property_run(&unavailable, &[request]).1.is_empty());
     }
 }
 

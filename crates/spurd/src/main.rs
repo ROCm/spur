@@ -1031,7 +1031,9 @@ fn spawn_inventory_refresh(
                     };
                     match change {
                         CapacityChange::Applied => {
-                            let commit = converge(&reporter, &fresh, &delta, &mut last_delta).await;
+                            let commit =
+                                converge(&reporter, &allocation, &fresh, &delta, &mut last_delta)
+                                    .await;
                             if !suspect_dropout {
                                 publish_registry(&registry, candidate, commit).await;
                             }
@@ -1076,7 +1078,8 @@ fn spawn_inventory_refresh(
                     // the shared registry, which the fresh discovery may no longer
                     // contain. Converge the reconciled REPORTED inventory but leave
                     // the registry as-is so injection keeps resolving the held device.
-                    let _ = converge(&reporter, &reconciled, &delta, &mut last_delta).await;
+                    let _ = converge(&reporter, &allocation, &reconciled, &delta, &mut last_delta)
+                        .await;
                 }
             }
         }
@@ -1089,6 +1092,7 @@ fn spawn_inventory_refresh(
 /// `post_converge` so a failed register re-arms rather than being lost.
 async fn converge(
     reporter: &NodeReporter,
+    allocation: &Mutex<spur_sched::cons_tres::NodeAllocation>,
     fresh: &spur_core::resource::ResourceSet,
     acted_delta: &reporter::InventoryDelta,
     last_delta: &mut reporter::InventoryDelta,
@@ -1100,7 +1104,7 @@ async fn converge(
     let (commit, next_last) = reporter::post_converge(acted_delta, registered.is_ok());
     *last_delta = next_last;
     if commit == reporter::BaselineCommit::Commit {
-        reporter.update_resources(fresh.clone());
+        reporter.publish_resources(allocation, fresh.clone()).await;
     }
     commit
 }

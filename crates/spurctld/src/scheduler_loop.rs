@@ -200,9 +200,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     tokio::spawn(async move {
         enforce_inactive_limits(inactive_cluster, inactive_raft).await;
     });
-    // Captured once at loop start: the tick interval, per-cycle job cap, and
-    // topology tree are baked into loop-local state and are NOT picked up by
-    // `scontrol reconfigure` — changing them needs a controller restart.
+    // The tick interval and per-cycle job cap require a controller restart;
+    // topology is rebuilt from the current configuration each cycle.
     let startup_config = cluster.config();
     let interval_secs = startup_config.scheduler.interval_secs.max(1) as u64;
     let max_jobs = startup_config.scheduler.max_jobs_per_cycle as usize;

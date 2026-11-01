@@ -47,7 +47,7 @@ impl GpuField {
                 .map(Value::Text),
             Self::PhysicalPod | Self::Vpod => {
                 let f = t.fabric.as_ref()?;
-                if f.status != spur_devices::topology::ObservationStatus::Observed
+                if f.status != spur_devices::topology::ObservationStatus::Consistent
                     || !f.issues.is_empty()
                 {
                     return None;
@@ -336,7 +336,7 @@ mod property_tests {
                 numa_node: Some(0),
                 vram_bytes: Some(192 * 1024_u64.pow(3)),
                 fabric: Some(FabricObservation {
-                    status: ObservationStatus::Observed,
+                    status: ObservationStatus::Consistent,
                     physical_domain_id: Some("rack-a".into()),
                     fabric_domain_id: Some("15".into()),
                     ..Default::default()

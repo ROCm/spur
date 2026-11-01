@@ -19,7 +19,7 @@ message ResourceSet {
   repeated GpuResource gpus = 3;
   map<string, uint64> generic = 4;  // licenses, etc.
   uint64 generation = 5;  // bumped by the agent on each topology rebuild
-  uint32 fabric_binding_version = 6; // highest enforced binding version; zero is unsupported
+  uint32 fabric_binding_version = 6; // shared capability level: native fabric=1, file=2, GPU properties=3
   optional string block_file_revision = 7;
 }
 
@@ -125,6 +125,7 @@ message FabricBlock {
   optional uint32 fabric_capacity = 5;
   repeated string issues = 6;
   optional string file_revision = 7;
+  // Legacy file-backed native identity; current producers leave this unset.
   FabricBlockKey observed_key = 8;
 }
 
@@ -136,6 +137,7 @@ message FabricBinding {
   string node = 5;
   uint64 inventory_generation = 6;
   optional string file_revision = 7;
+  // Legacy file-backed native identity; current producers leave this unset.
   FabricBlockKey observed_key = 8;
 }
 
@@ -164,7 +166,7 @@ message GetFabricTopologyResponse {
   string namespace = 1;
   repeated FabricBlock blocks = 2;
   repeated UnresolvedFabricDevice unresolved = 3;
-  // Retained for wire compatibility; always empty. Placement is a job requirement.
+  // Unused experimental field; always empty. Placement is a job requirement.
   repeated string single_block_partitions = 4;
   repeated BlockFileNotice notices = 5;
 }

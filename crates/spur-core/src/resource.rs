@@ -43,6 +43,7 @@ pub struct ResourceSet {
     /// for a different logical device is caught by a generation mismatch.
     #[serde(default)]
     pub generation: u64,
+    /// Shared monotonic capability: native fabric = 1, file = 2, GPU properties = 3.
     #[serde(default)]
     pub fabric_binding_version: u32,
     #[serde(default)]
@@ -519,7 +520,7 @@ mod tests {
         let mut a = sample_inventory();
         a.gpus[0].topology = Some(DeviceTopology {
             fabric: Some(FabricObservation {
-                status: ObservationStatus::Observed,
+                status: ObservationStatus::Consistent,
                 fabric_domain_id: Some("15".into()),
                 ..Default::default()
             }),

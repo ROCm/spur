@@ -45,6 +45,7 @@ pub struct FabricBlock {
     pub issues: Vec<String>,
     #[serde(default)]
     pub file_revision: Option<String>,
+    /// Legacy file-backed native identity; current producers leave this unset.
     #[serde(default)]
     pub observed_key: Option<FabricBlockKey>,
 }
@@ -249,7 +250,7 @@ fn assemble_block(
         if observation.source.trim().is_empty() {
             issues.insert("missing_source");
         }
-        if observation.status != ObservationStatus::Observed || !observation.issues.is_empty() {
+        if observation.status != ObservationStatus::Consistent || !observation.issues.is_empty() {
             issues.insert("observation_not_consistent");
         }
         physical_capacities.insert(observation.physical_capacity);
@@ -628,7 +629,7 @@ mod tests {
                         pci_bdf: Some("0001:04:00.0".into()),
                         fabric: Some(FabricObservation {
                             source: "test".into(),
-                            status: ObservationStatus::Observed,
+                            status: ObservationStatus::Consistent,
                             physical_domain_id: Some(physical.into()),
                             fabric_domain_id: Some("7".into()),
                             endpoint_id: Some(endpoint.into()),

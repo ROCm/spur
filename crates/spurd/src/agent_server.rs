@@ -4043,14 +4043,18 @@ impl AgentService {
                 ))
             })?;
 
-        let (fabric_binding, gpu_binding) = {
+        let (fabric_binding, gpu_binding, allocation) = {
             let jobs = self.running.lock().await;
             let tracked = jobs
                 .get(&job_id)
                 .ok_or_else(|| Status::failed_precondition("parent allocation disappeared"))?;
-            self.check_tracked_fabric(tracked)?;
-            (tracked.fabric_binding.clone(), tracked.gpu_binding.clone())
+            (
+                tracked.fabric_binding.clone(),
+                tracked.gpu_binding.clone(),
+                Self::tracked_allocation(tracked),
+            )
         };
+        self.check_dispatch_allocation(&allocation).await?;
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
         let waiter = self
@@ -4196,14 +4200,18 @@ impl AgentService {
                 ))
             })?;
 
-        let (fabric_binding, gpu_binding) = {
+        let (fabric_binding, gpu_binding, allocation) = {
             let jobs = self.running.lock().await;
             let tracked = jobs
                 .get(&job_id)
                 .ok_or_else(|| Status::failed_precondition("parent allocation disappeared"))?;
-            self.check_tracked_fabric(tracked)?;
-            (tracked.fabric_binding.clone(), tracked.gpu_binding.clone())
+            (
+                tracked.fabric_binding.clone(),
+                tracked.gpu_binding.clone(),
+                Self::tracked_allocation(tracked),
+            )
         };
+        self.check_dispatch_allocation(&allocation).await?;
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
         let waiter = self
@@ -5198,6 +5206,85 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
             "DrainNode failed with non-retryable error"
         ),
     }
+}
+
+fn validate_dispatch_snapshot(
+    mut inventory: spur_core::resource::ResourceSet,
+    allocation: ResourceAllocations,
+    block_file: Option<std::path::PathBuf>,
+    hostname: String,
+    cluster_id: String,
+) -> Result<(), Status> {
+    let mut resources = spur_core::resource::ResourceAllocations {
+        generation: allocation.generation,
+        ..Default::default()
+    };
+    resources.devices.insert(
+        "gpu".into(),
+        allocation
+            .devices
+            .get("gpu")
+            .map(|devices| {
+                devices
+                    .devices
+                    .iter()
+                    .map(|device| spur_core::resource::AllocatedDevice {
+                        device_id: device.device_id,
+                        count: device.count,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
+    if let Some(binding) = allocation
+        .gpu_binding
+        .clone()
+        .map(spur_core::gpu_binding::from_proto)
+    {
+        refresh_bound_gpu_properties(&mut inventory, &binding, std::path::Path::new("/sys"))?;
+        binding
+            .validate(&hostname, &inventory, &resources)
+            .map_err(Status::failed_precondition)?;
+    }
+    let Some(binding) = allocation
+        .fabric_binding
+        .clone()
+        .map(spur_core::fabric_binding::from_proto)
+    else {
+        return Ok(());
+    };
+    if let Some(revision) = &binding.file_revision {
+        let path = block_file.as_deref().ok_or_else(|| {
+            Status::failed_precondition("block file is not configured on this agent")
+        })?;
+        let file =
+            spur_core::block_file::BlockFile::read(path).map_err(Status::failed_precondition)?;
+        if &file.revision != revision || !file.contains(&binding.key.fabric_domain, &hostname) {
+            return Err(Status::failed_precondition(
+                "block file revision or node membership changed",
+            ));
+        }
+        if binding.observed_key.is_none()
+            && binding.active_endpoints.iter().any(|endpoint| {
+                endpoint.rsplit_once('/').is_none_or(|(node, id)| {
+                    !file.contains(&binding.key.fabric_domain, node) || id.parse::<u64>().is_err()
+                })
+            })
+        {
+            return Err(Status::failed_precondition(
+                "declared endpoint outside the block file",
+            ));
+        }
+    }
+    refresh_bound_fabric(&mut inventory, &binding, std::path::Path::new("/sys"))?;
+    if !cluster_id.is_empty() && cluster_id != binding.key.namespace {
+        return Err(Status::failed_precondition(
+            "fabric namespace differs from authenticated cluster",
+        ));
+    }
+    binding
+        .validate(&binding.key.namespace, &hostname, &inventory, &resources)
+        .map_err(Status::failed_precondition)
 }
 
 fn refresh_bound_gpu_properties(
@@ -6351,6 +6438,7 @@ impl SlurmAgent for AgentService {
                 );
                 if let Err(error) = self
                     .check_dispatch_allocation(&crate::reporter::allocations_to_proto(&allocation))
+                    .await
                 {
                     let _ = stop_stepd_process(descriptor).await;
                     release_stepd_tracking(
@@ -6698,6 +6786,10 @@ impl SlurmAgent for AgentService {
             .map(|p| p.device_paths.clone())
             .unwrap_or_default();
 
+        if let Some(allocation) = allocated {
+            self.check_dispatch_allocation(allocation).await?;
+        }
+
         // Hold the running lock across the duplicate check, reserve+commit, and
         // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
@@ -6710,11 +6802,10 @@ impl SlurmAgent for AgentService {
         }
         let alloc_result = {
             let mut alloc = self.allocation.lock().await;
-            // Atomic with the bind: the refresh task publishes inventory via
-            // update_capacity under this same lock, so no newer generation can
-            // land between this check and allocate_for_job.
+            // Inventory may change during preflight; publication takes this
+            // same lock, keeping the generation check atomic with reservation.
             if let Some(a) = allocated {
-                self.check_dispatch_allocation(a)?;
+                self.check_current_dispatch_generation(a)?;
             }
             let result = alloc
                 .allocate_for_job(
@@ -7243,12 +7334,12 @@ impl SlurmAgent for AgentService {
             job_owner,
             job_entry,
             job_attempt,
+            allocation,
         ) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
             })?;
-            self.check_tracked_fabric(tracked)?;
             let nodelist = if tracked.nodelist.is_empty() {
                 hostname::get()
                     .map(|h| h.to_string_lossy().to_string())
@@ -7287,8 +7378,10 @@ impl SlurmAgent for AgentService {
                 tracked.user.clone(),
                 entry,
                 tracked.run_attempt,
+                Self::tracked_allocation(tracked),
             )
         };
+        self.check_dispatch_allocation(&allocation).await?;
         if job_attempt != step_run_attempt {
             return Err(Status::aborted(
                 "job attempt changed while admitting the step",
@@ -8502,7 +8595,7 @@ impl SlurmAgent for AgentService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
         let step_id = spur_core::step::STEP_INTERACTIVE;
-        let (run_attempt, cpus, memory_mb, gpu_devices, partition, nodelist, user) = {
+        let (run_attempt, cpus, memory_mb, gpu_devices, partition, nodelist, user, allocation) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&init.job_id).ok_or_else(|| {
                 Status::failed_precondition(format!(
@@ -8510,7 +8603,6 @@ impl SlurmAgent for AgentService {
                     init.job_id
                 ))
             })?;
-            self.check_tracked_fabric(tracked)?;
             (
                 tracked.run_attempt,
                 tracked.cpus,
@@ -8519,8 +8611,10 @@ impl SlurmAgent for AgentService {
                 tracked.partition.clone(),
                 tracked.nodelist.clone(),
                 tracked.user.clone(),
+                Self::tracked_allocation(tracked),
             )
         };
+        self.check_dispatch_allocation(&allocation).await?;
         let mut host_device_plan: Option<spur_devices::inject::HostInjectionPlan> = None;
         let custody_dir = crate::stepd::StepdStore::new(&self.stepd_state_dir).session_dir(
             init.job_id,
@@ -9249,93 +9343,51 @@ impl AgentService {
         Ok(Some(host_plan))
     }
 
-    fn check_dispatch_allocation(&self, allocation: &ResourceAllocations) -> Result<(), Status> {
-        let mut inventory = self.reporter.snapshot_resources();
-        check_dispatch_generation(allocation.generation, inventory.generation)?;
-        let mut resources = spur_core::resource::ResourceAllocations {
-            generation: allocation.generation,
-            ..Default::default()
-        };
-        resources.devices.insert(
-            "gpu".into(),
-            allocation
-                .devices
-                .get("gpu")
-                .map(|devices| {
-                    devices
-                        .devices
-                        .iter()
-                        .map(|device| spur_core::resource::AllocatedDevice {
-                            device_id: device.device_id,
-                            count: device.count,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        );
-        if let Some(binding) = allocation
-            .gpu_binding
-            .clone()
-            .map(spur_core::gpu_binding::from_proto)
+    fn check_current_dispatch_generation(
+        &self,
+        allocation: &ResourceAllocations,
+    ) -> Result<(), Status> {
+        let live = self.reporter.resource_generation();
+        if (allocation.fabric_binding.is_some() || allocation.gpu_binding.is_some())
+            && (allocation.generation == 0 || live == 0)
         {
-            refresh_bound_gpu_properties(&mut inventory, &binding, std::path::Path::new("/sys"))?;
-            binding
-                .validate(&self.reporter.hostname, &inventory, &resources)
-                .map_err(Status::failed_precondition)?;
-        }
-        let Some(binding) = allocation
-            .fabric_binding
-            .clone()
-            .map(spur_core::fabric_binding::from_proto)
-        else {
-            return Ok(());
-        };
-        if let Some(revision) = &binding.file_revision {
-            let path = self.block_file.as_deref().ok_or_else(|| {
-                Status::failed_precondition("block file is not configured on this agent")
-            })?;
-            let file = spur_core::block_file::BlockFile::read(path)
-                .map_err(Status::failed_precondition)?;
-            if &file.revision != revision
-                || !file.contains(&binding.key.fabric_domain, &self.reporter.hostname)
-            {
-                return Err(Status::failed_precondition(
-                    "block file revision or node membership changed",
-                ));
-            }
-            if binding.observed_key.is_none()
-                && binding.active_endpoints.iter().any(|endpoint| {
-                    endpoint.rsplit_once('/').is_none_or(|(node, id)| {
-                        !file.contains(&binding.key.fabric_domain, node)
-                            || id.parse::<u64>().is_err()
-                    })
-                })
-            {
-                return Err(Status::failed_precondition(
-                    "declared endpoint outside the block file",
-                ));
-            }
-        }
-        refresh_bound_fabric(&mut inventory, &binding, std::path::Path::new("/sys"))?;
-        if !self.cluster_id.is_empty() && self.cluster_id != binding.key.namespace {
             return Err(Status::failed_precondition(
-                "fabric namespace differs from authenticated cluster",
+                "bound dispatch has no inventory generation",
             ));
         }
-        binding
-            .validate(
-                &binding.key.namespace,
-                &self.reporter.hostname,
-                &inventory,
-                &resources,
-            )
-            .map_err(Status::failed_precondition)
+        check_dispatch_generation(allocation.generation, live)
     }
 
-    fn check_tracked_fabric(&self, tracked: &TrackedJob) -> Result<(), Status> {
-        if tracked.fabric_binding.is_none() && tracked.gpu_binding.is_none() {
+    async fn check_dispatch_allocation(
+        &self,
+        allocation: &ResourceAllocations,
+    ) -> Result<(), Status> {
+        self.check_current_dispatch_generation(allocation)?;
+        if allocation.fabric_binding.is_none() && allocation.gpu_binding.is_none() {
             return Ok(());
         }
+        let inventory = self.reporter.snapshot_resources();
+        let snapshot_allocation = allocation.clone();
+        let block_file = self.block_file.clone();
+        let hostname = self.reporter.hostname.clone();
+        let cluster_id = self.cluster_id.clone();
+        tokio::task::spawn_blocking(move || {
+            validate_dispatch_snapshot(
+                inventory,
+                snapshot_allocation,
+                block_file,
+                hostname,
+                cluster_id,
+            )
+        })
+        .await
+        .map_err(|error| {
+            Status::internal(format!("dispatch validation worker failed: {error}"))
+        })??;
+        self.check_current_dispatch_generation(allocation)
+    }
+
+    fn tracked_allocation(tracked: &TrackedJob) -> ResourceAllocations {
         let mut allocation = spur_core::resource::ResourceAllocations {
             generation: tracked
                 .gpu_binding
@@ -9361,7 +9413,7 @@ impl AgentService {
                 .map(spur_core::resource::AllocatedDevice::injectable)
                 .collect(),
         );
-        self.check_dispatch_allocation(&crate::reporter::allocations_to_proto(&allocation))
+        crate::reporter::allocations_to_proto(&allocation)
     }
 
     /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
@@ -9390,6 +9442,10 @@ impl AgentService {
             )));
         }
 
+        if let Some(allocation) = allocated {
+            self.check_dispatch_allocation(allocation).await?;
+        }
+
         // Hold running across the reclaim (running-then-allocation, as in commit)
         // so a concurrent commit can't make a live owner look stale.
         let running = self.running.lock().await;
@@ -9397,11 +9453,10 @@ impl AgentService {
 
         let mut alloc = self.allocation.lock().await;
 
-        // Generation check under the allocation lock: the refresh task mutates
-        // inventory via update_capacity under this same lock, so checking here
-        // is atomic with the bind below — no publish can interleave.
+        // Recheck after preflight: inventory publication uses this same lock,
+        // so no newer generation can interleave with the reservation.
         if let Some(a) = allocated {
-            self.check_dispatch_allocation(a)?;
+            self.check_current_dispatch_generation(a)?;
         }
 
         let result = match alloc.allocate_for_job(
@@ -17142,7 +17197,7 @@ mod tests {
             pci_bdf: Some("0001:04:00.0".into()),
             fabric: Some(spur_devices::topology::FabricObservation {
                 source: "test".into(),
-                status: spur_devices::topology::ObservationStatus::Observed,
+                status: spur_devices::topology::ObservationStatus::Consistent,
                 physical_domain_id: Some("rack-a".into()),
                 fabric_domain_id: Some("7".into()),
                 endpoint_id: Some("1".into()),
@@ -17292,7 +17347,10 @@ mod tests {
             tracked.gpu_devices = vec![42];
             tracked.gpu_binding = Some(binding);
             assert!(
-                service.check_tracked_fabric(&tracked).is_err(),
+                service
+                    .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+                    .await
+                    .is_err(),
                 "property {property}"
             );
         }
@@ -17338,11 +17396,17 @@ mod tests {
         recover_stepds(&service.running, vec![restored]).await;
         let jobs = service.running.lock().await;
         assert_eq!(jobs[&501].gpu_binding, Some(binding));
-        service.check_tracked_fabric(&jobs[&501]).unwrap();
+        service
+            .check_dispatch_allocation(&AgentService::tracked_allocation(&jobs[&501]))
+            .await
+            .unwrap();
         let mut live = service.reporter.snapshot_resources();
         live.generation += 1;
         service.reporter.update_resources(live);
-        assert!(service.check_tracked_fabric(&jobs[&501]).is_err());
+        assert!(service
+            .check_dispatch_allocation(&AgentService::tracked_allocation(&jobs[&501]))
+            .await
+            .is_err());
         let legacy: crate::stepd::StepdJobResources = serde_json::from_str(r#"{"cpus":4,"memory_mb":1024,"gpu_devices":[42],"cpu_ids":[0,1,2,3],"partition":"rack","nodelist":"test-node","mpi":"none"}"#).unwrap();
         assert!(legacy.gpu_binding.is_none());
     }
@@ -17379,7 +17443,65 @@ mod tests {
         let mut tracked = TrackedJob::allocation_only(None);
         tracked.gpu_devices = vec![42];
         tracked.fabric_binding = Some(binding);
-        assert!(service.check_tracked_fabric(&tracked).is_err());
+        assert!(service
+            .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_preflight_rejects_missing_file_before_shared_locks() {
+        let (mut service, mut binding, mut allocation) = fabric_dispatch_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        service.set_block_file(Some(directory.path().join("missing.conf")));
+        binding.version = 2;
+        binding.file_revision = Some("0".repeat(64));
+        allocation.fabric_binding = Some(spur_core::fabric_binding::to_proto(&binding));
+        allocation.devices.clear();
+        let running = service.running.lock().await;
+        let ledger = service.allocation.lock().await;
+        let error = service
+            .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("cannot open block file"));
+        let error = service
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 502,
+                allocated: Some(allocation),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("cannot open block file"));
+        assert!(ledger.allocated_gpu_ids().is_empty());
+        assert!(running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_generation_recheck_rejects_publication_after_preflight() {
+        for properties in [false, true] {
+            let (service, allocation) = if properties {
+                let (service, _, allocation) = gpu_dispatch_fixture();
+                (service, allocation)
+            } else {
+                let (service, _, allocation) = fabric_dispatch_fixture();
+                (service, allocation)
+            };
+            service
+                .check_dispatch_allocation(&allocation)
+                .await
+                .unwrap();
+            let ledger = service.allocation.lock().await;
+            let mut inventory = service.reporter.snapshot_resources();
+            inventory.generation += 1;
+            service.reporter.update_resources(inventory);
+            let error = service
+                .check_current_dispatch_generation(&allocation)
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(ledger.allocated_gpu_ids().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -17413,14 +17535,20 @@ mod tests {
         tracked.gpu_devices = vec![42];
         tracked.fabric_binding = Some(binding);
         std::fs::write(&path, "# reordered\nNodes=test-node BlockName=a\n").unwrap();
-        service.check_tracked_fabric(&tracked).unwrap();
+        service
+            .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+            .await
+            .unwrap();
         for replacement in [Some("BlockName=b Nodes=test-node"), Some("bad input"), None] {
             if let Some(text) = replacement {
                 std::fs::write(&path, text).unwrap();
             } else {
                 std::fs::remove_file(&path).unwrap();
             }
-            assert!(service.check_tracked_fabric(&tracked).is_err());
+            assert!(service
+                .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+                .await
+                .is_err());
             let error = service
                 .allocate_local_resources(502, 1, &JobSpec::default(), Some(&allocation), 1, 0)
                 .await
@@ -17434,7 +17562,10 @@ mod tests {
                 .is_empty());
         }
         std::fs::write(&path, text).unwrap();
-        service.check_tracked_fabric(&tracked).unwrap();
+        service
+            .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

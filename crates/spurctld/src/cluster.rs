@@ -11410,7 +11410,7 @@ state = "UP"
                         pci_bdf: Some("0001:04:00.0".into()),
                         fabric: Some(spur_core::fabric::FabricObservation {
                             source: "test".into(),
-                            status: spur_core::fabric::ObservationStatus::Observed,
+                            status: spur_core::fabric::ObservationStatus::Consistent,
                             physical_domain_id: Some("rack".into()),
                             fabric_domain_id: Some("15".into()),
                             endpoint_id: Some("1".into()),

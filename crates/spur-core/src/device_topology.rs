@@ -30,7 +30,7 @@ pub fn to_proto(t: &model::DeviceTopology) -> wire::DeviceTopology {
                 model::ObservationStatus::Unknown => {
                     wire::ObservationStatus::ObservationUnknown as i32
                 }
-                model::ObservationStatus::Observed => {
+                model::ObservationStatus::Consistent => {
                     wire::ObservationStatus::ObservationObserved as i32
                 }
                 model::ObservationStatus::Incomplete => {
@@ -99,7 +99,7 @@ pub fn from_proto(t: wire::DeviceTopology) -> model::DeviceTopology {
             fabric_capacity: f.fabric_capacity,
             status: match wire::ObservationStatus::try_from(f.status) {
                 Ok(wire::ObservationStatus::ObservationObserved) => {
-                    model::ObservationStatus::Observed
+                    model::ObservationStatus::Consistent
                 }
                 Ok(wire::ObservationStatus::ObservationIncomplete) => {
                     model::ObservationStatus::Incomplete
@@ -181,6 +181,23 @@ mod tests {
             from_proto(wire::DeviceTopology::default()),
             model::DeviceTopology::default()
         );
+    }
+
+    #[test]
+    fn consistent_observation_preserves_frozen_json_and_wire_value() {
+        let old = r#"{"fabric":{"status":"observed"}}"#;
+        let topology: model::DeviceTopology = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            topology.fabric.as_ref().unwrap().status,
+            model::ObservationStatus::Consistent
+        );
+        assert_eq!(
+            serde_json::to_value(&topology).unwrap()["fabric"]["status"],
+            "observed"
+        );
+        let wire = to_proto(&topology);
+        assert_eq!(wire.fabric.as_ref().unwrap().status, 1);
+        assert_eq!(from_proto(wire), topology);
     }
 
     #[test]

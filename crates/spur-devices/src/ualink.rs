@@ -98,7 +98,7 @@ fn endpoints(value: &str) -> Option<Vec<String>> {
 fn read_snapshot(root: &Path) -> FabricObservation {
     let mut o = FabricObservation {
         source: SOURCE.into(),
-        status: Status::Observed,
+        status: Status::Consistent,
         ..Default::default()
     };
     o.physical_domain_id = read_field(root, "ppod_id", &mut o, identifier);
@@ -255,7 +255,7 @@ mod tests {
         // A directory cannot be parsed as an attribute; an accidental read would fail.
         std::fs::create_dir(dir.path().join("ualink/config")).unwrap();
         let o = observe(dir.path()).unwrap();
-        assert_eq!(o.status, Status::Observed);
+        assert_eq!(o.status, Status::Consistent);
         assert_eq!(o.fabric_domain_id.as_deref(), Some("15"));
         assert_eq!(o.active_endpoints, o.local_endpoints);
         assert_eq!(o.transport.as_deref(), Some("UALoE"));
@@ -361,8 +361,8 @@ mod tests {
         left.fabric = observe(a.path());
         right.fabric = observe(b.path());
         validate_local(&mut [&mut left, &mut right]);
-        assert_eq!(left.fabric.unwrap().status, Status::Observed);
-        assert_eq!(right.fabric.unwrap().status, Status::Observed);
+        assert_eq!(left.fabric.unwrap().status, Status::Consistent);
+        assert_eq!(right.fabric.unwrap().status, Status::Consistent);
     }
 
     #[test]
@@ -375,7 +375,7 @@ mod tests {
         };
         let mut b = a.clone();
         validate_local(&mut [&mut a, &mut b]);
-        assert_eq!(a.fabric.as_ref().unwrap().status, Status::Observed);
+        assert_eq!(a.fabric.as_ref().unwrap().status, Status::Consistent);
         b.pci_bdf = Some("0002:04:00.0".into());
         validate_local(&mut [&mut a, &mut b]);
         assert!(a

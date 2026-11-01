@@ -313,7 +313,7 @@ mod tests {
         metadata.stable_id = Some(128);
         metadata.topology = Some(DeviceTopology {
             fabric: Some(FabricObservation {
-                status: ObservationStatus::Observed,
+                status: ObservationStatus::Consistent,
                 ..Default::default()
             }),
             ..Default::default()
@@ -347,7 +347,7 @@ mod tests {
         meta.topology = Some(DeviceTopology {
             fabric: Some(FabricObservation {
                 source: "amd-ualink".into(),
-                status: ObservationStatus::Observed,
+                status: ObservationStatus::Consistent,
                 fabric_domain_id: Some("15".into()),
                 ..Default::default()
             }),

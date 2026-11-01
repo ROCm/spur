@@ -282,6 +282,16 @@ impl NodeReporter {
         read_recover(&self.resources).clone()
     }
 
+    pub fn resource_generation(&self) -> u64 {
+        read_recover(&self.resources).generation
+    }
+
+    pub async fn publish_resources(&self, allocation: &Mutex<NodeAllocation>, fresh: ResourceSet) {
+        // Dispatch checks generation while reserving under this same mutex.
+        let _allocation = allocation.lock().await;
+        self.update_resources(fresh);
+    }
+
     /// Swap the reported inventory if its schedulable content changed. Ignores
     /// `generation` so a pure generation bump does not itself count as a change.
     pub fn update_resources(&self, fresh: ResourceSet) -> bool {
@@ -986,7 +996,7 @@ mod tests {
             vram_bytes: Some(309_237_645_312),
             fabric: Some(FabricObservation {
                 source: "amd-ualink".into(),
-                status: ObservationStatus::Observed,
+                status: ObservationStatus::Consistent,
                 physical_domain_id: Some("00000000-0000-4000-8000-000000000001".into()),
                 fabric_domain_id: Some(domain.into()),
                 endpoint_id: Some("63".into()),
@@ -2280,6 +2290,35 @@ mod tests {
                 .generation,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn inventory_publication_waits_for_allocation_reservation() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let resources = ResourceSet {
+            generation: 7,
+            ..Default::default()
+        };
+        let reporter = test_reporter(resources.clone());
+        let allocation = Mutex::new(NodeAllocation::new("test-node".into(), &resources));
+        let guard = allocation.lock().await;
+        let fresh = ResourceSet {
+            generation: 8,
+            ..resources
+        };
+        let mut publish = Box::pin(reporter.publish_resources(&allocation, fresh));
+        assert!(matches!(
+            publish
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        assert_eq!(reporter.resource_generation(), 7);
+        drop(guard);
+        publish.await;
+        assert_eq!(reporter.resource_generation(), 8);
     }
 
     #[test]

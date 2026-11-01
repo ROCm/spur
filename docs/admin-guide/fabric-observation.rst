@@ -26,7 +26,8 @@ bytes, and fabric observations. For example:
       FabricSource=amd-ualink Observation=observed PhysicalDomain=... FabricDomain=15 Endpoint=63 EndpointState=active Transport=UALoE
       PhysicalCapacity=72 FabricCapacity=4 ActiveEndpoints=[60,61,62,63] LocalEndpoints=[60,61,62,63]
 
-``observed`` means the attributes were read consistently. It does not mean
+``observed`` (``ObservationStatus::Consistent`` internally) means the attributes
+were read consistently; the serialized name is retained for compatibility. It does not mean
 ``Ready`` in AFM. Other statuses are ``incomplete`` (missing, malformed, or
 unreadable fields), ``inconsistent`` (conflicting or changing observations),
 ``unavailable`` (the source/device could not be observed), and ``unknown``.
@@ -344,8 +345,10 @@ reports ``FabricUnavailable`` in the pending reason description. A property-only
 request that cannot fit reports ``GpuPropertiesUnavailable``; inspect
 ``spur control show node`` for its reported GPU facts.
 
-The agent checks the binding under its allocation lock before admitting the
-resources. AMD UALink bindings also reread the allowlisted attributes of the bound
+The agent validates bindings before admission, then rechecks the inventory
+generation under the allocation lock before reserving resources. Inventory
+publication uses the same lock; file and device reads run outside it.
+AMD UALink bindings reread the allowlisted attributes of the bound
 PCI devices. Missing observations, changed domains/endpoints, a changed inventory
 generation, or an unsupported binding version reject the launch. Other discovery
 sources use their current typed inventory for binding checks. No device or fabric

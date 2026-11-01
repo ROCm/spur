@@ -6103,7 +6103,7 @@ mod tests {
                     pci_bdf: Some("0001:04:00.0".into()),
                     fabric: Some(spur_core::device_topology::FabricObservation {
                         source: "amd-ualink".into(),
-                        status: spur_core::device_topology::ObservationStatus::Observed,
+                        status: spur_core::device_topology::ObservationStatus::Consistent,
                         fabric_domain_id: Some("15".into()),
                         ..Default::default()
                     }),

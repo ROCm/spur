@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use spur_devices::topology::ObservationStatus;
 
 use crate::fabric::{FabricBlock, FabricBlockKey, FabricMember};
+use crate::gpu_binding::{binding_generation_matches, binding_gpu_ids_match};
 use crate::resource::{ResourceAllocations, ResourceSet};
 
 pub const FABRIC_BINDING_VERSION: u32 = 1;
@@ -23,6 +24,7 @@ pub struct FabricBinding {
     pub members: Vec<FabricMember>,
     #[serde(default)]
     pub file_revision: Option<String>,
+    /// Legacy file-backed native identity; current producers leave this unset.
     #[serde(default)]
     pub observed_key: Option<FabricBlockKey>,
 }
@@ -87,7 +89,7 @@ impl FabricBinding {
         if self.node != node || self.inventory_generation != allocation.generation {
             return Err("fabric binding targets a different node or generation".into());
         }
-        if allocation.generation == 0 || allocation.generation != inventory.generation {
+        if !binding_generation_matches(self.inventory_generation, inventory, allocation) {
             return Err("stale fabric binding inventory generation".into());
         }
         if let Some(revision) = &self.file_revision {
@@ -111,18 +113,10 @@ impl FabricBinding {
         if active.is_empty() || active.len() != self.active_endpoints.len() {
             return Err("invalid fabric binding endpoints".into());
         }
-        let allocated = allocation
-            .devices
-            .get("gpu")
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let ids: BTreeSet<_> = allocated.iter().map(|d| d.device_id).collect();
-        let member_ids: BTreeSet<_> = self.members.iter().map(|m| m.device.stable_id).collect();
-        if allocated.iter().any(|d| d.count != 1)
-            || ids.len() != allocated.len()
-            || ids != member_ids
-            || member_ids.len() != self.members.len()
-        {
+        if !binding_gpu_ids_match(
+            allocation,
+            self.members.iter().map(|member| member.device.stable_id),
+        ) {
             return Err("fabric binding does not match exact allocated GPUs".into());
         }
         for member in &self.members {
@@ -156,7 +150,7 @@ impl FabricBinding {
                 .as_ref()
                 .and_then(|t| t.fabric.as_ref())
                 .ok_or("fabric observation is missing")?;
-            if observation.status != ObservationStatus::Observed
+            if observation.status != ObservationStatus::Consistent
                 || !observation.issues.is_empty()
                 || observation.physical_domain_id.as_ref() != Some(&observed_key.physical_domain)
                 || observation.fabric_domain_id.as_ref() != Some(&observed_key.fabric_domain)
@@ -267,7 +261,7 @@ mod tests {
                 topology: Some(DeviceTopology {
                     fabric: Some(FabricObservation {
                         source: "test".into(),
-                        status: ObservationStatus::Observed,
+                        status: ObservationStatus::Consistent,
                         physical_domain_id: Some("rack-a".into()),
                         fabric_domain_id: Some("7".into()),
                         endpoint_id: Some("1".into()),
@@ -311,6 +305,48 @@ mod tests {
             inventory,
             allocation,
         )
+    }
+
+    #[test]
+    fn both_bindings_reject_inexact_gpu_sets() {
+        let (fabric, mut inventory, allocation) = fixture();
+        inventory.fabric_binding_version = crate::gpu_binding::GPU_PROPERTIES_CAPABILITY;
+        let properties =
+            crate::gpu_binding::GpuBinding::new("n1", &inventory, &allocation).unwrap();
+        for case in 0..5 {
+            let mut allocation = allocation.clone();
+            let mut fabric = fabric.clone();
+            let mut properties = properties.clone();
+            match case {
+                0 => allocation.devices.get_mut("gpu").unwrap()[0].count = 2,
+                1 => allocation
+                    .devices
+                    .get_mut("gpu")
+                    .unwrap()
+                    .push(AllocatedDevice::injectable(42)),
+                2 => {
+                    allocation.devices.clear();
+                }
+                3 => {
+                    fabric.members.push(fabric.members[0].clone());
+                    properties.gpus.push(properties.gpus[0].clone());
+                }
+                _ => {
+                    fabric.members[0].device.stable_id += 1;
+                    properties.gpus[0].stable_id += 1;
+                }
+            }
+            assert!(
+                fabric
+                    .validate("test", "n1", &inventory, &allocation)
+                    .is_err(),
+                "case {case}"
+            );
+            assert!(
+                properties.validate("n1", &inventory, &allocation).is_err(),
+                "case {case}"
+            );
+        }
     }
 
     #[test]

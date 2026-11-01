@@ -1998,6 +1998,9 @@ converges to the new device count without restarting ``spurd``.
    those specs. With ``auto_detect = false``, all CDI metadata is re-read from
    disk and changes only when the specs change. See :doc:`fabric-observation`
    for the read-only fabric observation contract and its scheduling limits.
+   With ``auto_detect = false`` and no on-disk CDI specs, GPU inventory is empty;
+   GPU-property constraints require automatic discovery or equivalent CDI specs
+   containing the requested GPU properties.
 
 ``[isolation]``
 ---------------
