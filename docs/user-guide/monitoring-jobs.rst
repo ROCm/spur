@@ -570,7 +570,8 @@ is leader keeps the reason of its previous run, and a run the older controller
 force-finished reads ``NonZeroExitCode`` rather than ``CompletingTimeout``.
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
-NNodes ExitCode``.
+NNodes ExitCode Reason``. Scripts that read columns by position should select
+them with ``--format``.
 
 Time arguments accept an absolute date (``YYYY-MM-DD`` or
 ``YYYY-MM-DDTHH:MM:SS``) or a relative offset (``now-7days``, ``now-6hours``).

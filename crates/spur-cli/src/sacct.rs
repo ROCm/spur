@@ -93,7 +93,7 @@ impl SacctArgs {
     }
 }
 
-const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x";
+const SACCT_DEFAULT_FORMAT: &str = "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %18r";
 const SACCT_LONG_FORMAT: &str =
     "%.8i %.15j %.10u %.10a %.10P %.8T %10M %.8D %6x %.10X %.19S %.19E %.10l %8y %8m %12q %18r";
 const SACCT_BRIEF_FORMAT: &str = "%.8i %.8T %6x";
@@ -170,21 +170,7 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<SacctArgs>(&args);
     let style = args.output_style();
-
-    // -o/--format uses Slurm's comma-separated field-name syntax, not %-specifiers.
-    let fields = if let Some(ref f) = args.format {
-        let fields = format_engine::parse_named_format(f, &sacct_field_spec, &sacct_header);
-        if fields.is_empty() {
-            anyhow::bail!("sacct: no recognized fields in --format='{f}'");
-        }
-        fields
-    } else if args.long {
-        format_engine::parse_format(SACCT_LONG_FORMAT, &sacct_header)
-    } else if args.brief {
-        format_engine::parse_format(SACCT_BRIEF_FORMAT, &sacct_header)
-    } else {
-        format_engine::parse_format(SACCT_DEFAULT_FORMAT, &sacct_header)
-    };
+    let fields = output_fields(&args)?;
 
     // Parse state filter
     let states: Vec<i32> = args
@@ -238,6 +224,25 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn output_fields(args: &SacctArgs) -> Result<Vec<format_engine::FormatToken>> {
+    // -o/--format uses Slurm's comma-separated field-name syntax, not %-specifiers.
+    if let Some(ref f) = args.format {
+        let fields = format_engine::parse_named_format(f, &sacct_field_spec, &sacct_header);
+        if fields.is_empty() {
+            anyhow::bail!("sacct: no recognized fields in --format='{f}'");
+        }
+        return Ok(fields);
+    }
+    let format = if args.long {
+        SACCT_LONG_FORMAT
+    } else if args.brief {
+        SACCT_BRIEF_FORMAT
+    } else {
+        SACCT_DEFAULT_FORMAT
+    };
+    Ok(format_engine::parse_format(format, &sacct_header))
 }
 
 fn render(
@@ -412,6 +417,19 @@ mod tests {
     #[test]
     fn long_format_ends_with_reason() {
         assert!(SACCT_LONG_FORMAT.ends_with("%18r"));
+    }
+
+    #[test]
+    fn default_output_ends_with_reason() {
+        let args = SacctArgs::try_parse_from(["sacct"]).unwrap();
+        let fields = output_fields(&args).unwrap();
+        let mut cancelled = job(0, 0, 0);
+        cancelled.end_reason = "UserCancel".into();
+        let lines = render(args.output_style(), &fields, &[cancelled, job(0, 0, 0)]);
+        let last = |line: &str| line.split_whitespace().last().map(str::to_owned);
+        assert_eq!(last(&lines[0]).as_deref(), Some("Reason"));
+        assert_eq!(last(&lines[2]).as_deref(), Some("UserCancel"));
+        assert_eq!(last(&lines[3]).as_deref(), Some("N/A"));
     }
 
     #[test]
