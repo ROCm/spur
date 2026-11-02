@@ -600,8 +600,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Reap an interactive allocation (``salloc``, or a standalone ``srun`` with
        or without ``--pty``) whose client has sent no keepalive for this many
-       seconds, freeing the nodes. The reaper sends SIGTERM, waits a 30 second
-       grace, then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
+       seconds, freeing the nodes. The reaper sends SIGTERM, waits ``kill_wait_secs``,
+       then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
        Mirrors Slurm's ``InactiveLimit``; the value in effect is shown by
        ``scontrol show config``. Must be at least twice the client keepalive
        interval (60 seconds); smaller non-zero values are rejected at startup so a
@@ -739,12 +739,14 @@ Reaping abandoned interactive allocations (``inactive_limit_secs``)
 ``salloc`` and standalone ``srun`` (with or without ``--pty``) ping the
 controller every 30 seconds for as long as the client is running. When the pings
 stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
-allocation is reaped: SIGTERM, a 30 second grace, then SIGKILL. The SIGTERM is
-final: a client that reconnects during the grace does not save the allocation,
-and the job ends ``TIMEOUT`` however its processes exit. With the default, an
-abandoned allocation is signalled 270 to 310 seconds after its client is lost
-(the last ping can be up to 30 seconds old) and is finished within about 40
-seconds of the signal.
+allocation is reaped: SIGTERM, a wait of ``kill_wait_secs`` (default 30
+seconds), then SIGKILL. The controller times the wait and the SIGTERM is
+delivered as a signal only, so the node never ends the job on its own during
+it. The SIGTERM is final: a client that reconnects during the wait does not save
+the allocation, and the job ends ``TIMEOUT`` however its processes exit. With
+the defaults, an abandoned allocation is signalled 270 to 310 seconds after its
+client is lost (the last ping can be up to 30 seconds old) and is finished
+within about 40 seconds of the signal.
 
 The limit measures the client, not the job. A busy job whose client is gone is
 reaped, and so is one whose client is only stopped, such as a foreground

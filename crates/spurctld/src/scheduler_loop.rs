@@ -13,8 +13,8 @@ use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
-    RegisterJobAllocationRequest, SubmitJobRequest,
+    AgentCancelJobRequest, AgentSignalJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec,
+    LaunchJobRequest, RegisterJobAllocationRequest, SignalTarget, SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{Assignment, ClusterState, Scheduler};
@@ -27,10 +27,6 @@ use crate::raft::RaftHandle;
 /// awaits delivery. Best-effort cleanup must not stall eviction on an
 /// unreachable agent.
 const CANCEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Grace between SIGTERM and SIGKILL when force-finishing a job. The time-limit
-/// and inactive-limit watchdogs share it so the two windows can't drift apart.
-const GRACE_PERIOD_SECS: i64 = 30;
 
 fn node_comm_socket(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
@@ -3155,65 +3151,88 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
             let Some(job) = by_id.get(&job_id) else {
                 continue;
             };
-
-            match signaled.get(&job_id) {
-                None => {
-                    info!(
-                        job_id,
-                        limit_secs,
-                        grace_secs = GRACE_PERIOD_SECS,
-                        "interactive allocation idle past InactiveLimit — sending SIGTERM, grace period starts"
-                    );
-                    // Record before signalling, as the time-limit watchdog does:
-                    // the agent ends a run it is sent this SIGTERM for, and a run
-                    // that exits on it must finalize as TIMEOUT on every path
-                    // rather than as a plain signal death.
-                    if let Err(e) = cluster.signal_time_limit(job_id, now) {
-                        warn!(job_id, error = %e, "failed to record InactiveLimit reap");
-                        continue;
-                    }
-                    send_cancel_to_agents(&cluster, job, 15).await; // SIGTERM
-                    signaled.insert(job_id, now);
-                }
-                Some(signaled_at) if (now - *signaled_at).num_seconds() < GRACE_PERIOD_SECS => {}
-                Some(_) => {
-                    // Re-fetch before finalizing: if the job was requeued and
-                    // redispatched as a new run under the same id since the
-                    // snapshot, `complete_job`'s terminal-state guard would not
-                    // catch it and the SIGKILL could hit the new run.
-                    let Some(fresh) = cluster.get_job(job_id) else {
-                        signaled.remove(&job_id);
-                        continue;
-                    };
-                    if fresh.state != JobState::Running || fresh.run_attempt != job.run_attempt {
-                        signaled.remove(&job_id);
-                        continue;
-                    }
-
-                    info!(
-                        job_id,
-                        "InactiveLimit grace expired — force-killing allocation"
-                    );
-
-                    if let Err(e) = cluster.complete_job(job_id, -1, JobState::Timeout) {
-                        warn!(job_id, error = %e, "failed to reap inactive allocation");
-                        continue;
-                    }
-
-                    // SIGKILL on the run's current nodes, not the stale snapshot.
-                    send_cancel_to_nodes(
-                        &cluster,
-                        job_id,
-                        fresh.run_attempt,
-                        &fresh.allocated_nodes,
-                        9,
-                    )
-                    .await;
-                    signaled.remove(&job_id);
-                }
-            }
+            reap_inactive_job(&cluster, job, &mut signaled, now).await;
         }
     }
+}
+
+/// Advance one idle allocation through the InactiveLimit sequence: the first
+/// time it is seen, record the reap and send SIGTERM; once the window has
+/// elapsed without the client pinging again, finalize it as TIMEOUT and SIGKILL.
+async fn reap_inactive_job(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+    signaled: &mut HashMap<spur_core::job::JobId, DateTime<Utc>>,
+    now: DateTime<Utc>,
+) {
+    use spur_core::job::JobState;
+
+    let job_id = job.job_id;
+    let kill_wait_secs = cluster.config().scheduler.effective_kill_wait_secs();
+    let Some(signaled_at) = signaled.get(&job_id).copied() else {
+        info!(
+            job_id,
+            grace_secs = kill_wait_secs,
+            "interactive allocation idle past InactiveLimit — sending SIGTERM, grace period starts"
+        );
+        // Record before signalling: a run that exits on this SIGTERM
+        // must finalize as TIMEOUT on every path rather than as a
+        // plain signal death.
+        if let Err(e) = cluster.signal_time_limit(job_id, now) {
+            warn!(job_id, error = %e, "failed to record InactiveLimit reap");
+            return;
+        }
+        // Signal-only: the agent must not end the run while the client can
+        // still ping and call the kill off.
+        send_signal_to_nodes(
+            cluster,
+            job_id,
+            job.run_attempt,
+            &job.allocated_nodes,
+            &[15], // SIGTERM
+            SignalTarget::Full,
+        )
+        .await;
+        signaled.insert(job_id, now);
+        return;
+    };
+    if (now - signaled_at).num_seconds() < i64::from(kill_wait_secs) {
+        return;
+    }
+
+    // Re-fetch before finalizing: if the job was requeued and
+    // redispatched as a new run under the same id since the
+    // snapshot, `complete_job`'s terminal-state guard would not
+    // catch it and the SIGKILL could hit the new run.
+    let Some(fresh) = cluster.get_job(job_id) else {
+        signaled.remove(&job_id);
+        return;
+    };
+    if fresh.state != JobState::Running || fresh.run_attempt != job.run_attempt {
+        signaled.remove(&job_id);
+        return;
+    }
+
+    info!(
+        job_id,
+        "InactiveLimit grace expired — force-killing allocation"
+    );
+
+    if let Err(e) = cluster.complete_job(job_id, -1, JobState::Timeout) {
+        warn!(job_id, error = %e, "failed to reap inactive allocation");
+        return;
+    }
+
+    // SIGKILL on the run's current nodes, not the stale snapshot.
+    send_cancel_to_nodes(
+        cluster,
+        job_id,
+        fresh.run_attempt,
+        &fresh.allocated_nodes,
+        9,
+    )
+    .await;
+    signaled.remove(&job_id);
 }
 
 /// Force-finish jobs stuck in COMPLETING past `complete_wait_secs`.
@@ -3691,30 +3710,40 @@ fn cancel_agent_addrs(
     job_id: spur_core::job::JobId,
     node_names: &[String],
 ) -> Vec<String> {
-    let mut addrs = Vec::with_capacity(node_names.len());
+    resolve_agents(cluster, job_id, node_names)
+        .into_iter()
+        .map(|(addr, _)| addr)
+        .collect()
+}
+
+/// Like `cancel_agent_addrs`, but keeps each node so callers can look at what
+/// its agent supports.
+fn resolve_agents(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    node_names: &[String],
+) -> Vec<(String, Node)> {
+    let mut agents = Vec::with_capacity(node_names.len());
     for node_name in node_names {
-        match cluster.get_node(node_name) {
-            Some(ref n) => {
-                if let Some(url) = node_comm_http_url(n) {
-                    addrs.push(url);
-                } else {
-                    warn!(
-                        job_id,
-                        node = %node_name,
-                        "no comm address — cannot cancel job on node"
-                    );
-                }
-            }
-            _ => {
-                warn!(
-                    job_id,
-                    node = %node_name,
-                    "no agent address — cannot cancel job on node"
-                );
-            }
-        }
+        let Some(node) = cluster.get_node(node_name) else {
+            warn!(
+                job_id,
+                node = %node_name,
+                "no agent address — cannot reach node for job"
+            );
+            continue;
+        };
+        let Some(url) = node_comm_http_url(&node) else {
+            warn!(
+                job_id,
+                node = %node_name,
+                "no comm address — cannot reach node for job"
+            );
+            continue;
+        };
+        agents.push((url, node));
     }
-    addrs
+    agents
 }
 
 /// Deliver one CancelJob RPC, bounded by `CANCEL_RPC_TIMEOUT`. Errors and
@@ -3769,6 +3798,111 @@ async fn cancel_one_agent(
             agent = %agent_addr,
             "CancelJob RPC timed out"
         );
+    }
+}
+
+/// Deliver `signals`, in order, to every node in `node_names` without any of
+/// the agent's termination escalation. Nodes run concurrently on their own
+/// tasks and this returns immediately; each RPC is bounded by
+/// `CANCEL_RPC_TIMEOUT`.
+///
+/// A node whose agent predates `SignalJob` gets the signals through
+/// `CancelJob` instead, which only a `Full` target can stand in for; any other
+/// target skips the node, so callers gate on the capability before choosing one.
+pub async fn send_signal_to_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+    signals: &[i32],
+    target: SignalTarget,
+) {
+    for (agent_addr, node) in resolve_agents(cluster, job_id, node_names) {
+        if node.supports(spur_core::node::CAP_SIGNAL_JOB) {
+            tokio::spawn(signal_one_agent(
+                agent_addr,
+                job_id,
+                run_attempt,
+                signals.to_vec(),
+                target,
+            ));
+        } else if target == SignalTarget::Full {
+            tokio::spawn(cancel_with_signals(
+                agent_addr,
+                job_id,
+                run_attempt,
+                signals.to_vec(),
+            ));
+        } else {
+            warn!(
+                job_id,
+                node = %node.name,
+                ?target,
+                "agent does not support SignalJob — skipping signal"
+            );
+        }
+    }
+}
+
+/// Legacy delivery: one signal-carrying `CancelJob` per signal, in order.
+async fn cancel_with_signals(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    signals: Vec<i32>,
+) {
+    for signal in signals {
+        cancel_one_agent(agent_addr.clone(), job_id, run_attempt, signal, 0).await;
+    }
+}
+
+/// Deliver `signals` to one agent through `SignalJob`, in order. A failed
+/// signal is logged and the rest still go out: they are independent warnings,
+/// not steps that depend on each other.
+async fn signal_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    signals: Vec<i32>,
+    target: SignalTarget,
+) {
+    for signal in signals {
+        let attempt = async {
+            let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
+                Ok(client) => client,
+                Err(e) => {
+                    warn!(
+                        job_id,
+                        agent = %agent_addr,
+                        error = %e,
+                        "failed to connect to agent for signal"
+                    );
+                    return;
+                }
+            };
+            let request = AgentSignalJobRequest {
+                job_id,
+                run_attempt,
+                signal,
+                target: target as i32,
+            };
+            match client.signal_job(request).await {
+                Ok(_) => info!(job_id, signal, ?target, agent = %agent_addr, "sent SignalJob"),
+                Err(e) => warn!(
+                    job_id,
+                    signal,
+                    agent = %agent_addr,
+                    error = %e,
+                    "SignalJob RPC failed"
+                ),
+            }
+        };
+        if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
+            .await
+            .is_err()
+        {
+            warn!(job_id, signal, agent = %agent_addr, "SignalJob RPC timed out");
+        }
     }
 }
 
@@ -5021,6 +5155,7 @@ mod tests {
             reject_start: bool,
             cancelled_attempts: Arc<std::sync::Mutex<Vec<u32>>>,
             cancel_requests: Arc<std::sync::Mutex<Vec<spur_proto::proto::AgentCancelJobRequest>>>,
+            signal_requests: Arc<std::sync::Mutex<Vec<spur_proto::proto::AgentSignalJobRequest>>>,
             suspend_calls: Arc<AtomicU32>,
         }
 
@@ -5121,8 +5256,12 @@ mod tests {
 
             async fn signal_job(
                 &self,
-                _request: tonic::Request<spur_proto::proto::AgentSignalJobRequest>,
+                request: tonic::Request<spur_proto::proto::AgentSignalJobRequest>,
             ) -> Result<tonic::Response<()>, tonic::Status> {
+                self.signal_requests
+                    .lock()
+                    .unwrap()
+                    .push(*request.get_ref());
                 Ok(tonic::Response::new(()))
             }
 
@@ -5406,6 +5545,7 @@ mod tests {
                 cancel_delay,
                 cancelled_attempts: Default::default(),
                 cancel_requests: Default::default(),
+                signal_requests: Default::default(),
                 suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
@@ -5437,6 +5577,7 @@ mod tests {
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
                 cancel_requests: Default::default(),
+                signal_requests: Default::default(),
                 suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
@@ -5468,6 +5609,7 @@ mod tests {
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
                 cancel_requests: Default::default(),
+                signal_requests: Default::default(),
                 suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
@@ -5503,6 +5645,7 @@ mod tests {
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: cancelled_attempts.clone(),
                 cancel_requests: Default::default(),
+                signal_requests: Default::default(),
                 suspend_calls: suspend_calls.clone(),
             };
             tokio::spawn(async move {
@@ -5516,14 +5659,16 @@ mod tests {
             (addr, cancelled_attempts, suspend_calls)
         }
 
-        /// Mock agent that keeps every `CancelJob` request it receives.
-        async fn spawn_mock_agent_recording_cancel_requests() -> (
+        /// Mock agent that keeps every `CancelJob` and `SignalJob` request it receives.
+        async fn spawn_mock_agent_recording_requests() -> (
             std::net::SocketAddr,
             Arc<std::sync::Mutex<Vec<spur_proto::proto::AgentCancelJobRequest>>>,
+            Arc<std::sync::Mutex<Vec<spur_proto::proto::AgentSignalJobRequest>>>,
         ) {
             let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = incoming.local_addr().unwrap();
             let cancel_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let signal_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
             let agent = MockAgent {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
@@ -5536,6 +5681,7 @@ mod tests {
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
                 cancel_requests: cancel_requests.clone(),
+                signal_requests: signal_requests.clone(),
                 suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
@@ -5546,7 +5692,7 @@ mod tests {
                     .serve_with_incoming(incoming)
                     .await;
             });
-            (addr, cancel_requests)
+            (addr, cancel_requests, signal_requests)
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted,
@@ -5659,6 +5805,15 @@ mod tests {
         }
 
         fn register_node_at(cm: &ClusterManager, name: &str, addr: std::net::SocketAddr) {
+            register_node_with_capabilities(cm, name, addr, Vec::new());
+        }
+
+        fn register_node_with_capabilities(
+            cm: &ClusterManager,
+            name: &str,
+            addr: std::net::SocketAddr,
+            capabilities: Vec<String>,
+        ) {
             cm.register_node(
                 name.into(),
                 name.into(),
@@ -5673,7 +5828,7 @@ mod tests {
                 String::new(),
                 NodeSource::NativeHost,
                 HashMap::new(),
-                Vec::new(),
+                capabilities,
                 true,
             )
             .unwrap();
@@ -5846,7 +6001,7 @@ mod tests {
         async fn a_graceful_cancel_carries_the_configured_kill_wait() {
             let dir = TempDir::new().unwrap();
             let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
-            let (addr, requests) = spawn_mock_agent_recording_cancel_requests().await;
+            let (addr, requests, _) = spawn_mock_agent_recording_requests().await;
             register_node_at(&cm, "n1", addr);
             let job = run_on(&cm, "graceful", "n1");
 
@@ -5884,7 +6039,7 @@ mod tests {
             use spur_core::job::JobState;
             let dir = TempDir::new().unwrap();
             let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
-            let (addr, requests) = spawn_mock_agent_recording_cancel_requests().await;
+            let (addr, requests, _) = spawn_mock_agent_recording_requests().await;
             register_node_at(&cm, "n1", addr);
             let job = run_with_time_limit(&cm, "n1");
             let start = job.start_time.expect("a running job has a start time");
@@ -5906,6 +6061,133 @@ mod tests {
                 .map(|r| (r.signal, r.kill_wait_secs))
                 .collect();
             assert_eq!(seen, [(0, 30)]);
+        }
+
+        const SIGNAL_JOB_CAPABILITY: &str = spur_core::node::CAP_SIGNAL_JOB;
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn inactive_limit_sigterm_uses_signal_job_full() {
+            use spur_core::job::JobState;
+            use spur_proto::proto::SignalTarget;
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+            register_node_with_capabilities(&cm, "n1", addr, vec![SIGNAL_JOB_CAPABILITY.into()]);
+            let job = run_on(&cm, "idle", "n1");
+
+            reap_inactive_job(&cm, &job, &mut HashMap::new(), Utc::now()).await;
+            wait_for("SIGTERM delivered", || !signals.lock().unwrap().is_empty());
+
+            let seen: Vec<(u32, u32, i32, i32)> = signals
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.job_id, r.run_attempt, r.signal, r.target))
+                .collect();
+            assert_eq!(
+                seen,
+                [(job.job_id, job.run_attempt, 15, SignalTarget::Full as i32)]
+            );
+            assert!(cancels.lock().unwrap().is_empty(), "no CancelJob SIGTERM");
+            assert_eq!(cm.get_job(job.job_id).unwrap().state, JobState::Running);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn inactive_limit_falls_back_to_cancel_on_nodes_without_capability() {
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "idle", "n1");
+
+            reap_inactive_job(&cm, &job, &mut HashMap::new(), Utc::now()).await;
+            wait_for("SIGTERM delivered", || !cancels.lock().unwrap().is_empty());
+
+            let seen: Vec<(i32, u32)> = cancels
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.signal, r.kill_wait_secs))
+                .collect();
+            assert_eq!(seen, [(15, 0)]);
+            assert!(signals.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn inactive_limit_window_is_the_kill_wait() {
+            use spur_core::job::JobState;
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.scheduler.kill_wait_secs = 45;
+            let cm = crate::cluster::gated::cluster(&dir, config).await.0;
+            let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+            register_node_with_capabilities(&cm, "n1", addr, vec![SIGNAL_JOB_CAPABILITY.into()]);
+            let job = run_on(&cm, "idle", "n1");
+            let t0 = Utc::now();
+            let mut signaled = HashMap::new();
+
+            reap_inactive_job(&cm, &job, &mut signaled, t0).await;
+            wait_for("SIGTERM delivered", || !signals.lock().unwrap().is_empty());
+
+            reap_inactive_job(&cm, &job, &mut signaled, t0 + chrono::Duration::seconds(44)).await;
+            assert_eq!(cm.get_job(job.job_id).unwrap().state, JobState::Running);
+            assert!(signaled.contains_key(&job.job_id));
+
+            reap_inactive_job(&cm, &job, &mut signaled, t0 + chrono::Duration::seconds(45)).await;
+            settle(&cm, job.job_id, JobState::Timeout);
+            wait_for("SIGKILL delivered", || !cancels.lock().unwrap().is_empty());
+            let killed: Vec<i32> = cancels.lock().unwrap().iter().map(|r| r.signal).collect();
+            assert_eq!(killed, [9]);
+            assert!(signaled.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn signals_reach_each_node_in_order_and_skip_legacy_nodes_for_partial_targets() {
+            use spur_proto::proto::SignalTarget;
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let (new_addr, new_cancels, new_signals) = spawn_mock_agent_recording_requests().await;
+            let (old_addr, old_cancels, old_signals) = spawn_mock_agent_recording_requests().await;
+            register_node_with_capabilities(
+                &cm,
+                "new",
+                new_addr,
+                vec![SIGNAL_JOB_CAPABILITY.into()],
+            );
+            register_node_at(&cm, "old", old_addr);
+            let nodes = ["new".to_string(), "old".to_string()];
+
+            send_signal_to_nodes(&cm, 7, 3, &nodes, &[18, 15], SignalTarget::Steps).await;
+            wait_for("both signals reach the capable node", || {
+                new_signals.lock().unwrap().len() == 2
+            });
+            let seen: Vec<(i32, i32, u32)> = new_signals
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.signal, r.target, r.run_attempt))
+                .collect();
+            let steps = SignalTarget::Steps as i32;
+            assert_eq!(seen, [(18, steps, 3), (15, steps, 3)]);
+            assert!(old_signals.lock().unwrap().is_empty());
+            assert!(
+                old_cancels.lock().unwrap().is_empty(),
+                "skipped, not cancelled"
+            );
+            assert!(new_cancels.lock().unwrap().is_empty());
+
+            send_signal_to_nodes(&cm, 7, 3, &nodes, &[18, 15], SignalTarget::Full).await;
+            wait_for("both signals reach the legacy node", || {
+                old_cancels.lock().unwrap().len() == 2
+            });
+            let legacy: Vec<(i32, u32)> = old_cancels
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.signal, r.run_attempt))
+                .collect();
+            assert_eq!(legacy, [(18, 3), (15, 3)]);
+            assert!(old_signals.lock().unwrap().is_empty());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
