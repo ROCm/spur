@@ -12520,6 +12520,28 @@ state = "UP"
         });
     }
 
+    /// The path every pre-upgrade node takes to gain a capability: its resources
+    /// also changed (or it would take the skip path), so the update arm must
+    /// carry the capabilities too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn re_registration_with_changed_resources_records_new_capabilities() {
+        use spur_core::node::CAP_SIGNAL_JOB;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        try_register_node(&cm, "n1", 4, 1024).unwrap();
+        wait_for("n1 registered", || cm.get_node("n1").is_some());
+        assert!(!cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
+
+        try_register_node_with_capabilities(&cm, "n1", 8, 2048, vec![CAP_SIGNAL_JOB.into()])
+            .unwrap();
+
+        wait_for("update applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.detected_resources.cpus == 8)
+        });
+        assert!(cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
+    }
+
     fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
         try_register_node(cm, name, cpus, mem).unwrap();
         let n = name.to_string();
