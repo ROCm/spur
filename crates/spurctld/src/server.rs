@@ -1479,9 +1479,16 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
     }
     // A cancel this old that the node is still claiming never reached it
     // (an agent that was down when it was sent); the run is over regardless.
+    // Not inside a grace: a first-exit stamps the cancel time while the other
+    // nodes are still draining their warned step until the deadline.
     if job.cancel_signaled_at.is_some_and(|at| {
+        let now = Utc::now();
         let kill_wait = cluster.config().scheduler.effective_kill_wait_secs();
-        Utc::now() - at > cancel_reclaim_grace(kill_wait)
+        let in_grace = job
+            .preempt_pending
+            .as_ref()
+            .is_some_and(|p| p.deadline > now);
+        !in_grace && now - at > cancel_reclaim_grace(kill_wait)
     }) {
         return true;
     }
@@ -7667,6 +7674,90 @@ mod tests {
         assert!(
             is_reclaimable(&cluster, "n2", &report_run(92, 0)),
             "a straggler past twice the kill wait never got the terminate"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_reclaimable_spares_a_grace_straggler_until_the_deadline() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState, PreemptPending};
+        use spur_core::partition::PreemptMode;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = test_slurm_config();
+        config.scheduler.kill_wait_secs = 30;
+        let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
+        // Node n1 reported 70 s ago; the grace deadline is `deadline_in` seconds from now.
+        let in_grace = |job_id: u32, deadline_in: i64| {
+            apply(&WalOperation::JobSubmit {
+                job_id,
+                spec: Box::new(JobSpec {
+                    name: "victim".into(),
+                    user: "alice".into(),
+                    num_nodes: 2,
+                    num_tasks: 2,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            });
+            let per_node = std::collections::HashMap::from([
+                ("n1".to_string(), res.clone()),
+                ("n2".to_string(), res.clone()),
+            ]);
+            apply(&WalOperation::job_start(
+                job_id,
+                vec!["n1".into(), "n2".into()],
+                res.clone(),
+                per_node,
+            ));
+            apply(&WalOperation::job_state_change(
+                job_id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            let deadline = Utc::now() + chrono::Duration::seconds(deadline_in);
+            apply(&WalOperation::JobPreemptSignaled {
+                job_id,
+                pending: PreemptPending {
+                    signaled_at: deadline - chrono::Duration::seconds(600),
+                    deadline,
+                    preempted_by: 99,
+                    preempt_qos: None,
+                    mode: PreemptMode::Cancel,
+                    run_attempt: cluster.get_job(job_id).unwrap().run_attempt,
+                    requeue_hold_secs: 30,
+                },
+            });
+            apply(&WalOperation::JobNodeComplete {
+                job_id,
+                node_name: "n1".into(),
+                exit_code: 0,
+                signal: 0,
+                run_attempt: 0,
+                at: Some(Utc::now() - chrono::Duration::seconds(70)),
+            });
+            assert_eq!(cluster.get_job(job_id).unwrap().state, JobState::Completing);
+        };
+
+        in_grace(93, 300);
+        in_grace(94, -70);
+
+        assert!(
+            !is_reclaimable(&cluster, "n2", &report_run(93, 0)),
+            "a straggler's grace has not ended; the deadline finalizer owns its terminate"
+        );
+        assert!(
+            is_reclaimable(&cluster, "n2", &report_run(94, 0)),
+            "a straggler well past the deadline never got the terminate"
         );
     }
 
