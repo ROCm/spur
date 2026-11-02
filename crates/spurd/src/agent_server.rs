@@ -10396,13 +10396,8 @@ impl AgentService {
             // Neither stepds nor running names an attempt to scope to, but an
             // orphaned unsupervised step can still outlive both maps — reach
             // it via the wildcard rather than stranding it.
-            self.cancel_active_steps_for_job(
-                job_id,
-                0,
-                signal,
-                Some(EXPLICIT_SIGNAL_STEP_ESCALATION),
-            )
-            .await;
+            self.cancel_active_steps_for_job(job_id, 0, signal, EXPLICIT_SIGNAL_STEP_ESCALATION)
+                .await;
             return;
         };
         // A signal reaches every step the job holds; one failing must not
@@ -10450,7 +10445,7 @@ impl AgentService {
             job_id,
             run_attempt,
             signal,
-            Some(EXPLICIT_SIGNAL_STEP_ESCALATION),
+            EXPLICIT_SIGNAL_STEP_ESCALATION,
         )
         .await;
         if supervised {
@@ -10547,7 +10542,7 @@ impl AgentService {
                     "runtime signal request failed");
             }
         }
-        self.cancel_active_steps_for_job(job_id, run_attempt, signal, None)
+        self.signal_active_steps_for_job(job_id, run_attempt, signal)
             .await;
 
         // A batch supervisor owns the job's processes, so the agent has no
@@ -10623,48 +10618,23 @@ impl AgentService {
     /// `run_attempt == 0` is a wildcard (`stepds_for_attempt`'s own
     /// convention), reached only when nothing named a concrete attempt —
     /// so an orphaned unsupervised step stays reachable, not stranded.
-    /// `escalate_after` is the SIGKILL delay; `None` never escalates.
+    /// `escalate_after` is the SIGKILL delay.
     async fn cancel_active_steps_for_job(
         &self,
         job_id: u32,
         run_attempt: u32,
         signal: i32,
-        escalate_after: Option<std::time::Duration>,
+        escalate_after: std::time::Duration,
     ) {
-        let supervised: Vec<spur_core::step::StepId> =
-            stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
-                .iter()
-                .map(|descriptor| descriptor.step_id)
-                .collect();
-        // Snapshot (key, pid, epoch) under the lock, then signal *outside* it:
-        // signal_step_tree walks /proc, so holding active_steps across it would
-        // block every concurrent run_command (and the ActiveStepGuard's try_lock
-        // cleanup, which silently skips on contention).
-        let targets: Vec<((u32, u32), u32, u64)> = {
-            let mut steps = self.active_steps.lock().await;
-            let mut targets = Vec::new();
-            for (key, step) in steps.iter_mut() {
-                if key.0 == job_id
-                    && (run_attempt == 0 || step.run_attempt == run_attempt)
-                    && !supervised.contains(&key.1)
-                {
-                    step.cancel_requested = true;
-                    if let Some(pid) = step.pid {
-                        targets.push((*key, pid, step.epoch));
-                    }
-                }
-            }
-            targets
-        };
+        let targets = self
+            .unsupervised_step_targets(job_id, run_attempt, true)
+            .await;
         if targets.is_empty() {
             return;
         }
         for (_key, pid, _epoch) in &targets {
             signal_step_tree(*pid, signal);
         }
-        let Some(escalate_after) = escalate_after else {
-            return;
-        };
         // Escalate to SIGKILL: a container-init step ignores the graceful signal.
         // Compare epochs (not pids) so a step that reused the (job, step) key
         // with a recycled pid is never signalled.
@@ -10685,6 +10655,53 @@ impl AgentService {
         });
     }
 
+    /// Delivers one signal to the job's unsupervised steps and nothing more:
+    /// the steps are not marked cancelled, so a step still launching is not
+    /// aborted, and nothing escalates to SIGKILL.
+    async fn signal_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
+        for (_key, pid, _epoch) in self
+            .unsupervised_step_targets(job_id, run_attempt, false)
+            .await
+        {
+            signal_step_tree(pid, signal);
+        }
+    }
+
+    /// Snapshots (key, pid, epoch) of the job's steps that have no supervisor
+    /// and a process to signal; the caller signals *outside* the lock, since
+    /// signal_step_tree walks /proc and holding active_steps across it would
+    /// block every concurrent run_command (and the ActiveStepGuard's try_lock
+    /// cleanup, which silently skips on contention). `mark_cancelled` also
+    /// flags every in-scope step, including one with no pid yet, so a launch
+    /// still in flight aborts.
+    async fn unsupervised_step_targets(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        mark_cancelled: bool,
+    ) -> Vec<((u32, u32), u32, u64)> {
+        let supervised: Vec<spur_core::step::StepId> =
+            stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
+                .iter()
+                .map(|descriptor| descriptor.step_id)
+                .collect();
+        let mut steps = self.active_steps.lock().await;
+        let mut targets = Vec::new();
+        for (key, step) in steps.iter_mut() {
+            let in_scope = key.0 == job_id
+                && (run_attempt == 0 || step.run_attempt == run_attempt)
+                && !supervised.contains(&key.1);
+            if !in_scope {
+                continue;
+            }
+            step.cancel_requested |= mark_cancelled;
+            if let Some(pid) = step.pid {
+                targets.push((*key, pid, step.epoch));
+            }
+        }
+        targets
+    }
+
     async fn graceful_cancel(&self, job_id: u32, run_attempt: u32, kill_wait: std::time::Duration) {
         // A cancel naming an epoch this node no longer runs belongs to a superseded
         // run, and the processes here are the redispatch that replaced it.
@@ -10703,7 +10720,7 @@ impl AgentService {
                 job_id,
                 0,
                 nix::sys::signal::Signal::SIGTERM as i32,
-                Some(kill_wait),
+                kill_wait,
             )
             .await;
             return;
@@ -10779,7 +10796,7 @@ impl AgentService {
             job_id,
             run_attempt,
             nix::sys::signal::Signal::SIGTERM as i32,
-            Some(kill_wait),
+            kill_wait,
         )
         .await;
         if supervised {
@@ -18360,7 +18377,7 @@ mod tests {
             79,
             0,
             nix::sys::signal::Signal::SIGTERM as i32,
-            Some(EXPLICIT_SIGNAL_STEP_ESCALATION),
+            EXPLICIT_SIGNAL_STEP_ESCALATION,
         )
         .await;
 
@@ -22054,8 +22071,8 @@ mod tests {
             "a signal-only request must never escalate to SIGKILL"
         );
         assert!(
-            svc.step_cancel_requested(912, 4).await,
-            "the unsupervised step must have been signalled"
+            !svc.step_cancel_requested(912, 4).await,
+            "a warning must not mark the step cancelled"
         );
         assert!(svc.running.lock().await.contains_key(&912));
         assert!(svc
@@ -22069,6 +22086,57 @@ mod tests {
             "the attempt must stay accepted, not be cancelled"
         );
         assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_signals_an_unsupervised_step_without_cancelling_it() {
+        let svc = test_agent();
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        svc.register_test_step(919, 4, Some(pid)).await;
+
+        svc.signal_job(signal_job_request(
+            919,
+            0,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        let gone = wait_until_not_running(pid as i32).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(gone, "the step must receive the signal");
+        assert!(!svc.step_cancel_requested(919, 4).await);
+    }
+
+    #[tokio::test]
+    async fn signal_job_does_not_mark_a_launching_step_cancelled() {
+        let svc = test_agent();
+        svc.register_test_step(920, 4, None).await;
+
+        svc.signal_job(signal_job_request(
+            920,
+            0,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+
+        assert!(
+            !svc.step_cancel_requested(920, 4).await,
+            "a step with no pid yet must not be aborted by a warning"
+        );
     }
 
     #[tokio::test]
