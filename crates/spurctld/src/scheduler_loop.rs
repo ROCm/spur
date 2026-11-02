@@ -9621,6 +9621,7 @@ mod tests {
                 let after_deadline = signaled_at + chrono::Duration::seconds(601);
                 (
                     StragglerFixture {
+                        _dir: dir,
                         cm,
                         cancels,
                         after_deadline,
@@ -9630,6 +9631,8 @@ mod tests {
             }
 
             struct StragglerFixture {
+                /// Keeps the controller's state directory alive for later writes.
+                _dir: TempDir,
                 cm: Arc<ClusterManager>,
                 cancels: Cancels,
                 after_deadline: DateTime<Utc>,
@@ -9704,6 +9707,34 @@ mod tests {
                 finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
 
                 assert_eq!(cancelled.keys().copied().collect::<Vec<_>>(), [key]);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn partial_exit_then_deadline_still_preempts() {
+                let (f, victim) = completing_victim_with_a_straggler().await;
+                let mut cancelled = StragglerCancels::new();
+                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
+                assert_eq!(
+                    f.cm.get_job(victim.job_id).unwrap().state,
+                    JobState::Completing,
+                    "the deadline leaves the finish to the stragglers' reports"
+                );
+
+                let result =
+                    f.cm.node_complete(victim.job_id, "n2", -1, 15, victim.run_attempt)
+                        .unwrap();
+
+                assert!(matches!(
+                    result,
+                    crate::cluster::NodeCompleteResult::AllDone {
+                        state: JobState::Preempted,
+                        ..
+                    }
+                ));
+                let job = f.cm.get_job(victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Cancelled);
+                assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+                assert!(job.preempt_pending.is_none());
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

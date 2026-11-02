@@ -7580,6 +7580,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn is_reclaimable_recovers_a_lost_terminate_for_a_completing_grace_victim() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState, PreemptPending};
+        use spur_core::partition::PreemptMode;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = test_slurm_config();
+        config.scheduler.kill_wait_secs = 30;
+        let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
+        let first_report_ago = |job_id: u32, ago_secs: i64| {
+            apply(&WalOperation::JobSubmit {
+                job_id,
+                spec: Box::new(JobSpec {
+                    name: "victim".into(),
+                    user: "alice".into(),
+                    num_nodes: 2,
+                    num_tasks: 2,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            });
+            let per_node = std::collections::HashMap::from([
+                ("n1".to_string(), res.clone()),
+                ("n2".to_string(), res.clone()),
+            ]);
+            apply(&WalOperation::job_start(
+                job_id,
+                vec!["n1".into(), "n2".into()],
+                res.clone(),
+                per_node,
+            ));
+            apply(&WalOperation::job_state_change(
+                job_id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            let signaled_at = Utc::now() - chrono::Duration::seconds(ago_secs + 60);
+            apply(&WalOperation::JobPreemptSignaled {
+                job_id,
+                pending: PreemptPending {
+                    signaled_at,
+                    deadline: signaled_at + chrono::Duration::seconds(60),
+                    preempted_by: 99,
+                    preempt_qos: None,
+                    mode: PreemptMode::Cancel,
+                    run_attempt: cluster.get_job(job_id).unwrap().run_attempt,
+                    requeue_hold_secs: 30,
+                },
+            });
+            apply(&WalOperation::JobNodeComplete {
+                job_id,
+                node_name: "n1".into(),
+                exit_code: 0,
+                signal: 0,
+                run_attempt: 0,
+                at: Some(Utc::now() - chrono::Duration::seconds(ago_secs)),
+            });
+            assert_eq!(cluster.get_job(job_id).unwrap().state, JobState::Completing);
+        };
+
+        first_report_ago(91, 20);
+        first_report_ago(92, 70);
+
+        assert!(
+            !is_reclaimable(&cluster, "n2", &report_run(91, 0)),
+            "a straggler inside the kill wait may still be tearing down"
+        );
+        assert!(
+            is_reclaimable(&cluster, "n2", &report_run(92, 0)),
+            "a straggler past twice the kill wait never got the terminate"
+        );
+    }
+
     /// GATE: for an agent that names no run, a job requeued (Timeout -> Pending) after
     /// the reclaim snapshot must fail the re-check, not just the snapshot.
     #[tokio::test]

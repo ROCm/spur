@@ -1564,6 +1564,9 @@ impl Job {
             (JobState::Completing, JobState::Timeout) => true,
             (JobState::Completing, JobState::NodeFail) => true,
             (JobState::Completing, JobState::OutOfMemory) => true,
+            // A victim that exits during its preemption grace ends the run as
+            // preempted, whether it is then re-pended or cancelled.
+            (JobState::Completing, JobState::Preempted) => true,
             (JobState::Suspended, JobState::Running) => true,
             (JobState::Suspended, JobState::Cancelled) => true,
             // Completion routes through Completing like a running job (Slurm JOB_COMPLETING).
@@ -2484,6 +2487,18 @@ mod tests {
             JobState::from_proto(JobState::Requeued.to_proto()),
             JobState::Requeued
         );
+    }
+
+    #[test]
+    fn a_completing_run_can_end_preempted_and_then_re_pend() {
+        let mut job = make_job();
+        job.transition(JobState::Running).unwrap();
+        job.transition(JobState::Completing).unwrap();
+
+        job.transition(JobState::Preempted).unwrap();
+        job.transition(JobState::Pending).unwrap();
+
+        assert_eq!(job.state, JobState::Pending);
     }
 
     #[test]
