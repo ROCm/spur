@@ -7118,9 +7118,14 @@ impl SlurmAgent for AgentService {
 
     async fn signal_job(
         &self,
-        _request: Request<AgentSignalJobRequest>,
+        request: Request<AgentSignalJobRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("SignalJob is not implemented yet"))
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let target = SignalTarget::try_from(req.target).unwrap_or(SignalTarget::Unspecified);
+        self.deliver_signal(req.job_id, req.run_attempt, req.signal, target)
+            .await?;
+        Ok(Response::new(()))
     }
 
     async fn cancel_job(
@@ -10493,6 +10498,75 @@ impl AgentService {
             )
             .await;
         }
+    }
+
+    /// Deliver a signal and nothing else: no launch fencing, release wait,
+    /// teardown or escalation, so a warning leaves the run alive to react to it.
+    async fn deliver_signal(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        signal: i32,
+        target: SignalTarget,
+    ) -> Result<(), Status> {
+        let include_batch = match target {
+            SignalTarget::Steps => false,
+            SignalTarget::Full => true,
+            SignalTarget::Batch => {
+                return Err(Status::unimplemented(
+                    "signalling only the batch script is not supported",
+                ))
+            }
+            SignalTarget::Unspecified => {
+                return Err(Status::invalid_argument("a signal target is required"))
+            }
+        };
+        let sig = nix::sys::signal::Signal::try_from(signal)
+            .map_err(|_| Status::invalid_argument(format!("invalid signal {signal}")))?;
+        if !self.runs_attempt(job_id, run_attempt).await {
+            warn!(
+                job_id,
+                run_attempt, signal, "dropping a signal for a superseded run"
+            );
+            return Ok(());
+        }
+
+        let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
+        for descriptor in runtimes
+            .iter()
+            .filter(|descriptor| include_batch || descriptor.step_id != spur_core::step::STEP_BATCH)
+        {
+            if let Err(error) = crate::stepd::signal_allocation(
+                descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                signal,
+            )
+            .await
+            {
+                warn!(job_id, step_id = descriptor.step_id, %error,
+                    "runtime signal request failed");
+            }
+        }
+        self.cancel_active_steps_for_job(job_id, run_attempt, signal, None)
+            .await;
+
+        // A batch supervisor owns the job's processes, so the agent has no
+        // handle of its own to signal.
+        if !include_batch || owns_job_processes(&runtimes) {
+            return Ok(());
+        }
+        let jobs = self.running.lock().await;
+        let Some(tracked) = jobs.get(&job_id).filter(|tracked| {
+            !tracked.job.is_allocation_only()
+                && (run_attempt == 0 || tracked.run_attempt == run_attempt)
+        }) else {
+            return Ok(());
+        };
+        info!(job_id, signal, "signalling the unsupervised job");
+        if let Err(error) = tracked.job.kill_signal(sig) {
+            warn!(job_id, signal, %error, "failed to signal the unsupervised job");
+        }
+        Ok(())
     }
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
@@ -21730,6 +21804,413 @@ mod tests {
             "send_explicit_signal must not return before the job's running entry clears"
         );
         server.await.expect("runtime control server");
+    }
+
+    /// Serves a stepd's control socket, acknowledging every request, until it
+    /// is asked to shut down; the shutdown ends the loop so the test learns
+    /// exactly which requests arrived before it, without a timeout.
+    fn serve_recording_stepd(
+        listener: tokio::net::UnixListener,
+        descriptor: crate::stepd::StepdDescriptor,
+    ) -> tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        tokio::spawn(async move {
+            let mut received = Vec::new();
+            loop {
+                let (stream, _) =
+                    crate::stepd::accept_hello(&listener, &descriptor, &descriptor.capability)
+                        .await
+                        .expect("accept runtime hello");
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut line)
+                    .await
+                    .expect("read runtime request");
+                let request: crate::stepd::StepdRequest =
+                    serde_json::from_str(&line).expect("decode runtime request");
+                let acknowledgement =
+                    serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
+                        .expect("encode acknowledgement");
+                writer
+                    .write_all(format!("{acknowledgement}\n").as_bytes())
+                    .await
+                    .expect("acknowledge runtime request");
+                let stop = request == crate::stepd::StepdRequest::Shutdown;
+                received.push(request);
+                if stop {
+                    return received;
+                }
+            }
+        })
+    }
+
+    /// Binds a recording stepd for one step of a job and registers it with `svc`.
+    async fn register_recording_stepd(
+        svc: &AgentService,
+        dir: &std::path::Path,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> (
+        crate::stepd::StepdDescriptor,
+        tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>>,
+    ) {
+        let socket_path = dir.join(format!("step-{step_id}.sock"));
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "signal-job-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let server = serve_recording_stepd(listener, descriptor.clone());
+        (descriptor, server)
+    }
+
+    /// Everything the stepd was asked before this call, minus the shutdown
+    /// that ends the recording.
+    async fn finish_recording_stepd(
+        descriptor: &crate::stepd::StepdDescriptor,
+        server: tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>>,
+    ) -> Vec<crate::stepd::StepdRequest> {
+        crate::stepd::shutdown_allocation(descriptor, uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("stop the recording stepd");
+        let mut received = server.await.expect("recording stepd");
+        assert_eq!(
+            received.pop(),
+            Some(crate::stepd::StepdRequest::Shutdown),
+            "the recording ends on the test's own shutdown"
+        );
+        received
+    }
+
+    fn signal_job_request(
+        job_id: u32,
+        run_attempt: u32,
+        signal: nix::sys::signal::Signal,
+        target: SignalTarget,
+    ) -> Request<AgentSignalJobRequest> {
+        let mut req = Request::new(AgentSignalJobRequest {
+            job_id,
+            run_attempt,
+            signal: signal as i32,
+            target: target as i32,
+        });
+        req.extensions_mut().insert(controller_identity());
+        req
+    }
+
+    fn sigterm_request() -> crate::stepd::StepdRequest {
+        crate::stepd::StepdRequest::SignalAllocation {
+            signal: nix::sys::signal::Signal::SIGTERM as i32,
+        }
+    }
+
+    fn test_agent() -> AgentService {
+        AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    #[tokio::test]
+    async fn signal_job_steps_target_skips_the_batch_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 910, 1, spur_core::step::STEP_BATCH).await;
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 910, 1, 0).await;
+
+        svc.signal_job(signal_job_request(
+            910,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+
+        assert_eq!(
+            finish_recording_stepd(&step, step_server).await,
+            vec![sigterm_request()]
+        );
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_full_target_reaches_every_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 911, 1, spur_core::step::STEP_BATCH).await;
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 911, 1, 0).await;
+
+        svc.signal_job(signal_job_request(
+            911,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("signal job");
+
+        assert_eq!(
+            finish_recording_stepd(&step, step_server).await,
+            vec![sigterm_request()]
+        );
+        assert_eq!(
+            finish_recording_stepd(&batch, batch_server).await,
+            vec![sigterm_request()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signal_job_never_escalates() {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential};
+
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 912, 1, spur_core::step::STEP_BATCH).await;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(912, tracked).await;
+        let child = spawn_term_ignoring_process().await;
+        let pid = child.id().expect("pid");
+        svc.register_test_step(912, 4, Some(pid)).await;
+        let credential = ExecutionCredential {
+            kind: CredentialKind::Job,
+            cluster_id: "cluster-a".into(),
+            key_id: String::new(),
+            job_id: 912,
+            step_id: spur_core::step::STEP_BATCH,
+            run_attempt: 1,
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![],
+            account: "research".into(),
+            partition: "gpu".into(),
+            qos: String::new(),
+            resources_by_node: vec![],
+            command_digest: [1u8; spur_core::native_cred::DIGEST_LEN],
+            container_digest: None,
+            issued_at: 0,
+            not_before: 0,
+            expires_at: 0,
+            credential_id: [2u8; spur_core::native_cred::CREDENTIAL_ID_LEN],
+        };
+        assert_eq!(svc.launch_acceptance.accept(&credential), Ok(true));
+
+        svc.signal_job(signal_job_request(
+            912,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        // Let any task the signal spawned register its timer before the clock
+        // moves, or it would sleep from the advanced instant instead.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+
+        // A SIGKILL sent by the advanced clock lands in the kernel a moment
+        // later, so give it a short real-time window to show up.
+        let mut still_running = true;
+        for _ in 0..20 {
+            still_running = process_is_running(pid as i32);
+            if !still_running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            still_running,
+            "a signal-only request must never escalate to SIGKILL"
+        );
+        assert!(
+            svc.step_cancel_requested(912, 4).await,
+            "the unsupervised step must have been signalled"
+        );
+        assert!(svc.running.lock().await.contains_key(&912));
+        assert!(svc
+            .stepds
+            .lock()
+            .await
+            .contains_key(&(912, spur_core::step::STEP_BATCH)));
+        assert_eq!(
+            svc.launch_acceptance.accept(&credential),
+            Ok(false),
+            "the attempt must stay accepted, not be cancelled"
+        );
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_with_no_steps_succeeds() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 913, 1, spur_core::step::STEP_BATCH).await;
+
+        svc.signal_job(signal_job_request(
+            913,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("a batch-only job has no step to warn, which is not an error");
+
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_full_target_signals_a_legacy_unsupervised_job() {
+        let svc = test_agent();
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid") as i32;
+        let mut tracked = TrackedJob {
+            job: executor::RunningJob::Managed { child },
+            ..TrackedJob::allocation_only(None)
+        };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(914, tracked).await;
+
+        svc.signal_job(signal_job_request(
+            914,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        assert!(
+            process_is_running(pid),
+            "the steps target must leave the batch script alone"
+        );
+
+        svc.signal_job(signal_job_request(
+            914,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("signal job");
+        let gone = wait_until_not_running(pid).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(gone, "the full target must reach the unsupervised batch");
+        assert!(
+            svc.running.lock().await.contains_key(&914),
+            "a signal does not tear the job down"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_job_drops_a_stale_run_attempt() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 915, 2, 0).await;
+
+        svc.signal_job(signal_job_request(
+            915,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("a signal for a superseded run is dropped, not an error");
+
+        assert_eq!(finish_recording_stepd(&step, step_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_unspecified_target() {
+        let svc = test_agent();
+        let err = svc
+            .signal_job(signal_job_request(
+                916,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Unspecified,
+            ))
+            .await
+            .expect_err("a signal needs a target");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_the_batch_target_until_it_is_supported() {
+        let svc = test_agent();
+        let err = svc
+            .signal_job(signal_job_request(
+                917,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("the batch target is not implemented");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_a_non_controller_caller() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(918, tracked).await;
+
+        let mut req = signal_job_request(
+            918,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        );
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .signal_job(req)
+            .await
+            .expect_err("a user token must not signal jobs by dialing the agent directly");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     // A session cancelled before `Start` has nothing that pushes completion; left
