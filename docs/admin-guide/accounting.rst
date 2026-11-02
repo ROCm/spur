@@ -439,13 +439,13 @@ Show QOS
 The default columns include ``Preempt`` (the allow-list of QOS names this QOS
 may preempt), so a preemption setup can be read back without a ``format=``
 override. For the full set of stored fields — ``Descr``,
-``PreemptExemptTime``, ``MaxSubmitPA``, ``GrpSubmit``, ``IdleFillPreemptable``
-— pass ``--long`` (short ``-l``), equivalent to ``format=all``. ``show qos``
-also accepts a ``format=`` list to select and order columns; an explicit
-``format=`` takes precedence over ``--long``. The same ``--long`` flag widens
-``show account`` and ``show txn`` to their full column sets as well. When no QOS
-exists and no name filter is given, Spur prints a synthetic ``normal`` QOS
-(preemption off, usage factor 1.0).
+``PreemptExemptTime``, ``GraceTime``, ``MaxSubmitPA``, ``GrpSubmit``,
+``IdleFillPreemptable`` — pass ``--long`` (short ``-l``), equivalent to
+``format=all``. ``show qos`` also accepts a ``format=`` list to select and order
+columns; an explicit ``format=`` takes precedence over ``--long``. The same
+``--long`` flag widens ``show account`` and ``show txn`` to their full column
+sets as well. When no QOS exists and no name filter is given, Spur prints a
+synthetic ``normal`` QOS (preemption off, usage factor 1.0).
 
 .. code-block:: bash
 
@@ -534,6 +534,13 @@ QOS keys
        (see :doc:`configuration`). ``0`` means immediately preemptable (no
        exemption). To revert to inheriting from the partition or global default:
        ``sacctmgr modify qos name=<name> set clearpreemptexempttime=1``.
+   * - ``gracetime``
+     - ``0`` (no grace)
+     - Seconds a job in this QOS is given to wind down (checkpoint, flush
+       output) between the preemption signal and the kill, when it is
+       preempted. The *victim's* QOS value applies, not the preemptor's. It is
+       capped at the victim's remaining time limit, and ``0`` means no grace
+       period. See :ref:`qos-preempt-grace`.
    * - ``usagefactor``
      - ``1.0``
      - Multiplier applied to both CPU and GPU usage charged under this QOS.
@@ -886,6 +893,18 @@ regardless of ``preemptmode``.
 keeps its node allocation. Nothing resumes it automatically — that needs an
 explicit ``scontrol resume`` — and the node stays occupied either way, so
 choose ``cancel`` or ``requeue`` when the pending job needs capacity freed.
+
+.. _qos-preempt-grace:
+
+**Preemption grace time**
+
+``GraceTime`` is a per-QOS value in seconds, set with
+``sacctmgr modify qos name=<name> set GraceTime=600`` (keys are
+case-insensitive) and shown by ``sacctmgr show qos --long`` or
+``format=GraceTime``. The victim's QOS value applies; it is capped at the
+victim's remaining time limit, and ``0`` (the default) means no grace. It takes
+effect with the preemption-grace feature; for now it is only stored, and the
+behaviour arrives in a later change in the same release.
 
 .. _qos-preempt-same-qos:
 

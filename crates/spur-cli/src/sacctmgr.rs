@@ -76,9 +76,9 @@ Fields (key=value), by entity:
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
-            idlefillpreemptable, usagefactor, maxjobsperuser, maxwall, maxtresperjob,
-            maxsubmitjobsperuser, maxsubmitjobsperaccount, grpsubmit, maxtresperuser,
-            grptres, grpwall, flags";
+            gracetime, idlefillpreemptable, usagefactor, maxjobsperuser, maxwall,
+            maxtresperjob, maxsubmitjobsperuser, maxsubmitjobsperaccount, grpsubmit,
+            maxtresperuser, grptres, grpwall, flags";
 
 /// `key=value` fields `modify` accepts. Same as `add` plus the clearing
 /// operations that only make sense against an existing record:
@@ -91,9 +91,9 @@ Fields (key=value), by entity:
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
-            clearpreemptexempttime, idlefillpreemptable, usagefactor, maxjobsperuser,
-            maxwall, maxtresperjob, maxsubmitjobsperuser, maxsubmitjobsperaccount,
-            grpsubmit, maxtresperuser, grptres, grpwall, flags
+            clearpreemptexempttime, gracetime, idlefillpreemptable, usagefactor,
+            maxjobsperuser, maxwall, maxtresperjob, maxsubmitjobsperuser,
+            maxsubmitjobsperaccount, grpsubmit, maxtresperuser, grptres, grpwall, flags
 
 Note: clearpreemptexempttime=1 clears a QOS preempt-exempt override back to NULL
 (inherit from partition/global); a bare clearpreemptexempttime does nothing.
@@ -210,6 +210,7 @@ const QOS_KEYS: &[&str] = &[
     "preempt",
     "preemptexempttime",
     "clearpreemptexempttime",
+    "gracetime",
     "idlefillpreemptable",
     "usagefactor",
     "maxjobsperuser",
@@ -605,86 +606,24 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             Ok(())
         }
         "qos" => {
-            reject_unknown_keys(&p, QOS_KEYS)?;
-            let name = p
-                .get("name")
-                .or_else(|| p.get("qos"))
-                .ok_or_else(|| anyhow::anyhow!("name= required"))?;
-            let desc = p.get("description").cloned().unwrap_or_default();
-            let priority: i32 = p.get("priority").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let preempt = p.get("preemptmode").cloned().unwrap_or_default();
-            let usage_factor: f64 = p
-                .get("usagefactor")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1.0);
-            let no_limit = spur_core::accounting::INFINITE;
-            let max_jobs: u32 = find_alias(&p, &["maxjobsperuser", "maxjobspu"])
-                .map(|(k, v)| parse_limit(k, v))
-                .transpose()?
-                .unwrap_or(no_limit);
-            let max_wall: u32 = p
-                .get("maxwall")
-                .map(|v| parse_wall_limit("maxwall", v))
-                .transpose()?
-                .unwrap_or(no_limit);
-            let max_tres = p.get("maxtresperjob").cloned().unwrap_or_default();
-            let grp_wall: u32 = p
-                .get("grpwall")
-                .map(|v| parse_wall_limit("grpwall", v))
-                .transpose()?
-                .unwrap_or(no_limit);
+            let req = build_add_qos_request(&p)?;
+            let name = req.name.clone();
+            let priority = req.priority.unwrap_or_default();
+            let preempt = req.preempt_mode.clone().unwrap_or_default();
+            let max_wall = req
+                .max_wall_minutes
+                .unwrap_or(spur_core::accounting::INFINITE);
+            let max_jobs = req
+                .max_jobs_per_user
+                .unwrap_or(spur_core::accounting::INFINITE);
 
             let mut client = connect(addr).await?;
             client
-                .create_qos(CreateQosRequest {
-                    name: name.clone(),
-                    description: Some(desc),
-                    priority: Some(priority),
-                    preempt_mode: Some(preempt.clone()),
-                    preempt: p.get("preempt").cloned(),
-                    usage_factor: Some(usage_factor),
-                    max_jobs_per_user: Some(max_jobs),
-                    max_wall_minutes: Some(max_wall),
-                    max_tres_per_job: Some(max_tres),
-                    max_submit_jobs_per_user: Some(
-                        p.get("maxsubmitjobsperuser")
-                            .map(|v| parse_limit("maxsubmitjobsperuser", v))
-                            .transpose()?
-                            .unwrap_or(no_limit),
-                    ),
-                    max_tres_per_user: Some(p.get("maxtresperuser").cloned().unwrap_or_default()),
-                    grp_tres: Some(p.get("grptres").cloned().unwrap_or_default()),
-                    grp_wall_minutes: Some(grp_wall),
-                    preempt_exempt_time: p
-                        .get("preemptexempttime")
-                        .map(|v| parse_u32("preemptexempttime", v))
-                        .transpose()?,
-                    clear_preempt_exempt_time: false,
-                    grace_time: None,
-                    idle_fill_preemptable: p
-                        .get("idlefillpreemptable")
-                        .map(|v| parse_bool("idlefillpreemptable", v))
-                        .transpose()?,
-                    max_submit_jobs_per_account: Some(
-                        find_alias(
-                            &p,
-                            &["maxsubmitjobsperaccount", "maxsubmitpa", "maxsubmitjobspa"],
-                        )
-                        .map(|(k, v)| parse_limit(k, v))
-                        .transpose()?
-                        .unwrap_or(no_limit),
-                    ),
-                    grp_submit_jobs: Some(
-                        find_alias(&p, &["grpsubmit", "grpsubmitjobs"])
-                            .map(|(k, v)| parse_limit(k, v))
-                            .transpose()?
-                            .unwrap_or(no_limit),
-                    ),
-                    flags: Some(p.get("flags").cloned().unwrap_or_default()),
-                })
+                .create_qos(req)
                 .await
                 .context("CreateQos RPC failed")?;
 
+            let no_limit = spur_core::accounting::INFINITE;
             println!(
                 " Adding QOS(s)\n  Name       = {}\n  Priority   = {}\n  Preempt    = {}",
                 name, priority, preempt
@@ -805,6 +744,88 @@ fn build_modify_account_request(
     })
 }
 
+/// Build the full `CreateQosRequest` for `add qos`: unset limits default to the
+/// `INFINITE` sentinel, while `grace_time` stays absent unless given.
+fn build_add_qos_request(
+    p: &std::collections::HashMap<String, String>,
+) -> Result<CreateQosRequest> {
+    reject_unknown_keys(p, QOS_KEYS)?;
+    let name = p
+        .get("name")
+        .or_else(|| p.get("qos"))
+        .ok_or_else(|| anyhow::anyhow!("name= required"))?
+        .clone();
+    let no_limit = spur_core::accounting::INFINITE;
+    Ok(CreateQosRequest {
+        name,
+        description: Some(p.get("description").cloned().unwrap_or_default()),
+        priority: Some(p.get("priority").and_then(|v| v.parse().ok()).unwrap_or(0)),
+        preempt_mode: Some(p.get("preemptmode").cloned().unwrap_or_default()),
+        preempt: p.get("preempt").cloned(),
+        usage_factor: Some(
+            p.get("usagefactor")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0),
+        ),
+        max_jobs_per_user: Some(
+            find_alias(p, &["maxjobsperuser", "maxjobspu"])
+                .map(|(k, v)| parse_limit(k, v))
+                .transpose()?
+                .unwrap_or(no_limit),
+        ),
+        max_wall_minutes: Some(
+            p.get("maxwall")
+                .map(|v| parse_wall_limit("maxwall", v))
+                .transpose()?
+                .unwrap_or(no_limit),
+        ),
+        max_tres_per_job: Some(p.get("maxtresperjob").cloned().unwrap_or_default()),
+        max_submit_jobs_per_user: Some(
+            p.get("maxsubmitjobsperuser")
+                .map(|v| parse_limit("maxsubmitjobsperuser", v))
+                .transpose()?
+                .unwrap_or(no_limit),
+        ),
+        max_tres_per_user: Some(p.get("maxtresperuser").cloned().unwrap_or_default()),
+        grp_tres: Some(p.get("grptres").cloned().unwrap_or_default()),
+        grp_wall_minutes: Some(
+            p.get("grpwall")
+                .map(|v| parse_wall_limit("grpwall", v))
+                .transpose()?
+                .unwrap_or(no_limit),
+        ),
+        preempt_exempt_time: p
+            .get("preemptexempttime")
+            .map(|v| parse_u32("preemptexempttime", v))
+            .transpose()?,
+        clear_preempt_exempt_time: false,
+        grace_time: p
+            .get("gracetime")
+            .map(|v| parse_u32("gracetime", v))
+            .transpose()?,
+        idle_fill_preemptable: p
+            .get("idlefillpreemptable")
+            .map(|v| parse_bool("idlefillpreemptable", v))
+            .transpose()?,
+        max_submit_jobs_per_account: Some(
+            find_alias(
+                p,
+                &["maxsubmitjobsperaccount", "maxsubmitpa", "maxsubmitjobspa"],
+            )
+            .map(|(k, v)| parse_limit(k, v))
+            .transpose()?
+            .unwrap_or(no_limit),
+        ),
+        grp_submit_jobs: Some(
+            find_alias(p, &["grpsubmit", "grpsubmitjobs"])
+                .map(|(k, v)| parse_limit(k, v))
+                .transpose()?
+                .unwrap_or(no_limit),
+        ),
+        flags: Some(p.get("flags").cloned().unwrap_or_default()),
+    })
+}
+
 /// Build a partial-patch `CreateQosRequest` for `modify qos` (see
 /// `build_modify_account_request` for the presence contract).
 fn build_modify_qos_request(
@@ -855,7 +876,10 @@ fn build_modify_qos_request(
             .get("clearpreemptexempttime")
             .map(|v| is_truthy(v))
             .unwrap_or(false),
-        grace_time: None,
+        grace_time: p
+            .get("gracetime")
+            .map(|v| parse_u32("gracetime", v))
+            .transpose()?,
         idle_fill_preemptable: p
             .get("idlefillpreemptable")
             .map(|v| parse_bool("idlefillpreemptable", v))
@@ -1495,7 +1519,7 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
 const QOS_DEFAULT_FORMAT: &str =
     "%-15N %-8p %-10P %-20Q %-12U %-10J %-10S %-10W %-10w %-14F %-20T %-20V %-20G";
 
-const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-20Q %-20E %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
+const QOS_ALL_FORMAT: &str = "%-15N %-30D %-8p %-10P %-20Q %-20E %-10g %-12U %-10J %-10S %-12A %-12B %-10W %-10w %-14F %-22I %-20T %-20V %-20G";
 
 fn qos_header(spec: char) -> &'static str {
     match spec {
@@ -1505,6 +1529,7 @@ fn qos_header(spec: char) -> &'static str {
         'P' => "PreemptMode",
         'Q' => "Preempt",
         'E' => "PreemptExemptTime",
+        'g' => "GraceTime",
         'I' => "IdleFillPreemptable",
         'U' => "UsageFactor",
         'G' => "GrpTRES",
@@ -1529,6 +1554,7 @@ fn qos_field_spec(name: &str) -> Option<char> {
         "preemptmode" => Some('P'),
         "preempt" => Some('Q'),
         "preemptexempttime" => Some('E'),
+        "gracetime" => Some('g'),
         "idlefillpreemptable" => Some('I'),
         "usagefactor" => Some('U'),
         "grptres" => Some('G'),
@@ -1553,6 +1579,7 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'P' => q.preempt_mode.clone(),
         'Q' => q.preempt.clone(),
         'E' => q.preempt_exempt_time.map(blank_if_zero).unwrap_or_default(),
+        'g' => blank_if_zero(q.grace_time),
         'I' => if q.idle_fill_preemptable { "yes" } else { "no" }.into(),
         'U' => format!("{}", q.usage_factor),
         'G' => q.grp_tres.clone(),
@@ -2985,6 +3012,100 @@ mod tests {
             build_modify_qos_request(&p).is_err(),
             "malformed preemptexempttime should error"
         );
+    }
+
+    #[test]
+    fn add_qos_parses_gracetime() {
+        let p = parse_params(&["name=q".into(), "GraceTime=600".into()]);
+        let req = build_add_qos_request(&p).unwrap();
+        assert_eq!(req.grace_time, Some(600));
+    }
+
+    #[test]
+    fn add_qos_without_gracetime_leaves_it_unset() {
+        let p = parse_params(&["name=q".into()]);
+        let req = build_add_qos_request(&p).unwrap();
+        assert_eq!(req.grace_time, None);
+    }
+
+    #[test]
+    fn modify_qos_parses_gracetime() {
+        let p = parse_params(&["name=q".into(), "set".into(), "GraceTime=90".into()]);
+        let req = build_modify_qos_request(&p).unwrap();
+        assert_eq!(req.grace_time, Some(90));
+    }
+
+    #[test]
+    fn modify_qos_can_reset_gracetime_to_zero() {
+        let p = parse_params(&["name=q".into(), "set".into(), "gracetime=0".into()]);
+        let req = build_modify_qos_request(&p).unwrap();
+        assert_eq!(req.grace_time, Some(0));
+    }
+
+    #[test]
+    fn modify_qos_without_gracetime_leaves_it_unchanged() {
+        let p = parse_params(&["name=q".into(), "set".into(), "priority=5".into()]);
+        let req = build_modify_qos_request(&p).unwrap();
+        assert_eq!(req.grace_time, None);
+    }
+
+    #[test]
+    fn gracetime_bad_value_errors() {
+        for value in ["soon", "-1", ""] {
+            let p = parse_params(&["name=q".into(), format!("gracetime={value}")]);
+            let add = build_add_qos_request(&p).unwrap_err().to_string();
+            assert!(add.contains("gracetime"), "add: {add}");
+            let modify = build_modify_qos_request(&p).unwrap_err().to_string();
+            assert!(modify.contains("gracetime"), "modify: {modify}");
+        }
+    }
+
+    #[test]
+    fn long_show_includes_gracetime_column() {
+        let fields = format_engine::resolve_format(
+            Some("all"),
+            QOS_DEFAULT_FORMAT,
+            QOS_ALL_FORMAT,
+            &qos_field_spec,
+            &qos_header,
+            "",
+        )
+        .expect("all format resolves");
+        let q = QosInfo {
+            grace_time: 600,
+            ..stub_qos()
+        };
+
+        let header = format_engine::format_header(&fields);
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&q, spec));
+        assert!(header.contains("GraceTime"), "header: {header}");
+        assert!(row.contains("600"), "row: {row}");
+    }
+
+    #[test]
+    fn default_show_omits_gracetime_column() {
+        let fields = format_engine::parse_format(QOS_DEFAULT_FORMAT, &qos_header);
+        assert!(!format_engine::format_header(&fields).contains("GraceTime"));
+    }
+
+    #[test]
+    fn format_gracetime_selects_the_column() {
+        let fields =
+            format_engine::parse_named_format("Name,GraceTime", &qos_field_spec, &qos_header);
+        let q = QosInfo {
+            grace_time: 600,
+            ..stub_qos()
+        };
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&q, spec));
+        assert!(row.contains("gpuqos") && row.contains("600"), "row: {row}");
+        assert!(format_engine::format_header(&fields).contains("GraceTime"));
+    }
+
+    #[test]
+    fn zero_gracetime_renders_blank() {
+        let fields = format_engine::parse_named_format("GraceTime", &qos_field_spec, &qos_header);
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&stub_qos(), spec));
+        assert!(row.trim().is_empty(), "row: {row:?}");
     }
 
     #[test]
