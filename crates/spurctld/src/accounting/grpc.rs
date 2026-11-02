@@ -75,6 +75,40 @@ fn nullable_limit(field: Option<u32>, what: &str) -> Result<Option<Option<i32>>,
     }
 }
 
+/// Map the optional `grace_time` proto field to a column patch: unset -> keep,
+/// n -> store n (0 means no grace). Errors if `n` overflows i32.
+fn grace_time_patch(field: Option<u32>) -> Result<Option<i32>, Status> {
+    field
+        .map(|n| {
+            i32::try_from(n).map_err(|_| Status::invalid_argument("grace_time exceeds i32::MAX"))
+        })
+        .transpose()
+}
+
+fn qos_info_from_record(r: db::QosRecord) -> QosInfo {
+    QosInfo {
+        idle_fill_preemptable: r.idle_fill_preemptable,
+        name: r.name,
+        description: r.description,
+        priority: r.priority,
+        preempt_mode: r.preempt_mode,
+        preempt: r.preempt,
+        usage_factor: r.usage_factor,
+        max_jobs_per_user: limit_to_wire(r.max_jobs_per_user),
+        max_wall_minutes: limit_to_wire(r.max_wall_min),
+        max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
+        max_submit_jobs_per_user: limit_to_wire(r.max_submit_per_user),
+        max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
+        grp_tres: r.grp_tres.unwrap_or_default(),
+        grp_wall_minutes: limit_to_wire(r.grp_wall_min),
+        preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
+        max_submit_jobs_per_account: limit_to_wire(r.max_submit_per_account),
+        grp_submit_jobs: limit_to_wire(r.grp_submit_jobs),
+        flags: r.flags,
+        grace_time: u32::try_from(r.grace_time).unwrap_or(0),
+    }
+}
+
 /// Validate and canonicalize the QOS `flags` string. Only `DenyOnLimit` is
 /// recognized; an unknown token errors loudly rather than being silently
 /// dropped (a dropped flag reads as "set" but never takes effect).
@@ -1078,6 +1112,7 @@ impl SlurmAccounting for AccountingService {
             } else {
                 req.preempt_exempt_time.map(|v| Some(v as i32))
             },
+            grace_time: grace_time_patch(req.grace_time)?,
             flags: flags.as_deref(),
         };
         let mut tx = pool.begin().await.map_err(internal)?;
@@ -1095,6 +1130,7 @@ impl SlurmAccounting for AccountingService {
             ("grp_wall_minutes", req.grp_wall_minutes.map(Into::into)),
             ("max_tres_per_job", req.max_tres_per_job.map(Into::into)),
             ("grp_tres", req.grp_tres.map(Into::into)),
+            ("grace_time", req.grace_time.map(Into::into)),
             ("flags", flags.map(Into::into)),
         ]);
         write_txn_in_band(
@@ -1140,29 +1176,7 @@ impl SlurmAccounting for AccountingService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let qos_list = records
-            .into_iter()
-            .map(|r| QosInfo {
-                idle_fill_preemptable: r.idle_fill_preemptable,
-                name: r.name,
-                description: r.description,
-                priority: r.priority,
-                preempt_mode: r.preempt_mode,
-                preempt: r.preempt,
-                usage_factor: r.usage_factor,
-                max_jobs_per_user: limit_to_wire(r.max_jobs_per_user),
-                max_wall_minutes: limit_to_wire(r.max_wall_min),
-                max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
-                max_submit_jobs_per_user: limit_to_wire(r.max_submit_per_user),
-                max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
-                grp_tres: r.grp_tres.unwrap_or_default(),
-                grp_wall_minutes: limit_to_wire(r.grp_wall_min),
-                preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
-                max_submit_jobs_per_account: limit_to_wire(r.max_submit_per_account),
-                grp_submit_jobs: limit_to_wire(r.grp_submit_jobs),
-                flags: r.flags,
-            })
-            .collect();
+        let qos_list = records.into_iter().map(qos_info_from_record).collect();
 
         Ok(Response::new(ListQosResponse { qos_list }))
     }
@@ -1736,6 +1750,46 @@ mod tests {
         let err = nullable_limit(Some(i32::MAX as u32 + 1), "maxsubmit").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("maxsubmit"));
+    }
+
+    #[test]
+    fn grace_time_patch_keeps_when_absent_and_stores_literal_zero() {
+        assert_eq!(grace_time_patch(None).unwrap(), None);
+        assert_eq!(grace_time_patch(Some(0)).unwrap(), Some(0));
+        assert_eq!(grace_time_patch(Some(600)).unwrap(), Some(600));
+    }
+
+    #[test]
+    fn grace_time_patch_rejects_over_i32_max() {
+        let err = grace_time_patch(Some(i32::MAX as u32 + 1)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("grace_time"));
+    }
+
+    #[test]
+    fn qos_info_from_record_copies_grace_time() {
+        let record = db::QosRecord {
+            name: "preemptible".into(),
+            description: String::new(),
+            priority: 0,
+            preempt_mode: String::new(),
+            preempt: String::new(),
+            usage_factor: 1.0,
+            max_jobs_per_user: None,
+            max_wall_min: None,
+            max_tres_per_job: None,
+            max_submit_per_user: None,
+            max_submit_per_account: None,
+            grp_submit_jobs: None,
+            max_tres_per_user: None,
+            grp_tres: None,
+            grp_wall_min: None,
+            preempt_exempt_time: None,
+            grace_time: 600,
+            idle_fill_preemptable: false,
+            flags: String::new(),
+        };
+        assert_eq!(qos_info_from_record(record).grace_time, 600);
     }
 
     #[test]

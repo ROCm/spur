@@ -660,6 +660,7 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .map(|v| parse_u32("preemptexempttime", v))
                         .transpose()?,
                     clear_preempt_exempt_time: false,
+                    grace_time: None,
                     idle_fill_preemptable: p
                         .get("idlefillpreemptable")
                         .map(|v| parse_bool("idlefillpreemptable", v))
@@ -854,6 +855,7 @@ fn build_modify_qos_request(
             .get("clearpreemptexempttime")
             .map(|v| is_truthy(v))
             .unwrap_or(false),
+        grace_time: None,
         idle_fill_preemptable: p
             .get("idlefillpreemptable")
             .map(|v| parse_bool("idlefillpreemptable", v))
