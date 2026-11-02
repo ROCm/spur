@@ -908,6 +908,8 @@ pub struct TrackedJob {
     has_pid_namespace: bool,
     has_user_namespace: bool,
     has_mount_namespace: bool,
+    /// The image the job itself runs in, as `sbatch --container-image`.
+    container_image: Option<String>,
     _pty_master: Option<std::os::fd::OwnedFd>,
     work_dir: String,
     uid: u32,
@@ -1691,6 +1693,7 @@ pub async fn recover_stepds(
             has_pid_namespace: descriptor.has_pid_namespace,
             has_user_namespace: descriptor.has_user_namespace,
             has_mount_namespace: descriptor.has_mount_namespace,
+            container_image: None,
             _pty_master: None,
             work_dir: descriptor.work_dir.clone(),
             uid: descriptor.uid,
@@ -1722,6 +1725,7 @@ pub async fn recover_stepds(
             tracked.stderr_path = descriptor.stderr_path.clone();
         }
         if let Some(mode) = descriptor.container_rootfs_mode.clone() {
+            tracked.container_image = Some(descriptor.container_image.clone());
             tracked.rootfs_mode = mode;
         }
     }
@@ -2854,26 +2858,57 @@ fn settled_outcome_belongs_to_this_invocation(
 }
 
 /// What a step's own `--container-image` resolves to once weighed against
-/// whether its parent job already provides one to join.
+/// the job it runs in.
 enum StepContainerPlan {
-    /// No image requested, or requested but a live containerized parent takes
-    /// priority — the step joins the parent's namespaces instead.
+    /// No image requested: the step joins the job's namespaces, if it has any.
     None,
-    /// No containerized parent to join: build a fresh rootfs for this step.
+    /// The step builds its own rootfs, outside the job's namespaces.
     Fresh(spur_proto::proto::ContainerSpec),
 }
 
+impl StepContainerPlan {
+    fn joins_parent_namespaces(&self, parent: &crate::job_entry::JobEntry) -> bool {
+        matches!(self, Self::None) && parent.is_enterable()
+    }
+}
+
+/// A job that runs in a container has one rootfs for all its steps. A step
+/// naming that same image joins it, as before; one naming another image cannot
+/// be honoured and is refused rather than run in the wrong one. A job adopted
+/// from before its image was recorded keeps the old behaviour: the step joins.
+/// Any other job, including a batch job whose namespaces are only the
+/// isolation a root agent gives every batch process, lets the step build its own.
 fn resolve_step_container_plan(
     container: Option<&spur_proto::proto::ContainerSpec>,
-    joins_parent_namespaces: bool,
-) -> StepContainerPlan {
+    parent: &crate::job_entry::JobEntry,
+) -> Result<StepContainerPlan, Status> {
     let Some(c) = container.filter(|c| !c.image.is_empty()) else {
-        return StepContainerPlan::None;
+        return Ok(StepContainerPlan::None);
     };
-    if joins_parent_namespaces {
-        return StepContainerPlan::None;
+    let Some(job_image) = parent
+        .container_image
+        .as_deref()
+        .filter(|_| parent.is_enterable())
+    else {
+        return Ok(StepContainerPlan::Fresh(c.clone()));
+    };
+    if job_image.is_empty() {
+        warn!(
+            image = %c.image,
+            "job container image unknown (job started before it was recorded); \
+             step joins the job's container"
+        );
+        return Ok(StepContainerPlan::None);
     }
-    StepContainerPlan::Fresh(c.clone())
+    if crate::container::same_image(job_image, &c.image, parent.uid) {
+        return Ok(StepContainerPlan::None);
+    }
+    Err(Status::failed_precondition(format!(
+        "--container-image {} differs from the image this job runs in ({job_image}), and a step \
+         of a containerized job cannot use another one; drop the flag to run the step in the \
+         job's container, or submit the job without --container-image to give each step its own",
+        c.image
+    )))
 }
 
 /// Everything needed to resolve an image and stage a fresh rootfs for a
@@ -3070,12 +3105,13 @@ fn step_scratch_names(node_id: u32, step_id: u32) -> (String, String) {
 /// them and survives independently of the job it is running work for.
 fn supervised_step_script(
     job_entry: &crate::job_entry::JobEntry,
+    joins_parent_namespaces: bool,
     uid: u32,
     gid: u32,
     work_dir: &str,
     command: &[String],
 ) -> Result<String, Status> {
-    if !(job_entry.has_namespaces() && job_entry.pid > 0) {
+    if !joins_parent_namespaces {
         return build_one_shot_command_script(command);
     }
     let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid);
@@ -3110,6 +3146,7 @@ fn supervised_step_script(
 /// step does.
 fn interactive_step_script(
     job_entry: &crate::job_entry::JobEntry,
+    joins_parent_namespaces: bool,
     uid: u32,
     gid: u32,
     argv: &[String],
@@ -3120,7 +3157,14 @@ fn interactive_step_script(
     } else {
         argv
     };
-    supervised_step_script(job_entry, uid, gid, &job_entry.work_dir, command)
+    supervised_step_script(
+        job_entry,
+        joins_parent_namespaces,
+        uid,
+        gid,
+        &job_entry.work_dir,
+        command,
+    )
 }
 
 /// The same shape RunCommand would have returned, output included: a user
@@ -4796,6 +4840,7 @@ mod child_containment_tests {
 
     fn entry(namespaced: bool, cgroup: Option<&str>) -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
+            container_image: None,
             pid: if namespaced { 1234 } else { 0 },
             has_pid_namespace: namespaced,
             has_user_namespace: false,
@@ -6024,6 +6069,10 @@ impl SlurmAgent for AgentService {
 
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let namespaces = launch_namespaces(&launch_cfg, nix::unistd::geteuid().is_root());
+                let container_image = launch_cfg
+                    .container
+                    .as_ref()
+                    .map(|c| c.config.image.clone());
                 // Report the real resolved paths back so the controller can
                 // surface where output actually landed (e.g. the /tmp fallback).
                 let stdout_path = result.stdout_path.clone();
@@ -6038,6 +6087,7 @@ impl SlurmAgent for AgentService {
                         has_pid_namespace: namespaces.pid,
                         has_user_namespace: namespaces.user,
                         has_mount_namespace: namespaces.mount,
+                        container_image,
                         _pty_master: result.pty_master,
                         work_dir: launch_cfg.work_dir,
                         uid: launch_cfg.uid,
@@ -6758,6 +6808,7 @@ impl SlurmAgent for AgentService {
         jobs.insert(
             req.job_id,
             TrackedJob {
+                container_image: None,
                 job: executor::RunningJob::AllocationOnly,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: String::new(),
@@ -7059,6 +7110,7 @@ impl SlurmAgent for AgentService {
                 has_pid_namespace: tracked.has_pid_namespace,
                 has_user_namespace: tracked.has_user_namespace,
                 has_mount_namespace: tracked.has_mount_namespace,
+                container_image: tracked.container_image.clone(),
                 uid: tracked.uid,
                 gid: tracked.gid,
                 work_dir: tracked.work_dir.clone(),
@@ -7084,6 +7136,9 @@ impl SlurmAgent for AgentService {
                 "job attempt changed while admitting the step",
             ));
         }
+
+        let step_container_plan = resolve_step_container_plan(req.container.as_ref(), &job_entry)?;
+        let joins_parent_namespaces = step_container_plan.joins_parent_namespaces(&job_entry);
 
         let job_nodelist = nodelist;
         let step_nodelist = if req.nodelist.trim().is_empty() {
@@ -7392,33 +7447,22 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
         let mut supervised_rootfs_mode = None;
         let mut supervised_step_cfg = if supervise_step {
             let command: Vec<String> = std::iter::once(program.clone())
                 .chain(program_args.iter().cloned())
                 .collect();
-            let step_script =
-                supervised_step_script(&job_entry, req.uid, req.gid, &work_dir, &command)?;
-            let username = job_owner.clone();
-            let container = match resolve_step_container_plan(
-                req.container.as_ref(),
+            let step_script = supervised_step_script(
+                &job_entry,
                 joins_parent_namespaces,
-            ) {
-                StepContainerPlan::None => {
-                    if joins_parent_namespaces {
-                        if let Some(c) = req.container.as_ref().filter(|c| !c.image.is_empty()) {
-                            warn!(
-                                job_id,
-                                step_id,
-                                image = %c.image,
-                                "step --container-image ignored: joining the parent job's \
-                                 running container instead of building a new one"
-                            );
-                        }
-                    }
-                    None
-                }
+                req.uid,
+                req.gid,
+                &work_dir,
+                &command,
+            )?;
+            let username = job_owner.clone();
+            let container = match step_container_plan {
+                StepContainerPlan::None => None,
                 StepContainerPlan::Fresh(c) => {
                     let home_dir = env
                         .get("HOME")
@@ -7557,24 +7601,9 @@ impl SlurmAgent for AgentService {
                 persist_cred,
             )
             .await?
-        } else if job_entry.has_namespaces() && job_entry.pid > 0 {
-            // Case 1: parent job is containerized — enter its namespaces via nsenter
-            // (srun inside sbatch/salloc --container-image).
-            //
-            // If the step asked for its own image, it is not honored here: the
-            // step joins the parent's live container. Leave a trace rather than
-            // silently dropping it.
-            if let Some(c) = req.container.as_ref() {
-                if !c.image.is_empty() {
-                    warn!(
-                        job_id,
-                        step_id,
-                        image = %c.image,
-                        "step --container-image ignored: joining the parent job's \
-                         running container instead of building a new one"
-                    );
-                }
-            }
+        } else if joins_parent_namespaces {
+            // Case 1: the step joins the job's namespaces via nsenter, whether
+            // those are a job-level container's or the batch job's own.
             // Enter the step's work_dir *inside* the container by cd-ing in a
             // shell that runs after nsenter — a host-side chdir does not
             // survive entering the container's pivoted mount namespace, and
@@ -8285,9 +8314,8 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        let parent_has_namespaces = entry.has_namespaces() && entry.pid > 0;
-        let container_plan =
-            resolve_step_container_plan(init.container.as_ref(), parent_has_namespaces);
+        let container_plan = resolve_step_container_plan(init.container.as_ref(), &entry)?;
+        let joins_parent_namespaces = container_plan.joins_parent_namespaces(&entry);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
@@ -8409,24 +8437,18 @@ impl SlurmAgent for AgentService {
                     (master, interactive_exit_future(waiter), pid)
                 }
                 None => {
-                    let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
+                    let script = interactive_step_script(
+                        &entry,
+                        joins_parent_namespaces,
+                        entry.uid,
+                        entry.gid,
+                        &argv,
+                    )?;
                     let mut container_rootfs_mode = None;
                     let mut fresh_container_env: Option<HashMap<String, String>> = None;
                     let mut host_identity_env: Option<HashMap<String, String>> = None;
                     let container = match &container_plan {
                         StepContainerPlan::None => {
-                            if parent_has_namespaces {
-                                if let Some(c) =
-                                    init.container.as_ref().filter(|c| !c.image.is_empty())
-                                {
-                                    warn!(
-                                        job_id = init.job_id,
-                                        image = %c.image,
-                                        "step --container-image ignored: joining the parent job's \
-                                         running container instead of building a new one"
-                                    );
-                                }
-                            }
                             if entry.uid > 0 {
                                 if let Some(user) = nix::unistd::User::from_uid(
                                     nix::unistd::Uid::from_raw(entry.uid),
@@ -8534,7 +8556,7 @@ impl SlurmAgent for AgentService {
                         job_id: init.job_id,
                         run_attempt,
                         step_id,
-                        joins_parent_namespaces: parent_has_namespaces,
+                        joins_parent_namespaces,
                         allocation_holder: false,
                         script,
                         work_dir: entry.work_dir.clone(),
@@ -9761,6 +9783,7 @@ impl AgentService {
             has_pid_namespace: tracked.has_pid_namespace,
             has_user_namespace: tracked.has_user_namespace,
             has_mount_namespace: tracked.has_mount_namespace,
+            container_image: tracked.container_image.clone(),
             uid: tracked.uid,
             gid: tracked.gid,
             work_dir: tracked.work_dir.clone(),
@@ -10058,6 +10081,7 @@ impl TrackedJob {
         Self {
             job: executor::RunningJob::AllocationOnly,
             rootfs_mode: crate::container::RootfsMode::Extracted,
+            container_image: None,
             stdout_path: "/dev/null".into(),
             stderr_path: "/dev/null".into(),
             has_pid_namespace: false,
@@ -11980,6 +12004,7 @@ mod tests {
 
     fn plain_job_entry() -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
+            container_image: None,
             pid: 0,
             has_pid_namespace: false,
             has_user_namespace: false,
@@ -11991,36 +12016,112 @@ mod tests {
         }
     }
 
+    fn alpine() -> spur_proto::proto::ContainerSpec {
+        spur_proto::proto::ContainerSpec {
+            image: "docker://alpine".into(),
+            ..Default::default()
+        }
+    }
+
+    /// A root agent's batch job: fresh PID and mount namespaces, no container.
+    fn batch_job_entry() -> crate::job_entry::JobEntry {
+        let mut entry = plain_job_entry();
+        entry.pid = 4242;
+        entry.has_pid_namespace = true;
+        entry.has_mount_namespace = true;
+        entry
+    }
+
+    fn containerized_job_entry() -> crate::job_entry::JobEntry {
+        let mut entry = batch_job_entry();
+        entry.container_image = Some("docker://job-image".into());
+        entry
+    }
+
     #[test]
     fn a_plain_step_with_no_container_needs_no_plan() {
         assert!(matches!(
-            resolve_step_container_plan(None, false),
-            StepContainerPlan::None
+            resolve_step_container_plan(None, &plain_job_entry()),
+            Ok(StepContainerPlan::None)
         ));
     }
 
     #[test]
-    fn a_step_with_its_own_image_and_no_containerized_parent_builds_fresh() {
-        let container = spur_proto::proto::ContainerSpec {
-            image: "docker://alpine".into(),
-            ..Default::default()
-        };
+    fn a_step_with_its_own_image_and_no_namespaced_parent_builds_fresh() {
+        let plan = resolve_step_container_plan(Some(&alpine()), &plain_job_entry());
         assert!(matches!(
-            resolve_step_container_plan(Some(&container), false),
-            StepContainerPlan::Fresh(c) if c.image == "docker://alpine"
+            &plan,
+            Ok(StepContainerPlan::Fresh(c)) if c.image == "docker://alpine"
         ));
+        assert!(!plan.unwrap().joins_parent_namespaces(&plain_job_entry()));
     }
 
     #[test]
-    fn a_step_s_own_image_is_ignored_when_joining_a_containerized_parent() {
-        let container = spur_proto::proto::ContainerSpec {
-            image: "docker://alpine".into(),
+    fn a_step_with_its_own_image_in_a_batch_job_builds_fresh_outside_its_namespaces() {
+        let entry = batch_job_entry();
+        let plan = resolve_step_container_plan(Some(&alpine()), &entry).expect("plan");
+        assert!(matches!(&plan, StepContainerPlan::Fresh(c) if c.image == "docker://alpine"));
+        assert!(!plan.joins_parent_namespaces(&entry));
+    }
+
+    #[test]
+    fn a_step_without_an_image_in_a_batch_job_joins_its_namespaces() {
+        let entry = batch_job_entry();
+        let plan = resolve_step_container_plan(None, &entry).expect("plan");
+        assert!(plan.joins_parent_namespaces(&entry));
+
+        let empty_image = spur_proto::proto::ContainerSpec::default();
+        let plan = resolve_step_container_plan(Some(&empty_image), &entry).expect("plan");
+        assert!(plan.joins_parent_namespaces(&entry));
+    }
+
+    #[test]
+    fn a_step_without_an_image_in_a_containerized_job_joins_its_container() {
+        let entry = containerized_job_entry();
+        let plan = resolve_step_container_plan(None, &entry).expect("plan");
+        assert!(plan.joins_parent_namespaces(&entry));
+    }
+
+    #[test]
+    fn a_step_naming_the_jobs_own_image_joins_its_container() {
+        let entry = containerized_job_entry();
+        let same = spur_proto::proto::ContainerSpec {
+            image: "docker://job-image".into(),
             ..Default::default()
         };
-        assert!(matches!(
-            resolve_step_container_plan(Some(&container), true),
-            StepContainerPlan::None
-        ));
+        let plan = resolve_step_container_plan(Some(&same), &entry).expect("plan");
+        assert!(plan.joins_parent_namespaces(&entry));
+    }
+
+    #[test]
+    fn a_step_naming_an_image_joins_a_job_whose_image_was_never_recorded() {
+        let mut entry = containerized_job_entry();
+        entry.container_image = Some(String::new());
+        let plan = resolve_step_container_plan(Some(&alpine()), &entry).expect("plan");
+        assert!(plan.joins_parent_namespaces(&entry));
+    }
+
+    #[test]
+    fn a_step_naming_a_different_image_is_refused_in_a_containerized_job() {
+        let status = match resolve_step_container_plan(Some(&alpine()), &containerized_job_entry())
+        {
+            Err(status) => status,
+            Ok(_) => panic!("the step's image must not be dropped silently"),
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("docker://alpine"), "{status:?}");
+        assert!(
+            status.message().contains("docker://job-image"),
+            "{status:?}"
+        );
+    }
+
+    #[test]
+    fn a_namespaced_parent_with_no_live_pid_is_not_joined() {
+        let mut entry = batch_job_entry();
+        entry.pid = 0;
+        let plan = resolve_step_container_plan(None, &entry).expect("plan");
+        assert!(!plan.joins_parent_namespaces(&entry));
     }
 
     fn proto_pmix_plan(
@@ -12118,6 +12219,7 @@ mod tests {
         svc.insert_test_job(
             job_id,
             TrackedJob {
+                container_image: None,
                 run_attempt: 5,
                 ..TrackedJob::allocation_only(None)
             },
@@ -12339,6 +12441,7 @@ mod tests {
     fn a_plain_steps_script_runs_the_command_directly() {
         let script = supervised_step_script(
             &plain_job_entry(),
+            false,
             1000,
             1000,
             "/tmp",
@@ -12359,8 +12462,9 @@ mod tests {
         entry.has_mount_namespace = true;
         entry.pid = 4242;
 
-        let script = supervised_step_script(&entry, 1000, 1000, "/tmp", &["true".to_string()])
-            .expect("script");
+        let script =
+            supervised_step_script(&entry, true, 1000, 1000, "/tmp", &["true".to_string()])
+                .expect("script");
 
         // Inside the script, so the supervisor itself stays out of the job's
         // namespaces and outlives it.
@@ -12381,6 +12485,7 @@ mod tests {
 
         let script = supervised_step_script(
             &entry,
+            true,
             1000,
             1000,
             "/srv/step-scratch",
@@ -12399,12 +12504,16 @@ mod tests {
     }
 
     #[test]
-    fn a_namespaced_parent_with_no_live_pid_runs_the_command_directly() {
-        let mut entry = plain_job_entry();
-        entry.has_pid_namespace = true;
-
-        let script = supervised_step_script(&entry, 1000, 1000, "/tmp", &["true".to_string()])
-            .expect("script");
+    fn a_step_outside_its_parent_s_namespaces_runs_the_command_directly() {
+        let script = supervised_step_script(
+            &batch_job_entry(),
+            false,
+            1000,
+            1000,
+            "/tmp",
+            &["true".to_string()],
+        )
+        .expect("script");
 
         assert!(!script.contains("nsenter"), "{script}");
     }
@@ -12487,7 +12596,7 @@ mod tests {
 
     #[test]
     fn interactive_step_script_defaults_an_empty_argv_to_a_shell() {
-        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, &[])
+        let script = interactive_step_script(&plain_job_entry(), false, 1000, 1000, &[])
             .expect("script")
             .trim()
             .to_string();
@@ -12496,10 +12605,11 @@ mod tests {
 
     #[test]
     fn interactive_step_script_honors_an_explicit_command() {
-        let script = interactive_step_script(&plain_job_entry(), 1000, 1000, &["zsh".to_string()])
-            .expect("script")
-            .trim()
-            .to_string();
+        let script =
+            interactive_step_script(&plain_job_entry(), false, 1000, 1000, &["zsh".to_string()])
+                .expect("script")
+                .trim()
+                .to_string();
         assert!(script.ends_with("zsh"), "{script}");
     }
 
@@ -13358,6 +13468,7 @@ mod tests {
 
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
+            container_image: None,
             pid: 1234,
             has_pid_namespace: true,
             has_user_namespace: false,
@@ -13493,6 +13604,7 @@ mod tests {
     #[test]
     fn build_launch_plan_no_namespaces_spawns_directly_with_child_drop() {
         let entry = crate::job_entry::JobEntry {
+            container_image: None,
             pid: 0,
             has_pid_namespace: false,
             has_user_namespace: false,
@@ -13517,6 +13629,7 @@ mod tests {
         // has_namespaces() is true but pid is 0 (no live process to enter):
         // fall back to a direct spawn rather than a broken nsenter.
         let entry = crate::job_entry::JobEntry {
+            container_image: None,
             pid: 0,
             has_pid_namespace: true,
             has_user_namespace: false,
@@ -14852,6 +14965,7 @@ mod tests {
         svc.insert_test_job(
             44,
             TrackedJob {
+                container_image: None,
                 run_attempt: 1,
                 ..TrackedJob::dummy(std::process::id())
             },
@@ -16008,20 +16122,8 @@ mod tests {
         );
     }
 
-    /// The parent-container (nsenter) path takes precedence over setting up a
-    /// fresh container: a step whose tracked job already has live namespaces must
-    /// enter them, never call `resolve_image`. Proven by the *absence* of the
-    /// image-not-found error even though a bogus image is supplied.
-    #[tokio::test]
-    async fn run_command_enters_parent_namespaces_before_new_container() {
-        let (svc, job_id) = run_command_test_setup().await;
-        {
-            let mut jobs = svc.running.lock().await;
-            let job = jobs.get_mut(&job_id).unwrap();
-            job.has_pid_namespace = true;
-            job.has_mount_namespace = true;
-        }
-        let req = Request::new(RunCommandRequest {
+    fn run_command_with_bogus_image(job_id: u32) -> Request<RunCommandRequest> {
+        Request::new(RunCommandRequest {
             command: vec!["echo".into(), "hi".into()],
             uid: 0,
             gid: 0,
@@ -16033,37 +16135,46 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
-        });
-        // The nsenter path was taken, not Case 2: the bogus image is never
-        // resolved. On a typical (unprivileged) test runner setns is denied, so
-        // the step comes back as a run with an nsenter trace on stderr — the
-        // observable branch — rather than the "image not found" resolution error.
-        match svc.run_command(req).await {
-            Ok(resp) => {
-                let r = resp.into_inner();
-                assert!(
-                    !r.stdout.contains("not found in [") && !r.stderr.contains("not found in ["),
-                    "namespaced job must nsenter, not resolve a new image: {r:?}"
-                );
-                assert!(
-                    r.exit_code == 0
-                        || r.stderr.to_lowercase().contains("nsenter")
-                        || r.stderr.contains("Operation not permitted")
-                        || !r.stderr.is_empty(),
-                    "expected the nsenter path (success, or an nsenter/permission \
-                     failure on an unprivileged runner), got: {r:?}"
-                );
-            }
-            Err(err) => {
-                // A spawn error (e.g. no nsenter binary) is acceptable, as long as
-                // it is not image resolution — that would mean Case 2 was entered.
-                assert!(
-                    !err.message().contains("not found in ["),
-                    "namespaced job should nsenter, not resolve a new image: {}",
-                    err.message()
-                );
-            }
+        })
+    }
+
+    /// A root agent runs every batch job in fresh PID and mount namespaces; a
+    /// step naming its own image there must build its own container, not join
+    /// those namespaces and drop the image. Proven by the step reaching image
+    /// resolution, which fails on the bogus image.
+    #[tokio::test]
+    async fn run_command_with_image_in_a_namespaced_batch_job_builds_its_own_container() {
+        let (svc, job_id) = run_command_test_setup().await;
+        {
+            let mut jobs = svc.running.lock().await;
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.has_pid_namespace = true;
+            job.has_mount_namespace = true;
         }
+        let err = svc
+            .run_command(run_command_with_bogus_image(job_id))
+            .await
+            .expect_err("the bogus image must fail to resolve, not be ignored");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("not found"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn run_command_refuses_a_different_step_image_in_a_containerized_job() {
+        let (svc, job_id) = run_command_test_setup().await;
+        {
+            let mut jobs = svc.running.lock().await;
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.has_pid_namespace = true;
+            job.has_mount_namespace = true;
+            job.container_image = Some("/images/job-image.sqsh".into());
+        }
+        let err = svc
+            .run_command(run_command_with_bogus_image(job_id))
+            .await
+            .expect_err("the step's image cannot be honoured, so it must not run");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("differs from"), "{}", err.message());
     }
 
     /// Without a container_image and without namespaces, the step runs directly
@@ -16254,6 +16365,7 @@ mod tests {
         svc.insert_test_job(
             80,
             TrackedJob {
+                container_image: None,
                 run_attempt: 1,
                 ..TrackedJob::allocation_only(None)
             },
@@ -18595,6 +18707,7 @@ mod tests {
             .spawn()
             .expect("failed to spawn SIGTERM-trapping process");
         let tracked = TrackedJob {
+            container_image: None,
             job: executor::RunningJob::Managed { child },
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: "/dev/null".into(),
@@ -19147,6 +19260,7 @@ mod tests {
                 .expect("spawn trap process");
             let pid = child.id().expect("pid") as i32;
             let t = TrackedJob {
+                container_image: None,
                 job: executor::RunningJob::Managed { child },
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: "/dev/null".into(),
@@ -19687,6 +19801,7 @@ mod tests {
         );
         fn allocation_only_job(run_attempt: u32) -> TrackedJob {
             TrackedJob {
+                container_image: None,
                 job: executor::RunningJob::AllocationOnly,
                 cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
@@ -19773,6 +19888,7 @@ mod tests {
         svc.insert_test_job(
             job_id,
             TrackedJob {
+                container_image: None,
                 job: executor::RunningJob::AllocationOnly,
                 cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,

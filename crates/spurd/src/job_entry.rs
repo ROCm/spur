@@ -11,6 +11,10 @@ pub struct JobEntry {
     pub has_pid_namespace: bool,
     pub has_user_namespace: bool,
     pub has_mount_namespace: bool,
+    /// The image the job itself runs in (`--container-image` on the job), as
+    /// opposed to the fresh namespaces a root agent gives every batch job.
+    /// Empty when a job from before the image was recorded is adopted.
+    pub container_image: Option<String>,
     pub uid: u32,
     pub gid: u32,
     pub work_dir: String,
@@ -56,6 +60,12 @@ impl JobEntry {
         self.has_pid_namespace || self.has_user_namespace || self.has_mount_namespace
     }
 
+    /// Whether a step can enter this job's namespaces: there is a live process
+    /// to enter and at least one namespace to enter.
+    pub fn is_enterable(&self) -> bool {
+        self.has_namespaces() && self.pid > 0
+    }
+
     /// Build env vars that should be set in the entered context.
     pub fn env_vars(&self, job_id: u32) -> Vec<(String, String)> {
         vec![
@@ -72,6 +82,7 @@ mod tests {
     #[test]
     fn nsenter_args_root_non_container() {
         let entry = JobEntry {
+            container_image: None,
             pid: 1234,
             has_pid_namespace: true,
             has_user_namespace: false,
@@ -96,6 +107,7 @@ mod tests {
     #[test]
     fn nsenter_args_root_container() {
         let entry = JobEntry {
+            container_image: None,
             pid: 5678,
             has_pid_namespace: true,
             has_user_namespace: true,
@@ -121,6 +133,7 @@ mod tests {
     #[test]
     fn nsenter_args_non_root_no_namespaces() {
         let entry = JobEntry {
+            container_image: None,
             pid: 9999,
             has_pid_namespace: false,
             has_user_namespace: false,
@@ -138,6 +151,7 @@ mod tests {
     #[test]
     fn nsenter_args_rootless_container() {
         let entry = JobEntry {
+            container_image: None,
             pid: 4444,
             has_pid_namespace: true,
             has_user_namespace: true,
