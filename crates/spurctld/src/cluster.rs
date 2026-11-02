@@ -1115,10 +1115,8 @@ impl ClusterManager {
             if job.state == JobState::Pending && !job.pending_reason.is_scheduling_hold() {
                 schedulable_owners.insert(job.job_id);
             }
-            if job.state == JobState::Completing {
-                if let Some(preemptor) = job.preempted_by {
-                    owners_still_draining.insert(preemptor);
-                }
+            if let Some(preemptor) = crate::scheduler_loop::preemptor_awaiting_release(job) {
+                owners_still_draining.insert(preemptor);
             }
         }
         earmarks.retain(|_, (preemptor, remaining)| {
@@ -5374,8 +5372,9 @@ impl ClusterManager {
         // preemptor ahead of a bystander puts it first in the pending list, so
         // backfill's ordinary ordering reserves that node for it rather than
         // handing it to whoever sorts highest on effective priority. Scoped to
-        // draining victims (Completing) so suspend-mode evictions, which never
-        // free a node, do not trigger a hoist. The `preempt_freed_nodes` earmarks
+        // draining victims (Completing, or Running in a preemption grace) so
+        // suspend-mode evictions, which never free a node, do not trigger a
+        // hoist. The `preempt_freed_nodes` earmarks
         // extend the hoist across the one cycle after a victim finalizes (clearing
         // the draining anchor) before the preemptor is placed. The hoist only
         // affects sort order; it never hides a node from other jobs.
@@ -5387,10 +5386,11 @@ impl ClusterManager {
         let hoisted: HashSet<JobId> = {
             let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
             for job in jobs.values() {
-                if job.state == JobState::Completing && !job.allocated_nodes.is_empty() {
-                    if let Some(owner) = job.preempted_by {
-                        draining_by_owner.entry(owner).or_default().push(job);
-                    }
+                if job.allocated_nodes.is_empty() {
+                    continue;
+                }
+                if let Some(owner) = crate::scheduler_loop::preemptor_awaiting_release(job) {
+                    draining_by_owner.entry(owner).or_default().push(job);
                 }
             }
             let freed_by_owner = self.preempt_freed_nodes_by_owner(&jobs);
@@ -21880,10 +21880,9 @@ state = "UP"
         bystander_id
     }
 
-    /// Drive a cancel-mode preemption so the victim is left draining in
-    /// Completing with `preempted_by` set to the hunter. Returns (victim_id,
-    /// hunter_id). The hunter stays pending because the node is still held.
-    async fn preempt_into_drain(
+    /// A RUNNING victim of `victim_qos` on `node`, plus a pending hunter of
+    /// `hunter_qos` pinned to the same node. Returns (victim_id, hunter_id).
+    fn run_victim_and_submit_hunter(
         cm: &Arc<ClusterManager>,
         node: &str,
         victim_qos: &str,
@@ -21907,6 +21906,19 @@ state = "UP"
         hunter.qos = Some(hunter_qos.into());
         hunter.nodelist = Some(node.into());
         let hunter_id = submit_and_wait(cm, hunter);
+        (victim_id, hunter_id)
+    }
+
+    /// Drive a cancel-mode preemption so the victim is left draining in
+    /// Completing with `preempted_by` set to the hunter. Returns (victim_id,
+    /// hunter_id). The hunter stays pending because the node is still held.
+    async fn preempt_into_drain(
+        cm: &Arc<ClusterManager>,
+        node: &str,
+        victim_qos: &str,
+        hunter_qos: &str,
+    ) -> (JobId, JobId) {
+        let (victim_id, hunter_id) = run_victim_and_submit_hunter(cm, node, victim_qos, hunter_qos);
         let hunter_job = cm.get_job(hunter_id).unwrap();
         let partitions = cm.get_partitions();
         crate::scheduler_loop::try_preempt(
@@ -21919,6 +21931,30 @@ state = "UP"
         .await;
         settle(cm, victim_id, JobState::Completing);
         assert_eq!(cm.get_job(victim_id).unwrap().preempted_by, Some(hunter_id));
+        (victim_id, hunter_id)
+    }
+
+    /// Leave the victim RUNNING inside its preemption grace, owed to the hunter.
+    /// Returns (victim_id, hunter_id).
+    fn preempt_into_grace(
+        cm: &Arc<ClusterManager>,
+        node: &str,
+        victim_qos: &str,
+        hunter_qos: &str,
+    ) -> (JobId, JobId) {
+        let (victim_id, hunter_id) = run_victim_and_submit_hunter(cm, node, victim_qos, hunter_qos);
+        let signaled_at = Utc::now();
+        let pending = PreemptPending {
+            signaled_at,
+            deadline: signaled_at + chrono::Duration::seconds(600),
+            preempted_by: hunter_id,
+            preempt_qos: Some(hunter_qos.into()),
+            mode: PreemptMode::Cancel,
+            run_attempt: cm.get_job(victim_id).unwrap().run_attempt,
+            requeue_hold_secs: 30,
+        };
+        assert!(cm.signal_preemption(pending, victim_id).unwrap());
+        assert_eq!(cm.get_job(victim_id).unwrap().state, JobState::Running);
         (victim_id, hunter_id)
     }
 
@@ -22010,6 +22046,52 @@ state = "UP"
             n1_owner,
             Some(hunter_id),
             "the node freed by the preemption must go to the preemptor, not the bystander"
+        );
+    }
+
+    /// A victim still inside its grace holds the node just like one tearing
+    /// down, so its preemptor must stay ahead of a higher-effective-priority
+    /// bystander for the whole grace, not only after the kill is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemptor_stays_hoisted_during_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (victim_id, hunter_id) = preempt_into_grace(&cm, "n1", "low", "high");
+        let bystander_id = submit_bystander(&cm, "n1");
+
+        assert_eq!(cm.get_job(victim_id).unwrap().state, JobState::Running);
+        let pending = cm.pending_jobs();
+        assert!(
+            pending.iter().position(|j| j.job_id == hunter_id)
+                < pending.iter().position(|j| j.job_id == bystander_id),
+            "while the victim is in its grace, the preemptor must stay hoisted"
+        );
+    }
+
+    /// An earmark is held at full budget while any victim of its owner is still
+    /// in its grace, as it is while one drains; otherwise it would expire before
+    /// the grace deadline and the freed node would go to a bystander.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn earmark_is_refreshed_during_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (_victim_id, hunter_id) = preempt_into_grace(&cm, "n1", "low", "high");
+        cm.record_preempt_freed_nodes(&["n2".to_string()], hunter_id);
+
+        for _ in 0..=ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
+            cm.tick_preempt_freed_earmarks();
+        }
+
+        assert_eq!(
+            cm.preempt_freed_nodes_raw().get("n2").copied(),
+            Some((hunter_id, ClusterManager::PREEMPT_FREED_EARMARK_PASSES))
         );
     }
 

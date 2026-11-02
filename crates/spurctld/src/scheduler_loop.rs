@@ -1067,6 +1067,9 @@ pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<Strin
     )
 }
 
+/// Slack past a grace deadline's kill wait before backfill counts the nodes free.
+const BUSY_UNTIL_MARGIN_SECS: i64 = 5;
+
 /// Pure core of [`running_jobs_busy_until`], split out so it's testable
 /// without a full `ClusterManager` harness.
 fn busy_until_from_running_jobs(
@@ -1114,10 +1117,21 @@ fn busy_until_from_running_jobs(
             .min(UNLIMITED_FALLBACK.num_seconds());
         // A long-unbounded job outliving UNLIMITED_FALLBACK would otherwise
         // compute an `end` already in the past, producing a backwards interval.
-        let end = start
+        let mut end = start
             .checked_add_signed(chrono::Duration::seconds(slack_secs))
-            .unwrap_or(far_future)
-            .max(now);
+            .unwrap_or(far_future);
+        // A job in its grace is killed at the deadline, so its nodes free by then
+        // even when its time limit is further out.
+        if let Some(pending) = &job.preempt_pending {
+            let free_after_kill = pending
+                .deadline
+                .checked_add_signed(chrono::Duration::seconds(
+                    kill_wait_secs as i64 + BUSY_UNTIL_MARGIN_SECS,
+                ))
+                .unwrap_or(far_future);
+            end = end.min(free_after_kill);
+        }
+        let end = end.max(now);
         for node in &job.allocated_nodes {
             busy_until
                 .entry(node.clone())
@@ -1273,22 +1287,20 @@ pub(crate) async fn try_preempt(
         .map(|j| (j.job_id, cluster.resolve_qos(j)))
         .collect();
 
-    // Victims of an earlier tick that are still tearing down. Their nodes stay
-    // allocated until each agent reports, so their preemptor must not kill again.
-    let draining_victims: Vec<spur_core::job::Job> = cluster
-        .get_jobs(&JobFilter {
-            states: &[JobState::Completing],
-            ..Default::default()
-        })
-        .into_iter()
-        .filter(|j| j.preempted_by.is_some())
+    // Victims of an earlier tick that are still tearing down or running out their
+    // grace. Their nodes stay allocated until each agent reports, so their
+    // preemptor must not kill again.
+    let draining_victims: Vec<spur_core::job::Job> = holders
+        .iter()
+        .filter(|j| preemptor_awaiting_release(j).is_some())
+        .cloned()
         .collect();
 
     for pending in unscheduled {
         // Scoped to the nodes this job could actually use: a victim wedged
         // elsewhere must not block preemption across the whole cluster.
         let waiting_on_release = draining_victims.iter().any(|victim| {
-            victim.preempted_by == Some(pending.job_id)
+            preemptor_awaiting_release(victim) == Some(pending.job_id)
                 && preempt_overlaps_pending_nodes(pending, victim, cluster_nodes)
         });
         if waiting_on_release {
@@ -1718,7 +1730,9 @@ async fn reclaim_for_unplaced(
     let mut over_quota: HashMap<String, bool> = HashMap::new();
     let mut reclaimable: Vec<ReclaimableRun> = Vec::new();
     for job in &running {
-        if job.allocated_nodes.is_empty() {
+        // Requeuing a run in its grace would end the grace early; its preemptor
+        // waits for the deadline like any other.
+        if job.allocated_nodes.is_empty() || job.preempt_pending.is_some() {
             continue;
         }
         let borrowed = if job.idle_fill {
@@ -1946,6 +1960,20 @@ fn satisfiable_victim_set(
     }
 
     (have >= needed && !victims.is_empty()).then_some(victims)
+}
+
+/// The pending job a victim is being cleared out for while it still holds its
+/// nodes: one tearing down after a kill, or one running out its grace.
+pub(crate) fn preemptor_awaiting_release(
+    job: &spur_core::job::Job,
+) -> Option<spur_core::job::JobId> {
+    use spur_core::job::JobState;
+
+    match job.state {
+        JobState::Completing => job.preempted_by,
+        JobState::Running => job.preempt_pending.as_ref().map(|p| p.preempted_by),
+        _ => None,
+    }
 }
 
 /// True when `candidate` occupies a node the pending job could target.
@@ -4346,6 +4374,47 @@ mod tests {
             job(120) - job(30),
             chrono::Duration::seconds(90),
             "the slack past the time limit is the kill wait"
+        );
+    }
+
+    fn in_grace(mut job: Job, deadline: DateTime<Utc>) -> Job {
+        job.preempt_pending = Some(spur_core::job::PreemptPending {
+            signaled_at: deadline - chrono::Duration::seconds(60),
+            deadline,
+            preempted_by: 99,
+            preempt_qos: None,
+            mode: spur_core::partition::PreemptMode::Cancel,
+            run_attempt: job.run_attempt,
+            requeue_hold_secs: 30,
+        });
+        job
+    }
+
+    #[test]
+    fn busy_until_uses_the_grace_deadline() {
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(120);
+        let job = in_grace(running_job_on("node001", now, 600), deadline);
+
+        let busy_until = busy_until_from_running_jobs(&[job], 300, 30);
+
+        assert_eq!(
+            busy_until["node001"] - deadline,
+            chrono::Duration::seconds(35),
+            "nodes free at the deadline plus the kill wait and the five-second margin"
+        );
+    }
+
+    #[test]
+    fn busy_until_keeps_the_time_limit_when_it_ends_before_the_grace_deadline() {
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::hours(2);
+        let plain = running_job_on("node001", now, 10);
+        let graced = in_grace(plain.clone(), deadline);
+
+        assert_eq!(
+            busy_until_from_running_jobs(&[graced], 300, 30),
+            busy_until_from_running_jobs(&[plain], 300, 30)
         );
     }
 
@@ -9002,6 +9071,93 @@ mod tests {
                 assert!(bystander.preempt_pending.is_none());
                 assert_eq!(last_log_index(&raft), log_before, "no new log entry");
                 assert!(signals.lock().unwrap().is_empty());
+                assert!(cancels.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn preemptor_waits_for_its_in_grace_victim() {
+                let dir = TempDir::new().unwrap();
+                let (cm, raft) = test_cluster_with_raft(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                for node in ["n1", "n2"] {
+                    register_node_with_capabilities(
+                        &cm,
+                        node,
+                        addr,
+                        vec![SIGNAL_JOB_CAPABILITY.into()],
+                    );
+                }
+                insert_qos_pair(&cm, 600);
+                let in_grace = run_victim(&cm, "in-grace", "n1", None);
+                let bystander = run_victim(&cm, "bystander", "n2", None);
+                let hunter = submit_preemptor(&cm);
+                let applied = cm
+                    .signal_preemption(pending_for(&in_grace, &hunter), in_grace.job_id)
+                    .unwrap();
+                assert!(applied);
+                let log_before = last_log_index(&raft);
+
+                preempt_for(&cm, &hunter).await;
+
+                let bystander = cm.get_job(bystander.job_id).unwrap();
+                assert_eq!(bystander.state, JobState::Running);
+                assert!(bystander.preempt_pending.is_none());
+                assert_eq!(last_log_index(&raft), log_before, "no new log entry");
+                assert!(signals.lock().unwrap().is_empty());
+                assert!(cancels.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn reclaim_skips_an_in_grace_job() {
+                let dir = TempDir::new().unwrap();
+                let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, _) = spawn_mock_agent_recording_requests().await;
+                register_node_at(&cm, "n1", addr);
+                insert_qos_pair(&cm, 600);
+                cm.qos_cache().insert(Qos {
+                    name: "burst".into(),
+                    priority: 1,
+                    idle_fill_preemptable: true,
+                    ..Default::default()
+                });
+                let borrowed = submit_and_wait(
+                    &cm,
+                    JobSpec {
+                        name: "borrowed".into(),
+                        user: "testuser".into(),
+                        work_dir: "/tmp".into(),
+                        qos: Some("burst".into()),
+                        ..Default::default()
+                    },
+                );
+                start_on(&cm, borrowed, "n1");
+                let hunter = submit_preemptor(&cm);
+                let borrowed_job = cm.get_job(borrowed).unwrap();
+                let applied = cm
+                    .signal_preemption(pending_for(&borrowed_job, &hunter), borrowed)
+                    .unwrap();
+                assert!(applied);
+                let nodes = cm.get_nodes();
+                let partitions = cm.get_partitions();
+                let reservations = cm.get_reservations();
+                let busy_until = HashMap::new();
+                let state = ClusterState {
+                    nodes: &nodes,
+                    partitions: &partitions,
+                    reservations: &reservations,
+                    topology: None,
+                    fabric: None,
+                    busy_until: &busy_until,
+                };
+
+                let (freed, freed_for) =
+                    reclaim_for_unplaced(&cm, &[&hunter], &HashSet::new(), &state, 0).await;
+
+                assert!(freed.is_empty());
+                assert_eq!(freed_for, None);
+                let job = cm.get_job(borrowed).unwrap();
+                assert_eq!(job.state, JobState::Running);
+                assert!(job.preempt_pending.is_some());
                 assert!(cancels.lock().unwrap().is_empty());
             }
 

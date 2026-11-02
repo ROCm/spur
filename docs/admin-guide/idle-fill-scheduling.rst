@@ -161,6 +161,9 @@ preferred next victim — the more capacity it lost, the more it would go on to 
 Reclaim is attempted before preemption, since recovering lent capacity is always
 preferable to evicting a job that holds a claim to it.
 
+Reclaim never takes a job that is in its preemption grace period; the job that
+needs its nodes waits for the grace to end, like any other preemptor.
+
 Priority inside the opportunistic tier
 --------------------------------------
 
