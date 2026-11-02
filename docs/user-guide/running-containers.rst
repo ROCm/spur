@@ -125,12 +125,21 @@ flags above apply to a step's ``srun`` and behave as follows:
   with ``--container-image`` (``sbatch --container-image ...``), a nested
   ``srun`` step enters that already-running container — it shares the job's
   image, mounts, and GPU devices. This is the standard Slurm + Pyxis pattern
-  used by multi-node launchers.
+  used by multi-node launchers. Naming the job's own image on the step
+  (``srun --container-image`` with the same image, including one inherited from
+  ``SRUN_CONTAINER``) also enters it. Two references are the same image when they
+  are identical or resolve to the same squashfs file. A step cannot use a
+  different image: ``srun --container-image`` naming one fails with an error
+  rather than run in the wrong image.
 
-- **Step with its own image.** A standalone ``srun --container-image`` (or an
-  ``salloc`` allocation followed by ``srun --container-image``) creates a fresh
-  container for that step. Different steps in one allocation can use different
-  images and mounts.
+- **Step with its own image.** A standalone ``srun --container-image``, an
+  ``salloc`` allocation followed by ``srun --container-image``, or an
+  ``srun --container-image`` inside an ``sbatch`` script that was submitted
+  without ``--container-image``, creates a fresh container for that step.
+  Different steps in one allocation can use different images and mounts. The job's
+  cgroup limits and GPU allocation still apply to the step. A step without
+  ``--container-image`` in such a batch job keeps running on the node's own
+  root filesystem.
 
 Allocate first, then run steps from inside the allocation shell. By default a
 single step fans out one container per allocated node; ``-N`` or ``-w`` limits
@@ -172,7 +181,7 @@ the image from its containerized ``sbatch`` job:
 
 A ``--pty`` step nested inside a containerized ``sbatch`` job enters
 the parent's running container (like any other nested step) rather than building
-a fresh one.
+a fresh one, and fails if it names a different image.
 
 Exec Into a Running Container Job
 ---------------------------------

@@ -929,6 +929,10 @@ pub struct StepdDescriptor {
     /// before removing it, so guessing the mode leaks the mounts.
     #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
+    /// The image the job runs in, as requested; empty without a job container
+    /// or when the session predates recording it.
+    #[serde(default)]
+    pub container_image: String,
     #[serde(default)]
     pub cred_id: String,
     #[serde(default)]
@@ -978,6 +982,7 @@ impl StepdDescriptor {
             stdout_path: String::new(),
             stderr_path: String::new(),
             container_rootfs_mode: None,
+            container_image: String::new(),
             cred_id: String::new(),
             cred_kid: String::new(),
             cred_digest: String::new(),
@@ -2185,6 +2190,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     descriptor.resources = launch_spec.resources.clone();
     descriptor.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
+    descriptor.container_image = launch_spec
+        .container
+        .as_ref()
+        .map(|c| c.config.image.clone())
+        .unwrap_or_default();
     descriptor.cred_id = launch_spec.cred_id.clone();
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
@@ -4109,6 +4119,7 @@ mod tests {
             "stdout_path",
             "stderr_path",
             "container_rootfs_mode",
+            "container_image",
         ] {
             fields.remove(field);
         }
@@ -4123,6 +4134,7 @@ mod tests {
         assert!(restored.stdout_path.is_empty());
         assert!(restored.stderr_path.is_empty());
         assert_eq!(restored.container_rootfs_mode, None);
+        assert!(restored.container_image.is_empty());
     }
 
     #[test]
