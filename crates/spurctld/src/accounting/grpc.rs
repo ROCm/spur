@@ -377,6 +377,7 @@ impl SlurmAccounting for AccountingService {
                 reason_detail: String::new(),
                 ended_by: String::new(),
                 ended_by_uid: None,
+                submission: None,
             },
         )
         .await

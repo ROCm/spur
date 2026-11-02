@@ -41,8 +41,8 @@ use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::{
-    txn, AccountingNotifier, JobEndRecord, JobStartRecord, TxnAction, TxnEntity, TxnOutcome,
-    TxnRecord, TxnSource,
+    txn, AccountingNotifier, JobEndRecord, JobStartRecord, JobSubmission, TxnAction, TxnEntity,
+    TxnOutcome, TxnRecord, TxnSource,
 };
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
@@ -3287,7 +3287,14 @@ impl ClusterManager {
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
-            let (exit_signal, derived_exit_code, preempted_by, preempt_mode, preempt_qos) = self
+            let (
+                exit_signal,
+                derived_exit_code,
+                preempted_by,
+                preempt_mode,
+                preempt_qos,
+                submission,
+            ) = self
                 .jobs
                 .read()
                 .get(&job_id)
@@ -3298,9 +3305,10 @@ impl ClusterManager {
                         j.preempted_by,
                         j.preempt_mode.clone(),
                         j.preempt_qos.clone(),
+                        Some(JobSubmission::for_job(j)),
                     )
                 })
-                .unwrap_or((0, 0, None, None, None));
+                .unwrap_or((0, 0, None, None, None, None));
             notifier.notify_job_end(JobEndRecord {
                 job_id,
                 state: state.display().to_owned(),
@@ -3319,6 +3327,7 @@ impl ClusterManager {
                     .map(|c| c.user.clone())
                     .unwrap_or_default(),
                 ended_by_uid: finalized.ended_by.as_ref().and_then(|c| c.uid),
+                submission,
             });
         }
 
