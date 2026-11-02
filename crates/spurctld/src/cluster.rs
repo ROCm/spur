@@ -7534,6 +7534,27 @@ impl ClusterManager {
         job.preempt_qos = preempt_qos;
     }
 
+    /// A user cancel ends a preemption grace: the run ends as that cancel, so
+    /// the grace and whatever provenance a node report already adopted from it
+    /// are dropped. Provenance that did not come from this grace is left alone.
+    fn cancel_preempt_grace(job: &mut Job) {
+        let Some(pending) = job.preempt_pending.take() else {
+            return;
+        };
+        let adopted_mode = match pending.mode {
+            PreemptMode::Cancel => "Cancel",
+            PreemptMode::Requeue => "Requeue",
+            PreemptMode::Off | PreemptMode::Suspend => return,
+        };
+        if job.preempted_by == Some(pending.preempted_by)
+            && job.preempt_mode.as_deref() == Some(adopted_mode)
+        {
+            job.preempted_by = None;
+            job.preempt_mode = None;
+            job.preempt_qos = None;
+        }
+    }
+
     /// When a victim re-pended after its grace may run again: the hold recorded
     /// with the warning, never earlier than a later `--begin` the user set.
     fn preempt_hold_until(job: &Job, at: DateTime<Utc>, hold_secs: u32) -> DateTime<Utc> {
@@ -8491,6 +8512,9 @@ impl ClusterManager {
                 if job.cancelled_by.is_none() {
                     job.cancelled_by = cancel.clone();
                 }
+                // Independent of begin_completing: a victim already Completing
+                // keeps its grace otherwise, and the grace would override the cancel.
+                Self::cancel_preempt_grace(job);
                 Self::begin_completing(job, *at);
             }
             WalOperation::JobTimeLimitExpired {
@@ -30814,6 +30838,118 @@ state = "UP"
         assert_eq!(user.completed, 0);
         assert_eq!(user.failed, 0);
         assert_eq!(user.cancelled, 0);
+    }
+
+    /// A two-node victim in grace that has started completing (n1 reported) and is
+    /// then cancelled by its owner, with n2 still to report.
+    async fn cancelled_while_a_grace_victim_drains(
+        mode: PreemptMode,
+    ) -> (
+        TempDir,
+        Arc<ClusterManager>,
+        Arc<crate::sched_stats::SchedStatsCollector>,
+        JobId,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(crate::sched_stats::SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        let id = run_two_node_job_in_grace(&cm, mode);
+        report_node(&cm, id, "n1", grace_exit_at());
+        cm.cancel_job_for(id, Canceller::user("testuser", None), false)
+            .unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(job.preempt_mode, None);
+        assert_eq!(job.preempt_qos, None);
+        assert!(job.cancelled_by.is_some());
+        (dir, cm, stats, id)
+    }
+
+    fn assert_ended_as_the_users_cancel(
+        cm: &ClusterManager,
+        stats: &crate::sched_stats::SchedStatsCollector,
+        id: JobId,
+        resp: &ClientResponse,
+    ) {
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Cancelled);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert!(job.cancelled_by.is_some());
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(stats.snapshot().jobs_preempted, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_cancel_wins_over_a_draining_cancel_grace() {
+        let (_dir, cm, stats, id) =
+            cancelled_while_a_grace_victim_drains(PreemptMode::Cancel).await;
+
+        let resp = report_node(&cm, id, "n2", grace_exit_at());
+
+        assert_ended_as_the_users_cancel(&cm, &stats, id, &resp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_cancel_wins_over_a_draining_requeue_grace() {
+        let (_dir, cm, stats, id) =
+            cancelled_while_a_grace_victim_drains(PreemptMode::Requeue).await;
+
+        let resp = report_node(&cm, id, "n2", grace_exit_at());
+
+        assert_ended_as_the_users_cancel(&cm, &stats, id, &resp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_force_finish_after_a_user_cancel_ends_a_cancel_grace_as_the_cancel() {
+        let (_dir, cm, stats, id) =
+            cancelled_while_a_grace_victim_drains(PreemptMode::Cancel).await;
+
+        let resp = force_finish_cancelled(&cm, id);
+
+        assert_ended_as_the_users_cancel(&cm, &stats, id, &resp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_force_finish_after_a_user_cancel_ends_a_requeue_grace_as_the_cancel() {
+        let (_dir, cm, stats, id) =
+            cancelled_while_a_grace_victim_drains(PreemptMode::Requeue).await;
+
+        let resp = force_finish_cancelled(&cm, id);
+
+        assert_ended_as_the_users_cancel(&cm, &stats, id, &resp);
+    }
+
+    fn force_finish_cancelled(cm: &ClusterManager, id: JobId) -> ClientResponse {
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: 1,
+            state: JobState::Cancelled,
+            unreported_nodes: vec!["n2".into()],
+            cancel: None,
+            at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
+        });
+        cm.run_all_finalized_side_effects(&resp);
+        resp
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_cancel_during_the_grace_itself_still_ends_as_the_cancel() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
+
+        cm.cancel_job_for(id, Canceller::user("testuser", None), false)
+            .unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(job.preempted_by, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
