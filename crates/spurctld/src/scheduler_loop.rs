@@ -3537,12 +3537,21 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
 
 /// Whether a COMPLETING job has waited long enough to be force-finished. No
 /// production path leaves the end time unset, so a missing one is corrupt state.
+/// A grace in progress extends the wait: the unreported nodes are still allowed
+/// to run until its deadline.
 fn completing_job_is_overdue(
     job: &spur_core::job::Job,
     now: DateTime<Utc>,
     wait: chrono::Duration,
 ) -> bool {
-    job.end_time.is_none_or(|since| now - since >= wait)
+    let Some(end_time) = job.end_time else {
+        return true;
+    };
+    let since = job
+        .preempt_pending
+        .as_ref()
+        .map_or(end_time, |p| end_time.max(p.deadline));
+    now - since >= wait
 }
 
 /// Force-finishes a job stuck in Completing past `complete_wait_secs`. Cancels
@@ -4479,6 +4488,33 @@ mod tests {
 
         job.end_time = Some(now - chrono::Duration::seconds(300));
         assert!(completing_job_is_overdue(&job, now, wait));
+    }
+
+    #[test]
+    fn a_completing_grace_victim_is_measured_from_the_deadline() {
+        let now = Utc::now();
+        let wait = chrono::Duration::seconds(300);
+        let mut job = running_job_on("node001", now, 10);
+        job.state = spur_core::job::JobState::Completing;
+        job.end_time = Some(now - chrono::Duration::seconds(400));
+        job.preempt_pending = Some(spur_core::job::PreemptPending {
+            signaled_at: now - chrono::Duration::seconds(450),
+            deadline: now + chrono::Duration::seconds(600),
+            preempted_by: 7,
+            preempt_qos: None,
+            mode: spur_core::partition::PreemptMode::Cancel,
+            run_attempt: job.run_attempt,
+            requeue_hold_secs: 30,
+        });
+        assert!(
+            !completing_job_is_overdue(&job, now, wait),
+            "the first exit is older than the wait, but the grace has not ended"
+        );
+
+        let before_wait_ends = now + chrono::Duration::seconds(600 + 299);
+        assert!(!completing_job_is_overdue(&job, before_wait_ends, wait));
+        let wait_ends = now + chrono::Duration::seconds(600 + 300);
+        assert!(completing_job_is_overdue(&job, wait_ends, wait));
     }
 
     #[test]
