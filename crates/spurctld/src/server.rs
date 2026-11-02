@@ -5998,7 +5998,7 @@ fn update_job_err_to_status(err: anyhow::Error) -> Status {
     }
 }
 
-fn cluster_err_to_precondition_status(err: anyhow::Error) -> Status {
+pub(crate) fn cluster_err_to_precondition_status(err: anyhow::Error) -> Status {
     if err.downcast_ref::<spur_core::auth::AuthError>().is_some() {
         return Status::permission_denied(err.to_string());
     }

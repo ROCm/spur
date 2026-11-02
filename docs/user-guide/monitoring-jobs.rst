@@ -1235,6 +1235,9 @@ seconds.
    scontrol suspend 1024    # SIGSTOP, keep the allocation
    scontrol resume 1024     # SIGCONT
 
+Suspending a job that is in its preemption grace period is refused, because the
+preemption that ends the grace only applies to a running job.
+
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
 ``Account=``, ``Comment=``, ``QOS=``, and ``ExcNodeList=`` (also spelled
