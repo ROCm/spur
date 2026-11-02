@@ -124,18 +124,14 @@ The two daemons are configured with command-line flags. The most common are belo
    status is reported over the reconnect, so a job whose agent restarted
    mid-step still completes with the right exit code.
 
-   Two launches are still unsupervised and do **not** survive a restart: a step
-   given its own ``--container-image``, and an ``srun --pty`` that allocates its
-   own job. A terminal opened *inside* an existing allocation is supervised —
-   see :doc:`../user-guide/interactive`. A container step killed that way also
-   leaks its unpacked rootfs, which nothing reclaims. Containerized *jobs* are
-   supervised and survive a restart normally.
+   One launch is still unsupervised and does **not** survive a restart: an
+   ``srun --pty`` that allocates its own job. A terminal opened *inside* an
+   existing allocation is supervised — see :doc:`../user-guide/interactive`. A
+   step given its own ``--container-image`` is supervised like any other step.
 
    ``--mpi=pmix`` work survives a restart the same way: a job and an inner
    ``srun --mpi=pmix`` step each host their PMIx server inside their own
-   supervisor. A step given its own ``--container-image`` is the exception —
-   its server stays in ``spurd``, so restarting the agent breaks its
-   rendezvous along with the step itself.
+   supervisor.
 
    Before the controller will *fence* a supervisor belonging to a superseded
    run, the reporting node has to prove its identity, and that takes **two**
@@ -638,11 +634,10 @@ a granularity gap *inside* the job rather than a hole between jobs:
        step process that leaves that tree (``setsid``) is missed even though the
        step now has a cgroup that would catch it. Cancelling the whole *job* is
        exact, because that is a cgroup operation.
-   * - ``task_prolog`` / ``task_epilog`` for a containerized step
-     - A supervised step runs its task hooks as the job user inside its own
-       ``step_<n>`` cgroup. A containerized ``srun`` step still takes the legacy
-       launch path, where the hooks — like the container workload — run in the
-       parent job's leaf rather than a per-step ``step_<n>`` leaf.
+
+A step's ``task_prolog`` and ``task_epilog`` run as the job user inside the
+step's own ``step_<n>`` cgroup under its ``spurstepd``, whether or not the step
+gives its own ``--container-image``.
 
 Node-level ``prolog`` and ``epilog`` run uncontained, and that is by design:
 they run before the job's cgroup exists and after it is gone, and their purpose is
