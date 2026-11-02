@@ -855,7 +855,10 @@ async fn main() -> anyhow::Result<()> {
         let cleanup_store = stepds.clone();
         tokio::spawn(async move {
             loop {
-                if cleanup_store.ensure_cleanup_ready().is_err() {
+                if cleanup_store
+                    .ensure_job_cleanup_ready(job_id, run_attempt)
+                    .is_err()
+                {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
                 }

@@ -7831,6 +7831,30 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn cleanup_admission_hold_retries_the_job_and_cools_down_the_node() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let addr = spawn_mock_agent_rejecting_with_status(tonic::Status::resource_exhausted(
+                "node has unfinished job cgroup cleanup",
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(&cm, batch_spec("cleanup-admission-hold", 1));
+
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(cm.nodes_on_dispatch_cooldown().contains("n1"));
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, spur_core::job::JobState::Pending);
+            assert_eq!(job.requeue_count, 1);
+            assert!(job.allocated_nodes.is_empty());
+            assert!(job
+                .state_reason()
+                .contains("gpu/resource allocation mismatch"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn resources_unavailable_reject_cools_down_the_node() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;

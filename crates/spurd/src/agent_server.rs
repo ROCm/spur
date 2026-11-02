@@ -2127,7 +2127,9 @@ async fn report_runtime_completion(
         if !store.cleanup_expired(&descriptor).unwrap_or(false) {
             return false;
         }
-        report.drain = Some(&drain);
+        if !store.cleanup_quarantined(&descriptor).unwrap_or(false) {
+            report.drain = Some(&drain);
+        }
     }
     let completion = crate::stepd::PendingStepdCompletion {
         job_id: report.job_id,
@@ -2140,6 +2142,12 @@ async fn report_runtime_completion(
     };
     if !report_completion(controller_addr, report).await {
         return false;
+    }
+    if !cleaned {
+        if let Err(error) = store.acknowledge_cleanup_quarantine(&descriptor) {
+            warn!(job_id = completion.job_id, %error, "cannot persist acknowledged cleanup quarantine");
+            return false;
+        }
     }
     if let Err(error) = store.acknowledge_completion(&completion) {
         warn!(job_id = completion.job_id, %error, "cannot persist acknowledged runtime completion");
@@ -2520,6 +2528,126 @@ async fn settle_replayed_completions(
     }
 }
 
+async fn quarantine_expired_cleanup(
+    store: &crate::stepd::StepdStore,
+    controller_addr: &str,
+    reporting_node: &str,
+    node_token: &str,
+) -> std::io::Result<()> {
+    store.retry_cleanup()?;
+    let cleanup = store.cleanup_store();
+    for record in cleanup.records()? {
+        if !cleanup.expired(&record)? {
+            continue;
+        }
+        if !record.quarantine_acknowledged {
+            if !report_node_quarantine(controller_addr, reporting_node, node_token).await {
+                break;
+            }
+            cleanup.acknowledge_quarantine(&record)?;
+        }
+        let session = store.session_dir(record.job_id, record.run_attempt, record.step_id);
+        if store.load_descriptor(&session).is_err() {
+            report_orphan_cleanup_completion(
+                store,
+                &record,
+                controller_addr,
+                reporting_node,
+                node_token,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn report_orphan_cleanup_completion(
+    store: &crate::stepd::StepdStore,
+    record: &crate::cgroup_cleanup::PendingCleanup,
+    controller_addr: &str,
+    reporting_node: &str,
+    node_token: &str,
+) -> std::io::Result<()> {
+    if store.completion_reported(record.job_id, record.run_attempt, record.step_id)? {
+        return Ok(());
+    }
+    // The cleanup marker can outlive a lost or pruned supervisor directory.
+    store.prepare_session_dir(record.job_id, record.run_attempt, record.step_id)?;
+    let (exit_code, signal) =
+        match store.observed_exit(record.job_id, record.run_attempt, record.step_id)? {
+            Some(exit) => exit,
+            None => {
+                let exit = (0, nix::sys::signal::Signal::SIGKILL as i32);
+                store
+                    .obligations(record.job_id, record.run_attempt, record.step_id)
+                    .append(&crate::stepd::StepdObligation::ExitObserved {
+                        exit_code: exit.0,
+                        signal: exit.1,
+                    })?;
+                exit
+            }
+        };
+    if report_completion(
+        controller_addr,
+        CompletionReport {
+            job_id: record.job_id,
+            run_attempt: record.run_attempt,
+            step_id: Some(record.step_id),
+            exit_code,
+            signal,
+            reporting_node,
+            drain: None,
+            node_token: node_token.to_owned(),
+            pty_step_id: None,
+        },
+    )
+    .await
+    {
+        store.acknowledge_completion(&crate::stepd::PendingStepdCompletion {
+            job_id: record.job_id,
+            run_attempt: record.run_attempt,
+            step_id: record.step_id,
+            exit_code,
+            signal,
+            epilog_failed: false,
+            pty_step_id: None,
+        })?;
+    }
+    Ok(())
+}
+
+async fn report_node_quarantine(
+    controller_addr: &str,
+    reporting_node: &str,
+    node_token: &str,
+) -> bool {
+    let result = retry_controller_rpc(|_| async {
+        let channel = spur_client::connect_channel(controller_addr)
+            .await
+            .map_err(ControllerRpcError::Connect)?;
+        let mut client = crate::controller_auth::wrap(channel)
+            .await
+            .map_err(ControllerRpcError::Rpc)?;
+        client
+            .report_job_status(ReportJobStatusRequest {
+                job_id: 0,
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                reporting_node: reporting_node.to_owned(),
+                drain_node: true,
+                drain_reason: crate::cgroup_cleanup::DRAIN_REASON.into(),
+                node_token: node_token.to_owned(),
+                ..Default::default()
+            })
+            .await
+            .map_err(ControllerRpcError::Rpc)
+    })
+    .await;
+    if let Err(error) = &result {
+        warn!(%error, "could not confirm node quarantine for pending cleanup");
+    }
+    result.is_ok()
+}
+
 pub fn retry_unacknowledged_stepd_completions(
     store: crate::stepd::StepdStore,
     controller_addr: String,
@@ -2530,6 +2658,16 @@ pub fn retry_unacknowledged_stepd_completions(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if let Err(error) = quarantine_expired_cleanup(
+                &store,
+                &controller_addr,
+                &reporting_node,
+                &reporter.node_token(),
+            )
+            .await
+            {
+                warn!(%error, "failed to reconcile cleanup quarantine");
+            }
             match replay_runtime_completions(
                 &store,
                 &controller_addr,
@@ -2548,34 +2686,6 @@ pub fn retry_unacknowledged_stepd_completions(
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(%error, "failed to replay durable runtime completions");
-                }
-            }
-            if let Ok(records) = store.cleanup_store().records() {
-                for record in records {
-                    let session =
-                        store.session_dir(record.job_id, record.run_attempt, record.step_id);
-                    if store.load_descriptor(&session).is_ok()
-                        || !store.cleanup_store().expired(&record).unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    report_completion(
-                        &controller_addr,
-                        CompletionReport {
-                            job_id: record.job_id,
-                            exit_code: 0,
-                            signal: nix::sys::signal::Signal::SIGKILL as i32,
-                            run_attempt: record.run_attempt,
-                            reporting_node: &reporting_node,
-                            drain: Some(&DrainRequest {
-                                reason: crate::cgroup_cleanup::DRAIN_REASON.into(),
-                            }),
-                            step_id: Some(record.step_id),
-                            node_token: reporter.node_token(),
-                            pty_step_id: None,
-                        },
-                    )
-                    .await;
                 }
             }
             if let Err(error) = store.retry_cleanup() {
@@ -4783,6 +4893,7 @@ impl Drop for LaunchReservationGuard {
 use spur_proto::controller_rpc_retryable;
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
+const CONTROLLER_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A single failed attempt at a controller RPC.
@@ -4822,7 +4933,14 @@ where
 {
     let mut n = 1;
     loop {
-        match attempt(n).await {
+        let result = tokio::time::timeout(CONTROLLER_RPC_TIMEOUT, attempt(n))
+            .await
+            .unwrap_or_else(|_| {
+                Err(ControllerRpcError::Rpc(Status::deadline_exceeded(
+                    "controller report timed out",
+                )))
+            });
+        match result {
             Ok(value) => return Ok(value),
             Err(e) => {
                 if !e.retryable() || n == CONTROLLER_RPC_ATTEMPTS {
@@ -4839,7 +4957,7 @@ where
 mod controller_rpc_tests {
     use super::{
         controller_rpc_retryable, retry_controller_rpc, ControllerRpcError,
-        CONTROLLER_RPC_ATTEMPTS, CONTROLLER_RPC_RETRY_GAP,
+        CONTROLLER_RPC_ATTEMPTS, CONTROLLER_RPC_RETRY_GAP, CONTROLLER_RPC_TIMEOUT,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -4867,6 +4985,26 @@ mod controller_rpc_tests {
         })
         .await;
         (result, calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unresponsive_controller_cannot_block_cleanup_reconciliation() {
+        let calls = AtomicU32::new(0);
+        let start = tokio::time::Instant::now();
+        let result = retry_controller_rpc::<(), _, _>(|_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending()
+        })
+        .await;
+        assert!(
+            matches!(result, Err(ControllerRpcError::Rpc(status)) if status.code() == tonic::Code::DeadlineExceeded)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), CONTROLLER_RPC_ATTEMPTS);
+        assert_eq!(
+            start.elapsed(),
+            CONTROLLER_RPC_TIMEOUT * CONTROLLER_RPC_ATTEMPTS
+                + CONTROLLER_RPC_RETRY_GAP * (CONTROLLER_RPC_ATTEMPTS - 1)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -5301,8 +5439,8 @@ pub(crate) struct CompletionReport<'a> {
     pub reporting_node: &'a str,
     pub drain: Option<&'a DrainRequest>,
     pub step_id: Option<spur_core::step::StepId>,
-    /// Node-identity token. The controller verifies it only on the server-side
-    /// standalone-PTY completion path, so a report with no step may leave it empty.
+    /// Required for drain requests and standalone-PTY completion when the
+    /// controller enforces node identity.
     pub node_token: String,
     /// See [`crate::stepd::StepdDescriptor::pty_step_id`].
     pub pty_step_id: Option<spur_core::step::StepId>,
@@ -6659,7 +6797,7 @@ impl SlurmAgent for AgentService {
         for descriptor in &gated {
             crate::stepd::StepdStore::new(&self.stepd_state_dir)
                 .ensure_cleanup_ready()
-                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                .map_err(|e| Status::resource_exhausted(e.to_string()))?;
             if descriptor.resources.fabric_binding.is_some()
                 || descriptor.resources.gpu_binding.is_some()
             {
@@ -6927,7 +7065,7 @@ impl SlurmAgent for AgentService {
         let entry = self.job_entry(req.job_id).await?;
         crate::stepd::StepdStore::new(&self.stepd_state_dir)
             .ensure_cleanup_ready()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
 
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
@@ -7014,7 +7152,7 @@ impl SlurmAgent for AgentService {
         }
         crate::stepd::StepdStore::new(&self.stepd_state_dir)
             .ensure_cleanup_ready()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         // Creates this id's cgroup, so it must not run while a prior run's teardown
         // still owns the directory.
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
@@ -7381,9 +7519,6 @@ impl SlurmAgent for AgentService {
             }
         }
         let req = request.into_inner();
-        crate::stepd::StepdStore::new(&self.stepd_state_dir)
-            .ensure_cleanup_ready()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
         }
@@ -7560,6 +7695,9 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_cleanup_ready()
+            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         let step_epoch = next_step_epoch();
         {
             self.active_steps.lock().await.insert(
@@ -8990,6 +9128,9 @@ impl SlurmAgent for AgentService {
                     (master, interactive_exit_future(waiter), pid)
                 }
                 None => {
+                    crate::stepd::StepdStore::new(&self.stepd_state_dir)
+                        .ensure_cleanup_ready()
+                        .map_err(|error| Status::resource_exhausted(error.to_string()))?;
                     let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
                     let mut container_rootfs_mode = None;
                     let mut fresh_container_env: Option<HashMap<String, String>> = None;
@@ -9741,7 +9882,7 @@ impl AgentService {
     ) -> Result<(AllocationResult, Vec<u64>), Status> {
         crate::stepd::StepdStore::new(&self.stepd_state_dir)
             .ensure_cleanup_ready()
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         let controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -12642,6 +12783,7 @@ mod tests {
                 run_attempt: 7,
                 step_id,
                 cgroup,
+                quarantine_acknowledged: false,
                 deadline_unix_ms: u64::MAX,
             })
             .unwrap();
@@ -12711,6 +12853,7 @@ mod tests {
                 run_attempt: 7,
                 step_id,
                 cgroup: descriptor.cgroup_path.clone(),
+                quarantine_acknowledged: false,
                 deadline_unix_ms: 0,
             };
             context

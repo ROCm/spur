@@ -18,6 +18,8 @@ pub(crate) struct PendingCleanup {
     pub step_id: u32,
     pub cgroup: PathBuf,
     pub deadline_unix_ms: u64,
+    #[serde(default)]
+    pub quarantine_acknowledged: bool,
 }
 
 impl PendingCleanup {
@@ -33,6 +35,7 @@ impl PendingCleanup {
             run_attempt,
             step_id,
             cgroup,
+            quarantine_acknowledged: false,
             deadline_unix_ms: unix_ms()?.saturating_add(u64::from(timeout_secs) * 1000),
         })
     }
@@ -78,6 +81,11 @@ impl CleanupStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        self.write_record(record, true)
+    }
+
+    fn write_record(&self, record: &PendingCleanup, create_new: bool) -> io::Result<()> {
+        let path = self.path(record);
         let temporary = self
             .directory
             .join(format!(".tmp-{}", uuid::Uuid::new_v4()));
@@ -90,21 +98,50 @@ impl CleanupStore {
                 .open(&temporary)?;
             file.write_all(&serde_json::to_vec(record)?)?;
             file.sync_all()?;
-            // Concurrent supervisors and replay must keep the first persisted deadline.
-            match fs::hard_link(&temporary, &path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    check_identity(&fs::read(&path)?, record)?;
+            if create_new {
+                // Concurrent supervisors and replay must keep the first persisted deadline.
+                match fs::hard_link(&temporary, &path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        check_identity(&fs::read(&path)?, record)?;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
+                fs::remove_file(&temporary)?;
+            } else {
+                fs::rename(&temporary, &path)?;
             }
-            fs::remove_file(&temporary)?;
             fs::File::open(&self.directory)?.sync_all()
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+
+    pub fn quarantine_acknowledged(&self, record: &PendingCleanup) -> io::Result<bool> {
+        match fs::read(self.path(record)) {
+            Ok(bytes) => {
+                Ok(serde_json::from_slice::<PendingCleanup>(&bytes)?.quarantine_acknowledged)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn acknowledge_quarantine(&self, record: &PendingCleanup) -> io::Result<()> {
+        let bytes = match fs::read(self.path(record)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        check_identity(&bytes, record)?;
+        let mut stored: PendingCleanup = serde_json::from_slice(&bytes)?;
+        if !stored.quarantine_acknowledged {
+            stored.quarantine_acknowledged = true;
+            self.write_record(&stored, false)?;
+        }
+        Ok(())
     }
 
     pub fn finish(&self, record: &PendingCleanup) -> io::Result<()> {
@@ -382,6 +419,7 @@ mod tests {
             run_attempt: 1,
             step_id: spur_core::step::STEP_BATCH,
             cgroup: path.clone(),
+            quarantine_acknowledged: false,
             deadline_unix_ms: 0,
         };
         let store = CleanupStore::new(&runtime);
@@ -408,6 +446,22 @@ mod tests {
         fs::write(store.directory.join("7.1.0.json"), "broken").unwrap();
         store.retry().unwrap();
         assert!(store.is_pending().unwrap());
+    }
+
+    #[test]
+    fn quarantine_acknowledgment_preserves_old_records_and_survives_restart() {
+        let old = r#"{"job_id":7,"run_attempt":1,"step_id":4294967291,"cgroup":"/fixture/job_7_1","deadline_unix_ms":0}"#;
+        let record: PendingCleanup = serde_json::from_str(old).unwrap();
+        assert!(!record.quarantine_acknowledged);
+        let dir = tempfile::tempdir().unwrap();
+        let store = CleanupStore::new(dir.path());
+        store.track(&record).unwrap();
+        store.acknowledge_quarantine(&record).unwrap();
+        let restarted = CleanupStore::new(dir.path());
+        assert!(restarted.quarantine_acknowledged(&record).unwrap());
+        assert_eq!(restarted.records().unwrap()[0].deadline_unix_ms, 0);
+        restarted.track(&record).unwrap();
+        assert!(restarted.quarantine_acknowledged(&record).unwrap());
     }
 
     #[test]

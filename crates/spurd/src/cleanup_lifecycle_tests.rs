@@ -192,6 +192,7 @@ impl SessionFixture {
                 run_attempt: 1,
                 step_id,
                 cgroup: cgroup.clone(),
+                quarantine_acknowledged: false,
                 deadline_unix_ms,
             })
             .expect("record cleanup");
@@ -283,6 +284,165 @@ impl SessionFixture {
             .expect("allocate fixture resources");
         assert!(allocation.commit_job(self.descriptor.job_id, self.descriptor.run_attempt));
     }
+}
+
+fn command_request(step_id: u32) -> Request<RunCommandRequest> {
+    Request::new(RunCommandRequest {
+        job_id: 71,
+        step_id,
+        command: vec!["true".into()],
+        uid: 1000,
+        gid: 1000,
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn command_replay_returns_an_acknowledged_exit_during_cleanup() {
+    let controller = ControllerFixture::new(true);
+    for memoized in [false, true] {
+        let fixture = SessionFixture::new(0);
+        let agent = fixture.agent(&controller);
+        fixture.track_allocation(&agent).await;
+        let step_id = 3;
+        let mut descriptor = fixture.descriptor.clone();
+        descriptor.step_id = step_id;
+        descriptor.socket_path = fixture
+            .store
+            .session_dir(71, 1, step_id)
+            .join("runtime.sock");
+        fixture.store.publish(&descriptor).expect("publish step");
+        let obligations = fixture.store.obligations(71, 1, step_id);
+        obligations
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 9,
+                signal: 0,
+            })
+            .expect("record exit");
+        obligations
+            .append(&StepdObligation::CompletionAcknowledged)
+            .expect("record quarantine acknowledgment");
+        if memoized {
+            agent
+                .step_completions
+                .complete(
+                    71,
+                    1,
+                    step_id,
+                    crate::step_completion::StepOutcome {
+                        exit_code: 9,
+                        signal: 0,
+                    },
+                )
+                .await;
+        }
+
+        let response = agent
+            .run_command(command_request(step_id))
+            .await
+            .expect("retry returns the acknowledged result")
+            .into_inner();
+
+        assert_eq!(response.exit_code, 9);
+        assert!(agent.active_steps.lock().await.is_empty());
+        assert!(fixture.store.ensure_cleanup_ready().is_err());
+    }
+}
+
+#[tokio::test]
+async fn command_rejoins_a_running_step_during_unrelated_cleanup_but_refuses_a_new_step() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    let controller = ControllerFixture::new(true);
+    let fixture = SessionFixture::new(0);
+    let agent = fixture.agent(&controller);
+    fixture.track_allocation(&agent).await;
+    let error = agent
+        .run_command(command_request(4))
+        .await
+        .expect_err("fresh steps remain blocked");
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    let mut descriptor = fixture.descriptor.clone();
+    descriptor.step_id = 3;
+    agent.stepds.lock().await.insert((71, 3), descriptor);
+    let retry = agent.run_command(command_request(3));
+    tokio::pin!(retry);
+    let mut context = Context::from_waker(Waker::noop());
+
+    assert!(matches!(retry.as_mut().poll(&mut context), Poll::Pending));
+    assert_eq!(agent.step_completions.parked().await, 1);
+    agent
+        .step_completions
+        .complete(
+            71,
+            1,
+            3,
+            crate::step_completion::StepOutcome {
+                exit_code: 9,
+                signal: 0,
+            },
+        )
+        .await;
+    assert_eq!(
+        retry.await.expect("rejoined result").into_inner().exit_code,
+        9
+    );
+    assert!(agent.active_steps.lock().await.is_empty());
+    assert!(fixture.store.ensure_cleanup_ready().is_err());
+}
+
+#[tokio::test]
+async fn fresh_interactive_rpc_cannot_launch_during_cleanup() {
+    let controller = ControllerFixture::new(true);
+    let fixture = SessionFixture::new(0);
+    let agent = fixture.agent(&controller);
+    fixture.track_allocation(&agent).await;
+    {
+        let mut running = agent.running.lock().await;
+        let job = running.get_mut(&71).expect("tracked allocation");
+        job.uid = 1000;
+        job.gid = 1000;
+        job.user = "fixture-user".into();
+    }
+    let sessions = agent.stepds.clone();
+    let active = agent.active_steps.clone();
+    let incoming = tonic::transport::server::TcpIncoming::bind(
+        "127.0.0.1:0".parse().expect("loopback address"),
+    )
+    .expect("bind agent fixture");
+    let address = format!("http://{}", incoming.local_addr().expect("agent address"));
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(spur_proto::agent_server(agent))
+            .serve_with_incoming(incoming)
+            .await
+            .expect("serve agent fixture");
+    });
+    let mut client = spur_proto::proto::slurm_agent_client::SlurmAgentClient::connect(address)
+        .await
+        .expect("connect agent fixture");
+    let result = client
+        .interactive_session(tokio_stream::iter([InteractiveInput {
+            msg: Some(interactive_input::Msg::Init(InitSession {
+                job_id: 71,
+                step_id: 3,
+                argv: vec!["true".into()],
+                user: "fixture-user".into(),
+                ..Default::default()
+            })),
+        }]))
+        .await;
+    server.abort();
+
+    let error = result.expect_err("cleanup blocks a fresh terminal workload");
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(!sessions
+        .lock()
+        .await
+        .contains_key(&(71, spur_core::step::STEP_INTERACTIVE)));
+    assert!(active.lock().await.is_empty());
+    assert!(fixture.store.ensure_cleanup_ready().is_err());
 }
 
 #[tokio::test]
@@ -392,10 +552,42 @@ async fn restarted_agent_rejects_new_allocation_before_any_resource_is_reserved(
         .await
         .expect_err("pending cleanup rejects admission");
 
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert!(error.message().contains("unfinished job cgroup cleanup"));
     assert!(agent.running.lock().await.is_empty());
     assert_eq!(agent.allocation.lock().await.allocated_memory_mb, 0);
+    assert!(controller.reports().is_empty());
+}
+
+#[tokio::test]
+async fn batch_resource_reservation_is_retryable_while_cleanup_is_pending_or_corrupt() {
+    let controller = ControllerFixture::new(true);
+    for corrupt in [false, true] {
+        let fixture = SessionFixture::new(0);
+        let agent = fixture.agent(&controller);
+        if corrupt {
+            std::fs::write(
+                fixture
+                    .store
+                    .root()
+                    .join("cleanup")
+                    .join(format!("71.1.{}.json", spur_core::step::STEP_BATCH)),
+                "invalid cleanup record",
+            )
+            .expect("corrupt cleanup record");
+        }
+
+        let error = agent
+            .allocate_local_resources(72, 1, &JobSpec::default(), None, 1, 128)
+            .await
+            .expect_err("cleanup holds batch admission");
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(error.message().contains("unfinished job cgroup cleanup"));
+        assert!(agent.running.lock().await.is_empty());
+        assert_eq!(agent.allocation.lock().await.allocated_memory_mb, 0);
+        assert!(fixture.store.ensure_cleanup_ready().is_err());
+    }
     assert!(controller.reports().is_empty());
 }
 
@@ -464,7 +656,7 @@ async fn pending_cleanup_prevents_a_prepared_supervisor_from_opening_its_start_g
         .await
         .expect_err("gate stays closed");
 
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert!(error.message().contains("unfinished job cgroup cleanup"));
     assert_eq!(agent.allocation.lock().await.allocated_memory_mb, 128);
     assert!(agent
@@ -736,4 +928,81 @@ async fn unreadable_cleanup_identity_keeps_an_allocation_reserved() {
     assert!(agent.running.lock().await.contains_key(&71));
     assert_eq!(agent.allocation.lock().await.allocated_memory_mb, 128);
     assert!(fixture.store.ensure_cleanup_ready().is_err());
+}
+
+#[tokio::test]
+async fn an_expired_live_supervisor_is_quarantined_once_without_completing_its_job() {
+    let controller = ControllerFixture::new(false);
+    let mut fixture = SessionFixture::new(0);
+    fixture.descriptor.pid = std::process::id();
+    fixture.descriptor.process_start_ticks =
+        crate::stepd::process_start_ticks(fixture.descriptor.pid).expect("fixture start ticks");
+    fixture
+        .store
+        .publish(&fixture.descriptor)
+        .expect("live descriptor");
+    assert!(fixture
+        .store
+        .discover_unacknowledged_completions()
+        .unwrap()
+        .is_empty());
+
+    quarantine_expired_cleanup(&fixture.store, &controller.address, "cleanup-node", "")
+        .await
+        .unwrap();
+    assert!(!fixture.store.cleanup_store().records().unwrap()[0].quarantine_acknowledged);
+    controller.state.accept.store(true, Ordering::SeqCst);
+    quarantine_expired_cleanup(&fixture.store, &controller.address, "cleanup-node", "")
+        .await
+        .unwrap();
+    assert!(!fixture.acknowledged());
+    assert!(fixture.store.ensure_cleanup_ready().is_err());
+    for report in controller.reports() {
+        assert_eq!(report.job_id, 0);
+        assert!(report.drain_node);
+        assert_eq!(report.step_id, None);
+        assert_eq!(report.pty_step_id, None);
+    }
+    let restarted = StepdStore::new(fixture.directory.path());
+    assert!(restarted.cleanup_store().records().unwrap()[0].quarantine_acknowledged);
+    quarantine_expired_cleanup(&restarted, &controller.address, "cleanup-node", "")
+        .await
+        .unwrap();
+    assert_eq!(controller.reports().len(), 2);
+
+    assert!(report_runtime_completion(&restarted, &controller.address, fixture.report()).await);
+    assert!(fixture.acknowledged());
+    let reports = controller.reports();
+    assert_eq!(reports.len(), 3);
+    assert_eq!(reports[2].job_id, fixture.descriptor.job_id);
+    assert!(!reports[2].drain_node);
+}
+
+#[tokio::test]
+async fn expired_orphan_cleanup_completes_only_after_quarantine_and_does_not_repeat() {
+    for missing_session in [false, true] {
+        let controller = ControllerFixture::new(true);
+        let fixture = SessionFixture::new(0);
+        let session = fixture.descriptor.socket_path.parent().unwrap();
+        if missing_session {
+            std::fs::remove_dir_all(session).unwrap();
+        } else {
+            std::fs::write(session.join("descriptor.json"), "broken").unwrap();
+        }
+        quarantine_expired_cleanup(&fixture.store, &controller.address, "cleanup-node", "")
+            .await
+            .unwrap();
+        let reports = controller.reports();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].job_id, 0);
+        assert!(reports[0].drain_node);
+        assert_eq!(reports[1].job_id, fixture.descriptor.job_id);
+        assert!(!reports[1].drain_node);
+        assert!(fixture.acknowledged());
+        assert!(fixture.store.ensure_cleanup_ready().is_err());
+        quarantine_expired_cleanup(&fixture.store, &controller.address, "cleanup-node", "")
+            .await
+            .unwrap();
+        assert_eq!(controller.reports().len(), 2);
+    }
 }

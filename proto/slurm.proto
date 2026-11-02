@@ -1727,6 +1727,8 @@ message GetFairshareFactorsResponse {
 // -- K8s Operator --
 
 message ReportJobStatusRequest {
+  // Zero requests only a node drain; no job or step is completed. Requires
+  // drain_node and reporting_node, with no step, attempt, exit code, or signal.
   uint32 job_id = 1;
   // Completion gate for per-node reports. Must be JOB_COMPLETED when
   // exit_code==0, or JOB_FAILED when exit_code!=0.

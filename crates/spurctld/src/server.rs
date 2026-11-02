@@ -2606,6 +2606,18 @@ impl SlurmController for ControllerService {
         if !req.reporting_node.is_empty() && reports_whole_job(req.step_id) {
             validate_completion_report_state_for_rpc(state, req.exit_code)?;
         }
+        if req.job_id == 0
+            && (!req.drain_node
+                || req.step_id.is_some()
+                || req.pty_step_id.is_some()
+                || req.run_attempt != 0
+                || req.exit_code != 0
+                || req.signal != 0)
+        {
+            return Err(Status::invalid_argument(
+                "a node-only report requires only a drain request",
+            ));
+        }
         if req.drain_node {
             if req.reporting_node.is_empty() {
                 return Err(Status::invalid_argument(
@@ -2620,6 +2632,10 @@ impl SlurmController for ControllerService {
                 .map_err(|error| {
                     Status::unavailable(format!("could not commit node drain: {error}"))
                 })?;
+        }
+
+        if req.job_id == 0 {
+            return Ok(Response::new(()));
         }
 
         // Non-empty `reporting_node` means a per-node completion report. The final
@@ -7899,6 +7915,44 @@ mod tests {
             .collect();
         operations.sort_by_key(|(index, _)| *index);
         operations
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failure_node_only_report_authenticates_without_completing_jobs() {
+        use spur_core::wal::WalOperation;
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let job_id = running_job_owned_by(&svc, "u").await;
+        let mut report = cleanup_failure_report(0, 0);
+        report.step_id = None;
+        report.node_token = "invalid".into();
+        assert_eq!(
+            svc.report_job_status(Request::new(report.clone()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        assert!(svc.cluster.get_node("n1").unwrap().is_schedulable());
+        report.node_token =
+            spur_core::admission::generate_node_token("n1", svc.jwt_key.as_bytes()).unwrap();
+        svc.report_job_status(Request::new(report)).await.unwrap();
+        let node = svc.cluster.get_node("n1").unwrap();
+        assert_eq!(node.state, spur_core::node::NodeState::Draining);
+        assert!(node.admin_locked);
+        assert!(node.alloc_resources.cpus > 0);
+        assert_eq!(
+            svc.cluster.get_job(job_id).unwrap().state,
+            JobState::Running
+        );
+        assert!(
+            !logged_operations(dir.path()).iter().any(|(_, op)| matches!(
+                op,
+                WalOperation::JobNodeComplete { .. }
+                    | WalOperation::JobComplete { .. }
+                    | WalOperation::JobStepComplete { .. }
+            ))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

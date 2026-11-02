@@ -2616,6 +2616,19 @@ impl StepdStore {
             .expired(&self.cleanup_record(descriptor)?)
     }
 
+    pub(crate) fn cleanup_quarantined(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        self.cleanup_store()
+            .quarantine_acknowledged(&self.cleanup_record(descriptor)?)
+    }
+
+    pub(crate) fn acknowledge_cleanup_quarantine(
+        &self,
+        descriptor: &StepdDescriptor,
+    ) -> io::Result<()> {
+        self.cleanup_store()
+            .acknowledge_quarantine(&self.cleanup_record(descriptor)?)
+    }
+
     pub fn prepare_orphan_cleanup(
         &self,
         job_id: u32,
@@ -2644,7 +2657,7 @@ impl StepdStore {
         Ok(())
     }
 
-    pub(crate) fn ensure_job_cleanup_ready(&self, job_id: u32, run_attempt: u32) -> io::Result<()> {
+    pub fn ensure_job_cleanup_ready(&self, job_id: u32, run_attempt: u32) -> io::Result<()> {
         if self.cleanup_store().is_pending_for(job_id, run_attempt)? {
             return Err(io::Error::other("job has unfinished cgroup cleanup"));
         }
