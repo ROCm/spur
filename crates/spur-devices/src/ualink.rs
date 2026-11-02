@@ -159,26 +159,26 @@ pub fn validate_local(topologies: &mut [&mut DeviceTopology]) {
                 && b.physical_capacity.is_some()
                 && a.physical_capacity != b.physical_capacity
             {
-                fields.push("ppod_size");
+                fields.push(("ppod_size", Issue::PeerConflict));
             }
             if !has_issue(a, "local_accels")
                 && !has_issue(b, "local_accels")
                 && a.local_endpoints != b.local_endpoints
             {
-                fields.push("local_accels");
+                fields.push(("local_accels", Issue::PeerConflict));
             }
             if a.fabric_domain_id.is_some() && a.fabric_domain_id == b.fabric_domain_id {
                 if a.fabric_capacity.is_some()
                     && b.fabric_capacity.is_some()
                     && a.fabric_capacity != b.fabric_capacity
                 {
-                    fields.push("vpod_size");
+                    fields.push(("vpod_size", Issue::PeerConflict));
                 }
                 if !has_issue(a, "vpod_active_accels")
                     && !has_issue(b, "vpod_active_accels")
                     && a.active_endpoints != b.active_endpoints
                 {
-                    fields.push("vpod_active_accels");
+                    fields.push(("vpod_active_accels", Issue::PeerConflict));
                 }
             }
             // Logical partitions can share an endpoint only on the same BDF.
@@ -186,7 +186,7 @@ pub fn validate_local(topologies: &mut [&mut DeviceTopology]) {
                 && a.endpoint_id == b.endpoint_id
                 && left.pci_bdf != right.pci_bdf
             {
-                fields.push("accel_id");
+                fields.push(("accel_id", Issue::Conflict));
             }
             conflicts[i].extend(fields.iter().copied());
             conflicts[j].extend(fields);
@@ -194,17 +194,18 @@ pub fn validate_local(topologies: &mut [&mut DeviceTopology]) {
     }
     for (topology, fields) in topologies.iter_mut().zip(conflicts) {
         if let Some(o) = &mut topology.fabric {
-            for field in fields {
-                conflict(o, field);
+            for (field, kind) in fields {
+                o.status = Status::Inconsistent;
+                o.add_issue(field, kind);
             }
         }
     }
 }
 
 fn has_issue(o: &FabricObservation, field: &str) -> bool {
-    o.issues
-        .iter()
-        .any(|issue| issue.field == field && issue.kind != Issue::Conflict)
+    o.issues.iter().any(|issue| {
+        issue.field == field && !matches!(issue.kind, Issue::Conflict | Issue::PeerConflict)
+    })
 }
 
 pub fn pci_root(device: &Path) -> Option<String> {
@@ -353,6 +354,8 @@ mod tests {
         validate_local(&mut [&mut left, &mut right]);
         assert_eq!(left.fabric.as_ref().unwrap().status, Status::Inconsistent);
         assert_eq!(right.fabric.as_ref().unwrap().status, Status::Inconsistent);
+        let own = left.fabric.as_ref().unwrap().without_peer_conflicts();
+        assert_eq!(own, observe(a.path()).unwrap());
         std::fs::write(
             b.path().join("ualink/ppod_id"),
             "00000000-0000-4000-8000-000000000002",
@@ -378,12 +381,9 @@ mod tests {
         assert_eq!(a.fabric.as_ref().unwrap().status, Status::Consistent);
         b.pci_bdf = Some("0002:04:00.0".into());
         validate_local(&mut [&mut a, &mut b]);
-        assert!(a
-            .fabric
-            .unwrap()
-            .issues
-            .iter()
-            .any(|i| i.field == "accel_id"));
+        let own = a.fabric.unwrap().without_peer_conflicts();
+        assert!(own.issues.iter().any(|i| i.field == "accel_id"));
+        assert_eq!(own.status, Status::Inconsistent);
     }
 
     #[test]

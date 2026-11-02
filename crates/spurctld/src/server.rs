@@ -9373,6 +9373,136 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_rejects_a_changed_fabric_binding() {
+        use spur_core::fabric::{FabricObservation, ObservationStatus};
+        use spur_core::resource::{
+            AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource, ResourceAllocations,
+            ResourceSet,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let register = |domain: &str| {
+            let fabric = FabricObservation {
+                source: "test".into(),
+                status: ObservationStatus::Consistent,
+                physical_domain_id: Some("rack".into()),
+                fabric_domain_id: Some(domain.into()),
+                endpoint_id: Some("1".into()),
+                physical_capacity: Some(8),
+                fabric_capacity: Some(1),
+                active_endpoints: vec!["1".into()],
+                local_endpoints: vec!["1".into()],
+                ..Default::default()
+            };
+            let gpu = GpuResource {
+                device_id: 0,
+                stable_id: 42,
+                gpu_type: "test".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::PCIe,
+                topology: Some(DeviceTopology {
+                    fabric: Some(fabric),
+                    ..Default::default()
+                }),
+            };
+            svc.cluster
+                .register_node(
+                    "n1".into(),
+                    "n1".into(),
+                    ResourceSet {
+                        cpus: 8,
+                        memory_mb: 16000,
+                        generation: 7,
+                        fabric_binding_version: 1,
+                        gpus: vec![gpu],
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818,
+                    String::new(),
+                    String::new(),
+                    spur_core::node::NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                    true,
+                )
+                .unwrap();
+        };
+        let domain_is = |domain: &str| {
+            svc.cluster.get_node("n1").is_some_and(|node| {
+                node.total_resources.gpus[0]
+                    .topology
+                    .as_ref()
+                    .and_then(|t| t.fabric.as_ref())
+                    .and_then(|f| f.fabric_domain_id.as_deref())
+                    == Some(domain)
+            })
+        };
+        async fn settle(done: impl Fn() -> bool) {
+            for _ in 0..200 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        register("15");
+        settle(|| domain_is("15")).await;
+        let view = svc.cluster.fabric_view(chrono::Utc::now());
+        let mut allocation = ResourceAllocations::with_scalar(1, 1000);
+        allocation.generation = 7;
+        allocation
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(42)]);
+        allocation.fabric_binding = Some(
+            spur_core::fabric_binding::FabricBinding::for_allocation(
+                &view.blocks[0],
+                "n1",
+                &allocation,
+            )
+            .unwrap(),
+        );
+        let spec = spur_core::job::JobSpec {
+            name: "bound".into(),
+            user: "ubuntu".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            gpus: Some(spur_core::gpu_request::GpuRequest::new(1, None)),
+            constraint: Some("same(gpu.fabric_domain_id)".into()),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let per_node = [("n1".to_string(), allocation.clone())]
+            .into_iter()
+            .collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into()], allocation, per_node)
+            .unwrap();
+        settle(|| svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running)).await;
+        let step = || {
+            svc.create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                user: "ubuntu".into(),
+                num_tasks: 1,
+                cpus_per_task: 1,
+                overlap: true,
+                ..Default::default()
+            }))
+        };
+        step().await.expect("the binding still matches");
+        register("16");
+        settle(|| domain_is("16")).await;
+        let err = step()
+            .await
+            .expect_err("the bound GPU moved to another domain");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("fabric"), "{err}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_create_job_step_never_hands_out_a_duplicate_step_id() {
         // Two clients handed the same id land on one supervisor session and

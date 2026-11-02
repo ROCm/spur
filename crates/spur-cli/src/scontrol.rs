@@ -37,7 +37,7 @@ pub enum ScontrolCommand {
     /// Show detailed information
     Show {
         /// Entity type: job, node, partition, reservation, assoc_mgr, federation,
-        /// config, hostnames, hostlist, hostlistsorted
+        /// config, topology, hostnames, hostlist, hostlistsorted
         entity: String,
         /// Entity name or ID
         name: Option<String>,
@@ -957,7 +957,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
         }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, hostnames, hostlist, hostlistsorted",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, topology, hostnames, hostlist, hostlistsorted",
                 other
             );
         }
@@ -1264,6 +1264,7 @@ fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
                     Ok(ObservationIssueKind::ObservationIssueConflict) => "conflict",
                     Ok(ObservationIssueKind::ObservationIssueChanged) => "changed",
                     Ok(ObservationIssueKind::ObservationIssueUnavailable) => "unavailable",
+                    Ok(ObservationIssueKind::ObservationIssuePeerConflict) => "peer_conflict",
                     _ => "unknown",
                 };
                 format!("{}:{kind}", text(Some(&issue.field)))
@@ -2241,13 +2242,9 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
                 })
                 .collect();
             if let Some(revision) = &binding.file_revision {
-                let _ = writeln!(
-                    out,
-                    "   BlockFileRevision={} BindingVersion={}",
-                    revision, binding.version
-                );
+                let _ = writeln!(out, "   BlockFileRevision={revision}");
             }
-            let _ = writeln!(out, "   FabricNode={} Namespace={} PhysicalDomain={} FabricDomain={} Generation={} StableIds=[{}]", node, key.namespace, key.physical_domain, key.fabric_domain, binding.inventory_generation, ids.join(","));
+            let _ = writeln!(out, "   FabricNode={} Namespace={} PhysicalDomain={} FabricDomain={} Generation={} StableIds=[{}] BindingVersion={}", node, key.namespace, key.physical_domain, key.fabric_domain, binding.inventory_generation, ids.join(","), binding.version);
         }
     }
     let _ = writeln!(out, "   UserId={} Account={}", job.user, job.account);
@@ -2548,6 +2545,30 @@ mod tests {
         // Slurm prints a bare 0 when no per-node floor was requested.
         let unset = format_job_detail(&spur_proto::proto::JobInfo::default());
         assert!(unset.contains("MinMemoryNode=0\n"), "{unset}");
+    }
+
+    #[test]
+    fn job_detail_shows_the_binding_version_for_native_and_file_bindings() {
+        use spur_proto::proto::{FabricBinding, FabricBlockKey};
+        let mut job = spur_proto::proto::JobInfo::default();
+        for (node, version, revision) in [("n1", 1, None), ("n2", 2, Some("ab".repeat(32)))] {
+            job.fabric_bindings.insert(
+                node.into(),
+                FabricBinding {
+                    version,
+                    key: Some(FabricBlockKey::default()),
+                    file_revision: revision,
+                    ..Default::default()
+                },
+            );
+        }
+        let out = format_job_detail(&job);
+        assert!(
+            out.contains("FabricNode=n1 ") && out.contains("BindingVersion=1\n"),
+            "{out}"
+        );
+        assert!(out.contains("BindingVersion=2\n"), "{out}");
+        assert_eq!(out.matches("BlockFileRevision=").count(), 1, "{out}");
     }
 
     #[test]

@@ -21,10 +21,20 @@ pub struct BoundGpu {
 }
 
 impl BoundGpu {
+    /// Disagreement between devices is block health, checked at placement, not part of
+    /// one device's binding.
+    fn device_facts(&self) -> Self {
+        let mut facts = self.clone();
+        if let Some(fabric) = facts.topology.as_mut().and_then(|t| t.fabric.as_mut()) {
+            *fabric = fabric.without_peer_conflicts();
+        }
+        facts
+    }
+
     /// Keeps only this device's own entry in shared endpoint lists, so a step is not
     /// fenced by changes to other accelerators.
     fn own_facts(&self) -> Self {
-        let mut facts = self.clone();
+        let mut facts = self.device_facts();
         if let Some(fabric) = facts.topology.as_mut().and_then(|t| t.fabric.as_mut()) {
             let own = fabric.endpoint_id.clone();
             fabric.active_endpoints.retain(|e| Some(e) == own.as_ref());
@@ -123,7 +133,9 @@ impl GpuBinding {
                 .iter()
                 .filter(|g| g.stable_id == expected.stable_id);
             let same = |gpu: &GpuResource| match check {
-                BindingCheck::Dispatch => BoundGpu::from(gpu) == *expected,
+                BindingCheck::Dispatch => {
+                    BoundGpu::from(gpu).device_facts() == expected.device_facts()
+                }
                 BindingCheck::Step => BoundGpu::from(gpu).own_facts() == expected.own_facts(),
             };
             if !found.next().is_some_and(same) || found.next().is_some() {
@@ -263,7 +275,7 @@ mod tests {
 
     #[test]
     fn step_check_ignores_generation_and_vpod_wide_fields_only() {
-        use spur_devices::topology::{FabricObservation, ObservationStatus};
+        use spur_devices::topology::{FabricObservation, ObservationIssueKind, ObservationStatus};
         let (mut inventory, allocation) = fixture();
         inventory.gpus[0].topology.as_mut().unwrap().fabric = Some(FabricObservation {
             status: ObservationStatus::Consistent,
@@ -287,7 +299,19 @@ mod tests {
         fabric.fabric_capacity = Some(1);
         assert!(binding.validate("n0", &changed, &allocation).is_err());
         binding.validate_step("n0", &changed, &allocation).unwrap();
-        for mutate in 0..4 {
+        let mut peer = inventory.clone();
+        let fabric = peer.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap();
+        fabric.status = ObservationStatus::Inconsistent;
+        fabric.add_issue("vpod_size", ObservationIssueKind::PeerConflict);
+        binding.validate("n0", &peer, &allocation).unwrap();
+        binding.validate_step("n0", &peer, &allocation).unwrap();
+        for mutate in 0..5 {
             let mut own = changed.clone();
             let topology = own.gpus[0].topology.as_mut().unwrap();
             let fabric = topology.fabric.as_mut().unwrap();
@@ -295,6 +319,7 @@ mod tests {
                 0 => fabric.fabric_domain_id = Some("16".into()),
                 1 => fabric.status = ObservationStatus::Unavailable,
                 2 => fabric.active_endpoints = vec!["2".into()],
+                3 => fabric.add_issue("accel_id", ObservationIssueKind::Conflict),
                 _ => topology.numa_node = Some(1),
             }
             assert!(binding.validate_step("n0", &own, &allocation).is_err());

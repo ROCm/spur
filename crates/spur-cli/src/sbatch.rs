@@ -129,7 +129,7 @@ pub struct SbatchArgs {
     #[arg(short = 'x', long, overrides_with = "exclude")]
     pub exclude: Option<String>,
 
-    /// Required node features or same(gpu.fabric_domain_id) for one fabric block
+    /// Required node features and GPU predicates: gpu.<field><op><value>, same(gpu.<field>)
     #[arg(short = 'C', long, overrides_with = "constraint")]
     pub constraint: Option<String>,
 

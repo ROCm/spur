@@ -407,10 +407,8 @@ impl BackfillScheduler {
         let mut block_job = job.clone();
         block_job.spec.constraint = Some(constraints.features.join(","));
         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
-        let gpu_type = resolve_gpu_demand(&job.spec)
-            .ok()?
-            .gpu_type()
-            .map(str::to_string);
+        let demand = resolve_gpu_demand(&job.spec).ok()?;
+        let gpu_type = demand.gpu_type().map(str::to_string);
         let mut best: Option<(Assignment, chrono::DateTime<Utc>)> = None;
         let mut blocks: Vec<_> = if constraints.same_fabric {
             context
@@ -433,13 +431,18 @@ impl BackfillScheduler {
                 Vec<String>,
                 std::collections::BTreeMap<&str, BTreeSet<u64>>,
             > = Default::default();
+            let members: Option<BTreeSet<_>> = block.map(|block| {
+                block
+                    .members
+                    .iter()
+                    .map(|m| (m.device.node.as_str(), m.device.stable_id))
+                    .collect()
+            });
             for node in cluster.nodes {
                 for gpu in &node.total_resources.gpus {
                     if !constraints.matches_gpu(gpu)
-                        || block.is_some_and(|block| {
-                            !block.members.iter().any(|m| {
-                                m.device.node == node.name && m.device.stable_id == gpu.stable_id
-                            })
+                        || members.as_ref().is_some_and(|members| {
+                            !members.contains(&(node.name.as_str(), gpu.stable_id))
                         })
                     {
                         continue;
@@ -456,6 +459,9 @@ impl BackfillScheduler {
                 }
             }
             for allowed in groups.values() {
+                if (allowed.values().map(BTreeSet::len).sum::<usize>() as u64) < demand.total() {
+                    continue;
+                }
                 for (node, original) in nodes.iter_mut().zip(cluster.nodes) {
                     node.state = original.state;
                     let original_count = original.total_resources.gpus.len();

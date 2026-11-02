@@ -361,6 +361,16 @@ pub fn declared_endpoint(node: &str, stable_id: u64) -> String {
     format!("{node}/{stable_id}")
 }
 
+/// A block issue that only a file edit can fix, as opposed to node health that
+/// recovers on its own.
+pub fn is_membership_error(issue: &str) -> bool {
+    let kind = issue.split_once(':').map_or(issue, |(kind, _)| kind);
+    matches!(
+        kind,
+        "node_unregistered" | "node_has_no_gpus" | "invalid_device_identity"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

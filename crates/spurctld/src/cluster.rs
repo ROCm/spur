@@ -5995,16 +5995,32 @@ impl ClusterManager {
                         info!(block_name = %notice.block_name, "{}", notice.message);
                     }
                 }
-                if let Some(block) = view
-                    .blocks
-                    .iter()
-                    .find(|b| b.file_revision.is_some() && !b.issues.is_empty())
-                {
-                    anyhow::bail!(
-                        "invalid block file membership for {}: {}",
-                        block.key.fabric_domain,
-                        block.issues.join(",")
-                    );
+                for block in view.blocks.iter().filter(|b| b.file_revision.is_some()) {
+                    let (membership, health): (Vec<&String>, Vec<&String>) = block
+                        .issues
+                        .iter()
+                        .partition(|i| spur_core::block_file::is_membership_error(i));
+                    let join = |issues: Vec<&String>| {
+                        issues
+                            .into_iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    if !membership.is_empty() {
+                        anyhow::bail!(
+                            "invalid block file membership for {}: {}",
+                            block.key.fabric_domain,
+                            join(membership)
+                        );
+                    }
+                    if !health.is_empty() {
+                        warn!(
+                            block = %block.key.fabric_domain,
+                            "block is unavailable until its nodes recover: {}",
+                            join(health)
+                        );
+                    }
                 }
             }
         }
@@ -11634,6 +11650,68 @@ state = "UP"
             .validate_step_bindings(&job, &job.allocated_nodes)
             .unwrap_err();
         assert!(error.to_string().contains("block file"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_applies_with_an_unhealthy_block_but_rejects_unknown_nodes() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=n0,n1").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "gpu"
+nodes = "ALL"
+"#,
+            block_path
+        );
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf).await;
+        for name in ["n0", "n1"] {
+            cm.register_node(
+                name.into(),
+                name.into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    generation: 7,
+                    fabric_binding_version: 2,
+                    gpus: vec![gpu_resource(0, 42)],
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                true,
+            )
+            .unwrap();
+        }
+        cm.nodes.write().get_mut("n1").unwrap().state = NodeState::Drain;
+        std::fs::write(
+            &conf_path,
+            conf.replace(r#"name = "gpu""#, r#"name = "changed""#),
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.get_partitions().iter().any(|p| p.name == "changed"));
+        let view = cm.fabric_view(Utc::now());
+        assert!(view.blocks[0]
+            .issues
+            .contains(&"node_unavailable:n1".to_string()));
+
+        std::fs::write(&block_path, "BlockName=a Nodes=n0,n1,typo").unwrap();
+        std::fs::write(&conf_path, &conf).unwrap();
+        let error = cm.reconfigure().unwrap_err();
+        assert!(
+            error.to_string().contains("node_unregistered:typo"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("node_unavailable"), "{error}");
+        assert!(cm.get_partitions().iter().any(|p| p.name == "changed"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

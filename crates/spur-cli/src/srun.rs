@@ -94,7 +94,8 @@ pub struct SrunArgs {
     #[arg(long)]
     pub gpu_bind: Option<String>,
 
-    /// Required node features or same(gpu.fabric_domain_id) for one fabric block
+    /// Required node features and GPU predicates: gpu.<field><op><value>, same(gpu.<field>).
+    /// GPU predicates apply to new allocations only; steps inherit the allocation binding
     #[arg(short = 'C', long)]
     pub constraint: Option<String>,
 

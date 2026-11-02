@@ -22,7 +22,7 @@ bytes, and fabric observations. For example:
 
 .. code-block:: text
 
-   GPUDevice=0 StableId=... PCI=0001:04:00.0 PCIRoot=pci0001:00 NUMA=unknown VRAMBytes=309237645312
+   GPUDevice=0 StableId=... PCI=0001:04:00.0 PCIRoot=pci0001:00 NUMA=unknown VRAMBytes=309237645312 GPUType=mi300x
       FabricSource=amd-ualink Observation=observed PhysicalDomain=... FabricDomain=15 Endpoint=63 EndpointState=active Transport=UALoE
       PhysicalCapacity=72 FabricCapacity=4 ActiveEndpoints=[60,61,62,63] LocalEndpoints=[60,61,62,63]
 
@@ -31,7 +31,8 @@ external fabric manager reports the partition as ready. Other statuses are ``inc
 unreadable fields), ``inconsistent`` (conflicting or changing observations),
 ``unavailable`` (the source/device could not be observed), and ``unknown``.
 Issue kinds are ``missing``, ``unreadable``, ``malformed``, ``too_large``,
-``conflict``, ``changed``, ``unavailable``, and ``unknown``.
+``conflict``, ``changed``, ``unavailable``, ``peer_conflict`` (another GPU on
+the node reports different shared vPod facts), and ``unknown``.
 ``ObservationIssues`` identifies affected fields and stable diagnostic kinds.
 Unknown NUMA locality remains ``unknown`` rather than becoming NUMA node zero.
 
@@ -137,12 +138,14 @@ capacity, isolation, or a scheduling guarantee. Multiple logical GPU partitions
 may share a physical endpoint when they report the same node and PCI identity.
 
 ``export`` prints a version 1 JSON candidate membership document only when every
-GPU has resolved membership and every block is consistent. The document contains
+block is consistent and every GPU on a block's nodes has resolved membership.
+GPUs on nodes outside every block, such as plain GPU nodes, are listed by
+``show`` but do not prevent an export. The document contains
 scoped block keys and exact node/stable-ID pairs. It deliberately contains no
 health or availability claims. ``validate`` resolves all declared blocks and
 devices against current controller inventory, rejecting duplicates, unknown
 identities, namespace mismatches, changed membership, and invalid live blocks.
-Unknown JSON fields and unsupported versions are errors; input is limited to
+Unknown top-level and block fields and unsupported versions are errors; input is limited to
 8 MiB. A document can describe a subset of blocks, but each declared block must
 contain its complete registered membership.
 
@@ -297,10 +300,10 @@ The controller persists the exact selected GPU identities and property
 snapshots with their inventory generation. Admission and the start gate require
 that generation to be current. Steps inside a running allocation, including after
 supervisor recovery, instead re-attest the bound GPUs' own facts, so an agent
-restart or a change to another GPU does not block them. Native AMD discovery
-re-reads the selected devices' KFD and PCI facts before launch; other device
-providers use their reported inventory, so their changes apply once the agent
-reports them. Inspection with ``spur control show job``
+restart, a change to another GPU, or another GPU's ``peer_conflict`` does not
+block them. Before launch, the agent re-reads the selected devices' UALink
+attributes; other properties, such as VRAM and NUMA locality, are checked
+against the inventory the agent last reported. Inspection with ``spur control show job``
 includes ``GpuPropertyNode``, ``Generation``, and ``StableIds``. A change to a
 bound GPU's own properties rejects subsequent steps of that allocation. This does
 not terminate GPU processes already executing when the hardware changes.
@@ -490,8 +493,10 @@ the validated file on controllers and file-only agents, and restart those
 agents to load the new ``block_file`` setting. Reconfigure or restart the controller to enable the
 setting. A controller can start before nodes register; affected blocks remain
 unavailable until complete live inventory and matching revisions arrive.
-Reconfigure requires every applied file-only block to resolve against current
-inventory, so wait for registration before using it for activation. Records
+Reconfigure rejects a file-only block that names an unregistered node, a node
+without GPUs, or GPUs without stable identities, so wait for registration before
+using it for activation. A drained, down, or stale node only leaves its block
+unavailable and is logged; it does not block unrelated configuration changes. Records
 superseded by native discovery do not require matching files on native agents.
 
 For later membership changes:

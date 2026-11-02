@@ -65,9 +65,23 @@ pub enum ObservationIssueKind {
     Conflict,
     Changed,
     Unavailable,
+    /// Another device on the node reports different shared fabric facts.
+    PeerConflict,
 }
 
 impl FabricObservation {
+    /// Drops disagreements with other devices, which fence placement but not steps
+    /// already bound to this device.
+    pub fn without_peer_conflicts(&self) -> Self {
+        let mut own = self.clone();
+        own.issues
+            .retain(|issue| issue.kind != ObservationIssueKind::PeerConflict);
+        if own.status == ObservationStatus::Inconsistent && own.issues.is_empty() {
+            own.status = ObservationStatus::Consistent;
+        }
+        own
+    }
+
     pub fn add_issue(&mut self, field: &str, kind: ObservationIssueKind) {
         self.issues.push(ObservationIssue {
             field: field.into(),

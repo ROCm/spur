@@ -34,7 +34,8 @@ impl GpuField {
 
     fn value(self, gpu: &GpuResource) -> Option<Value> {
         if self == Self::Type {
-            return (!gpu.gpu_type.is_empty()).then(|| Value::Text(gpu.gpu_type.clone()));
+            return (!gpu.gpu_type.is_empty())
+                .then(|| Value::Text(gpu.gpu_type.to_ascii_lowercase()));
         }
         let t = gpu.topology.as_ref()?;
         match self {
@@ -166,7 +167,11 @@ impl<'a> Constraints<'a> {
                                 .into(),
                         );
                     }
-                    Value::Text(raw.into())
+                    Value::Text(if field == GpuField::Type {
+                        raw.to_ascii_lowercase()
+                    } else {
+                        raw.into()
+                    })
                 };
                 if field == GpuField::Vpod && comparison == Comparison::Eq {
                     result.same_fabric = true;
@@ -178,7 +183,10 @@ impl<'a> Constraints<'a> {
                 });
                 continue;
             }
-            if term.is_empty() || term.contains(['(', ')', '=', '!', '<', '>']) {
+            if term.is_empty()
+                || term.contains(['(', ')', '=', '!', '<', '>'])
+                || looks_like_gpu_term(term)
+            {
                 return Err(format!("unsupported GPU constraint {term:?}"));
             }
             result.features.push(term);
@@ -231,7 +239,8 @@ impl<'a> Constraints<'a> {
     }
 }
 
-/// Near-misses of the typed syntax would otherwise become node features that never match.
+/// Near-misses of the typed syntax, including a bare property name, would otherwise
+/// become node features that never match.
 fn looks_like_gpu_term(term: &str) -> bool {
     term.split(['&', '|']).map(str::trim).any(|part| {
         let lower = part.to_ascii_lowercase();
@@ -240,7 +249,7 @@ fn looks_like_gpu_term(term: &str) -> bool {
             .is_some_and(|rest| rest.trim_start().starts_with(['(', '[']));
         let gpu = lower.starts_with("gpu.")
             && part.contains(['(', ')', '[', ']', '=', '<', '>', '!', ':', '~']);
-        same || gpu
+        same || gpu || GpuField::parse(&lower).is_ok()
     })
 }
 
@@ -294,10 +303,9 @@ pub fn validate(spec: &JobSpec) -> Result<(), String> {
                 .into(),
         );
     }
-    if constraints.has_gpu()
-        && crate::gpu_request::resolve_gpu_demand(spec)
-            .map_err(|e| e.to_string())?
-            .is_none()
+    if crate::gpu_request::resolve_gpu_demand(spec)
+        .map_err(|e| e.to_string())?
+        .is_none()
         && !spec.exclusive
     {
         return Err(
@@ -353,6 +361,10 @@ mod tests {
             "SAME (gpu.vpod_id)",
             "fast&GPU.vram>=1GiB",
             "fast&SAME(gpu.vpod_id)",
+            "gpu.fabric_domain_id",
+            "fast,gpu.vpod_id",
+            "GPU.VRAM",
+            "same(gpu.vpod_id),GPU.vram",
         ] {
             assert!(Constraints::parse(Some(value)).is_err(), "{value}");
         }
@@ -408,6 +420,7 @@ mod property_tests {
             ("gpu.vram=196608MiB", true),
             ("gpu.vram_bytes=206158430208", true),
             ("gpu.type=mi300x&gpu.vram>=192GiB", true),
+            ("gpu.type=MI300X", true),
             ("gpu.type!=mi300x", false),
             ("gpu.physical_pod_id=rack-a", true),
             ("gpu.physical_pod_id!=rack-a", false),

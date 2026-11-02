@@ -256,9 +256,11 @@ domain filters are also supported; OR combinations are not supported. The constr
 
 ``--topology none`` skips the hint without disabling an explicit constraint.
 Omitting ``-p`` uses the default partition and does not alter the constraint.
-A malformed GPU expression, such as an unknown field or an uppercase ``GPU.``
-prefix, is rejected at submit with ``unsupported GPU constraint``; it is never
-treated as a node feature. Partition names have no built-in topology meaning. See
+A malformed GPU expression, such as an unknown field (``gpu.unknown=1``), an
+uppercase ``GPU.`` prefix on a comparison, or a property name without a
+comparison (``gpu.vram``), is rejected at submit with
+``unsupported GPU constraint``. A term such as ``gpu.fast``, which is not a
+property name and has no operator, remains an ordinary node feature. Partition names have no built-in topology meaning. See
 :doc:`/admin-guide/fabric-observation` for configuration and inspection.
 
 .. _submit-export:

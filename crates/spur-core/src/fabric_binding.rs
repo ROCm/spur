@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,10 @@ impl FabricBinding {
                 continue;
             }
             let observation = observation.ok_or("fabric observation is missing")?;
+            let observation = match check {
+                BindingCheck::Dispatch => Cow::Borrowed(observation),
+                BindingCheck::Step => Cow::Owned(observation.without_peer_conflicts()),
+            };
             let observed_active: BTreeSet<_> = observation.active_endpoints.iter().collect();
             let endpoints_hold = match check {
                 BindingCheck::Dispatch => observed_active == active,
@@ -251,7 +256,7 @@ mod tests {
     use super::*;
     use crate::fabric::{FabricDeviceKey, FabricMember};
     use crate::resource::{AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource};
-    use spur_devices::topology::FabricObservation;
+    use spur_devices::topology::{FabricObservation, ObservationIssueKind};
 
     fn fixture() -> (FabricBinding, ResourceSet, ResourceAllocations) {
         let inventory = ResourceSet {
@@ -451,6 +456,21 @@ mod tests {
             .validate_step("test", "n1", &inventory, &allocation)
             .is_err());
         observation.active_endpoints = vec!["1".into()];
+        observation.status = ObservationStatus::Inconsistent;
+        observation.add_issue("vpod_active_accels", ObservationIssueKind::PeerConflict);
+        set(&mut inventory, observation.clone());
+        binding
+            .validate_step("test", "n1", &inventory, &allocation)
+            .unwrap();
+        assert!(binding
+            .validate("test", "n1", &inventory, &allocation)
+            .is_err());
+        observation.add_issue("accel_id", ObservationIssueKind::Conflict);
+        set(&mut inventory, observation.clone());
+        assert!(binding
+            .validate_step("test", "n1", &inventory, &allocation)
+            .is_err());
+        observation.issues.clear();
         observation.status = ObservationStatus::Unavailable;
         set(&mut inventory, observation);
         assert!(binding

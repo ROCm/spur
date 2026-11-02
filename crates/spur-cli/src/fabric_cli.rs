@@ -101,12 +101,7 @@ pub async fn run(controller: &str, command: TopologyCommand) -> Result<()> {
         TopologyCommand::Export {
             format: TopologyFormat::Json,
         } => {
-            if !view.unresolved.is_empty() {
-                bail!("some GPUs have unresolved membership; inspect topology show --json");
-            }
-            let manifest = FabricManifest::from_view(&view);
-            manifest.resolve(&view).map_err(anyhow::Error::msg)?;
-            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            println!("{}", export_json(&view)?);
         }
         TopologyCommand::Export {
             format: TopologyFormat::Block,
@@ -148,7 +143,36 @@ pub async fn run(controller: &str, command: TopologyCommand) -> Result<()> {
     Ok(())
 }
 
+/// GPUs on nodes outside every block, such as plain GPU nodes, do not block an export.
+fn reject_unresolved_on_block_nodes(view: &FabricView) -> Result<()> {
+    let included: std::collections::BTreeSet<_> = view
+        .blocks
+        .iter()
+        .flat_map(|block| &block.members)
+        .map(|member| member.device.node.as_str())
+        .collect();
+    if let Some(gpu) = view
+        .unresolved
+        .iter()
+        .find(|gpu| included.contains(gpu.device.node.as_str()))
+    {
+        bail!(
+            "node {} has GPUs with unresolved membership; inspect topology show --json",
+            gpu.device.node
+        );
+    }
+    Ok(())
+}
+
+fn export_json(view: &FabricView) -> Result<String> {
+    reject_unresolved_on_block_nodes(view)?;
+    let manifest = FabricManifest::from_view(view);
+    manifest.resolve(view).map_err(anyhow::Error::msg)?;
+    Ok(serde_json::to_string_pretty(&manifest)?)
+}
+
 fn export_blocks(view: &FabricView) -> Result<String> {
+    reject_unresolved_on_block_nodes(view)?;
     let mut text = String::new();
     for (index, block) in view.blocks.iter().enumerate() {
         if !block.issues.is_empty() {
@@ -159,13 +183,6 @@ fn export_blocks(view: &FabricView) -> Result<String> {
             .iter()
             .map(|m| m.device.node.clone())
             .collect();
-        if view
-            .unresolved
-            .iter()
-            .any(|gpu| nodes.contains(&gpu.device.node))
-        {
-            bail!("cannot export a whole-node block with unresolved GPUs");
-        }
         let name = if block.file_revision.is_some() {
             block.key.fabric_domain.clone()
         } else {
@@ -231,11 +248,18 @@ fn format_view(view: &FabricView) -> String {
             );
         }
     }
+    let mut unresolved = std::collections::BTreeMap::<_, Vec<_>>::new();
     for item in &view.unresolved {
+        unresolved
+            .entry((&item.device.node, &item.issue))
+            .or_default()
+            .push(item.device.stable_id.to_string());
+    }
+    for ((node, issue), ids) in unresolved {
         let _ = writeln!(
             out,
-            "UnresolvedNode={} StableId={} Issue={}",
-            item.device.node, item.device.stable_id, item.issue
+            "UnresolvedNode={node} Issue={issue} StableIds=[{}]",
+            ids.join(",")
         );
     }
     out
@@ -369,6 +393,20 @@ mod tests {
                 issue: "missing".into(),
             });
         assert!(export_blocks(&view).is_err());
+        assert!(export_json(&view).is_err());
+        view.unresolved = [1, 2]
+            .map(|stable_id| spur_core::fabric::UnresolvedFabricDevice {
+                device: FabricDeviceKey {
+                    node: "plain".into(),
+                    stable_id,
+                },
+                issue: "missing_observation".into(),
+            })
+            .into();
+        assert_eq!(export_blocks(&view).unwrap(), "BlockName=block0 Nodes=n1\n");
+        assert!(export_json(&view).unwrap().contains("\"n1\""));
+        assert!(format_view(&view)
+            .contains("UnresolvedNode=plain Issue=missing_observation StableIds=[1,2]"));
     }
 
     #[tokio::test]

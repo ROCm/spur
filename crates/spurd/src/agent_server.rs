@@ -4,7 +4,7 @@
 //! gRPC server implementing the SlurmAgent service.
 //! Receives job launch/cancel requests from spurctld.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
@@ -5213,6 +5213,24 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
     }
 }
 
+/// Below the controller's 5s StartJob deadline, so a hung sysfs read fails the start
+/// instead of outliving it.
+const BINDING_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn run_preflight<F>(timeout: std::time::Duration, check: F) -> Result<(), Status>
+where
+    F: FnOnce() -> Result<(), Status> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(check)).await {
+        Ok(joined) => joined.map_err(|error| {
+            Status::internal(format!("dispatch validation worker failed: {error}"))
+        })?,
+        Err(_) => Err(Status::failed_precondition(
+            "timed out reading device state for the allocation's bindings",
+        )),
+    }
+}
+
 fn validate_dispatch_snapshot(
     mut inventory: spur_core::resource::ResourceSet,
     allocation: ResourceAllocations,
@@ -5248,7 +5266,8 @@ fn validate_dispatch_snapshot(
         .clone()
         .map(spur_core::gpu_binding::from_proto)
     {
-        refresh_bound_gpu_properties(&mut inventory, &binding, std::path::Path::new("/sys"))?;
+        let bound = binding.gpus.iter().map(|gpu| gpu.stable_id).collect();
+        refresh_bound_fabric(&mut inventory, &bound, false, std::path::Path::new("/sys"))?;
         match check {
             BindingCheck::Dispatch => binding.validate(&hostname, &inventory, &resources),
             BindingCheck::Step => binding.validate_step(&hostname, &inventory, &resources),
@@ -5289,7 +5308,17 @@ fn validate_dispatch_snapshot(
             ));
         }
     }
-    refresh_bound_fabric(&mut inventory, &binding, std::path::Path::new("/sys"))?;
+    let bound = binding
+        .members
+        .iter()
+        .map(|member| member.device.stable_id)
+        .collect();
+    refresh_bound_fabric(
+        &mut inventory,
+        &bound,
+        binding.file_revision.is_some(),
+        std::path::Path::new("/sys"),
+    )?;
     if !cluster_id.is_empty() && cluster_id != binding.key.namespace {
         return Err(Status::failed_precondition(
             "fabric namespace differs from authenticated cluster",
@@ -5303,66 +5332,16 @@ fn validate_dispatch_snapshot(
     .map_err(Status::failed_precondition)
 }
 
-fn refresh_bound_gpu_properties(
-    inventory: &mut spur_core::resource::ResourceSet,
-    binding: &spur_core::gpu_binding::GpuBinding,
-    sysfs: &std::path::Path,
-) -> Result<(), Status> {
-    let native = |gpu: &spur_core::gpu_binding::BoundGpu| {
-        gpu.topology
-            .as_ref()
-            .and_then(|t| t.fabric.as_ref())
-            .is_some_and(|f| f.source == "amd-ualink")
-            || gpu.gpu_type.starts_with("amdgpu")
-            || matches!(
-                gpu.gpu_type.as_str(),
-                "mi100"
-                    | "mi210"
-                    | "mi250x"
-                    | "mi300a"
-                    | "mi300x"
-                    | "mi308x"
-                    | "mi325x"
-                    | "mi350x"
-                    | "mi355x"
-                    | "rx9070"
-            )
-    };
-    if !binding.gpus.iter().any(native) {
-        return Ok(());
-    }
-    let fresh = spur_devices::cdi::discovery::gpu_property_snapshots(sysfs);
-    for expected in &binding.gpus {
-        let Some(gpu) = inventory
-            .gpus
-            .iter_mut()
-            .find(|g| g.stable_id == expected.stable_id)
-        else {
-            continue;
-        };
-        if let Some((gpu_type, topology)) = fresh.get(&gpu.stable_id) {
-            gpu.gpu_type.clone_from(gpu_type);
-            gpu.topology = Some(topology.clone());
-        } else if native(expected) {
-            return Err(Status::failed_precondition(
-                "bound GPU is absent from live discovery",
-            ));
-        }
-    }
-    Ok(())
-}
-
+/// Re-reads only the bound devices' UALink attributes by PCI address; other properties
+/// change only through a republished inventory.
 fn refresh_bound_fabric(
     inventory: &mut spur_core::resource::ResourceSet,
-    binding: &spur_core::fabric_binding::FabricBinding,
+    bound: &BTreeSet<u64>,
+    file_bound: bool,
     sysfs: &std::path::Path,
 ) -> Result<(), Status> {
     for gpu in &mut inventory.gpus {
-        if !binding
-            .members
-            .iter()
-            .any(|member| member.device.stable_id == gpu.stable_id)
-        {
+        if !bound.contains(&gpu.stable_id) {
             continue;
         }
         let Some(topology) = &mut gpu.topology else {
@@ -5372,9 +5351,8 @@ fn refresh_bound_fabric(
             .fabric
             .as_ref()
             .is_some_and(|f| f.source == "amd-ualink");
-        let check_new_observation = binding.file_revision.is_some()
-            && topology.fabric.is_none()
-            && topology.pci_bdf.is_some();
+        let check_new_observation =
+            file_bound && topology.fabric.is_none() && topology.pci_bdf.is_some();
         if !refresh_native && !check_new_observation {
             continue;
         }
@@ -9380,7 +9358,7 @@ impl AgentService {
         &self,
         allocation: &ResourceAllocations,
     ) -> Result<(), Status> {
-        self.check_bindings(allocation, BindingCheck::Dispatch, Vec::new())
+        self.check_bindings(allocation, BindingCheck::Dispatch, "")
             .await
     }
 
@@ -9390,13 +9368,7 @@ impl AgentService {
         allocation: &ResourceAllocations,
         job_nodelist: &str,
     ) -> Result<(), Status> {
-        let job_nodes = if job_nodelist.is_empty() {
-            Vec::new()
-        } else {
-            spur_core::hostlist::expand(job_nodelist)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?
-        };
-        self.check_bindings(allocation, BindingCheck::Step, job_nodes)
+        self.check_bindings(allocation, BindingCheck::Step, job_nodelist)
             .await
     }
 
@@ -9404,7 +9376,7 @@ impl AgentService {
         &self,
         allocation: &ResourceAllocations,
         check: BindingCheck,
-        job_nodes: Vec<String>,
+        job_nodelist: &str,
     ) -> Result<(), Status> {
         if check == BindingCheck::Dispatch {
             self.check_current_dispatch_generation(allocation)?;
@@ -9412,12 +9384,18 @@ impl AgentService {
         if allocation.fabric_binding.is_none() && allocation.gpu_binding.is_none() {
             return Ok(());
         }
+        let job_nodes = if job_nodelist.is_empty() {
+            Vec::new()
+        } else {
+            spur_core::hostlist::expand(job_nodelist)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?
+        };
         let inventory = self.reporter.snapshot_resources();
         let snapshot_allocation = allocation.clone();
         let block_file = self.block_file.clone();
         let hostname = self.reporter.hostname.clone();
         let cluster_id = self.cluster_id.clone();
-        tokio::task::spawn_blocking(move || {
+        run_preflight(BINDING_PREFLIGHT_TIMEOUT, move || {
             validate_dispatch_snapshot(
                 inventory,
                 snapshot_allocation,
@@ -9428,10 +9406,7 @@ impl AgentService {
                 job_nodes,
             )
         })
-        .await
-        .map_err(|error| {
-            Status::internal(format!("dispatch validation worker failed: {error}"))
-        })??;
+        .await?;
         match check {
             BindingCheck::Dispatch => self.check_current_dispatch_generation(allocation),
             BindingCheck::Step => Ok(()),
@@ -17650,6 +17625,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_rejects_a_step_whose_bound_fabric_changed() {
+        let (service, mut binding, _) = fabric_dispatch_fixture();
+        *service.device_registry.lock().await = test_gpu_registry();
+        let mut live = service.reporter.snapshot_resources();
+        live.gpus[0].stable_id = 1;
+        service.reporter.update_resources(live.clone());
+        binding.members[0].device.stable_id = 1;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.gpu_devices = vec![1];
+        tracked.fabric_binding = Some(binding);
+        service.insert_test_job(901, tracked).await;
+        let step = || {
+            Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id: 901,
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            service
+                .run_command(step())
+                .await
+                .unwrap()
+                .into_inner()
+                .exit_code,
+            0
+        );
+        let fabric = live.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap();
+        fabric.fabric_domain_id = Some("8".into());
+        service.reporter.update_resources(live);
+        let error = service.run_command(step()).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("fabric observation"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unbound_steps_skip_binding_checks_even_with_an_odd_nodelist() {
+        let (service, _, _) = fabric_dispatch_fixture();
+        let step = AgentService::tracked_allocation(&TrackedJob::allocation_only(None));
+        service
+            .check_step_allocation(&step, "node[1-")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn binding_preflight_that_never_finishes_is_rejected() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let error = run_preflight(std::time::Duration::from_millis(1), move || {
+            let _ = wait.recv();
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        drop(release);
+    }
+
+    #[tokio::test]
     async fn allocation_rpc_rejects_unknown_fabric_binding_version() {
         let (service, mut binding, mut allocation) = fabric_dispatch_fixture();
         binding.version = 99;
@@ -17716,6 +17756,7 @@ mod tests {
     #[test]
     fn fabric_preflight_rereads_only_the_bound_pci_observation() {
         let (service, binding, _) = fabric_dispatch_fixture();
+        let bound = binding.members.iter().map(|m| m.device.stable_id).collect();
         let mut inventory = service.reporter.snapshot_resources();
         inventory.gpus[0]
             .topology
@@ -17741,7 +17782,7 @@ mod tests {
         ] {
             std::fs::write(ualink.join(name), value).unwrap();
         }
-        refresh_bound_fabric(&mut inventory, &binding, directory.path()).unwrap();
+        refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).unwrap();
         assert_eq!(
             inventory.gpus[0]
                 .topology
@@ -17755,7 +17796,7 @@ mod tests {
             Some("7")
         );
         std::fs::write(ualink.join("vpod_id"), "8").unwrap();
-        refresh_bound_fabric(&mut inventory, &binding, directory.path()).unwrap();
+        refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).unwrap();
         assert_eq!(
             inventory.gpus[0]
                 .topology
@@ -17769,7 +17810,7 @@ mod tests {
             Some("8")
         );
         inventory.gpus[0].topology.as_mut().unwrap().pci_bdf = Some("../../escape".into());
-        assert!(refresh_bound_fabric(&mut inventory, &binding, directory.path()).is_err());
+        assert!(refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).is_err());
     }
 
     #[test]

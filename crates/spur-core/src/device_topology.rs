@@ -73,6 +73,9 @@ pub fn to_proto(t: &model::DeviceTopology) -> wire::DeviceTopology {
                         model::ObservationIssueKind::Unavailable => {
                             wire::ObservationIssueKind::ObservationIssueUnavailable as i32
                         }
+                        model::ObservationIssueKind::PeerConflict => {
+                            wire::ObservationIssueKind::ObservationIssuePeerConflict as i32
+                        }
                     },
                 })
                 .collect(),
@@ -138,6 +141,9 @@ pub fn from_proto(t: wire::DeviceTopology) -> model::DeviceTopology {
                         }
                         Ok(wire::ObservationIssueKind::ObservationIssueUnavailable) => {
                             model::ObservationIssueKind::Unavailable
+                        }
+                        Ok(wire::ObservationIssueKind::ObservationIssuePeerConflict) => {
+                            model::ObservationIssueKind::PeerConflict
                         }
                         _ => model::ObservationIssueKind::Unknown,
                     },

@@ -448,15 +448,6 @@ fn gpu_supplementary_gids_from_group_file(path: &str) -> Vec<u32> {
     gids
 }
 
-pub fn gpu_property_snapshots(
-    sysfs: &Path,
-) -> std::collections::BTreeMap<u64, (String, DeviceTopology)> {
-    discover_amd_gpus_from_root(sysfs)
-        .into_iter()
-        .filter_map(|gpu| Some((gpu.stable_id, (gpu.gpu_type, gpu.topology?))))
-        .collect()
-}
-
 fn discover_amd_gpus() -> Vec<DiscoveredGpu> {
     discover_amd_gpus_from_root(Path::new("/sys"))
 }
@@ -1191,19 +1182,18 @@ mod tests {
         assert_eq!(t.numa_node, Some(0));
         assert_eq!(t.vram_bytes, Some(206141652992));
         assert!(t.fabric.is_none());
-        let before = gpu_property_snapshots(root);
-        assert_eq!(before[&gpu.stable_id], (gpu.gpu_type.clone(), t.clone()));
         fs::write(root.join("devices/pci0000:00/0000:05:00.0/numa_node"), "-1").unwrap();
         fs::write(
             kfd.join("2/mem_banks/0/properties"),
             "heap_type 1\nsize_in_bytes bad",
         )
         .unwrap();
-        let after = gpu_property_snapshots(root);
-        assert_eq!(after[&gpu.stable_id].1.numa_node, None);
-        assert_eq!(after[&gpu.stable_id].1.vram_bytes, None);
-        fs::remove_dir_all(kfd.join("2")).unwrap();
-        assert!(!gpu_property_snapshots(root).contains_key(&gpu.stable_id));
+        let after = discover_amd_gpus_from_root(root)
+            .remove(0)
+            .topology
+            .unwrap();
+        assert_eq!(after.numa_node, None);
+        assert_eq!(after.vram_bytes, None);
     }
 
     #[test]

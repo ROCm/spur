@@ -92,7 +92,9 @@ impl CdiCache {
 
     fn refresh_topology(&mut self, live: &[CdiSpec]) {
         use crate::cdi::annotations::{DeviceMetadata, TOPOLOGY};
-        use crate::topology::{DeviceTopology, FabricObservation, ObservationIssueKind};
+        use crate::topology::{
+            DeviceTopology, FabricObservation, ObservationIssueKind::Unavailable,
+        };
 
         let live_devices: HashMap<_, _> = live
             .iter()
@@ -114,7 +116,11 @@ impl CdiCache {
             let meta = DeviceMetadata::from_annotations(&cached.device.annotations);
             let observed = render_path(&cached.device).and_then(|path| live_devices.get(path));
             // Keep administrator-provided injection edits, but never freeze fabric
-            // membership at the time an on-disk CDI spec was generated.
+            // membership; only a device that had fabric evidence becomes unavailable.
+            let lost = meta
+                .topology
+                .and_then(|t| t.fabric)
+                .map(|f| FabricObservation::unavailable(&f.source, "device", Unavailable));
             let topology = observed
                 .filter(|(topology, stable_id)| {
                     (meta.pci_bdf.is_none() || meta.pci_bdf == topology.pci_bdf)
@@ -124,11 +130,7 @@ impl CdiCache {
                 .map(|(topology, _)| topology.clone())
                 .unwrap_or_else(|| DeviceTopology {
                     pci_bdf: meta.pci_bdf,
-                    fabric: Some(FabricObservation::unavailable(
-                        "amd-ualink",
-                        "device",
-                        ObservationIssueKind::Unavailable,
-                    )),
+                    fabric: lost,
                     ..Default::default()
                 });
             match serde_json::to_string(&topology) {
@@ -387,7 +389,19 @@ mod tests {
         );
         let observation = meta.topology.unwrap().fabric.unwrap();
         assert_eq!(observation.status, ObservationStatus::Unavailable);
+        assert_eq!(observation.source, "amd-ualink");
         assert!(observation.fabric_domain_id.is_none());
+    }
+
+    #[test]
+    fn unmatched_device_without_fabric_evidence_stays_plain() {
+        use crate::cdi::annotations::DeviceMetadata;
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[make_amd_spec(&["0"])]);
+        cache.refresh_topology(&[]);
+        let device = cache.get_device("amd.com/gpu=0").unwrap();
+        let topology = DeviceMetadata::from_annotations(&device.device.annotations).topology;
+        assert!(topology.unwrap().fabric.is_none());
     }
 
     use super::*;

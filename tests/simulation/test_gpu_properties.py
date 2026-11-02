@@ -3,6 +3,8 @@
 
 """Scheduling and discovery against generated sysfs; no accelerator execution."""
 
+import re
+
 import pytest
 
 POD = "00000000-0000-4000-8000-000000000001"
@@ -126,6 +128,7 @@ def test_spec_gpu_quantity_forms(sim, extra):
 def test_invalid_or_unsupported_property_grammar_is_rejected(sim, expression):
     result = sim.cli("submit", "--gpus", 1, "--constraint", expression, "--wrap", "true", check=False)
     assert result.returncode != 0
+    assert re.search(r"GPU (constraint|property)", result.stdout + result.stderr), result.stderr
 
 
 @pytest.mark.parametrize("flag", [
@@ -135,6 +138,7 @@ def test_invalid_or_unsupported_property_grammar_is_rejected(sim, expression):
 def test_unsupported_spec_block_and_managed_cli_is_explicitly_rejected(sim, flag):
     result = sim.cli("submit", flag, "--gpus", 1, "--wrap", "true", check=False)
     assert result.returncode != 0
+    assert flag.split("=")[0] in result.stdout + result.stderr, result.stderr
 
 
 @pytest.mark.parametrize("field,value,key", [
@@ -277,6 +281,8 @@ def test_named_block_hostlist_expansion_is_not_implemented(sim):
         job = int(result.stdout.strip())
         sim.jobs.append(job)
         sim.pending(job)
+    else:
+        assert "block{a}" in result.stdout + result.stderr, result.stderr
 
 
 def test_gpu_properties_and_domain_pins_respect_named_reservations(sim):

@@ -378,7 +378,6 @@ NaN
 PromQL
 deduplication
 failovers
-AFM
 BDF
 DRM
 GPU's

@@ -97,6 +97,7 @@ enum ObservationIssueKind {
   OBSERVATION_ISSUE_CONFLICT = 5;
   OBSERVATION_ISSUE_CHANGED = 6;
   OBSERVATION_ISSUE_UNAVAILABLE = 7;
+  OBSERVATION_ISSUE_PEER_CONFLICT = 8;
 }
 
 // Derived from the current controller inventory; no fabric mutation or health claim.
