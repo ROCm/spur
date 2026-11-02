@@ -524,8 +524,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - ``1``
      - Restart
      - How often (seconds) the scheduler runs. The loop cadence and the
-       preemption requeue hold are fixed at startup; the launch-backoff base
-       does re-read this value live.
+       interval term of the requeue hold (``2 x interval_secs + 3``) are fixed at
+       startup; the launch-backoff base does re-read this value live.
    * - ``max_jobs_per_cycle``
      - integer
      - ``10000``
@@ -583,7 +583,10 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        while the old run is still in its kill wait, so another job can be
        dispatched onto them during that window. The window can last up to
        ``kill_wait_secs``; lower it if that matters with requeue-mode
-       preemption. Mirrors Slurm's ``KillWait``.
+       preemption. A requeued job itself is held out of the queue for the larger
+       of ``2 x interval_secs + 3`` and ``kill_wait_secs`` seconds (30 with the
+       defaults); that term follows ``kill_wait_secs`` live. Mirrors Slurm's
+       ``KillWait``.
    * - ``max_user_priority``
      - integer
      - ``1000``

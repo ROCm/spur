@@ -824,7 +824,17 @@ to a ``spur.conf`` that is not edited.
        then ends ``TIMEOUT`` with reason ``TimeLimit``
      - ``squeue`` shows ``CG`` instead of ``R`` during the wait. The final state,
        reason, timing, and ``--requeue`` behavior are unchanged, and the nodes
-       stay held until the processes are gone.
+       stay held until the processes are gone. The kill is now the agent's, so a
+       job on a hung or unreachable agent stays in ``CG`` for up to
+       ``complete_wait_secs`` (300 seconds by default) before it ends ``TIMEOUT``,
+       where the controller used to end it 30 seconds after SIGTERM.
+   * - A requeued job (requeue-mode preemption, ``scontrol requeue``)
+     - Held out of the queue for ``2 x interval_secs + 3`` seconds (5 seconds
+       with the default 1 second interval)
+     - Held for the larger of that and ``kill_wait_secs``: 30 seconds with the
+       defaults
+     - The job waits longer before it can start again, so it does not restart
+       into its own old run's kill wait.
    * - An unsupervised ``srun`` step on cancel or at a time limit
      - SIGKILL after 2 seconds
      - SIGKILL after the full kill wait
