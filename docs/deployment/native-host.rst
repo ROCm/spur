@@ -549,13 +549,15 @@ left unset.
 Job termination waits for all processes in the owned cgroup, including
 children that outlive the batch shell. The ``[cgroup] cleanup_timeout_secs``
 setting defaults to 20 seconds. The node agent blocks new launches while cleanup
-is pending. At the deadline, it requests a node drain before reporting
-completion. An unreadable cgroup is treated as unresolved cleanup, rather than as empty.
+is pending. At the deadline, it requests a node drain independently of job
+completion, including when a supervisor is still busy with cleanup or exit hooks. An unreadable cgroup is treated as unresolved cleanup, rather than
+as empty.
 
 Pending cleanup is recorded on disk and retried after an agent or supervisor
-restart. The deadline survives a supervisor handoff; the agent's force-reclaim
-timer does not prove that the workload has exited. The controller also drains
-unreported nodes before force-finishing a job at ``complete_wait_secs``.
+restart. The original deadline is preserved during recovery; the agent's
+force-reclaim timer does not prove that the workload has exited. The controller
+also drains unreported nodes before force-finishing a job at
+``complete_wait_secs``.
 The node remains drained for administrator investigation and explicit resume;
 resuming it does not bypass the agent's outstanding cleanup check.
 These guarantees require cgroup containment to be enabled and successfully
