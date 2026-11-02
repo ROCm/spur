@@ -2334,13 +2334,13 @@ impl ClusterManager {
             if job.state != JobState::Running {
                 anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
             }
+            Self::check_job_owner_for(user, &job.spec.user, "suspend", operates_jobs)?;
             // The preemption that ends the grace only applies to a Running job.
             if job.preempt_pending.is_some() {
                 anyhow::bail!(
                     "job {job_id} is in its preemption grace period and cannot be suspended"
                 );
             }
-            Self::check_job_owner_for(user, &job.spec.user, "suspend", operates_jobs)?;
         }
         self.propose(WalOperation::JobSuspend {
             job_id,
@@ -30060,6 +30060,34 @@ state = "UP"
         assert_eq!(
             crate::server::cluster_err_to_precondition_status(err).code(),
             tonic::Code::FailedPrecondition
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_pending.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_by_non_owner_of_a_job_in_grace_is_denied() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+        let owner = cm.get_job(id).unwrap().spec.user.clone();
+        let intruder = Actor {
+            user: format!("not-{owner}"),
+            uid: None,
+        };
+
+        let err = cm.suspend_job_by(id, intruder, false).unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<spur_core::auth::AuthError>(),
+            Some(spur_core::auth::AuthError::NotJobOwner { .. })
+        ));
+        assert!(!err.to_string().contains("preemption grace"));
+        assert_eq!(
+            crate::server::cluster_err_to_precondition_status(err).code(),
+            tonic::Code::PermissionDenied
         );
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.state, JobState::Running);
