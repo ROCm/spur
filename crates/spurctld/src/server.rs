@@ -4668,6 +4668,7 @@ fn container_spec_from_job_spec(spec: &spur_core::job::JobSpec) -> Option<Contai
         env: spec.container_env.clone(),
         entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         remap_root: spec.container_remap_root,
+        no_auth_socket: false,
     })
 }
 

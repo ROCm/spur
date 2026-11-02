@@ -1149,6 +1149,7 @@ message ContainerSpec {
   map<string, string> env = 7;      // Extra env vars inside the container
   string entrypoint = 8;            // Override the container entrypoint
   bool remap_root = 9;              // Remap the user to root inside the container
+  bool no_auth_socket = 10;         // Keep the node's credential mint socket out of the container
 }
 
 message RunStepResponse {

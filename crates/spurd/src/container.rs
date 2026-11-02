@@ -159,14 +159,16 @@ pub struct ContainerConfig {
 }
 
 /// Bind-mount the host mint socket so nested `srun` can mint. Host UID 0 does
-/// not receive the socket unless root jobs are explicitly allowed.
+/// not receive the socket unless root jobs are explicitly allowed, and a
+/// container whose owner `withheld` it never does.
 pub fn maybe_bind_auth_socket(
     mounts: &mut Vec<BindMount>,
     cluster_id: &str,
     uid: u32,
     allow_root_jobs: bool,
+    withheld: bool,
 ) {
-    if cluster_id.is_empty() || (uid == 0 && !allow_root_jobs) {
+    if withheld || cluster_id.is_empty() || (uid == 0 && !allow_root_jobs) {
         return;
     }
     let Ok(path) = spur_core::native_mint::resolve_socket_path(cluster_id) else {
@@ -1154,6 +1156,42 @@ mod tests {
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // --- Credential mint socket ---
+
+    fn auth_socket_mounts(uid: u32, withheld: bool) -> Vec<BindMount> {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("auth.sock");
+        std::fs::write(&socket, b"").unwrap();
+        let prev = std::env::var_os(spur_core::native_mint::AUTH_SOCKET_ENV);
+        std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, &socket);
+        let mut mounts = Vec::new();
+        maybe_bind_auth_socket(&mut mounts, "cluster", uid, false, withheld);
+        match prev {
+            Some(v) => std::env::set_var(spur_core::native_mint::AUTH_SOCKET_ENV, v),
+            None => std::env::remove_var(spur_core::native_mint::AUTH_SOCKET_ENV),
+        }
+        mounts
+    }
+
+    #[test]
+    fn auth_socket_is_bound_for_a_non_root_container_by_default() {
+        let mounts = auth_socket_mounts(1000, false);
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].source.ends_with("auth.sock"));
+        assert_eq!(mounts[0].source, mounts[0].target);
+    }
+
+    #[test]
+    fn a_withheld_auth_socket_is_never_bound() {
+        assert!(auth_socket_mounts(1000, true).is_empty());
+    }
+
+    #[test]
+    fn root_does_not_get_the_auth_socket_unless_root_jobs_are_allowed() {
+        assert!(auth_socket_mounts(0, false).is_empty());
     }
 
     // --- Mount parsing ---

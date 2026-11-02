@@ -183,6 +183,11 @@ pub struct SrunArgs {
     #[arg(long)]
     pub container_remap_root: bool,
 
+    /// Keep the node's credential mint socket out of the container, so nothing
+    /// in it can act on the cluster as you (nested srun there will fail)
+    #[arg(long)]
+    pub container_no_auth_socket: bool,
+
     /// Prolog script to run locally before step dispatch
     #[arg(long)]
     pub prolog: Option<String>,
@@ -777,6 +782,7 @@ fn container_spec_from_srun_args(args: &SrunArgs) -> Option<ContainerSpec> {
             .collect(),
         entrypoint: args.container_entrypoint.clone().unwrap_or_default(),
         remap_root: args.container_remap_root,
+        no_auth_socket: args.container_no_auth_socket,
     })
 }
 
@@ -2194,6 +2200,22 @@ mod tests {
 
         assert_eq!(args.ntasks, Some(4), "env must reach args");
         assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
+    }
+
+    #[test]
+    fn container_no_auth_socket_reaches_the_step_container_spec() {
+        let (args, _) = parse_srun(&[
+            "srun",
+            "--container-image",
+            "img.sqsh",
+            "--container-no-auth-socket",
+            "true",
+        ]);
+        let spec = container_spec_from_srun_args(&args).expect("an image was given");
+        assert!(spec.no_auth_socket);
+
+        let (args, _) = parse_srun(&["srun", "--container-image", "img.sqsh", "true"]);
+        assert!(!container_spec_from_srun_args(&args).unwrap().no_auth_socket);
     }
 
     #[test]

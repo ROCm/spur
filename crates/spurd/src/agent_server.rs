@@ -2897,6 +2897,7 @@ struct ContainerLaunchRequest {
     device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
     resolve_user: Option<String>,
     rootfs_base: String,
+    no_auth_socket: bool,
 }
 
 fn build_container_launch(
@@ -2938,7 +2939,13 @@ fn build_container_launch(
         home_dir: req.home_dir,
         device_plan: req.device_plan,
     };
-    crate::container::maybe_bind_auth_socket(&mut cfg.mounts, cluster_id, req.uid, allow_root_jobs);
+    crate::container::maybe_bind_auth_socket(
+        &mut cfg.mounts,
+        cluster_id,
+        req.uid,
+        allow_root_jobs,
+        req.no_auth_socket,
+    );
 
     let image_path =
         crate::container::resolve_image(&req.image, req.resolve_user.as_deref(), Some(req.uid))
@@ -3015,6 +3022,7 @@ fn stage_fresh_container_step(
             device_plan: ctx.device_plan,
             resolve_user: None,
             rootfs_base: ctx.rootfs_base,
+            no_auth_socket: c.no_auth_socket,
         },
     )?;
     // `executor::launch_job`'s container path execs this fixed in-container
@@ -5521,6 +5529,7 @@ impl SlurmAgent for AgentService {
                 &self.cluster_id,
                 uid,
                 self.allow_root_jobs,
+                false,
             );
 
             let image_path = crate::container::resolve_image(
@@ -7704,6 +7713,7 @@ impl SlurmAgent for AgentService {
                 &self.cluster_id,
                 step_uid,
                 self.allow_root_jobs,
+                c.no_auth_socket,
             );
 
             let image_path = crate::container::resolve_image(&c.image, None, Some(step_uid))
