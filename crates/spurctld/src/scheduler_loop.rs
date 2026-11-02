@@ -238,11 +238,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     // which reclaimer has capacity in flight and leave it alone until it lands.
     let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
     let mut was_leader = false;
-    // Completing in-grace victims already told to stop, so each is asked once per
-    // leader term; a new term starts over because the old leader's cancel may not
-    // have landed.
-    let mut stragglers_cancelled: HashSet<(spur_core::job::JobId, u32)> = HashSet::new();
-    let mut stragglers_term = 0;
+    let mut straggler_cancels = StragglerCancels::new();
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -263,7 +259,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             // from before it lost leadership.
             relinquish_leadership(&cluster, &mut scheduler);
             was_leader = false;
-            stragglers_cancelled.clear();
+            straggler_cancels.clear();
             continue;
         }
 
@@ -298,12 +294,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // hoisting below, so each earmark survives a fixed number of real
         // scheduling passes rather than a wall-clock window.
         cluster.tick_preempt_freed_earmarks();
-        let term = raft.current_term();
-        if term != stragglers_term {
-            stragglers_cancelled.clear();
-            stragglers_term = term;
-        }
-        finalize_expired_graces(&cluster, Utc::now(), &mut stragglers_cancelled).await;
+        finalize_expired_graces(&cluster, Utc::now(), &mut straggler_cancels).await;
 
         // Submit due node health checks as exclusive whole-node jobs and enforce
         // the starvation drain/resume. Runs leader-only, alongside the other
@@ -1652,15 +1643,19 @@ async fn start_preemption_grace(
     Ok(())
 }
 
+/// When the terminate last went to the nodes still running a Completing in-grace
+/// victim, per run.
+type StragglerCancels = HashMap<(spur_core::job::JobId, u32), std::time::Instant>;
+
 /// Ends the preemption of every job whose grace period is over, exactly as an
 /// immediate preemption would have, using the mode and provenance recorded when
-/// the victim was warned. A victim that already started completing is only
-/// asked once, per leader term, to stop what is left of it: the node-completion
-/// path finalizes it, and re-sending every pass would be noise.
+/// the victim was warned. A victim that already started completing has its
+/// remaining nodes told to stop again each time the kill budget has elapsed
+/// without them reporting; the node-completion path finalizes it.
 async fn finalize_expired_graces(
     cluster: &Arc<ClusterManager>,
     now: DateTime<Utc>,
-    stragglers_cancelled: &mut HashSet<(spur_core::job::JobId, u32)>,
+    straggler_cancels: &mut StragglerCancels,
 ) {
     use spur_core::job::JobState;
 
@@ -1682,11 +1677,11 @@ async fn finalize_expired_graces(
         .filter(|job| job.state == JobState::Completing)
         .map(|job| (job.job_id, job.run_attempt))
         .collect();
-    stragglers_cancelled.retain(|key| completing.contains(key));
+    straggler_cancels.retain(|key, _| completing.contains(key));
 
     for job in &due {
         if job.state == JobState::Completing {
-            cancel_stragglers_once(cluster, job, stragglers_cancelled).await;
+            cancel_stragglers_throttled(cluster, job, straggler_cancels).await;
             continue;
         }
         finalize_running_grace(cluster, job).await;
@@ -1716,20 +1711,38 @@ async fn finalize_running_grace(cluster: &Arc<ClusterManager>, job: &spur_core::
     }
 }
 
-async fn cancel_stragglers_once(
-    cluster: &Arc<ClusterManager>,
-    job: &spur_core::job::Job,
-    cancelled: &mut HashSet<(spur_core::job::JobId, u32)>,
-) {
-    let stragglers: Vec<String> = job
-        .allocated_nodes
+/// Nodes of a Completing run that have not reported yet.
+fn unreported_nodes(job: &spur_core::job::Job) -> Vec<String> {
+    job.allocated_nodes
         .iter()
         .filter(|node| !job.node_completions.contains_key(*node))
         .cloned()
-        .collect();
-    if stragglers.is_empty() || !cancelled.insert((job.job_id, job.run_attempt)) {
+        .collect()
+}
+
+/// A completion report is not a retry trigger of its own: a lost terminate is
+/// only recovered once the agent's whole kill budget has passed without a report.
+async fn cancel_stragglers_throttled(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+    straggler_cancels: &mut StragglerCancels,
+) {
+    let stragglers = unreported_nodes(job);
+    if stragglers.is_empty() {
         return;
     }
+    let key = (job.job_id, job.run_attempt);
+    let budget =
+        crate::server::cancel_reclaim_grace(cluster.config().scheduler.effective_kill_wait_secs())
+            .to_std()
+            .unwrap_or_default();
+    if straggler_cancels
+        .get(&key)
+        .is_some_and(|sent| sent.elapsed() < budget)
+    {
+        return;
+    }
+    straggler_cancels.insert(key, std::time::Instant::now());
     info!(
         job_id = job.job_id,
         nodes = ?stragglers,
@@ -9461,7 +9474,7 @@ mod tests {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn grace_does_nothing_before_the_deadline() {
                 let f = victim_in_grace(PreemptMode::Cancel, None).await;
-                let mut cancelled = HashSet::new();
+                let mut cancelled = StragglerCancels::new();
 
                 let just_before = f.deadline() - chrono::Duration::seconds(1);
                 finalize_expired_graces(&f.cm, just_before, &mut cancelled).await;
@@ -9475,7 +9488,7 @@ mod tests {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn grace_preempts_at_the_deadline_with_the_stored_mode() {
                 let f = victim_in_grace(PreemptMode::Cancel, None).await;
-                let mut cancelled = HashSet::new();
+                let mut cancelled = StragglerCancels::new();
 
                 finalize_expired_graces(&f.cm, f.deadline(), &mut cancelled).await;
 
@@ -9494,7 +9507,7 @@ mod tests {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn grace_requeues_at_the_deadline_when_that_was_the_stored_mode() {
                 let f = victim_in_grace(PreemptMode::Requeue, None).await;
-                let mut cancelled = HashSet::new();
+                let mut cancelled = StragglerCancels::new();
 
                 finalize_expired_graces(&f.cm, f.deadline(), &mut cancelled).await;
 
@@ -9526,7 +9539,7 @@ mod tests {
                 restored
                     .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
                     .unwrap();
-                let mut cancelled = HashSet::new();
+                let mut cancelled = StragglerCancels::new();
 
                 finalize_expired_graces(&restored, f.deadline(), &mut cancelled).await;
 
@@ -9543,7 +9556,7 @@ mod tests {
                 let dir = TempDir::new().unwrap();
                 let successor = test_cluster_with_config(&dir, preempting_config("cancel")).await;
                 successor.restore_from_snapshot(&snapshot).unwrap();
-                let mut cancelled = HashSet::new();
+                let mut cancelled = StragglerCancels::new();
 
                 finalize_expired_graces(&successor, f.deadline(), &mut cancelled).await;
 
@@ -9560,8 +9573,8 @@ mod tests {
                 );
             }
 
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn grace_stops_the_stragglers_of_a_completing_victim_once() {
+            /// A two-node victim in grace whose `n1` has already reported.
+            async fn completing_victim_with_a_straggler() -> (StragglerFixture, Job) {
                 let dir = TempDir::new().unwrap();
                 let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
                 let (addr, cancels, _) = spawn_mock_agent_recording_requests().await;
@@ -9604,34 +9617,93 @@ mod tests {
                 assert!(cm.signal_preemption(pending, job_id).unwrap());
                 cm.node_complete(job_id, "n1", 0, 0, victim.run_attempt)
                     .unwrap();
+                let victim = cm.get_job(job_id).unwrap();
                 let after_deadline = signaled_at + chrono::Duration::seconds(601);
-                let mut cancelled = HashSet::new();
+                (
+                    StragglerFixture {
+                        cm,
+                        cancels,
+                        after_deadline,
+                    },
+                    victim,
+                )
+            }
 
-                finalize_expired_graces(&cm, after_deadline, &mut cancelled).await;
-                finalize_expired_graces(&cm, after_deadline, &mut cancelled).await;
+            struct StragglerFixture {
+                cm: Arc<ClusterManager>,
+                cancels: Cancels,
+                after_deadline: DateTime<Utc>,
+            }
 
-                wait_for("one cancel delivered", || {
-                    !cancels.lock().unwrap().is_empty()
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn grace_stops_only_the_unreported_nodes_of_a_completing_victim() {
+                let (f, victim) = completing_victim_with_a_straggler().await;
+                assert_eq!(victim.state, JobState::Completing);
+                assert_eq!(unreported_nodes(&victim), ["n2".to_string()]);
+                let mut cancelled = StragglerCancels::new();
+
+                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
+
+                wait_for("the terminate is delivered", || {
+                    !f.cancels.lock().unwrap().is_empty()
                 });
-                let job = cm.get_job(job_id).unwrap();
+                let key = (victim.job_id, victim.run_attempt);
+                assert_eq!(cancelled.keys().copied().collect::<Vec<_>>(), [key]);
+                let job = f.cm.get_job(victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Completing);
                 assert!(
                     job.preempt_pending.is_some(),
                     "node completion owns the finish"
                 );
-                let seen: Vec<(i32, u32)> = cancels
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn grace_stragglers_are_recancelled_after_the_throttle() {
+                let (f, victim) = completing_victim_with_a_straggler().await;
+                let key = (victim.job_id, victim.run_attempt);
+                let mut cancelled = StragglerCancels::new();
+                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
+                wait_for("the first terminate is delivered", || {
+                    f.cancels.lock().unwrap().len() == 1
+                });
+                let first_sent = cancelled[&key];
+
+                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
+                assert_eq!(
+                    cancelled[&key], first_sent,
+                    "inside the throttle: no resend"
+                );
+
+                let budget = crate::server::cancel_reclaim_grace(30).to_std().unwrap();
+                cancelled.insert(key, first_sent - budget - Duration::from_secs(1));
+                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
+                assert!(
+                    cancelled[&key] > first_sent,
+                    "past the throttle: sent again"
+                );
+                wait_for("the terminate is repeated", || {
+                    f.cancels.lock().unwrap().len() >= 2
+                });
+                let seen: Vec<(i32, u32)> = f
+                    .cancels
                     .lock()
                     .unwrap()
                     .iter()
                     .map(|r| (r.signal, r.kill_wait_secs))
                     .collect();
-                assert_eq!(seen, [(0, 30)], "only n2, only once");
+                assert!(seen.iter().all(|s| *s == (0, 30)));
+            }
 
-                cancelled.clear();
-                finalize_expired_graces(&cm, after_deadline, &mut cancelled).await;
-                wait_for("a new term asks again", || {
-                    cancels.lock().unwrap().len() == 2
-                });
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn straggler_throttle_entries_are_dropped_with_the_job() {
+                let (f, victim) = completing_victim_with_a_straggler().await;
+                let key = (victim.job_id, victim.run_attempt);
+                let mut cancelled = StragglerCancels::new();
+                cancelled.insert((victim.job_id + 100, 1), std::time::Instant::now());
+
+                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
+
+                assert_eq!(cancelled.keys().copied().collect::<Vec<_>>(), [key]);
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

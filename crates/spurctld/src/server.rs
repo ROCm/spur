@@ -1460,7 +1460,7 @@ fn reservation_manager_ruling(
 
 /// Twice the agent's own kill budget (the kill wait plus a 3 s reap). Past it, a
 /// node still claiming the job missed the cancel rather than being mid-teardown.
-fn cancel_reclaim_grace(kill_wait_secs: u32) -> chrono::Duration {
+pub(crate) fn cancel_reclaim_grace(kill_wait_secs: u32) -> chrono::Duration {
     chrono::Duration::seconds(2 * (kill_wait_secs as i64 + 3))
 }
 
