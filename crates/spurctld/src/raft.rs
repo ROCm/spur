@@ -146,6 +146,10 @@ pub struct ClientResponse {
     /// holding a placement, and left its exclusion unchanged.
     #[serde(default)]
     pub exclude_applied: bool,
+    /// False when a `JobPreemptSignaled` found the job no longer Running at that
+    /// run, or already warned, and left it unchanged.
+    #[serde(default)]
+    pub preempt_signal_applied: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

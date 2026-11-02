@@ -444,6 +444,13 @@ pub enum WalOperation {
         run_attempt: u32,
         at: chrono::DateTime<chrono::Utc>,
     },
+    /// A running job was warned of preemption and is in its grace period until
+    /// `pending.deadline`. Applied only to a Running job at `pending.run_attempt`
+    /// that is not already pending, so replaying it is idempotent.
+    JobPreemptSignaled {
+        job_id: JobId,
+        pending: crate::job::PreemptPending,
+    },
 }
 
 impl WalOperation {
@@ -597,6 +604,7 @@ impl WalOperation {
             | Self::JobTimeLimitSignaled { at, .. }
             | Self::JobTimeLimitExpired { at, .. }
             | Self::JobCancelSignaled { at, .. } => Some(*at),
+            Self::JobPreemptSignaled { pending, .. } => Some(pending.signaled_at),
             // Exhaustive on purpose: a new variant that dates something a user
             // reads back must be a compile error here, not a silent `None`.
             Self::JobSubmit { .. }
@@ -647,6 +655,7 @@ impl WalOperation {
             | Self::JobResume { .. }
             | Self::JobTimeLimitSignaled { .. }
             | Self::JobTimeLimitExpired { .. }
+            | Self::JobPreemptSignaled { .. }
             | Self::JobCancelSignaled { .. }
             | Self::JobSubmit { .. }
             | Self::JobStepComplete { .. }
@@ -1822,6 +1831,43 @@ mod suspend_wal_tests {
         assert!(matches!(
             back,
             WalOperation::JobTimeLimitExpired { job_id: 13, run_attempt: 2, at: a } if a == at
+        ));
+        assert_eq!(back.occurred_at(), Some(at));
+        back.stamp_occurred_at(at + chrono::Duration::hours(1));
+        assert_eq!(back.occurred_at(), Some(at), "it carries its own stamp");
+    }
+
+    #[test]
+    fn job_preempt_signaled_has_a_frozen_wire_form() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&chrono::Utc);
+        let deadline = at + chrono::Duration::seconds(90);
+        let frozen = concat!(
+            r#"{"JobPreemptSignaled":{"job_id":13,"pending":{"#,
+            r#""signaled_at":"2026-03-04T05:06:07Z","deadline":"2026-03-04T05:07:37Z","#,
+            r#""preempted_by":21,"preempt_qos":"high","mode":"Requeue","#,
+            r#""run_attempt":2,"requeue_hold_secs":30}}}"#
+        );
+        let pending = crate::job::PreemptPending {
+            signaled_at: at,
+            deadline,
+            preempted_by: 21,
+            preempt_qos: Some("high".into()),
+            mode: crate::partition::PreemptMode::Requeue,
+            run_attempt: 2,
+            requeue_hold_secs: 30,
+        };
+        let op = WalOperation::JobPreemptSignaled {
+            job_id: 13,
+            pending: pending.clone(),
+        };
+        assert_eq!(serde_json::to_string(&op).unwrap(), frozen);
+
+        let mut back: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            &back,
+            WalOperation::JobPreemptSignaled { job_id: 13, pending: p } if *p == pending
         ));
         assert_eq!(back.occurred_at(), Some(at));
         back.stamp_occurred_at(at + chrono::Duration::hours(1));

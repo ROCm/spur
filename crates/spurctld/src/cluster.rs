@@ -8424,6 +8424,17 @@ impl ClusterManager {
                 }
                 Self::begin_completing(job, *at);
             }
+            WalOperation::JobPreemptSignaled { job_id, pending } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    if job.state == JobState::Running
+                        && job.run_attempt == pending.run_attempt
+                        && job.preempt_pending.is_none()
+                    {
+                        job.preempt_pending = Some(pending.clone());
+                        response.preempt_signal_applied = true;
+                    }
+                }
+            }
             WalOperation::JobComplete {
                 job_id,
                 exit_code,
@@ -11193,7 +11204,7 @@ mod tests {
 
     use super::*;
     use spur_core::end_reason::EndReason;
-    use spur_core::job::JobSpec;
+    use spur_core::job::{JobSpec, PreemptPending};
     use spur_core::resource::{ResourceAllocations, ResourceSet};
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
@@ -29916,6 +29927,96 @@ state = "UP"
         });
         assert!(!resp.exclude_applied);
         assert_eq!(cm.get_job(id).unwrap().spec.exclude, None);
+    }
+
+    fn preempt_pending_for(run_attempt: u32, deadline_offset_secs: i64) -> PreemptPending {
+        let signaled_at = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        PreemptPending {
+            signaled_at,
+            deadline: signaled_at + chrono::Duration::seconds(deadline_offset_secs),
+            preempted_by: 99,
+            preempt_qos: Some("high".into()),
+            mode: PreemptMode::Requeue,
+            run_attempt,
+            requeue_hold_secs: 30,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_signal_applies_to_a_running_job_at_its_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: pending.clone(),
+        });
+
+        assert!(resp.preempt_signal_applied);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.preempt_pending, Some(pending));
+        assert_eq!(job.state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_signal_ignores_a_stale_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let stale = cm.get_job(id).unwrap().run_attempt + 1;
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: preempt_pending_for(stale, 90),
+        });
+
+        assert!(!resp.preempt_signal_applied);
+        assert!(cm.get_job(id).unwrap().preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_signal_ignores_a_non_running_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("still-pending"));
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: preempt_pending_for(attempt, 90),
+        });
+
+        assert!(!resp.preempt_signal_applied);
+        assert!(cm.get_job(id).unwrap().preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_signal_is_idempotent_on_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+        let first = preempt_pending_for(attempt, 90);
+
+        let applied = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: first.clone(),
+        });
+        assert!(applied.preempt_signal_applied);
+
+        let replayed = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: preempt_pending_for(attempt, 600),
+        });
+        assert!(!replayed.preempt_signal_applied);
+        assert_eq!(cm.get_job(id).unwrap().preempt_pending, Some(first));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -864,6 +864,22 @@ pub fn effective_gpus(spec: &JobSpec, num_nodes: u32) -> u64 {
     }
 }
 
+/// A running job that has been warned of preemption and may keep running until
+/// `deadline`. Replicated so every replica, and a new leader, honours the same
+/// grace period instead of restarting it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreemptPending {
+    pub signaled_at: DateTime<Utc>,
+    pub deadline: DateTime<Utc>,
+    pub preempted_by: JobId,
+    pub preempt_qos: Option<String>,
+    /// `Cancel` or `Requeue`: how the run ends once the grace is over.
+    pub mode: crate::partition::PreemptMode,
+    pub run_attempt: u32,
+    /// Computed by the leader so a replay re-pends the job with the same hold.
+    pub requeue_hold_secs: u32,
+}
+
 /// One node's completion outcome for a job: the raw process wait status,
 /// split into exit code and terminating signal (0 = none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -957,6 +973,10 @@ pub struct Job {
     /// every replica reads the run as cancelled, not as a plain signal death.
     #[serde(default)]
     pub cancel_signaled_at: Option<DateTime<Utc>>,
+
+    /// Set while the run is inside its preemption grace period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt_pending: Option<PreemptPending>,
 
     /// Wall-clock instant the job entered Suspended (None unless currently suspended).
     #[serde(default)]
@@ -1084,6 +1104,7 @@ impl Job {
             node_completions: HashMap::new(),
             time_limit_signaled_at: None,
             cancel_signaled_at: None,
+            preempt_pending: None,
             suspended_at: None,
             suspended_secs: 0,
             bb_stage_state: BbStageState::None,
@@ -2260,6 +2281,34 @@ mod tests {
         assert_eq!(job.state, JobState::Running);
         assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
         assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[test]
+    fn job_without_preempt_pending_deserializes() {
+        let json = serde_json::to_value(make_job()).unwrap();
+        assert!(json.get("preempt_pending").is_none());
+        let back: Job = serde_json::from_value(json).unwrap();
+        assert!(back.preempt_pending.is_none());
+    }
+
+    #[test]
+    fn a_pending_preemption_round_trips_on_the_job() {
+        let at = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let pending = PreemptPending {
+            signaled_at: at,
+            deadline: at + chrono::Duration::seconds(90),
+            preempted_by: 9,
+            preempt_qos: Some("high".into()),
+            mode: crate::partition::PreemptMode::Requeue,
+            run_attempt: 3,
+            requeue_hold_secs: 30,
+        };
+        let mut job = make_job();
+        job.preempt_pending = Some(pending.clone());
+        let back: Job = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+        assert_eq!(back.preempt_pending, Some(pending));
     }
 
     #[test]
