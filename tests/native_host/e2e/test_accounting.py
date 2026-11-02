@@ -60,6 +60,12 @@ class TestSacctNodeFailState:
         assert final_state == "NF", f"expected NODE_FAIL, got {final_state}"
         wait_node_gone(c, node0)
 
+        # The existing RUNNING row remains visible until the asynchronous end
+        # update commits its reason and state together.
+        end = _wait_end(c.cli, job_id)
+        assert end["reason"] == "NodeRemoved", end
+        assert end["detail"] == f"node {node0}: node-fail accounting test", end
+
         row = wait_sacct_row(c, job_id, "JobID,State")
         assert row.split()[1] == "NODE_FAIL", f"sacct displayed {row!r}, not NODE_FAIL"
 
@@ -74,10 +80,6 @@ class TestSacctNodeFailState:
         assert str(job_id) not in completed_out, (
             f"sacct --state=COMPLETED must not match a NODE_FAIL job: {completed_out!r}"
         )
-
-        end = _wait_end(c.cli, job_id)
-        assert end["reason"] == "NodeRemoved", end
-        assert end["detail"] == f"node {node0}: node-fail accounting test", end
 
 
 class TestSacctExitReporting:
