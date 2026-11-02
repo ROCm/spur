@@ -150,6 +150,10 @@ pub struct ClientResponse {
     /// run, or already warned, and left it unchanged.
     #[serde(default)]
     pub preempt_signal_applied: bool,
+    /// False when a `JobTimeLimitExpired` found the run no longer Running or
+    /// Suspended at that attempt, and left it unchanged.
+    #[serde(default)]
+    pub time_limit_applied: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

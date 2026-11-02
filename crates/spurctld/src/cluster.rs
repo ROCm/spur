@@ -3076,24 +3076,26 @@ impl ClusterManager {
 
     /// Record that a run exhausted its time limit and move it to Completing in
     /// one entry, so the caller's graceful cancel finds the verdict already
-    /// durable. `true` if the run is now Completing; `false` means it holds no
-    /// nodes (or already ended) and the caller must finalize it itself.
+    /// durable. `true` if this expiry moved the run to Completing; `false` means
+    /// it holds no nodes (or already ended or is draining) and the caller must
+    /// finalize it itself.
     pub fn expire_time_limit(
         &self,
         job_id: JobId,
         run_attempt: u32,
         at: DateTime<Utc>,
     ) -> anyhow::Result<bool> {
-        self.propose(WalOperation::JobTimeLimitExpired {
+        let resp = self.propose(WalOperation::JobTimeLimitExpired {
             job_id,
             run_attempt,
             at,
         })?;
-        Ok(self
-            .jobs
-            .read()
-            .get(&job_id)
-            .is_some_and(|job| job.state == JobState::Completing))
+        Ok(resp.time_limit_applied
+            && self
+                .jobs
+                .read()
+                .get(&job_id)
+                .is_some_and(|job| job.state == JobState::Completing))
     }
 
     /// Preempt a running job per its partition's PreemptMode, without
@@ -8525,9 +8527,10 @@ impl ClusterManager {
                 let Some(job) = jobs.get_mut(job_id) else {
                     return ClientResponse::default();
                 };
-                // A run that already ended keeps its verdict, and an expiry
-                // decided for an earlier run must not condemn the current one.
-                if !job.state.is_active()
+                // A run that already ended or is already draining keeps its
+                // verdict, and an expiry decided for an earlier run must not
+                // condemn the current one.
+                if !matches!(job.state, JobState::Running | JobState::Suspended)
                     || (*run_attempt != 0
                         && job.run_attempt != 0
                         && *run_attempt != job.run_attempt)
@@ -8543,6 +8546,7 @@ impl ClusterManager {
                     job.cancel_signaled_at = Some(*at);
                 }
                 Self::begin_completing(job, *at);
+                response.time_limit_applied = true;
             }
             WalOperation::JobPreemptSignaled { job_id, pending } => {
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -16681,6 +16685,27 @@ state = "UP"
         assert_eq!(job.state, JobState::Completed);
         assert!(job.time_limit_signaled_at.is_none());
         assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_does_not_relabel_a_cancelled_completing_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiry-after-cancel", "worker1");
+        cm.cancel_job(job_id, "testuser").unwrap();
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completing);
+
+        let completing = cm.expire_time_limit(job_id, 0, Utc::now()).unwrap();
+
+        assert!(
+            !completing,
+            "an expiry that changed nothing must not trigger a second cancel"
+        );
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.time_limit_signaled_at.is_none());
+        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
