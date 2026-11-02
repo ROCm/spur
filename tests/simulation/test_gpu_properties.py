@@ -80,8 +80,10 @@ def test_same_property_selects_one_local_group(sim, field):
 
 @pytest.mark.parametrize("field", ["numa_node_id", "pcie_root_id"])
 def test_equal_local_labels_on_different_nodes_do_not_satisfy_same(sim, field):
-    job = sim.submit(f"same(gpu.{field})", nodes=2, gpus=4)
-    sim.pending(job)
+    result = sim.cli("submit", "-N", 2, "-n", 2, "--gpus", 4, "--constraint",
+                     f"same(gpu.{field})", "--wrap", "true", check=False)
+    assert result.returncode != 0
+    assert "-N 1" in result.stdout + result.stderr
 
 
 def test_vram_predicate_is_not_a_node_label(sim):
@@ -188,13 +190,6 @@ def test_vpod_wide_changes_keep_steps_of_a_property_binding(sim, field, value, k
         sim.cancel(job)
         sim.call("reset")
         sim.wait(lambda: sim.inventory()[node] == before)
-
-
-def test_local_grouping_across_nodes_is_rejected_at_submit(sim):
-    result = sim.cli("submit", "-N", 2, "-n", 2, "--gpus", 2, "--constraint",
-                     "same(gpu.numa_node_id)", "--wrap", "true", check=False)
-    assert result.returncode != 0
-    assert "-N 1" in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("field,value,expression", [
