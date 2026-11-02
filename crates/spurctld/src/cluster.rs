@@ -7476,6 +7476,7 @@ impl ClusterManager {
         // It is what gives the job its full complete_wait_secs grace.
         job.end_time = Some(at);
         job.end_suspension(at);
+        job.preempt_pending = None;
         true
     }
 
@@ -7492,6 +7493,7 @@ impl ClusterManager {
         job.time_limit_signaled_at = None;
         job.cancel_signaled_at = None;
         job.cancelled_by = None;
+        job.preempt_pending = None;
         job.node_failure = None;
         job.suspended_by = None;
         job.pending_reason = PendingReason::None;
@@ -7578,6 +7580,7 @@ impl ClusterManager {
         }
         job.exit_code = Some(-1);
         job.end_time = Some(timestamp);
+        job.preempt_pending = None;
         match evicted_state {
             JobState::NodeFail => {
                 job.set_pending_reason(reason);
@@ -8046,6 +8049,7 @@ impl ClusterManager {
                     job.preempt_mode = Some("Cancel".to_string());
                     job.preempt_qos = preempt_qos.clone();
                     job.cancel_signaled_at = Some(at);
+                    job.preempt_pending = None;
                     finalized = JobFinalized::for_job(job, JobState::Preempted, -1);
 
                     // The killed run still occupies its nodes; wait in Completing
@@ -8471,6 +8475,7 @@ impl ClusterManager {
                         );
                         return ClientResponse::default();
                     }
+                    job.preempt_pending = None;
                     job.unreported_nodes = unreported_nodes.clone();
                     if *state == JobState::Cancelled && job.cancelled_by.is_none() {
                         job.cancelled_by = cancel.clone();
@@ -30017,6 +30022,168 @@ state = "UP"
         });
         assert!(!replayed.preempt_signal_applied);
         assert_eq!(cm.get_job(id).unwrap().preempt_pending, Some(first));
+    }
+
+    /// A RUNNING job on `node` that has been told it is being preempted.
+    fn run_job_in_grace(cm: &ClusterManager, name: &str, node: &str) -> JobId {
+        let id = run_job_on(cm, name, node);
+        let pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
+        let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending,
+        });
+        assert!(resp.preempt_signal_applied);
+        assert!(cm.get_job(id).unwrap().preempt_pending.is_some());
+        id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_cancel_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.cancel_job(id, "testuser").unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.expire_time_limit(id, 0, Utc::now()).unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_requeue_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id: id,
+            hold: false,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eviction_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobEvict {
+            job_id: id,
+            detail: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_down_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("lost".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_preempt_cancel_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobPreemptCancel {
+            job_id: id,
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_preempt_requeue_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: id,
+            begin_time: Utc::now(),
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_complete_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: 1,
+            state: JobState::Failed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert!(job.preempt_pending.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
