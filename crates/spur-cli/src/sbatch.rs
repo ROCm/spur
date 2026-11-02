@@ -1603,6 +1603,17 @@ echo "hello world"
     }
 
     #[test]
+    fn test_requeue_flags_last_wins_in_directives() {
+        let on_then_off = parse_merged(&["--requeue", "--no-requeue"], &["sbatch"]);
+        assert!(!on_then_off.requeue);
+        assert!(on_then_off.no_requeue);
+
+        let off_then_on = parse_merged(&["--no-requeue", "--requeue"], &["sbatch"]);
+        assert!(off_then_on.requeue);
+        assert!(!off_then_on.no_requeue);
+    }
+
+    #[test]
     fn test_cli_can_override_default_value_arg() {
         // `--cpus-per-task` has default_value = "1". Verify directive sets it
         // and CLI overrides — no surprises from the default interacting with
