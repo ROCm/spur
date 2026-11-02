@@ -793,17 +793,18 @@ When a job has been preempted, ``scontrol show job`` includes three additional
 fields:
 
 * ``PreemptedBy=<job_id>`` — the ID of the higher-priority job that triggered
-  the preemption. Only shown when the job has been preempted.
+  the preemption. Only shown once the job has been preempted; during a
+  preemption grace period nothing has been preempted yet, so it is not printed.
 * ``PreemptMode=Requeue|Cancel|Suspend`` — how the preemption was carried out.
 * ``PreemptQOS=<name>`` — the QOS of the preempting job, whose ``preempt``
   allow-list authorized the preemption. Set for any job preempted by this
   release; jobs preempted by an earlier release show ``N/A`` even though they
   were preempted.
 
-While a job is inside its preemption grace period, the same line also shows
-``PreemptTime=<timestamp>``, the moment the job was signaled to wind down, and
-``EndTime`` shows when the grace ends. ``PreemptTime`` is omitted for a job that
-is not in a grace.
+While a job is inside its preemption grace period, ``scontrol show job`` instead
+prints a line holding only ``PreemptTime=<timestamp>``, the moment the job was
+signaled to wind down, and ``EndTime`` shows when the grace ends. ``PreemptTime``
+is omitted for a job that is not in a grace.
 
 .. _preemption-grace-user:
 

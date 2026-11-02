@@ -2411,10 +2411,15 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     out
 }
 
-/// Shown for a preempted job, and for one still inside its preemption grace.
+/// Shown for a preempted job, and for one still inside its preemption grace,
+/// where only the deadline is known: nothing has been preempted yet.
 fn preemption_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
-    if job.preempted_by == 0 && job.preempt_mode.is_empty() && job.preempt_time.is_none() {
-        return None;
+    let preempt_time = job
+        .preempt_time
+        .as_ref()
+        .map(|t| format!("PreemptTime={}", format_ts(Some(t))));
+    if job.preempted_by == 0 && job.preempt_mode.is_empty() {
+        return preempt_time.map(|t| format!("   {t}"));
     }
     let or_na = |s: &str| {
         if s.is_empty() {
@@ -2433,11 +2438,9 @@ fn preemption_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
         or_na(&job.preempt_mode),
         or_na(&job.preempt_qos),
     );
-    if job.preempt_time.is_some() {
-        line.push_str(&format!(
-            " PreemptTime={}",
-            format_ts(job.preempt_time.as_ref())
-        ));
+    if let Some(t) = preempt_time {
+        line.push(' ');
+        line.push_str(&t);
     }
     Some(line)
 }
@@ -2542,8 +2545,12 @@ mod tests {
             ..Default::default()
         };
         let out = format_job_detail(&job);
-        let preempt_time = format!("PreemptTime={}", format_ts(job.preempt_time.as_ref()));
-        assert!(out.contains(&preempt_time), "{out}");
+        let preempt_time = format!("   PreemptTime={}", format_ts(job.preempt_time.as_ref()));
+        assert!(
+            out.lines().any(|line| line == preempt_time),
+            "the grace line carries the deadline alone: {out}"
+        );
+        assert!(!out.contains("PreemptedBy"), "{out}");
         let end_time = format!("EndTime={}", format_ts(job.end_time.as_ref()));
         assert!(out.contains(&end_time), "{out}");
     }
