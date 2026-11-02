@@ -768,26 +768,39 @@ class SpurCluster:
             f"kubectl apply for {what} did not succeed:\n{out}"
         )
 
-    def k8s_active_controllers(self) -> list[str]:
+    def k8s_active_controllers(self, status: str | None = None) -> list[str]:
         """Node names whose `spur k8s status` row is role=controller/single and active."""
+        if status is None:
+            status = self.k8s_status()
         out = []
-        for line in self.k8s_status().splitlines():
+        for line in status.splitlines():
             fields = line.split()
             if len(fields) >= 3 and fields[1] in ("controller", "single") and fields[2] == "active":
                 out.append(fields[0])
         return out
 
-    def wait_k8s_phase(self, phase: str, timeout: int = 600) -> str:
-        """Poll `spur k8s status` until it reports the given phase."""
+    def wait_k8s_phase(self, phase: str, timeout: int = 600, *,
+                       active_controllers: list[str] | None = None) -> str:
+        """Poll for the phase and, optionally, the expected active controller identities."""
         deadline = time.time() + timeout
+        expected = None if active_controllers is None else set(active_controllers)
         last = ""
         while time.time() < deadline:
             last = self.k8s_status()
-            for line in last.splitlines():
-                if line.startswith("phase:") and line.split(":", 1)[1].strip() == phase:
-                    return last
+            phase_reached = any(
+                line.startswith("phase:") and line.split(":", 1)[1].strip() == phase
+                for line in last.splitlines()
+            )
+            # A restored ready phase can precede recovery of live agent probes.
+            if phase_reached and (
+                expected is None or set(self.k8s_active_controllers(last)) == expected
+            ):
+                return last
             time.sleep(5)
-        raise TimeoutError(f"k0s phase did not reach {phase} within {timeout}s:\n{last}")
+        requirement = f"phase {phase}"
+        if active_controllers is not None:
+            requirement += f" with active controllers {active_controllers}"
+        raise TimeoutError(f"k0s did not reach {requirement} within {timeout}s:\n{last}")
 
     def etcd_member_count(self) -> int:
         """Ground-truth etcd quorum size via `k0s etcd member-list`. Runs on a control-plane node
