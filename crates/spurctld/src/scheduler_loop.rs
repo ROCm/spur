@@ -1204,7 +1204,6 @@ pub(crate) async fn try_preempt(
     unscheduled: &[&spur_core::job::Job],
     sched: &spur_core::config::SchedulerConfig,
 ) {
-    use crate::cluster::PreemptOutcome;
     use spur_core::job::JobState;
     use spur_core::partition::{Partition, PreemptMode, PreemptType};
     use spur_core::reservation::job_runs_in_active_reservation;
@@ -1232,9 +1231,12 @@ pub(crate) async fn try_preempt(
         states: &[JobState::Running, JobState::Suspended, JobState::Completing],
         ..Default::default()
     });
+    // A job already in its grace is not a candidate (a second preemptor must not
+    // evict someone else for the same nodes), yet stays in `holders` so its
+    // nodes still count as occupied.
     let mut running: Vec<spur_core::job::Job> = holders
         .iter()
-        .filter(|j| j.state == JobState::Running)
+        .filter(|j| j.state == JobState::Running && j.preempt_pending.is_none())
         .cloned()
         .collect();
     let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
@@ -1400,34 +1402,38 @@ pub(crate) async fn try_preempt(
                 mode = ?mode,
                 "preempting job"
             );
-            match cluster.preempt_job_with_provenance(
-                candidate.job_id,
+            let grace_secs = victim_grace_secs(
+                candidate,
                 *mode,
-                Some(pending.job_id),
-                preempt_qos.clone(),
-            ) {
-                Ok(PreemptOutcome::Killed) => {
-                    // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
-                    send_cancel_to_agents(cluster, candidate, 0).await;
-                    preempted = true;
-                    evicted_so_far.push(candidate.job_id);
-                }
-                Ok(PreemptOutcome::Suspended) => {
-                    send_suspend_to_agents(cluster, candidate, false).await;
+                candidate_qos.limits.grace_time,
+                cluster_nodes,
+                now,
+            );
+            let outcome = if grace_secs > 0 {
+                let grace = PreemptionGrace {
+                    preemptor: pending.job_id,
+                    preempt_qos: preempt_qos.clone(),
+                    mode: *mode,
+                    secs: grace_secs,
+                    now,
+                };
+                start_preemption_grace(cluster, candidate, grace).await
+            } else {
+                preempt_victim_now(
+                    cluster,
+                    candidate,
+                    *mode,
+                    pending.job_id,
+                    preempt_qos.clone(),
+                )
+                .await
+            };
+            match outcome {
+                Ok(()) => {
                     preempted = true;
                     evicted_so_far.push(candidate.job_id);
                 }
                 Err(e) => {
-                    let follow_up = if *mode == spur_core::partition::PreemptMode::Suspend {
-                        VictimFollowUp::Suspend(Box::new((*candidate).clone()))
-                    } else {
-                        VictimFollowUp::Cancel {
-                            job_id: candidate.job_id,
-                            run_attempt: candidate.run_attempt,
-                            nodes: candidate.allocated_nodes.clone(),
-                        }
-                    };
-                    follow_late_preemption(cluster, &e, follow_up);
                     // A victim gone since the snapshot already released its node, so
                     // the set still holds. Any other failure leaves it held, with
                     // `evicted_so_far` already gone and the rest of the set abandoned.
@@ -1458,6 +1464,186 @@ pub(crate) async fn try_preempt(
             break;
         }
     }
+}
+
+/// SIGCONT first so a stopped step can run its handler, then SIGTERM as the warning.
+const PREEMPT_WARNING_SIGNALS: [i32; 2] = [18, 15];
+
+/// The grace a victim is allowed: its QOS `GraceTime`, capped so it never
+/// outlives the time limit the watchdog enforces. No time limit means no cap.
+fn effective_grace_secs(grace_time: u32, job: &spur_core::job::Job, now: DateTime<Utc>) -> u32 {
+    let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
+        return grace_time;
+    };
+    let remaining = (job.effective_deadline(start_time, time_limit) - now).num_seconds();
+    grace_time.min(u32::try_from(remaining.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Whether a victim can be warned and left running: not suspend, and every
+/// node it holds is a native agent that takes `SignalJob`. Anything else is
+/// preempted at once, as before.
+fn grace_eligible(
+    job: &spur_core::job::Job,
+    mode: spur_core::partition::PreemptMode,
+    nodes: &[Node],
+) -> bool {
+    if mode == spur_core::partition::PreemptMode::Suspend {
+        return false;
+    }
+    job.allocated_nodes.iter().all(|name| {
+        let Some(node) = nodes.iter().find(|n| &n.name == name) else {
+            warn!(job_id = job.job_id, node = %name, "node unknown — preempting without a grace period");
+            return false;
+        };
+        if matches!(node.source, NodeSource::Kubernetes { .. }) {
+            return false;
+        }
+        let capable = node.supports(spur_core::node::CAP_SIGNAL_JOB);
+        if !capable {
+            warn!(
+                job_id = job.job_id,
+                node = %name,
+                "agent cannot take SignalJob — preempting without a grace period"
+            );
+        }
+        capable
+    })
+}
+
+/// Seconds of grace to give a victim, `0` meaning preempt it now.
+fn victim_grace_secs(
+    victim: &spur_core::job::Job,
+    mode: spur_core::partition::PreemptMode,
+    grace_time: u32,
+    nodes: &[Node],
+    now: DateTime<Utc>,
+) -> u32 {
+    let secs = effective_grace_secs(grace_time, victim, now);
+    if secs == 0 || !grace_eligible(victim, mode, nodes) {
+        return 0;
+    }
+    secs
+}
+
+/// Preempts `victim` immediately and tells its agents.
+async fn preempt_victim_now(
+    cluster: &Arc<ClusterManager>,
+    victim: &spur_core::job::Job,
+    mode: spur_core::partition::PreemptMode,
+    preemptor: spur_core::job::JobId,
+    preempt_qos: Option<String>,
+) -> anyhow::Result<()> {
+    use crate::cluster::PreemptOutcome;
+
+    match cluster.preempt_job_with_provenance(victim.job_id, mode, Some(preemptor), preempt_qos) {
+        Ok(PreemptOutcome::Killed) => {
+            // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
+            send_cancel_to_agents(cluster, victim, 0).await;
+            Ok(())
+        }
+        Ok(PreemptOutcome::Suspended) => {
+            send_suspend_to_agents(cluster, victim, false).await;
+            Ok(())
+        }
+        Err(e) => {
+            let follow_up = if mode == spur_core::partition::PreemptMode::Suspend {
+                VictimFollowUp::Suspend(Box::new(victim.clone()))
+            } else {
+                VictimFollowUp::Cancel {
+                    job_id: victim.job_id,
+                    run_attempt: victim.run_attempt,
+                    nodes: victim.allocated_nodes.clone(),
+                }
+            };
+            follow_late_preemption(cluster, &e, follow_up);
+            Err(e)
+        }
+    }
+}
+
+/// What a grace commits the victim to, fixed when the warning goes out.
+struct PreemptionGrace {
+    preemptor: spur_core::job::JobId,
+    preempt_qos: Option<String>,
+    mode: spur_core::partition::PreemptMode,
+    secs: u32,
+    now: DateTime<Utc>,
+}
+
+/// Warns `victim` instead of ending it: records the deadline in the Raft log
+/// and signals its steps. The victim keeps running and keeps its nodes; the
+/// preemption itself is finalized at the deadline.
+async fn start_preemption_grace(
+    cluster: &Arc<ClusterManager>,
+    victim: &spur_core::job::Job,
+    grace: PreemptionGrace,
+) -> anyhow::Result<()> {
+    let deadline = grace.now + chrono::Duration::seconds(i64::from(grace.secs));
+    let pending = spur_core::job::PreemptPending {
+        signaled_at: grace.now,
+        deadline,
+        preempted_by: grace.preemptor,
+        preempt_qos: grace.preempt_qos.clone(),
+        mode: grace.mode,
+        run_attempt: victim.run_attempt,
+        requeue_hold_secs: u32::try_from(cluster.requeue_hold_secs()).unwrap_or(u32::MAX),
+    };
+    let applied = match cluster.signal_preemption(pending, victim.job_id) {
+        Ok(applied) => applied,
+        Err(e) => {
+            follow_late_preemption(
+                cluster,
+                &e,
+                VictimFollowUp::Warn {
+                    job_id: victim.job_id,
+                    run_attempt: victim.run_attempt,
+                    nodes: victim.allocated_nodes.clone(),
+                },
+            );
+            return Err(e);
+        }
+    };
+    // The run ended or was replaced since the snapshot: warning it now would
+    // signal a different run than the one chosen as victim.
+    if !applied {
+        anyhow::bail!(
+            "job {} can no longer be given a preemption grace",
+            victim.job_id
+        );
+    }
+    info!(
+        preempted_job = victim.job_id,
+        pending_job = grace.preemptor,
+        pending_qos = ?grace.preempt_qos,
+        %deadline,
+        "preemption grace period started"
+    );
+    send_preemption_warning(
+        cluster,
+        victim.job_id,
+        victim.run_attempt,
+        &victim.allocated_nodes,
+    )
+    .await;
+    Ok(())
+}
+
+/// Warns the victim's `srun` steps, never the batch script.
+async fn send_preemption_warning(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    nodes: &[String],
+) {
+    send_signal_to_nodes(
+        cluster,
+        job_id,
+        run_attempt,
+        nodes,
+        &PREEMPT_WARNING_SIGNALS,
+        SignalTarget::Steps,
+    )
+    .await;
 }
 
 /// A borrowed run that reclaim is permitted to evict, and the nodes it holds.
@@ -3380,6 +3566,13 @@ enum VictimFollowUp {
         nodes: Vec<String>,
     },
     Suspend(Box<spur_core::job::Job>),
+    /// Only owed if the grace entry applied: a replayed or superseded one has
+    /// no warning to send.
+    Warn {
+        job_id: spur_core::job::JobId,
+        run_attempt: u32,
+        nodes: Vec<String>,
+    },
 }
 
 /// Carries out a preemption whose write applied only after `propose` gave up waiting.
@@ -3401,6 +3594,15 @@ fn follow_late_preemption(
                 nodes,
             } => cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, 0).await,
             VictimFollowUp::Suspend(job) => send_suspend_to_agents(&cluster, &job, false).await,
+            VictimFollowUp::Warn {
+                job_id,
+                run_attempt,
+                nodes,
+            } => {
+                if resp.preempt_signal_applied {
+                    send_preemption_warning(&cluster, job_id, run_attempt, &nodes).await;
+                }
+            }
         }
     });
 }
@@ -3742,8 +3944,6 @@ async fn cancel_one_agent(
 /// A node whose agent predates `SignalJob` gets the signals through
 /// `CancelJob` instead, which only a `Full` target can stand in for; any other
 /// target skips the node, so callers gate on the capability before choosing one.
-// Nothing outside tests calls this until the preemption warning is wired to it.
-#[allow(dead_code)]
 pub async fn send_signal_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
@@ -3973,6 +4173,136 @@ mod tests {
         job.start_time = Some(start);
         job.allocated_nodes = vec![node.to_string()];
         job
+    }
+
+    #[test]
+    fn effective_grace_caps_at_remaining_time() {
+        let now = Utc::now();
+        let job = running_job_on("n1", now - chrono::Duration::seconds(480), 10);
+        assert_eq!(effective_grace_secs(600, &job, now), 120);
+    }
+
+    #[test]
+    fn effective_grace_keeps_a_grace_shorter_than_the_remaining_time() {
+        let now = Utc::now();
+        let job = running_job_on("n1", now, 10);
+        assert_eq!(effective_grace_secs(90, &job, now), 90);
+    }
+
+    #[test]
+    fn effective_grace_without_time_limit_is_uncapped() {
+        let now = Utc::now();
+        let mut job = running_job_on("n1", now, 10);
+        job.spec.time_limit = None;
+        assert_eq!(effective_grace_secs(600, &job, now), 600);
+    }
+
+    #[test]
+    fn effective_grace_is_zero_past_the_limit() {
+        let now = Utc::now();
+        let job = running_job_on("n1", now - chrono::Duration::minutes(11), 10);
+        assert_eq!(effective_grace_secs(600, &job, now), 0);
+    }
+
+    #[test]
+    fn effective_grace_extends_the_cap_by_suspended_time() {
+        let now = Utc::now();
+        let mut job = running_job_on("n1", now - chrono::Duration::seconds(480), 10);
+        job.suspended_secs = 60;
+        assert_eq!(effective_grace_secs(600, &job, now), 180);
+    }
+
+    fn node_with(name: &str, source: NodeSource, capabilities: &[&str]) -> Node {
+        let mut node = Node::new(name.into(), spur_core::resource::ResourceSet::default());
+        node.source = source;
+        node.capabilities = capabilities.iter().map(|c| c.to_string()).collect();
+        node
+    }
+
+    #[test]
+    fn grace_is_eligible_on_capable_native_nodes() {
+        use spur_core::partition::PreemptMode;
+        let job = running_job_on("n1", Utc::now(), 10);
+        let nodes = [node_with(
+            "n1",
+            NodeSource::NativeHost,
+            &[spur_core::node::CAP_SIGNAL_JOB],
+        )];
+        assert!(grace_eligible(&job, PreemptMode::Cancel, &nodes));
+        assert!(grace_eligible(&job, PreemptMode::Requeue, &nodes));
+    }
+
+    #[test]
+    fn grace_is_never_eligible_for_suspend() {
+        use spur_core::partition::PreemptMode;
+        let job = running_job_on("n1", Utc::now(), 10);
+        let nodes = [node_with(
+            "n1",
+            NodeSource::NativeHost,
+            &[spur_core::node::CAP_SIGNAL_JOB],
+        )];
+        assert!(!grace_eligible(&job, PreemptMode::Suspend, &nodes));
+    }
+
+    #[test]
+    fn grace_is_not_eligible_on_a_kubernetes_node() {
+        use spur_core::partition::PreemptMode;
+        let job = running_job_on("n1", Utc::now(), 10);
+        let nodes = [node_with(
+            "n1",
+            NodeSource::Kubernetes {
+                namespace: "ns".into(),
+            },
+            &[spur_core::node::CAP_SIGNAL_JOB],
+        )];
+        assert!(!grace_eligible(&job, PreemptMode::Cancel, &nodes));
+    }
+
+    #[test]
+    fn grace_needs_every_allocated_node_to_support_signal_job() {
+        use spur_core::partition::PreemptMode;
+        let mut job = running_job_on("n1", Utc::now(), 10);
+        job.allocated_nodes.push("n2".into());
+        let nodes = [
+            node_with(
+                "n1",
+                NodeSource::NativeHost,
+                &[spur_core::node::CAP_SIGNAL_JOB],
+            ),
+            node_with("n2", NodeSource::NativeHost, &[]),
+        ];
+        assert!(!grace_eligible(&job, PreemptMode::Cancel, &nodes));
+    }
+
+    #[test]
+    fn grace_is_not_eligible_when_an_allocated_node_is_unknown() {
+        use spur_core::partition::PreemptMode;
+        let job = running_job_on("n1", Utc::now(), 10);
+        assert!(!grace_eligible(&job, PreemptMode::Cancel, &[]));
+    }
+
+    #[test]
+    fn a_victim_grace_of_zero_stays_zero_whatever_the_nodes() {
+        use spur_core::partition::PreemptMode;
+        let now = Utc::now();
+        let job = running_job_on("n1", now, 10);
+        let nodes = [node_with(
+            "n1",
+            NodeSource::NativeHost,
+            &[spur_core::node::CAP_SIGNAL_JOB],
+        )];
+        assert_eq!(
+            victim_grace_secs(&job, PreemptMode::Cancel, 0, &nodes, now),
+            0
+        );
+        assert_eq!(
+            victim_grace_secs(&job, PreemptMode::Cancel, 45, &nodes, now),
+            45
+        );
+        assert_eq!(
+            victim_grace_secs(&job, PreemptMode::Suspend, 45, &nodes, now),
+            0
+        );
     }
 
     #[test]
@@ -5712,6 +6042,13 @@ mod tests {
             dir: &TempDir,
             config: SlurmConfig,
         ) -> Arc<ClusterManager> {
+            test_cluster_with_raft(dir, config).await.0
+        }
+
+        async fn test_cluster_with_raft(
+            dir: &TempDir,
+            config: SlurmConfig,
+        ) -> (Arc<ClusterManager>, crate::raft::SpurRaft) {
             let cm = Arc::new(ClusterManager::new(config, dir.path()).unwrap());
             let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
                 .await
@@ -5722,8 +6059,8 @@ mod tests {
                 .metrics(|m| m.current_leader == Some(1), "leader elected")
                 .await
                 .expect("single-node raft did not self-elect within 5s");
-            cm.set_raft(handle.raft);
-            cm
+            cm.set_raft(handle.raft.clone());
+            (cm, handle.raft)
         }
 
         /// Spin until an async mutation (Raft-committed state, or a
@@ -5749,6 +6086,16 @@ mod tests {
             addr: std::net::SocketAddr,
             capabilities: Vec<String>,
         ) {
+            register_node_from(cm, name, addr, NodeSource::NativeHost, capabilities);
+        }
+
+        fn register_node_from(
+            cm: &ClusterManager,
+            name: &str,
+            addr: std::net::SocketAddr,
+            source: NodeSource,
+            capabilities: Vec<String>,
+        ) {
             cm.register_node(
                 name.into(),
                 name.into(),
@@ -5761,7 +6108,7 @@ mod tests {
                 addr.port(),
                 String::new(),
                 String::new(),
-                NodeSource::NativeHost,
+                source,
                 HashMap::new(),
                 capabilities,
                 true,
@@ -8410,6 +8757,376 @@ mod tests {
                 "failed-precondition-reject",
             )
             .await;
+        }
+
+        mod preemption_grace {
+            use super::*;
+            use spur_core::accounting::{Qos, QosLimits};
+            use spur_core::job::{JobState, PreemptPending};
+            use spur_core::partition::{PreemptMode, PreemptType};
+            use spur_proto::proto::{AgentCancelJobRequest, AgentSignalJobRequest};
+
+            type Cancels = Arc<std::sync::Mutex<Vec<AgentCancelJobRequest>>>;
+            type Signals = Arc<std::sync::Mutex<Vec<AgentSignalJobRequest>>>;
+
+            const SIGCONT: i32 = 18;
+            const SIGTERM: i32 = 15;
+
+            fn preempting_config(mode: &str) -> SlurmConfig {
+                let mut config = test_config();
+                config.partitions[0].preempt_mode = mode.into();
+                config.scheduler.preempt_type = PreemptType::QosPriority;
+                config
+            }
+
+            fn insert_qos_pair(cm: &ClusterManager, victim_grace: u32) {
+                cm.qos_cache().insert(Qos {
+                    name: "low".into(),
+                    priority: 100,
+                    limits: QosLimits {
+                        grace_time: victim_grace,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                cm.qos_cache().insert(Qos {
+                    name: "high".into(),
+                    priority: 10_000,
+                    preempt: vec!["low".into()],
+                    ..Default::default()
+                });
+            }
+
+            fn run_victim(
+                cm: &ClusterManager,
+                name: &str,
+                node: &str,
+                time_limit: Option<chrono::Duration>,
+            ) -> Job {
+                let spec = JobSpec {
+                    name: name.into(),
+                    user: "testuser".into(),
+                    work_dir: "/tmp".into(),
+                    qos: Some("low".into()),
+                    time_limit,
+                    ..Default::default()
+                };
+                let job_id = submit_and_wait(cm, spec);
+                start_on(cm, job_id, node);
+                cm.get_job(job_id).unwrap()
+            }
+
+            fn submit_preemptor(cm: &ClusterManager) -> Job {
+                let spec = JobSpec {
+                    name: "hunter".into(),
+                    user: "testuser".into(),
+                    work_dir: "/tmp".into(),
+                    qos: Some("high".into()),
+                    ..Default::default()
+                };
+                let job_id = submit_and_wait(cm, spec);
+                cm.get_job(job_id).unwrap()
+            }
+
+            async fn preempt_for(cm: &Arc<ClusterManager>, preemptor: &Job) {
+                let partitions = cm.get_partitions();
+                try_preempt(
+                    cm,
+                    &partitions,
+                    &cm.get_nodes(),
+                    &[preemptor],
+                    &cm.config().scheduler,
+                )
+                .await;
+            }
+
+            fn pending_for(victim: &Job, preemptor: &Job) -> PreemptPending {
+                let now = Utc::now();
+                PreemptPending {
+                    signaled_at: now,
+                    deadline: now + chrono::Duration::seconds(600),
+                    preempted_by: preemptor.job_id,
+                    preempt_qos: Some("high".into()),
+                    mode: PreemptMode::Cancel,
+                    run_attempt: victim.run_attempt,
+                    requeue_hold_secs: 30,
+                }
+            }
+
+            fn signals_seen(signals: &Signals) -> Vec<(i32, i32)> {
+                signals
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r.signal, r.target))
+                    .collect()
+            }
+
+            fn assert_killed_without_grace(cm: &ClusterManager, victim: &Job, cancels: &Cancels) {
+                wait_for("graceful cancel delivered", || {
+                    !cancels.lock().unwrap().is_empty()
+                });
+                let seen: Vec<(i32, u32)> = cancels
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|r| (r.signal, r.kill_wait_secs))
+                    .collect();
+                assert_eq!(seen, [(0, 30)]);
+                let job = cm.get_job(victim.job_id).unwrap();
+                assert_ne!(job.state, JobState::Running);
+                assert!(job.preempt_pending.is_none());
+            }
+
+            fn last_log_index(raft: &crate::raft::SpurRaft) -> Option<u64> {
+                raft.metrics().borrow().last_log_index
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn try_preempt_with_zero_grace_is_unchanged() {
+                let dir = TempDir::new().unwrap();
+                let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 0);
+                let victim = run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+
+                preempt_for(&cm, &hunter).await;
+
+                assert_killed_without_grace(&cm, &victim, &cancels);
+                assert_eq!(
+                    cm.get_job(victim.job_id).unwrap().preempted_by,
+                    Some(hunter.job_id)
+                );
+                assert!(signals.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn try_preempt_with_grace_signals_instead_of_killing() {
+                let dir = TempDir::new().unwrap();
+                let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 600);
+                let victim = run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+                let before = Utc::now();
+
+                preempt_for(&cm, &hunter).await;
+
+                wait_for("both warning signals delivered", || {
+                    signals.lock().unwrap().len() == 2
+                });
+                let steps = SignalTarget::Steps as i32;
+                assert_eq!(signals_seen(&signals), [(SIGCONT, steps), (SIGTERM, steps)]);
+                assert!(cancels.lock().unwrap().is_empty());
+                let job = cm.get_job(victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Running);
+                let pending = job.preempt_pending.expect("the grace is recorded");
+                let until_deadline = (pending.deadline - before).num_seconds();
+                assert!(
+                    (599..=601).contains(&until_deadline),
+                    "deadline is the grace after the pass, got {until_deadline}s"
+                );
+                assert_eq!(pending.preempted_by, hunter.job_id);
+                assert_eq!(pending.preempt_qos.as_deref(), Some("high"));
+                assert_eq!(pending.mode, PreemptMode::Cancel);
+                assert_eq!(pending.run_attempt, victim.run_attempt);
+                assert!(pending.requeue_hold_secs >= 30);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn in_grace_victim_is_not_picked_again() {
+                let dir = TempDir::new().unwrap();
+                let (cm, raft) = test_cluster_with_raft(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 600);
+                run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+                preempt_for(&cm, &hunter).await;
+                wait_for("both warning signals delivered", || {
+                    signals.lock().unwrap().len() == 2
+                });
+                let log_before = last_log_index(&raft);
+
+                preempt_for(&cm, &hunter).await;
+
+                assert_eq!(last_log_index(&raft), log_before, "no new log entry");
+                assert_eq!(signals.lock().unwrap().len(), 2);
+                assert!(cancels.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn second_preemptor_does_not_evict_another_job_for_in_grace_nodes() {
+                let dir = TempDir::new().unwrap();
+                let (cm, raft) = test_cluster_with_raft(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 600);
+                let in_grace = run_victim(&cm, "in-grace", "n1", None);
+                let bystander = run_victim(&cm, "bystander", "n1", None);
+                let first = submit_preemptor(&cm);
+                let applied = cm
+                    .signal_preemption(pending_for(&in_grace, &first), in_grace.job_id)
+                    .unwrap();
+                assert!(applied);
+                let second = submit_preemptor(&cm);
+                let log_before = last_log_index(&raft);
+
+                preempt_for(&cm, &second).await;
+
+                let bystander = cm.get_job(bystander.job_id).unwrap();
+                assert_eq!(bystander.state, JobState::Running);
+                assert!(bystander.preempt_pending.is_none());
+                assert_eq!(last_log_index(&raft), log_before, "no new log entry");
+                assert!(signals.lock().unwrap().is_empty());
+                assert!(cancels.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn kubernetes_victim_gets_no_grace() {
+                let dir = TempDir::new().unwrap();
+                let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_from(
+                    &cm,
+                    "n1",
+                    addr,
+                    NodeSource::Kubernetes {
+                        namespace: "ns".into(),
+                    },
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 600);
+                let victim = run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+
+                preempt_for(&cm, &hunter).await;
+
+                assert_killed_without_grace(&cm, &victim, &cancels);
+                assert!(signals.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn victim_on_node_without_capability_gets_no_grace() {
+                let dir = TempDir::new().unwrap();
+                let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_at(&cm, "n1", addr);
+                insert_qos_pair(&cm, 600);
+                let victim = run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+
+                preempt_for(&cm, &hunter).await;
+
+                assert_killed_without_grace(&cm, &victim, &cancels);
+                assert!(signals.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn suspend_mode_victim_gets_no_grace() {
+                let dir = TempDir::new().unwrap();
+                let cm = test_cluster_with_config(&dir, preempting_config("suspend")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 600);
+                let victim = run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+
+                preempt_for(&cm, &hunter).await;
+
+                let job = cm.get_job(victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Running);
+                assert!(job.preempt_pending.is_none());
+                assert!(signals.lock().unwrap().is_empty());
+                assert!(cancels.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn grace_capped_to_zero_preempts_immediately() {
+                let dir = TempDir::new().unwrap();
+                let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 600);
+                let victim = run_victim(&cm, "victim", "n1", Some(chrono::Duration::seconds(1)));
+                let hunter = submit_preemptor(&cm);
+
+                preempt_for(&cm, &hunter).await;
+
+                assert_killed_without_grace(&cm, &victim, &cancels);
+                assert!(signals.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn a_grace_that_applies_late_still_warns_the_victim() {
+                let dir = TempDir::new().unwrap();
+                let (cm, gate) =
+                    crate::cluster::gated::cluster(&dir, preempting_config("cancel")).await;
+                let (addr, _, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair(&cm, 600);
+                let victim = run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+
+                let closed = gate.close();
+                let err = cm
+                    .signal_preemption(pending_for(&victim, &hunter), victim.job_id)
+                    .expect_err("the grace cannot apply while the gate is closed");
+                follow_late_preemption(
+                    &cm,
+                    &err,
+                    VictimFollowUp::Warn {
+                        job_id: victim.job_id,
+                        run_attempt: victim.run_attempt,
+                        nodes: victim.allocated_nodes.clone(),
+                    },
+                );
+                assert!(signals.lock().unwrap().is_empty());
+
+                drop(closed);
+                wait_for("both warning signals delivered", || {
+                    signals.lock().unwrap().len() == 2
+                });
+                assert!(cm.get_job(victim.job_id).unwrap().preempt_pending.is_some());
+            }
         }
     }
 

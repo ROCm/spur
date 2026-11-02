@@ -24,7 +24,7 @@ use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
-    PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
+    PendingReason, PreemptPending, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -2079,10 +2079,7 @@ impl ClusterManager {
         // leader so every replica applies one instant.
         let begin_time = match (&snapshot, hold) {
             (Some(job), false) => {
-                let hold_secs = requeue_hold_secs(
-                    self.scheduler_interval_secs,
-                    self.config().scheduler.effective_kill_wait_secs(),
-                );
+                let hold_secs = self.requeue_hold_secs();
                 let deferred = Utc::now() + chrono::Duration::seconds(hold_secs);
                 Some(
                     job.spec
@@ -3058,6 +3055,27 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Record that a running job has been warned of preemption and may keep
+    /// its nodes until `pending.deadline`. `true` if the entry applied; `false`
+    /// means the run ended, was replaced, or already has a grace, and the
+    /// caller must not warn it.
+    pub fn signal_preemption(
+        &self,
+        pending: PreemptPending,
+        job_id: JobId,
+    ) -> anyhow::Result<bool> {
+        let resp = self.propose(WalOperation::JobPreemptSignaled { job_id, pending })?;
+        Ok(resp.preempt_signal_applied)
+    }
+
+    /// Seconds a requeued job stays ineligible after its old run is cancelled.
+    pub(crate) fn requeue_hold_secs(&self) -> i64 {
+        requeue_hold_secs(
+            self.scheduler_interval_secs,
+            self.config().scheduler.effective_kill_wait_secs(),
+        )
+    }
+
     /// Record that a run exhausted its time limit and move it to Completing in
     /// one entry, so the caller's graceful cancel finds the verdict already
     /// durable. `true` if the run is now Completing; `false` means it holds no
@@ -3178,10 +3196,7 @@ impl ClusterManager {
                 // the maybe_requeue MAX_REQUEUE cap: Slurm always requeues a
                 // preempted job regardless of its --requeue flag. This is a
                 // deliberate divergence from the ordinary requeue path.
-                let hold_secs = requeue_hold_secs(
-                    self.scheduler_interval_secs,
-                    self.config().scheduler.effective_kill_wait_secs(),
-                );
+                let hold_secs = self.requeue_hold_secs();
                 let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
                 // Honor a later user --begin: compute the max on the leader so
                 // followers apply one verbatim instant (no per-replica clock).
@@ -30041,6 +30056,36 @@ state = "UP"
         assert!(resp.preempt_signal_applied);
         assert!(cm.get_job(id).unwrap().preempt_pending.is_some());
         id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_preemption_records_the_grace_and_reports_it_applied() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+        let pending = preempt_pending_for(attempt, 90);
+
+        assert!(cm.signal_preemption(pending.clone(), id).unwrap());
+        assert_eq!(cm.get_job(id).unwrap().preempt_pending, Some(pending));
+
+        let again = preempt_pending_for(attempt, 600);
+        assert!(!cm.signal_preemption(again, id).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_preemption_for_a_stale_attempt_is_not_applied() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let stale = cm.get_job(id).unwrap().run_attempt + 1;
+
+        assert!(!cm
+            .signal_preemption(preempt_pending_for(stale, 90), id)
+            .unwrap());
+        assert!(cm.get_job(id).unwrap().preempt_pending.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
