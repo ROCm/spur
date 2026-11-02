@@ -338,6 +338,7 @@ const BPF_PROG_LOAD: i32 = 5;
 const BPF_PROG_ATTACH: i32 = 8;
 const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
 const BPF_CGROUP_DEVICE: u32 = 6;
+const BPF_F_ALLOW_MULTI: u32 = 1 << 1;
 
 /// The kernel reads this as a C string; a GPL-compatible license is what every
 /// in-tree device filter ships.
@@ -512,14 +513,15 @@ fn bpf_prog_load(prog: &[BpfInsn]) -> anyhow::Result<OwnedFd> {
     )
 }
 
-/// `attach_flags` stays zero: an exclusive attach is the stricter contract for a
-/// security filter, and it is what makes this the job cgroup's only device program.
+/// `BPF_F_ALLOW_MULTI` lets a step stack its own filter under its job's. The
+/// kernel runs every program from the step up to the job and allows an open only
+/// if all of them do, so a descendant's filter can narrow access, never widen it.
 fn prog_attach_attr(prog_fd: RawFd, cgroup_fd: RawFd) -> ProgAttachAttr {
     ProgAttachAttr {
         target_fd: cgroup_fd as u32,
         attach_bpf_fd: prog_fd as u32,
         attach_type: BPF_CGROUP_DEVICE,
-        attach_flags: 0,
+        attach_flags: BPF_F_ALLOW_MULTI,
     }
 }
 
@@ -1109,8 +1111,8 @@ mod tests {
         assert_eq!(attr.attach_bpf_fd, 7, "the program is what is attached");
         assert_eq!(attr.attach_type, BPF_CGROUP_DEVICE);
         assert_eq!(
-            attr.attach_flags, 0,
-            "no BPF_F_ALLOW_MULTI: one exclusive filter per job cgroup"
+            attr.attach_flags, 2,
+            "BPF_F_ALLOW_MULTI (uapi value 2), so a step's filter can stack under its job's"
         );
     }
 

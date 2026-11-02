@@ -152,6 +152,75 @@ nodes. A step cannot request more nodes than its allocation.
 ``--nodes`` (one task on one node) and, with ``-w``, uses only the first listed
 name.
 
+.. _step-own-share:
+
+A step's own share of the allocation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default every step shares the whole allocation on its nodes: all of the job's
+CPUs, memory, and GPUs. A buffered step can instead take a share of its own by
+typing resource flags on its ``srun`` command line. Each one is enforced on the
+step's own ``step_<n>`` cgroup, below the job's, so it can only narrow what the
+job already holds:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 66
+
+   * - Flag
+     - What the step gets on each of its nodes
+   * - ``--cpus-per-task`` / ``-c``
+     - A CPU-time cap (``cpu.max``) of ``-c`` times its tasks on that node. The
+       step keeps the job's cpuset; it is not pinned to cores of its own.
+   * - ``--mem``
+     - A memory cap, sized like a job's (``memory.max``/``memory.high``, and
+       ``memory.swap.max`` when swap is constrained). With ``oom_kill_job`` on,
+       going over it kills that step only; the job and its other steps keep running.
+   * - ``--gpus-per-node``, ``--gres=gpu:N``, ``--gpus-per-task``, ``--gpus``
+     - That many of the job's GPUs, kept from every other step that also asked
+       for GPUs, and a device filter of the step's own that denies the rest.
+       ``--gpus`` must split evenly across the step's nodes. ``0`` means no GPU
+       at all. A step cannot ask for a GPU type: it takes from GPUs its job holds.
+
+Only flags typed on the command line count. The values an allocation exports
+into its shell (``SPUR_CPUS_PER_TASK``, ``SPUR_MEM_PER_NODE``,
+``SPUR_GPUS_PER_NODE``, and their ``SLURM_*`` twins) stay shared, so a plain
+``srun`` keeps behaving as before. A step that types none of these flags shares
+everything, exactly as above.
+
+.. code-block:: bash
+
+   salloc -N1 --gpus-per-node=8 --cpus-per-task=64 --mem=512G
+   # ...inside the allocation shell: eight one-GPU steps, each with its own limits
+   for i in $(seq 8); do
+     srun -c 8 --mem=64G --gpus=1 ./serve.sh "$i" &
+   done
+   wait
+
+A step that asks for GPUs when not enough of the job's are free fails at once
+with ``ResourceExhausted``; it does not wait for another step to finish.
+
+Inside a step with GPUs of its own, the GPU runtimes can open no other GPU, so
+they number the step's GPUs from ``0``. ``ROCR_VISIBLE_DEVICES``,
+``CUDA_VISIBLE_DEVICES``, ``GPU_DEVICE_ORDINAL`` and ``SPUR_JOB_GPUS`` follow that
+numbering there.
+
+The node refuses a step whose share it cannot enforce rather than run it with the
+job's: ``spurd`` must run as root with ``[cgroup] enabled``, a memory cap also
+needs ``constrain_ram_space`` or ``constrain_swap``, and GPUs need
+``constrain_devices`` (see :doc:`/admin-guide/configuration`). ``--pty`` steps
+ignore these flags and warn.
+
+.. note::
+
+   A step with GPUs of its own reaches only those and the node's shared
+   infrastructure devices; a non-GPU device allocated to the job is not part of
+   its filter. The filter governs opening a device: it does not stop two
+   cooperating processes in different steps from handing an already-open
+   descriptor to each other over a Unix socket. A node agent that predates step
+   shares ignores these flags, so upgrade the nodes before relying on them; a job
+   started before its node was upgraded cannot give a step GPUs of its own.
+
 The ``-N``/``-n`` defaults of 1 apply when ``srun`` submits a **new** job, not
 when it runs as a step inside ``salloc``/``sbatch``. Common options: ``--nodes``/
 ``-N``, ``--ntasks``/``-n``, ``--cpus-per-task``/``-c``, ``--mem``, ``--time``/
@@ -326,6 +395,9 @@ the allocated device ordinals so GPU runtimes find the right devices:
 Under ``srun``, ``--gpu-bind`` adjusts the visible set per task —
 ``--gpu-bind=closest`` binds each task to its nearest GPU, and
 ``map_gpu:...``/``mask_gpu:...`` set an explicit per-task mapping or mask.
+
+Inside an allocation, a step that asks for a GPU count takes those GPUs for itself
+and sees them numbered from ``0``; see :ref:`step-own-share`.
 
 See Also
 --------

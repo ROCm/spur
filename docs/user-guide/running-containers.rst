@@ -174,6 +174,26 @@ A ``--pty`` step nested inside a containerized ``sbatch`` job enters
 the parent's running container (like any other nested step) rather than building
 a fresh one.
 
+Isolating Steps From Each Other
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+One allocation can run several unrelated containers side by side on a node, each
+kept apart from the others. Give each step its own image, its own share of the
+allocation (:ref:`see the step resource flags <step-own-share>`):
+
+.. code-block:: bash
+
+   salloc -N1 --gpus-per-node=8 --cpus-per-task=64 --mem=512G
+   # ...inside the allocation shell:
+   srun --container-image=inference.sqsh -c 16 --mem=128G --gpus=2 ./serve.sh &
+   srun --container-image=batch.sqsh -c 8 --mem=32G --gpus=1 ./process.sh &
+   wait
+
+Each such step has its own root filesystem, mount and PID namespaces, ``/tmp``
+and ``/dev/shm``, its own cgroup with the CPU, memory and GPU limits it asked
+for, and only its own GPUs. It still runs as your user and shares the node's
+network namespace with the rest of the allocation.
+
 Exec Into a Running Container Job
 ---------------------------------
 

@@ -625,9 +625,11 @@ a granularity gap *inside* the job rather than a hole between jobs:
    * - What is missing
      - Where it stands
    * - Per-step **limits**
-     - Each step gets its own ``step_<n>`` cgroup, but that leaf carries no
-       budget of its own: it inherits the job's limits and device filter, so
-       every step in a job still draws on one shared budget. Where the host lets
+     - Each step gets its own ``step_<n>`` cgroup. A step that types
+       ``--cpus-per-task``, ``--mem`` or a GPU count gets those as limits of
+       its own on that leaf (:ref:`step-own-share`); any other step's leaf
+       carries no budget of its own: it inherits the job's limits and device
+       filter, so those steps still draw on one shared budget. Where the host lets
        the job delegate its controllers, per-step CPU and memory *readings* show
        up in the leaf's ``cpu.stat`` and ``memory.current``; Spur does not yet
        collect them into step accounting.

@@ -2306,8 +2306,11 @@ the device filter; each step runs in its own ``step_<n>`` leaf underneath it and
 inherits both, because cgroup v2 will not hold processes in a node whose
 children have controllers enabled. The limits are derived from the **per-node
 budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
-the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
-cgroups.
+the user requested. A step that asks for a share of its own adds a CPU cap,
+memory cap or device filter to its leaf on top of the job's
+(:ref:`step-own-share`); that needs root, ``enabled``, and the matching
+``constrain_*`` setting, or the step is refused. Kubernetes jobs are unaffected:
+there the kubelet owns the cgroups.
 
 .. warning::
 
@@ -2316,8 +2319,8 @@ cgroups.
    ``CAP_NET_ADMIN`` for the device filter, say — logs a warning and runs the work
    unconstrained. Set ``required = true`` to make that case fail closed instead.
    See :ref:`cgroup-containment-gaps` for what remains even then: a step leaf
-   carries no budget of its own, and the site-supplied task hooks run outside
-   the job cgroup.
+   carries no budget of its own unless the step asks for one, and the
+   site-supplied task hooks run outside the job cgroup.
 
 .. note::
 
@@ -2596,7 +2599,8 @@ them, so a site's existing percentages carry over directly.
      -
    * - ``OOMKillStep``
      - ``oom_kill_job``
-     - Applies to the whole job; Spur has no per-step cgroups yet.
+     - Applies to the whole job, and to just the step when a step that set its
+       own ``--mem`` goes over it.
 
 Deliberate differences from Slurm:
 
