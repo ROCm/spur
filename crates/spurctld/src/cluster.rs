@@ -3043,6 +3043,10 @@ impl ClusterManager {
     /// completion path report `Timeout` instead of reading the terminating
     /// signal as an ordinary failure — a job that exits promptly on SIGTERM
     /// reports back long before the grace period is up.
+    ///
+    /// Controllers no longer emit this entry (see `expire_time_limit`); tests
+    /// use it to build the state an older entry replays into.
+    #[cfg(test)]
     pub fn signal_time_limit(&self, job_id: JobId, at: DateTime<Utc>) -> anyhow::Result<()> {
         self.propose(WalOperation::JobTimeLimitSignaled { job_id, at })?;
         Ok(())

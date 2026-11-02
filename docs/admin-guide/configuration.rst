@@ -739,14 +739,14 @@ Reaping abandoned interactive allocations (``inactive_limit_secs``)
 ``salloc`` and standalone ``srun`` (with or without ``--pty``) ping the
 controller every 30 seconds for as long as the client is running. When the pings
 stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
-allocation is reaped: SIGTERM, a wait of ``kill_wait_secs`` (default 30
-seconds), then SIGKILL. The controller times the wait and the SIGTERM is
-delivered as a signal only, so the node never ends the job on its own during
-it. The SIGTERM is final: a client that reconnects during the wait does not save
-the allocation, and the job ends ``TIMEOUT`` however its processes exit. With
-the defaults, an abandoned allocation is signalled 270 to 310 seconds after its
-client is lost (the last ping can be up to 30 seconds old) and is finished
-within about 40 seconds of the signal.
+allocation is reaped: SIGTERM, a wait of up to ``kill_wait_secs`` (default 30
+seconds, ending early once the job's processes exit), then SIGKILL. The node
+keeps the wait. The job shows ``COMPLETING`` (``CG``) meanwhile and ends
+``TIMEOUT``. The SIGTERM is final: a client that reconnects during the wait
+does not save the allocation, and the job ends ``TIMEOUT`` however its
+processes exit. With the defaults, an abandoned allocation is signalled 270 to
+310 seconds after its client is lost (the last ping can be up to 30 seconds
+old) and is finished within about 40 seconds of the signal.
 
 The limit measures the client, not the job. A busy job whose client is gone is
 reaped, and so is one whose client is only stopped, such as a foreground

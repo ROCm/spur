@@ -3055,6 +3055,13 @@ async fn expire_job_if_overdue(
         "time limit exceeded — completing"
     );
 
+    expire_run(cluster, job, now).await;
+}
+
+/// Record that `job`'s run timed out and stop it with the graceful cancel. The
+/// kill wait is the agent's to keep; a run holding no nodes will never report,
+/// so it is finalized here instead.
+async fn expire_run(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job, now: DateTime<Utc>) {
     match cluster.expire_time_limit(job.job_id, job.run_attempt, now) {
         Ok(true) => send_cancel_to_agents(cluster, job, 0).await,
         Ok(false) => finalize_timed_out_without_nodes(cluster, job),
@@ -3080,20 +3087,15 @@ fn finalize_timed_out_without_nodes(cluster: &ClusterManager, expired: &spur_cor
 }
 
 /// Reap interactive allocations (salloc/srun) whose client stopped sending
-/// keepalives, mirroring Slurm's `InactiveLimit`. Idle allocations get a
-/// SIGTERM -> grace -> SIGKILL sequence (like `enforce_time_limits`) and are
-/// finalized via the TIMEOUT path. Disabled when `inactive_limit_secs == 0`.
+/// keepalives, mirroring Slurm's `InactiveLimit`. An idle allocation is stopped
+/// the way a time limit stops a job: it moves to COMPLETING and gets the
+/// graceful cancel, then ends TIMEOUT. Disabled when `inactive_limit_secs == 0`.
 async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     use spur_core::job::{JobId, JobState};
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
-    // Jobs that were sent SIGTERM and are in their grace window, keyed by
-    // job id -> when SIGTERM was sent. Local to this task (only the reaper
-    // touches it); lost on restart, which merely restarts the grace.
-    let mut signaled: HashMap<JobId, DateTime<Utc>> = HashMap::new();
-
-    // Neither map is tied to a leadership term, so reset them on a
+    // The keepalive map is not tied to a leadership term, so it is reset on a
     // follower -> leader transition (below) to drop a prior stint's stale state.
     let mut was_leader = false;
 
@@ -3104,16 +3106,15 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
             was_leader = false;
             continue;
         }
-        // A failed confirmation only skips this tick; resetting the timers on it
-        // would hand every idle allocation a fresh grace window.
+        // A failed confirmation only skips this tick; resetting the keepalive
+        // map on it would hand every idle allocation a fresh window.
         if !raft.ensure_leader().await {
             continue;
         }
 
         if !was_leader {
-            // (Re)gained leadership: drop stale timers so the reap check below
-            // reseeds every running allocation to a full grace window.
-            signaled.clear();
+            // (Re)gained leadership: drop stale keepalives so the reap check
+            // below reseeds every running allocation to a full window.
             cluster.reset_interactive_last_seen();
             was_leader = true;
         }
@@ -3139,10 +3140,6 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
         // Prunes the keepalive map every tick; returns candidates only when
         // the limit is enabled and the client is keepalive-capable.
         let stale = cluster.interactive_reap_candidates(&ids, &keepalive_capable, now, limit_secs);
-        let stale_set: HashSet<JobId> = stale.iter().copied().collect();
-        // Drop grace timers for jobs that pinged again or are gone, so the
-        // reaper never force-kills them itself.
-        signaled.retain(|id, _| stale_set.contains(id));
 
         let by_id: HashMap<JobId, &spur_core::job::Job> =
             running.iter().map(|j| (j.job_id, j)).collect();
@@ -3151,88 +3148,24 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
             let Some(job) = by_id.get(&job_id) else {
                 continue;
             };
-            reap_inactive_job(&cluster, job, &mut signaled, now).await;
+            reap_inactive_job(&cluster, job, limit_secs, now).await;
         }
     }
 }
 
-/// Advance one idle allocation through the InactiveLimit sequence: the first
-/// time it is seen, record the reap and send SIGTERM; once the window has
-/// elapsed without the client pinging again, finalize it as TIMEOUT and SIGKILL.
+/// Stop one idle allocation: it leaves Running at once, so it is not a
+/// candidate again and a client that reconnects later cannot save it.
 async fn reap_inactive_job(
     cluster: &Arc<ClusterManager>,
     job: &spur_core::job::Job,
-    signaled: &mut HashMap<spur_core::job::JobId, DateTime<Utc>>,
+    limit_secs: u32,
     now: DateTime<Utc>,
 ) {
-    use spur_core::job::JobState;
-
-    let job_id = job.job_id;
-    let kill_wait_secs = cluster.config().scheduler.effective_kill_wait_secs();
-    let Some(signaled_at) = signaled.get(&job_id).copied() else {
-        info!(
-            job_id,
-            grace_secs = kill_wait_secs,
-            "interactive allocation idle past InactiveLimit — sending SIGTERM, grace period starts"
-        );
-        // Record before signalling: a run that exits on this SIGTERM
-        // must finalize as TIMEOUT on every path rather than as a
-        // plain signal death.
-        if let Err(e) = cluster.signal_time_limit(job_id, now) {
-            warn!(job_id, error = %e, "failed to record InactiveLimit reap");
-            return;
-        }
-        // Signal-only: the agent must not end the run while the client can
-        // still ping and call the kill off.
-        send_signal_to_nodes(
-            cluster,
-            job_id,
-            job.run_attempt,
-            &job.allocated_nodes,
-            &[15], // SIGTERM
-            SignalTarget::Full,
-        )
-        .await;
-        signaled.insert(job_id, now);
-        return;
-    };
-    if (now - signaled_at).num_seconds() < i64::from(kill_wait_secs) {
-        return;
-    }
-
-    // Re-fetch before finalizing: if the job was requeued and
-    // redispatched as a new run under the same id since the
-    // snapshot, `complete_job`'s terminal-state guard would not
-    // catch it and the SIGKILL could hit the new run.
-    let Some(fresh) = cluster.get_job(job_id) else {
-        signaled.remove(&job_id);
-        return;
-    };
-    if fresh.state != JobState::Running || fresh.run_attempt != job.run_attempt {
-        signaled.remove(&job_id);
-        return;
-    }
-
     info!(
-        job_id,
-        "InactiveLimit grace expired — force-killing allocation"
+        job_id = job.job_id,
+        limit_secs, "interactive allocation idle past InactiveLimit — completing"
     );
-
-    if let Err(e) = cluster.complete_job(job_id, -1, JobState::Timeout) {
-        warn!(job_id, error = %e, "failed to reap inactive allocation");
-        return;
-    }
-
-    // SIGKILL on the run's current nodes, not the stale snapshot.
-    send_cancel_to_nodes(
-        cluster,
-        job_id,
-        fresh.run_attempt,
-        &fresh.allocated_nodes,
-        9,
-    )
-    .await;
-    signaled.remove(&job_id);
+    expire_run(cluster, job, now).await;
 }
 
 /// Force-finish jobs stuck in COMPLETING past `complete_wait_secs`.
@@ -3809,6 +3742,8 @@ async fn cancel_one_agent(
 /// A node whose agent predates `SignalJob` gets the signals through
 /// `CancelJob` instead, which only a `Full` target can stand in for; any other
 /// target skips the node, so callers gate on the capability before choosing one.
+// Nothing outside tests calls this until the preemption warning is wired to it.
+#[allow(dead_code)]
 pub async fn send_signal_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
@@ -6066,79 +6001,87 @@ mod tests {
         const SIGNAL_JOB_CAPABILITY: &str = spur_core::node::CAP_SIGNAL_JOB;
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn inactive_limit_sigterm_uses_signal_job_full() {
+        async fn inactive_limit_expires_through_completing_with_kill_wait() {
             use spur_core::job::JobState;
-            use spur_proto::proto::SignalTarget;
             let dir = TempDir::new().unwrap();
             let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
             let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
             register_node_with_capabilities(&cm, "n1", addr, vec![SIGNAL_JOB_CAPABILITY.into()]);
             let job = run_on(&cm, "idle", "n1");
 
-            reap_inactive_job(&cm, &job, &mut HashMap::new(), Utc::now()).await;
-            wait_for("SIGTERM delivered", || !signals.lock().unwrap().is_empty());
+            reap_inactive_job(&cm, &job, 300, Utc::now()).await;
+            wait_for("graceful cancel delivered", || {
+                !cancels.lock().unwrap().is_empty()
+            });
 
-            let seen: Vec<(u32, u32, i32, i32)> = signals
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| (r.job_id, r.run_attempt, r.signal, r.target))
-                .collect();
-            assert_eq!(
-                seen,
-                [(job.job_id, job.run_attempt, 15, SignalTarget::Full as i32)]
-            );
-            assert!(cancels.lock().unwrap().is_empty(), "no CancelJob SIGTERM");
-            assert_eq!(cm.get_job(job.job_id).unwrap().state, JobState::Running);
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn inactive_limit_falls_back_to_cancel_on_nodes_without_capability() {
-            let dir = TempDir::new().unwrap();
-            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
-            let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
-            register_node_at(&cm, "n1", addr);
-            let job = run_on(&cm, "idle", "n1");
-
-            reap_inactive_job(&cm, &job, &mut HashMap::new(), Utc::now()).await;
-            wait_for("SIGTERM delivered", || !cancels.lock().unwrap().is_empty());
-
+            let expired = cm.get_job(job.job_id).unwrap();
+            assert_eq!(expired.state, JobState::Completing);
+            assert!(expired.time_limit_signaled_at.is_some());
             let seen: Vec<(i32, u32)> = cancels
                 .lock()
                 .unwrap()
                 .iter()
                 .map(|r| (r.signal, r.kill_wait_secs))
                 .collect();
-            assert_eq!(seen, [(15, 0)]);
+            assert_eq!(seen, [(0, 30)]);
             assert!(signals.lock().unwrap().is_empty());
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn inactive_limit_window_is_the_kill_wait() {
+        async fn inactive_limit_reconnect_after_expiry_does_not_save_the_job() {
             use spur_core::job::JobState;
             let dir = TempDir::new().unwrap();
-            let mut config = test_config();
-            config.scheduler.kill_wait_secs = 45;
-            let cm = crate::cluster::gated::cluster(&dir, config).await.0;
-            let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
-            register_node_with_capabilities(&cm, "n1", addr, vec![SIGNAL_JOB_CAPABILITY.into()]);
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let (addr, cancels, _) = spawn_mock_agent_recording_requests().await;
+            register_node_at(&cm, "n1", addr);
             let job = run_on(&cm, "idle", "n1");
-            let t0 = Utc::now();
-            let mut signaled = HashMap::new();
+            let now = Utc::now();
 
-            reap_inactive_job(&cm, &job, &mut signaled, t0).await;
-            wait_for("SIGTERM delivered", || !signals.lock().unwrap().is_empty());
+            reap_inactive_job(&cm, &job, 300, now).await;
+            wait_for("graceful cancel delivered", || {
+                !cancels.lock().unwrap().is_empty()
+            });
+            cm.record_job_keepalive(job.job_id);
 
-            reap_inactive_job(&cm, &job, &mut signaled, t0 + chrono::Duration::seconds(44)).await;
-            assert_eq!(cm.get_job(job.job_id).unwrap().state, JobState::Running);
-            assert!(signaled.contains_key(&job.job_id));
+            let running = cm.get_jobs(&JobFilter {
+                states: &[JobState::Running],
+                ..Default::default()
+            });
+            assert!(
+                running.iter().all(|j| j.job_id != job.job_id),
+                "the reaper only considers Running jobs"
+            );
+            assert_eq!(cm.get_job(job.job_id).unwrap().state, JobState::Completing);
 
-            reap_inactive_job(&cm, &job, &mut signaled, t0 + chrono::Duration::seconds(45)).await;
+            cm.node_complete(job.job_id, "n1", 0, 0, 0).unwrap();
             settle(&cm, job.job_id, JobState::Timeout);
-            wait_for("SIGKILL delivered", || !cancels.lock().unwrap().is_empty());
-            let killed: Vec<i32> = cancels.lock().unwrap().iter().map(|r| r.signal).collect();
-            assert_eq!(killed, [9]);
-            assert!(signaled.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn inactive_limit_no_nodes_finalizes_timeout() {
+            use crate::raft::StateMachineApply;
+            use spur_core::job::JobState;
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let spec = JobSpec {
+                name: "idle-no-nodes".into(),
+                user: "testuser".into(),
+                work_dir: "/tmp".into(),
+                interactive: true,
+                client_keepalive: true,
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec);
+            cm.apply_operation(&spur_core::wal::WalOperation::job_state_change(
+                job_id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            let job = cm.get_job(job_id).unwrap();
+
+            reap_inactive_job(&cm, &job, 300, Utc::now()).await;
+
+            settle(&cm, job_id, JobState::Timeout);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
