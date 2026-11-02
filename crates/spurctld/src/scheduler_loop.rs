@@ -1540,7 +1540,6 @@ fn victim_grace_secs(
     secs
 }
 
-/// Preempts `victim` immediately and tells its agents.
 async fn preempt_victim_now(
     cluster: &Arc<ClusterManager>,
     victim: &spur_core::job::Job,
