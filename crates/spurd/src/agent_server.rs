@@ -7096,6 +7096,13 @@ impl SlurmAgent for AgentService {
         Ok(Response::new(()))
     }
 
+    async fn signal_job(
+        &self,
+        _request: Request<AgentSignalJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented("SignalJob is not implemented yet"))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,
@@ -17510,6 +17517,7 @@ mod tests {
             job_id: 48,
             signal: 9,
             run_attempt: 0,
+            kill_wait_secs: 0,
         });
         req.extensions_mut().insert(user_identity("attacker"));
         let err = svc
@@ -20484,6 +20492,7 @@ mod tests {
             job_id: 7,
             signal: 9,
             run_attempt: 1,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -20517,6 +20526,7 @@ mod tests {
             job_id: 7,
             signal: 9,
             run_attempt: 1,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -20555,6 +20565,7 @@ mod tests {
             job_id,
             signal: 9,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -22306,6 +22317,7 @@ mod tests {
             job_id,
             signal: 0,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -22340,6 +22352,7 @@ mod tests {
             job_id,
             signal: 0,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");

@@ -3715,6 +3715,7 @@ async fn cancel_one_agent(
                         job_id,
                         signal,
                         run_attempt,
+                        kill_wait_secs: 0,
                     })
                     .await
                 {
@@ -5076,6 +5077,13 @@ mod tests {
                 Ok(tonic::Response::new(
                     spur_proto::proto::ReleasePmixResponse {},
                 ))
+            }
+
+            async fn signal_job(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AgentSignalJobRequest>,
+            ) -> Result<tonic::Response<()>, tonic::Status> {
+                Ok(tonic::Response::new(()))
             }
 
             async fn cancel_job(

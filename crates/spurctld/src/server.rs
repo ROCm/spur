@@ -8024,6 +8024,12 @@ mod tests {
         ) -> Result<Response<spur_proto::proto::ReleasePmixResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
+        async fn signal_job(
+            &self,
+            _request: Request<spur_proto::proto::AgentSignalJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Ok(Response::new(()))
+        }
         async fn cancel_job(
             &self,
             _request: Request<AgentCancelJobRequest>,

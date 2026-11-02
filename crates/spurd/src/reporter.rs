@@ -462,6 +462,7 @@ impl NodeReporter {
             labels,
             join_token: self.join_token.clone(),
             topology: resources.topology.as_ref().map(Into::into),
+            capabilities: vec![],
         };
         let inner = self
             .with_controller(move |mut client| async move { client.register_agent(req).await })

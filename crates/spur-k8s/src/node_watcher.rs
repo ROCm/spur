@@ -134,6 +134,7 @@ pub async fn run(
                         labels: std::collections::HashMap::new(),
                         join_token: String::new(),
                         topology: None,
+                        capabilities: vec![],
                     };
 
                     let reg = req.clone();

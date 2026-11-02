@@ -265,6 +265,9 @@ pub enum NodeSource {
 /// `RegisterAgentRequest.version` sent by the spur-k8s operator.
 pub const K8S_OPERATOR_VERSION: &str = "spur-k8s-operator";
 
+/// Agent capability: the agent implements the `SignalJob` RPC.
+pub const CAP_SIGNAL_JOB: &str = "signal-job";
+
 /// Node label carrying the operator's Kubernetes namespace.
 pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
 

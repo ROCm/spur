@@ -687,6 +687,9 @@ service SlurmAgent {
   // before anything the job runs can ask about it.
   rpc StartJob(AgentStartJobRequest) returns (google.protobuf.Empty);
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
+  // Deliver a signal without tearing the run down (e.g. a preemption grace
+  // warning). Agents that implement it advertise the `signal-job` capability.
+  rpc SignalJob(AgentSignalJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ProbeStepd(StepdProbeRequest) returns (StepdProbeResponse);
@@ -1090,6 +1093,9 @@ message RegisterAgentRequest {
   map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
   string join_token = 8;     // Admission token for token-based admission
   CpuTopology topology = 9;  // absent from agents that predate it
+  // Optional agent features (e.g. "signal-job"), so the controller can avoid
+  // calling RPCs an older agent does not implement.
+  repeated string capabilities = 10;
 }
 
 message RegisterAgentResponse {
@@ -1270,6 +1276,24 @@ message AgentCancelJobRequest {
   // attempt is currently tracked). Guards a still-launching reservation
   // release against a concurrent redispatch under the same job_id.
   uint32 run_attempt = 3;
+  // Seconds to wait after the first signal before escalating to SIGKILL.
+  // 0 means the agent default (5 s).
+  uint32 kill_wait_secs = 4;
+}
+
+enum SignalTarget {
+  SIGNAL_TARGET_UNSPECIFIED = 0;
+  SIGNAL_TARGET_STEPS = 1;   // every step except the batch script
+  SIGNAL_TARGET_BATCH = 2;   // the batch script only
+  SIGNAL_TARGET_FULL = 3;    // everything in the run
+}
+
+message AgentSignalJobRequest {
+  uint32 job_id = 1;
+  // Epoch of the targeted run; 0 means whichever attempt is currently tracked.
+  uint32 run_attempt = 2;
+  int32 signal = 3;
+  SignalTarget target = 4;
 }
 
 message AgentSuspendJobRequest {
