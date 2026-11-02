@@ -1211,6 +1211,20 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 (or ``-s KILL``) and is not reported. With another signal it fails, and
 ``--quiet``/``-Q`` hides the report but not the exit status.
 
+**Time limits and the kill wait.** At its time limit a job moves from ``RUNNING``
+to ``COMPLETING`` (``CG`` in ``squeue``) straight away and is sent SIGTERM. It
+stays ``COMPLETING`` for up to the kill wait (``kill_wait_secs``, default 30
+seconds), then Spur sends SIGKILL. The wait ends early once every process has
+exited, and the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits:
+a clean exit on SIGTERM does not make it ``COMPLETED``. Its nodes stay allocated
+until its processes are gone, and ``--requeue`` still requeues it on timeout. The
+SIGTERM is final, so use the wait to checkpoint and exit. ``scancel``, the final
+kill of a preempted job, and the reaping of an idle interactive allocation
+(:ref:`inactive-limit`) wait up to the same kill wait; a job reaped for
+inactivity also shows ``CG`` and ends ``TIMEOUT``. An ``srun`` step that has no
+supervisor process gets the full kill wait too, where earlier releases gave it 2
+seconds.
+
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
 .. code-block:: bash

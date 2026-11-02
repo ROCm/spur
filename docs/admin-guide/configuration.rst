@@ -578,7 +578,12 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        should exceed it, or a job can be force-finished before its kill wait
        elapses; the controller logs a warning when it does not. A job that
        reaches its time limit moves to COMPLETING straight away and spends the
-       kill wait there before ending ``TIMEOUT``. Mirrors Slurm's ``KillWait``.
+       kill wait there before ending ``TIMEOUT``. Known issue: a requeued job
+       (requeue-mode preemption, ``scontrol requeue``) frees its nodes at once,
+       while the old run is still in its kill wait, so another job can be
+       dispatched onto them during that window. The window can last up to
+       ``kill_wait_secs``; lower it if that matters with requeue-mode
+       preemption. Mirrors Slurm's ``KillWait``.
    * - ``max_user_priority``
      - integer
      - ``1000``

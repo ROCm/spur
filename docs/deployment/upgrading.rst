@@ -793,6 +793,65 @@ cannot recreate a cgroup during replacement.
 Completed steps keep their recorded exit status when a replacement reclaims
 their retained sessions. An unreadable exit record also refuses replacement.
 
+.. _kill-wait-upgrade-notes:
+
+Kill wait and the time-limit completing state (``kill_wait_secs``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release adds ``scheduler.kill_wait_secs`` (default ``30``) and makes it the
+wait between SIGTERM and SIGKILL everywhere Spur stops a job. Both changes apply
+to a ``spur.conf`` that is not edited.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 26 26 26
+
+   * - Behavior
+     - Before
+     - After
+     - Effect
+   * - ``scancel`` and the final preemption kill
+     - SIGKILL 5 seconds after SIGTERM
+     - SIGKILL up to ``kill_wait_secs`` (30 seconds) after SIGTERM; a job that
+       exits on SIGTERM is gone as soon as it exits
+     - A job that ignores or is slow to handle SIGTERM holds its nodes up to 30
+       seconds longer. Set ``kill_wait_secs = 5`` for the old wait.
+   * - A job at its time limit, or an idle interactive allocation reaped by
+       ``inactive_limit_secs``
+     - Stayed ``RUNNING`` for 30 seconds after SIGTERM, then ended ``TIMEOUT``
+       and was SIGKILLed
+     - Moves to ``COMPLETING`` (``CG``) at once, waits up to ``kill_wait_secs``,
+       then ends ``TIMEOUT`` with reason ``TimeLimit``
+     - ``squeue`` shows ``CG`` instead of ``R`` during the wait. The final state,
+       reason, timing, and ``--requeue`` behavior are unchanged, and the nodes
+       stay held until the processes are gone.
+   * - An unsupervised ``srun`` step on cancel or at a time limit
+     - SIGKILL after 2 seconds
+     - SIGKILL after the full kill wait
+     - A step that handles SIGTERM now has time to shut down cleanly.
+
+Keep ``complete_wait_secs`` above ``kill_wait_secs``; otherwise a job can be
+force-finished before its kill wait elapses, and the controller logs a warning
+on startup and on reconfigure. See :doc:`/admin-guide/configuration` for the field, including a
+known issue with requeue: a requeued job frees its nodes while the old run is
+still in its kill wait, so lower ``kill_wait_secs`` if that matters with
+requeue-mode preemption.
+
+**Upgrade the leader last.** Every time limit and every inactivity-limit
+expiry now writes a new Raft log entry, ``JobTimeLimitExpired``. A controller
+that predates it cannot parse the entry and stops replicating until it is
+upgraded, so the order in :ref:`upgrading-leader-last` applies, and a rollback
+after the entry has been written is not supported: roll forward.
+
+**Time-limited jobs during the rolling upgrade.** The controller sends the kill
+wait with each cancel, and an agent that predates it ignores the value and
+waits a fixed 5 seconds. Controllers are upgraded before agents, so a job that
+reaches its time limit on a node that is not yet upgraded gets 5 seconds
+between SIGTERM and SIGKILL instead of the 30 it had before, which can be too
+short for a checkpoint. Upgrade the agents promptly, or drain the nodes still
+on the old build before their jobs' limits arrive. Once a node is upgraded the
+job gets the full ``kill_wait_secs``.
+
 See Also
 --------
 
