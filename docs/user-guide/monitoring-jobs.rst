@@ -591,7 +591,8 @@ Running-Job Stats — ``sstat``
 -----------------------------
 
 ``spur stat`` (Slurm ``sstat``) reports live resource usage for running jobs.
-``--jobs``/``-j`` is required (comma list).
+``--jobs``/``-j`` is required (comma list). A step suffix (``30.0``) matches
+the base job. A non-numeric ID is an error.
 
 .. code-block:: bash
 

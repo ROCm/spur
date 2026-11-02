@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Shared parsing for the Slurm-style `-j/--jobs` job-ID argument used by
-//! `squeue`, `sprio`, and `sacct`.
+//! `squeue`, `sprio`, `sacct`, and `sstat`.
 
 use anyhow::{bail, Result};
 use spur_core::job::JobId;
@@ -20,7 +20,7 @@ pub fn parse_job_ids(spec: &str) -> Result<Vec<JobId>> {
         if tok.is_empty() {
             continue;
         }
-        let base = tok.split('.').next().unwrap_or(tok);
+        let base = tok.split_once('.').map_or(tok, |(base, _)| base);
         match base.parse::<JobId>() {
             Ok(id) => ids.push(id),
             Err(_) => bail!("Invalid job id specified: {tok}"),

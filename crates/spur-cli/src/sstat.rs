@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::timefmt::format_duration_dhms as format_duration;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::Parser;
 use spur_proto::proto::GetJobRequest;
 
@@ -46,16 +46,7 @@ pub async fn main() -> Result<()> {
 pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<SstatArgs>(&args);
 
-    // Parse job IDs (comma-separated)
-    let job_ids: Vec<u32> = args
-        .job_id
-        .split(',')
-        .filter_map(|j| j.trim().parse::<u32>().ok())
-        .collect();
-
-    if job_ids.is_empty() {
-        bail!("sstat: no valid job IDs specified");
-    }
+    let job_ids = crate::job_id_arg::parse_job_ids(&args.job_id)?;
 
     let channel = crate::authclient::connect(&args.controller)
         .await
@@ -253,6 +244,21 @@ fn state_name(state: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bad_job_id_is_rejected_before_connect() {
+        let err = main_with_args(vec![
+            "sstat".into(),
+            "-j".into(),
+            "30,abc".into(),
+            "--controller".into(),
+            "http://127.0.0.1:1".into(),
+        ])
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Invalid job id specified: abc"), "{err}");
+    }
 
     #[test]
     fn noconvert_is_accepted() {
