@@ -4668,7 +4668,7 @@ fn container_spec_from_job_spec(spec: &spur_core::job::JobSpec) -> Option<Contai
         env: spec.container_env.clone(),
         entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         remap_root: spec.container_remap_root,
-        no_auth_socket: false,
+        no_auth_socket: spec.container_no_auth_socket,
     })
 }
 
@@ -4688,6 +4688,7 @@ fn resolve_step_container(
                 let mut env = parent.env;
                 env.extend(step.env);
                 step.env = env;
+                step.no_auth_socket |= parent.no_auth_socket;
             }
             Some(step)
         }
@@ -5003,6 +5004,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
             Some(spec.container_entrypoint)
         },
         container_remap_root: spec.container_remap_root,
+        container_no_auth_socket: spec.container_no_auth_socket,
         burst_buffer: if spec.burst_buffer.is_empty() {
             None
         } else {
@@ -6235,6 +6237,34 @@ mod tests {
         let eff = resolve_step_container(Some(step), &job).expect("effective container");
         assert_eq!(eff.env.get("A").map(String::as_str), Some("parent"));
         assert_eq!(eff.env.get("B").map(String::as_str), Some("step"));
+    }
+
+    #[test]
+    fn resolve_step_container_carries_the_jobs_withheld_auth_socket() {
+        let mut job = owned_job("u", "/w");
+        job.container_image = Some("parent.sqsh".into());
+        job.container_no_auth_socket = true;
+        assert!(
+            resolve_step_container(None, &job)
+                .expect("inherit")
+                .no_auth_socket
+        );
+        let step = ContainerSpec {
+            image: "step.sqsh".into(),
+            ..Default::default()
+        };
+        assert!(
+            resolve_step_container(Some(step), &job)
+                .expect("override")
+                .no_auth_socket,
+            "a step image must not re-expose a socket the job withheld"
+        );
+        job.container_no_auth_socket = false;
+        assert!(
+            !resolve_step_container(None, &job)
+                .expect("inherit")
+                .no_auth_socket
+        );
     }
 
     #[test]

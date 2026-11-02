@@ -2945,7 +2945,8 @@ fn build_container_launch(
         req.uid,
         allow_root_jobs,
         req.no_auth_socket,
-    );
+    )
+    .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
     let image_path =
         crate::container::resolve_image(&req.image, req.resolve_user.as_deref(), Some(req.uid))
@@ -5529,8 +5530,9 @@ impl SlurmAgent for AgentService {
                 &self.cluster_id,
                 uid,
                 self.allow_root_jobs,
-                false,
-            );
+                spec.container_no_auth_socket,
+            )
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
             let image_path = crate::container::resolve_image(
                 &spec.container_image,
@@ -7714,7 +7716,8 @@ impl SlurmAgent for AgentService {
                 step_uid,
                 self.allow_root_jobs,
                 c.no_auth_socket,
-            );
+            )
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
             let image_path = crate::container::resolve_image(&c.image, None, Some(step_uid))
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;

@@ -72,16 +72,18 @@ runs inside the container.
    * - ``--container-remap-root``
      - Map the job user to root inside the container.
    * - ``--container-no-auth-socket``
-     - ``srun`` steps that give their own ``--container-image`` and so build a
-       container of their own (a step in a ``salloc`` allocation, or a
-       standalone ``srun``). Keep the node's
-       credential mint socket out of the container. By default it is
-       bind-mounted so that a nested ``srun`` can authenticate; without it,
-       nothing in the container can mint a credential and act on the cluster as
-       you. It has no effect on a container started with ``--container-image``
-       on ``sbatch``/``salloc`` itself, nor on a step that enters its job's
-       running container. Only meaningful under ``[auth] plugin =
-       "spur"``, and it does not hide a token file in a mounted home directory.
+     - ``srun`` with ``--container-image`` (a step in a ``salloc`` allocation,
+       or a standalone ``srun``). Keep the node's credential mint socket out of
+       the container. By default it is bind-mounted so that a nested ``srun``
+       can authenticate; without it, nothing in the container can mint a
+       credential and act on the cluster as you. A step inside a standalone
+       ``srun`` allocation inherits the choice. A ``--container-mounts`` entry
+       that would bind the socket back in, either the socket itself or a
+       directory that contains it such as ``/run/spur``, is rejected. It has no
+       effect on a container started with ``--container-image`` on
+       ``sbatch``/``salloc`` itself, nor on a step that enters its job's
+       running container. Only meaningful under ``[auth] plugin = "spur"``, and
+       it does not hide a token file in a mounted home directory.
 
 A GPU training job with a read-only data mount:
 
