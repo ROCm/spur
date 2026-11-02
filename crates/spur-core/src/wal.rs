@@ -437,6 +437,13 @@ pub enum WalOperation {
     K0sMemberNodesRemove {
         nodes: Vec<String>,
     },
+    /// A run exhausted its time limit: records the TIMEOUT verdict and moves it to
+    /// Completing in one step, holding its nodes until they report.
+    JobTimeLimitExpired {
+        job_id: JobId,
+        run_attempt: u32,
+        at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 impl WalOperation {
@@ -588,6 +595,7 @@ impl WalOperation {
             Self::JobSuspend { at, .. }
             | Self::JobResume { at, .. }
             | Self::JobTimeLimitSignaled { at, .. }
+            | Self::JobTimeLimitExpired { at, .. }
             | Self::JobCancelSignaled { at, .. } => Some(*at),
             // Exhaustive on purpose: a new variant that dates something a user
             // reads back must be a compile error here, not a silent `None`.
@@ -638,6 +646,7 @@ impl WalOperation {
             Self::JobSuspend { .. }
             | Self::JobResume { .. }
             | Self::JobTimeLimitSignaled { .. }
+            | Self::JobTimeLimitExpired { .. }
             | Self::JobCancelSignaled { .. }
             | Self::JobSubmit { .. }
             | Self::JobStepComplete { .. }
@@ -1793,6 +1802,30 @@ mod suspend_wal_tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn job_time_limit_expired_has_a_frozen_wire_form() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&chrono::Utc);
+        let frozen =
+            r#"{"JobTimeLimitExpired":{"job_id":13,"run_attempt":2,"at":"2026-03-04T05:06:07Z"}}"#;
+        let op = WalOperation::JobTimeLimitExpired {
+            job_id: 13,
+            run_attempt: 2,
+            at,
+        };
+        assert_eq!(serde_json::to_string(&op).unwrap(), frozen);
+
+        let mut back: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            back,
+            WalOperation::JobTimeLimitExpired { job_id: 13, run_attempt: 2, at: a } if a == at
+        ));
+        assert_eq!(back.occurred_at(), Some(at));
+        back.stamp_occurred_at(at + chrono::Duration::hours(1));
+        assert_eq!(back.occurred_at(), Some(at), "it carries its own stamp");
     }
 
     #[test]

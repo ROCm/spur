@@ -3048,6 +3048,28 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Record that a run exhausted its time limit and move it to Completing in
+    /// one entry, so the caller's graceful cancel finds the verdict already
+    /// durable. `true` if the run is now Completing; `false` means it holds no
+    /// nodes (or already ended) and the caller must finalize it itself.
+    pub fn expire_time_limit(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        self.propose(WalOperation::JobTimeLimitExpired {
+            job_id,
+            run_attempt,
+            at,
+        })?;
+        Ok(self
+            .jobs
+            .read()
+            .get(&job_id)
+            .is_some_and(|job| job.state == JobState::Completing))
+    }
+
     /// Preempt a running job per its partition's PreemptMode, without
     /// recording a triggering job (e.g. controller-initiated fencing rather
     /// than scheduler priority preemption). See `preempt_job_with_provenance`.
@@ -7433,6 +7455,26 @@ impl ClusterManager {
         }
     }
 
+    /// Move a live run to Completing, where it holds its nodes until each
+    /// reports. Returns whether it now waits for them: a run holding no nodes
+    /// never will, so it must not wait, and the caller finalizes it instead.
+    fn begin_completing(job: &mut Job, at: DateTime<Utc>) -> bool {
+        let waits_for_nodes = matches!(job.state, JobState::Running | JobState::Suspended)
+            && !job.allocated_nodes.is_empty();
+        if !waits_for_nodes {
+            return false;
+        }
+        if let Err(e) = job.transition(JobState::Completing) {
+            warn!(job_id = job.job_id, error = %e, "invalid transition to Completing");
+            return false;
+        }
+        // Completing is not terminal, so nothing stamps this for us.
+        // It is what gives the job its full complete_wait_secs grace.
+        job.end_time = Some(at);
+        job.end_suspension(at);
+        true
+    }
+
     /// Clear a job's run-state fields so it's schedulable again after requeue.
     /// Does not bump either counter; callers do that based on why they're requeuing.
     fn clear_run_state_for_requeue(job: &mut Job) {
@@ -7518,10 +7560,13 @@ impl ClusterManager {
         job.end_suspension(timestamp);
         // A run already signalled for cancellation keeps that verdict: reporting
         // it as NodeFail would requeue a job the user or the scheduler killed.
-        let evicted_state = if job.cancel_signaled_at.is_some() {
-            JobState::Cancelled
-        } else {
+        // An expired time limit outranks the cancel it implies, as everywhere.
+        let evicted_state = if job.cancel_signaled_at.is_none() {
             JobState::NodeFail
+        } else if job.time_limit_signaled_at.is_some() {
+            JobState::Timeout
+        } else {
+            JobState::Cancelled
         };
         if let Err(e) = job.transition(evicted_state) {
             warn!(job_id, error = %e, state = ?evicted_state, "evict: invalid transition");
@@ -7529,9 +7574,13 @@ impl ClusterManager {
         }
         job.exit_code = Some(-1);
         job.end_time = Some(timestamp);
-        if evicted_state == JobState::NodeFail {
-            job.set_pending_reason(reason);
-            job.node_failure = failure;
+        match evicted_state {
+            JobState::NodeFail => {
+                job.set_pending_reason(reason);
+                job.node_failure = failure;
+            }
+            JobState::Timeout => job.set_pending_reason(PendingReason::TimeLimit),
+            _ => {}
         }
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
@@ -8342,20 +8391,34 @@ impl ClusterManager {
                 if job.cancelled_by.is_none() {
                     job.cancelled_by = cancel.clone();
                 }
-                // Nothing will ever report for a run holding no nodes, so it must
-                // not wait in Completing; the caller finalizes it instead.
-                let waits_for_nodes = matches!(job.state, JobState::Running | JobState::Suspended)
-                    && !job.allocated_nodes.is_empty();
-                if waits_for_nodes {
-                    if let Err(e) = job.transition(JobState::Completing) {
-                        warn!(job_id = *job_id, error = %e, "invalid cancel transition to Completing");
-                        return ClientResponse::default();
-                    }
-                    // Completing is not terminal, so nothing stamps this for us.
-                    // It is what gives the job its full complete_wait_secs grace.
-                    job.end_time = Some(*at);
-                    job.end_suspension(*at);
+                Self::begin_completing(job, *at);
+            }
+            WalOperation::JobTimeLimitExpired {
+                job_id,
+                run_attempt,
+                at,
+            } => {
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                // A run that already ended keeps its verdict, and an expiry
+                // decided for an earlier run must not condemn the current one.
+                if !job.state.is_active()
+                    || (*run_attempt != 0
+                        && job.run_attempt != 0
+                        && *run_attempt != job.run_attempt)
+                {
+                    return ClientResponse::default();
                 }
+                if job.time_limit_signaled_at.is_none() {
+                    job.time_limit_signaled_at = Some(*at);
+                }
+                // Also marks the run as signalled, so a lost cancel is re-sent on
+                // the node's next heartbeat and the completing machinery applies.
+                if job.cancel_signaled_at.is_none() {
+                    job.cancel_signaled_at = Some(*at);
+                }
+                Self::begin_completing(job, *at);
             }
             WalOperation::JobComplete {
                 job_id,
@@ -16300,6 +16363,230 @@ state = "UP"
         record_marker(cancelled);
         cm.complete_job(cancelled, -1, JobState::Cancelled).unwrap();
         settle(&cm, cancelled, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_moves_to_completing_and_holds_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiring", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        let at = Utc::now();
+
+        assert!(cm.expire_time_limit(job_id, run_attempt, at).unwrap());
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert_eq!(job.time_limit_signaled_at, Some(at));
+        assert_eq!(job.cancel_signaled_at, Some(at));
+        assert_eq!(job.end_time, Some(at));
+        assert!(job.cancelled_by.is_none(), "nobody cancelled it");
+        assert_eq!(
+            cm.get_node("worker1").unwrap().alloc_resources.cpus,
+            2,
+            "the nodes stay held until they report"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_ends_timeout_when_the_job_exits() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiring-exit", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.expire_time_limit(job_id, run_attempt, Utc::now())
+            .unwrap();
+
+        cm.node_complete(job_id, "worker1", 0, 15, run_attempt)
+            .unwrap();
+
+        settle(&cm, job_id, JobState::Timeout);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::TimeLimit);
+        assert_eq!(job.end_reason(JobState::Timeout).0, EndReason::TimeLimit);
+        assert!(job.ended_by(EndReason::TimeLimit).is_none());
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_ends_timeout_when_force_finished() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiring-stuck", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.expire_time_limit(job_id, run_attempt, Utc::now())
+            .unwrap();
+
+        // What enforce_completing_timeout does when no node ever reports.
+        cm.complete_job(job_id, -1, JobState::Failed).unwrap();
+
+        settle(&cm, job_id, JobState::Timeout);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::TimeLimit
+        );
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_requeues_a_requeue_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let mut spec = basic_spec("expiring-requeue");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            alloc.clone(),
+            per_node_for(&["worker1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.expire_time_limit(job_id, run_attempt, Utc::now())
+            .unwrap();
+
+        cm.node_complete(job_id, "worker1", 0, 15, run_attempt)
+            .unwrap();
+
+        settle(&cm, job_id, JobState::Pending);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.requeue_count, 1);
+        assert!(job.time_limit_signaled_at.is_none());
+        assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_ignores_a_stale_run_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiring-stale", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        assert_ne!(run_attempt, 0, "the run must carry an epoch for this test");
+
+        let completing = cm
+            .expire_time_limit(job_id, run_attempt + 1, Utc::now())
+            .unwrap();
+
+        assert!(!completing);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.time_limit_signaled_at.is_none());
+        assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_for_a_run_holding_no_nodes_leaves_it_to_the_caller() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("expiring-no-nodes"));
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+
+        assert!(!cm.expire_time_limit(job_id, 0, Utc::now()).unwrap());
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+
+        cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
+        settle(&cm, job_id, JobState::Timeout);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_is_ignored_once_the_run_has_ended() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiry-raced", "worker1");
+        cm.node_complete(job_id, "worker1", 0, 0, 0).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+
+        assert!(!cm.expire_time_limit(job_id, 0, Utc::now()).unwrap());
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert!(job.time_limit_signaled_at.is_none());
+        assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_is_not_reported_as_a_cancel_or_preemption() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiry-provenance", "worker1");
+        cm.expire_time_limit(job_id, 0, Utc::now()).unwrap();
+
+        let resp = cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+
+        assert!(matches!(
+            resp,
+            NodeCompleteResult::AllDone {
+                state: JobState::Timeout,
+                ..
+            }
+        ));
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.end_of_run_state(JobState::Timeout), JobState::Timeout);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicting_a_time_limited_run_keeps_the_timeout_verdict() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiry-evicted", "worker1");
+        cm.expire_time_limit(job_id, 0, Utc::now()).unwrap();
+
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "worker1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("evicted".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Timeout);
+        assert_eq!(resp.jobs_finalized[0].reason, EndReason::TimeLimit);
+        assert!(resp.jobs_finalized[0].ended_by.is_none());
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::TimeLimit
+        );
+    }
+
+    // A controller upgraded over a log written by the previous release replays
+    // the watchdog's old SIGTERM marker; it must still behave as it did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_time_limit_signaled_entry_still_replays() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "legacy-marker", "worker1");
+
+        cm.apply_operation(&WalOperation::JobTimeLimitSignaled {
+            job_id,
+            at: Utc::now(),
+        });
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.time_limit_signaled_at.is_some());
+        assert!(job.cancel_signaled_at.is_none());
+
+        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+        settle(&cm, job_id, JobState::Timeout);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

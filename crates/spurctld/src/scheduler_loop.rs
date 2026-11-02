@@ -2989,18 +2989,13 @@ async fn confirm_dispatch_on_nodes(
     DispatchConfirmOutcome::Aborted
 }
 
-/// Watchdog: gracefully terminate running jobs that exceed their time limit.
+/// Watchdog: terminate running jobs that exceed their time limit.
 ///
-/// Two-phase shutdown:
-///   1. **Warning phase**: When `start_time + time_limit < now`, durably mark
-///      the run as timed out and send SIGTERM (signal 15) to all agents.
-///   2. **Kill phase**: 30 seconds after the warning, if the job is still
-///      running, mark it as Timeout and send SIGKILL (signal 9).
-///
-/// Both phases key off the job's replicated `time_limit_signaled_at`, so the
-/// grace period is measured from one agreed instant even across a leadership
-/// change, and a job that exits during the grace period still finalizes as
-/// `Timeout` rather than as a plain signal death.
+/// A job past its deadline is recorded as timed out and moved to COMPLETING in
+/// one replicated step, then sent the ordinary graceful cancel. The agent keeps
+/// the SIGTERM-to-SIGKILL clock and each node reports back, so the controller
+/// holds no timer of its own; a job stuck in COMPLETING is the completing
+/// timeout's to force-finish.
 ///
 /// Runs every 10 seconds.
 async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
@@ -3033,63 +3028,58 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
         }
 
         let running = cluster.get_jobs(&JobFilter {
-            states: &[
-                spur_core::job::JobState::Running,
-                spur_core::job::JobState::Completing,
-            ],
+            states: &[spur_core::job::JobState::Running],
             ..Default::default()
         });
 
         for job in &running {
-            if job.state == spur_core::job::JobState::Completing {
-                continue;
-            }
-
-            let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
-                continue;
-            };
-            let deadline = job.effective_deadline(start_time, time_limit);
-            if now < deadline {
-                continue;
-            }
-
-            let Some(signaled_at) = job.time_limit_signaled_at else {
-                info!(
-                    job_id = job.job_id,
-                    elapsed_secs = (now - start_time).num_seconds(),
-                    limit_secs = time_limit.num_seconds(),
-                    grace_secs = GRACE_PERIOD_SECS,
-                    "time limit exceeded — sending SIGTERM, grace period starts"
-                );
-
-                // Record before signalling: if the job exits on the SIGTERM, its
-                // completion must find the run already marked as timed out.
-                if let Err(e) = cluster.signal_time_limit(job.job_id, now) {
-                    warn!(job_id = job.job_id, error = %e, "failed to record time limit expiry");
-                    continue;
-                }
-
-                send_cancel_to_agents(&cluster, job, 15).await; // SIGTERM
-                continue;
-            };
-
-            if (now - signaled_at).num_seconds() < GRACE_PERIOD_SECS {
-                continue;
-            }
-
-            info!(
-                job_id = job.job_id,
-                "grace period expired — force-killing job"
-            );
-
-            if let Err(e) = cluster.complete_job(job.job_id, -1, spur_core::job::JobState::Timeout)
-            {
-                warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
-                continue;
-            }
-
-            send_cancel_to_agents(&cluster, job, 9).await; // SIGKILL
+            expire_job_if_overdue(&cluster, job, now).await;
         }
+    }
+}
+
+/// Terminate `job` if it has outlived its time limit as of `now`. A job holding
+/// no nodes will never report, so it is finalized here instead of waiting.
+async fn expire_job_if_overdue(
+    cluster: &Arc<ClusterManager>,
+    job: &spur_core::job::Job,
+    now: DateTime<Utc>,
+) {
+    let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
+        return;
+    };
+    if now < job.effective_deadline(start_time, time_limit) {
+        return;
+    }
+
+    info!(
+        job_id = job.job_id,
+        elapsed_secs = (now - start_time).num_seconds(),
+        limit_secs = time_limit.num_seconds(),
+        "time limit exceeded — completing"
+    );
+
+    match cluster.expire_time_limit(job.job_id, job.run_attempt, now) {
+        Ok(true) => send_cancel_to_agents(cluster, job, 0).await,
+        Ok(false) => finalize_timed_out_without_nodes(cluster, job),
+        Err(e) => warn!(job_id = job.job_id, error = %e, "failed to record time limit expiry"),
+    }
+}
+
+/// Finish a run the expiry left Running because it holds no nodes. Re-reads the
+/// job: `false` from the expiry also means it ended or was requeued meanwhile,
+/// and the replacement run must not inherit this run's timeout.
+fn finalize_timed_out_without_nodes(cluster: &ClusterManager, expired: &spur_core::job::Job) {
+    let still_this_run = cluster.get_job(expired.job_id).is_some_and(|job| {
+        job.state == spur_core::job::JobState::Running
+            && job.run_attempt == expired.run_attempt
+            && job.allocated_nodes.is_empty()
+    });
+    if !still_this_run {
+        return;
+    }
+    if let Err(e) = cluster.complete_job(expired.job_id, -1, spur_core::job::JobState::Timeout) {
+        warn!(job_id = expired.job_id, error = %e, "failed to mark job as timed out");
     }
 }
 
@@ -5874,6 +5864,75 @@ mod tests {
                 [(0, 30), (9, 0)],
                 "only the graceful cancel carries the kill wait"
             );
+        }
+
+        fn run_with_time_limit(cm: &ClusterManager, node: &str) -> spur_core::job::Job {
+            let spec = JobSpec {
+                name: "limited".into(),
+                user: "testuser".into(),
+                work_dir: "/tmp".into(),
+                time_limit: Some(chrono::Duration::minutes(1)),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(cm, spec);
+            start_on(cm, job_id, node);
+            cm.get_job(job_id).unwrap()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn an_expired_time_limit_sends_one_graceful_cancel_and_no_sigkill() {
+            use spur_core::job::JobState;
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let (addr, requests) = spawn_mock_agent_recording_cancel_requests().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_with_time_limit(&cm, "n1");
+            let start = job.start_time.expect("a running job has a start time");
+
+            expire_job_if_overdue(&cm, &job, start + chrono::Duration::seconds(30)).await;
+            assert_eq!(cm.get_job(job.job_id).unwrap().state, JobState::Running);
+
+            let overdue = start + chrono::Duration::minutes(2);
+            expire_job_if_overdue(&cm, &job, overdue).await;
+            wait_for("graceful cancel delivered", || {
+                !requests.lock().unwrap().is_empty()
+            });
+
+            assert_eq!(cm.get_job(job.job_id).unwrap().state, JobState::Completing);
+            let seen: Vec<(i32, u32)> = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.signal, r.kill_wait_secs))
+                .collect();
+            assert_eq!(seen, [(0, 30)]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_time_limited_run_holding_no_nodes_is_finalized_by_the_watchdog() {
+            use crate::raft::StateMachineApply;
+            use spur_core::job::JobState;
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let spec = JobSpec {
+                name: "limited-no-nodes".into(),
+                user: "testuser".into(),
+                work_dir: "/tmp".into(),
+                time_limit: Some(chrono::Duration::minutes(1)),
+                ..Default::default()
+            };
+            let job_id = submit_and_wait(&cm, spec);
+            cm.apply_operation(&spur_core::wal::WalOperation::job_state_change(
+                job_id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            let job = cm.get_job(job_id).unwrap();
+            let start = job.start_time.expect("a running job has a start time");
+
+            expire_job_if_overdue(&cm, &job, start + chrono::Duration::minutes(2)).await;
+
+            settle(&cm, job_id, JobState::Timeout);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

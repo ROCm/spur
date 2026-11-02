@@ -576,8 +576,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        (``scancel``, preemption, time and inactivity limits). Ends early once the
        job's processes exit. Values below 5 act as 5. ``complete_wait_secs``
        should exceed it, or a job can be force-finished before its kill wait
-       elapses; the controller logs a warning when it does not. Mirrors Slurm's
-       ``KillWait``.
+       elapses; the controller logs a warning when it does not. A job that
+       reaches its time limit moves to COMPLETING straight away and spends the
+       kill wait there before ending ``TIMEOUT``. Mirrors Slurm's ``KillWait``.
    * - ``max_user_priority``
      - integer
      - ``1000``
