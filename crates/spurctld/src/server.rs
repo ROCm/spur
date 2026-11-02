@@ -5353,7 +5353,14 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         state_reason: job.state_reason(),
         submit_time: Some(datetime_to_proto(job.submit_time)),
         start_time: job.start_time.map(datetime_to_proto),
-        end_time: job.end_time.map(datetime_to_proto),
+        end_time: job
+            .end_time
+            .or(job.preempt_pending.as_ref().map(|p| p.deadline))
+            .map(datetime_to_proto),
+        preempt_time: job
+            .preempt_pending
+            .as_ref()
+            .map(|p| datetime_to_proto(p.signaled_at)),
         time_limit: job.spec.time_limit.map(|d| prost_types::Duration {
             seconds: d.num_seconds(),
             nanos: 0,
@@ -13112,6 +13119,37 @@ mod tests {
         // The allocated list stays empty while pending: this is exactly the
         // distinction that made a pinned pending job undiagnosable.
         assert!(info.nodelist.is_empty());
+    }
+
+    #[test]
+    fn job_to_proto_reports_grace_preempt_time_and_end_time() {
+        use chrono::{Duration, Utc};
+        use spur_core::job::{Job, JobSpec, PreemptPending};
+        use spur_core::partition::PreemptMode;
+
+        let mut job = Job::new(7, JobSpec::default());
+        let plain = job_to_proto(&job);
+        assert!(plain.preempt_time.is_none());
+        assert!(plain.end_time.is_none());
+
+        let signaled_at = Utc::now();
+        let deadline = signaled_at + Duration::seconds(60);
+        job.preempt_pending = Some(PreemptPending {
+            signaled_at,
+            deadline,
+            preempted_by: 9,
+            preempt_qos: None,
+            mode: PreemptMode::Cancel,
+            run_attempt: 0,
+            requeue_hold_secs: 0,
+        });
+        let info = job_to_proto(&job);
+        assert_eq!(info.preempt_time, Some(datetime_to_proto(signaled_at)));
+        assert_eq!(info.end_time, Some(datetime_to_proto(deadline)));
+
+        let ended = signaled_at + Duration::seconds(10);
+        job.end_time = Some(ended);
+        assert_eq!(job_to_proto(&job).end_time, Some(datetime_to_proto(ended)));
     }
 
     #[test]

@@ -800,6 +800,11 @@ fields:
   release; jobs preempted by an earlier release show ``N/A`` even though they
   were preempted.
 
+While a job is inside its preemption grace period, the same line also shows
+``PreemptTime=<timestamp>``, the moment the job was signaled to wind down, and
+``EndTime`` shows when the grace ends. ``PreemptTime`` is omitted for a job that
+is not in a grace.
+
 Borrowed runs and reclaim
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 

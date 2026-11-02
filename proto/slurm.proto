@@ -490,6 +490,10 @@ message JobInfo {
   string last_requeue_by = 87;
   map<string, FabricBinding> fabric_bindings = 88;
   map<string, GpuPropertyBinding> gpu_bindings = 89;
+
+  // When the job was signaled to start its preemption grace. Set only while
+  // the grace runs; `end_time` then carries the grace deadline.
+  google.protobuf.Timestamp preempt_time = 90;
 }
 
 message NodeInfo {

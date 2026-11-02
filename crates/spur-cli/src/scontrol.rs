@@ -2404,29 +2404,42 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         format_exit(job.derived_exit_code, 0),
         job.priority
     );
-    if job.preempted_by != 0 || !job.preempt_mode.is_empty() {
-        let _ = writeln!(
-            out,
-            "   PreemptedBy={} PreemptMode={} PreemptQOS={}",
-            if job.preempted_by == 0 {
-                "N/A".to_string()
-            } else {
-                job.preempted_by.to_string()
-            },
-            if job.preempt_mode.is_empty() {
-                "N/A"
-            } else {
-                &job.preempt_mode
-            },
-            if job.preempt_qos.is_empty() {
-                "N/A"
-            } else {
-                &job.preempt_qos
-            },
-        );
+    if let Some(line) = preemption_line(job) {
+        let _ = writeln!(out, "{line}");
     }
     let _ = writeln!(out);
     out
+}
+
+/// Shown for a preempted job, and for one still inside its preemption grace.
+fn preemption_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
+    if job.preempted_by == 0 && job.preempt_mode.is_empty() && job.preempt_time.is_none() {
+        return None;
+    }
+    let or_na = |s: &str| {
+        if s.is_empty() {
+            "N/A".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    let preempted_by = if job.preempted_by == 0 {
+        "N/A".to_string()
+    } else {
+        job.preempted_by.to_string()
+    };
+    let mut line = format!(
+        "   PreemptedBy={preempted_by} PreemptMode={} PreemptQOS={}",
+        or_na(&job.preempt_mode),
+        or_na(&job.preempt_qos),
+    );
+    if job.preempt_time.is_some() {
+        line.push_str(&format!(
+            " PreemptTime={}",
+            format_ts(job.preempt_time.as_ref())
+        ));
+    }
+    Some(line)
 }
 
 fn gpu_tres_label(detail: &str) -> &'static str {
@@ -2513,6 +2526,43 @@ mod tests {
         assert!(error
             .to_string()
             .contains("invalid value for ExclusiveTopo="));
+    }
+
+    #[test]
+    fn scontrol_show_job_prints_preempt_time_during_grace() {
+        let job = spur_proto::proto::JobInfo {
+            preempt_time: Some(prost_types::Timestamp {
+                seconds: 1_700_000_000,
+                nanos: 0,
+            }),
+            end_time: Some(prost_types::Timestamp {
+                seconds: 1_700_000_060,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        let out = format_job_detail(&job);
+        let preempt_time = format!("PreemptTime={}", format_ts(job.preempt_time.as_ref()));
+        assert!(out.contains(&preempt_time), "{out}");
+        let end_time = format!("EndTime={}", format_ts(job.end_time.as_ref()));
+        assert!(out.contains(&end_time), "{out}");
+    }
+
+    #[test]
+    fn scontrol_show_job_prints_no_preempt_time_without_a_grace() {
+        let plain = format_job_detail(&spur_proto::proto::JobInfo::default());
+        assert!(!plain.contains("PreemptTime"), "{plain}");
+
+        let preempted = format_job_detail(&spur_proto::proto::JobInfo {
+            preempted_by: 9,
+            preempt_mode: "Requeue".into(),
+            ..Default::default()
+        });
+        assert!(
+            preempted.contains("PreemptedBy=9 PreemptMode=Requeue"),
+            "{preempted}"
+        );
+        assert!(!preempted.contains("PreemptTime"), "{preempted}");
     }
 
     #[test]
