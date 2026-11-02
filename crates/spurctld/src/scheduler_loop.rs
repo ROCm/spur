@@ -8491,6 +8491,12 @@ mod tests {
             crate::raft::LeaderSince { at, term }
         }
 
+        /// `None` on a host booted less than `secs` ago, whose monotonic clock
+        /// cannot represent an instant that far back; the caller skips.
+        fn instant_ago(secs: u64) -> Option<Instant> {
+            Instant::now().checked_sub(Duration::from_secs(secs))
+        }
+
         #[test]
         fn past_dispatch_grace_holds_off_until_the_grace_elapses() {
             let grace = Duration::from_secs(300);
@@ -8498,7 +8504,9 @@ mod tests {
                 !past_dispatch_grace(Some(leader_since(Instant::now(), 1)), 1, grace),
                 "just entered leadership: nothing has had time to land or time out yet"
             );
-            let long_ago = Instant::now() - Duration::from_secs(301);
+            let Some(long_ago) = instant_ago(301) else {
+                return;
+            };
             assert!(
                 past_dispatch_grace(Some(leader_since(long_ago, 1)), 1, grace),
                 "grace window has elapsed"
@@ -8516,10 +8524,10 @@ mod tests {
 
         #[test]
         fn should_sweep_orphaned_placements_never_fires_with_a_disabled_dispatch_timeout() {
-            let long_ago = Some(leader_since(
-                Instant::now() - Duration::from_secs(10_000),
-                1,
-            ));
+            let Some(long_ago) = instant_ago(10_000).map(|at| leader_since(at, 1)) else {
+                return;
+            };
+            let long_ago = Some(long_ago);
             assert!(
                 !should_sweep_orphaned_placements(None, long_ago, 1),
                 "dispatch_timeout_secs = 0 means no RPC timeout, so there is no bound to wait out"
@@ -8540,14 +8548,15 @@ mod tests {
             // getting a full dispatch_timeout_secs budget — one elapsed
             // budget is not proof the whole sequence is done.
             let deadline = Duration::from_secs(100);
-            let one_budget_elapsed =
-                Some(leader_since(Instant::now() - Duration::from_secs(150), 1));
+            let (Some(one_ago), Some(two_ago)) = (instant_ago(150), instant_ago(250)) else {
+                return;
+            };
+            let one_budget_elapsed = Some(leader_since(one_ago, 1));
             assert!(
                 !should_sweep_orphaned_placements(Some(deadline), one_budget_elapsed, 1),
                 "only one of the two legitimate phases has had time to run"
             );
-            let both_budgets_elapsed =
-                Some(leader_since(Instant::now() - Duration::from_secs(250), 1));
+            let both_budgets_elapsed = Some(leader_since(two_ago, 1));
             assert!(
                 should_sweep_orphaned_placements(Some(deadline), both_budgets_elapsed, 1),
                 "both phases have now had their full budget"
@@ -9713,7 +9722,10 @@ mod tests {
                 );
 
                 let budget = crate::server::cancel_reclaim_grace(30).to_std().unwrap();
-                cancelled.insert(key, first_sent - budget - Duration::from_secs(1));
+                let Some(stale) = first_sent.checked_sub(budget + Duration::from_secs(1)) else {
+                    return;
+                };
+                cancelled.insert(key, stale);
                 finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
                 assert!(
                     cancelled[&key] > first_sent,
