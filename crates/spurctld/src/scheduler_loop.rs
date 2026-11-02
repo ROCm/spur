@@ -477,21 +477,21 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     .await;
                     if !freed.is_empty() {
                         // The cancel has been *delivered*, which is not the same as the
-                        // workload being gone: the agent then sends SIGTERM, waits its
-                        // grace, and only then SIGKILLs. Hold the freed nodes out for
+                        // workload being gone: the agent then sends SIGTERM, waits the
+                        // kill wait, and only then SIGKILLs. Hold the freed nodes out for
                         // that long so the reclaimer is not dispatched onto a node
                         // whose previous occupant still holds GPU memory and its
                         // cgroup (D3).
-                        const AGENT_KILL_GRACE: std::time::Duration =
-                            std::time::Duration::from_secs(5);
+                        let kill_wait = cluster.config().scheduler.effective_kill_wait_secs();
+                        let cooldown = std::time::Duration::from_secs(kill_wait as u64);
                         for node in &freed {
-                            cluster.cool_down_node_for(node, AGENT_KILL_GRACE);
+                            cluster.cool_down_node_for(node, cooldown);
                         }
-                        // Give the reclaimer the whole grace period plus a cycle to be
+                        // Give the reclaimer the whole kill wait plus a cycle to be
                         // dispatched onto what it was just given.
                         if let Some(job_id) = freed_for {
                             let settle = chrono::Duration::seconds(
-                                AGENT_KILL_GRACE.as_secs() as i64 + interval_secs as i64 + 1,
+                                kill_wait as i64 + interval_secs as i64 + 1,
                             );
                             reclaim_in_flight.insert(job_id, Utc::now() + settle);
                         }
@@ -1063,7 +1063,12 @@ pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<Strin
         ],
         ..Default::default()
     });
-    busy_until_from_running_jobs(&running, cluster.config().scheduler.complete_wait_secs)
+    let scheduler = &cluster.config().scheduler;
+    busy_until_from_running_jobs(
+        &running,
+        scheduler.complete_wait_secs,
+        scheduler.effective_kill_wait_secs(),
+    )
 }
 
 /// Pure core of [`running_jobs_busy_until`], split out so it's testable
@@ -1071,6 +1076,7 @@ pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<Strin
 fn busy_until_from_running_jobs(
     running: &[spur_core::job::Job],
     complete_wait_secs: u32,
+    kill_wait_secs: u32,
 ) -> HashMap<String, DateTime<Utc>> {
     use spur_sched::UNLIMITED_JOB_DURATION as UNLIMITED_FALLBACK;
 
@@ -1108,7 +1114,7 @@ fn busy_until_from_running_jobs(
             .unwrap_or(UNLIMITED_FALLBACK.num_seconds());
         let slack_secs = time_limit_secs
             .saturating_add(suspended)
-            .saturating_add(GRACE_PERIOD_SECS)
+            .saturating_add(kill_wait_secs as i64)
             .min(UNLIMITED_FALLBACK.num_seconds());
         // A long-unbounded job outliving UNLIMITED_FALLBACK would otherwise
         // compute an `end` already in the past, producing a backwards interval.
@@ -3541,9 +3547,25 @@ pub async fn send_cancel_to_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    let kill_wait_secs = cancel_kill_wait_secs(cluster, signal);
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        tokio::spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+        tokio::spawn(cancel_one_agent(
+            agent_addr,
+            job_id,
+            run_attempt,
+            signal,
+            kill_wait_secs,
+        ));
     }
+}
+
+/// The kill wait a cancel carries: only a graceful cancel (`signal == 0`) has
+/// a SIGTERM-to-SIGKILL window; an explicit signal is delivered as given.
+fn cancel_kill_wait_secs(cluster: &ClusterManager, signal: i32) -> u32 {
+    if signal != 0 {
+        return 0;
+    }
+    cluster.config().scheduler.effective_kill_wait_secs()
 }
 
 /// Like `send_cancel_to_nodes`, but awaits delivery of every cancel before
@@ -3557,9 +3579,16 @@ pub async fn cancel_job_on_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    let kill_wait_secs = cancel_kill_wait_secs(cluster, signal);
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+        set.spawn(cancel_one_agent(
+            agent_addr,
+            job_id,
+            run_attempt,
+            signal,
+            kill_wait_secs,
+        ));
     }
     while set.join_next().await.is_some() {}
 }
@@ -3706,6 +3735,7 @@ async fn cancel_one_agent(
     job_id: spur_core::job::JobId,
     run_attempt: u32,
     signal: i32,
+    kill_wait_secs: u32,
 ) {
     let attempt = async {
         match crate::agent_client::connect(agent_addr.clone()).await {
@@ -3715,7 +3745,7 @@ async fn cancel_one_agent(
                         job_id,
                         signal,
                         run_attempt,
-                        kill_wait_secs: 0,
+                        kill_wait_secs,
                     })
                     .await
                 {
@@ -3873,6 +3903,8 @@ mod tests {
         Job::new(1, spec)
     }
 
+    const TEST_KILL_WAIT_SECS: u32 = 30;
+
     fn running_job_on(node: &str, start: DateTime<Utc>, minutes: i64) -> Job {
         let mut job = job_with_spec(JobSpec {
             time_limit: Some(chrono::Duration::minutes(minutes)),
@@ -3914,6 +3946,21 @@ mod tests {
     }
 
     #[test]
+    fn busy_until_uses_kill_wait() {
+        let now = Utc::now();
+        let job = |wait| {
+            busy_until_from_running_jobs(&[running_job_on("node001", now, 10)], 300, wait)
+                ["node001"]
+        };
+
+        assert_eq!(
+            job(120) - job(30),
+            chrono::Duration::seconds(90),
+            "the slack past the time limit is the kill wait"
+        );
+    }
+
+    #[test]
     fn busy_until_bounds_a_completing_job_by_the_completing_timeout() {
         // An unlimited job tearing down would otherwise read as a year out and
         // block every backfill reservation on its nodes.
@@ -3923,7 +3970,7 @@ mod tests {
         job.state = spur_core::job::JobState::Completing;
         job.end_time = Some(now);
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300);
+        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
         let got = busy_until["node001"];
         assert!(
             (got - (now + chrono::Duration::seconds(300)))
@@ -3942,10 +3989,11 @@ mod tests {
 
         // Larger-ending job processed first: a "last wins" bug (instead of a
         // true max) would incorrectly keep the smaller value here.
-        let busy_until = busy_until_from_running_jobs(&[later, sooner], 300);
+        let busy_until = busy_until_from_running_jobs(&[later, sooner], 300, TEST_KILL_WAIT_SECS);
 
-        let expected =
-            now + chrono::Duration::minutes(60) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let expected = now
+            + chrono::Duration::minutes(60)
+            + chrono::Duration::seconds(TEST_KILL_WAIT_SECS as i64);
         let got = busy_until["node001"];
         assert!(
             (got - expected).num_seconds().abs() < 2,
@@ -3959,7 +4007,7 @@ mod tests {
         let mut job = running_job_on("node001", now, 60);
         job.suspended_secs = i64::MAX;
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300);
+        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
         let got = busy_until["node001"];
         assert!(got > now, "expected a sane future timestamp, got {got}");
     }
@@ -3970,7 +4018,7 @@ mod tests {
         let mut job = running_job_on("node001", now - chrono::Duration::days(400), 0);
         job.spec.time_limit = None;
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300);
+        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
         let got = busy_until["node001"];
         assert!(
             got >= now,
@@ -3984,11 +4032,11 @@ mod tests {
         let mut job = running_job_on("node001", now, 10);
         job.suspended_at = Some(now - chrono::Duration::minutes(5));
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300);
+        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
         let expected = now
             + chrono::Duration::minutes(10)
             + chrono::Duration::minutes(5)
-            + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+            + chrono::Duration::seconds(TEST_KILL_WAIT_SECS as i64);
         let got = busy_until["node001"];
         assert!(
             (got - expected).num_seconds().abs() < 2,
@@ -4002,9 +4050,10 @@ mod tests {
         let mut job = running_job_on("node001", now, 10);
         job.start_time = None;
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300);
-        let expected =
-            now + chrono::Duration::minutes(10) + chrono::Duration::seconds(GRACE_PERIOD_SECS);
+        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
+        let expected = now
+            + chrono::Duration::minutes(10)
+            + chrono::Duration::seconds(TEST_KILL_WAIT_SECS as i64);
         let got = busy_until["node001"];
         assert!(
             (got - expected).num_seconds().abs() < 2,
@@ -4981,6 +5030,7 @@ mod tests {
             /// launch but could not then release the workload.
             reject_start: bool,
             cancelled_attempts: Arc<std::sync::Mutex<Vec<u32>>>,
+            cancel_requests: Arc<std::sync::Mutex<Vec<spur_proto::proto::AgentCancelJobRequest>>>,
             suspend_calls: Arc<AtomicU32>,
         }
 
@@ -5097,6 +5147,10 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(request.get_ref().run_attempt);
+                self.cancel_requests
+                    .lock()
+                    .unwrap()
+                    .push(*request.get_ref());
                 self.cancel_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(()))
             }
@@ -5361,6 +5415,7 @@ mod tests {
                 reject_start: false,
                 cancel_delay,
                 cancelled_attempts: Default::default(),
+                cancel_requests: Default::default(),
                 suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
@@ -5391,6 +5446,7 @@ mod tests {
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
+                cancel_requests: Default::default(),
                 suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
@@ -5421,6 +5477,7 @@ mod tests {
                 reject_start: true,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
+                cancel_requests: Default::default(),
                 suspend_calls: Default::default(),
             };
             tokio::spawn(async move {
@@ -5455,6 +5512,7 @@ mod tests {
                 reject_start: false,
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: cancelled_attempts.clone(),
+                cancel_requests: Default::default(),
                 suspend_calls: suspend_calls.clone(),
             };
             tokio::spawn(async move {
@@ -5466,6 +5524,39 @@ mod tests {
                     .await;
             });
             (addr, cancelled_attempts, suspend_calls)
+        }
+
+        /// Mock agent that keeps every `CancelJob` request it receives.
+        async fn spawn_mock_agent_recording_cancel_requests() -> (
+            std::net::SocketAddr,
+            Arc<std::sync::Mutex<Vec<spur_proto::proto::AgentCancelJobRequest>>>,
+        ) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let cancel_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                cancelled_attempts: Default::default(),
+                cancel_requests: cancel_requests.clone(),
+                suspend_calls: Default::default(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, cancel_requests)
         }
 
         /// Mock agent whose launch_job always rejects with ResourceExhausted,
@@ -5759,6 +5850,30 @@ mod tests {
             crate::server::cancel_stale_runs(cm.clone(), "n1".into(), vec![report]).await;
 
             assert_eq!(*cancelled.lock().unwrap(), [job.run_attempt]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_graceful_cancel_carries_the_configured_kill_wait() {
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let (addr, requests) = spawn_mock_agent_recording_cancel_requests().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "graceful", "n1");
+
+            cancel_job_on_nodes(&cm, job.job_id, job.run_attempt, &["n1".to_string()], 0).await;
+            cancel_job_on_nodes(&cm, job.job_id, job.run_attempt, &["n1".to_string()], 9).await;
+
+            let seen: Vec<(i32, u32)> = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.signal, r.kill_wait_secs))
+                .collect();
+            assert_eq!(
+                seen,
+                [(0, 30), (9, 0)],
+                "only the graceful cancel carries the kill wait"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

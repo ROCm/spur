@@ -1458,9 +1458,11 @@ fn reservation_manager_ruling(
     }
 }
 
-/// Twice the agent's own kill budget (SIGTERM grace plus reap). Past it, a node
-/// still claiming the job missed the cancel rather than being mid-teardown.
-const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(16);
+/// Twice the agent's own kill budget (the kill wait plus a 3 s reap). Past it, a
+/// node still claiming the job missed the cancel rather than being mid-teardown.
+fn cancel_reclaim_grace(kill_wait_secs: u32) -> chrono::Duration {
+    chrono::Duration::seconds(2 * (kill_wait_secs as i64 + 3))
+}
 
 /// Whether `node` may release its reported run (never one newer than this controller applied): the
 /// run is over, the job is active elsewhere or queued with no launch here, or unknown but ours.
@@ -1477,10 +1479,10 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
     }
     // A cancel this old that the node is still claiming never reached it
     // (an agent that was down when it was sent); the run is over regardless.
-    if job
-        .cancel_signaled_at
-        .is_some_and(|at| Utc::now() - at > CANCEL_RECLAIM_GRACE)
-    {
+    if job.cancel_signaled_at.is_some_and(|at| {
+        let kill_wait = cluster.config().scheduler.effective_kill_wait_secs();
+        Utc::now() - at > cancel_reclaim_grace(kill_wait)
+    }) {
         return true;
     }
     // A queued job's reported run is stale unless a launch of it is placed here. An attempt-0
@@ -7507,6 +7509,74 @@ mod tests {
         assert!(
             stale_reported_jobs(&cluster, "n1", &reported).is_empty(),
             "Running with no nodelist yet is not authoritative — the node accepting the launch must be spared"
+        );
+    }
+
+    #[test]
+    fn cancel_reclaim_grace_scales_with_kill_wait() {
+        assert_eq!(cancel_reclaim_grace(5), chrono::Duration::seconds(16));
+        assert_eq!(cancel_reclaim_grace(30), chrono::Duration::seconds(66));
+    }
+
+    #[tokio::test]
+    async fn is_reclaimable_waits_out_the_kill_wait() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = test_slurm_config();
+        config.scheduler.kill_wait_secs = 30;
+        let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
+        let cancelled_ago = |job_id: u32, ago_secs: i64| {
+            apply(&WalOperation::JobSubmit {
+                job_id,
+                spec: Box::new(JobSpec {
+                    name: "cancelled".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            });
+            let per_node = std::collections::HashMap::from([("n2".to_string(), res.clone())]);
+            apply(&WalOperation::job_start(
+                job_id,
+                vec!["n2".into()],
+                res.clone(),
+                per_node,
+            ));
+            apply(&WalOperation::job_state_change(
+                job_id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            apply(&WalOperation::JobCancelSignaled {
+                job_id,
+                at: Utc::now() - chrono::Duration::seconds(ago_secs),
+                cancel: None,
+            });
+        };
+
+        cancelled_ago(81, 20);
+        cancelled_ago(82, 70);
+
+        assert!(
+            !is_reclaimable(&cluster, "n2", &report_run(81, 0)),
+            "a cancel inside the kill wait may still be tearing the run down"
+        );
+        assert!(
+            is_reclaimable(&cluster, "n2", &report_run(82, 0)),
+            "a cancel past twice the kill wait never reached the node"
         );
     }
 

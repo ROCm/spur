@@ -71,6 +71,12 @@ fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 
         .min(spur_core::config::MAX_LAUNCH_BACKOFF_SECS)
 }
 
+/// Seconds a requeued job stays ineligible: long enough for the scheduler to
+/// see the cancel through, and never before the old run's kill wait elapses.
+fn requeue_hold_secs(scheduler_interval_secs: u32, kill_wait_secs: u32) -> i64 {
+    (scheduler_interval_secs as i64 * 2 + 3).max(kill_wait_secs as i64)
+}
+
 /// Warn about a `complete_wait_secs` that would force-finish a job before its
 /// kill wait elapses. Run on every config load, startup and reconfigure alike.
 pub(crate) fn warn_if_complete_wait_too_short(scheduler: &spur_core::config::SchedulerConfig) {
@@ -2073,7 +2079,10 @@ impl ClusterManager {
         // leader so every replica applies one instant.
         let begin_time = match (&snapshot, hold) {
             (Some(job), false) => {
-                let hold_secs = (self.scheduler_interval_secs as i64 * 2 + 3).max(5);
+                let hold_secs = requeue_hold_secs(
+                    self.scheduler_interval_secs,
+                    self.config().scheduler.effective_kill_wait_secs(),
+                );
                 let deferred = Utc::now() + chrono::Duration::seconds(hold_secs);
                 Some(
                     job.spec
@@ -3137,7 +3146,10 @@ impl ClusterManager {
                 // the maybe_requeue MAX_REQUEUE cap: Slurm always requeues a
                 // preempted job regardless of its --requeue flag. This is a
                 // deliberate divergence from the ordinary requeue path.
-                let hold_secs = (self.scheduler_interval_secs as i64 * 2 + 3).max(5);
+                let hold_secs = requeue_hold_secs(
+                    self.scheduler_interval_secs,
+                    self.config().scheduler.effective_kill_wait_secs(),
+                );
                 let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
                 // Honor a later user --begin: compute the max on the leader so
                 // followers apply one verbatim instant (no per-replica clock).
@@ -18502,6 +18514,59 @@ state = "UP"
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Preempted,
             "refresh_pending_reasons must not clobber an active Preempted hold"
+        );
+    }
+
+    #[test]
+    fn requeue_hold_is_at_least_the_kill_wait() {
+        assert_eq!(requeue_hold_secs(1, 5), 5);
+        assert_eq!(requeue_hold_secs(1, 30), 30);
+        assert_eq!(requeue_hold_secs(20, 30), 43);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_hold_covers_kill_wait() {
+        // The victim is still being killed for the kill wait; re-dispatching it
+        // earlier would start the new run into its own teardown.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.scheduler.interval_secs = 1;
+        config.scheduler.kill_wait_secs = 30;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "hold-kill-wait", "worker1");
+        let before = Utc::now();
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
+            .unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let begin = cm.get_job(job_id).unwrap().spec.begin_time.unwrap();
+        assert!(
+            begin >= before + chrono::Duration::seconds(30),
+            "hold ends {begin}, before the kill wait elapses"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_hold_covers_kill_wait() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.scheduler.interval_secs = 1;
+        config.scheduler.kill_wait_secs = 30;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "requeue-kill-wait", "worker1");
+        let before = Utc::now();
+        cm.requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let begin = cm.get_job(job_id).unwrap().spec.begin_time.unwrap();
+        assert!(
+            begin >= before + chrono::Duration::seconds(30),
+            "hold ends {begin}, before the kill wait elapses"
         );
     }
 
