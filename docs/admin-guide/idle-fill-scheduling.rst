@@ -161,8 +161,11 @@ preferred next victim — the more capacity it lost, the more it would go on to 
 Reclaim is attempted before preemption, since recovering lent capacity is always
 preferable to evicting a job that holds a claim to it.
 
-Reclaim never takes a job that is in its preemption grace period; the job that
-needs its nodes waits for the grace to end, like any other preemptor.
+Reclaim never takes a job that is in its preemption grace period
+(:ref:`preemption grace time <qos-preempt-grace>`): taking it would cut the grace short. The job that
+needs its nodes waits for the grace and kill wait to end, like any other
+preemptor, and reclaims only after they finish. Reclaim itself gives a borrowed
+run no grace; it is requeued at once.
 
 Priority inside the opportunistic tier
 --------------------------------------

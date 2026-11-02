@@ -852,6 +852,35 @@ short for a checkpoint. Upgrade the agents promptly, or drain the nodes still
 on the old build before their jobs' limits arrive. Once a node is upgraded the
 job gets the full ``kill_wait_secs``.
 
+.. _preempt-grace-upgrade-notes:
+
+Preemption grace time (QOS ``GraceTime``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release makes the per-QOS ``GraceTime`` take effect (see
+:ref:`preemption grace time <qos-preempt-grace>`). It defaults to ``0``, so nothing changes until an
+administrator sets it.
+
+**Upgrade the leader last.** The first preemption that starts a grace writes a
+new Raft log entry, ``JobPreemptSignaled``. A controller that predates it
+cannot parse the entry and stops replicating until it is upgraded, so the order
+in :ref:`upgrading-leader-last` applies, and a rollback after the entry has been
+written is not supported: roll forward. The entry is written only when a
+``GraceTime`` greater than ``0`` is in use.
+
+**Upgrade controllers and agents before setting ``GraceTime``.** A node whose
+``spurd`` predates this release does not advertise the ``signal-job``
+capability. A victim on such a node gets no grace and is preempted at once, and
+the controller logs a warning naming the node, so setting ``GraceTime`` before
+the agents are upgraded silently does nothing for jobs on those nodes.
+
+**Kubernetes operator nodes get no grace.** Victims on nodes managed by
+``spur-k8s`` are preempted at once whatever the QOS ``GraceTime``.
+
+The ``grace_time`` column is added to the QOS table automatically with
+``ADD COLUMN IF NOT EXISTS``, and a controller that predates this release
+ignores it.
+
 See Also
 --------
 

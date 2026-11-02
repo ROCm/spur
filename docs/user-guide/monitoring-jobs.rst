@@ -805,6 +805,36 @@ While a job is inside its preemption grace period, the same line also shows
 ``EndTime`` shows when the grace ends. ``PreemptTime`` is omitted for a job that
 is not in a grace.
 
+.. _preemption-grace-user:
+
+How a job learns it is being preempted
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If the QOS your job runs under has a ``GraceTime`` (ask your administrator; see
+:ref:`preemption grace time <qos-preempt-grace>`), a job selected for preemption in ``cancel`` or
+``requeue`` mode is not killed at once. It gets SIGCONT then SIGTERM, one time,
+as a warning, stays ``RUNNING`` and keeps its nodes, and is preempted at the
+deadline shown as ``EndTime`` (``PreemptTime`` shows when the warning was sent).
+The grace is shortened if the job's own time limit arrives first. Without a
+``GraceTime`` there is no warning period and the job is preempted immediately.
+
+* **Launch your work with** ``srun``. The warning goes to the job's ``srun``
+  steps, not to the batch script, so a training process started directly from
+  the batch script gets no warning and sees only the final kill. Run it as
+  ``srun python train.py`` and handle SIGTERM there to checkpoint.
+* **Expect a second SIGTERM.** At the deadline Spur sends SIGTERM to every
+  process in the job, waits up to the kill wait (30 seconds by default), then
+  sends SIGKILL. A handler that is already shutting down should ignore a repeat.
+* **Exiting early is fine.** A job that exits during its grace is recorded as
+  ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
+  mode), and the preempting job starts as soon as the nodes are free.
+* **You can still cancel.** ``scancel`` during the grace ends the job as your
+  cancel. ``scontrol suspend`` is refused.
+* **The grace is not withdrawn.** The job is preempted at the deadline even if
+  the job that triggered it is cancelled meanwhile.
+
+Jobs on nodes managed by the Kubernetes operator get no grace and no warning.
+
 Borrowed runs and reclaim
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 

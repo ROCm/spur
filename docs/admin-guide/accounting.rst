@@ -537,10 +537,11 @@ QOS keys
    * - ``gracetime``
      - ``0`` (no grace)
      - Seconds a job in this QOS is given to wind down (checkpoint, flush
-       output) between the preemption signal and the kill, when it is
-       preempted. The *victim's* QOS value applies, not the preemptor's. It is
-       capped at the victim's remaining time limit, and ``0`` means no grace
-       period. See :ref:`preemption grace time <qos-preempt-grace>`.
+       output) between the preemption warning and the kill, when it is
+       preempted in ``cancel`` or ``requeue`` mode. The *victim's* QOS value
+       applies, not the preemptor's. It is capped at the victim's remaining
+       time limit, and ``0`` means no grace period. See :ref:`preemption grace
+       time <qos-preempt-grace>`.
    * - ``usagefactor``
      - ``1.0``
      - Multiplier applied to both CPU and GPU usage charged under this QOS.
@@ -901,10 +902,61 @@ choose ``cancel`` or ``requeue`` when the pending job needs capacity freed.
 ``GraceTime`` is a per-QOS value in seconds, set with
 ``sacctmgr modify qos name=<name> set GraceTime=600`` (keys are
 case-insensitive) and shown by ``sacctmgr show qos --long`` or
-``format=GraceTime``. The victim's QOS value applies; it is capped at the
-victim's remaining time limit, and ``0`` (the default) means no grace. It takes
-effect with the preemption-grace feature; for now it is only stored, and the
-behaviour arrives in a later change in the same release.
+``format=GraceTime``. The victim's QOS value applies, not the preemptor's, and
+there is no per-partition ``GraceTime``. ``0`` (the default) means no grace: the
+victim is preempted at once, as in earlier releases.
+
+The grace a victim gets is ``min(GraceTime, time left before the victim's own
+time limit)``; a victim with no time limit is not capped. It applies to
+``cancel`` and ``requeue`` preemption. ``suspend`` has no grace.
+
+When a pending job selects a victim that has a grace:
+
+#. The victim is sent SIGCONT and then SIGTERM, **once**, as a warning. The
+   signals go to the job's ``srun`` steps only, **not to the batch script**,
+   as in Slurm. A process the batch script starts directly, without ``srun``,
+   gets no warning and sees nothing until the final kill, so users who want
+   to checkpoint on preemption must launch their work with ``srun``.
+#. The victim stays ``RUNNING`` (``R`` in ``squeue``) and keeps its nodes for
+   the whole grace. ``scontrol show job`` shows ``PreemptTime=`` (when the
+   warning was sent) and sets ``EndTime=`` to the grace deadline.
+#. At the deadline the normal preemption runs: SIGTERM to every process of the
+   job, a wait of up to ``kill_wait_secs`` (see :doc:`configuration`; it ends
+   early once the processes exit), then SIGKILL. The job therefore receives a
+   second SIGTERM and should tolerate it. In ``cancel`` mode the job ends
+   ``CANCELLED`` (``PREEMPTED`` in ``sacct``, with ``PreemptedBy``); in
+   ``requeue`` mode it returns to ``PENDING``.
+
+Rules that follow from this:
+
+* **No abort.** Once a grace starts, the job is preempted at the deadline even
+  if the preemptor is cancelled or no longer needs the nodes.
+* **A job that exits during its grace** is recorded as ``PREEMPTED`` in
+  ``cancel`` mode, or re-queued in ``requeue`` mode, and frees its nodes as
+  soon as it exits.
+* **A user cancel during the grace wins.** After ``scancel`` the job ends as the
+  user's cancel, not as preempted.
+* **Suspending is refused.** ``scontrol suspend`` on a job in its grace fails.
+* **The preemptor waits.** It stays at the front of the queue until the grace
+  and kill wait finish. No other job is placed on the victim's nodes, no second
+  preemptor selects the same victim, and idle-fill reclaim
+  (:doc:`idle-fill-scheduling`) waits for the grace too.
+* **A grace shortened by the time limit** still ends as a preemption, not a
+  time limit.
+
+Where no grace is given, the victim is preempted at once and the controller
+continues as if ``GraceTime`` were ``0``:
+
+* Nodes managed by the Kubernetes operator (``spur-k8s``) cannot deliver the
+  warning, so a victim on such a node gets no grace.
+* A node running a ``spurd`` that predates the feature does not advertise the
+  ``signal-job`` capability, so a victim on it gets no grace, and the controller
+  logs a warning naming the node. See :ref:`the upgrade notes
+  <preempt-grace-upgrade-notes>` before setting ``GraceTime``.
+
+The victim's nodes stay occupied for the grace plus, at worst,
+``kill_wait_secs``, and the preemptor waits that long, so set ``GraceTime`` to
+what a victim needs to checkpoint and no higher.
 
 .. _qos-preempt-same-qos:
 
