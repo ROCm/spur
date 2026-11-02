@@ -2603,6 +2603,7 @@ impl SlurmController for ControllerService {
                 req.version,
                 source,
                 req.labels,
+                req.capabilities,
                 caller_privileged,
             )
             .map_err(register_node_rpc_status)?;
@@ -9174,6 +9175,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .expect("update recovery probe address");
@@ -9197,6 +9199,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .expect("point the node at its probe agent");
@@ -9481,6 +9484,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .expect("point n1 at its live probe agent");
@@ -9501,6 +9505,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .expect("register the untouched peer");
@@ -9822,6 +9827,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -10047,6 +10053,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -10235,6 +10242,7 @@ mod tests {
                     String::new(),
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
+                    Vec::new(),
                     true,
                 )
                 .unwrap();
@@ -10459,6 +10467,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -10863,6 +10872,7 @@ mod tests {
                     String::new(),
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
+                    Vec::new(),
                     true,
                 )
                 .unwrap();
@@ -10969,6 +10979,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -11583,6 +11594,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -11669,6 +11681,7 @@ mod tests {
                     String::new(),
                     NodeSource::NativeHost,
                     std::collections::HashMap::new(),
+                    Vec::new(),
                     true,
                 )
                 .unwrap();
@@ -11804,6 +11817,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -12151,6 +12165,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -13620,6 +13635,7 @@ mod tests {
                     String::new(),
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
+                    Vec::new(),
                     true,
                 )
                 .unwrap();

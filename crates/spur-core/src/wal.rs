@@ -293,6 +293,8 @@ pub enum WalOperation {
         labels: HashMap<String, String>,
         #[serde(default)]
         source: NodeSource,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     NodeUpdate {
         name: String,
@@ -305,6 +307,8 @@ pub enum WalOperation {
         version: String,
         #[serde(default)]
         source: NodeSource,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     NodeStateChange {
         name: String,
@@ -1525,6 +1529,54 @@ mod deregistration_wal_tests {
         match op {
             WalOperation::EvictTerminalJobs { job_ids } => {
                 assert_eq!(job_ids, vec![7, 42]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen pre-capabilities Raft entries; a new field needs #[serde(default)],
+    // not a fixture edit.
+    #[test]
+    fn node_register_without_capabilities_still_deserializes() {
+        const NODE_REGISTER: &str = r#"{"NodeRegister":{"name":"n1","hostname":"n1","resources":{"cpus":4,"memory_mb":8000,"gpus":[],"generic":{}},"address":"10.0.0.1","port":6818,"wg_pubkey":"","version":"0.1.0","labels":{},"source":{"type":"NativeHost"}}}"#;
+        let op: WalOperation = serde_json::from_str(NODE_REGISTER)
+            .expect("frozen NodeRegister must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::NodeRegister { capabilities, .. } => assert!(capabilities.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn node_update_without_capabilities_still_deserializes() {
+        const NODE_UPDATE: &str = r#"{"NodeUpdate":{"name":"n1","hostname":"n1","resources":{"cpus":4,"memory_mb":8000,"gpus":[],"generic":{}},"address":"10.0.0.1","port":6818,"wg_pubkey":"","version":"0.1.0","source":{"type":"NativeHost"}}}"#;
+        let op: WalOperation = serde_json::from_str(NODE_UPDATE)
+            .expect("frozen NodeUpdate must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::NodeUpdate { capabilities, .. } => assert!(capabilities.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn node_register_capabilities_round_trip() {
+        let op = WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet::default(),
+            address: "10.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: NodeSource::NativeHost,
+            capabilities: vec![crate::node::CAP_SIGNAL_JOB.to_string()],
+        };
+        let json = serde_json::to_string(&op).expect("serialize");
+        let back: WalOperation = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            WalOperation::NodeRegister { capabilities, .. } => {
+                assert_eq!(capabilities, vec!["signal-job".to_string()]);
             }
             _ => panic!("wrong variant"),
         }

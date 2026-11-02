@@ -408,6 +408,9 @@ pub struct Node {
     /// from heartbeats, never persisted.
     #[serde(skip)]
     pub layout_enforce_error: Option<String>,
+    /// Optional RPCs the node's agent advertised at registration (e.g. `CAP_SIGNAL_JOB`).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 fn default_weight() -> u32 {
@@ -457,7 +460,13 @@ impl Node {
             spec_memory_mb: 0,
             layout_seq: 0,
             layout_enforce_error: None,
+            capabilities: Vec::new(),
         }
+    }
+
+    /// Whether the node's agent advertised `capability` at registration.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
     }
 
     /// Reset config-derived scheduling policy (features, weight) to defaults.
@@ -569,6 +578,25 @@ mod tests {
         value.as_object_mut().unwrap().remove("k0s_last_error");
         let back: Node = serde_json::from_value(value).expect("deserialize node");
         assert_eq!(back.k0s_last_error, None);
+    }
+
+    #[test]
+    fn a_node_snapshot_without_capabilities_still_deserializes() {
+        let node = Node::new("n1".into(), ResourceSet::default());
+        let mut value = serde_json::to_value(&node).expect("serialize node");
+        value.as_object_mut().unwrap().remove("capabilities");
+        let back: Node = serde_json::from_value(value).expect("deserialize node");
+        assert!(back.capabilities.is_empty());
+        assert!(!back.supports(CAP_SIGNAL_JOB));
+    }
+
+    #[test]
+    fn supports_matches_only_advertised_capabilities() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        assert!(!node.supports(CAP_SIGNAL_JOB));
+        node.capabilities = vec![CAP_SIGNAL_JOB.to_string()];
+        assert!(node.supports(CAP_SIGNAL_JOB));
+        assert!(!node.supports("other"));
     }
 
     #[test]

@@ -3781,6 +3781,7 @@ impl ClusterManager {
         version: String,
         source: NodeSource,
         labels: HashMap<String, String>,
+        capabilities: Vec<String>,
         caller_privileged: bool,
     ) -> Result<(), RegisterNodeError> {
         let hostname = if hostname.is_empty() {
@@ -3810,7 +3811,8 @@ impl ClusterManager {
                         || (!wg_pubkey.is_empty()
                             && existing.wg_pubkey.as_deref() != Some(wg_pubkey.as_str()))
                         || (!version.is_empty()
-                            && existing.version.as_deref() != Some(version.as_str()));
+                            && existing.version.as_deref() != Some(version.as_str()))
+                        || existing.capabilities != capabilities;
                     if needs_update {
                         self.propose(WalOperation::NodeUpdate {
                             name: name.clone(),
@@ -3824,6 +3826,7 @@ impl ClusterManager {
                             wg_pubkey,
                             version,
                             source: source.clone(),
+                            capabilities,
                         })
                         .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                         info!(node = %name, "node comm address or metadata updated");
@@ -3845,6 +3848,7 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                     source: source.clone(),
+                    capabilities,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 self.sync_node_labels(&name, labels, caller_privileged)?;
@@ -3864,6 +3868,7 @@ impl ClusterManager {
                     version,
                     labels,
                     source: source.clone(),
+                    capabilities,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
@@ -8561,6 +8566,7 @@ impl ClusterManager {
                 version,
                 labels,
                 source,
+                capabilities,
             } => {
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                 let mut resources = resources.clone();
@@ -8575,6 +8581,7 @@ impl ClusterManager {
                 // Establish the source before applying policy so layout
                 // derivation can skip Kubernetes-backed nodes (no topology).
                 node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
+                node.capabilities = capabilities.clone();
                 self.apply_node_config_policy(&mut node);
                 if !address.is_empty() {
                     node.address = Some(address.clone());
@@ -8623,6 +8630,7 @@ impl ClusterManager {
                 wg_pubkey,
                 version,
                 source,
+                capabilities,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     // Normalize legacy Raft entries so replay can't collide on stable_id==0.
@@ -8644,6 +8652,7 @@ impl ClusterManager {
                     }
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
+                    node.capabilities = capabilities.clone();
                     node.last_heartbeat = Some(Utc::now());
                     // Re-clamp against config: NodeUpdate carries a fresh detected
                     // report and must honor caps just like NodeRegister does.
@@ -11672,6 +11681,7 @@ nodes = "ALL"
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -11777,6 +11787,7 @@ state = "UP"
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -11867,6 +11878,7 @@ nodes = "ALL"
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -11962,6 +11974,7 @@ state = "UP"
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -12171,6 +12184,16 @@ state = "UP"
         cpus: u32,
         mem: u64,
     ) -> Result<(), RegisterNodeError> {
+        try_register_node_with_capabilities(cm, name, cpus, mem, Vec::new())
+    }
+
+    fn try_register_node_with_capabilities(
+        cm: &ClusterManager,
+        name: &str,
+        cpus: u32,
+        mem: u64,
+        capabilities: Vec<String>,
+    ) -> Result<(), RegisterNodeError> {
         cm.register_node(
             name.into(),
             name.into(),
@@ -12185,8 +12208,48 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            capabilities,
             true,
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_node_records_capabilities() {
+        use spur_core::node::CAP_SIGNAL_JOB;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        try_register_node_with_capabilities(&cm, "n1", 4, 1024, vec![CAP_SIGNAL_JOB.into()])
+            .unwrap();
+        try_register_node(&cm, "n2", 4, 1024).unwrap();
+        wait_for("both nodes registered", || {
+            cm.get_node("n1").is_some() && cm.get_node("n2").is_some()
+        });
+
+        assert!(cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
+        assert!(!cm.get_node("n2").unwrap().supports(CAP_SIGNAL_JOB));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn re_registration_updates_changed_capabilities() {
+        use spur_core::node::CAP_SIGNAL_JOB;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        try_register_node(&cm, "n1", 4, 1024).unwrap();
+        wait_for("n1 registered", || cm.get_node("n1").is_some());
+        assert!(!cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
+
+        try_register_node_with_capabilities(&cm, "n1", 4, 1024, vec![CAP_SIGNAL_JOB.into()])
+            .unwrap();
+        wait_for("capability recorded", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.supports(CAP_SIGNAL_JOB))
+        });
+
+        try_register_node(&cm, "n1", 4, 1024).unwrap();
+        wait_for("capability withdrawn", || {
+            cm.get_node("n1")
+                .is_some_and(|n| !n.supports(CAP_SIGNAL_JOB))
+        });
     }
 
     fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
@@ -13375,6 +13438,7 @@ state = "UP"
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 HashMap::from([("pool".to_string(), pool.to_string())]),
+                Vec::new(),
                 privileged,
             )
         };
@@ -13427,6 +13491,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -14205,6 +14270,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -14979,6 +15045,7 @@ state = "UP"
             version: "1.0".into(),
             labels: HashMap::new(),
             source: NodeSource::default(),
+            capabilities: Vec::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -22761,6 +22828,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -28071,6 +28139,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -30613,6 +30682,7 @@ state = "UP"
             "1.0".into(),
             NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -33143,6 +33213,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("role".into(), "infer".into())]),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -33215,6 +33286,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "train".into())]),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -33239,6 +33311,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "infer".into()), ("tier".into(), "1".into())]),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -33273,6 +33346,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -33288,6 +33362,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -33330,6 +33405,7 @@ state = "UP"
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "train".into())]),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -33381,6 +33457,7 @@ state = "UP"
             version: String::new(),
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
+            capabilities: Vec::new(),
         });
 
         assert_eq!(
@@ -33424,6 +33501,7 @@ state = "UP"
             version: String::new(),
             labels: HashMap::new(),
             source: NodeSource::default(),
+            capabilities: Vec::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -33475,6 +33553,7 @@ state = "UP"
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi300x".into())]),
             source: NodeSource::default(),
+            capabilities: Vec::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -33526,6 +33605,7 @@ state = "UP"
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi250".into())]),
             source: NodeSource::default(),
+            capabilities: Vec::new(),
         });
 
         let node = cm.get_node("cpu-node").unwrap();
@@ -34007,6 +34087,7 @@ state = "UP"
             version: String::new(),
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
+            capabilities: Vec::new(),
         });
         assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
 

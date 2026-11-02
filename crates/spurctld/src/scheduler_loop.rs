@@ -5592,6 +5592,7 @@ mod tests {
                 String::new(),
                 NodeSource::NativeHost,
                 HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
@@ -5619,6 +5620,7 @@ mod tests {
                 version: String::new(),
                 labels: HashMap::new(),
                 source: NodeSource::NativeHost,
+                capabilities: Vec::new(),
             });
             let n = name.to_string();
             wait_for(
@@ -7117,6 +7119,7 @@ mod tests {
                     namespace: "spur-test".into(),
                 },
                 HashMap::new(),
+                Vec::new(),
                 true,
             )
             .unwrap();
