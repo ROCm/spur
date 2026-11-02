@@ -401,13 +401,8 @@ impl NodeReporter {
                 }),
             };
 
-            // Bounded by `with_controller`'s own timeout, so a controller that goes
-            // silent on the network can't stall this loop past one tick.
-            match self
-                .with_controller(move |mut client| async move { client.heartbeat(req).await })
-                .await
-            {
-                Ok(_) => debug!(load, free_mem, "heartbeat sent"),
+            match self.send_heartbeat(req).await {
+                Ok(()) => debug!(load, free_mem, "heartbeat sent"),
                 Err(crate::controller_auth::ConnectAuthError::Status(status))
                     if should_reregister(&status) =>
                 {
@@ -422,6 +417,33 @@ impl NodeReporter {
                 Err(e) => warn!(error = %e, "heartbeat failed"),
             }
         }
+    }
+
+    /// One heartbeat. A transport failure is retried at once when another controller
+    /// is configured: the failed one was just deprioritized, so the retry reaches a
+    /// different host instead of leaving this node silent until the next beat. With
+    /// the failover cooldown off nothing is deprioritized, so there is no retry. Each
+    /// attempt is bounded by `with_controller`'s timeout.
+    async fn send_heartbeat(
+        &self,
+        req: spur_proto::proto::HeartbeatRequest,
+    ) -> Result<(), crate::controller_auth::ConnectAuthError> {
+        let retry = req.clone();
+        let Err(e) = self
+            .with_controller(move |mut client| async move { client.heartbeat(req).await })
+            .await
+        else {
+            return Ok(());
+        };
+        let another_host = spur_client::parse_endpoints(&self.controller_addr).len() > 1
+            && !self.timeouts.failover_cooldown.is_zero();
+        if !is_transport_failure(&e) || !another_host {
+            return Err(e);
+        }
+        warn!(error = %e, "heartbeat did not reach the controller; retrying on another controller");
+        self.with_controller(move |mut client| async move { client.heartbeat(retry).await })
+            .await
+            .map(|_| ())
     }
 }
 
@@ -455,8 +477,12 @@ fn should_reregister(status: &tonic::Status) -> bool {
 fn is_transport_failure(e: &crate::controller_auth::ConnectAuthError) -> bool {
     match e {
         crate::controller_auth::ConnectAuthError::Transport(_) => true,
+        // No controller handler returns ResourceExhausted; tonic surfaces an h2
+        // GOAWAY(ENHANCE_YOUR_CALM) as it, from this connection or from the one a
+        // follower forwards over.
         crate::controller_auth::ConnectAuthError::Status(status) => {
             spur_proto::controller_rpc_retryable(status)
+                || status.code() == tonic::Code::ResourceExhausted
         }
     }
 }
@@ -1296,6 +1322,167 @@ mod tests {
             start.elapsed() < Duration::from_millis(250),
             "a dial that reaches the responsive host must not wait out the stuck one's timeout"
         );
+    }
+
+    /// A controller stand-in that answers every RPC with `code` and counts the calls,
+    /// so a test can tell whether a heartbeat was retried and which host it reached.
+    /// Every call counts, including the native-auth Ping `wrap` sends first once a
+    /// test in this binary has configured it.
+    async fn controller_answering(
+        code: tonic::Code,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        #[derive(Clone)]
+        struct Answer {
+            code: tonic::Code,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl tonic::server::NamedService for Answer {
+            const NAME: &'static str = "slurm.SlurmController";
+        }
+        impl tonic::codegen::Service<http::Request<tonic::body::Body>> for Answer {
+            type Response = http::Response<tonic::body::Body>;
+            type Error = std::convert::Infallible;
+            type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+            fn poll_ready(
+                &mut self,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _: http::Request<tonic::body::Body>) -> Self::Future {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(
+                    tonic::Status::new(self.code, "stand-in answer").into_http()
+                ))
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answer = Answer {
+            code,
+            calls: Arc::clone(&calls),
+        };
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(answer)
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        (addr, calls)
+    }
+
+    #[test]
+    fn resource_exhausted_counts_as_a_transport_failure() {
+        let status =
+            |code| crate::controller_auth::ConnectAuthError::Status(tonic::Status::new(code, ""));
+        assert!(is_transport_failure(&status(
+            tonic::Code::ResourceExhausted
+        )));
+        for code in [
+            tonic::Code::NotFound,
+            tonic::Code::PermissionDenied,
+            tonic::Code::Unauthenticated,
+            tonic::Code::InvalidArgument,
+        ] {
+            assert!(
+                !is_transport_failure(&status(code)),
+                "{code:?} is the controller's answer, not a broken path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_refused_with_resource_exhausted_fails_over_within_the_beat() {
+        let (exhausted, exhausted_calls) =
+            controller_answering(tonic::Code::ResourceExhausted).await;
+        let (healthy, healthy_calls) = controller_answering(tonic::Code::Unimplemented).await;
+        let reporter = test_reporter_with_addr(
+            rset(8, 0, vec![]),
+            format!("http://{exhausted},http://{healthy}"),
+        );
+
+        let err = reporter
+            .send_heartbeat(spur_proto::proto::HeartbeatRequest::default())
+            .await
+            .expect_err("the healthy stand-in answers Unimplemented");
+
+        assert_eq!(
+            err_code(&err),
+            tonic::Code::Unimplemented,
+            "the retry must have reached the healthy controller"
+        );
+        assert_eq!(exhausted_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reporter.dial_endpoints(),
+            format!("http://{healthy},http://{exhausted}"),
+            "later beats must keep preferring the controller that answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_to_a_single_controller_is_not_retried() {
+        let (only, calls) = controller_answering(tonic::Code::ResourceExhausted).await;
+        let reporter = test_reporter_with_addr(rset(8, 0, vec![]), format!("http://{only}"));
+
+        let err = reporter
+            .send_heartbeat(spur_proto::proto::HeartbeatRequest::default())
+            .await
+            .expect_err("the only controller refuses");
+
+        assert_eq!(err_code(&err), tonic::Code::ResourceExhausted);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_is_not_retried_with_the_failover_cooldown_off() {
+        let (exhausted, exhausted_calls) =
+            controller_answering(tonic::Code::ResourceExhausted).await;
+        let (healthy, healthy_calls) = controller_answering(tonic::Code::Unimplemented).await;
+        let mut reporter = test_reporter_with_addr(
+            rset(8, 0, vec![]),
+            format!("http://{exhausted},http://{healthy}"),
+        );
+        reporter.timeouts.failover_cooldown = Duration::ZERO;
+
+        let err = reporter
+            .send_heartbeat(spur_proto::proto::HeartbeatRequest::default())
+            .await
+            .expect_err("the first controller refuses");
+
+        assert_eq!(err_code(&err), tonic::Code::ResourceExhausted);
+        assert_eq!(exhausted_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_the_controller_rejects_is_not_retried_elsewhere() {
+        let (rejecting, rejecting_calls) = controller_answering(tonic::Code::NotFound).await;
+        let (other, other_calls) = controller_answering(tonic::Code::Unimplemented).await;
+        let reporter = test_reporter_with_addr(
+            rset(8, 0, vec![]),
+            format!("http://{rejecting},http://{other}"),
+        );
+
+        let err = reporter
+            .send_heartbeat(spur_proto::proto::HeartbeatRequest::default())
+            .await
+            .expect_err("the controller does not know this node");
+
+        assert_eq!(
+            err_code(&err),
+            tonic::Code::NotFound,
+            "a NotFound must reach the re-register path unchanged"
+        );
+        assert_eq!(rejecting_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(other_calls.load(Ordering::SeqCst), 0);
     }
 
     /// A dead-fast entry can precede the wedged host; blame must still land on the
