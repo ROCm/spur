@@ -107,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     config.auth.check_private_data()?;
+    cluster::warn_if_complete_wait_too_short(&config.scheduler);
 
     // Fail fast on a broken submit hook (missing, non-executable, or a Lua that
     // won't compile) instead of deferring the error to the first user submission.

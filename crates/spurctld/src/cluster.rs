@@ -71,6 +71,18 @@ fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 
         .min(spur_core::config::MAX_LAUNCH_BACKOFF_SECS)
 }
 
+/// Warn about a `complete_wait_secs` that would force-finish a job before its
+/// kill wait elapses. Run on every config load, startup and reconfigure alike.
+pub(crate) fn warn_if_complete_wait_too_short(scheduler: &spur_core::config::SchedulerConfig) {
+    if scheduler.complete_wait_too_short() {
+        warn!(
+            complete_wait_secs = scheduler.complete_wait_secs,
+            kill_wait_secs = scheduler.effective_kill_wait_secs(),
+            "scheduler.complete_wait_secs should exceed the kill wait, or jobs can be force-finished before SIGKILL"
+        );
+    }
+}
+
 /// Result of recording a per-node completion report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCompleteResult {
@@ -6119,6 +6131,7 @@ impl ClusterManager {
         if let Some(warning) = new_config.auth.private_data_warning() {
             warn!("{warning}");
         }
+        warn_if_complete_wait_too_short(&new_config.scheduler);
         // Reject a broken submit hook before it goes live, so reconfigure can't
         // silently swap in a hook that fails every subsequent submission.
         crate::hooks::validate_submit_hooks(&new_config.hooks)?;

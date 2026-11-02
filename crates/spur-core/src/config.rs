@@ -677,6 +677,11 @@ pub struct SchedulerConfig {
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
+    /// Seconds between SIGTERM and SIGKILL whenever Spur stops a job. Values
+    /// below [`MIN_EFFECTIVE_KILL_WAIT_SECS`] act as that minimum. Mirrors
+    /// Slurm's `KillWait`.
+    #[serde(default = "default_kill_wait")]
+    pub kill_wait_secs: u32,
     /// Grace minutes after a reservation ends before cancelling its running jobs.
     #[serde(default)]
     pub resv_overrun_minutes: u32,
@@ -844,6 +849,26 @@ impl BillingWeights {
     }
 }
 
+/// Largest accepted `scheduler.kill_wait_secs` (Slurm's `KillWait` ceiling).
+pub const MAX_KILL_WAIT_SECS: u32 = 65533;
+
+/// Floor applied to `scheduler.kill_wait_secs`: a shorter wait gives a job's
+/// SIGTERM handler no realistic chance to run before SIGKILL.
+pub const MIN_EFFECTIVE_KILL_WAIT_SECS: u32 = 5;
+
+impl SchedulerConfig {
+    /// The SIGTERM-to-SIGKILL wait to apply, with the floor enforced.
+    pub fn effective_kill_wait_secs(&self) -> u32 {
+        self.kill_wait_secs.max(MIN_EFFECTIVE_KILL_WAIT_SECS)
+    }
+
+    /// Whether `complete_wait_secs` would force-finish a job before its kill
+    /// wait can elapse. Not a validation error so existing configs keep loading.
+    pub fn complete_wait_too_short(&self) -> bool {
+        self.complete_wait_secs <= self.effective_kill_wait_secs()
+    }
+}
+
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
 /// keep its allocation attended. Shared with the CLI so `inactive_limit_secs`
 /// can be validated against it.
@@ -863,6 +888,9 @@ fn default_time_limit() -> u32 {
 }
 fn default_complete_wait() -> u32 {
     300
+}
+fn default_kill_wait() -> u32 {
+    30
 }
 fn default_inactive_limit() -> u32 {
     300
@@ -884,6 +912,7 @@ impl Default for SchedulerConfig {
             default_time_limit_minutes: 0,
             enforce_part_limits: EnforcePartLimits::No,
             complete_wait_secs: 300,
+            kill_wait_secs: default_kill_wait(),
             resv_overrun_minutes: 0,
             inactive_limit_secs: default_inactive_limit(),
             max_user_priority: default_max_user_priority(),
@@ -2526,6 +2555,15 @@ impl SlurmConfig {
             return Err(ConfigError::InvalidValue {
                 field: "cgroup.allowed_ram_percent".into(),
                 value: "0 (must be at least 1)".into(),
+            });
+        }
+        if self.scheduler.kill_wait_secs > MAX_KILL_WAIT_SECS {
+            return Err(ConfigError::InvalidValue {
+                field: "scheduler.kill_wait_secs".into(),
+                value: format!(
+                    "{} (must be at most {MAX_KILL_WAIT_SECS})",
+                    self.scheduler.kill_wait_secs
+                ),
             });
         }
         // A limit below the client's ping interval would reap a live client
@@ -4620,6 +4658,64 @@ inactive_limit_secs = 20
                 .unwrap();
         assert_eq!(other_scheduler_keys.scheduler.inactive_limit_secs, 300);
         assert_eq!(SchedulerConfig::default().inactive_limit_secs, 300);
+    }
+
+    #[test]
+    fn kill_wait_defaults_to_30() {
+        let parsed = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(parsed.scheduler.kill_wait_secs, 30);
+        assert_eq!(SchedulerConfig::default().kill_wait_secs, 30);
+    }
+
+    #[test]
+    fn effective_kill_wait_floors_at_5() {
+        let with = |kill_wait_secs| SchedulerConfig {
+            kill_wait_secs,
+            ..Default::default()
+        };
+        assert_eq!(with(0).effective_kill_wait_secs(), 5);
+        assert_eq!(with(3).effective_kill_wait_secs(), 5);
+        assert_eq!(with(45).effective_kill_wait_secs(), 45);
+    }
+
+    #[test]
+    fn kill_wait_above_max_is_rejected() {
+        let toml = format!(
+            "cluster_name = \"test\"\n[scheduler]\nkill_wait_secs = {}\n",
+            MAX_KILL_WAIT_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("scheduler.kill_wait_secs"),
+            "unexpected error: {err}"
+        );
+        let at_max = format!(
+            "cluster_name = \"test\"\n[scheduler]\nkill_wait_secs = {MAX_KILL_WAIT_SECS}\n"
+        );
+        SlurmConfig::load_from_str(&at_max).expect("the maximum must be accepted");
+    }
+
+    #[test]
+    fn complete_wait_too_short_flags_a_wait_not_above_the_effective_kill_wait() {
+        let with = |kill_wait_secs, complete_wait_secs| SchedulerConfig {
+            kill_wait_secs,
+            complete_wait_secs,
+            ..Default::default()
+        };
+        assert!(!SchedulerConfig::default().complete_wait_too_short());
+        assert!(with(300, 300).complete_wait_too_short());
+        assert!(with(30, 30).complete_wait_too_short());
+        assert!(!with(30, 31).complete_wait_too_short());
+        // The effective floor of 5 applies, so a configured 0 still flags 5.
+        assert!(with(0, 5).complete_wait_too_short());
+        assert!(!with(0, 6).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_not_above_kill_wait_still_loads() {
+        let toml = "cluster_name = \"test\"\n[scheduler]\ncomplete_wait_secs = 30\n";
+        let parsed = SlurmConfig::load_from_str(toml).expect("a legacy config must still load");
+        assert!(parsed.scheduler.complete_wait_too_short());
     }
 
     #[test]
