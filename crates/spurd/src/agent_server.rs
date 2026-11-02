@@ -22,6 +22,7 @@ use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
+use spur_core::gpu_binding::BindingCheck;
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_MPIRUN, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
@@ -4043,7 +4044,7 @@ impl AgentService {
                 ))
             })?;
 
-        let (fabric_binding, gpu_binding, allocation) = {
+        let (fabric_binding, gpu_binding, allocation, job_nodelist) = {
             let jobs = self.running.lock().await;
             let tracked = jobs
                 .get(&job_id)
@@ -4052,9 +4053,11 @@ impl AgentService {
                 tracked.fabric_binding.clone(),
                 tracked.gpu_binding.clone(),
                 Self::tracked_allocation(tracked),
+                tracked.nodelist.clone(),
             )
         };
-        self.check_dispatch_allocation(&allocation).await?;
+        self.check_step_allocation(&allocation, &job_nodelist)
+            .await?;
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
         let waiter = self
@@ -4200,7 +4203,7 @@ impl AgentService {
                 ))
             })?;
 
-        let (fabric_binding, gpu_binding, allocation) = {
+        let (fabric_binding, gpu_binding, allocation, job_nodelist) = {
             let jobs = self.running.lock().await;
             let tracked = jobs
                 .get(&job_id)
@@ -4209,9 +4212,11 @@ impl AgentService {
                 tracked.fabric_binding.clone(),
                 tracked.gpu_binding.clone(),
                 Self::tracked_allocation(tracked),
+                tracked.nodelist.clone(),
             )
         };
-        self.check_dispatch_allocation(&allocation).await?;
+        self.check_step_allocation(&allocation, &job_nodelist)
+            .await?;
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
         let waiter = self
@@ -5214,6 +5219,8 @@ fn validate_dispatch_snapshot(
     block_file: Option<std::path::PathBuf>,
     hostname: String,
     cluster_id: String,
+    check: BindingCheck,
+    job_nodes: Vec<String>,
 ) -> Result<(), Status> {
     let mut resources = spur_core::resource::ResourceAllocations {
         generation: allocation.generation,
@@ -5242,9 +5249,11 @@ fn validate_dispatch_snapshot(
         .map(spur_core::gpu_binding::from_proto)
     {
         refresh_bound_gpu_properties(&mut inventory, &binding, std::path::Path::new("/sys"))?;
-        binding
-            .validate(&hostname, &inventory, &resources)
-            .map_err(Status::failed_precondition)?;
+        match check {
+            BindingCheck::Dispatch => binding.validate(&hostname, &inventory, &resources),
+            BindingCheck::Step => binding.validate_step(&hostname, &inventory, &resources),
+        }
+        .map_err(Status::failed_precondition)?;
     }
     let Some(binding) = allocation
         .fabric_binding
@@ -5259,12 +5268,16 @@ fn validate_dispatch_snapshot(
         })?;
         let file =
             spur_core::block_file::BlockFile::read(path).map_err(Status::failed_precondition)?;
-        if &file.revision != revision || !file.contains(&binding.key.fabric_domain, &hostname) {
+        let revision_changed = check == BindingCheck::Dispatch && &file.revision != revision;
+        let node_left = std::iter::once(&hostname)
+            .chain(&job_nodes)
+            .any(|node| !file.contains(&binding.key.fabric_domain, node));
+        if revision_changed || node_left {
             return Err(Status::failed_precondition(
                 "block file revision or node membership changed",
             ));
         }
-        if binding.observed_key.is_none()
+        if check == BindingCheck::Dispatch
             && binding.active_endpoints.iter().any(|endpoint| {
                 endpoint.rsplit_once('/').is_none_or(|(node, id)| {
                     !file.contains(&binding.key.fabric_domain, node) || id.parse::<u64>().is_err()
@@ -5282,9 +5295,12 @@ fn validate_dispatch_snapshot(
             "fabric namespace differs from authenticated cluster",
         ));
     }
-    binding
-        .validate(&binding.key.namespace, &hostname, &inventory, &resources)
-        .map_err(Status::failed_precondition)
+    let namespace = binding.key.namespace.clone();
+    match check {
+        BindingCheck::Dispatch => binding.validate(&namespace, &hostname, &inventory, &resources),
+        BindingCheck::Step => binding.validate_step(&namespace, &hostname, &inventory, &resources),
+    }
+    .map_err(Status::failed_precondition)
 }
 
 fn refresh_bound_gpu_properties(
@@ -5357,7 +5373,6 @@ fn refresh_bound_fabric(
             .as_ref()
             .is_some_and(|f| f.source == "amd-ualink");
         let check_new_observation = binding.file_revision.is_some()
-            && binding.observed_key.is_none()
             && topology.fabric.is_none()
             && topology.pci_bdf.is_some();
         if !refresh_native && !check_new_observation {
@@ -7335,6 +7350,7 @@ impl SlurmAgent for AgentService {
             job_entry,
             job_attempt,
             allocation,
+            job_nodelist,
         ) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
@@ -7379,9 +7395,11 @@ impl SlurmAgent for AgentService {
                 entry,
                 tracked.run_attempt,
                 Self::tracked_allocation(tracked),
+                tracked.nodelist.clone(),
             )
         };
-        self.check_dispatch_allocation(&allocation).await?;
+        self.check_step_allocation(&allocation, &job_nodelist)
+            .await?;
         if job_attempt != step_run_attempt {
             return Err(Status::aborted(
                 "job attempt changed while admitting the step",
@@ -8614,7 +8632,7 @@ impl SlurmAgent for AgentService {
                 Self::tracked_allocation(tracked),
             )
         };
-        self.check_dispatch_allocation(&allocation).await?;
+        self.check_step_allocation(&allocation, &nodelist).await?;
         let mut host_device_plan: Option<spur_devices::inject::HostInjectionPlan> = None;
         let custody_dir = crate::stepd::StepdStore::new(&self.stepd_state_dir).session_dir(
             init.job_id,
@@ -9362,7 +9380,35 @@ impl AgentService {
         &self,
         allocation: &ResourceAllocations,
     ) -> Result<(), Status> {
-        self.check_current_dispatch_generation(allocation)?;
+        self.check_bindings(allocation, BindingCheck::Dispatch, Vec::new())
+            .await
+    }
+
+    /// `job_nodelist` lets a file-bound step confirm every allocated node is still in its block.
+    async fn check_step_allocation(
+        &self,
+        allocation: &ResourceAllocations,
+        job_nodelist: &str,
+    ) -> Result<(), Status> {
+        let job_nodes = if job_nodelist.is_empty() {
+            Vec::new()
+        } else {
+            spur_core::hostlist::expand(job_nodelist)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?
+        };
+        self.check_bindings(allocation, BindingCheck::Step, job_nodes)
+            .await
+    }
+
+    async fn check_bindings(
+        &self,
+        allocation: &ResourceAllocations,
+        check: BindingCheck,
+        job_nodes: Vec<String>,
+    ) -> Result<(), Status> {
+        if check == BindingCheck::Dispatch {
+            self.check_current_dispatch_generation(allocation)?;
+        }
         if allocation.fabric_binding.is_none() && allocation.gpu_binding.is_none() {
             return Ok(());
         }
@@ -9378,13 +9424,18 @@ impl AgentService {
                 block_file,
                 hostname,
                 cluster_id,
+                check,
+                job_nodes,
             )
         })
         .await
         .map_err(|error| {
             Status::internal(format!("dispatch validation worker failed: {error}"))
         })??;
-        self.check_current_dispatch_generation(allocation)
+        match check {
+            BindingCheck::Dispatch => self.check_current_dispatch_generation(allocation),
+            BindingCheck::Step => Ok(()),
+        }
     }
 
     fn tracked_allocation(tracked: &TrackedJob) -> ResourceAllocations {
@@ -17210,7 +17261,6 @@ mod tests {
         reporter.update_resources(inventory);
         let block = FabricBlock {
             file_revision: None,
-            observed_key: None,
             key: FabricBlockKey {
                 namespace: "test".into(),
                 physical_domain: "rack-a".into(),
@@ -17346,13 +17396,10 @@ mod tests {
             let mut tracked = TrackedJob::allocation_only(None);
             tracked.gpu_devices = vec![42];
             tracked.gpu_binding = Some(binding);
-            assert!(
-                service
-                    .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
-                    .await
-                    .is_err(),
-                "property {property}"
-            );
+            let step = service
+                .check_step_allocation(&AgentService::tracked_allocation(&tracked), "test-node")
+                .await;
+            assert_eq!(step.is_ok(), property == 7, "property {property}");
         }
     }
 
@@ -17396,15 +17443,23 @@ mod tests {
         recover_stepds(&service.running, vec![restored]).await;
         let jobs = service.running.lock().await;
         assert_eq!(jobs[&501].gpu_binding, Some(binding));
+        let tracked = AgentService::tracked_allocation(&jobs[&501]);
         service
-            .check_dispatch_allocation(&AgentService::tracked_allocation(&jobs[&501]))
+            .check_step_allocation(&tracked, "test-node")
             .await
             .unwrap();
         let mut live = service.reporter.snapshot_resources();
         live.generation += 1;
+        service.reporter.update_resources(live.clone());
+        service
+            .check_step_allocation(&tracked, "test-node")
+            .await
+            .unwrap();
+        assert!(service.check_dispatch_allocation(&tracked).await.is_err());
+        live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1);
         service.reporter.update_resources(live);
         assert!(service
-            .check_dispatch_allocation(&AgentService::tracked_allocation(&jobs[&501]))
+            .check_step_allocation(&tracked, "test-node")
             .await
             .is_err());
         let legacy: crate::stepd::StepdJobResources = serde_json::from_str(r#"{"cpus":4,"memory_mb":1024,"gpu_devices":[42],"cpu_ids":[0,1,2,3],"partition":"rack","nodelist":"test-node","mpi":"none"}"#).unwrap();
@@ -17444,7 +17499,7 @@ mod tests {
         tracked.gpu_devices = vec![42];
         tracked.fabric_binding = Some(binding);
         assert!(service
-            .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+            .check_step_allocation(&AgentService::tracked_allocation(&tracked), "test-node")
             .await
             .is_err());
     }
@@ -17515,11 +17570,14 @@ mod tests {
         let mut live = service.reporter.snapshot_resources();
         live.fabric_binding_version = 2;
         live.block_file_revision = Some(file.revision.clone());
+        live.gpus[0].topology = None;
         service.reporter.update_resources(live);
+        let endpoint = spur_core::block_file::declared_endpoint("test-node", 42);
         binding.version = 2;
         binding.file_revision = Some(file.revision);
-        binding.observed_key = Some(binding.key.clone());
         binding.key.fabric_domain = "a".into();
+        binding.active_endpoints = vec![endpoint.clone()];
+        binding.members[0].endpoint = endpoint;
         allocation.fabric_binding = Some(spur_core::fabric_binding::to_proto(&binding));
         assert!(service
             .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
@@ -17534,11 +17592,34 @@ mod tests {
         let mut tracked = TrackedJob::allocation_only(None);
         tracked.gpu_devices = vec![42];
         tracked.fabric_binding = Some(binding);
+        let step = AgentService::tracked_allocation(&tracked);
         std::fs::write(&path, "# reordered\nNodes=test-node BlockName=a\n").unwrap();
         service
-            .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+            .check_step_allocation(&step, "test-node")
             .await
             .unwrap();
+        std::fs::write(
+            &path,
+            "BlockName=a Nodes=test-node\nBlockName=b Nodes=other\n",
+        )
+        .unwrap();
+        service
+            .check_step_allocation(&step, "test-node")
+            .await
+            .unwrap();
+        assert!(service
+            .check_step_allocation(&step, "test-node,other")
+            .await
+            .is_err());
+        std::fs::write(&path, "BlockName=a Nodes=test-node,other\n").unwrap();
+        service
+            .check_step_allocation(&step, "test-node,other")
+            .await
+            .unwrap();
+        assert!(service
+            .allocate_local_resources(502, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .is_err());
         for replacement in [Some("BlockName=b Nodes=test-node"), Some("bad input"), None] {
             if let Some(text) = replacement {
                 std::fs::write(&path, text).unwrap();
@@ -17546,7 +17627,7 @@ mod tests {
                 std::fs::remove_file(&path).unwrap();
             }
             assert!(service
-                .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+                .check_step_allocation(&step, "test-node")
                 .await
                 .is_err());
             let error = service
@@ -17563,7 +17644,7 @@ mod tests {
         }
         std::fs::write(&path, text).unwrap();
         service
-            .check_dispatch_allocation(&AgentService::tracked_allocation(&tracked))
+            .check_step_allocation(&step, "test-node")
             .await
             .unwrap();
     }

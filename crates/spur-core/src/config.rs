@@ -962,8 +962,6 @@ impl AuthConfig {
 pub struct PartitionConfig {
     pub name: String,
     #[serde(default)]
-    pub fabric: Option<crate::partition::PartitionFabric>,
-    #[serde(default)]
     pub default: bool,
     #[serde(default = "default_partition_state")]
     pub state: String,
@@ -2601,7 +2599,6 @@ impl SlurmConfig {
         self.partitions
             .iter()
             .map(|pc| Partition {
-                fabric: pc.fabric.clone(),
                 name: pc.name.clone(),
                 state: match pc.state.to_uppercase().as_str() {
                     "UP" => PartitionState::Up,
@@ -5077,41 +5074,5 @@ memlock = "inherit"
             config.rlimits.memlock_limit().unwrap(),
             MemlockLimit::Inherit
         );
-    }
-}
-
-#[cfg(test)]
-mod fabric_policy_tests {
-    use super::*;
-
-    #[test]
-    fn preconfigured_mode_is_partition_policy() {
-        let config = SlurmConfig::load_from_str(
-            r#"cluster_name = "test"
-[[partitions]]
-name = "gpu"
-nodes = "ALL"
-[partitions.fabric]
-mode = "preconfigured"
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            config.build_partitions()[0]
-                .fabric
-                .as_ref()
-                .unwrap()
-                .mode_str(),
-            "preconfigured"
-        );
-        assert!(SlurmConfig::load_from_str(
-            r#"cluster_name = "test"
-[[partitions]]
-name = "gpu"
-[partitions.fabric]
-mode = "per_job"
-"#
-        )
-        .is_err());
     }
 }

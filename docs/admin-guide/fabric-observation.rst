@@ -4,13 +4,13 @@ External fabric observations
 Spur can report GPU membership in a fabric partition configured by an external
 manager. With ``[devices] auto_detect = true`` (the default), ``spurd`` reads
 AMD UALink attributes during local device discovery and inventory refresh.
-No intermediate inventory file or AFM credentials are required on the agent.
+No intermediate inventory file or fabric-manager credentials are required on the agent.
 Discovery performs no fabric configuration writes.
 
 Observation is independent of job placement requirements. Jobs can request
 single-block placement using the discovered membership, as described below.
-This neither reserves a whole topology block nor verifies AFM readiness or
-fabric isolation.
+This neither reserves a whole topology block nor verifies fabric-manager
+readiness or fabric isolation.
 
 Inspecting a node
 -----------------
@@ -26,11 +26,12 @@ bytes, and fabric observations. For example:
       FabricSource=amd-ualink Observation=observed PhysicalDomain=... FabricDomain=15 Endpoint=63 EndpointState=active Transport=UALoE
       PhysicalCapacity=72 FabricCapacity=4 ActiveEndpoints=[60,61,62,63] LocalEndpoints=[60,61,62,63]
 
-``observed`` (``ObservationStatus::Consistent`` internally) means the attributes
-were read consistently; the serialized name is retained for compatibility. It does not mean
-``Ready`` in AFM. Other statuses are ``incomplete`` (missing, malformed, or
+``observed`` means the attributes were read consistently. It does not mean the
+external fabric manager reports the partition as ready. Other statuses are ``incomplete`` (missing, malformed, or
 unreadable fields), ``inconsistent`` (conflicting or changing observations),
 ``unavailable`` (the source/device could not be observed), and ``unknown``.
+Issue kinds are ``missing``, ``unreadable``, ``malformed``, ``too_large``,
+``conflict``, ``changed``, ``unavailable``, and ``unknown``.
 ``ObservationIssues`` identifies affected fields and stable diagnostic kinds.
 Unknown NUMA locality remains ``unknown`` rather than becoming NUMA node zero.
 
@@ -42,7 +43,8 @@ participate in refresh even when device IDs and GPU counts remain constant.
 Identity and capacity
 ---------------------
 
-``PhysicalDomain`` identifies a physical pod; ``FabricDomain`` is a vPod ID
+``PhysicalDomain`` identifies a physical pod; ``FabricDomain`` is a vPod (virtual
+pod: the accelerator partition configured by the external fabric manager) ID
 scoped to that physical pod. Equal vPod numbers on different physical pods do
 not imply connectivity. The controller scopes domain
 identities by the configured ``cluster_name`` administrative namespace. PCI host bridge names and GPU
@@ -87,8 +89,10 @@ Older agents and saved inventories omit it. New agents send typed
 node/resource responses preserve them. Unknown wire status values map to
 ``unknown``. Existing allocated device identities remain accounted for during
 inventory changes, while missing devices' old fabric observations become
-unavailable. A full discovery dropout also marks retained declaration-only GPUs
-unavailable, even if they previously had no native topology metadata. During
+unavailable. When ``block_file`` is configured, a full discovery dropout also
+marks retained declaration-only GPUs unavailable. GPUs with neither a fabric
+observation nor a block file are left unchanged, so a failed scan does not
+alter plain GPU inventory. During
 partial loss, a missing held GPU retains its accounting identity with an
 unavailable marker. These markers participate in inventory refresh and disable
 affected block placement; identity retention does not establish device presence.
@@ -177,9 +181,11 @@ configured. Observations do not establish links between vPods, so the controller
 does not invent parent switches, distances, or bandwidth. An explicit
 ``[[topology.switches]]`` hierarchy retains precedence in tree mode. Existing
 block configurations without any native/file membership source retain grouping
-by ``block_size`` (18 by default). An invalid or unavailable membership source
-does not fall back to groups inferred from node count. ``plugin = "none"``
-disables the locality model.
+by ``block_size`` (18 by default). Readable but incomplete or inconsistent fabric
+observations do not fall back to groups inferred from node count. Unavailable
+markers alone, such as those left by a failed discovery scan, carry no membership
+evidence: if no block or file remains, ``block_size`` grouping applies.
+``plugin = "none"`` disables the locality model.
 
 The existing submission options request locality using this model:
 
@@ -193,30 +199,11 @@ is a hard single-vPod requirement. ``--topology none`` skips the locality hint.
 Omitting the option retains ordinary resource ordering. To require containment,
 add the job constraint below. Locality hints cannot relax that requirement.
 
-Read-only ownership and job placement
--------------------------------------
+Job placement
+-------------
 
-Declare externally configured fabric ownership on the partition:
-
-.. code-block:: toml
-
-   [[partitions]]
-   name = "gpu"
-   nodes = "node[01-04]"
-   default = true
-
-   [partitions.fabric]
-   mode = "preconfigured"
-
-This mode records that the fabric is managed externally. Spur observes membership;
-it does not create, resize, or delete fabric groups. It does not impose a
-single-block requirement on every GPU job. Managed modes are not implemented
-and are rejected. The mode is persisted with the partition and shown as
-``FabricMode`` by ``spur control show partition``. Administrator commands can
-create or update it using ``--fabric-mode preconfigured`` or ``FabricMode=preconfigured``;
-``FabricMode=none`` clears it. Reconfiguration applies the partition mode in
-``spur.conf``, including clearing it when the fabric section is absent.
-
+Spur observes membership; it does not create, resize, or delete fabric groups,
+and no partition setting imposes a single-block requirement on every GPU job.
 Request hard containment with an existing constraint option:
 
 .. code-block:: console
@@ -280,13 +267,20 @@ retains its previous meaning as one literal feature name.
 
 ``same(field)`` requires one value across all selected GPUs for any field in
 the table. NUMA and PCI-root identities are scoped to a node, so identical
-local labels on different nodes do not satisfy a same-NUMA or same-root request.
+local labels on different nodes do not satisfy a same-NUMA or same-root request;
+these two groupings are rejected at submit unless the job requests ``-N 1``.
 The constraint selects GPUs; it does not pin job CPUs or memory to that NUMA
 node. Equality on a fabric-domain ID also requires one scoped block, avoiding
 accidental combinations of repeated local IDs in different racks. A file block
 name does not manufacture a GPU observation: direct domain-ID filters still
 require reported values, while ``same(gpu.fabric_domain_id)`` can use a declared
 block when native membership is absent.
+
+Malformed expressions are rejected at submit, including an unknown field such as
+``same(gpu.vpodid)`` and near-misses such as ``GPU.vram>=192GiB``,
+``same[gpu.vpod_id]``, or ``gpu.type:mi300x``, which would otherwise be read as
+node feature names. A ``job_submit`` hook that rewrites the constraint is
+validated again after the hook runs.
 
 .. code-block:: console
 
@@ -295,24 +289,23 @@ block when native membership is absent.
    spur run -N 1 -n 1 --gpus 2 --constraint='same(gpu.numa_node_id)' hostname
 
 These expressions require a GPU request or whole-node exclusivity. Upgrade
-controllers and clients together before using them. Agents must advertise
-``FabricBindingVersion`` of at least 1 for native membership, 2 for file-defined
-blocks, or 3 for additional GPU property predicates and grouping. Jobs using
-only existing fabric containment retain their older binding requirements.
+controllers and clients together before using them. Agents from this release
+report ``FabricBindingVersion=3``; older agents report 0 and are never selected
+for constrained placement.
 
 The controller persists the exact selected GPU identities and property
-snapshots with their inventory generation. Admission, the start gate, and
-steps validate those bindings, including after supervisor recovery. Native
-AMD discovery re-reads the selected devices' KFD and PCI facts before launch;
-other device providers use their reported inventory and generation. Inspection
-with ``spur control show job`` includes ``GpuPropertyNode``, ``Generation``,
-and ``StableIds``. A change invalidates the old allocation for subsequent steps;
-restoring matching values does not authorize silently rebinding that allocation
-across an inventory generation change. This does not terminate GPU processes
-already executing when the hardware changes.
+snapshots with their inventory generation. Admission and the start gate require
+that generation to be current. Steps inside a running allocation, including after
+supervisor recovery, instead re-attest the bound GPUs' own facts, so an agent
+restart or a change to another GPU does not block them. Native AMD discovery
+re-reads the selected devices' KFD and PCI facts before launch; other device
+providers use their reported inventory, so their changes apply once the agent
+reports them. Inspection with ``spur control show job``
+includes ``GpuPropertyNode``, ``Generation``, and ``StableIds``. A change to a
+bound GPU's own properties rejects subsequent steps of that allocation. This does
+not terminate GPU processes already executing when the hardware changes.
 
-Plain GPU jobs use ordinary scheduling, including when the partition has
-``mode = "preconfigured"``. They can span blocks. With a same-fabric constraint,
+Plain GPU jobs use ordinary scheduling and can span blocks. With a same-fabric constraint,
 a job waits if no single block can fit it; there is no automatic fallback.
 ``--topology none`` cannot disable that requirement. Omitting ``-p`` selects the
 configured default partition, or the first partition if no default is marked;
@@ -321,8 +314,9 @@ comma-separated partition lists. Partition names have no built-in rack meaning.
 
 Bare ``--exclusive`` retains whole-node allocation semantics. Combined with the
 same-fabric constraint, every GPU reserved on an exclusive node must belong to
-the selected block. ``ExclusiveTopo`` remains unsupported: reserving a node does
-not reserve all nodes in its block. Steps inherit their parent allocation's
+the selected block. ``ExclusiveTopo=YES`` is rejected for partitions; reserving a
+node does not reserve all nodes in its block. ``ExclusiveTopo=NO`` is accepted as
+Slurm's default. Steps inherit their parent allocation's
 binding. Adding a GPU property constraint to an existing step is rejected; specify
 it when creating the allocation.
 
@@ -352,12 +346,18 @@ AMD UALink bindings reread the allowlisted attributes of the bound
 PCI devices. Missing observations, changed domains/endpoints, a changed inventory
 generation, or an unsupported binding version reject the launch. Other discovery
 sources use their current typed inventory for binding checks. No device or fabric
-configuration is written. A supervisor retains the parent binding across an
-agent restart, and numbered/interactive steps validate it before executing;
-they cannot acquire devices outside the parent allocation. Capable agents start
-with a nonzero random inventory epoch, fencing bindings from an earlier agent
-instance. An inventory change or agent restart requires requeuing a stale
-allocation before new steps can launch.
+configuration is written. Capable agents start with a nonzero random inventory
+epoch, fencing dispatches made against an earlier agent instance.
+
+A supervisor retains the parent binding across an agent restart, and
+numbered/interactive steps validate it before executing; they cannot acquire
+devices outside the parent allocation. Steps re-attest only the bound devices:
+each must still report the bound domain and endpoint, and its own endpoint must
+remain active. An agent restart, a generation change from other devices, a
+drained or stale node elsewhere in the block, or another vPod member becoming
+inactive does not block new steps. A change to a bound device's own membership
+does, until the allocation is requeued; for file bindings, so does removing any
+of the allocation's nodes from the bound block.
 
 This is a snapshot-based placement contract. An external manager can still
 change a fabric after preflight or while a job is running; operators must
@@ -365,8 +365,8 @@ coordinate such changes with running allocations. Observed membership is not
 an assertion of fabric readiness, bandwidth, security isolation, or an atomic
 fabric lease.
 
-Heterogeneous job groups with this requirement are left pending until group-wide
-binding is supported. Constrained jobs do not trigger automatic preemption,
+Heterogeneous job components with GPU property or containment constraints are
+rejected at submit until group-wide binding is supported. Constrained jobs do not trigger automatic preemption,
 idle-fill reclamation, or federation forwarding, whose current selection paths
 do not carry fabric requirements. Ordinary backfill, including future resource
 reservations, remains available. Segments, whole-block exclusivity, and per-device static import remain future
@@ -388,8 +388,7 @@ Native discovery remains authoritative when ``block_file`` is configured.
 The file adds whole-node groups for nodes without native fabric observations;
 discovered vPods need not be listed. The filename has no special meaning; an
 absolute path is required. Install the same setting and file on the controller
-and agents participating in file-defined groups. Those agents must advertise
-``FabricBindingVersion`` of at least 2. Native-only agents do not require the
+and agents participating in file-defined groups. Native-only agents do not require the
 file and use native bindings. All nodes can remain in one partition. The job
 constraint selects hard containment; plain GPU jobs retain ordinary scheduling.
 
@@ -498,8 +497,8 @@ superseded by native discovery do not require matching files on native agents.
 For later membership changes:
 
 #. Generate a complete candidate and run ``topology validate --format block``.
-#. Coordinate with running allocations. Membership changes invalidate old
-   bindings for new steps; requeue affected allocations as appropriate.
+#. Coordinate with running allocations. Moving a node to another block rejects
+   new steps of allocations bound to the old block; requeue them as appropriate.
 #. Atomically replace the file on participating agents and controllers. Use a
    temporary file in the same directory followed by rename; keep the directory
    readable by the daemon and writable only by the administrator/operator.
@@ -524,15 +523,14 @@ Revisions hash normalized block names and expanded node memberships. Comments,
 whitespace, field order, and record order do not change the revision. Membership
 or block-name changes do. During rollout, revision differences deliberately
 make affected file-only placement unavailable. Native blocks remain independent
-of file revisions. The revision covers the whole file, so even an edit to
-another record fences file-bound allocations using an older revision. Plan
-updates as a coordinated operation.
+of file revisions. The revision covers the whole file, so an edit to any record
+fences new placements and dispatches made against an older revision. Steps of a
+running file-bound allocation instead re-read the file and require every node
+of the allocation to remain in the bound block. Plan updates as a coordinated operation.
 Step dispatch is not an atomic multi-node barrier: during partial rollout, a
 step may start on nodes that still validate the old binding while another node
 rejects it. Quiesce affected allocations before changing membership.
-Existing running processes are not moved or killed by a file update. A stale
-parent allocation must be requeued before it can start further steps; restoring
-the old file may still leave a newer inventory generation that fences it.
+Existing running processes are not moved or killed by a file update.
 
 High-availability deployments follow the existing controller configuration
 model: ``reconfigure`` applies on the active leader, and does not replicate
@@ -565,16 +563,9 @@ the two records above:
 The first two jobs can use different eight-GPU blocks. The twelve-GPU job stays
 pending because it cannot fit within either block. Omitting ``-p`` uses the
 configured default partition; the constraint is independent of that default.
-``topology show`` includes ``Source=file``, ``Revision``, and
-``NativeObservation=false`` for file-only blocks. Native blocks retain their
-native domain IDs. Job inspection includes ``BlockFileRevision`` and
+``topology show`` includes ``Source=file`` and ``Revision`` for file-only blocks.
+Native blocks retain their native domain IDs. Job inspection includes ``BlockFileRevision`` and
 ``BindingVersion=2`` for file bindings, or ``BindingVersion=1`` for native
 fabric bindings, alongside exact per-node GPU bindings. The constraint uses
 the existing submission flag; no job ID environment variable
 is required when submitting a new job.
-
-Existing allocations created with file-backed native bindings before this
-precedence change keep their accounting identities, but their next step may
-be rejected because that file-defined group is no longer active. Quiesce and
-requeue those allocations to acquire fresh native bindings. File-only bindings
-and the wire representation of existing bindings remain supported.

@@ -590,7 +590,7 @@ fn mixed_fleet_schedules_native_and_file_blocks_with_independent_revision_checks
 }
 
 #[test]
-fn explicit_requirements_work_in_one_partition_with_readonly_ownership() {
+fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
     let nodes = nodes(4);
     let context = FabricSchedulingContext {
         view: FabricView::from_nodes("test", &nodes, now(), 90),
@@ -600,7 +600,6 @@ fn explicit_requirements_work_in_one_partition_with_readonly_ownership() {
         name: "rack".into(),
         nodes: "ALL".into(),
         is_default: true,
-        fabric: spur_core::partition::PartitionFabric::parse("preconfigured").unwrap(),
         ..Default::default()
     }];
     let busy = HashMap::new();

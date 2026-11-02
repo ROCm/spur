@@ -159,9 +159,6 @@ pub enum ScontrolCommand {
         /// (0 = immediately preemptable; omit to use the global default)
         #[arg(long)]
         preempt_exempt_time: Option<u32>,
-        /// Fabric ownership: preconfigured (read-only) or none
-        #[arg(long)]
-        fabric_mode: Option<String>,
     },
     /// Update a partition
     #[command(name = "update-partition")]
@@ -239,9 +236,6 @@ pub enum ScontrolCommand {
         /// preemption. 0 is a valid value (immediately preemptable).
         #[arg(long)]
         preempt_exempt_time: Option<u32>,
-        /// Fabric ownership: preconfigured (read-only) or none
-        #[arg(long)]
-        fabric_mode: Option<String>,
         /// Clear the partition's preempt_exempt_time override, reverting to the
         /// global scheduler.preempt_exempt_time default.
         #[arg(long)]
@@ -424,7 +418,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             priority_tier,
             preempt_mode,
             preempt_exempt_time,
-            fabric_mode,
         } => {
             create_partition(
                 &args.controller,
@@ -445,7 +438,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 priority_tier,
                 &preempt_mode,
                 preempt_exempt_time,
-                fabric_mode,
             )
             .await
         }
@@ -474,7 +466,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             priority_tier,
             preempt_mode,
             preempt_exempt_time,
-            fabric_mode,
             clear_preempt_exempt_time,
         } => {
             let selector_map = match selector {
@@ -506,7 +497,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 priority_tier,
                 preempt_mode,
                 preempt_exempt_time,
-                fabric_mode,
                 clear_preempt_exempt_time,
             };
             update_partition(&args.controller, req).await
@@ -849,14 +839,6 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         &part.preempt_mode
                     },
                     part.priority_tier
-                );
-                print!(
-                    " FabricMode={}",
-                    if part.fabric_mode.is_empty() {
-                        "none"
-                    } else {
-                        &part.fabric_mode
-                    }
                 );
                 if let Some(t) = part.preempt_exempt_time {
                     if t > 0 {
@@ -1292,6 +1274,15 @@ fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
     output
 }
 
+/// Spur never isolates whole topology blocks, so only Slurm's default is accepted.
+fn reject_exclusive_topo(value: &str) -> Result<()> {
+    match value.to_ascii_lowercase().as_str() {
+        "no" | "0" | "false" => Ok(()),
+        "yes" | "1" | "true" => bail!("ExclusiveTopo=YES is not supported"),
+        _ => bail!("invalid value for ExclusiveTopo=: '{value}'"),
+    }
+}
+
 fn node_state_name(state: i32) -> &'static str {
     spur_core::node::NodeState::from_proto_i32(state)
         .map(|s| s.display_upper())
@@ -1437,7 +1428,6 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
     let mut priority_tier: u32 = 1;
     let mut preempt_mode = String::new();
     let mut preempt_exempt_time: Option<u32> = None;
-    let mut fabric_mode: Option<String> = None;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1457,13 +1447,12 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                 "denyqos" => deny_qos = value.into(),
                 "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().unwrap_or(1),
                 "preemptmode" => preempt_mode = value.to_uppercase(),
-                "fabricmode" => fabric_mode = Some(value.into()),
                 "preemptexempttime" => {
                     preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
                         anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
                     })?);
                 }
-                "exclusivetopo" => bail!("ExclusiveTopo is not supported"),
+                "exclusivetopo" => reject_exclusive_topo(value)?,
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
                 | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser" | "lln"
@@ -1497,7 +1486,6 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
         priority_tier,
         &preempt_mode,
         preempt_exempt_time,
-        fabric_mode,
     )
     .await?;
 
@@ -1824,7 +1812,6 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     let mut priority_tier: Option<u32> = None;
     let mut preempt_mode: Option<String> = None;
     let mut preempt_exempt_time: Option<u32> = None;
-    let mut fabric_mode: Option<String> = None;
     let mut clear_preempt_exempt_time = false;
 
     for param in params {
@@ -1859,7 +1846,6 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                 priority_tier = Some(value.parse().map_err(|_| invalid())?)
             }
             "preemptmode" => preempt_mode = Some(value.to_uppercase()),
-            "fabricmode" => fabric_mode = Some(value.into()),
             "preemptexempttime" => {
                 preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
                     anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
@@ -1870,7 +1856,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                     || value == "1"
                     || value.eq_ignore_ascii_case("true");
             }
-            "exclusivetopo" => bail!("ExclusiveTopo is not supported"),
+            "exclusivetopo" => reject_exclusive_topo(value)?,
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
             | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser" | "lln"
@@ -1910,7 +1896,6 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
         priority_tier,
         preempt_mode,
         preempt_exempt_time,
-        fabric_mode,
         clear_preempt_exempt_time,
     };
 
@@ -2000,10 +1985,7 @@ async fn create_partition(
     priority_tier: u32,
     preempt_mode: &str,
     preempt_exempt_time: Option<u32>,
-    fabric_mode: Option<String>,
 ) -> Result<()> {
-    spur_core::partition::PartitionFabric::parse(fabric_mode.as_deref().unwrap_or_default())
-        .map_err(anyhow::Error::msg)?;
     let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
@@ -2028,7 +2010,6 @@ async fn create_partition(
             priority_tier,
             preempt_mode: preempt_mode.to_string(),
             preempt_exempt_time,
-            fabric_mode: fabric_mode.unwrap_or_default(),
         })
         .await
         .context("failed to create partition")?;
@@ -2044,9 +2025,6 @@ async fn update_partition(
     controller: &str,
     req: spur_proto::proto::UpdatePartitionRequest,
 ) -> Result<()> {
-    if let Some(mode) = &req.fabric_mode {
-        spur_core::partition::PartitionFabric::parse(mode).map_err(anyhow::Error::msg)?;
-    }
     let channel = crate::authclient::connect(controller)
         .await
         .context("failed to connect to spurctld")?;
@@ -2468,20 +2446,42 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn unsupported_topology_exclusivity_fails_before_connecting() {
+    async fn exclusive_topology_accepts_only_slurms_default() {
         for params in [
             vec!["PartitionName=rack".into(), "ExclusiveTopo=yes".into()],
+            vec!["ExclusiveTopo=YES".into(), "PartitionName=rack".into()],
+        ] {
+            let error = parse_and_create_partition("not-a-controller", &params)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("ExclusiveTopo=YES is not supported"));
+            let error = parse_and_update_partition("not-a-controller", &params)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("ExclusiveTopo=YES is not supported"));
+        }
+        for params in [
+            vec!["PartitionName=rack".into(), "ExclusiveTopo=NO".into()],
             vec!["ExclusiveTopo=no".into(), "PartitionName=rack".into()],
         ] {
             let error = parse_and_create_partition("not-a-controller", &params)
                 .await
                 .unwrap_err();
-            assert!(error.to_string().contains("ExclusiveTopo is not supported"));
-            let error = parse_and_update_partition("not-a-controller", &params)
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("ExclusiveTopo is not supported"));
+            assert!(!error.to_string().contains("ExclusiveTopo"), "{error}");
         }
+        let error = parse_and_create_partition(
+            "not-a-controller",
+            &["PartitionName=rack".into(), "ExclusiveTopo=maybe".into()],
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid value for ExclusiveTopo="));
     }
 
     #[test]

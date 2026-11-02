@@ -177,7 +177,9 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Submit a job array, e.g. ``0-99%10``. See :ref:`submit-arrays`.
    * - ``--constraint``
      - ``-C``
-     - Required node features, e.g. ``mi300x,nvlink``.
+     - Required node features, e.g. ``mi300x,nvlink``, and optional GPU
+       predicates such as ``same(gpu.fabric_domain_id)``. See
+       :ref:`submit-topology`.
    * - ``--nodelist``
      - ``-w``
      - Request a specific list of nodes.
@@ -227,6 +229,8 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
        Works with ``--parsable`` (ID printed at submission, then blocks).
        Also accepted as an ``#SBATCH --wait`` directive in scripts.
 
+.. _submit-topology:
+
 Topology Locality and Block Containment
 ---------------------------------------
 
@@ -252,9 +256,9 @@ domain filters are also supported; OR combinations are not supported. The constr
 
 ``--topology none`` skips the hint without disabling an explicit constraint.
 Omitting ``-p`` uses the default partition and does not alter the constraint.
-A partition's ``mode = "preconfigured"`` describes read-only fabric ownership;
-a plain GPU job in that partition still uses ordinary scheduling. Partition
-names have no built-in topology meaning. See
+A malformed GPU expression, such as an unknown field or an uppercase ``GPU.``
+prefix, is rejected at submit with ``unsupported GPU constraint``; it is never
+treated as a node feature. Partition names have no built-in topology meaning. See
 :doc:`/admin-guide/fabric-observation` for configuration and inspection.
 
 .. _submit-export:

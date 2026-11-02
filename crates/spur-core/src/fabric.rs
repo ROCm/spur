@@ -12,7 +12,6 @@ pub use spur_devices::topology::{FabricObservation, ObservationStatus};
 use crate::node::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FabricBlockKey {
     pub namespace: String,
     pub physical_domain: String,
@@ -20,7 +19,6 @@ pub struct FabricBlockKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FabricDeviceKey {
     pub node: String,
     pub stable_id: u64,
@@ -45,9 +43,6 @@ pub struct FabricBlock {
     pub issues: Vec<String>,
     #[serde(default)]
     pub file_revision: Option<String>,
-    /// Legacy file-backed native identity; current producers leave this unset.
-    #[serde(default)]
-    pub observed_key: Option<FabricBlockKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +92,18 @@ struct Report<'a> {
     observation: &'a FabricObservation,
 }
 
+pub(crate) fn heartbeat_is_fresh(
+    last: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    timeout_secs: u64,
+) -> bool {
+    last.is_some_and(|last| {
+        let age = now.signed_duration_since(last);
+        age >= chrono::Duration::zero()
+            && age.num_seconds() < timeout_secs.min(i64::MAX as u64) as i64
+    })
+}
+
 impl FabricView {
     pub fn from_nodes(
         namespace: &str,
@@ -128,10 +135,10 @@ impl FabricView {
                             node: node.name.clone(),
                             stable_id: gpu.stable_id,
                         },
-                        issue: if observation.is_some() {
-                            "missing_domain"
-                        } else {
-                            "missing_observation"
+                        issue: match observation.map(|o| o.status) {
+                            None => "missing_observation",
+                            Some(ObservationStatus::Unavailable) => "unavailable_observation",
+                            Some(_) => "missing_domain",
                         }
                         .into(),
                     });
@@ -239,12 +246,7 @@ fn assemble_block(
         if !node.state.is_up() {
             issues.insert("node_unavailable");
         }
-        let fresh = node.last_heartbeat.is_some_and(|last| {
-            let age = now.signed_duration_since(last);
-            age >= chrono::Duration::zero()
-                && age.num_seconds() < heartbeat_timeout_secs.min(i64::MAX as u64) as i64
-        });
-        if !fresh {
+        if !heartbeat_is_fresh(node.last_heartbeat, now, heartbeat_timeout_secs) {
             issues.insert("stale_node");
         }
         if observation.source.trim().is_empty() {
@@ -350,7 +352,6 @@ fn assemble_block(
         },
         issues: issues.into_iter().map(str::to_string).collect(),
         file_revision: None,
-        observed_key: None,
     }
 }
 
@@ -461,7 +462,6 @@ impl From<&FabricView> for spur_proto::proto::GetFabricTopologyResponse {
             stable_id: key.stable_id,
         };
         Self {
-            single_block_partitions: Vec::new(),
             notices: view
                 .notices
                 .iter()
@@ -495,11 +495,6 @@ impl From<&FabricView> for spur_proto::proto::GetFabricTopologyResponse {
                     fabric_capacity: block.fabric_capacity,
                     issues: block.issues.clone(),
                     file_revision: block.file_revision.clone(),
-                    observed_key: block.observed_key.as_ref().map(|k| proto::FabricBlockKey {
-                        namespace: k.namespace.clone(),
-                        physical_domain: k.physical_domain.clone(),
-                        fabric_domain: k.fabric_domain.clone(),
-                    }),
                 })
                 .collect(),
             unresolved: view
@@ -554,11 +549,6 @@ impl TryFrom<spur_proto::proto::GetFabricTopologyResponse> for FabricView {
                     fabric_capacity: block.fabric_capacity,
                     issues: block.issues,
                     file_revision: block.file_revision,
-                    observed_key: block.observed_key.map(|k| FabricBlockKey {
-                        namespace: k.namespace,
-                        physical_domain: k.physical_domain,
-                        fabric_domain: k.fabric_domain,
-                    }),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -760,6 +750,8 @@ mod tests {
         assert!(result.blocks[0]
             .issues
             .contains(&"unregistered_endpoints".into()));
+        observation(&mut nodes[0]).status = ObservationStatus::Unavailable;
+        assert_eq!(view(&nodes).unresolved[0].issue, "unavailable_observation");
     }
 
     #[test]

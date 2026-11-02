@@ -101,12 +101,18 @@ impl<'a> Constraints<'a> {
         let typed = value.contains("same(")
             || (value.contains("gpu.") && value.contains(['(', ')', '=', '<', '>', '!']));
         if !typed {
+            let features: Vec<_> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if let Some(term) = features.iter().find(|term| looks_like_gpu_term(term)) {
+                return Err(format!(
+                    "unsupported GPU constraint {term:?}: use lowercase gpu.<field><op><value> or same(gpu.<field>)"
+                ));
+            }
             return Ok(Self {
-                features: value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect(),
+                features,
                 ..Default::default()
             });
         }
@@ -225,6 +231,19 @@ impl<'a> Constraints<'a> {
     }
 }
 
+/// Near-misses of the typed syntax would otherwise become node features that never match.
+fn looks_like_gpu_term(term: &str) -> bool {
+    term.split(['&', '|']).map(str::trim).any(|part| {
+        let lower = part.to_ascii_lowercase();
+        let same = lower
+            .strip_prefix("same")
+            .is_some_and(|rest| rest.trim_start().starts_with(['(', '[']));
+        let gpu = lower.starts_with("gpu.")
+            && part.contains(['(', ')', '[', ']', '=', '<', '>', '!', ':', '~']);
+        same || gpu
+    })
+}
+
 fn parse_number(raw: &str, bytes: bool) -> Result<u64, String> {
     let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
     let number = raw[..split]
@@ -258,6 +277,23 @@ pub fn requires_gpu_properties(spec: &JobSpec) -> bool {
 
 pub fn validate(spec: &JobSpec) -> Result<(), String> {
     let constraints = Constraints::parse(spec.constraint.as_deref())?;
+    if !constraints.has_gpu() {
+        return Ok(());
+    }
+    if spec.het_group.is_some() {
+        return Err("GPU property constraints are not supported for heterogeneous jobs".into());
+    }
+    if spec.num_nodes > 1
+        && constraints
+            .same
+            .iter()
+            .any(|field| matches!(field, GpuField::Numa | GpuField::PciRoot))
+    {
+        return Err(
+            "same(gpu.numa_node_id) and same(gpu.pcie_root_id) group GPUs within one node; request -N 1"
+                .into(),
+        );
+    }
     if constraints.has_gpu()
         && crate::gpu_request::resolve_gpu_demand(spec)
             .map_err(|e| e.to_string())?
@@ -309,8 +345,22 @@ mod tests {
             "gpu.vram==1",
             "gpu.type=",
             "gpu.unknown=1",
+            "GPU.vram>=192GiB",
+            "fast,Gpu.type=mi300x",
+            "gpu.type:mi300x",
+            "gpu.vram~192GiB",
+            "same[gpu.vpod_id]",
+            "SAME (gpu.vpod_id)",
+            "fast&GPU.vram>=1GiB",
+            "fast&SAME(gpu.vpod_id)",
         ] {
             assert!(Constraints::parse(Some(value)).is_err(), "{value}");
+        }
+        for feature in ["gpu.fast", "GPU.big", "samesite", "same"] {
+            assert_eq!(
+                Constraints::parse(Some(feature)).unwrap().features,
+                [feature]
+            );
         }
         assert!(Constraints::parse(Some(&["gpu.type=a"; 33].join("&"))).is_err());
     }
@@ -400,6 +450,30 @@ mod property_tests {
                 .group_key("n0", &gpu)
                 .is_none());
         }
+    }
+
+    #[test]
+    fn submit_rejects_requests_that_can_never_be_placed() {
+        let spec = |constraint: &str, nodes: u32| JobSpec {
+            constraint: Some(constraint.into()),
+            num_nodes: nodes,
+            num_tasks: nodes,
+            gpus: Some(crate::gpu_request::GpuRequest::new(2, None)),
+            ..Default::default()
+        };
+        for field in ["numa_node_id", "pcie_root_id"] {
+            let constraint = format!("same(gpu.{field})");
+            assert!(validate(&spec(&constraint, 1)).is_ok());
+            assert!(validate(&spec(&constraint, 2))
+                .unwrap_err()
+                .contains("-N 1"));
+        }
+        assert!(validate(&spec("same(gpu.vpod_id)", 2)).is_ok());
+        let mut het = spec("gpu.vram>=1GiB", 1);
+        het.het_group = Some(0);
+        assert!(validate(&het).unwrap_err().contains("heterogeneous"));
+        het.constraint = Some("fast".into());
+        assert!(validate(&het).is_ok());
     }
 
     #[test]

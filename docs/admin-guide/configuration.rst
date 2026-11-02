@@ -2739,8 +2739,8 @@ See :doc:`/deployment/managed-kubernetes` for provisioning a Spur-owned cluster.
    (string, e.g. ``"http://peer-ctrl:6817"``). Defaults to no peers.
 
 ``[topology]``
-   **Reload: Live.** Optional block/tree configuration for locality-aware
-   scheduling.
+   **Reload: Live** on the controller; agents read the ``external.block_file``
+   path at startup and re-read the file's contents during inventory refresh. Optional block/tree configuration for locality-aware scheduling.
    ``plugin`` (string, default ``"none"``) selects the model: ``"tree"`` for a
    switch hierarchy, ``"block"`` for flat groups, or ``"none"`` to disable.
    In tree mode, each ``[[topology.switches]]`` entry has ``name`` (string),
@@ -2750,8 +2750,11 @@ See :doc:`/deployment/managed-kubernetes` for provisioning a Spur-owned cluster.
    mode when no explicit switches are configured. Membership is refreshed each
    scheduling cycle. In block mode without a membership source, ``block_size``
    (integer, default ``18``) sets the number of nodes per block. It is not used to
-   infer vPods. Defaults to no topology. See :doc:`fabric-observation` for locality
-   options and the separate partition constraint that requires one block.
+   infer vPods. ``[topology.external] block_file`` (absolute path, default unset)
+   adds whole-node ``BlockName=... Nodes=...`` groups for nodes without native
+   fabric observations; native discovery takes precedence. Defaults to no
+   topology. Jobs require single-block placement with
+   ``--constraint='same(gpu.fabric_domain_id)'``; see :doc:`fabric-observation`.
 
 ``[burst_buffer]``
    **Reload: Live.** Burst-buffer capacity. ``total_gb`` (integer, default ``0``)
@@ -2792,20 +2795,3 @@ See Also
 - :doc:`accounting`
 - :doc:`/deployment/ansible`
 - :doc:`/deployment/native-host`
-
-External fabric block source
-----------------------------
-
-``[partitions.fabric] mode = "preconfigured"`` declares externally owned,
-read-only fabric membership for a partition. It does not require every GPU job
-to fit one block. Jobs request that outcome with
-``--constraint='same(gpu.fabric_domain_id)'`` (alias ``same(gpu.vpod_id)``).
-Plain GPU jobs retain ordinary placement and may span blocks.
-
-The optional ``[topology.external] block_file`` absolute path adds
-administrator/operator whole-node definitions using ``BlockName=... Nodes=...``
-records for nodes without native fabric observations. Native discovery takes
-precedence: overlapping records are ignored with informational or warning
-notices, and discovered nodes need not appear in the file. Both sources feed
-the existing block/tree topology. See :doc:`fabric-observation` for the supported syntax,
-controller and agent installation, revision fencing, reconfiguration, and examples.

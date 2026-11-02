@@ -194,10 +194,8 @@ fn format_view(view: &FabricView) -> String {
         if let Some(revision) = &block.file_revision {
             let _ = writeln!(
                 out,
-                "BlockName={} Source=file Revision={} NativeObservation={}",
-                block.key.fabric_domain,
-                revision,
-                block.observed_key.is_some()
+                "BlockName={} Source=file Revision={}",
+                block.key.fabric_domain, revision
             );
         }
         let _ = writeln!(
@@ -329,7 +327,6 @@ mod tests {
             unresolved: Vec::new(),
             blocks: vec![FabricBlock {
                 file_revision: None,
-                observed_key: None,
                 key: FabricBlockKey {
                     namespace: "test".into(),
                     physical_domain: "rack-a".into(),

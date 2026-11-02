@@ -988,6 +988,11 @@ fn spawn_inventory_refresh(
             fresh.generation = reporter.snapshot_resources().generation + 1;
 
             let old = reporter.snapshot_resources();
+            let block_path = config
+                .as_ref()
+                .and_then(|c| c.topology.as_ref())
+                .and_then(|t| t.external.as_ref())
+                .and_then(|e| e.block_file.as_deref());
 
             // A failed scan cannot safely remove capacity, but old fabric
             // observations must no longer appear current.
@@ -999,15 +1004,10 @@ fn spawn_inventory_refresh(
                 );
                 fresh = old.clone();
                 fresh.generation = old.generation + 1;
-                reporter::mark_fabric_unavailable(&mut fresh);
+                reporter::mark_fabric_unavailable(&mut fresh, block_path.is_some());
             }
 
             reporter::retain_native_fabric_loss(&old, &mut fresh);
-            let block_path = config
-                .as_ref()
-                .and_then(|c| c.topology.as_ref())
-                .and_then(|t| t.external.as_ref())
-                .and_then(|e| e.block_file.as_deref());
             reporter::refresh_block_file(&mut fresh, block_path);
             let held: std::collections::HashSet<u64> = {
                 let a = allocation.lock().await;

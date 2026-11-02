@@ -637,9 +637,13 @@ fn bdf_anchor(stable_id: u64) -> u64 {
     stable_id & !spur_devices::cdi::STABLE_ID_PARTITION_MASK
 }
 
-pub fn mark_fabric_unavailable(resources: &mut ResourceSet) {
+/// Plain GPUs without fabric evidence stay untouched, so a failed scan does not churn their inventory.
+pub fn mark_fabric_unavailable(resources: &mut ResourceSet, declared: bool) {
     for gpu in &mut resources.gpus {
-        mark_gpu_fabric_unavailable(gpu);
+        let observed = gpu.topology.as_ref().is_some_and(|t| t.fabric.is_some());
+        if declared || observed {
+            mark_gpu_fabric_unavailable(gpu);
+        }
     }
 }
 
@@ -1088,7 +1092,7 @@ mod tests {
         };
         baseline.gpus[0].topology = Some(observed_topology("15"));
         let mut unavailable = baseline.clone();
-        mark_fabric_unavailable(&mut unavailable);
+        mark_fabric_unavailable(&mut unavailable, false);
         assert_eq!(unavailable.gpus[0].stable_id, 128);
         assert_eq!(unavailable.cpus, 8);
         assert_eq!(unavailable.memory_mb, 1024);
@@ -1108,8 +1112,33 @@ mod tests {
             baseline.schedulable_fingerprint()
         );
         let previous = unavailable.clone();
-        mark_fabric_unavailable(&mut unavailable);
+        mark_fabric_unavailable(&mut unavailable, false);
         assert_eq!(previous, unavailable);
+    }
+
+    #[test]
+    fn discovery_failure_leaves_plain_gpu_inventory_unchanged() {
+        let baseline = ResourceSet {
+            gpus: vec![gpu(0, 128)],
+            cpus: 8,
+            memory_mb: 1024,
+            generation: 7,
+            ..Default::default()
+        };
+        let mut retained = baseline.clone();
+        retained.generation += 1;
+        mark_fabric_unavailable(&mut retained, false);
+        assert!(retained.gpus[0].topology.is_none());
+        assert_eq!(
+            classify(&baseline, &retained, &Default::default()),
+            InventoryDelta::Unchanged
+        );
+        assert_eq!(
+            retained.schedulable_fingerprint(),
+            baseline.schedulable_fingerprint()
+        );
+        mark_fabric_unavailable(&mut retained, true);
+        assert!(retained.gpus[0].topology.is_some());
     }
 
     fn declaration_only_node(
@@ -1253,7 +1282,7 @@ mod tests {
             let baseline = node.total_resources.clone();
             let mut unavailable = baseline.clone();
             unavailable.generation += 1;
-            mark_fabric_unavailable(&mut unavailable);
+            mark_fabric_unavailable(&mut unavailable, true);
             assert_eq!(
                 classify(&baseline, &unavailable, &Default::default()),
                 InventoryDelta::FreeCapacityChanged
@@ -1282,7 +1311,7 @@ mod tests {
                 RefreshAction::ApplyCapacity
             );
             let repeated = unavailable.clone();
-            mark_fabric_unavailable(&mut unavailable);
+            mark_fabric_unavailable(&mut unavailable, true);
             assert_eq!(repeated, unavailable);
             node.total_resources = unavailable;
             assert!(!declaration_only_view(&file, &node).blocks[0]

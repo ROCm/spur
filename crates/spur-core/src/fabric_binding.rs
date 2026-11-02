@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use spur_devices::topology::ObservationStatus;
 
 use crate::fabric::{FabricBlock, FabricBlockKey, FabricMember};
-use crate::gpu_binding::{binding_generation_matches, binding_gpu_ids_match};
+use crate::gpu_binding::{binding_generation_matches, binding_gpu_ids_match, BindingCheck};
 use crate::resource::{ResourceAllocations, ResourceSet};
 
 pub const FABRIC_BINDING_VERSION: u32 = 1;
@@ -24,9 +24,6 @@ pub struct FabricBinding {
     pub members: Vec<FabricMember>,
     #[serde(default)]
     pub file_revision: Option<String>,
-    /// Legacy file-backed native identity; current producers leave this unset.
-    #[serde(default)]
-    pub observed_key: Option<FabricBlockKey>,
 }
 
 impl FabricBinding {
@@ -57,19 +54,49 @@ impl FabricBinding {
                 FABRIC_BINDING_VERSION
             },
             file_revision: block.file_revision.clone(),
-            observed_key: block.observed_key.clone(),
             key: block.key.clone(),
             active_endpoints: block.active_endpoints.clone(),
             members,
         })
     }
 
+    /// Placement and dispatch check: the node must still report the exact inventory
+    /// generation, block file revision, and vPod endpoint set the binding was made under.
     pub fn validate(
         &self,
         namespace: &str,
         node: &str,
         inventory: &ResourceSet,
         allocation: &ResourceAllocations,
+    ) -> Result<(), String> {
+        self.check(
+            namespace,
+            node,
+            inventory,
+            allocation,
+            BindingCheck::Dispatch,
+        )
+    }
+
+    /// Step check inside a running allocation: re-attest only the bound devices' own
+    /// membership, so agent restarts and changes elsewhere in the vPod do not fence it.
+    pub fn validate_step(
+        &self,
+        namespace: &str,
+        node: &str,
+        inventory: &ResourceSet,
+        allocation: &ResourceAllocations,
+    ) -> Result<(), String> {
+        self.check(namespace, node, inventory, allocation, BindingCheck::Step)
+    }
+
+    fn check(
+        &self,
+        namespace: &str,
+        node: &str,
+        inventory: &ResourceSet,
+        allocation: &ResourceAllocations,
+        check: BindingCheck,
     ) -> Result<(), String> {
         let expected_version = if self.file_revision.is_some() {
             FILE_BINDING_VERSION
@@ -89,25 +116,20 @@ impl FabricBinding {
         if self.node != node || self.inventory_generation != allocation.generation {
             return Err("fabric binding targets a different node or generation".into());
         }
-        if !binding_generation_matches(self.inventory_generation, inventory, allocation) {
+        if check == BindingCheck::Dispatch
+            && !binding_generation_matches(self.inventory_generation, inventory, allocation)
+        {
             return Err("stale fabric binding inventory generation".into());
         }
         if let Some(revision) = &self.file_revision {
-            if revision.len() != 64
-                || !revision.bytes().all(|b| b.is_ascii_hexdigit())
-                || inventory.block_file_revision.as_ref() != Some(revision)
-            {
-                return Err("stale or invalid block file revision".into());
+            if revision.len() != 64 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("invalid block file revision".into());
             }
-        } else if self.observed_key.is_some() {
-            return Err("native binding cannot override its observed key".into());
-        }
-        let observed_key = self.observed_key.as_ref().unwrap_or(&self.key);
-        if observed_key.namespace != namespace
-            || observed_key.physical_domain != self.key.physical_domain
-            || observed_key.fabric_domain.is_empty()
-        {
-            return Err("invalid observed block scope".into());
+            if check == BindingCheck::Dispatch
+                && inventory.block_file_revision.as_ref() != Some(revision)
+            {
+                return Err("stale block file revision".into());
+            }
         }
         let active: BTreeSet<_> = self.active_endpoints.iter().collect();
         if active.is_empty() || active.len() != self.active_endpoints.len() {
@@ -131,12 +153,9 @@ impl FabricBinding {
             if matches.next().is_some() {
                 return Err("fabric binding GPU identity is ambiguous".into());
             }
-            if self.file_revision.is_some() && self.observed_key.is_none() {
-                if gpu
-                    .topology
-                    .as_ref()
-                    .and_then(|t| t.fabric.as_ref())
-                    .is_some()
+            let observation = gpu.topology.as_ref().and_then(|t| t.fabric.as_ref());
+            if self.file_revision.is_some() {
+                if observation.is_some()
                     || member.endpoint
                         != crate::block_file::declared_endpoint(node, member.device.stable_id)
                     || !active.contains(&member.endpoint)
@@ -145,19 +164,20 @@ impl FabricBinding {
                 }
                 continue;
             }
-            let observation = gpu
-                .topology
-                .as_ref()
-                .and_then(|t| t.fabric.as_ref())
-                .ok_or("fabric observation is missing")?;
+            let observation = observation.ok_or("fabric observation is missing")?;
+            let observed_active: BTreeSet<_> = observation.active_endpoints.iter().collect();
+            let endpoints_hold = match check {
+                BindingCheck::Dispatch => observed_active == active,
+                BindingCheck::Step => observed_active.contains(&member.endpoint),
+            };
             if observation.status != ObservationStatus::Consistent
                 || !observation.issues.is_empty()
-                || observation.physical_domain_id.as_ref() != Some(&observed_key.physical_domain)
-                || observation.fabric_domain_id.as_ref() != Some(&observed_key.fabric_domain)
+                || observation.physical_domain_id.as_ref() != Some(&self.key.physical_domain)
+                || observation.fabric_domain_id.as_ref() != Some(&self.key.fabric_domain)
                 || observation.endpoint_id.as_ref() != Some(&member.endpoint)
                 || !active.contains(&member.endpoint)
                 || !observation.local_endpoints.contains(&member.endpoint)
-                || observation.active_endpoints.iter().collect::<BTreeSet<_>>() != active
+                || !endpoints_hold
             {
                 return Err("fabric observation no longer matches the bound membership".into());
             }
@@ -173,14 +193,6 @@ pub fn to_proto(binding: &FabricBinding) -> spur_proto::proto::FabricBinding {
         node: binding.node.clone(),
         inventory_generation: binding.inventory_generation,
         file_revision: binding.file_revision.clone(),
-        observed_key: binding
-            .observed_key
-            .as_ref()
-            .map(|k| proto::FabricBlockKey {
-                namespace: k.namespace.clone(),
-                physical_domain: k.physical_domain.clone(),
-                fabric_domain: k.fabric_domain.clone(),
-            }),
         key: Some(proto::FabricBlockKey {
             namespace: binding.key.namespace.clone(),
             physical_domain: binding.key.physical_domain.clone(),
@@ -207,14 +219,9 @@ pub fn from_proto(binding: spur_proto::proto::FabricBinding) -> FabricBinding {
     let key = binding.key.unwrap_or_default();
     FabricBinding {
         version: binding.version,
-        node: binding.node.clone(),
+        node: binding.node,
         inventory_generation: binding.inventory_generation,
         file_revision: binding.file_revision,
-        observed_key: binding.observed_key.map(|k| FabricBlockKey {
-            namespace: k.namespace,
-            physical_domain: k.physical_domain,
-            fabric_domain: k.fabric_domain,
-        }),
         key: FabricBlockKey {
             namespace: key.namespace,
             physical_domain: key.physical_domain,
@@ -281,7 +288,6 @@ mod tests {
         };
         let block = FabricBlock {
             file_revision: None,
-            observed_key: None,
             key: FabricBlockKey {
                 namespace: "test".into(),
                 physical_domain: "rack-a".into(),
@@ -378,7 +384,8 @@ mod tests {
         assert!(allocation.fabric_binding.is_none());
         let binding: FabricBinding = serde_json::from_str(r#"{"version":1,"node":"n1","inventory_generation":7,"key":{"namespace":"test","physical_domain":"rack-a","fabric_domain":"7"},"active_endpoints":["1"],"members":[{"device":{"node":"n1","stable_id":42},"endpoint":"1","inventory_generation":7}]}"#).unwrap();
         assert!(binding.file_revision.is_none());
-        assert!(binding.observed_key.is_none());
+        let newer: FabricBinding = serde_json::from_str(r#"{"version":1,"node":"n1","inventory_generation":7,"key":{"namespace":"test","physical_domain":"rack-a","fabric_domain":"7","future":1},"active_endpoints":["1"],"members":[{"device":{"node":"n1","stable_id":42,"future":1},"endpoint":"1","inventory_generation":7}],"future":1}"#).unwrap();
+        assert_eq!(newer, binding);
         let (_, inventory, allocation) = fixture();
         binding
             .validate("test", "n1", &inventory, &allocation)
@@ -403,6 +410,74 @@ mod tests {
         allocation.generation = 0;
         assert!(binding
             .validate("test", "n1", &inventory, &allocation)
+            .is_err());
+    }
+
+    #[test]
+    fn step_check_reattests_only_the_bound_devices() {
+        let (mut binding, mut inventory, allocation) = fixture();
+        let fabric = |inventory: &mut ResourceSet| {
+            inventory.gpus[0]
+                .topology
+                .as_mut()
+                .unwrap()
+                .fabric
+                .as_mut()
+                .unwrap()
+                .clone()
+        };
+        let set = |inventory: &mut ResourceSet, observation: FabricObservation| {
+            inventory.gpus[0].topology.as_mut().unwrap().fabric = Some(observation);
+        };
+        binding.active_endpoints.push("2".into());
+        let mut observation = fabric(&mut inventory);
+        observation.active_endpoints = vec!["1".into(), "2".into()];
+        set(&mut inventory, observation.clone());
+        inventory.generation = 9;
+        assert!(binding
+            .validate("test", "n1", &inventory, &allocation)
+            .is_err());
+        binding
+            .validate_step("test", "n1", &inventory, &allocation)
+            .unwrap();
+        observation.active_endpoints = vec!["1".into()];
+        set(&mut inventory, observation.clone());
+        binding
+            .validate_step("test", "n1", &inventory, &allocation)
+            .unwrap();
+        observation.active_endpoints = vec!["2".into()];
+        set(&mut inventory, observation.clone());
+        assert!(binding
+            .validate_step("test", "n1", &inventory, &allocation)
+            .is_err());
+        observation.active_endpoints = vec!["1".into()];
+        observation.status = ObservationStatus::Unavailable;
+        set(&mut inventory, observation);
+        assert!(binding
+            .validate_step("test", "n1", &inventory, &allocation)
+            .is_err());
+    }
+
+    #[test]
+    fn file_step_ignores_an_unrelated_revision_change() {
+        let (mut binding, mut inventory, allocation) = fixture();
+        inventory.gpus[0].topology = None;
+        inventory.fabric_binding_version = FILE_BINDING_VERSION;
+        inventory.block_file_revision = Some("b".repeat(64));
+        let endpoint = crate::block_file::declared_endpoint("n1", 42);
+        binding.version = FILE_BINDING_VERSION;
+        binding.file_revision = Some("a".repeat(64));
+        binding.active_endpoints = vec![endpoint.clone()];
+        binding.members[0].endpoint = endpoint;
+        assert!(binding
+            .validate("test", "n1", &inventory, &allocation)
+            .is_err());
+        binding
+            .validate_step("test", "n1", &inventory, &allocation)
+            .unwrap();
+        binding.file_revision = Some("not-hex".into());
+        assert!(binding
+            .validate_step("test", "n1", &inventory, &allocation)
             .is_err());
     }
 

@@ -7,11 +7,33 @@ use std::collections::BTreeSet;
 
 pub const GPU_PROPERTIES_CAPABILITY: u32 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingCheck {
+    Dispatch,
+    Step,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundGpu {
     pub stable_id: u64,
     pub gpu_type: String,
     pub topology: Option<DeviceTopology>,
+}
+
+impl BoundGpu {
+    /// Keeps only this device's own entry in shared endpoint lists, so a step is not
+    /// fenced by changes to other accelerators.
+    fn own_facts(&self) -> Self {
+        let mut facts = self.clone();
+        if let Some(fabric) = facts.topology.as_mut().and_then(|t| t.fabric.as_mut()) {
+            let own = fabric.endpoint_id.clone();
+            fabric.active_endpoints.retain(|e| Some(e) == own.as_ref());
+            fabric.local_endpoints.retain(|e| Some(e) == own.as_ref());
+            fabric.physical_capacity = None;
+            fabric.fabric_capacity = None;
+        }
+        facts
+    }
 }
 
 impl From<&GpuResource> for BoundGpu {
@@ -58,6 +80,26 @@ impl GpuBinding {
         inventory: &ResourceSet,
         allocation: &ResourceAllocations,
     ) -> Result<(), String> {
+        self.check(node, inventory, allocation, BindingCheck::Dispatch)
+    }
+
+    /// Re-attests the bound devices' own properties without the node-wide generation fence.
+    pub fn validate_step(
+        &self,
+        node: &str,
+        inventory: &ResourceSet,
+        allocation: &ResourceAllocations,
+    ) -> Result<(), String> {
+        self.check(node, inventory, allocation, BindingCheck::Step)
+    }
+
+    fn check(
+        &self,
+        node: &str,
+        inventory: &ResourceSet,
+        allocation: &ResourceAllocations,
+        check: BindingCheck,
+    ) -> Result<(), String> {
         if node.is_empty()
             || self.node != node
             || inventory.fabric_binding_version < GPU_PROPERTIES_CAPABILITY
@@ -66,7 +108,10 @@ impl GpuBinding {
                 "GPU property binding has an invalid node or unsupported agent capability".into(),
             );
         }
-        if !binding_generation_matches(self.generation, inventory, allocation) {
+        if self.generation != allocation.generation
+            || (check == BindingCheck::Dispatch
+                && !binding_generation_matches(self.generation, inventory, allocation))
+        {
             return Err("stale GPU property binding inventory generation".into());
         }
         if !binding_gpu_ids_match(allocation, self.gpus.iter().map(|gpu| gpu.stable_id)) {
@@ -77,9 +122,11 @@ impl GpuBinding {
                 .gpus
                 .iter()
                 .filter(|g| g.stable_id == expected.stable_id);
-            if !found.next().is_some_and(|g| BoundGpu::from(g) == *expected)
-                || found.next().is_some()
-            {
+            let same = |gpu: &GpuResource| match check {
+                BindingCheck::Dispatch => BoundGpu::from(gpu) == *expected,
+                BindingCheck::Step => BoundGpu::from(gpu).own_facts() == expected.own_facts(),
+            };
+            if !found.next().is_some_and(same) || found.next().is_some() {
                 return Err("GPU properties changed or the allocated device disappeared".into());
             }
         }
@@ -212,6 +259,46 @@ mod tests {
         wrong = allocation.clone();
         wrong.generation = 0;
         assert!(binding.validate("n0", &inventory, &wrong).is_err());
+    }
+
+    #[test]
+    fn step_check_ignores_generation_and_vpod_wide_fields_only() {
+        use spur_devices::topology::{FabricObservation, ObservationStatus};
+        let (mut inventory, allocation) = fixture();
+        inventory.gpus[0].topology.as_mut().unwrap().fabric = Some(FabricObservation {
+            status: ObservationStatus::Consistent,
+            fabric_domain_id: Some("15".into()),
+            endpoint_id: Some("1".into()),
+            active_endpoints: vec!["1".into(), "2".into()],
+            fabric_capacity: Some(2),
+            ..Default::default()
+        });
+        let binding = GpuBinding::new("n0", &inventory, &allocation).unwrap();
+        let mut changed = inventory.clone();
+        changed.generation += 1;
+        let fabric = changed.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap();
+        fabric.active_endpoints = vec!["1".into()];
+        fabric.fabric_capacity = Some(1);
+        assert!(binding.validate("n0", &changed, &allocation).is_err());
+        binding.validate_step("n0", &changed, &allocation).unwrap();
+        for mutate in 0..4 {
+            let mut own = changed.clone();
+            let topology = own.gpus[0].topology.as_mut().unwrap();
+            let fabric = topology.fabric.as_mut().unwrap();
+            match mutate {
+                0 => fabric.fabric_domain_id = Some("16".into()),
+                1 => fabric.status = ObservationStatus::Unavailable,
+                2 => fabric.active_endpoints = vec!["2".into()],
+                _ => topology.numa_node = Some(1),
+            }
+            assert!(binding.validate_step("n0", &own, &allocation).is_err());
+        }
     }
 
     #[test]

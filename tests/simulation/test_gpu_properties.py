@@ -119,6 +119,7 @@ def test_spec_gpu_quantity_forms(sim, extra):
 @pytest.mark.parametrize("expression", [
     "gpu.vram=18446744073709551615GiB", "gpu.type>mi300x", "gpu.numa_node_id=-1",
     "gpu.unknown=1", "same(gpu.pcie_root_id)|fast", "gpu.vram>=192GiB&",
+    "GPU.vram>=192GiB", "same[gpu.vpod_id]", "gpu.type:mi300x",
 ])
 def test_invalid_or_unsupported_property_grammar_is_rejected(sim, expression):
     result = sim.cli("submit", "--gpus", 1, "--constraint", expression, "--wrap", "true", check=False)
@@ -146,9 +147,8 @@ def test_unsupported_spec_block_and_managed_cli_is_explicitly_rejected(sim, flag
     ("accel_state", "inactive", "state"),
     ("link_type", "changed", "transport"),
     ("accel_id", "99", "endpoint"),
-    ("ppod_size", "71", "physical_capacity"),
     ("vpod_size", "7", "fabric_capacity"),
-    ("vpod_active_accels", "0", "active_endpoints"),
+    ("vpod_active_accels", "4 5 6 7", "active_endpoints"),
     ("local_accels", "99", "local_endpoints"),
     ("vpod_id", "<missing>", "vpod"),
 ])
@@ -168,6 +168,33 @@ def test_changed_gpu_facts_reject_steps_with_old_binding(sim, field, value, key)
         sim.cancel(job)
         sim.call("reset")
         sim.wait(lambda: sim.inventory()[node] == before)
+
+
+@pytest.mark.parametrize("field,value,key", [
+    ("ppod_size", "71", "physical_capacity"),
+    ("vpod_active_accels", "0 1 2 3", "active_endpoints"),
+])
+def test_vpod_wide_changes_keep_steps_of_a_property_binding(sim, field, value, key):
+    node = "sim-node-0"
+    before = sim.inventory()[node]
+    job = sim.submit("gpu.vram>=24GiB", extra=["--nodelist", node])
+    assert node in sim.selected(job)
+    try:
+        sim.call("mutate", node, field, value)
+        sim.wait(lambda: sim.inventory()[node][0][key] != before[0][key])
+        result = sim.call("step", job, "-N", 1, "-n", 1, "hostname")
+        assert node in result.stdout.splitlines()
+    finally:
+        sim.cancel(job)
+        sim.call("reset")
+        sim.wait(lambda: sim.inventory()[node] == before)
+
+
+def test_local_grouping_across_nodes_is_rejected_at_submit(sim):
+    result = sim.cli("submit", "-N", 2, "-n", 2, "--gpus", 2, "--constraint",
+                     "same(gpu.numa_node_id)", "--wrap", "true", check=False)
+    assert result.returncode != 0
+    assert "-N 1" in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("field,value,expression", [

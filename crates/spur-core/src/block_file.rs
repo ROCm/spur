@@ -297,10 +297,8 @@ impl DefinedBlock {
             if !node.state.is_up() {
                 issues.insert(format!("node_unavailable:{name}"));
             }
-            if node.last_heartbeat.is_none_or(|t| {
-                (now - t).num_seconds() < 0
-                    || (now - t).num_seconds() as u64 > heartbeat_timeout_secs
-            }) {
+            if !crate::fabric::heartbeat_is_fresh(node.last_heartbeat, now, heartbeat_timeout_secs)
+            {
                 issues.insert(format!("stale_node:{name}"));
             }
             if check_revision
@@ -355,7 +353,6 @@ impl DefinedBlock {
             fabric_capacity: None,
             issues: issues.into_iter().collect(),
             file_revision: Some(revision.into()),
-            observed_key: None,
         }
     }
 }
@@ -432,7 +429,6 @@ mod tests {
         assert_eq!(view.blocks[0].members.len(), 4);
         assert_eq!(view.unresolved.len(), 4);
         assert!(view.blocks[0].issues.is_empty());
-        assert!(view.blocks[0].observed_key.is_none());
         assert!(view.notices.is_empty());
         let allocation = ResourceAllocations {
             generation: 7,

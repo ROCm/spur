@@ -400,11 +400,14 @@ impl TopologyConfig {
         if !matches!(self.plugin.as_str(), "tree" | "block") {
             return None;
         }
+        // Unavailable markers carry no fabric evidence, so plain clusters keep sized blocks.
         let has_membership_source = !view.blocks.is_empty()
-            || view
-                .unresolved
-                .iter()
-                .any(|item| item.issue != "missing_observation")
+            || view.unresolved.iter().any(|item| {
+                !matches!(
+                    item.issue.as_str(),
+                    "missing_observation" | "unavailable_observation"
+                )
+            })
             || self
                 .external
                 .as_ref()
@@ -588,14 +591,6 @@ mod external_config_tests {
             serde_json::from_str(r#"{"plugin":"none","switches":[],"block_size":null}"#).unwrap();
         assert!(config.external.is_none());
     }
-
-    #[test]
-    fn obsolete_partition_list_is_rejected() {
-        assert!(toml::from_str::<TopologyConfig>(
-            "[external]\nsingle_block_partitions = [\"rack\"]\n"
-        )
-        .is_err());
-    }
 }
 
 #[cfg(test)]
@@ -635,7 +630,6 @@ mod discovery_tests {
                     fabric_capacity: None,
                     issues: vec![],
                     file_revision: None,
-                    observed_key: None,
                 })
                 .collect(),
         }
@@ -697,7 +691,7 @@ mod discovery_tests {
     }
 
     #[test]
-    fn unavailable_source_does_not_fall_back_to_sized_blocks() {
+    fn only_readable_fabric_evidence_replaces_sized_blocks() {
         let config = TopologyConfig {
             plugin: "block".into(),
             ..Default::default()
@@ -713,6 +707,8 @@ mod discovery_tests {
             issue: "missing_domain".into(),
         });
         assert!(config.build(&nodes, &view).unwrap().node_switch.is_empty());
+        view.unresolved[0].issue = "unavailable_observation".into();
+        assert_eq!(config.build(&nodes, &view).unwrap().node_switch.len(), 1);
         view.unresolved.clear();
         assert_eq!(config.build(&nodes, &view).unwrap().node_switch.len(), 1);
         let file_config = TopologyConfig {

@@ -1238,6 +1238,8 @@ impl ClusterManager {
         check_submission_size(&spec)?;
 
         self.run_job_submit_hook(&mut spec, &partitions)?;
+        // The hook may rewrite constraint and GPU fields that were validated above.
+        spur_core::constraints::validate(&spec).map_err(SubmitError::invalid)?;
 
         // Every input to wall-time defaulting — partition, account, QOS — is a field
         // the hook may rewrite, so defaulting follows the hook and reads the scope
@@ -2502,7 +2504,6 @@ impl ClusterManager {
                 .ok_or_else(|| anyhow::anyhow!("fabric block is no longer consistent"))?;
             if block.active_endpoints != binding.active_endpoints
                 || block.file_revision != binding.file_revision
-                || block.observed_key != binding.observed_key
                 || binding
                     .members
                     .iter()
@@ -2521,6 +2522,85 @@ impl ClusterManager {
                     allocation,
                 )
                 .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
+    /// Steps re-attest their nodes' own bound devices; whole-block health gates placement only.
+    pub(crate) fn validate_step_bindings(
+        &self,
+        job: &Job,
+        step_nodes: &[String],
+    ) -> anyhow::Result<()> {
+        if job
+            .per_node_alloc
+            .values()
+            .all(|a| a.fabric_binding.is_none() && a.gpu_binding.is_none())
+        {
+            return Ok(());
+        }
+        let constraints =
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        let properties = !constraints.same.is_empty() || !constraints.predicates.is_empty();
+        let config = self.config();
+        let block_file = config
+            .topology
+            .as_ref()
+            .and_then(|t| t.external.as_ref())
+            .and_then(|e| e.loaded_block_file.as_ref());
+        let keys: std::collections::BTreeSet<_> = job
+            .per_node_alloc
+            .values()
+            .filter_map(|a| a.fabric_binding.as_ref().map(|b| &b.key))
+            .collect();
+        if keys.len() > 1 {
+            anyhow::bail!("allocation crosses fabric blocks");
+        }
+        for name in step_nodes {
+            let allocation = job
+                .per_node_alloc
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("missing allocation for {name}"))?;
+            let needs_properties = properties || allocation.gpu_binding.is_some();
+            let needs_fabric = constraints.same_fabric || allocation.fabric_binding.is_some();
+            if !needs_properties && !needs_fabric {
+                continue;
+            }
+            let node = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("bound node {name} disappeared"))?;
+            if needs_properties {
+                allocation
+                    .gpu_binding
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing GPU property binding for {name}"))?
+                    .validate_step(name, &node.total_resources, allocation)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            if needs_fabric {
+                let binding = allocation
+                    .fabric_binding
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing fabric binding for {name}"))?;
+                if binding.file_revision.is_some()
+                    && !block_file.is_some_and(|file| {
+                        job.allocated_nodes
+                            .iter()
+                            .all(|node| file.contains(&binding.key.fabric_domain, node))
+                    })
+                {
+                    anyhow::bail!("block file no longer declares the allocation in one block");
+                }
+                binding
+                    .validate_step(
+                        &config.cluster_name,
+                        name,
+                        &node.total_resources,
+                        allocation,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            }
         }
         Ok(())
     }
@@ -5792,7 +5872,6 @@ impl ClusterManager {
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
         preempt_exempt_time: Option<Option<u32>>,
-        fabric_mode: Option<String>,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -5832,9 +5911,6 @@ impl ClusterManager {
             max_nodes.map(Some)
         };
 
-        if let Some(mode) = &fabric_mode {
-            spur_core::partition::PartitionFabric::parse(mode).map_err(PartitionError::invalid)?;
-        }
         self.propose(WalOperation::PartitionUpdate {
             name: name.to_string(),
             nodes,
@@ -5853,7 +5929,6 @@ impl ClusterManager {
             preempt_mode,
             is_default,
             preempt_exempt_time,
-            fabric_mode,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         Ok(())
@@ -6011,7 +6086,6 @@ impl ClusterManager {
                 // Only push a WAL change when TOML explicitly sets the field;
                 // absent means "leave whatever the runtime WAL already has".
                 preempt_exempt_time: part.preempt_exempt_time.map(Some),
-                fabric_mode: Some(part.fabric.as_ref().map_or("", |f| f.mode_str()).into()),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -8635,7 +8709,6 @@ impl ClusterManager {
                 preempt_mode,
                 is_default,
                 preempt_exempt_time,
-                fabric_mode,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -8693,14 +8766,6 @@ impl ClusterManager {
                         }
                         if let Some(def) = is_default {
                             part.is_default = *def;
-                        }
-                        if let Some(mode) = fabric_mode {
-                            match spur_core::partition::PartitionFabric::parse(mode) {
-                                Ok(fabric) => part.fabric = fabric,
-                                Err(error) => {
-                                    warn!(name, %error, "invalid fabric mode in partition update")
-                                }
-                            }
                         }
                         if let Some(et) = preempt_exempt_time {
                             part.preempt_exempt_time = *et;
@@ -10881,7 +10946,6 @@ mod tests {
             scheduler: Default::default(),
             auth: Default::default(),
             partitions: vec![spur_core::config::PartitionConfig {
-                fabric: None,
                 name: "default".into(),
                 default: true,
                 state: "UP".into(),
@@ -11370,6 +11434,206 @@ nodes = "ALL"
             dir.path()
         )
         .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steps_reattest_own_devices_while_placement_needs_a_healthy_block() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let observed = |endpoint: &str, active: &[&str]| spur_core::resource::DeviceTopology {
+            fabric: Some(spur_core::fabric::FabricObservation {
+                source: "test".into(),
+                status: spur_core::fabric::ObservationStatus::Consistent,
+                physical_domain_id: Some("rack".into()),
+                fabric_domain_id: Some("15".into()),
+                endpoint_id: Some(endpoint.into()),
+                physical_capacity: Some(8),
+                fabric_capacity: Some(2),
+                active_endpoints: active.iter().map(|e| e.to_string()).collect(),
+                local_endpoints: vec![endpoint.into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (index, name) in ["n0", "n1"].into_iter().enumerate() {
+            let mut gpu = gpu_resource(0, 42);
+            gpu.topology = Some(observed(&(index + 1).to_string(), &["1", "2"]));
+            cm.register_node(
+                name.into(),
+                name.into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    generation: 7,
+                    fabric_binding_version: 1,
+                    gpus: vec![gpu],
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                true,
+            )
+            .unwrap();
+        }
+        let view = cm.fabric_view(Utc::now());
+        assert!(view.blocks[0].issues.is_empty());
+        let mut allocation = ResourceAllocations {
+            generation: 7,
+            devices: [(
+                "gpu".into(),
+                vec![spur_core::resource::AllocatedDevice::injectable(42)],
+            )]
+            .into(),
+            ..Default::default()
+        };
+        allocation.fabric_binding = Some(
+            spur_core::fabric_binding::FabricBinding::for_allocation(
+                &view.blocks[0],
+                "n0",
+                &allocation,
+            )
+            .unwrap(),
+        );
+        let mut spec = basic_spec("bound");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(1, None));
+        spec.constraint = Some("same(gpu.fabric_domain_id)".into());
+        let mut job = Job::new(1, spec);
+        job.allocated_nodes = vec!["n0".into()];
+        job.per_node_alloc = [("n0".to_string(), allocation)].into();
+        let names = job.allocated_nodes.clone();
+        let placement = || cm.validate_fabric_placement(&job, &names, &job.per_node_alloc);
+        placement().unwrap();
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+
+        cm.nodes.write().get_mut("n1").unwrap().state = NodeState::Drain;
+        assert!(placement().is_err());
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+
+        let set_own = |topology: spur_core::resource::DeviceTopology, generation: u64| {
+            let mut nodes = cm.nodes.write();
+            let inventory = &mut nodes.get_mut("n0").unwrap().total_resources;
+            inventory.generation = generation;
+            inventory.gpus[0].topology = Some(topology);
+        };
+        set_own(observed("1", &["1"]), 9);
+        assert!(placement().is_err());
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+
+        set_own(observed("1", &["2"]), 9);
+        assert!(cm
+            .validate_step_bindings(&job, &job.allocated_nodes)
+            .is_err());
+        let mut moved = observed("1", &["1", "2"]);
+        moved.fabric.as_mut().unwrap().fabric_domain_id = Some("16".into());
+        set_own(moved, 9);
+        assert!(cm
+            .validate_step_bindings(&job, &job.allocated_nodes)
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_bound_steps_require_every_allocated_node_in_the_block() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=n0,n1\nBlockName=b Nodes=n2").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology]
+plugin = "block"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "default"
+nodes = "ALL"
+default = true
+state = "UP"
+"#,
+            block_path
+        );
+        let (cm, _) = test_cluster_with_conf_file(&dir, &conf).await;
+        let revision = spur_core::block_file::BlockFile::read(&block_path)
+            .unwrap()
+            .revision;
+        for name in ["n0", "n1", "n2"] {
+            cm.register_node(
+                name.into(),
+                name.into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    generation: 7,
+                    fabric_binding_version: 2,
+                    block_file_revision: Some(revision.clone()),
+                    gpus: vec![gpu_resource(0, 42)],
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                true,
+            )
+            .unwrap();
+        }
+        let view = cm.fabric_view(Utc::now());
+        assert!(view.blocks.iter().all(|b| b.issues.is_empty()));
+        assert_eq!(view.blocks[0].key.fabric_domain, "a");
+        let mut spec = basic_spec("file-bound");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
+        spec.constraint = Some("same(gpu.fabric_domain_id)".into());
+        let mut job = Job::new(1, spec);
+        job.allocated_nodes = vec!["n0".into(), "n1".into()];
+        for name in ["n0", "n1"] {
+            let mut allocation = ResourceAllocations {
+                generation: 7,
+                devices: [(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(42)],
+                )]
+                .into(),
+                ..Default::default()
+            };
+            allocation.fabric_binding = Some(
+                spur_core::fabric_binding::FabricBinding::for_allocation(
+                    &view.blocks[0],
+                    name,
+                    &allocation,
+                )
+                .unwrap(),
+            );
+            job.per_node_alloc.insert(name.into(), allocation);
+        }
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+        cm.nodes.write().get_mut("n1").unwrap().total_resources.gpus[0].topology =
+            Some(spur_core::resource::DeviceTopology {
+                fabric: Some(spur_core::fabric::FabricObservation::default()),
+                ..Default::default()
+            });
+        cm.validate_step_bindings(&job, &["n0".into()]).unwrap();
+        assert!(cm
+            .validate_step_bindings(&job, &job.allocated_nodes)
+            .is_err());
+        cm.nodes.write().get_mut("n1").unwrap().total_resources.gpus[0].topology = None;
+        std::fs::write(&block_path, "BlockName=a Nodes=n0,n1\nBlockName=c Nodes=n2").unwrap();
+        cm.reconfigure().unwrap();
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+        std::fs::write(&block_path, "BlockName=a Nodes=n0\nBlockName=b Nodes=n1,n2").unwrap();
+        cm.reconfigure().unwrap();
+        let error = cm
+            .validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap_err();
+        assert!(error.to_string().contains("block file"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13100,7 +13364,6 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions.push(spur_core::config::PartitionConfig {
-            fabric: None,
             name: "small".into(),
             default: false,
             state: "UP".into(),
@@ -13268,6 +13531,24 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_constraint_rewrite_is_revalidated() {
+        for constraint in ["GPU.vram>=1GiB", "gpu.vram>=1GiB"] {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.hooks.job_submit = Some(write_hook_script(
+                &dir,
+                &format!(r#"echo '{{"constraint":"{constraint}"}}'"#),
+            ));
+            let cm = test_cluster_with_config(&dir, config).await;
+            let err = cm.submit_job(basic_spec("hook-constraint")).unwrap_err();
+            assert!(
+                matches!(&err, SubmitError::InvalidArgument(message) if message.contains("GPU")),
+                "{constraint}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_job_lua_modify_to_unknown_qos_is_rejected() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -13357,7 +13638,6 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
         config.partitions.push(spur_core::config::PartitionConfig {
-            fabric: None,
             name: "small".into(),
             default: false,
             state: "UP".into(),
@@ -32313,7 +32593,6 @@ state = "UP"
         let mut cfg = test_config();
         cfg.partitions = vec![
             spur_core::config::PartitionConfig {
-                fabric: None,
                 name: "default".into(),
                 default: true,
                 state: "UP".into(),
@@ -32333,7 +32612,6 @@ state = "UP"
                 preempt_exempt_time: None,
             },
             spur_core::config::PartitionConfig {
-                fabric: None,
                 name: "train".into(),
                 default: false,
                 state: "UP".into(),
@@ -32394,7 +32672,6 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.partitions = vec![spur_core::config::PartitionConfig {
-            fabric: None,
             name: "inference".into(),
             default: false,
             state: "UP".into(),
@@ -34303,7 +34580,6 @@ state = "UP"
         assert_eq!(gpu.priority_tier, 2);
 
         cm.apply_operation(&WalOperation::PartitionUpdate {
-            fabric_mode: None,
             name: "gpu".into(),
             nodes: None,
             selector: None,
@@ -34427,7 +34703,6 @@ state = "UP"
         let before = cm.get_partitions().len();
 
         cm.apply_operation(&WalOperation::PartitionUpdate {
-            fabric_mode: None,
             name: "does-not-exist".into(),
             nodes: Some("n1".into()),
             selector: None,
@@ -34473,7 +34748,6 @@ state = "UP"
 
         // Make "gpu" the default.
         cm.apply_operation(&WalOperation::PartitionUpdate {
-            fabric_mode: None,
             name: "gpu".into(),
             nodes: None,
             selector: None,

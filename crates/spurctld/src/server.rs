@@ -3080,14 +3080,6 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        if job.per_node_alloc.values().any(|allocation| {
-            allocation.fabric_binding.is_some() || allocation.gpu_binding.is_some()
-        }) {
-            self.cluster
-                .validate_fabric_placement(&job, &job.allocated_nodes, &job.per_node_alloc)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        }
-
         let step_nodes = resolve_step_nodes(
             &job.allocated_nodes,
             req.num_nodes,
@@ -3095,6 +3087,9 @@ impl SlurmController for ControllerService {
             &req.node,
         )
         .map_err(Status::invalid_argument)?;
+        self.cluster
+            .validate_step_bindings(&job, &step_nodes)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let target_node = step_nodes
             .first()
             .cloned()
@@ -3309,8 +3304,6 @@ impl SlurmController for ControllerService {
             priority_tier: req.priority_tier,
             preempt_mode,
             preempt_exempt_time: req.preempt_exempt_time,
-            fabric: spur_core::partition::PartitionFabric::parse(&req.fabric_mode)
-                .map_err(Status::invalid_argument)?,
             ..Default::default()
         };
 
@@ -3426,7 +3419,6 @@ impl SlurmController for ControllerService {
                 } else {
                     req.preempt_exempt_time.map(Some)
                 },
-                req.fabric_mode,
             )
             .map_err(partition_rpc_status)?;
 
@@ -3754,14 +3746,6 @@ impl SlurmController for ControllerService {
                 .map(Response::new);
         }
 
-        if job.per_node_alloc.values().any(|allocation| {
-            allocation.fabric_binding.is_some() || allocation.gpu_binding.is_some()
-        }) {
-            self.cluster
-                .validate_fabric_placement(&job, &job.allocated_nodes, &job.per_node_alloc)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
-        }
-
         validate_step_nodes_for_run(
             job_id,
             req.step_id,
@@ -3770,6 +3754,9 @@ impl SlurmController for ControllerService {
             &job.allocated_nodes,
         )
         .map_err(Status::failed_precondition)?;
+        self.cluster
+            .validate_step_bindings(&job, &step.nodes)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
         let num_nodes = step.nodes.len() as u32;
         let plan = build_step_task_plan(step.num_tasks, num_nodes, step.distribution);
@@ -5628,7 +5615,6 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         preempt_mode: spur_core::partition::preempt_mode_str(part.preempt_mode).to_string(),
         priority_tier: part.priority_tier,
         preempt_exempt_time: part.preempt_exempt_time,
-        fabric_mode: part.fabric.as_ref().map_or("", |f| f.mode_str()).into(),
     }
 }
 
@@ -11036,7 +11022,6 @@ mod tests {
             view.blocks[0].issues
         );
         assert!(view.blocks[0].file_revision.is_none());
-        assert!(view.blocks[0].observed_key.is_none());
         assert_eq!(view.notices.len(), 1);
         assert!(!view.notices[0].warning);
         assert!(svc.cluster.fabric_view(Utc::now()).blocks[0]
@@ -11059,56 +11044,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn partition_fabric_mode_rpc_and_round_trip() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service_with(&dir, step_test_config()).await;
-        svc.create_partition(admin_request(CreatePartitionRequest {
-            name: "external".into(),
-            nodes: "ALL".into(),
-            fabric_mode: "preconfigured".into(),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        let read = || {
-            svc.cluster
-                .get_partitions()
-                .into_iter()
-                .find(|p| p.name == "external")
-                .unwrap()
-        };
-        assert_eq!(partition_to_proto(&read()).fabric_mode, "preconfigured");
-        let error = svc
-            .update_partition(admin_request(UpdatePartitionRequest {
-                name: "external".into(),
-                fabric_mode: Some("per_job".into()),
-                ..Default::default()
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert_eq!(partition_to_proto(&read()).fabric_mode, "preconfigured");
-        svc.update_partition(admin_request(UpdatePartitionRequest {
-            name: "external".into(),
-            fabric_mode: Some(String::new()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        assert!(read().fabric.is_none());
-        svc.update_partition(admin_request(UpdatePartitionRequest {
-            name: "external".into(),
-            fabric_mode: Some("preconfigured".into()),
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-        let encoded = serde_json::to_string(&read()).unwrap();
-        let restored: spur_core::partition::Partition = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(partition_to_proto(&restored).fabric_mode, "preconfigured");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

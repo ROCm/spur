@@ -31,6 +31,7 @@ Set `SPUR_SIM_CONTROL` to an executable adapter for your isolated deployment:
 SPUR_SIM_CONTROL=/path/to/adapter pytest -q tests/simulation
 ```
 
+The suite is not in the default `testpaths` or CI; run it explicitly as above.
 Tests skip if the adapter is unset. The adapter protocol is:
 
 | Operation | Required behavior |
