@@ -82,7 +82,7 @@ noted as "accepted for compatibility" parse without error but have no effect yet
    * - QOS ``GrpWall``
      - Enforced at scheduling admission only: an over-budget QOS stops admitting jobs, and running jobs are never killed where Slurm cancels them. Consumption is a trailing window (``grp_wall_window_days`` under ``[accounting]``) rather than decayed usage, and the cap exists on a QOS only, not on an association. See :ref:`grpwall-budgets`.
    * - QOS ``GraceTime``
-     - Supported per QOS (``sacctmgr add|modify qos ... GraceTime=<seconds>``) and applies to the preempted job's QOS, as in Slurm. There is no per-partition ``GraceTime``; a partition cannot set one. It is stored now and takes effect with the preemption-grace feature, which arrives in a later change in the same release. See :ref:`qos-preempt-grace`.
+     - Supported per QOS (``sacctmgr add|modify qos ... GraceTime=<seconds>``) and applies to the preempted job's QOS, as in Slurm. There is no per-partition ``GraceTime``; a partition cannot set one. It is stored now and takes effect with the preemption-grace feature, which arrives in a later change in the same release. See :ref:`preemption grace time <qos-preempt-grace>`.
 
 Accounting and QOS Mapping
 --------------------------

@@ -540,7 +540,7 @@ QOS keys
        output) between the preemption signal and the kill, when it is
        preempted. The *victim's* QOS value applies, not the preemptor's. It is
        capped at the victim's remaining time limit, and ``0`` means no grace
-       period. See :ref:`qos-preempt-grace`.
+       period. See :ref:`preemption grace time <qos-preempt-grace>`.
    * - ``usagefactor``
      - ``1.0``
      - Multiplier applied to both CPU and GPU usage charged under this QOS.
