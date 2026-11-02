@@ -181,8 +181,9 @@ def _assert_grace_visible(cluster, victim: _Victim) -> None:
         f"EndTime must be the grace deadline, {_GRACE_SECS}s after PreemptTime:\n{show}"
     )
     lines = _marker_lines(cluster, victim.step_marker)
-    assert "CONT" in lines and lines.index("CONT") < lines.index("TERM"), (
-        f"the step must see SIGCONT before SIGTERM, saw {lines}"
+    # Bash runs pending traps in signal-number order, so the order sent is not observable here.
+    assert "CONT" in lines and "TERM" in lines, (
+        f"the step must receive both SIGCONT and SIGTERM, saw {lines}"
     )
 
 
