@@ -22224,9 +22224,14 @@ state = "UP"
 
         assert_eq!(cm.get_job(victim_id).unwrap().state, JobState::Running);
         let pending = cm.pending_jobs();
+        let hunter_pos = pending.iter().position(|j| j.job_id == hunter_id);
+        let bystander_pos = pending.iter().position(|j| j.job_id == bystander_id);
         assert!(
-            pending.iter().position(|j| j.job_id == hunter_id)
-                < pending.iter().position(|j| j.job_id == bystander_id),
+            hunter_pos.is_some() && bystander_pos.is_some(),
+            "both jobs must be pending for the ordering to mean anything"
+        );
+        assert!(
+            hunter_pos < bystander_pos,
             "while the victim is in its grace, the preemptor must stay hoisted"
         );
     }
