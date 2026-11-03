@@ -3,6 +3,7 @@
 
 //! Per-partition, per-node resource caps (`max_tres_per_node`).
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 
@@ -13,6 +14,7 @@ use spur_core::partition::{
     requested_partition_names, tres_key_report_rank, typed_gpu_tres_key, Partition, TRES_CPU,
     TRES_GPU, TRES_MEM,
 };
+use spur_core::partition_limits::MemoryAdjustment;
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 
 /// Amount a placement charges against partition caps, per TRES key (`mem` in
@@ -154,6 +156,18 @@ pub fn job_typed_gpu(job: &Job) -> Option<String> {
 /// What a running job's allocation on one node charges to its partition.
 pub fn job_node_charge(job: &Job, alloc: &ResourceAllocations) -> TresCharge {
     TresCharge::from_allocation(alloc, job_typed_gpu(job).as_deref())
+}
+
+/// The job as `partition` would run it, with its memory policy applied to
+/// the request. Borrowed when the policy changes nothing.
+pub fn job_in_partition<'a>(job: &'a Job, partition: &Partition) -> Cow<'a, Job> {
+    let adjusted = partition.memory_adjusted(&job.spec);
+    if adjusted == MemoryAdjustment::of(&job.spec) {
+        return Cow::Borrowed(job);
+    }
+    let mut job = job.clone();
+    adjusted.apply_to(&mut job.spec);
+    Cow::Owned(job)
 }
 
 /// Partitions a job may be charged to: the requested ones that exist, or the

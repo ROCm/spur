@@ -1147,6 +1147,12 @@ pub struct Job {
     #[serde(default)]
     pub effective_partition: Option<String>,
 
+    /// The request as submitted, kept while the spec carries a partition's
+    /// memory-policy adjustment, so a requeued run is re-adjusted from it
+    /// rather than from another partition's result.
+    #[serde(default)]
+    pub original_request: Option<crate::partition_limits::MemoryAdjustment>,
+
     /// Nodes the QOS/account grp-node admission check credited this job for
     /// reusing (they had spare capacity), recomputed fresh every scheduling
     /// pass. Consulted by `NodePlacement` as a nodelist fallback so placement
@@ -1221,6 +1227,7 @@ impl Job {
             preempt_qos: None,
             idle_fill: false,
             effective_partition: None,
+            original_request: None,
             preferred_nodes: HashSet::new(),
             last_sched_eval: None,
         }
@@ -1639,6 +1646,30 @@ impl Job {
             self.suspended_secs += (at - since).num_seconds().max(0);
         }
         self.suspended_by = None;
+    }
+
+    /// Record a run's partition and reshape the spec to the request that
+    /// partition's memory policy produced, keeping the submitted one.
+    pub fn start_in_partition(
+        &mut self,
+        partition: Option<String>,
+        adjustment: Option<crate::partition_limits::MemoryAdjustment>,
+    ) {
+        self.effective_partition = partition;
+        let Some(adjustment) = adjustment else {
+            return;
+        };
+        self.original_request
+            .get_or_insert_with(|| crate::partition_limits::MemoryAdjustment::of(&self.spec));
+        adjustment.apply_to(&mut self.spec);
+    }
+
+    /// Undo [`Job::start_in_partition`] when the job goes back to pending.
+    pub fn leave_partition(&mut self) {
+        self.effective_partition = None;
+        if let Some(original) = self.original_request.take() {
+            original.apply_to(&mut self.spec);
+        }
     }
 
     /// Set the scheduling reason, dropping any description the previous reason
@@ -3464,6 +3495,29 @@ mod tests {
         let value = serde_json::to_value(&job).expect("serialize job");
         let back: Job = serde_json::from_value(value).expect("deserialize job");
         assert_eq!(back.effective_partition.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn leaving_a_partition_restores_the_submitted_request() {
+        use crate::partition_limits::MemoryAdjustment;
+        let mut job = make_job();
+        let submitted = MemoryAdjustment::of(&job.spec);
+        let adjusted = MemoryAdjustment {
+            cpus_per_task: 6,
+            memory_per_node_mb: None,
+            memory_per_cpu_mb: Some(1707),
+        };
+
+        job.start_in_partition(Some("a".into()), Some(adjusted));
+        assert_eq!(MemoryAdjustment::of(&job.spec), adjusted);
+        job.leave_partition();
+        assert_eq!(job.effective_partition, None);
+        assert_eq!(MemoryAdjustment::of(&job.spec), submitted);
+        assert_eq!(job.original_request, None);
+
+        job.start_in_partition(Some("b".into()), None);
+        assert_eq!(job.effective_partition.as_deref(), Some("b"));
+        assert_eq!(MemoryAdjustment::of(&job.spec), submitted);
     }
 
     #[test]

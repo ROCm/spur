@@ -28,6 +28,9 @@ use spur_core::job::{
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
+use spur_core::partition_limits::{
+    fold_max_cpus_per_node, MemoryAdjustment, PartitionResourceLimits,
+};
 use spur_core::qos::{
     check_qos_limits_with_grp_node_charge, check_qos_standalone_limits, check_qos_submit_limits,
     QosCheckResult,
@@ -508,6 +511,64 @@ impl PartitionError {
     }
 }
 
+/// Requested changes to a partition's resource caps and memory policy; a
+/// `None` field is left as it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PartitionLimitsUpdate {
+    /// Replaces the whole cap map.
+    pub max_tres_per_node: Option<BTreeMap<String, u64>>,
+    /// Sets (`Some`) or clears (`None`) only the `cpu` cap.
+    pub max_cpus_per_node: Option<Option<u32>>,
+    pub max_mem_per_node: Option<Option<u64>>,
+    pub max_mem_per_cpu: Option<Option<u64>>,
+    pub def_mem_per_node: Option<Option<u64>>,
+    pub def_mem_per_cpu: Option<Option<u64>>,
+    pub def_mem_per_gpu: Option<Option<u64>>,
+}
+
+impl PartitionLimitsUpdate {
+    /// The limits `current` ends up with, validated as a whole; `None` when
+    /// nothing changes so the update leaves the limits untouched.
+    pub fn merged(&self, current: &Partition) -> Result<Option<PartitionResourceLimits>, String> {
+        if *self == Self::default() {
+            return Ok(None);
+        }
+        let mut limits = PartitionResourceLimits::of(current);
+        if let Some(map) = &self.max_tres_per_node {
+            limits.max_tres_per_node = map.clone();
+        }
+        if let Some(cpus) = self.max_cpus_per_node {
+            let cpu = spur_core::partition::TRES_CPU;
+            if let (Some(_), Some(cpus)) = (&self.max_tres_per_node, cpus) {
+                let map = std::mem::take(&mut limits.max_tres_per_node);
+                limits.max_tres_per_node = fold_max_cpus_per_node(map, Some(cpus))?;
+            } else if let Some(cpus) = cpus {
+                limits
+                    .max_tres_per_node
+                    .insert(cpu.to_string(), u64::from(cpus));
+            } else {
+                limits.max_tres_per_node.remove(cpu);
+            }
+        }
+        let knobs = [
+            (&mut limits.max_mem_per_node, self.max_mem_per_node),
+            (&mut limits.max_mem_per_cpu, self.max_mem_per_cpu),
+            (&mut limits.def_mem_per_node, self.def_mem_per_node),
+            (&mut limits.def_mem_per_cpu, self.def_mem_per_cpu),
+            (&mut limits.def_mem_per_gpu, self.def_mem_per_gpu),
+        ];
+        for (field, change) in knobs {
+            if let Some(value) = change {
+                *field = value;
+            }
+        }
+        let mut probe = current.clone();
+        limits.apply_to(&mut probe);
+        probe.validate_resource_limits()?;
+        Ok(Some(limits))
+    }
+}
+
 /// What the caller must dispatch to node agents after `preempt_job`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreemptOutcome {
@@ -720,9 +781,34 @@ fn gpu_ids_match(a: &[u64], b: &[u64]) -> bool {
     sa == sb
 }
 
+/// What a run is charged to, recorded with its placement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunAttribution {
+    /// Started on spare capacity outside the QOS group node quota.
+    pub idle_fill: bool,
+    /// Partition its usage counts against for partition caps.
+    pub effective_partition: Option<String>,
+    /// The request as that partition's memory policy reshaped it.
+    pub memory_adjustment: Option<spur_core::partition_limits::MemoryAdjustment>,
+}
+
+impl RunAttribution {
+    /// Attribution for a run the scheduler placed in `partition`.
+    pub fn for_partition(job: &Job, partition: Option<&Partition>, idle_fill: bool) -> Self {
+        let original = spur_core::partition_limits::MemoryAdjustment::of(&job.spec);
+        Self {
+            idle_fill,
+            effective_partition: partition.map(|p| p.name.clone()),
+            memory_adjustment: partition
+                .map(|p| p.memory_adjusted(&job.spec))
+                .filter(|adjusted| *adjusted != original),
+        }
+    }
+}
+
 pub(crate) struct PendingJobClassification {
     pub(crate) jobs: Vec<Job>,
-    reason_updates: Vec<(JobId, PendingReason)>,
+    reason_updates: Vec<ReasonUpdate>,
     bb_stage_candidates: Vec<JobId>,
     /// Jobs refused solely by their QOS group node cap that may run on capacity
     /// nobody with a claim wants. They are *not* in `jobs`: they keep reporting
@@ -1285,6 +1371,15 @@ impl ClusterManager {
                 &spec,
                 config.scheduler.enforce_part_limits,
                 &partitions,
+            )?;
+        }
+        if config.scheduler.enforce_part_limits != EnforcePartLimits::No {
+            validate_partition_resource_limits(
+                &spec,
+                config.scheduler.enforce_part_limits,
+                &partitions,
+                &self.nodes.read(),
+                &self.get_reservations(),
             )?;
         }
 
@@ -2723,8 +2818,8 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Charge a placement in Raft before dispatching, so a leader change
-    /// mid-dispatch finds it charged rather than free. Returns the run epoch.
+    /// [`Self::reserve_attributed_placement`] for a run charged to no partition.
+    #[cfg(test)]
     pub fn reserve_placement(
         &self,
         job_id: JobId,
@@ -2733,6 +2828,32 @@ impl ClusterManager {
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
         idle_fill: bool,
+    ) -> anyhow::Result<u32> {
+        self.reserve_attributed_placement(
+            job_id,
+            node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            RunAttribution {
+                idle_fill,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Charge a placement in Raft before dispatching, so a leader change
+    /// mid-dispatch finds it charged rather than free. What the run is charged
+    /// to travels in the same entry, so it survives restart and replay.
+    /// Returns the run epoch.
+    pub fn reserve_attributed_placement(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+        attribution: RunAttribution,
     ) -> anyhow::Result<u32> {
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
@@ -2777,7 +2898,9 @@ impl ClusterManager {
             per_node_alloc,
             srun_step_dispatch,
             run_attempt,
-            idle_fill,
+            idle_fill: attribution.idle_fill,
+            effective_partition: attribution.effective_partition,
+            memory_adjustment: attribution.memory_adjustment,
             at: None,
         })?;
         // The read-then-propose above is not atomic: a second reservation or a new
@@ -4058,6 +4181,7 @@ impl ClusterManager {
                     node.source = source;
                 }
                 info!(node = %name, "node updated (resources changed)");
+                self.warn_partition_cap_overcommit(&name);
             }
             RegistrationAction::Register => {
                 self.propose(WalOperation::NodeRegister {
@@ -4078,9 +4202,37 @@ impl ClusterManager {
                     node.agent_start_time = Some(Utc::now());
                 }
                 info!(node = %name, "node registered");
+                self.warn_partition_cap_overcommit(&name);
             }
         }
         Ok(())
+    }
+
+    /// Warn when the caps of the partitions sharing a node add up to more
+    /// than the node has. Valid by design, but they then contend for it.
+    pub fn warn_partition_cap_overcommit(&self, node_name: &str) {
+        let Some(node) = self.get_node(node_name) else {
+            return;
+        };
+        let partitions = self.partitions.read().clone();
+        for overcommit in partition_cap_overcommits(&node, &partitions) {
+            warn!(
+                node = %node.name,
+                resource = %overcommit.key,
+                total = overcommit.total,
+                capacity = overcommit.capacity,
+                partitions = %overcommit.partitions.join(","),
+                "partition caps on this node add up to more than it has; those partitions can contend for it"
+            );
+        }
+    }
+
+    /// [`Self::warn_partition_cap_overcommit`] for every known node.
+    pub fn warn_partition_cap_overcommits(&self) {
+        let names: Vec<String> = self.nodes.read().keys().cloned().collect();
+        for name in names {
+            self.warn_partition_cap_overcommit(&name);
+        }
     }
 
     /// Syncs node labels if they differ, rejecting the diff from an unprivileged caller instead of
@@ -5385,7 +5537,7 @@ impl ClusterManager {
             .iter()
             .map(|job| job.job_id)
             .chain(classification.idle_fill_candidates.iter().map(|j| j.job_id))
-            .chain(classification.reason_updates.iter().map(|(id, _)| *id))
+            .chain(classification.reason_updates.iter().map(|(id, _, _)| *id))
             .collect();
         self.apply_pending_reason_updates(classification.reason_updates);
         self.advance_bb_staging_for(&classification.bb_stage_candidates);
@@ -5612,13 +5764,23 @@ impl ClusterManager {
             let mut claimed_any = false;
             let grp_wall_usage = self.grp_wall_cache.usage();
             let nodes = self.nodes.read();
+            let partitions = self.partitions.read().clone();
             // An unplaceable job must not reserve grp-node quota it never uses.
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
-                match structural_unplaceable_reason(job, &nodes, &reservations) {
-                    Some(reason) => GateOutcome::Block(reason),
+                if let Some(reason) = structural_unplaceable_reason(job, &nodes, &reservations) {
+                    return GateOutcome::Block(reason);
+                }
+                match partition_cap_never_runs(job, &nodes, &reservations, &partitions) {
+                    Some(desc) => {
+                        GateOutcome::BlockDescribed(PendingReason::PartitionTresLimit, desc)
+                    }
                     None => GateOutcome::Keep,
                 }
             });
+            // Quota is charged for what the job will actually get under its
+            // partition's memory policy; placement re-derives it per partition
+            // from the original request, so that is restored below.
+            let original_requests = apply_quota_memory_requests(&mut candidates, &partitions);
             let (idle_fill_on, borrow_factor, borrow_fraction) = {
                 let cfg = self.config.read();
                 (
@@ -5726,6 +5888,13 @@ impl ClusterManager {
                 GateOutcome::Keep
             });
 
+            // Before the capacity gate: the largest request among candidates may
+            // fit no node even though another candidate partition's would.
+            let jobs_to_restore = candidates
+                .iter_mut()
+                .map(|candidate| &mut candidate.job)
+                .chain(idle_fill_candidates.iter_mut());
+            restore_original_requests(jobs_to_restore, &original_requests);
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 match resource_impossible_reason(job, &nodes, &reservations) {
                     Some(reason) => GateOutcome::Block(reason),
@@ -6078,14 +6247,14 @@ impl ClusterManager {
         self.apply_pending_reason_updates(reason_updates);
     }
 
-    fn apply_pending_reason_updates(&self, reason_updates: Vec<(JobId, PendingReason)>) {
+    fn apply_pending_reason_updates(&self, reason_updates: Vec<ReasonUpdate>) {
         if reason_updates.is_empty() {
             return;
         }
 
         let mut jobs = self.jobs.write();
         let now = Utc::now();
-        for (id, reason) in reason_updates {
+        for (id, reason, desc) in reason_updates {
             if let Some(j) = jobs.get_mut(&id) {
                 // Re-check under the write lock: the read snapshot was released,
                 // so the job may have started or been held/deadlined since.
@@ -6101,7 +6270,10 @@ impl ClusterManager {
                     {
                         continue;
                     }
-                    j.set_pending_reason(reason);
+                    match desc {
+                        Some(desc) => j.set_pending_reason_desc(reason, desc),
+                        None => j.set_pending_reason(reason),
+                    }
                 }
             }
         }
@@ -6111,6 +6283,9 @@ impl ClusterManager {
         if partition.name.is_empty() {
             return Err(PartitionError::invalid("partition name must not be empty"));
         }
+        partition
+            .validate_resource_limits()
+            .map_err(PartitionError::invalid)?;
         if self
             .partitions
             .read()
@@ -6156,13 +6331,21 @@ impl ClusterManager {
         preempt_mode: Option<String>,
         preempt_exempt_time: Option<Option<u32>>,
         grace_time: Option<Option<u32>>,
+        limits: PartitionLimitsUpdate,
     ) -> Result<(), PartitionError> {
-        if !self.partitions.read().iter().any(|p| p.name == name) {
+        let Some(current) = self
+            .partitions
+            .read()
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+        else {
             return Err(PartitionError::not_found(format!(
                 "partition '{}' not found",
                 name
             )));
-        }
+        };
+        let resource_limits = limits.merged(&current).map_err(PartitionError::invalid)?;
 
         let max_time_minutes = if let Some(ref t) = max_time {
             if t.eq_ignore_ascii_case("INFINITE") || t.eq_ignore_ascii_case("UNLIMITED") {
@@ -6214,6 +6397,7 @@ impl ClusterManager {
             is_default,
             preempt_exempt_time,
             grace_time,
+            resource_limits,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         Ok(())
@@ -6402,6 +6586,7 @@ impl ClusterManager {
                 // absent means "leave whatever the runtime WAL already has".
                 preempt_exempt_time: part.preempt_exempt_time.map(Some),
                 grace_time: part.grace_time.map(Some),
+                resource_limits: Some(PartitionResourceLimits::of(part)),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -6864,6 +7049,38 @@ impl ClusterManager {
                     job.set_pending_reason_desc(PendingReason::Resources, description);
                 }
             }
+        }
+    }
+
+    /// Name the partition cap that keeps these jobs from starting now, with
+    /// the numbers on the node closest to fitting.
+    pub fn annotate_partition_cap_pending(
+        &self,
+        unscheduled: &[&Job],
+        blocks: &HashMap<JobId, spur_sched::backfill::PartitionCapBlock>,
+    ) {
+        let now = Utc::now();
+        let mut jobs = self.jobs.write();
+        for job in unscheduled {
+            let Some(block) = blocks.get(&job.job_id) else {
+                continue;
+            };
+            let Some(desc) =
+                spur_core::job::partition_tres_limit_desc(&block.partition, &block.overshoots)
+            else {
+                continue;
+            };
+            let Some(entry) = jobs.get_mut(&job.job_id) else {
+                continue;
+            };
+            if entry.state != JobState::Pending
+                || entry.pending_reason.is_scheduling_hold()
+                || entry.pending_reason == PendingReason::DeadLine
+                || entry.reason_explains_begin_hold(now)
+            {
+                continue;
+            }
+            entry.set_pending_reason_desc(PendingReason::PartitionTresLimit, desc);
         }
     }
 
@@ -7827,6 +8044,7 @@ impl ClusterManager {
         job.allocated_nodes.clear();
         job.allocated_resources = None;
         job.per_node_alloc.clear();
+        job.leave_partition();
         job.node_completions.clear();
         job.unreported_nodes.clear();
         job.time_limit_signaled_at = None;
@@ -8517,6 +8735,8 @@ impl ClusterManager {
                 srun_step_dispatch,
                 run_attempt,
                 idle_fill,
+                effective_partition,
+                memory_adjustment,
                 at: _,
             } => {
                 // Durable backstop for `reserve_placement`'s own pre-check: a racing
@@ -8548,6 +8768,7 @@ impl ClusterManager {
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = (*run_attempt).max(job.run_attempt);
                     job.idle_fill = *idle_fill;
+                    job.start_in_partition(effective_partition.clone(), *memory_adjustment);
                     job.launch_failure_detail = None;
                     // A new run supersedes any prior preemption provenance; clear so
                     // this run's accounting record does not inherit the previous one's.
@@ -8988,6 +9209,7 @@ impl ClusterManager {
                             job.allocated_nodes.clear();
                             job.allocated_resources = None;
                             job.per_node_alloc.clear();
+                            job.leave_partition();
                             Self::deallocate_job_slices(
                                 &mut nodes,
                                 &freed_nodes,
@@ -9308,6 +9530,7 @@ impl ClusterManager {
                 is_default,
                 preempt_exempt_time,
                 grace_time,
+                resource_limits,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -9371,6 +9594,9 @@ impl ClusterManager {
                         }
                         if let Some(gt) = grace_time {
                             part.grace_time = *gt;
+                        }
+                        if let Some(limits) = resource_limits {
+                            limits.apply_to(part);
                         }
                         info!(name, "partition updated");
                     } else {
@@ -9930,7 +10156,7 @@ fn reservation_fence_reason(
 
 fn retain_unblocked(
     candidates: &mut Vec<PendingJobCandidate>,
-    reason_updates: &mut Vec<(JobId, PendingReason)>,
+    reason_updates: &mut Vec<ReasonUpdate>,
     mut block: impl FnMut(&Job) -> Option<PendingReason>,
 ) {
     candidates.retain(|candidate| {
@@ -9949,6 +10175,8 @@ enum GateOutcome {
     Keep,
     /// Drop and queue `reason` when the candidate permits reason updates.
     Block(PendingReason),
+    /// [`GateOutcome::Block`] with a `pending_reason_desc` naming the detail.
+    BlockDescribed(PendingReason, String),
     /// Drop without recording a reason. Only the burst-buffer stage-in handoff
     /// uses this: the gate reserved capacity and enqueued the job for staging,
     /// so it is tagged `BurstBufferStageIn` on the next cycle. Do not use this
@@ -9979,7 +10207,7 @@ fn job_requests_node(job: &Job, node: &str, nodes: &[Node]) -> bool {
 /// [`GateOutcome::DropUntagged`] drops without a reason.
 fn retain_eligible(
     candidates: &mut Vec<PendingJobCandidate>,
-    reason_updates: &mut Vec<(JobId, PendingReason)>,
+    reason_updates: &mut Vec<ReasonUpdate>,
     mut gate: impl FnMut(&mut Job) -> GateOutcome,
 ) {
     candidates.retain_mut(|candidate| {
@@ -9992,20 +10220,30 @@ fn retain_eligible(
                 record_pending_reason_update(reason_updates, candidate, reason);
                 false
             }
+            GateOutcome::BlockDescribed(reason, desc) => {
+                if candidate.tag_reason {
+                    reason_updates.push((candidate.job.job_id, reason, Some(desc)));
+                }
+                false
+            }
             GateOutcome::DropUntagged => false,
         }
     });
 }
 
 fn record_pending_reason_update(
-    reason_updates: &mut Vec<(JobId, PendingReason)>,
+    reason_updates: &mut Vec<ReasonUpdate>,
     candidate: &PendingJobCandidate,
     reason: PendingReason,
 ) {
     if candidate.tag_reason {
-        reason_updates.push((candidate.job.job_id, reason));
+        reason_updates.push((candidate.job.job_id, reason, None));
     }
 }
+
+/// A pending reason a classification pass assigns, with its optional
+/// `pending_reason_desc`.
+type ReasonUpdate = (JobId, PendingReason, Option<String>);
 
 /// `Reservation` if the job's `--reservation` is absent/inactive/expired or
 /// denies it, else `None`.
@@ -10078,6 +10316,221 @@ fn resource_impossible_reason(
             .iter()
             .any(|n| n.total_resources.can_satisfy(&required));
     impossible.then_some(PendingReason::NodeConfigUnavailable)
+}
+
+/// One capped resource whose limits, summed over the partitions sharing a
+/// node, exceed what that node has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapOvercommit {
+    pub key: String,
+    pub total: u64,
+    pub capacity: u64,
+    pub partitions: Vec<String>,
+}
+
+/// Overcommitted caps on `node`. A key only one partition caps is skipped: a
+/// single cap above capacity binds nothing and contends with no one.
+pub(crate) fn partition_cap_overcommits(
+    node: &Node,
+    partitions: &[Partition],
+) -> Vec<CapOvercommit> {
+    // Inventory not reported yet: nothing to compare against.
+    if node.total_resources.cpus == 0 {
+        return Vec::new();
+    }
+    let mut by_key: BTreeMap<&str, (u64, Vec<String>)> = BTreeMap::new();
+    for partition in partitions
+        .iter()
+        .filter(|p| node.partitions.contains(&p.name))
+    {
+        for (key, limit) in &partition.max_tres_per_node {
+            let (total, names) = by_key.entry(key).or_default();
+            *total = total.saturating_add(*limit);
+            names.push(partition.name.clone());
+        }
+    }
+    by_key
+        .into_iter()
+        .filter(|(_, (_, names))| names.len() > 1)
+        .filter_map(|(key, (total, partitions))| {
+            let capacity = node_tres_capacity(&node.total_resources, key);
+            (total > capacity).then(|| CapOvercommit {
+                key: key.to_string(),
+                total,
+                capacity,
+                partitions,
+            })
+        })
+        .collect()
+}
+
+/// What a node has of one partition-cap TRES key.
+fn node_tres_capacity(resources: &ResourceSet, key: &str) -> u64 {
+    use spur_core::partition::{tres_key_gpu_type, TRES_CPU, TRES_GPU, TRES_MEM};
+    match key {
+        TRES_CPU => u64::from(resources.cpus),
+        TRES_MEM => resources.memory_mb,
+        TRES_GPU => resources.gpus.len() as u64,
+        _ => {
+            let ty = tres_key_gpu_type(key);
+            resources
+                .gpus
+                .iter()
+                .filter(|gpu| Some(gpu.gpu_type.as_str()) == ty)
+                .count() as u64
+        }
+    }
+}
+
+/// The request each candidate's quota gates should see: the largest one its
+/// candidate partitions' memory policies produce, so quota is never
+/// under-charged. Returns the original requests of the jobs it changed.
+fn apply_quota_memory_requests(
+    candidates: &mut [PendingJobCandidate],
+    partitions: &[Partition],
+) -> HashMap<JobId, MemoryAdjustment> {
+    let mut originals = HashMap::new();
+    for candidate in candidates {
+        let job = &mut candidate.job;
+        let Some(adjusted) = quota_memory_request(job, partitions) else {
+            continue;
+        };
+        originals.insert(job.job_id, MemoryAdjustment::of(&job.spec));
+        adjusted.apply_to(&mut job.spec);
+    }
+    originals
+}
+
+/// Largest memory-policy-adjusted request among the job's candidate
+/// partitions, or `None` when no policy changes it.
+fn quota_memory_request(job: &Job, partitions: &[Partition]) -> Option<MemoryAdjustment> {
+    let original = MemoryAdjustment::of(&job.spec);
+    spur_sched::partition_cap::candidate_partitions(job, partitions)
+        .into_iter()
+        .filter(|p| p.has_memory_policy())
+        .map(|p| p.memory_adjusted(&job.spec))
+        .max_by_key(|adjusted| adjusted.node_footprint(&job.spec))
+        .filter(|adjusted| *adjusted != original)
+}
+
+fn restore_original_requests<'a>(
+    jobs: impl Iterator<Item = &'a mut Job>,
+    originals: &HashMap<JobId, MemoryAdjustment>,
+) {
+    for job in jobs {
+        if let Some(original) = originals.get(&job.job_id) {
+            original.apply_to(&mut job.spec);
+        }
+    }
+}
+
+/// Over-limit keys that keep `partition`'s cap from ever holding the job, as
+/// if every eligible node were idle. `None` when the partition is uncapped,
+/// enough of its nodes would admit the job, or too few nodes are known yet to
+/// tell (more may join).
+fn partition_cap_never_fits(
+    job: &Job,
+    partition: &Partition,
+    nodes: &HashMap<String, Node>,
+    reservations: &[Reservation],
+) -> Option<Vec<spur_core::job::PartitionTresOvershoot>> {
+    use spur_sched::partition_cap::{
+        is_capped, job_in_partition, job_typed_gpu, partition_cap_ok, TresCharge,
+    };
+    if !is_capped(partition) {
+        return None;
+    }
+    let job = job_in_partition(job, partition);
+    let placement = spur_sched::node_match::NodePlacement::new(&job);
+    let required = spur_sched::backfill::job_resource_request(&job);
+    let typed_gpu = job_typed_gpu(&job);
+    let now = chrono::Utc::now();
+    let needed = (job.spec.num_nodes as usize).max(1);
+    let eligible: Vec<&Node> = nodes
+        .values()
+        .filter(|n| n.partitions.contains(&partition.name))
+        .filter(|n| placement.eligible(n, reservations, now))
+        .collect();
+    if eligible.len() < needed {
+        return None;
+    }
+    let overshoots: Vec<_> = eligible
+        .iter()
+        .filter_map(|node| {
+            let charge =
+                spur_sched::backfill::placement_charge(&job, &required, node, typed_gpu.as_deref());
+            partition_cap_ok(partition, &node.name, &TresCharge::default(), &charge).err()
+        })
+        .collect();
+    (eligible.len() - overshoots.len() < needed).then_some(overshoots)
+}
+
+/// `pending_reason_desc` when every partition the job may run in has a cap
+/// that could never hold it, so it must not take quota other jobs could use.
+fn partition_cap_never_runs(
+    job: &Job,
+    nodes: &HashMap<String, Node>,
+    reservations: &[Reservation],
+    partitions: &[Partition],
+) -> Option<String> {
+    let candidates = spur_sched::partition_cap::candidate_partitions(job, partitions);
+    let mut blocked = Vec::with_capacity(candidates.len());
+    for partition in candidates {
+        let overshoots = partition_cap_never_fits(job, partition, nodes, reservations)?;
+        blocked.push((partition, overshoots));
+    }
+    let (partition, overshoots) = blocked.first()?;
+    Some(cap_never_runs_desc(job, partition, overshoots))
+}
+
+/// "Partition cpu can never run this job as configured: exclusive job needs
+/// 128 CPUs, max_cpus_per_node is 64 on every eligible node".
+fn cap_never_runs_desc(
+    job: &Job,
+    partition: &Partition,
+    overshoots: &[spur_core::job::PartitionTresOvershoot],
+) -> String {
+    let prefix = format!(
+        "Partition {} can never run this job as configured",
+        partition.name
+    );
+    let Some(closest) = overshoots.iter().min_by_key(|o| {
+        (
+            spur_core::partition::tres_key_report_rank(&o.resource),
+            o.requested.saturating_sub(o.limit),
+            o.node.as_str(),
+        )
+    }) else {
+        return prefix;
+    };
+    let who = if job.spec.exclusive {
+        "exclusive job"
+    } else {
+        "job"
+    };
+    let (amount, knob) = match closest.resource.as_str() {
+        spur_core::partition::TRES_CPU => (
+            format!("{} CPUs", closest.requested),
+            "max_cpus_per_node".to_string(),
+        ),
+        spur_core::partition::TRES_MEM => (
+            format!("{}M mem", closest.requested),
+            format!("max_tres_per_node.{}", closest.resource),
+        ),
+        resource => (
+            format!("{} {resource}", closest.requested),
+            format!("max_tres_per_node.{resource}"),
+        ),
+    };
+    let unit = if closest.resource == spur_core::partition::TRES_MEM {
+        "M"
+    } else {
+        ""
+    };
+    format!(
+        "{prefix}: {who} needs {amount}, {knob} is {}{unit} on every eligible node",
+        closest.limit
+    )
 }
 
 /// `Some(reason)` when no eligible node is one real placement would ever use.
@@ -10487,6 +10940,57 @@ fn validate_partition_time_limit(
     )))
 }
 
+/// Reject a request a requested partition could never run, per
+/// `EnforcePartLimits` (`All` = all must admit it, `Any` = at least one): its
+/// per-job memory limit, or its resource cap even on an idle node. Current
+/// load never rejects; a job over a cap only because of it waits.
+fn validate_partition_resource_limits(
+    spec: &JobSpec,
+    mode: EnforcePartLimits,
+    partitions: &[Partition],
+    nodes: &HashMap<String, Node>,
+    reservations: &[Reservation],
+) -> Result<(), SubmitError> {
+    if mode == EnforcePartLimits::No {
+        return Ok(());
+    }
+    let requested = spur_core::partition::matched_partitions(spec.partition.as_deref(), partitions);
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let job = Job::new(0, spec.clone());
+    let violations: Vec<String> = requested
+        .iter()
+        .filter_map(|p| partition_resource_violation(&job, p, nodes, reservations))
+        .collect();
+    let rejected = match mode {
+        EnforcePartLimits::All => !violations.is_empty(),
+        _ => violations.len() == requested.len(),
+    };
+    match violations.into_iter().next() {
+        Some(violation) if rejected => Err(SubmitError::invalid(violation)),
+        _ => Ok(()),
+    }
+}
+
+/// Why `partition` could never run the job, regardless of current load.
+fn partition_resource_violation(
+    job: &Job,
+    partition: &Partition,
+    nodes: &HashMap<String, Node>,
+    reservations: &[Reservation],
+) -> Option<String> {
+    if let Some((requested, limit)) = partition.max_mem_per_node_exceeded(&job.spec) {
+        return Some(format!(
+            "Memory specification can not be satisfied: {requested}M per node exceeds \
+             max_mem_per_node {limit}M of partition '{}'",
+            partition.name
+        ));
+    }
+    let overshoots = partition_cap_never_fits(job, partition, nodes, reservations)?;
+    Some(cap_never_runs_desc(job, partition, &overshoots))
+}
+
 /// True when a job's wall-time fits the partition's `MaxTime`. `None` `MaxTime`
 /// (UNLIMITED) or `None` time limit always fits. Compared at second precision so
 /// a request just over the cap is not truncated down to an allowed minute.
@@ -10512,6 +11016,9 @@ fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::
     }
     if !partition_time_allows(part, job.spec.time_limit.as_ref()) {
         return Some(PendingReason::PartitionTimeLimit);
+    }
+    if part.max_mem_per_node_exceeded(&job.spec).is_some() {
+        return Some(PendingReason::PartitionConfig);
     }
     None
 }
@@ -11569,6 +12076,8 @@ mod tests {
     use spur_core::resource::{ResourceAllocations, ResourceSet};
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
+
+    mod partition_limits;
 
     #[test]
     fn submission_size_accepts_normal_script() {
@@ -13311,6 +13820,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         };
 
@@ -14667,6 +15178,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -14868,6 +15381,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -14955,6 +15470,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -14987,6 +15504,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16029,6 +16548,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16074,6 +16595,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16120,6 +16643,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16193,6 +16718,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16258,6 +16785,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
@@ -16328,6 +16857,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         };
 
@@ -16440,6 +16971,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16496,6 +17029,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16533,6 +17068,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16584,6 +17121,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -16629,6 +17168,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: true,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
@@ -16688,6 +17229,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -16722,6 +17265,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -17155,6 +17700,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -17192,6 +17739,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -17232,6 +17781,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 2,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -17273,6 +17824,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
 
@@ -17353,6 +17906,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -19920,6 +20475,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
@@ -20004,6 +20561,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
     }
@@ -20578,6 +21137,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
         cm.apply_operation(&WalOperation::job_complete(1, 0, JobState::Completed));
@@ -20655,6 +21216,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
@@ -23209,6 +23772,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 1,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: Some(Utc::now()),
         });
         assert!(cm.preempt_freed_nodes_raw().is_empty());
@@ -37659,6 +38224,8 @@ state = "UP"
             srun_step_dispatch: false,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
     }
@@ -37677,6 +38244,8 @@ state = "UP"
             srun_step_dispatch: true,
             run_attempt: 0,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
     }
@@ -38460,6 +39029,8 @@ state = "UP"
             srun_step_dispatch: true,
             run_attempt,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
     }
@@ -39078,6 +39649,7 @@ state = "UP"
             is_default: None,
             preempt_exempt_time: None,
             grace_time: None,
+            resource_limits: None,
         });
 
         let gpu = cm
@@ -39202,6 +39774,7 @@ state = "UP"
             is_default: None,
             preempt_exempt_time: None,
             grace_time: None,
+            resource_limits: None,
         });
 
         assert_eq!(
@@ -39248,6 +39821,7 @@ state = "UP"
             is_default: Some(true),
             preempt_exempt_time: None,
             grace_time: None,
+            resource_limits: None,
         });
 
         let parts = cm.get_partitions();
@@ -39296,8 +39870,26 @@ state = "UP"
 
         let update = |grace_time: Option<Option<u32>>| {
             cm.update_partition(
-                "gpu", None, None, None, None, None, None, None, false, None, None, None, None,
-                None, None, None, None, None, grace_time,
+                "gpu",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                grace_time,
+                PartitionLimitsUpdate::default(),
             )
         };
         update(None).unwrap();

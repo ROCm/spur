@@ -857,3 +857,85 @@ fn running_typed_usage_is_seeded_from_the_usage_map() {
     assert_eq!(started(&a), [2]);
     assert_eq!(reserved(&sched, 1).map(|r| r.1), Some(hours(2)));
 }
+
+fn per_cpu_limited(name: &str, limit: u64, caps: &[(&str, u64)]) -> Partition {
+    Partition {
+        max_mem_per_cpu: Some(limit),
+        ..partition(name, caps)
+    }
+}
+
+fn mem_per_cpu_job(id: u32, partitions: &str, cpus: u32, mem_per_cpu: u64) -> Job {
+    let mut j = job(id, partitions, cpus, 1);
+    j.spec.memory_per_cpu_mb = Some(mem_per_cpu);
+    j
+}
+
+#[test]
+fn each_candidate_partition_plans_its_own_memory_adjusted_request() {
+    // -c 2 --mem-per-cpu=3G: 4 CPUs in `big` (2G/CPU limit), 6 in `small`
+    // (1G/CPU limit). n2 has only 4 CPUs, so `small` could never hold it.
+    let fx = Fixture::new(
+        vec![
+            node("n1", 8, 64_000, &["big"]),
+            node("n2", 4, 64_000, &["small"]),
+        ],
+        vec![
+            per_cpu_limited("big", 2048, &[]),
+            per_cpu_limited("small", 1024, &[]),
+        ],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[mem_per_cpu_job(1, "small,big", 2, 3072)]);
+    assert_eq!(started(&a), [1]);
+    assert_eq!(a[0].partition.as_deref(), Some("big"));
+    assert_eq!(a[0].per_node_alloc["n1"].cpus, 4);
+}
+
+#[test]
+fn a_single_partition_memory_policy_shapes_the_allocation() {
+    let fx = Fixture::new(
+        vec![node("n1", 8, 64_000, &["small"])],
+        vec![per_cpu_limited("small", 1024, &[])],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[mem_per_cpu_job(1, "small", 2, 3072)]);
+    assert_eq!(started(&a), [1]);
+    assert_eq!(a[0].per_node_alloc["n1"].cpus, 6);
+}
+
+#[test]
+fn a_partition_whose_max_mem_per_node_the_job_exceeds_is_not_chosen() {
+    let fx = Fixture::new(
+        vec![node("n1", 8, 64_000, &["tight", "roomy"])],
+        vec![
+            Partition {
+                max_mem_per_node: Some(1024),
+                priority_tier: 5,
+                ..partition("tight", &[])
+            },
+            partition("roomy", &[]),
+        ],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[mem_job(1, "tight,roomy", 2048)]);
+    assert_eq!(started(&a), [1]);
+    assert_eq!(a[0].partition.as_deref(), Some("roomy"));
+}
+
+#[test]
+fn a_memory_driven_cpu_raise_counts_toward_the_cpu_cap() {
+    let fx = Fixture::new(
+        vec![node("n1", 16, 64_000, &["cpu"])],
+        vec![per_cpu_limited("cpu", 1024, &[("cpu", 4)])],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[mem_per_cpu_job(1, "cpu", 2, 3072)]);
+    assert!(a.is_empty());
+    assert_eq!(
+        outcome(&sched, 1),
+        Some(UnplacedKind::PartitionCapNeverFits)
+    );
+    let o = overshoot(&sched, 1).expect("the cap is reported");
+    assert_eq!((o.resource.as_str(), o.requested, o.limit), ("cpu", 6, 4));
+}

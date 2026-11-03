@@ -17,7 +17,8 @@ use spur_core::resource::{
 
 use crate::node_match::NodePlacement;
 use crate::partition_cap::{
-    candidate_partitions, is_capped, job_typed_gpu, partition_cap_ok, resolution_rank, TresCharge,
+    candidate_partitions, is_capped, job_in_partition, job_typed_gpu, partition_cap_ok,
+    resolution_rank, TresCharge,
 };
 use crate::timeline::{CapCheck, NodeTimeline, PartitionCharge, UNLIMITED_JOB_DURATION};
 use crate::traits::{Assignment, ClusterState, Scheduler};
@@ -960,8 +961,12 @@ impl BackfillScheduler {
             let typed_gpu = job_typed_gpu(job);
             let candidates = candidate_partitions(job, cluster.partitions);
             let capped = candidates.iter().any(|p| is_capped(p));
-            let resolved = if capped {
-                self.resolve_capped_partition(
+            let per_partition = capped
+                || candidates
+                    .iter()
+                    .any(|p| p.has_memory_policy() || p.max_mem_per_node.is_some());
+            let resolved = if per_partition {
+                self.resolve_partition(
                     job,
                     cluster,
                     &handoffs,
@@ -1083,10 +1088,11 @@ type PlanResult = Result<PlacementPlan, (UnplacedKind, usize)>;
 
 impl BackfillScheduler {
     /// Pick the candidate partition the job should run in when any of them is
-    /// capped: each is planned under its own cap, and the best by priority
-    /// tier then earliest start wins. A partition whose cap could never hold
-    /// the job drops out; a merely full one stays and ranks by its later start.
-    fn resolve_capped_partition(
+    /// capped or reshapes the request: each is planned under its own cap and
+    /// memory policy, and the best by priority tier then earliest start wins.
+    /// A partition whose cap could never hold the job drops out; a merely full
+    /// one stays and ranks by its later start.
+    fn resolve_partition(
         &self,
         job: &Job,
         cluster: &ClusterState,
@@ -1098,6 +1104,11 @@ impl BackfillScheduler {
         let mut best: Option<(PlacementPlan, &Partition)> = None;
         let mut errors = Vec::new();
         for &partition in candidates {
+            // A per-job memory limit the job exceeds rules the partition out.
+            if partition.max_mem_per_node_exceeded(&job.spec).is_some() {
+                errors.push((UnplacedKind::NoSuitableNodes, 0));
+                continue;
+            }
             let scope = PartitionScope {
                 partition,
                 typed_gpu,
@@ -1181,6 +1192,7 @@ impl BackfillScheduler {
         partition: &Partition,
         typed_gpu: Option<&str>,
     ) -> Option<PartitionCapBlock> {
+        let job = &*job_in_partition(job, partition);
         let required = job_resource_request(job);
         let overshoots: Vec<PartitionTresOvershoot> = self
             .find_suitable_nodes(job, cluster, handoffs, now)
@@ -1236,6 +1248,8 @@ impl BackfillScheduler {
         now: chrono::DateTime<Utc>,
         scope: Option<PartitionScope<'_>>,
     ) -> PlanResult {
+        let adjusted = scope.map(|s| job_in_partition(job, s.partition));
+        let job = adjusted.as_deref().unwrap_or(job);
         let required = job_resource_request(job);
         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
         let needed_nodes = (job.spec.num_nodes as usize).max(1);
@@ -1554,7 +1568,7 @@ fn in_partition(node: &Node, partition: &Partition) -> bool {
 
 /// What a job's placement on `node` charges against a partition cap. An
 /// exclusive job holds the whole node, so it is charged the whole node.
-fn placement_charge(
+pub fn placement_charge(
     job: &Job,
     required: &ResourceSet,
     node: &Node,
