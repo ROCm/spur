@@ -377,6 +377,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             topology: topology.as_ref(),
             busy_until: &busy_until,
             preemption_handoffs: &handoffs,
+            partition_node_usage: &Default::default(),
         };
 
         // Catch panics in the scheduler so that a single bad job doesn't kill
@@ -1012,6 +1013,7 @@ pub(crate) fn trial_placement(
         topology: topology.as_ref(),
         busy_until: &busy_until,
         preemption_handoffs: &handoffs,
+        partition_node_usage: &Default::default(),
     };
     let mut list = classification.jobs.clone();
     list.extend(
@@ -1317,6 +1319,7 @@ pub(crate) async fn try_preempt_beside(
         fabric: None,
         busy_until: &HashMap::new(),
         preemption_handoffs: &handoffs,
+        partition_node_usage: &Default::default(),
     };
     try_preempt_with_handoffs(cluster, &state, unscheduled, assigned, sched).await;
 }
@@ -5623,6 +5626,7 @@ mod tests {
                 topology: None,
                 busy_until: &HashMap::new(),
                 preemption_handoffs: handoffs,
+                partition_node_usage: &Default::default(),
             };
             satisfiable_victim_set(reclaimer, pool, &state, Utc::now())
         }
@@ -5642,6 +5646,7 @@ mod tests {
                 topology: None,
                 busy_until: &HashMap::new(),
                 preemption_handoffs: &HashMap::new(),
+                partition_node_usage: &Default::default(),
             };
             satisfiable_victim_set(reclaimer, pool, &state, now)
         }
@@ -8716,6 +8721,7 @@ mod tests {
                 job_id,
                 nodes: nodes.iter().map(|n| n.to_string()).collect(),
                 per_node_alloc,
+                partition: None,
             }
         }
 
@@ -10014,6 +10020,7 @@ mod tests {
                     fabric: None,
                     busy_until: &busy_until,
                     preemption_handoffs: &HashMap::new(),
+                    partition_node_usage: &Default::default(),
                 };
 
                 let (freed, freed_for) =
