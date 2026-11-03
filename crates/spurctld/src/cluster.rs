@@ -2335,7 +2335,7 @@ impl ClusterManager {
             }
             Self::check_job_owner_for(user, &job.spec.user, "suspend", operates_jobs)?;
             // The preemption that ends the grace only applies to a Running job.
-            if job.preempt_pending.is_some() {
+            if job.preempt_grace().is_some() {
                 anyhow::bail!(
                     "job {job_id} is in its preemption grace period and cannot be suspended"
                 );
@@ -2979,7 +2979,7 @@ impl ClusterManager {
         if job.state.is_terminal() {
             return Ok(NodeCompleteResult::AlreadyTerminal);
         }
-        if job.state == JobState::Running && Self::preempt_grace_of(job).is_some() {
+        if job.state == JobState::Running && job.preempt_grace().is_some() {
             return Ok(NodeCompleteResult::InGrace);
         }
 
@@ -7516,19 +7516,11 @@ impl ClusterManager {
         true
     }
 
-    /// The preemption grace this run is still inside. A warning recorded for an
-    /// earlier run never counts against the current one.
-    fn preempt_grace_of(job: &Job) -> Option<&PreemptPending> {
-        job.preempt_pending
-            .as_ref()
-            .filter(|pending| pending.run_attempt == job.run_attempt)
-    }
-
     /// Record on a victim whose run is ending inside its grace the provenance a
     /// final `JobPreemptCancel`/`JobPreemptRequeue` would have set, so the
     /// completion verdict and the preemptor earmark treat it as preempted.
     fn adopt_grace_provenance(job: &mut Job, at: DateTime<Utc>) {
-        let Some(pending) = Self::preempt_grace_of(job) else {
+        let Some(pending) = job.preempt_grace() else {
             return;
         };
         let (preempted_by, preempt_qos, mode) = (
@@ -8453,7 +8445,8 @@ impl ClusterManager {
                         return ClientResponse::default();
                     }
 
-                    let grace = Self::preempt_grace_of(job)
+                    let grace = job
+                        .preempt_grace()
                         .filter(|_| job.state == JobState::Running)
                         .cloned();
                     let already_reported = job.node_completions.contains_key(node_name);
@@ -8606,7 +8599,8 @@ impl ClusterManager {
                     // A victim that ends during its grace (an srun/PTY run whose
                     // client reports its exit, or a force-finish after some nodes
                     // already reported) ends as the preemption it was warned of.
-                    let grace = Self::preempt_grace_of(job)
+                    let grace = job
+                        .preempt_grace()
                         .filter(|_| job.state == JobState::Running)
                         .cloned();
                     if grace.is_some() {

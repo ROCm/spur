@@ -1238,6 +1238,14 @@ impl Job {
         self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
     }
 
+    /// The preemption grace this run is still inside. A warning recorded for an
+    /// earlier run never counts against the current one.
+    pub fn preempt_grace(&self) -> Option<&PreemptPending> {
+        self.preempt_pending
+            .as_ref()
+            .filter(|pending| pending.run_attempt == self.run_attempt)
+    }
+
     /// The allocated nodes still charged for this job, in allocation order.
     pub fn held_nodes(&self) -> Vec<String> {
         self.allocated_nodes
@@ -2328,6 +2336,30 @@ mod tests {
         job.preempt_pending = Some(pending.clone());
         let back: Job = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
         assert_eq!(back.preempt_pending, Some(pending));
+    }
+
+    #[test]
+    fn preempt_grace_ignores_a_warning_recorded_for_an_earlier_run() {
+        let at = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let mut job = make_job();
+        job.run_attempt = 2;
+        assert!(job.preempt_grace().is_none());
+
+        job.preempt_pending = Some(PreemptPending {
+            signaled_at: at,
+            deadline: at + chrono::Duration::seconds(90),
+            preempted_by: 9,
+            preempt_qos: None,
+            mode: crate::partition::PreemptMode::Cancel,
+            run_attempt: 1,
+            requeue_hold_secs: 0,
+        });
+        assert!(job.preempt_grace().is_none());
+
+        job.run_attempt = 1;
+        assert_eq!(job.preempt_grace().map(|p| p.preempted_by), Some(9));
     }
 
     #[test]

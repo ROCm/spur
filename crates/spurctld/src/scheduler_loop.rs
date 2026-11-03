@@ -1125,7 +1125,7 @@ fn busy_until_from_running_jobs(
             .unwrap_or(far_future);
         // A job in its grace is killed at the deadline, so its nodes free by then
         // even when its time limit is further out.
-        if let Some(pending) = &job.preempt_pending {
+        if let Some(pending) = job.preempt_grace() {
             let free_after_kill = pending
                 .deadline
                 .checked_add_signed(chrono::Duration::seconds(
@@ -1272,7 +1272,7 @@ pub(crate) async fn try_preempt(
     // nodes still count as occupied.
     let mut running: Vec<spur_core::job::Job> = holders
         .iter()
-        .filter(|j| j.state == JobState::Running && j.preempt_pending.is_none())
+        .filter(|j| j.state == JobState::Running && j.preempt_grace().is_none())
         .cloned()
         .collect();
     let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
@@ -1680,9 +1680,8 @@ async fn finalize_expired_graces(cluster: &Arc<ClusterManager>, now: DateTime<Ut
         })
         .into_iter()
         .filter(|job| {
-            job.preempt_pending
-                .as_ref()
-                .is_some_and(|p| now >= p.deadline && p.run_attempt == job.run_attempt)
+            job.preempt_grace()
+                .is_some_and(|pending| now >= pending.deadline)
         })
         .collect();
 
@@ -1692,7 +1691,7 @@ async fn finalize_expired_graces(cluster: &Arc<ClusterManager>, now: DateTime<Ut
 }
 
 async fn finalize_running_grace(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) {
-    let Some(pending) = job.preempt_pending.as_ref() else {
+    let Some(pending) = job.preempt_grace() else {
         return;
     };
     info!(
@@ -1806,7 +1805,7 @@ async fn reclaim_for_unplaced(
     for job in &running {
         // Requeuing a run in its grace would end the grace early; its preemptor
         // waits for the deadline like any other.
-        if job.allocated_nodes.is_empty() || job.preempt_pending.is_some() {
+        if job.allocated_nodes.is_empty() || job.preempt_grace().is_some() {
             continue;
         }
         let borrowed = if job.idle_fill {
@@ -2045,7 +2044,7 @@ pub(crate) fn preemptor_awaiting_release(
 
     match job.state {
         JobState::Completing => job.preempted_by,
-        JobState::Running => job.preempt_pending.as_ref().map(|p| p.preempted_by),
+        JobState::Running => job.preempt_grace().map(|p| p.preempted_by),
         _ => None,
     }
 }
@@ -3331,7 +3330,7 @@ async fn expire_job_if_overdue(
 ) {
     // The grace deadline is capped at the time limit, so the preemption path
     // ends this run; a second kill sequence here would race it.
-    if job.preempt_pending.is_some() {
+    if job.preempt_grace().is_some() {
         return;
     }
     let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
@@ -3454,7 +3453,7 @@ async fn reap_inactive_job(
     limit_secs: u32,
     now: DateTime<Utc>,
 ) {
-    if job.preempt_pending.is_some() {
+    if job.preempt_grace().is_some() {
         return;
     }
     info!(
@@ -4546,6 +4545,20 @@ mod tests {
             busy_until["node001"] - deadline,
             chrono::Duration::seconds(35),
             "nodes free at the deadline plus the kill wait and the five-second margin"
+        );
+    }
+
+    #[test]
+    fn a_warning_left_by_an_earlier_run_is_not_a_grace() {
+        let now = Utc::now();
+        let plain = running_job_on("node001", now, 10);
+        let mut stale = in_grace(plain.clone(), now + chrono::Duration::seconds(20));
+        stale.run_attempt += 1;
+
+        assert_eq!(preemptor_awaiting_release(&stale), None);
+        assert_eq!(
+            busy_until_from_running_jobs(&[stale], 300, 30, 30),
+            busy_until_from_running_jobs(&[plain], 300, 30, 30),
         );
     }
 
