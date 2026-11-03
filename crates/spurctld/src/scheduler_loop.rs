@@ -6521,7 +6521,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 seen,
-                [(0, 30), (9, 0)],
+                [(0, 5), (9, 0)],
                 "only the graceful cancel carries the kill wait"
             );
         }
@@ -6565,7 +6565,7 @@ mod tests {
                 .iter()
                 .map(|r| (r.signal, r.kill_wait_secs))
                 .collect();
-            assert_eq!(seen, [(0, 30)]);
+            assert_eq!(seen, [(0, 5)]);
         }
 
         const SIGNAL_JOB_CAPABILITY: &str = spur_core::node::CAP_SIGNAL_JOB;
@@ -6593,7 +6593,7 @@ mod tests {
                 .iter()
                 .map(|r| (r.signal, r.kill_wait_secs))
                 .collect();
-            assert_eq!(seen, [(0, 30)]);
+            assert_eq!(seen, [(0, 5)]);
             assert!(signals.lock().unwrap().is_empty());
         }
 
@@ -9114,7 +9114,7 @@ mod tests {
                     .iter()
                     .map(|r| (r.signal, r.kill_wait_secs))
                     .collect();
-                assert_eq!(seen, [(0, 30)]);
+                assert_eq!(seen, [(0, 5)]);
                 let job = cm.get_job(victim.job_id).unwrap();
                 assert_ne!(job.state, JobState::Running);
                 assert!(job.preempt_pending.is_none());
@@ -9185,7 +9185,7 @@ mod tests {
                 assert_eq!(pending.preempt_qos.as_deref(), Some("high"));
                 assert_eq!(pending.mode, PreemptMode::Cancel);
                 assert_eq!(pending.run_attempt, victim.run_attempt);
-                assert!(pending.requeue_hold_secs >= 30);
+                assert!(pending.requeue_hold_secs >= 5);
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9539,7 +9539,7 @@ mod tests {
                 wait_for("graceful cancel delivered", || {
                     !f.cancels.lock().unwrap().is_empty()
                 });
-                assert_eq!(f.cancel_summary(), [(0, 30, f.victim.run_attempt)]);
+                assert_eq!(f.cancel_summary(), [(0, 5, f.victim.run_attempt)]);
                 let job = f.cm.get_job(f.victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Completing);
                 assert_eq!(job.preempted_by, Some(f.hunter.job_id));
@@ -9558,7 +9558,7 @@ mod tests {
                 wait_for("graceful cancel delivered", || {
                     !f.cancels.lock().unwrap().is_empty()
                 });
-                assert_eq!(f.cancel_summary(), [(0, 30, f.victim.run_attempt)]);
+                assert_eq!(f.cancel_summary(), [(0, 5, f.victim.run_attempt)]);
                 let job = f.cm.get_job(f.victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Pending);
                 assert_eq!(job.preempted_by, Some(f.hunter.job_id));
@@ -9607,7 +9607,7 @@ mod tests {
                 wait_for("graceful cancel delivered", || {
                     !f.cancels.lock().unwrap().is_empty()
                 });
-                assert_eq!(f.cancel_summary(), [(0, 30, f.victim.run_attempt)]);
+                assert_eq!(f.cancel_summary(), [(0, 5, f.victim.run_attempt)]);
                 let job = successor.get_job(f.victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Completing);
                 assert_eq!(job.preempted_by, Some(f.hunter.job_id));
@@ -9721,7 +9721,7 @@ mod tests {
                     "inside the throttle: no resend"
                 );
 
-                let budget = crate::server::cancel_reclaim_grace(30).to_std().unwrap();
+                let budget = crate::server::cancel_reclaim_grace(5).to_std().unwrap();
                 let Some(stale) = first_sent.checked_sub(budget + Duration::from_secs(1)) else {
                     return;
                 };
@@ -9741,7 +9741,7 @@ mod tests {
                     .iter()
                     .map(|r| (r.signal, r.kill_wait_secs))
                     .collect();
-                assert!(seen.iter().all(|s| *s == (0, 30)));
+                assert!(seen.iter().all(|s| *s == (0, 5)));
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

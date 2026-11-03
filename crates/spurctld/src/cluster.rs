@@ -84,7 +84,8 @@ pub(crate) fn warn_if_complete_wait_too_short(scheduler: &spur_core::config::Sch
         warn!(
             complete_wait_secs = scheduler.complete_wait_secs,
             kill_wait_secs = scheduler.effective_kill_wait_secs(),
-            "scheduler.complete_wait_secs should exceed the kill wait, or jobs can be force-finished before SIGKILL"
+            timeout_kill_wait_secs = scheduler.effective_timeout_kill_wait_secs(),
+            "scheduler.complete_wait_secs should exceed the larger kill wait, or jobs can be force-finished before SIGKILL"
         );
     }
 }

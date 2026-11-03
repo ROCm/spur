@@ -570,23 +570,34 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        retains its allocation and the controller retries.
    * - ``kill_wait_secs``
      - integer
+     - ``5``
+     - Live
+     - Seconds between SIGTERM and SIGKILL when Spur stops a job for any reason
+       other than a time or inactivity limit: ``scancel``, ``scontrol requeue``,
+       preemption, idle-fill reclaim, reservation end and other graceful stops.
+       Ends early once the job's processes exit. Valid ``0``-``65533``; values
+       below 5 act as 5. ``complete_wait_secs`` should exceed the larger of this
+       and ``timeout_kill_wait_secs``, or a job can be force-finished before its
+       kill wait elapses; the controller logs a warning when it does not. Known
+       issue: a requeued job (requeue-mode preemption, ``scontrol requeue``)
+       frees its nodes at once, while the old run is still in its kill wait, so
+       another job can be dispatched onto them during that window. The window
+       can last up to ``kill_wait_secs``; lower it if that matters with
+       requeue-mode preemption. A requeued job itself is held out of the queue
+       for the larger of ``2 x interval_secs + 3`` and ``kill_wait_secs``
+       seconds (5 with the defaults); that term follows ``kill_wait_secs`` live.
+       Mirrors Slurm's ``KillWait`` for these stops.
+   * - ``timeout_kill_wait_secs``
+     - integer
      - ``30``
      - Live
-     - Seconds between SIGTERM and SIGKILL whenever Spur stops a job
-       (``scancel``, preemption, time and inactivity limits). Ends early once the
-       job's processes exit. Values below 5 act as 5. ``complete_wait_secs``
-       should exceed it, or a job can be force-finished before its kill wait
-       elapses; the controller logs a warning when it does not. A job that
-       reaches its time limit moves to COMPLETING straight away and spends the
-       kill wait there before ending ``TIMEOUT``. Known issue: a requeued job
-       (requeue-mode preemption, ``scontrol requeue``) frees its nodes at once,
-       while the old run is still in its kill wait, so another job can be
-       dispatched onto them during that window. The window can last up to
-       ``kill_wait_secs``; lower it if that matters with requeue-mode
-       preemption. A requeued job itself is held out of the queue for the larger
-       of ``2 x interval_secs + 3`` and ``kill_wait_secs`` seconds (30 with the
-       defaults); that term follows ``kill_wait_secs`` live. Mirrors Slurm's
-       ``KillWait``.
+     - The same wait for a job stopped by its time limit or the inactivity limit
+       (``inactive_limit_secs``), the stops that end ``TIMEOUT``. Such a job
+       moves to COMPLETING straight away and spends this wait there before
+       ending ``TIMEOUT``. Valid ``0``-``65533``; values below 5 act as 5.
+       ``complete_wait_secs`` should exceed the larger of this and
+       ``kill_wait_secs``. In Slurm, ``KillWait`` also covers time limits; here
+       that part is this setting.
    * - ``max_user_priority``
      - integer
      - ``1000``

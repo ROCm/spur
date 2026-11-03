@@ -677,11 +677,16 @@ pub struct SchedulerConfig {
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
-    /// Seconds between SIGTERM and SIGKILL whenever Spur stops a job. Values
-    /// below [`MIN_EFFECTIVE_KILL_WAIT_SECS`] act as that minimum. Mirrors
-    /// Slurm's `KillWait`.
+    /// Seconds between SIGTERM and SIGKILL when Spur stops a job for any reason
+    /// other than a time or inactivity limit (scancel, requeue, preemption,
+    /// reclaim, reservation end). Values below [`MIN_EFFECTIVE_KILL_WAIT_SECS`]
+    /// act as that minimum.
     #[serde(default = "default_kill_wait")]
     pub kill_wait_secs: u32,
+    /// The same wait for a job stopped by its time limit or the inactivity
+    /// limit, i.e. one that ends `TIMEOUT`. Same floor as `kill_wait_secs`.
+    #[serde(default = "default_timeout_kill_wait")]
+    pub timeout_kill_wait_secs: u32,
     /// Grace minutes after a reservation ends before cancelling its running jobs.
     #[serde(default)]
     pub resv_overrun_minutes: u32,
@@ -849,11 +854,12 @@ impl BillingWeights {
     }
 }
 
-/// Largest accepted `scheduler.kill_wait_secs` (Slurm's `KillWait` ceiling).
+/// Largest accepted `scheduler.kill_wait_secs` and
+/// `scheduler.timeout_kill_wait_secs` (Slurm's `KillWait` ceiling).
 pub const MAX_KILL_WAIT_SECS: u32 = 65533;
 
-/// Floor applied to `scheduler.kill_wait_secs`: a shorter wait gives a job's
-/// SIGTERM handler no realistic chance to run before SIGKILL.
+/// Floor applied to both kill waits: a shorter wait gives a job's SIGTERM
+/// handler no realistic chance to run before SIGKILL.
 pub const MIN_EFFECTIVE_KILL_WAIT_SECS: u32 = 5;
 
 impl SchedulerConfig {
@@ -862,10 +868,21 @@ impl SchedulerConfig {
         self.kill_wait_secs.max(MIN_EFFECTIVE_KILL_WAIT_SECS)
     }
 
-    /// Whether `complete_wait_secs` would force-finish a job before its kill
-    /// wait can elapse. Not a validation error so existing configs keep loading.
+    /// The SIGTERM-to-SIGKILL wait for a job stopped by a time or inactivity
+    /// limit, with the floor enforced.
+    pub fn effective_timeout_kill_wait_secs(&self) -> u32 {
+        self.timeout_kill_wait_secs
+            .max(MIN_EFFECTIVE_KILL_WAIT_SECS)
+    }
+
+    /// Whether `complete_wait_secs` would force-finish a job before the longer
+    /// of its kill waits can elapse. Not a validation error so existing configs
+    /// keep loading.
     pub fn complete_wait_too_short(&self) -> bool {
-        self.complete_wait_secs <= self.effective_kill_wait_secs()
+        let longest_wait = self
+            .effective_kill_wait_secs()
+            .max(self.effective_timeout_kill_wait_secs());
+        self.complete_wait_secs <= longest_wait
     }
 }
 
@@ -890,6 +907,9 @@ fn default_complete_wait() -> u32 {
     300
 }
 fn default_kill_wait() -> u32 {
+    5
+}
+fn default_timeout_kill_wait() -> u32 {
     30
 }
 fn default_inactive_limit() -> u32 {
@@ -913,6 +933,7 @@ impl Default for SchedulerConfig {
             enforce_part_limits: EnforcePartLimits::No,
             complete_wait_secs: 300,
             kill_wait_secs: default_kill_wait(),
+            timeout_kill_wait_secs: default_timeout_kill_wait(),
             resv_overrun_minutes: 0,
             inactive_limit_secs: default_inactive_limit(),
             max_user_priority: default_max_user_priority(),
@@ -2557,14 +2578,19 @@ impl SlurmConfig {
                 value: "0 (must be at least 1)".into(),
             });
         }
-        if self.scheduler.kill_wait_secs > MAX_KILL_WAIT_SECS {
-            return Err(ConfigError::InvalidValue {
-                field: "scheduler.kill_wait_secs".into(),
-                value: format!(
-                    "{} (must be at most {MAX_KILL_WAIT_SECS})",
-                    self.scheduler.kill_wait_secs
-                ),
-            });
+        for (field, value) in [
+            ("scheduler.kill_wait_secs", self.scheduler.kill_wait_secs),
+            (
+                "scheduler.timeout_kill_wait_secs",
+                self.scheduler.timeout_kill_wait_secs,
+            ),
+        ] {
+            if value > MAX_KILL_WAIT_SECS {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: format!("{value} (must be at most {MAX_KILL_WAIT_SECS})"),
+                });
+            }
         }
         // A limit below the client's ping interval would reap a live client
         // between its own keepalives. Require at least two intervals of slack.
@@ -4661,10 +4687,24 @@ inactive_limit_secs = 20
     }
 
     #[test]
-    fn kill_wait_defaults_to_30() {
+    fn kill_wait_defaults_to_5() {
         let parsed = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
-        assert_eq!(parsed.scheduler.kill_wait_secs, 30);
-        assert_eq!(SchedulerConfig::default().kill_wait_secs, 30);
+        assert_eq!(parsed.scheduler.kill_wait_secs, 5);
+        assert_eq!(SchedulerConfig::default().kill_wait_secs, 5);
+    }
+
+    #[test]
+    fn timeout_kill_wait_defaults_to_30() {
+        let parsed = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(parsed.scheduler.timeout_kill_wait_secs, 30);
+        assert_eq!(SchedulerConfig::default().timeout_kill_wait_secs, 30);
+    }
+
+    #[test]
+    fn defaults_reproduce_main_timings() {
+        let scheduler = SchedulerConfig::default();
+        assert_eq!(scheduler.effective_kill_wait_secs(), 5);
+        assert_eq!(scheduler.effective_timeout_kill_wait_secs(), 30);
     }
 
     #[test]
@@ -4676,6 +4716,17 @@ inactive_limit_secs = 20
         assert_eq!(with(0).effective_kill_wait_secs(), 5);
         assert_eq!(with(3).effective_kill_wait_secs(), 5);
         assert_eq!(with(45).effective_kill_wait_secs(), 45);
+    }
+
+    #[test]
+    fn effective_timeout_kill_wait_floors_at_5() {
+        let with = |timeout_kill_wait_secs| SchedulerConfig {
+            timeout_kill_wait_secs,
+            ..Default::default()
+        };
+        assert_eq!(with(0).effective_timeout_kill_wait_secs(), 5);
+        assert_eq!(with(3).effective_timeout_kill_wait_secs(), 5);
+        assert_eq!(with(45).effective_timeout_kill_wait_secs(), 45);
     }
 
     #[test]
@@ -4696,9 +4747,27 @@ inactive_limit_secs = 20
     }
 
     #[test]
+    fn timeout_kill_wait_above_max_is_rejected() {
+        let toml = format!(
+            "cluster_name = \"test\"\n[scheduler]\ntimeout_kill_wait_secs = {}\n",
+            MAX_KILL_WAIT_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("scheduler.timeout_kill_wait_secs"),
+            "unexpected error: {err}"
+        );
+        let at_max = format!(
+            "cluster_name = \"test\"\n[scheduler]\ntimeout_kill_wait_secs = {MAX_KILL_WAIT_SECS}\n"
+        );
+        SlurmConfig::load_from_str(&at_max).expect("the maximum must be accepted");
+    }
+
+    #[test]
     fn complete_wait_too_short_flags_a_wait_not_above_the_effective_kill_wait() {
         let with = |kill_wait_secs, complete_wait_secs| SchedulerConfig {
             kill_wait_secs,
+            timeout_kill_wait_secs: 0,
             complete_wait_secs,
             ..Default::default()
         };
@@ -4709,6 +4778,22 @@ inactive_limit_secs = 20
         // The effective floor of 5 applies, so a configured 0 still flags 5.
         assert!(with(0, 5).complete_wait_too_short());
         assert!(!with(0, 6).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_uses_the_larger_wait() {
+        let scheduler = SchedulerConfig {
+            kill_wait_secs: 5,
+            timeout_kill_wait_secs: 40,
+            complete_wait_secs: 35,
+            ..Default::default()
+        };
+        assert!(scheduler.complete_wait_too_short());
+        let longer = SchedulerConfig {
+            complete_wait_secs: 41,
+            ..scheduler
+        };
+        assert!(!longer.complete_wait_too_short());
     }
 
     #[test]
