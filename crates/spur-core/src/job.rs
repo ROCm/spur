@@ -1227,6 +1227,13 @@ impl Job {
         final_state
     }
 
+    /// Whether a node reported the kernel OOM-killing its part of the run.
+    pub fn reported_oom(&self) -> bool {
+        self.node_completions
+            .values()
+            .any(|c| c.signal & OOM_SIGNAL_FLAG != 0)
+    }
+
     pub fn all_nodes_completed(&self) -> bool {
         !self.allocated_nodes.is_empty()
             && self.node_completions.len() == self.allocated_nodes.len()
@@ -1698,6 +1705,23 @@ mod tests {
             !job.occupies_resources(),
             "a node that already reported completion is no longer charged"
         );
+    }
+
+    #[test]
+    fn reported_oom_sees_the_flag_on_any_node() {
+        let mut job = make_job();
+        job.node_completions
+            .insert("n1".into(), NodeCompletion { code: 0, signal: 9 });
+        assert!(!job.reported_oom());
+
+        job.node_completions.insert(
+            "n2".into(),
+            NodeCompletion {
+                code: 0,
+                signal: 9 | OOM_SIGNAL_FLAG,
+            },
+        );
+        assert!(job.reported_oom());
     }
 
     #[test]

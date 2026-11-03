@@ -7550,6 +7550,9 @@ impl ClusterManager {
         at: DateTime<Utc>,
     ) -> Option<JobFinalized> {
         let all_reported = job.all_nodes_completed();
+        // An OOM kill is not the checkpoint-and-exit the warning asked for: the
+        // run ends as the failure it was.
+        let grace = grace.filter(|_| !(all_reported && job.reported_oom()));
         if let Some(pending) = grace {
             if !all_reported {
                 return None;
@@ -7640,10 +7643,7 @@ impl ClusterManager {
         // spurd flags an OOM kill via a sentinel bit in the signal; detect it,
         // then strip the bit so the stored signal is the real SIGKILL and the
         // job reports OUT_OF_MEMORY.
-        let oom = job
-            .node_completions
-            .values()
-            .any(|c| c.signal & spur_core::job::OOM_SIGNAL_FLAG != 0);
+        let oom = job.reported_oom();
         let (derived_state, final_exit, raw_signal) =
             Job::derived_completion(&job.node_completions, &primary);
         let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
@@ -8601,26 +8601,25 @@ impl ClusterManager {
                     // already reported) ends as the preemption it was warned of. A
                     // completion carrying a cancel was ended on purpose instead,
                     // and the cancel wins.
-                    let grace = job
+                    let in_grace = job
                         .preempt_grace()
                         .filter(|_| job.state == JobState::Running && cancel.is_none())
                         .cloned();
+                    // An OOM kill is not the checkpoint-and-exit the warning asked
+                    // for, so it ends the run as the failure it was.
+                    let grace = in_grace.clone().filter(|_| *state != JobState::OutOfMemory);
                     if grace.is_some() {
                         Self::adopt_grace_provenance(job, timestamp);
                     }
-                    // Only an OOM kill outranks the preemption, as in the per-node path.
                     let state = match &grace {
-                        Some(p)
-                            if p.mode == PreemptMode::Cancel && *state != JobState::OutOfMemory =>
-                        {
-                            &JobState::Cancelled
-                        }
+                        Some(p) if p.mode == PreemptMode::Cancel => &JobState::Cancelled,
                         _ => state,
                     };
-                    freed_for_preemptor = (grace.is_some()
-                        || job.preempt_mode.as_deref() == Some("Cancel"))
-                    .then_some(job.preempted_by)
-                    .flatten();
+                    freed_for_preemptor = in_grace.map(|p| p.preempted_by).or_else(|| {
+                        (job.preempt_mode.as_deref() == Some("Cancel"))
+                            .then_some(job.preempted_by)
+                            .flatten()
+                    });
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
@@ -31339,6 +31338,85 @@ state = "UP"
 
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::Cancelled);
+    }
+
+    async fn oom_victim(
+        mode: PreemptMode,
+    ) -> (
+        TempDir,
+        Arc<ClusterManager>,
+        Arc<crate::sched_stats::SchedStatsCollector>,
+        JobId,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(crate::sched_stats::SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, mode);
+        (dir, cm, stats, id)
+    }
+
+    fn assert_ended_out_of_memory(
+        cm: &ClusterManager,
+        stats: &crate::sched_stats::SchedStatsCollector,
+        id: JobId,
+        resp: &ClientResponse,
+        mode: PreemptMode,
+    ) {
+        assert_eq!(resp.jobs_finalized.len(), 1, "{mode:?}");
+        assert_eq!(
+            resp.jobs_finalized[0].state,
+            JobState::OutOfMemory,
+            "{mode:?}"
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::OutOfMemory, "{mode:?}");
+        assert_eq!(job.pending_reason, PendingReason::OutOfMemory, "{mode:?}");
+        assert_eq!(job.preempted_by, None, "{mode:?}");
+        assert_eq!(job.preempt_mode, None, "{mode:?}");
+        assert!(job.preempt_pending.is_none(), "{mode:?}");
+        assert_eq!(stats.snapshot().jobs_preempted, 0, "{mode:?}");
+        assert_eq!(cpus_in_use(cm, "n1"), 0, "{mode:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oom_kill_reported_in_a_grace_ends_out_of_memory() {
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let (_dir, cm, stats, id) = oom_victim(mode).await;
+
+            let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+                job_id: id,
+                node_name: "n1".into(),
+                exit_code: 0,
+                signal: 9 | spur_core::job::OOM_SIGNAL_FLAG,
+                at: Some(grace_exit_at()),
+                run_attempt: 0,
+            });
+            cm.run_all_finalized_side_effects(&resp);
+
+            assert_ended_out_of_memory(&cm, &stats, id, &resp, mode);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oom_completion_in_a_grace_ends_out_of_memory() {
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let (_dir, cm, stats, id) = oom_victim(mode).await;
+
+            let resp = cm.apply_operation(&WalOperation::JobComplete {
+                job_id: id,
+                exit_code: 137,
+                state: JobState::OutOfMemory,
+                unreported_nodes: Vec::new(),
+                cancel: None,
+                at: Some(grace_exit_at()),
+            });
+            cm.run_all_finalized_side_effects(&resp);
+
+            assert_ended_out_of_memory(&cm, &stats, id, &resp, mode);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
