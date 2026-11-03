@@ -1483,7 +1483,8 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
     // nodes are still draining their warned step until the deadline.
     if job.cancel_signaled_at.is_some_and(|at| {
         let now = Utc::now();
-        let kill_wait = cluster.config().scheduler.effective_kill_wait_secs();
+        let kill_wait =
+            crate::scheduler_loop::graceful_kill_wait_secs(&cluster.config().scheduler, &job);
         let in_grace = job
             .preempt_pending
             .as_ref()
@@ -7591,6 +7592,75 @@ mod tests {
         assert!(
             is_reclaimable(&cluster, "n2", &report_run(82, 0)),
             "a cancel past twice the kill wait never reached the node"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_recancel_of_a_timed_out_job_uses_the_timeout_interval() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = test_slurm_config();
+        config.scheduler.kill_wait_secs = 5;
+        config.scheduler.timeout_kill_wait_secs = 30;
+        let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+            generation: 0,
+            ..Default::default()
+        };
+        let timed_out_ago = |job_id: u32, ago_secs: i64| {
+            apply(&WalOperation::JobSubmit {
+                job_id,
+                spec: Box::new(JobSpec {
+                    name: "timed-out".into(),
+                    user: "alice".into(),
+                    num_nodes: 1,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    ..Default::default()
+                }),
+            });
+            let per_node = std::collections::HashMap::from([("n2".to_string(), res.clone())]);
+            apply(&WalOperation::job_start(
+                job_id,
+                vec!["n2".into()],
+                res.clone(),
+                per_node,
+            ));
+            apply(&WalOperation::job_state_change(
+                job_id,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            apply(&WalOperation::JobTimeLimitExpired {
+                job_id,
+                run_attempt: 0,
+                at: Utc::now() - chrono::Duration::seconds(ago_secs),
+            });
+        };
+
+        timed_out_ago(83, 40);
+        timed_out_ago(84, 70);
+
+        assert!(
+            !is_reclaimable(&cluster, "n2", &report_run(83, 0)),
+            "past twice the kill wait but inside the timeout wait the run may still be tearing down"
+        );
+        assert!(
+            is_reclaimable(&cluster, "n2", &report_run(84, 0)),
+            "a cancel past twice the timeout wait never reached the node"
         );
     }
 

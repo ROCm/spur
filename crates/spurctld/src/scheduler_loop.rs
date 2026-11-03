@@ -1067,6 +1067,7 @@ pub(crate) fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<Strin
         &running,
         scheduler.complete_wait_secs,
         scheduler.effective_kill_wait_secs(),
+        scheduler.effective_timeout_kill_wait_secs(),
     )
 }
 
@@ -1079,6 +1080,7 @@ fn busy_until_from_running_jobs(
     running: &[spur_core::job::Job],
     complete_wait_secs: u32,
     kill_wait_secs: u32,
+    timeout_kill_wait_secs: u32,
 ) -> HashMap<String, DateTime<Utc>> {
     use spur_sched::UNLIMITED_JOB_DURATION as UNLIMITED_FALLBACK;
 
@@ -1116,7 +1118,7 @@ fn busy_until_from_running_jobs(
             .unwrap_or(UNLIMITED_FALLBACK.num_seconds());
         let slack_secs = time_limit_secs
             .saturating_add(suspended)
-            .saturating_add(kill_wait_secs as i64)
+            .saturating_add(timeout_kill_wait_secs as i64)
             .min(UNLIMITED_FALLBACK.num_seconds());
         // A long-unbounded job outliving UNLIMITED_FALLBACK would otherwise
         // compute an `end` already in the past, producing a backwards interval.
@@ -1731,10 +1733,12 @@ async fn cancel_stragglers_throttled(
         return;
     }
     let key = (job.job_id, job.run_attempt);
-    let budget =
-        crate::server::cancel_reclaim_grace(cluster.config().scheduler.effective_kill_wait_secs())
-            .to_std()
-            .unwrap_or_default();
+    let budget = crate::server::cancel_reclaim_grace(graceful_kill_wait_secs(
+        &cluster.config().scheduler,
+        job,
+    ))
+    .to_std()
+    .unwrap_or_default();
     if straggler_cancels
         .get(&key)
         .is_some_and(|sent| sent.elapsed() < budget)
@@ -3846,7 +3850,7 @@ pub async fn send_cancel_to_nodes(
     node_names: &[String],
     signal: i32,
 ) {
-    let kill_wait_secs = cancel_kill_wait_secs(cluster, signal);
+    let kill_wait_secs = cancel_kill_wait_secs(cluster, job_id, signal);
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         tokio::spawn(cancel_one_agent(
             agent_addr,
@@ -3859,12 +3863,35 @@ pub async fn send_cancel_to_nodes(
 }
 
 /// The kill wait a cancel carries: only a graceful cancel (`signal == 0`) has
-/// a SIGTERM-to-SIGKILL window; an explicit signal is delivered as given.
-fn cancel_kill_wait_secs(cluster: &ClusterManager, signal: i32) -> u32 {
+/// a SIGTERM-to-SIGKILL window; an explicit signal is delivered as given. The
+/// job is read at send time, so a run that has since been marked timed out
+/// gets the timeout wait.
+fn cancel_kill_wait_secs(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    signal: i32,
+) -> u32 {
     if signal != 0 {
         return 0;
     }
-    cluster.config().scheduler.effective_kill_wait_secs()
+    let sched = &cluster.config().scheduler;
+    match cluster.get_job(job_id) {
+        Some(job) => graceful_kill_wait_secs(sched, &job),
+        None => sched.effective_kill_wait_secs(),
+    }
+}
+
+/// The SIGTERM-to-SIGKILL wait of a graceful cancel: a run stopped by its time
+/// or inactivity limit gets the timeout wait, every other cancel the kill wait.
+pub(crate) fn graceful_kill_wait_secs(
+    sched: &spur_core::config::SchedulerConfig,
+    job: &spur_core::job::Job,
+) -> u32 {
+    if job.time_limit_signaled_at.is_some() {
+        sched.effective_timeout_kill_wait_secs()
+    } else {
+        sched.effective_kill_wait_secs()
+    }
 }
 
 /// Like `send_cancel_to_nodes`, but awaits delivery of every cancel before
@@ -3878,7 +3905,7 @@ pub async fn cancel_job_on_nodes(
     node_names: &[String],
     signal: i32,
 ) {
-    let kill_wait_secs = cancel_kill_wait_secs(cluster, signal);
+    let kill_wait_secs = cancel_kill_wait_secs(cluster, job_id, signal);
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         set.spawn(cancel_one_agent(
@@ -4318,6 +4345,7 @@ mod tests {
     }
 
     const TEST_KILL_WAIT_SECS: u32 = 30;
+    const TEST_TIMEOUT_KILL_WAIT_SECS: u32 = 45;
 
     fn running_job_on(node: &str, start: DateTime<Utc>, minutes: i64) -> Job {
         let mut job = job_with_spec(JobSpec {
@@ -4517,18 +4545,53 @@ mod tests {
     }
 
     #[test]
-    fn busy_until_uses_kill_wait() {
+    fn busy_until_uses_the_timeout_wait_for_running_jobs() {
         let now = Utc::now();
-        let job = |wait| {
-            busy_until_from_running_jobs(&[running_job_on("node001", now, 10)], 300, wait)
-                ["node001"]
+        let job = |kill_wait, timeout_wait| {
+            busy_until_from_running_jobs(
+                &[running_job_on("node001", now, 10)],
+                300,
+                kill_wait,
+                timeout_wait,
+            )["node001"]
         };
 
         assert_eq!(
-            job(120) - job(30),
+            job(5, 120) - job(5, 30),
             chrono::Duration::seconds(90),
-            "the slack past the time limit is the kill wait"
+            "the slack past the time limit is the timeout wait"
         );
+        assert_eq!(
+            job(120, 30),
+            job(5, 30),
+            "the kill wait does not move a job that is not in a grace"
+        );
+    }
+
+    #[test]
+    fn graceful_wait_is_timeout_wait_for_a_timed_out_run() {
+        let sched = spur_core::config::SchedulerConfig {
+            kill_wait_secs: 7,
+            timeout_kill_wait_secs: 40,
+            ..Default::default()
+        };
+        let mut job = running_job_on("node001", Utc::now(), 10);
+        job.time_limit_signaled_at = Some(Utc::now());
+
+        assert_eq!(graceful_kill_wait_secs(&sched, &job), 40);
+    }
+
+    #[test]
+    fn graceful_wait_is_kill_wait_otherwise() {
+        let sched = spur_core::config::SchedulerConfig {
+            kill_wait_secs: 7,
+            timeout_kill_wait_secs: 40,
+            ..Default::default()
+        };
+        let mut job = running_job_on("node001", Utc::now(), 10);
+        job.cancel_signaled_at = Some(Utc::now());
+
+        assert_eq!(graceful_kill_wait_secs(&sched, &job), 7);
     }
 
     fn in_grace(mut job: Job, deadline: DateTime<Utc>) -> Job {
@@ -4550,7 +4613,7 @@ mod tests {
         let deadline = now + chrono::Duration::seconds(120);
         let job = in_grace(running_job_on("node001", now, 600), deadline);
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300, 30);
+        let busy_until = busy_until_from_running_jobs(&[job], 300, 30, 30);
 
         assert_eq!(
             busy_until["node001"] - deadline,
@@ -4567,8 +4630,8 @@ mod tests {
         let graced = in_grace(plain.clone(), deadline);
 
         assert_eq!(
-            busy_until_from_running_jobs(&[graced], 300, 30),
-            busy_until_from_running_jobs(&[plain], 300, 30)
+            busy_until_from_running_jobs(&[graced], 300, 30, 30),
+            busy_until_from_running_jobs(&[plain], 300, 30, 30)
         );
     }
 
@@ -4582,7 +4645,12 @@ mod tests {
         job.state = spur_core::job::JobState::Completing;
         job.end_time = Some(now);
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
+        let busy_until = busy_until_from_running_jobs(
+            &[job],
+            300,
+            TEST_KILL_WAIT_SECS,
+            TEST_TIMEOUT_KILL_WAIT_SECS,
+        );
         let got = busy_until["node001"];
         assert!(
             (got - (now + chrono::Duration::seconds(300)))
@@ -4601,11 +4669,16 @@ mod tests {
 
         // Larger-ending job processed first: a "last wins" bug (instead of a
         // true max) would incorrectly keep the smaller value here.
-        let busy_until = busy_until_from_running_jobs(&[later, sooner], 300, TEST_KILL_WAIT_SECS);
+        let busy_until = busy_until_from_running_jobs(
+            &[later, sooner],
+            300,
+            TEST_KILL_WAIT_SECS,
+            TEST_TIMEOUT_KILL_WAIT_SECS,
+        );
 
         let expected = now
             + chrono::Duration::minutes(60)
-            + chrono::Duration::seconds(TEST_KILL_WAIT_SECS as i64);
+            + chrono::Duration::seconds(TEST_TIMEOUT_KILL_WAIT_SECS as i64);
         let got = busy_until["node001"];
         assert!(
             (got - expected).num_seconds().abs() < 2,
@@ -4619,7 +4692,12 @@ mod tests {
         let mut job = running_job_on("node001", now, 60);
         job.suspended_secs = i64::MAX;
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
+        let busy_until = busy_until_from_running_jobs(
+            &[job],
+            300,
+            TEST_KILL_WAIT_SECS,
+            TEST_TIMEOUT_KILL_WAIT_SECS,
+        );
         let got = busy_until["node001"];
         assert!(got > now, "expected a sane future timestamp, got {got}");
     }
@@ -4630,7 +4708,12 @@ mod tests {
         let mut job = running_job_on("node001", now - chrono::Duration::days(400), 0);
         job.spec.time_limit = None;
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
+        let busy_until = busy_until_from_running_jobs(
+            &[job],
+            300,
+            TEST_KILL_WAIT_SECS,
+            TEST_TIMEOUT_KILL_WAIT_SECS,
+        );
         let got = busy_until["node001"];
         assert!(
             got >= now,
@@ -4644,11 +4727,16 @@ mod tests {
         let mut job = running_job_on("node001", now, 10);
         job.suspended_at = Some(now - chrono::Duration::minutes(5));
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
+        let busy_until = busy_until_from_running_jobs(
+            &[job],
+            300,
+            TEST_KILL_WAIT_SECS,
+            TEST_TIMEOUT_KILL_WAIT_SECS,
+        );
         let expected = now
             + chrono::Duration::minutes(10)
             + chrono::Duration::minutes(5)
-            + chrono::Duration::seconds(TEST_KILL_WAIT_SECS as i64);
+            + chrono::Duration::seconds(TEST_TIMEOUT_KILL_WAIT_SECS as i64);
         let got = busy_until["node001"];
         assert!(
             (got - expected).num_seconds().abs() < 2,
@@ -4662,10 +4750,15 @@ mod tests {
         let mut job = running_job_on("node001", now, 10);
         job.start_time = None;
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300, TEST_KILL_WAIT_SECS);
+        let busy_until = busy_until_from_running_jobs(
+            &[job],
+            300,
+            TEST_KILL_WAIT_SECS,
+            TEST_TIMEOUT_KILL_WAIT_SECS,
+        );
         let expected = now
             + chrono::Duration::minutes(10)
-            + chrono::Duration::seconds(TEST_KILL_WAIT_SECS as i64);
+            + chrono::Duration::seconds(TEST_TIMEOUT_KILL_WAIT_SECS as i64);
         let got = busy_until["node001"];
         assert!(
             (got - expected).num_seconds().abs() < 2,
@@ -6526,6 +6619,97 @@ mod tests {
             );
         }
 
+        fn distinct_wait_config() -> SlurmConfig {
+            let mut config = test_config();
+            config.scheduler.kill_wait_secs = 5;
+            config.scheduler.timeout_kill_wait_secs = 30;
+            config
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn scancel_carries_the_kill_wait() {
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, distinct_wait_config())
+                .await
+                .0;
+            let (addr, requests, _) = spawn_mock_agent_recording_requests().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "cancelled", "n1");
+            cm.cancel_job(job.job_id, "testuser").unwrap();
+            let cancelled = cm.get_job(job.job_id).unwrap();
+
+            send_cancel_to_agents(&cm, &cancelled, 0).await;
+            wait_for("graceful cancel delivered", || {
+                !requests.lock().unwrap().is_empty()
+            });
+
+            assert!(cancelled.time_limit_signaled_at.is_none());
+            let seen: Vec<(i32, u32)> = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.signal, r.kill_wait_secs))
+                .collect();
+            assert_eq!(seen, [(0, 5)]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn time_limit_cancel_carries_the_timeout_wait() {
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, distinct_wait_config())
+                .await
+                .0;
+            let (addr, requests, _) = spawn_mock_agent_recording_requests().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_with_time_limit(&cm, "n1");
+            let start = job.start_time.expect("a running job has a start time");
+
+            expire_job_if_overdue(&cm, &job, start + chrono::Duration::minutes(2)).await;
+            wait_for("graceful cancel delivered", || {
+                !requests.lock().unwrap().is_empty()
+            });
+
+            let seen: Vec<(i32, u32)> = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| (r.signal, r.kill_wait_secs))
+                .collect();
+            assert_eq!(seen, [(0, 30)]);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_recancel_by_job_id_follows_the_jobs_current_record() {
+            let dir = TempDir::new().unwrap();
+            let cm = crate::cluster::gated::cluster(&dir, distinct_wait_config())
+                .await
+                .0;
+            let (addr, requests, _) = spawn_mock_agent_recording_requests().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_with_time_limit(&cm, "n1");
+            let start = job.start_time.expect("a running job has a start time");
+            expire_job_if_overdue(&cm, &job, start + chrono::Duration::minutes(2)).await;
+            wait_for("first cancel delivered", || {
+                requests.lock().unwrap().len() == 1
+            });
+
+            let nodes = ["n1".to_string()];
+            cancel_job_on_nodes(&cm, job.job_id, 0, &nodes, 0).await;
+            cancel_job_on_nodes(&cm, job.job_id + 1000, 0, &nodes, 0).await;
+
+            let seen: Vec<u32> = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.kill_wait_secs)
+                .collect();
+            assert_eq!(
+                seen,
+                [30, 30, 5],
+                "a timed-out run keeps the timeout wait on a resend; an unknown job gets the kill wait"
+            );
+        }
+
         fn run_with_time_limit(cm: &ClusterManager, node: &str) -> spur_core::job::Job {
             let spec = JobSpec {
                 name: "limited".into(),
@@ -6565,16 +6749,18 @@ mod tests {
                 .iter()
                 .map(|r| (r.signal, r.kill_wait_secs))
                 .collect();
-            assert_eq!(seen, [(0, 5)]);
+            assert_eq!(seen, [(0, 30)]);
         }
 
         const SIGNAL_JOB_CAPABILITY: &str = spur_core::node::CAP_SIGNAL_JOB;
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn inactive_limit_expires_through_completing_with_kill_wait() {
+        async fn inactive_limit_cancel_carries_the_timeout_wait() {
             use spur_core::job::JobState;
             let dir = TempDir::new().unwrap();
-            let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
+            let cm = crate::cluster::gated::cluster(&dir, distinct_wait_config())
+                .await
+                .0;
             let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
             register_node_with_capabilities(&cm, "n1", addr, vec![SIGNAL_JOB_CAPABILITY.into()]);
             let job = run_on(&cm, "idle", "n1");
@@ -6593,7 +6779,7 @@ mod tests {
                 .iter()
                 .map(|r| (r.signal, r.kill_wait_secs))
                 .collect();
-            assert_eq!(seen, [(0, 5)]);
+            assert_eq!(seen, [(0, 30)]);
             assert!(signals.lock().unwrap().is_empty());
         }
 
@@ -9185,7 +9371,7 @@ mod tests {
                 assert_eq!(pending.preempt_qos.as_deref(), Some("high"));
                 assert_eq!(pending.mode, PreemptMode::Cancel);
                 assert_eq!(pending.run_attempt, victim.run_attempt);
-                assert!(pending.requeue_hold_secs >= 5);
+                assert_eq!(i64::from(pending.requeue_hold_secs), cm.requeue_hold_secs());
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9721,7 +9907,11 @@ mod tests {
                     "inside the throttle: no resend"
                 );
 
-                let budget = crate::server::cancel_reclaim_grace(5).to_std().unwrap();
+                let budget = crate::server::cancel_reclaim_grace(
+                    f.cm.config().scheduler.effective_kill_wait_secs(),
+                )
+                .to_std()
+                .unwrap();
                 let Some(stale) = first_sent.checked_sub(budget + Duration::from_secs(1)) else {
                     return;
                 };
