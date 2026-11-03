@@ -2124,6 +2124,53 @@ impl SlurmController for ControllerService {
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
     }
 
+    async fn validate_block_file(
+        &self,
+        request: Request<ValidateBlockFileRequest>,
+    ) -> Result<Response<GetFabricTopologyResponse>, Status> {
+        let forward = self.prepare_read(&request);
+        let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
+        let req = request.into_inner();
+        let file = spur_core::block_file::BlockFile::parse(&req.content)
+            .map_err(Status::invalid_argument)?;
+        if let Some(resp) = self
+            .forward_read(meta, forward.then_some(req), identity, path)
+            .await
+        {
+            return Ok(resp);
+        }
+        let config = self.cluster.config();
+        let view = file.view(
+            &config.cluster_name,
+            &self.cluster.get_nodes(),
+            chrono::Utc::now(),
+            config.controller.heartbeat_timeout_secs.unwrap_or(90),
+            false,
+        );
+        Ok(Response::new((&view).into()))
+    }
+
+    async fn get_fabric_topology(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<GetFabricTopologyResponse>, Status> {
+        let forward = self.prepare_read(&request);
+        let meta = request.metadata().clone();
+        let path = rpc_path(&request);
+        let identity = Self::verified_identity(&request).cloned();
+        if let Some(resp) = self
+            .forward_read(meta, forward.then_some(()), identity, path)
+            .await
+        {
+            return Ok(resp);
+        }
+        Ok(Response::new(
+            (&self.cluster.fabric_view(Utc::now())).into(),
+        ))
+    }
+
     async fn get_node(
         &self,
         request: Request<GetNodeRequest>,
@@ -3040,6 +3087,9 @@ impl SlurmController for ControllerService {
             &req.node,
         )
         .map_err(Status::invalid_argument)?;
+        self.cluster
+            .validate_step_bindings(&job, &step_nodes)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
         let target_node = step_nodes
             .first()
             .cloned()
@@ -3704,6 +3754,9 @@ impl SlurmController for ControllerService {
             &job.allocated_nodes,
         )
         .map_err(Status::failed_precondition)?;
+        self.cluster
+            .validate_step_bindings(&job, &step.nodes)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
 
         let num_nodes = step.nodes.len() as u32;
         let plan = build_step_task_plan(step.num_tasks, num_nodes, step.distribution);
@@ -5064,11 +5117,14 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
                     2 => spur_core::resource::GpuLinkType::NVLink,
                     _ => spur_core::resource::GpuLinkType::PCIe,
                 },
+                topology: g.topology.map(spur_core::device_topology::from_proto),
                 stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic,
         generation: r.generation,
+        fabric_binding_version: r.fabric_binding_version,
+        block_file_revision: r.block_file_revision.clone(),
     };
     rs.backfill_stable_ids();
     rs
@@ -5146,6 +5202,26 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
     JobInfo {
+        gpu_bindings: job
+            .per_node_alloc
+            .iter()
+            .filter_map(|(node, alloc)| {
+                alloc
+                    .gpu_binding
+                    .as_ref()
+                    .map(|binding| (node.clone(), spur_core::gpu_binding::to_proto(binding)))
+            })
+            .collect(),
+        fabric_bindings: job
+            .per_node_alloc
+            .iter()
+            .filter_map(|(node, allocation)| {
+                allocation
+                    .fabric_binding
+                    .as_ref()
+                    .map(|binding| (node.clone(), spur_core::fabric_binding::to_proto(binding)))
+            })
+            .collect(),
         job_id: job.job_id,
         name: job.spec.name.clone(),
         user: job.spec.user.clone(),
@@ -5568,6 +5644,11 @@ pub(crate) fn allocations_to_proto(
             })
             .collect::<HashMap<_, _>>(),
         generation: r.generation,
+        gpu_binding: r.gpu_binding.as_ref().map(spur_core::gpu_binding::to_proto),
+        fabric_binding: r
+            .fabric_binding
+            .as_ref()
+            .map(spur_core::fabric_binding::to_proto),
     }
 }
 
@@ -5596,11 +5677,17 @@ pub(crate) fn resource_to_proto(
                         spur_proto::proto::GpuLinkType::GpuLinkPcie as i32
                     }
                 },
+                topology: g
+                    .topology
+                    .as_ref()
+                    .map(spur_core::device_topology::to_proto),
                 stable_id: g.stable_id,
             })
             .collect(),
         generic: r.generic.clone(),
         generation: r.generation,
+        fabric_binding_version: r.fabric_binding_version,
+        block_file_revision: r.block_file_revision.clone(),
     }
 }
 
@@ -5985,9 +6072,11 @@ mod tests {
     }
 
     #[test]
-    fn resource_set_proto_round_trip_preserves_stable_id_and_generation() {
+    fn resource_set_proto_round_trip_preserves_stable_id_generation_and_topology() {
         use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
         let rs = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 8,
             memory_mb: 1024,
             gpus: vec![GpuResource {
@@ -5996,6 +6085,16 @@ mod tests {
                 memory_mb: 196_608,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: Some(spur_core::resource::DeviceTopology {
+                    pci_bdf: Some("0001:04:00.0".into()),
+                    fabric: Some(spur_core::device_topology::FabricObservation {
+                        source: "amd-ualink".into(),
+                        status: spur_core::device_topology::ObservationStatus::Consistent,
+                        fabric_domain_id: Some("15".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 stable_id: 129,
             }],
             generic: Default::default(),
@@ -6005,6 +6104,7 @@ mod tests {
         assert_eq!(back.generation, 42);
         assert_eq!(back.gpus[0].stable_id, 129);
         assert_eq!(back.gpus[0].device_id, 1);
+        assert_eq!(back, rs);
     }
 
     #[test]
@@ -6682,6 +6782,8 @@ mod tests {
         };
 
         let res = spur_core::resource::ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
@@ -6776,6 +6878,8 @@ mod tests {
         }
 
         let res = spur_core::resource::ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
@@ -6967,6 +7071,8 @@ mod tests {
         });
 
         let res = spur_core::resource::ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
@@ -7115,6 +7221,8 @@ mod tests {
             }),
         });
         let res = spur_core::resource::ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: std::collections::HashMap::new(),
@@ -9265,6 +9373,136 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_rejects_a_changed_fabric_binding() {
+        use spur_core::fabric::{FabricObservation, ObservationStatus};
+        use spur_core::resource::{
+            AllocatedDevice, DeviceTopology, GpuLinkType, GpuResource, ResourceAllocations,
+            ResourceSet,
+        };
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let register = |domain: &str| {
+            let fabric = FabricObservation {
+                source: "test".into(),
+                status: ObservationStatus::Consistent,
+                physical_domain_id: Some("rack".into()),
+                fabric_domain_id: Some(domain.into()),
+                endpoint_id: Some("1".into()),
+                physical_capacity: Some(8),
+                fabric_capacity: Some(1),
+                active_endpoints: vec!["1".into()],
+                local_endpoints: vec!["1".into()],
+                ..Default::default()
+            };
+            let gpu = GpuResource {
+                device_id: 0,
+                stable_id: 42,
+                gpu_type: "test".into(),
+                memory_mb: 0,
+                peer_gpus: vec![],
+                link_type: GpuLinkType::PCIe,
+                topology: Some(DeviceTopology {
+                    fabric: Some(fabric),
+                    ..Default::default()
+                }),
+            };
+            svc.cluster
+                .register_node(
+                    "n1".into(),
+                    "n1".into(),
+                    ResourceSet {
+                        cpus: 8,
+                        memory_mb: 16000,
+                        generation: 7,
+                        fabric_binding_version: 1,
+                        gpus: vec![gpu],
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818,
+                    String::new(),
+                    String::new(),
+                    spur_core::node::NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                    true,
+                )
+                .unwrap();
+        };
+        let domain_is = |domain: &str| {
+            svc.cluster.get_node("n1").is_some_and(|node| {
+                node.total_resources.gpus[0]
+                    .topology
+                    .as_ref()
+                    .and_then(|t| t.fabric.as_ref())
+                    .and_then(|f| f.fabric_domain_id.as_deref())
+                    == Some(domain)
+            })
+        };
+        async fn settle(done: impl Fn() -> bool) {
+            for _ in 0..200 {
+                if done() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        register("15");
+        settle(|| domain_is("15")).await;
+        let view = svc.cluster.fabric_view(chrono::Utc::now());
+        let mut allocation = ResourceAllocations::with_scalar(1, 1000);
+        allocation.generation = 7;
+        allocation
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(42)]);
+        allocation.fabric_binding = Some(
+            spur_core::fabric_binding::FabricBinding::for_allocation(
+                &view.blocks[0],
+                "n1",
+                &allocation,
+            )
+            .unwrap(),
+        );
+        let spec = spur_core::job::JobSpec {
+            name: "bound".into(),
+            user: "ubuntu".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            gpus: Some(spur_core::gpu_request::GpuRequest::new(1, None)),
+            constraint: Some("same(gpu.fabric_domain_id)".into()),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let per_node = [("n1".to_string(), allocation.clone())]
+            .into_iter()
+            .collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into()], allocation, per_node)
+            .unwrap();
+        settle(|| svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running)).await;
+        let step = || {
+            svc.create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                user: "ubuntu".into(),
+                num_tasks: 1,
+                cpus_per_task: 1,
+                overlap: true,
+                ..Default::default()
+            }))
+        };
+        step().await.expect("the binding still matches");
+        register("16");
+        settle(|| domain_is("16")).await;
+        let err = step()
+            .await
+            .expect_err("the bound GPU moved to another domain");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("fabric"), "{err}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_create_job_step_never_hands_out_a_duplicate_step_id() {
         // Two clients handed the same id land on one supervisor session and
@@ -10821,6 +11059,270 @@ mod tests {
             .await
             .expect_err("a bound non-admin must not become root by request field");
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fabric_topology_rpc_tracks_registered_membership_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        for (generation, domain) in [(1, "7"), (2, "8")] {
+            register_test_fabric_node(&svc, generation, domain).await;
+            let result = svc
+                .get_fabric_topology(Request::new(()))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(result.namespace, "test");
+            assert_eq!(result.blocks.len(), 1);
+            assert_eq!(result.blocks[0].key.as_ref().unwrap().fabric_domain, domain);
+            assert_eq!(result.blocks[0].members[0].inventory_generation, generation);
+            assert_eq!(
+                result.blocks[0].members[0]
+                    .device
+                    .as_ref()
+                    .unwrap()
+                    .stable_id,
+                42
+            );
+            assert!(
+                result.blocks[0].issues.is_empty(),
+                "{:?}",
+                result.blocks[0].issues
+            );
+        }
+    }
+
+    async fn register_test_fabric_node(svc: &ControllerService, generation: u64, domain: &str) {
+        let mut request = Request::new(RegisterAgentRequest {
+            hostname: "fabric-node".into(),
+            address: "192.0.2.1".into(),
+            port: 6818,
+            resources: Some(spur_proto::proto::ResourceSet {
+                cpus: 4,
+                generation,
+                fabric_binding_version: 1,
+                block_file_revision: None,
+                gpus: vec![spur_proto::proto::GpuResource {
+                    stable_id: 42,
+                    topology: Some(spur_proto::proto::DeviceTopology {
+                        pci_bdf: Some("0001:04:00.0".into()),
+                        fabric: Some(spur_proto::proto::FabricObservation {
+                            source: "test".into(),
+                            status: spur_proto::proto::ObservationStatus::ObservationObserved
+                                as i32,
+                            physical_domain_id: Some("rack-a".into()),
+                            fabric_domain_id: Some(domain.into()),
+                            endpoint_id: Some("1".into()),
+                            physical_capacity: Some(8),
+                            fabric_capacity: Some(1),
+                            active_endpoints: vec!["1".into()],
+                            local_endpoints: vec!["1".into()],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(viewer("admin", true));
+        svc.register_agent(request).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_file_validation_rpc_is_read_only_and_reports_membership_issues() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, step_test_config()).await;
+        register_test_fabric_node(&svc, 1, "7").await;
+        let candidate = |text: &str| {
+            Request::new(ValidateBlockFileRequest {
+                content: text.into(),
+            })
+        };
+        let view = svc
+            .validate_block_file(candidate("BlockName=a Nodes=fabric-node"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            view.blocks[0].issues.is_empty(),
+            "{:?}",
+            view.blocks[0].issues
+        );
+        assert!(view.blocks[0].file_revision.is_none());
+        assert_eq!(view.notices.len(), 1);
+        assert!(!view.notices[0].warning);
+        assert!(svc.cluster.fabric_view(Utc::now()).blocks[0]
+            .file_revision
+            .is_none());
+        let invalid = svc
+            .validate_block_file(candidate("BlockName=a Nodes=missing"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!invalid
+            .blocks
+            .iter()
+            .find(|block| block.file_revision.is_some())
+            .unwrap()
+            .issues
+            .is_empty());
+        let error = svc
+            .validate_block_file(candidate("BlockSizes=2"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_fabric_submission_validates_and_preserves_constraint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, step_test_config()).await;
+        for constraint in ["same(gpu.vpod_id)", "same(gpu.fabric_domain_id)"] {
+            let response = svc
+                .submit_job(Request::new(SubmitJobRequest {
+                    spec: Some(JobSpec {
+                        user: "test".into(),
+                        script: "#!/bin/sh\ntrue\n".into(),
+                        partition: "default".into(),
+                        num_nodes: 1,
+                        num_tasks: 1,
+                        gpus: Some(spur_proto::proto::GpuRequest {
+                            count: 1,
+                            gpu_type: String::new(),
+                        }),
+                        constraint: constraint.into(),
+                        ..Default::default()
+                    }),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            let job = svc.cluster.get_job(response.job_id).unwrap();
+            assert_eq!(job.spec.constraint.as_deref(), Some(constraint));
+        }
+        for constraint in ["same(gpu.vpod_id)|fast", "same(gpu.unknown)"] {
+            let error = svc
+                .submit_job(Request::new(SubmitJobRequest {
+                    spec: Some(JobSpec {
+                        user: "test".into(),
+                        script: "#!/bin/sh\ntrue\n".into(),
+                        partition: "default".into(),
+                        num_nodes: 1,
+                        num_tasks: 1,
+                        gpus: Some(spur_proto::proto::GpuRequest {
+                            count: 1,
+                            gpu_type: String::new(),
+                        }),
+                        constraint: constraint.into(),
+                        ..Default::default()
+                    }),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fabric_placement_is_validated_before_raft_charges_resources() {
+        use spur_core::fabric_binding::FabricBinding;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.topology = Some(spur_core::topology::TopologyConfig {
+            external: Some(spur_core::topology::ExternalFabricConfig {
+                block_file: None,
+                loaded_block_file: None,
+            }),
+            ..Default::default()
+        });
+        let svc = test_service_with(&dir, config).await;
+        register_test_fabric_node(&svc, 1, "7").await;
+        let id = svc
+            .cluster
+            .submit_job(spur_core::job::JobSpec {
+                user: "test".into(),
+                uid: 1000,
+                gid: 1000,
+                partition: Some("default".into()),
+                script: Some("true".into()),
+                constraint: Some("same(gpu.fabric_domain_id)".into()),
+                gpus: Some(spur_core::gpu_request::GpuRequest::new(1, None)),
+                ..Default::default()
+            })
+            .unwrap()
+            .job_id;
+        let mut allocation = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            generation: 1,
+            devices: [(
+                "gpu".into(),
+                vec![spur_core::resource::AllocatedDevice::injectable(42)],
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let reserve = |allocation: &spur_core::resource::ResourceAllocations| {
+            svc.cluster.reserve_placement(
+                id,
+                vec!["fabric-node".into()],
+                allocation.clone(),
+                [("fabric-node".into(), allocation.clone())].into(),
+                false,
+                false,
+            )
+        };
+        assert!(reserve(&allocation)
+            .unwrap_err()
+            .to_string()
+            .contains("fabric binding"));
+        assert_eq!(
+            svc.cluster
+                .get_node("fabric-node")
+                .unwrap()
+                .alloc_resources
+                .total_device_count("gpu"),
+            0
+        );
+        allocation.fabric_binding = Some(
+            FabricBinding::for_allocation(
+                &svc.cluster.fabric_view(Utc::now()).blocks[0],
+                "fabric-node",
+                &allocation,
+            )
+            .unwrap(),
+        );
+        register_test_fabric_node(&svc, 2, "8").await;
+        assert!(reserve(&allocation).is_err());
+        assert_eq!(
+            svc.cluster
+                .get_node("fabric-node")
+                .unwrap()
+                .alloc_resources
+                .total_device_count("gpu"),
+            0
+        );
+        allocation.generation = 2;
+        allocation.fabric_binding = Some(
+            FabricBinding::for_allocation(
+                &svc.cluster.fabric_view(Utc::now()).blocks[0],
+                "fabric-node",
+                &allocation,
+            )
+            .unwrap(),
+        );
+        reserve(&allocation).unwrap();
+        let stored = svc.cluster.get_job(id).unwrap();
+        assert_eq!(
+            stored.per_node_alloc["fabric-node"].fabric_binding,
+            allocation.fabric_binding
+        );
+        assert_eq!(
+            job_to_proto(&stored).fabric_bindings["fabric-node"].inventory_generation,
+            2
+        );
     }
 
     async fn register_plain_node(svc: &ControllerService, name: &str, port: u16) {

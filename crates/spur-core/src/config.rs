@@ -2095,6 +2095,23 @@ impl SlurmConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(external) = self
+            .topology
+            .as_ref()
+            .and_then(|topology| topology.external.as_ref())
+        {
+            if external
+                .block_file
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            {
+                return Err(ConfigError::InvalidValue {
+                    field: "topology.external.block_file".into(),
+                    value: "requires an absolute file path".into(),
+                });
+            }
+        }
+
         if self.cluster_name.is_empty() {
             return Err(ConfigError::MissingField("cluster_name".into()));
         }

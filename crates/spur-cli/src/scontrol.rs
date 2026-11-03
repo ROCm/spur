@@ -29,10 +29,15 @@ pub struct ScontrolArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ScontrolCommand {
+    /// Inspect and validate read-only fabric membership
+    Topology {
+        #[command(subcommand)]
+        command: crate::fabric_cli::TopologyCommand,
+    },
     /// Show detailed information
     Show {
         /// Entity type: job, node, partition, reservation, assoc_mgr, federation,
-        /// config, hostnames, hostlist, hostlistsorted
+        /// config, topology, hostnames, hostlist, hostlistsorted
         entity: String,
         /// Entity name or ID
         name: Option<String>,
@@ -320,6 +325,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let args = crate::clap_exit::parse_or_exit::<ScontrolArgs>(&args);
 
     match args.command {
+        ScontrolCommand::Topology { command } => {
+            crate::fabric_cli::run(&args.controller, command).await
+        }
         ScontrolCommand::Show { entity, name } => {
             let env = job_nodelist_env(|v| std::env::var(v).ok());
             if let Some(out) = show_hostlist(&entity, name.as_deref(), env.as_deref()) {
@@ -634,6 +642,16 @@ fn show_hostlist(
 
 async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> {
     let entity = entity.to_lowercase();
+    if entity == "topology" {
+        if name.is_some() {
+            bail!("show topology does not accept a name; use topology show");
+        }
+        return crate::fabric_cli::run(
+            controller,
+            crate::fabric_cli::TopologyCommand::Show { json: false },
+        )
+        .await;
+    }
     // Parsed before connecting so a malformed id surfaces its own error, not a connect failure.
     let job_ids = match entity.as_str() {
         "job" | "jobs" => parse_show_job_ids(name)?,
@@ -716,6 +734,18 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         .map(|g| format!("gpu:{}:1", g.gpu_type))
                         .collect();
                     println!("   Gres={}", gpu_types.join(","));
+                }
+                if let Some(resources) = total {
+                    println!(
+                        "   InventoryGeneration={} FabricBindingVersion={}",
+                        resources.generation, resources.fabric_binding_version
+                    );
+                    if let Some(revision) = &resources.block_file_revision {
+                        println!("   BlockFileRevision={revision}");
+                    }
+                    for gpu in &resources.gpus {
+                        print!("{}", format_gpu_topology(gpu));
+                    }
                 }
                 println!("   Arch={} OS={}", node.arch, node.os);
                 if !node.labels.is_empty() {
@@ -927,7 +957,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
         }
         other => {
             bail!(
-                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, hostnames, hostlist, hostlistsorted",
+                "scontrol: unknown entity type '{}'. Use: job, node, partition, reservation, assoc_mgr, federation, config, topology, hostnames, hostlist, hostlistsorted",
                 other
             );
         }
@@ -1174,6 +1204,86 @@ fn state_name(state: i32) -> &'static str {
         .unwrap_or("UNKNOWN")
 }
 
+fn format_gpu_topology(gpu: &spur_proto::proto::GpuResource) -> String {
+    use spur_proto::proto::{ObservationIssueKind, ObservationStatus};
+    let Some(topology) = &gpu.topology else {
+        return String::new();
+    };
+    let text = |value: Option<&str>| value.unwrap_or("unknown").escape_debug().to_string();
+    let mut output = format!(
+        "   GPUDevice={} StableId={} PCI={} PCIRoot={} NUMA={} VRAMBytes={} GPUType={}\n",
+        gpu.device_id,
+        gpu.stable_id,
+        text(topology.pci_bdf.as_deref()),
+        text(topology.pci_root.as_deref()),
+        topology
+            .numa_node
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        topology
+            .vram_bytes
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        gpu.gpu_type.escape_debug(),
+    );
+    let Some(fabric) = &topology.fabric else {
+        return output;
+    };
+    let status = match ObservationStatus::try_from(fabric.status) {
+        Ok(ObservationStatus::ObservationObserved) => "observed",
+        Ok(ObservationStatus::ObservationIncomplete) => "incomplete",
+        Ok(ObservationStatus::ObservationInconsistent) => "inconsistent",
+        Ok(ObservationStatus::ObservationUnavailable) => "unavailable",
+        _ => "unknown",
+    };
+    output.push_str(&format!(
+        "      FabricSource={} Observation={} PhysicalDomain={} FabricDomain={} Endpoint={} EndpointState={} Transport={}\n",
+        text(Some(&fabric.source)), status, text(fabric.physical_domain_id.as_deref()),
+        text(fabric.fabric_domain_id.as_deref()), text(fabric.endpoint_id.as_deref()),
+        text(fabric.endpoint_state.as_deref()), text(fabric.transport.as_deref()),
+    ));
+    output.push_str(&format!(
+        "      PhysicalCapacity={} FabricCapacity={} ActiveEndpoints=[{}] LocalEndpoints=[{}]\n",
+        fabric
+            .physical_capacity
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        fabric
+            .fabric_capacity
+            .map_or_else(|| "unknown".into(), |v| v.to_string()),
+        text(Some(&fabric.active_endpoints.join(","))),
+        text(Some(&fabric.local_endpoints.join(","))),
+    ));
+    if !fabric.issues.is_empty() {
+        let issues: Vec<_> = fabric
+            .issues
+            .iter()
+            .map(|issue| {
+                let kind = match ObservationIssueKind::try_from(issue.kind) {
+                    Ok(ObservationIssueKind::ObservationIssueMissing) => "missing",
+                    Ok(ObservationIssueKind::ObservationIssueUnreadable) => "unreadable",
+                    Ok(ObservationIssueKind::ObservationIssueMalformed) => "malformed",
+                    Ok(ObservationIssueKind::ObservationIssueTooLarge) => "too_large",
+                    Ok(ObservationIssueKind::ObservationIssueConflict) => "conflict",
+                    Ok(ObservationIssueKind::ObservationIssueChanged) => "changed",
+                    Ok(ObservationIssueKind::ObservationIssueUnavailable) => "unavailable",
+                    Ok(ObservationIssueKind::ObservationIssuePeerConflict) => "peer_conflict",
+                    _ => "unknown",
+                };
+                format!("{}:{kind}", text(Some(&issue.field)))
+            })
+            .collect();
+        output.push_str(&format!("      ObservationIssues={}\n", issues.join(",")));
+    }
+    output
+}
+
+/// Spur never isolates whole topology blocks, so only Slurm's default is accepted.
+fn reject_exclusive_topo(value: &str) -> Result<()> {
+    match value.to_ascii_lowercase().as_str() {
+        "no" | "0" | "false" => Ok(()),
+        "yes" | "1" | "true" => bail!("ExclusiveTopo=YES is not supported"),
+        _ => bail!("invalid value for ExclusiveTopo=: '{value}'"),
+    }
+}
+
 fn node_state_name(state: i32) -> &'static str {
     spur_core::node::NodeState::from_proto_i32(state)
         .map(|s| s.display_upper())
@@ -1343,11 +1453,12 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                         anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
                     })?);
                 }
+                "exclusivetopo" => reject_exclusive_topo(value)?,
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
-                | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket"
-                | "jobdefaults" | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
+                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser" | "lln"
+                | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults" | "defmempernode"
+                | "maxmempernode" | "qos" | "tres" => {}
                 other => eprintln!("scontrol create partition: unknown key '{}'", other),
             }
         }
@@ -1746,11 +1857,12 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                     || value == "1"
                     || value.eq_ignore_ascii_case("true");
             }
+            "exclusivetopo" => reject_exclusive_topo(value)?,
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-            | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser"
-            | "exclusivetopo" | "lln" | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults"
-            | "defmempernode" | "maxmempernode" | "qos" | "tres" => {}
+            | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser" | "lln"
+            | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults" | "defmempernode"
+            | "maxmempernode" | "qos" | "tres" => {}
             _ => bail!("scontrol update: update of this parameter is not supported: '{param}'"),
         }
     }
@@ -2099,6 +2211,42 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
     if !job.comment.is_empty() {
         let _ = writeln!(out, "   Comment={}", job.comment);
     }
+    let mut gpu_bindings: Vec<_> = job.gpu_bindings.iter().collect();
+    gpu_bindings.sort_by_key(|(node, _)| *node);
+    for (node, binding) in gpu_bindings {
+        let ids: Vec<_> = binding
+            .gpus
+            .iter()
+            .map(|g| g.stable_id.to_string())
+            .collect();
+        let _ = writeln!(
+            out,
+            "   GpuPropertyNode={} Generation={} StableIds=[{}]",
+            node,
+            binding.generation,
+            ids.join(",")
+        );
+    }
+    let mut bindings: Vec<_> = job.fabric_bindings.iter().collect();
+    bindings.sort_by_key(|(node, _)| *node);
+    for (node, binding) in bindings {
+        if let Some(key) = &binding.key {
+            let ids: Vec<_> = binding
+                .members
+                .iter()
+                .filter_map(|member| {
+                    member
+                        .device
+                        .as_ref()
+                        .map(|device| device.stable_id.to_string())
+                })
+                .collect();
+            if let Some(revision) = &binding.file_revision {
+                let _ = writeln!(out, "   BlockFileRevision={revision}");
+            }
+            let _ = writeln!(out, "   FabricNode={} Namespace={} PhysicalDomain={} FabricDomain={} Generation={} StableIds=[{}] BindingVersion={}", node, key.namespace, key.physical_domain, key.fabric_domain, binding.inventory_generation, ids.join(","), binding.version);
+        }
+    }
     let _ = writeln!(out, "   UserId={} Account={}", job.user, job.account);
     let _ = writeln!(out, "   Partition={} QOS={}", job.partition, job.qos);
     let _ = writeln!(
@@ -2259,7 +2407,79 @@ fn gpu_tres_label(detail: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpu_topology_detail_exposes_membership_and_incomplete_observations() {
+        use spur_proto::proto::*;
+        let gpu = GpuResource {
+            stable_id: 128,
+            topology: Some(DeviceTopology {
+                pci_bdf: Some("0001:04:00.0".into()),
+                vram_bytes: Some(309_237_645_312),
+                fabric: Some(FabricObservation {
+                    source: "amd-ualink".into(),
+                    status: ObservationStatus::ObservationIncomplete as i32,
+                    physical_domain_id: Some("synthetic-pod".into()),
+                    active_endpoints: vec!["60".into(), "61".into()],
+                    issues: vec![ObservationIssue {
+                        field: "vpod_id".into(),
+                        kind: ObservationIssueKind::ObservationIssueMissing as i32,
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let detail = super::format_gpu_topology(&gpu);
+        assert!(detail.contains("PCI=0001:04:00.0"));
+        assert!(detail.contains("NUMA=unknown VRAMBytes=309237645312"));
+        assert!(detail
+            .contains("Observation=incomplete PhysicalDomain=synthetic-pod FabricDomain=unknown"));
+        assert!(detail.contains("ActiveEndpoints=[60,61]"));
+        assert!(detail.contains("ObservationIssues=vpod_id:missing"));
+        assert!(super::format_gpu_topology(&GpuResource::default()).is_empty());
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn exclusive_topology_accepts_only_slurms_default() {
+        for params in [
+            vec!["PartitionName=rack".into(), "ExclusiveTopo=yes".into()],
+            vec!["ExclusiveTopo=YES".into(), "PartitionName=rack".into()],
+        ] {
+            let error = parse_and_create_partition("not-a-controller", &params)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("ExclusiveTopo=YES is not supported"));
+            let error = parse_and_update_partition("not-a-controller", &params)
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("ExclusiveTopo=YES is not supported"));
+        }
+        for params in [
+            vec!["PartitionName=rack".into(), "ExclusiveTopo=NO".into()],
+            vec!["ExclusiveTopo=no".into(), "PartitionName=rack".into()],
+        ] {
+            let error = parse_and_create_partition("not-a-controller", &params)
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("ExclusiveTopo"), "{error}");
+        }
+        let error = parse_and_create_partition(
+            "not-a-controller",
+            &["PartitionName=rack".into(), "ExclusiveTopo=maybe".into()],
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid value for ExclusiveTopo="));
+    }
 
     #[test]
     fn show_job_names_who_suspended_or_requeued_it() {
@@ -2325,6 +2545,41 @@ mod tests {
         // Slurm prints a bare 0 when no per-node floor was requested.
         let unset = format_job_detail(&spur_proto::proto::JobInfo::default());
         assert!(unset.contains("MinMemoryNode=0\n"), "{unset}");
+    }
+
+    #[test]
+    fn job_detail_shows_the_binding_version_for_native_and_file_bindings() {
+        use spur_proto::proto::{FabricBinding, FabricBlockKey};
+        let mut job = spur_proto::proto::JobInfo::default();
+        for (node, version, revision) in [("n1", 1, None), ("n2", 2, Some("ab".repeat(32)))] {
+            job.fabric_bindings.insert(
+                node.into(),
+                FabricBinding {
+                    version,
+                    key: Some(FabricBlockKey::default()),
+                    file_revision: revision,
+                    ..Default::default()
+                },
+            );
+        }
+        let out = format_job_detail(&job);
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("   FabricNode=n1 ")
+                    && line.ends_with(" BindingVersion=1")),
+            "native binding must include BindingVersion=1 on its node's line"
+        );
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("   FabricNode=n2 ")
+                    && line.ends_with(" BindingVersion=2")),
+            "file binding must include BindingVersion=2 on its node's line"
+        );
+        assert_eq!(
+            out.matches("BlockFileRevision=").count(),
+            1,
+            "only the file binding should include a block file revision"
+        );
     }
 
     #[test]

@@ -24,9 +24,31 @@ pub enum HostlistError {
 /// - `"node001,node002"` → `["node001", "node002"]`
 /// - `"gpu[01-04],cpu[01-02]"` → `["gpu01", "gpu02", "gpu03", "gpu04", "cpu01", "cpu02"]`
 pub fn expand(pattern: &str) -> Result<Vec<String>, HostlistError> {
+    expand_with_limits(pattern, MAX_HOSTLIST_SIZE, usize::MAX, usize::MAX)
+}
+
+pub fn expand_bounded(
+    pattern: &str,
+    max_hosts: usize,
+    max_name_bytes: usize,
+) -> Result<Vec<String>, HostlistError> {
+    expand_with_limits(pattern, max_hosts, max_name_bytes, 64)
+}
+
+fn expand_with_limits(
+    pattern: &str,
+    max_hosts: usize,
+    max_name_bytes: usize,
+    max_depth: usize,
+) -> Result<Vec<String>, HostlistError> {
     let mut results = Vec::new();
     for part in split_top_level(pattern) {
-        expand_single(part.trim(), &mut results)?;
+        expand_single(
+            part.trim(),
+            &mut results,
+            (max_hosts, max_name_bytes, max_depth),
+            0,
+        )?;
     }
     results.retain(|s| !s.is_empty());
     Ok(results)
@@ -325,7 +347,32 @@ fn parse_range_bounds(part: &str) -> Result<Option<(u64, u64, usize)>, HostlistE
 }
 
 /// Expand a single hostlist term (no top-level commas).
-fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), HostlistError> {
+fn expand_single(
+    pattern: &str,
+    results: &mut Vec<String>,
+    limits: (usize, usize, usize),
+    depth: usize,
+) -> Result<(), HostlistError> {
+    if depth > limits.2 {
+        return Err(HostlistError::InvalidPattern(
+            "hostlist nesting exceeds limit".into(),
+        ));
+    }
+    let push = |results: &mut Vec<String>, name: String| -> Result<(), HostlistError> {
+        if name.len() > limits.1 {
+            return Err(HostlistError::InvalidPattern(
+                "hostname exceeds length limit".into(),
+            ));
+        }
+        if results.len() >= limits.0 {
+            return Err(HostlistError::TooLarge {
+                count: results.len() as u64 + 1,
+                max: limits.0,
+            });
+        }
+        results.push(name);
+        Ok(())
+    };
     if let Some(bracket_start) = pattern.find('[') {
         let bracket_end = pattern
             .find(']')
@@ -347,40 +394,40 @@ fn expand_single(pattern: &str, results: &mut Vec<String>) -> Result<(), Hostlis
                 // Bound element count BEFORE materializing. Saturating so the count
                 // arithmetic itself can't overflow on a u64::MAX range.
                 let range_count = (end - start).saturating_add(1);
-                if (results.len() as u64).saturating_add(range_count) > MAX_HOSTLIST_SIZE as u64 {
+                if (results.len() as u64).saturating_add(range_count) > limits.0 as u64 {
                     return Err(HostlistError::TooLarge {
                         count: (results.len() as u64).saturating_add(range_count),
-                        max: MAX_HOSTLIST_SIZE,
+                        max: limits.0,
                     });
                 }
 
                 for i in start..=end {
                     let name = format!("{}{:0>width$}{}", prefix, i, suffix, width = width);
                     if suffix.contains('[') {
-                        expand_single(&name, results)?;
+                        expand_single(&name, results, limits, depth + 1)?;
                     } else {
-                        results.push(name);
+                        push(results, name)?;
                     }
                     // Incremental backstop: nested products like rack[0-9999]-node[0-9999]
                     // can exceed the cap even when each single range is under it.
-                    if results.len() > MAX_HOSTLIST_SIZE {
+                    if results.len() > limits.0 {
                         return Err(HostlistError::TooLarge {
                             count: results.len() as u64,
-                            max: MAX_HOSTLIST_SIZE,
+                            max: limits.0,
                         });
                     }
                 }
             } else {
                 let name = format!("{}{}{}", prefix, range_part, suffix);
                 if suffix.contains('[') {
-                    expand_single(&name, results)?;
+                    expand_single(&name, results, limits, depth + 1)?;
                 } else {
-                    results.push(name);
+                    push(results, name)?;
                 }
             }
         }
     } else {
-        results.push(pattern.to_string());
+        push(results, pattern.to_string())?;
     }
     Ok(())
 }
@@ -427,6 +474,17 @@ pub fn count(pattern: &str) -> Result<usize, HostlistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_expansion_limits_ranges_products_names_and_depth() {
+        assert_eq!(expand_bounded("n[01-02]", 2, 3).unwrap(), ["n01", "n02"]);
+        for pattern in ["n[0-65536]", "r[0-2]n[0-2]", "n1,n2,n3"] {
+            assert!(expand_bounded(pattern, 2, 255).is_err(), "{pattern}");
+        }
+        assert!(expand_bounded("node[01-02]", 2, 3).is_err());
+        assert!(expand_bounded(&"n[1]".repeat(66), 2, 255).is_err());
+        assert!(expand_bounded("n]x[1]", 2, 255).is_err());
+    }
 
     #[test]
     fn test_simple_range() {

@@ -76,17 +76,11 @@ impl<'a> NodePlacement<'a> {
             .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)))
             .unwrap_or_default();
 
-        let required_features = job
-            .spec
-            .constraint
-            .as_deref()
-            .map(|c| {
-                c.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let required_features =
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
+                .map(|constraints| constraints.features)
+                // Invalid requests must not become unconstrained candidates.
+                .unwrap_or_else(|_| vec![job.spec.constraint.as_deref().unwrap_or_default()]);
 
         let partitions = job
             .spec

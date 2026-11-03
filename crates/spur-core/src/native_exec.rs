@@ -429,6 +429,8 @@ mod tests {
     fn proto_slice_devices_sorts_and_defaults_empty() {
         assert_eq!(proto_slice_devices(&None), (0, 0, Vec::new()));
         let alloc = spur_proto::proto::ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 4,
             memory_mb: 512,
             devices: [(
