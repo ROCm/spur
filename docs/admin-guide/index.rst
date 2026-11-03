@@ -17,6 +17,8 @@ Configuring and operating a Spur cluster.
   hooks.
 - :doc:`karma-scoring` — per-user job lifecycle counters for computing a cluster
   citizenship karma score in Prometheus.
+- :doc:`tres-billing-weights` — configurable TRES billing weights for fairshare,
+  so GPU-heavy clusters bill GPU-seconds at a higher rate than CPU-seconds.
 
 Partitions are defined statically in ``spur.conf`` (see
 :doc:`/deployment/partitioning`), not created at runtime.

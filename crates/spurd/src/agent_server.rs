@@ -5813,6 +5813,8 @@ impl SlurmAgent for AgentService {
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
             inactive_limit_secs: None,
+            tres_billing_weights: String::new(),
+            usage_reset_period: String::new(),
         }))
     }
 

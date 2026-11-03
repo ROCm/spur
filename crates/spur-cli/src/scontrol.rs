@@ -582,6 +582,15 @@ fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> St
     if let Some(secs) = ping.inactive_limit_secs {
         out.push_str(&format!("InactiveLimit={secs}\n"));
     }
+    if !ping.tres_billing_weights.is_empty() {
+        out.push_str(&format!(
+            "TRESBillingWeights={}\n",
+            ping.tres_billing_weights
+        ));
+    }
+    if !ping.usage_reset_period.is_empty() && ping.usage_reset_period != "none" {
+        out.push_str(&format!("UsageResetPeriod={}\n", ping.usage_reset_period));
+    }
     out
 }
 

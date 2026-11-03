@@ -117,6 +117,7 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         "RemoveUser" => targeted(Delete, TxnEntity::User, Local),
         "CreateQos" => targeted(Create, TxnEntity::Qos, Local),
         "DeleteQos" => targeted(Delete, TxnEntity::Qos, Local),
+        "ModifyUsage" => targeted(Update, TxnEntity::User, Local),
 
         // --- Reads ---
         "GetJobs"

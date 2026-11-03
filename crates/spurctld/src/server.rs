@@ -2411,15 +2411,18 @@ impl SlurmController for ControllerService {
             .map(|p| format!("{}@{}", p.name, p.address))
             .collect();
 
+        let config = self.cluster.config();
         Ok(Response::new(PingResponse {
             hostname,
             server_time: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
             version: env!("CARGO_PKG_VERSION").into(),
             federation_peers,
-            cluster_name: self.cluster.config().cluster_name.clone(),
+            cluster_name: config.cluster_name.clone(),
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
             inactive_limit_secs: Some(self.cluster.config().scheduler.inactive_limit_secs),
+            tres_billing_weights: config.scheduler.tres_billing_weights.clone(),
+            usage_reset_period: config.scheduler.usage_reset_period.as_str().to_owned(),
         }))
     }
 
