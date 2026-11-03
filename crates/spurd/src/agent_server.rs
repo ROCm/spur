@@ -768,8 +768,8 @@ async fn fence_stepd(
     Ok(())
 }
 
-/// Fences every supervisor an older run of the job left on this node, the ones that own
-/// the run first so its script cannot react to its steps dying.
+/// Fences the supervisors an older run of the job left on this node, stopping at the first that
+/// fails; the ones owning the run go first so its script cannot react to its steps dying.
 async fn fence_older_runs(
     stepds: &Arc<Mutex<StepdMap>>,
     completions: &crate::step_completion::StepCompletions,
@@ -1833,59 +1833,56 @@ pub async fn recover_stepds(
     let mut jobs = running.lock().await;
     for descriptor in descriptors {
         let owns_lifetime = spur_core::step::owns_job_lifetime(descriptor.step_id);
-        let cgroup_path = (!descriptor.cgroup_path.as_os_str().is_empty())
-            .then(|| descriptor.cgroup_path.clone());
-        let tracked = jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
-            fabric_binding: descriptor.resources.fabric_binding.clone(),
-            gpu_binding: descriptor.resources.gpu_binding.clone(),
-            job: executor::RunningJob::AllocationOnly,
-            // Only the job-owning step's cgroup is the job's own; a step
-            // arriving first in directory order must not seed this from its
-            // own per-step leaf.
-            cgroup_path: owns_lifetime.then(|| cgroup_path.clone()).flatten(),
-            rootfs_mode: crate::container::RootfsMode::Extracted,
-            stdout_path: String::new(),
-            stderr_path: String::new(),
-            has_pid_namespace: descriptor.has_pid_namespace,
-            has_user_namespace: descriptor.has_user_namespace,
-            has_mount_namespace: descriptor.has_mount_namespace,
-            _pty_master: None,
-            work_dir: descriptor.work_dir.clone(),
-            uid: descriptor.uid,
-            gid: descriptor.gid,
-            user: if owns_lifetime {
-                descriptor.owner.clone()
-            } else {
-                String::new()
-            },
-            partition: descriptor.resources.partition.clone(),
-            gpu_devices: descriptor.resources.gpu_devices.clone(),
-            cpus: descriptor.resources.cpus,
-            memory_mb: descriptor.resources.memory_mb,
-            nodelist: descriptor.resources.nodelist.clone(),
-            mpi: descriptor.resources.mpi.clone(),
-            run_attempt: descriptor.run_attempt,
-        });
-        // Sessions arrive in directory order, so only take these from the job's
-        // own: a step's spool file and rootfs are the step's, not the job's.
-        // An older run's session left beside a newer one must not take the job back.
+        let tracked = jobs
+            .entry(descriptor.job_id)
+            .or_insert_with(|| tracked_from_session(&descriptor, owns_lifetime));
+        // Sessions arrive in directory order; only the newest run's own session sets the job.
         if !owns_lifetime || descriptor.run_attempt < tracked.run_attempt {
             continue;
         }
-        tracked.run_attempt = descriptor.run_attempt;
-        tracked.user = descriptor.owner.clone();
-        tracked.fabric_binding = descriptor.resources.fabric_binding.clone();
-        tracked.gpu_binding = descriptor.resources.gpu_binding.clone();
-        tracked.cgroup_path = cgroup_path;
-        if !descriptor.stdout_path.is_empty() {
-            tracked.stdout_path = descriptor.stdout_path.clone();
+        *tracked = tracked_from_session(&descriptor, true);
+    }
+}
+
+/// The job as one of its sessions describes it. Only the session that owns the job speaks for
+/// its cgroup, owner, spool and rootfs; a step's are its own.
+fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bool) -> TrackedJob {
+    let cgroup_path = (owns_job && !descriptor.cgroup_path.as_os_str().is_empty())
+        .then(|| descriptor.cgroup_path.clone());
+    let own = |value: &String| {
+        if owns_job {
+            value.clone()
+        } else {
+            String::new()
         }
-        if !descriptor.stderr_path.is_empty() {
-            tracked.stderr_path = descriptor.stderr_path.clone();
-        }
-        if let Some(mode) = descriptor.container_rootfs_mode.clone() {
-            tracked.rootfs_mode = mode;
-        }
+    };
+    TrackedJob {
+        fabric_binding: descriptor.resources.fabric_binding.clone(),
+        gpu_binding: descriptor.resources.gpu_binding.clone(),
+        job: executor::RunningJob::AllocationOnly,
+        cgroup_path,
+        rootfs_mode: descriptor
+            .container_rootfs_mode
+            .clone()
+            .filter(|_| owns_job)
+            .unwrap_or(crate::container::RootfsMode::Extracted),
+        stdout_path: own(&descriptor.stdout_path),
+        stderr_path: own(&descriptor.stderr_path),
+        has_pid_namespace: descriptor.has_pid_namespace,
+        has_user_namespace: descriptor.has_user_namespace,
+        has_mount_namespace: descriptor.has_mount_namespace,
+        _pty_master: None,
+        work_dir: descriptor.work_dir.clone(),
+        uid: descriptor.uid,
+        gid: descriptor.gid,
+        user: own(&descriptor.owner),
+        partition: descriptor.resources.partition.clone(),
+        gpu_devices: descriptor.resources.gpu_devices.clone(),
+        cpus: descriptor.resources.cpus,
+        memory_mb: descriptor.resources.memory_mb,
+        nodelist: descriptor.resources.nodelist.clone(),
+        mpi: descriptor.resources.mpi.clone(),
+        run_attempt: descriptor.run_attempt,
     }
 }
 
@@ -7304,13 +7301,19 @@ impl SlurmAgent for AgentService {
         let supervise_allocation = !self.force_legacy_launch;
         #[cfg(not(test))]
         let supervise_allocation = true;
+        // Checked before fencing, so a repeat of this run never fences its own live supervisor.
+        if tracks_run_at_or_after(&*self.running.lock().await, req.job_id, req.run_attempt) {
+            return Err(Status::already_exists(format!(
+                "job {} already registered on this node",
+                req.job_id
+            )));
+        }
         // Before reserving, for the same reason as the batch launch.
         if supervise_allocation {
-            fence_displaced_run(
+            fence_older_runs(
                 &self.stepds,
                 &self.step_completions,
                 req.job_id,
-                spur_core::step::STEP_EXTERN,
                 req.run_attempt,
             )
             .await
@@ -11364,34 +11367,75 @@ mod tests {
     }
 
     /// The newest run of the job's own session decides which run is tracked, in any arrival order.
+    /// A session of `run_attempt` whose resources and owner name that run.
+    fn session_of_run(
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> crate::stepd::StepdDescriptor {
+        let mut session = session_for(run_attempt, step_id);
+        session.uid = 1000 + run_attempt;
+        session.resources.gpu_devices = vec![u64::from(run_attempt)];
+        session.resources.cpus = run_attempt;
+        session
+    }
+
+    /// The newest run of the job's own session decides the whole tracked job, in any arrival order.
     #[tokio::test]
     async fn recovery_tracks_the_newest_run_of_the_jobs_own_session() {
+        let batch = spur_core::step::STEP_BATCH;
         let orders = [
-            vec![
-                session_for(1, 0),
-                session_for(2, spur_core::step::STEP_BATCH),
-            ],
-            vec![
-                session_for(2, spur_core::step::STEP_BATCH),
-                session_for(1, 0),
-            ],
-            vec![
-                session_for(2, spur_core::step::STEP_BATCH),
-                session_for(1, spur_core::step::STEP_BATCH),
-            ],
-            vec![
-                session_for(1, spur_core::step::STEP_BATCH),
-                session_for(2, spur_core::step::STEP_BATCH),
-            ],
+            vec![session_of_run(1, 0), session_of_run(2, batch)],
+            vec![session_of_run(2, batch), session_of_run(1, 0)],
+            vec![session_of_run(2, batch), session_of_run(1, batch)],
+            vec![session_of_run(1, batch), session_of_run(2, batch)],
         ];
         for order in orders {
             let running = new_running_jobs();
             recover_stepds(&running, order).await;
+            let jobs = running.lock().await;
+            let tracked = jobs.get(&79).expect("adopted");
             assert_eq!(
-                running.lock().await.get(&79).expect("adopted").run_attempt,
-                2
+                (
+                    tracked.run_attempt,
+                    tracked.uid,
+                    tracked.gpu_devices.clone(),
+                    tracked.cpus
+                ),
+                (2, 1002, vec![2], 2),
+                "every field comes from run 2's own session"
             );
         }
+    }
+
+    /// A repeat of the allocation run this node already tracks must leave its live
+    /// supervisor alone rather than fence it and then refuse the repeat.
+    #[tokio::test]
+    async fn a_repeated_allocation_run_keeps_its_supervisor() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let live = session_for(1, spur_core::step::STEP_EXTERN);
+        svc.stepds.lock().await.insert(stepd_key(&live), live);
+
+        let repeat = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 79,
+                cpus: 1,
+                run_attempt: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the same run is a duplicate");
+
+        assert_eq!(repeat.code(), tonic::Code::AlreadyExists);
+        assert!(
+            svc.stepds
+                .lock()
+                .await
+                .contains_key(&(79, spur_core::step::STEP_EXTERN)),
+            "the live supervisor must still be tracked"
+        );
     }
 
     #[tokio::test]

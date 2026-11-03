@@ -133,6 +133,8 @@ class TestRequeuedRunReclaim:
                     lambda pid=pid: not pid_alive(node, pid),
                     timeout_s=RECLAIM_BOUND, desc=f"the old run's {what} to be stopped",
                 )
+            assert pid_alive(node, new_batch), "stopping the old run must spare the new one"
+            assert job_state(cluster.squeue_all(), job_id) == "R"
         finally:
             if job_id is not None:
                 cluster.cli_allow_fail(["scancel", str(job_id)])

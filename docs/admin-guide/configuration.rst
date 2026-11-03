@@ -248,9 +248,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        default; the controller applies a 90-second fallback when absent.
        Jobs on a Down node end as ``NODE_FAIL``; a job submitted with
        ``--requeue`` goes back to the queue, and is held there after
-       ``max_batch_requeue`` requeues. Any run the node kept going is stopped
-       when it heartbeats again (see :ref:`requeued-run-upgrade-notes` for
-       older agents).
+       ``max_batch_requeue`` requeues. Any run the job's nodes kept going is
+       stopped when they heartbeat again, or when the job is relaunched there
+       (see :ref:`requeued-run-upgrade-notes` for older agents).
    * - ``health_tick_secs``
      - integer
      - ``30``
