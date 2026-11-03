@@ -251,7 +251,7 @@ class TestHeldJobStillRunning:
                 + "\n"
                 + fresh[-2000:]
             )
-            assert f"held_by=[{holder_id}]" in fresh, f"refusal did not name job {holder_id}:\n{fresh[-2000:]}"
+            assert f"gpu_owners=[{holder_id}]" in fresh, f"refusal did not name job {holder_id}:\n{fresh[-2000:]}"
 
             wait_job_state(cluster, challenger_id, "R", timeout=HEARTBEAT_WINDOW + 30)
             _sleep_pid(cluster, node, CHALLENGER_SECS, challenger_id)
