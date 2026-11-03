@@ -95,6 +95,9 @@ pub(crate) fn warn_if_complete_wait_too_short(scheduler: &spur_core::config::Sch
 pub enum NodeCompleteResult {
     /// Node recorded; waiting for remaining nodes.
     Completing,
+    /// Node recorded and freed, but the job is a preemption victim still inside
+    /// its grace: it keeps running on the other nodes, which must be left alone.
+    InGrace,
     /// All allocated nodes have reported; job is now terminal.
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
@@ -2970,8 +2973,14 @@ impl ClusterManager {
         }
 
         let jobs = self.jobs.read();
-        if jobs.get(&job_id).is_some_and(|job| job.state.is_terminal()) {
+        let Some(job) = jobs.get(&job_id) else {
+            return Ok(NodeCompleteResult::Completing);
+        };
+        if job.state.is_terminal() {
             return Ok(NodeCompleteResult::AlreadyTerminal);
+        }
+        if job.state == JobState::Running && Self::preempt_grace_of(job).is_some() {
+            return Ok(NodeCompleteResult::InGrace);
         }
 
         Ok(NodeCompleteResult::Completing)
@@ -7515,10 +7524,9 @@ impl ClusterManager {
             .filter(|pending| pending.run_attempt == job.run_attempt)
     }
 
-    /// Record on a victim that is leaving during its grace the provenance a
+    /// Record on a victim whose run is ending inside its grace the provenance a
     /// final `JobPreemptCancel`/`JobPreemptRequeue` would have set, so the
     /// completion verdict and the preemptor earmark treat it as preempted.
-    /// Idempotent: every node report of a Completing victim passes through here.
     fn adopt_grace_provenance(job: &mut Job, at: DateTime<Utc>) {
         let Some(pending) = Self::preempt_grace_of(job) else {
             return;
@@ -7540,25 +7548,45 @@ impl ClusterManager {
         job.preempt_qos = preempt_qos;
     }
 
-    /// A user cancel ends a preemption grace: the run ends as that cancel, so
-    /// the grace and whatever provenance a node report already adopted from it
-    /// are dropped. Provenance that did not come from this grace is left alone.
-    fn cancel_preempt_grace(job: &mut Job) {
-        let Some(pending) = job.preempt_pending.take() else {
-            return;
-        };
-        let adopted_mode = match pending.mode {
-            PreemptMode::Cancel => "Cancel",
-            PreemptMode::Requeue => "Requeue",
-            PreemptMode::Off | PreemptMode::Suspend => return,
-        };
-        if job.preempted_by == Some(pending.preempted_by)
-            && job.preempt_mode.as_deref() == Some(adopted_mode)
-        {
-            job.preempted_by = None;
-            job.preempt_mode = None;
-            job.preempt_qos = None;
+    /// Move a run whose node just reported toward its end. A victim in its
+    /// grace stays Running, with nothing sent to the nodes still working, until
+    /// every node has reported; then it ends as the preemption it was warned of.
+    /// `None` while nodes are outstanding or when the state machine refuses.
+    fn advance_after_node_report(
+        job: &mut Job,
+        grace: Option<&PreemptPending>,
+        at: DateTime<Utc>,
+    ) -> Option<JobFinalized> {
+        let all_reported = job.all_nodes_completed();
+        if let Some(pending) = grace {
+            if !all_reported {
+                return None;
+            }
+            if pending.mode == PreemptMode::Requeue {
+                let begin = Self::preempt_hold_until(job, at, pending.requeue_hold_secs);
+                return Self::repend_after_preemption(
+                    job,
+                    begin,
+                    Some(pending.preempted_by),
+                    pending.preempt_qos.clone(),
+                    at,
+                );
+            }
+            Self::adopt_grace_provenance(job, at);
         }
+        // Suspended jobs route through Completing too, so an out-of-band task
+        // death finalizes instead of stranding.
+        if matches!(job.state, JobState::Running | JobState::Suspended) {
+            if let Err(e) = job.transition(JobState::Completing) {
+                warn!(job_id = job.job_id, error = %e, "invalid transition to Completing");
+            }
+            job.end_suspension(at);
+            job.end_time = Some(at);
+        }
+        if !all_reported {
+            return None;
+        }
+        Self::finalize_reported_run(job, at)
     }
 
     /// When a victim re-pended after its grace may run again: the hold recorded
@@ -7812,10 +7840,12 @@ impl ClusterManager {
         let affected: Vec<JobId> = jobs
             .iter()
             .filter(|(_, j)| {
+                // A node that already reported is done with the run: its loss
+                // must not end a victim whose other nodes are still in their grace.
                 matches!(
                     j.state,
                     JobState::Running | JobState::Completing | JobState::Suspended
-                ) && j.allocated_nodes.iter().any(|n| n == node_name)
+                ) && j.is_held_on(node_name)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -8019,6 +8049,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let already_deallocated;
                 let finalized;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
@@ -8030,6 +8061,8 @@ impl ClusterManager {
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
+                    // Nodes that reported during a grace were freed at their report.
+                    already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
                     let Some(done) = Self::repend_after_preemption(
                         job,
                         *begin_time,
@@ -8046,7 +8079,7 @@ impl ClusterManager {
                     &freed_nodes,
                     allocated_resources.as_ref(),
                     &per_node_map,
-                    &[],
+                    &already_deallocated,
                     *job_id,
                 );
                 // The earmark for a requeue-preemption is set leader-side in
@@ -8392,7 +8425,7 @@ impl ClusterManager {
                 run_attempt,
                 ..
             } => {
-                // A node a preempt-cancel victim frees here is claimed for its
+                // A node a preempting victim frees here is claimed for its
                 // preemptor in the same critical section that releases it, so no
                 // scheduling pass can slip a bystander onto it before the hoist
                 // predicate or the earmark is visible.
@@ -8415,16 +8448,19 @@ impl ClusterManager {
                         return ClientResponse::default();
                     }
 
-                    // A victim exiting inside its grace is preempted from this report
-                    // on; adopting that before the earmark and the verdict below is
-                    // what lets both see it.
-                    Self::adopt_grace_provenance(job, timestamp);
-                    let in_grace = Self::preempt_grace_of(job).is_some();
+                    let grace = Self::preempt_grace_of(job)
+                        .filter(|_| job.state == JobState::Running)
+                        .cloned();
                     let already_reported = job.node_completions.contains_key(node_name);
-                    freed_for_preemptor = (!already_reported
-                        && (in_grace || job.preempt_mode.as_deref() == Some("Cancel")))
-                    .then_some(job.preempted_by)
-                    .flatten();
+                    freed_for_preemptor = if already_reported {
+                        None
+                    } else if let Some(pending) = &grace {
+                        Some(pending.preempted_by)
+                    } else if job.preempt_mode.as_deref() == Some("Cancel") {
+                        job.preempted_by
+                    } else {
+                        None
+                    };
                     job.node_completions.insert(
                         node_name.clone(),
                         spur_core::job::NodeCompletion {
@@ -8450,34 +8486,7 @@ impl ClusterManager {
                         }
                     }
 
-                    // Suspended jobs route through Completing too, so an
-                    // out-of-band task death finalizes instead of stranding.
-                    if matches!(job.state, JobState::Running | JobState::Suspended) {
-                        if let Err(e) = job.transition(JobState::Completing) {
-                            warn!(job_id = *job_id, error = %e, "invalid transition to Completing");
-                        }
-                        job.end_suspension(timestamp);
-                        job.end_time = Some(timestamp);
-                    }
-
-                    if !job.all_nodes_completed() {
-                        None
-                    } else if let Some(pending) = Self::preempt_grace_of(job)
-                        .filter(|p| p.mode == PreemptMode::Requeue)
-                        .cloned()
-                    {
-                        let begin =
-                            Self::preempt_hold_until(job, timestamp, pending.requeue_hold_secs);
-                        Self::repend_after_preemption(
-                            job,
-                            begin,
-                            Some(pending.preempted_by),
-                            pending.preempt_qos,
-                            timestamp,
-                        )
-                    } else {
-                        Self::finalize_reported_run(job, timestamp)
-                    }
+                    Self::advance_after_node_report(job, grace.as_ref(), timestamp)
                 };
 
                 if let Some(preemptor) = freed_for_preemptor {
@@ -8518,9 +8527,9 @@ impl ClusterManager {
                 if job.cancelled_by.is_none() {
                     job.cancelled_by = cancel.clone();
                 }
-                // Independent of begin_completing: a victim already Completing
-                // keeps its grace otherwise, and the grace would override the cancel.
-                Self::cancel_preempt_grace(job);
+                // Cleared here as well as by begin_completing: a run holding no
+                // nodes stays Running, and its grace must not override the cancel.
+                job.preempt_pending = None;
                 Self::begin_completing(job, *at);
             }
             WalOperation::JobTimeLimitExpired {
@@ -8589,11 +8598,11 @@ impl ClusterManager {
                     {
                         return ClientResponse::default();
                     }
-                    // A victim that ends during its grace (force-finished while
-                    // draining, or an srun/PTY run whose client reports its exit
-                    // while still Running) ends as the preemption it was warned of.
+                    // A victim that ends during its grace (an srun/PTY run whose
+                    // client reports its exit, or a force-finish after some nodes
+                    // already reported) ends as the preemption it was warned of.
                     let grace = Self::preempt_grace_of(job)
-                        .filter(|_| matches!(job.state, JobState::Running | JobState::Completing))
+                        .filter(|_| job.state == JobState::Running)
                         .cloned();
                     if grace.is_some() {
                         Self::adopt_grace_provenance(job, timestamp);
@@ -30580,6 +30589,55 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_that_already_reported_leaves_the_grace_victim_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some("lost".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_pending.is_some());
+        assert_eq!(cpus_in_use(&cm, "n2"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_still_running_ends_a_partially_exited_grace_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n2".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("lost".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0, "freed once, not twice");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn final_preempt_cancel_clears_preempt_pending() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -30642,12 +30700,12 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn force_complete_of_a_completing_cancel_grace_victim_ends_cancelled() {
+    async fn force_complete_of_a_partially_exited_cancel_grace_victim_ends_cancelled() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
         report_node(&cm, id, "n1", grace_exit_at());
-        assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
@@ -30857,53 +30915,186 @@ state = "UP"
         assert_eq!(stats.snapshot().jobs_preempted, 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_node_report_moves_a_multinode_grace_victim_to_completing_with_provenance() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
-        let at = grace_exit_at();
+    fn cpus_in_use(cm: &ClusterManager, node: &str) -> u32 {
+        cm.get_node(node).unwrap().alloc_resources.cpus
+    }
 
-        let resp = report_node(&cm, id, "n1", at);
+    /// Place a one-cpu job on `node`, as the preemptor does once a victim frees it.
+    fn take_over_node(cm: &ClusterManager, node: &str) {
+        let id = submit_and_wait(cm, basic_spec("takeover"));
+        cm.start_job(
+            id,
+            vec![node.into()],
+            scalar_alloc(1, 1000),
+            per_node_for(&[node], scalar_alloc(1, 1000)),
+        )
+        .unwrap();
+        settle(cm, id, JobState::Running);
+    }
 
-        assert!(resp.jobs_finalized.is_empty());
-        let job = cm.get_job(id).unwrap();
-        assert_eq!(job.state, JobState::Completing);
-        assert_eq!(job.preempted_by, Some(99));
-        assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
-        assert_eq!(job.cancel_signaled_at, Some(at));
-        assert!(
-            job.preempt_pending.is_some(),
-            "the final report, not the first, ends the grace"
-        );
-        assert_eq!(
-            cm.preempt_freed_nodes_raw()
-                .get("n1")
-                .map(|(owner, _)| *owner),
-            Some(99)
-        );
-        assert!(!cm.preempt_freed_nodes_raw().contains_key("n2"));
+    fn earmark_owner(cm: &ClusterManager, node: &str) -> Option<JobId> {
+        cm.preempt_freed_nodes_raw()
+            .get(node)
+            .map(|(owner, _)| *owner)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_last_report_of_a_multinode_cancel_victim_ends_it_preempted() {
+    async fn a_partial_exit_in_grace_keeps_the_job_running() {
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let id = run_two_node_job_in_grace(&cm, mode);
+
+            let resp = report_node(&cm, id, "n1", grace_exit_at());
+
+            assert!(resp.jobs_finalized.is_empty(), "{mode:?}");
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.state, JobState::Running, "{mode:?}");
+            assert!(job.preempt_pending.is_some(), "{mode:?}");
+            assert_eq!(job.end_time, None, "{mode:?}");
+            assert_eq!(job.cancel_signaled_at, None, "{mode:?}");
+            assert_eq!(job.preempted_by, None, "not preempted until the deadline");
+            assert!(job.node_completions.contains_key("n1"));
+            assert_eq!(cpus_in_use(&cm, "n1"), 0, "the reported node is freed");
+            assert_eq!(cpus_in_use(&cm, "n2"), 1, "the other node is still held");
+            assert_eq!(earmark_owner(&cm, "n1"), Some(99), "{mode:?}");
+            assert_eq!(earmark_owner(&cm, "n2"), None, "{mode:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_partial_exit_in_grace_frees_nothing_twice() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
         report_node(&cm, id, "n1", grace_exit_at());
+        take_over_node(&cm, "n1");
+
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "only the job that took n1 over");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_exit_in_grace_is_reported_as_in_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+
+        let first = cm.node_complete(id, "n1", 0, 0, attempt).unwrap();
+        let last = cm.node_complete(id, "n2", 0, 0, attempt).unwrap();
+
+        assert_eq!(first, NodeCompleteResult::InGrace);
+        assert!(matches!(last, NodeCompleteResult::AllDone { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_exit_without_a_grace_is_reported_as_completing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        cm.jobs.write().get_mut(&id).unwrap().preempt_pending = None;
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+
+        let first = cm.node_complete(id, "n1", 0, 0, attempt).unwrap();
+
+        assert_eq!(first, NodeCompleteResult::Completing);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_deadline_preempts_only_the_unreported_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+        take_over_node(&cm, "n1");
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            job_id: id,
+            preempted_by: Some(99),
+            preempt_qos: Some("high".into()),
+            at: Some(grace_exit_at() + chrono::Duration::seconds(10)),
+        });
+
+        assert!(resp.jobs_finalized.is_empty(), "waits for n2 to report");
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(job.held_nodes(), ["n2".to_string()]);
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "n1 is not subtracted again");
+        assert_eq!(cpus_in_use(&cm, "n2"), 1);
 
         let resp = report_node(
             &cm,
             id,
             "n2",
-            grace_exit_at() + chrono::Duration::seconds(4),
+            grace_exit_at() + chrono::Duration::seconds(14),
         );
+
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "still only the job that took n1");
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+        assert_eq!(earmark_owner(&cm, "n1"), Some(99));
+        assert_eq!(earmark_owner(&cm, "n2"), Some(99));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_deadline_requeues_a_partially_exited_requeue_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
+        report_node(&cm, id, "n1", grace_exit_at());
+        take_over_node(&cm, "n1");
+        let begin_time = grace_exit_at() + chrono::Duration::seconds(40);
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: id,
+            begin_time,
+            preempted_by: Some(99),
+            preempt_qos: Some("high".into()),
+            at: None,
+        });
+
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.spec.begin_time, Some(begin_time));
+        assert!(job.allocated_nodes.is_empty());
+        assert!(job.node_completions.is_empty());
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "n1 is not subtracted again");
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_nodes_exiting_in_grace_ends_preempted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+        let last = grace_exit_at() + chrono::Duration::seconds(4);
+
+        let resp = report_node(&cm, id, "n2", last);
 
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_qos.as_deref(), Some("high"));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+        assert_eq!(job.cancel_signaled_at, Some(last));
         assert!(job.preempt_pending.is_none());
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+        assert_eq!(earmark_owner(&cm, "n1"), Some(99));
+        assert_eq!(earmark_owner(&cm, "n2"), Some(99));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -30912,7 +31103,7 @@ state = "UP"
         let cm = test_cluster(&dir).await;
         let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
         report_node(&cm, id, "n1", grace_exit_at());
-        assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
         let last = grace_exit_at() + chrono::Duration::seconds(4);
 
         let resp = report_node(&cm, id, "n2", last);
@@ -31042,7 +31233,7 @@ state = "UP"
         assert_eq!(user.cancelled, 0);
     }
 
-    /// A two-node victim in grace that has started completing (n1 reported) and is
+    /// A two-node victim in grace that has partly exited (n1 reported) and is
     /// then cancelled by its owner, with n2 still to report.
     async fn cancelled_while_a_grace_victim_drains(
         mode: PreemptMode,
@@ -31084,10 +31275,12 @@ state = "UP"
         assert!(job.cancelled_by.is_some());
         assert!(job.preempt_pending.is_none());
         assert_eq!(stats.snapshot().jobs_preempted, 0);
+        assert_eq!(cpus_in_use(cm, "n1"), 0);
+        assert_eq!(cpus_in_use(cm, "n2"), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_user_cancel_wins_over_a_draining_cancel_grace() {
+    async fn a_user_cancel_after_a_partial_exit_in_grace_wins() {
         let (_dir, cm, stats, id) =
             cancelled_while_a_grace_victim_drains(PreemptMode::Cancel).await;
 
@@ -31097,7 +31290,7 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_user_cancel_wins_over_a_draining_requeue_grace() {
+    async fn a_user_cancel_after_a_partial_exit_in_a_requeue_grace_wins() {
         let (_dir, cm, stats, id) =
             cancelled_while_a_grace_victim_drains(PreemptMode::Requeue).await;
 

@@ -238,7 +238,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     // which reclaimer has capacity in flight and leave it alone until it lands.
     let mut reclaim_in_flight: HashMap<spur_core::job::JobId, DateTime<Utc>> = HashMap::new();
     let mut was_leader = false;
-    let mut straggler_cancels = StragglerCancels::new();
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -259,7 +258,6 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             // from before it lost leadership.
             relinquish_leadership(&cluster, &mut scheduler);
             was_leader = false;
-            straggler_cancels.clear();
             continue;
         }
 
@@ -294,7 +292,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // hoisting below, so each earmark survives a fixed number of real
         // scheduling passes rather than a wall-clock window.
         cluster.tick_preempt_freed_earmarks();
-        finalize_expired_graces(&cluster, Utc::now(), &mut straggler_cancels).await;
+        finalize_expired_graces(&cluster, Utc::now()).await;
 
         // Submit due node health checks as exclusive whole-node jobs and enforce
         // the starvation drain/resume. Runs leader-only, alongside the other
@@ -1096,9 +1094,9 @@ fn busy_until_from_running_jobs(
                 .checked_add_signed(chrono::Duration::seconds(complete_wait_secs as i64))
                 .unwrap_or(far_future)
                 .max(now);
-            for node in &job.allocated_nodes {
+            for node in job.held_nodes() {
                 busy_until
-                    .entry(node.clone())
+                    .entry(node)
                     .and_modify(|e| *e = (*e).max(end))
                     .or_insert(end);
             }
@@ -1137,9 +1135,9 @@ fn busy_until_from_running_jobs(
             end = end.min(free_after_kill);
         }
         let end = end.max(now);
-        for node in &job.allocated_nodes {
+        for node in job.held_nodes() {
             busy_until
-                .entry(node.clone())
+                .entry(node)
                 .and_modify(|e| *e = (*e).max(end))
                 .or_insert(end);
         }
@@ -1572,8 +1570,16 @@ async fn preempt_victim_now(
 
     match cluster.preempt_job_with_provenance(victim.job_id, mode, Some(preemptor), preempt_qos) {
         Ok(PreemptOutcome::Killed) => {
-            // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
-            send_cancel_to_agents(cluster, victim, 0).await;
+            // Signal 0 = graceful cancel (SIGTERM then SIGKILL). Nodes that
+            // already reported during a grace have nothing left to stop.
+            send_cancel_to_nodes(
+                cluster,
+                victim.job_id,
+                victim.run_attempt,
+                &victim.held_nodes(),
+                0,
+            )
+            .await;
             Ok(())
         }
         Ok(PreemptOutcome::Suspended) => {
@@ -1587,7 +1593,7 @@ async fn preempt_victim_now(
                 VictimFollowUp::Cancel {
                     job_id: victim.job_id,
                     run_attempt: victim.run_attempt,
-                    nodes: victim.allocated_nodes.clone(),
+                    nodes: victim.held_nodes(),
                 }
             };
             follow_late_preemption(cluster, &e, follow_up);
@@ -1663,25 +1669,13 @@ async fn start_preemption_grace(
     Ok(())
 }
 
-/// When the terminate last went to the nodes still running a Completing in-grace
-/// victim, per run.
-type StragglerCancels = HashMap<(spur_core::job::JobId, u32), std::time::Instant>;
-
 /// Ends the preemption of every job whose grace period is over, exactly as an
 /// immediate preemption would have, using the mode and provenance recorded when
-/// the victim was warned. A victim that already started completing has its
-/// remaining nodes told to stop again each time the kill budget has elapsed
-/// without them reporting; the node-completion path finalizes it.
-async fn finalize_expired_graces(
-    cluster: &Arc<ClusterManager>,
-    now: DateTime<Utc>,
-    straggler_cancels: &mut StragglerCancels,
-) {
-    use spur_core::job::JobState;
-
+/// the victim was warned.
+async fn finalize_expired_graces(cluster: &Arc<ClusterManager>, now: DateTime<Utc>) {
     let due: Vec<spur_core::job::Job> = cluster
         .get_jobs(&JobFilter {
-            states: &[JobState::Running, JobState::Completing],
+            states: &[spur_core::job::JobState::Running],
             ..Default::default()
         })
         .into_iter()
@@ -1692,18 +1686,7 @@ async fn finalize_expired_graces(
         })
         .collect();
 
-    let completing: HashSet<_> = due
-        .iter()
-        .filter(|job| job.state == JobState::Completing)
-        .map(|job| (job.job_id, job.run_attempt))
-        .collect();
-    straggler_cancels.retain(|key, _| completing.contains(key));
-
     for job in &due {
-        if job.state == JobState::Completing {
-            cancel_stragglers_throttled(cluster, job, straggler_cancels).await;
-            continue;
-        }
         finalize_running_grace(cluster, job).await;
     }
 }
@@ -1729,48 +1712,6 @@ async fn finalize_running_grace(cluster: &Arc<ClusterManager>, job: &spur_core::
     {
         warn!(job_id = job.job_id, error = %e, "failed to preempt job at the end of its grace period");
     }
-}
-
-/// Nodes of a Completing run that have not reported yet.
-fn unreported_nodes(job: &spur_core::job::Job) -> Vec<String> {
-    job.allocated_nodes
-        .iter()
-        .filter(|node| !job.node_completions.contains_key(*node))
-        .cloned()
-        .collect()
-}
-
-/// A completion report is not a retry trigger of its own: a lost terminate is
-/// only recovered once the agent's whole kill budget has passed without a report.
-async fn cancel_stragglers_throttled(
-    cluster: &Arc<ClusterManager>,
-    job: &spur_core::job::Job,
-    straggler_cancels: &mut StragglerCancels,
-) {
-    let stragglers = unreported_nodes(job);
-    if stragglers.is_empty() {
-        return;
-    }
-    let key = (job.job_id, job.run_attempt);
-    let budget = crate::server::cancel_reclaim_grace(graceful_kill_wait_secs(
-        &cluster.config().scheduler,
-        job,
-    ))
-    .to_std()
-    .unwrap_or_default();
-    if straggler_cancels
-        .get(&key)
-        .is_some_and(|sent| sent.elapsed() < budget)
-    {
-        return;
-    }
-    straggler_cancels.insert(key, std::time::Instant::now());
-    info!(
-        job_id = job.job_id,
-        nodes = ?stragglers,
-        "preemption grace period over — stopping the nodes still running"
-    );
-    send_cancel_to_nodes(cluster, job.job_id, job.run_attempt, &stragglers, 0).await;
 }
 
 /// Warns the victim's `srun` steps, never the batch script.
@@ -3559,8 +3500,6 @@ async fn enforce_completing_timeout(cluster: Arc<ClusterManager>, raft: Arc<Raft
 
 /// Whether a COMPLETING job has waited long enough to be force-finished. No
 /// production path leaves the end time unset, so a missing one is corrupt state.
-/// A grace in progress extends the wait: the unreported nodes are still allowed
-/// to run until its deadline.
 fn completing_job_is_overdue(
     job: &spur_core::job::Job,
     now: DateTime<Utc>,
@@ -3569,11 +3508,7 @@ fn completing_job_is_overdue(
     let Some(end_time) = job.end_time else {
         return true;
     };
-    let since = job
-        .preempt_pending
-        .as_ref()
-        .map_or(end_time, |p| end_time.max(p.deadline));
-    now - since >= wait
+    now - end_time >= wait
 }
 
 /// Force-finishes a job stuck in Completing past `complete_wait_secs`. Cancels
@@ -4537,33 +4472,6 @@ mod tests {
     }
 
     #[test]
-    fn a_completing_grace_victim_is_measured_from_the_deadline() {
-        let now = Utc::now();
-        let wait = chrono::Duration::seconds(300);
-        let mut job = running_job_on("node001", now, 10);
-        job.state = spur_core::job::JobState::Completing;
-        job.end_time = Some(now - chrono::Duration::seconds(400));
-        job.preempt_pending = Some(spur_core::job::PreemptPending {
-            signaled_at: now - chrono::Duration::seconds(450),
-            deadline: now + chrono::Duration::seconds(600),
-            preempted_by: 7,
-            preempt_qos: None,
-            mode: spur_core::partition::PreemptMode::Cancel,
-            run_attempt: job.run_attempt,
-            requeue_hold_secs: 30,
-        });
-        assert!(
-            !completing_job_is_overdue(&job, now, wait),
-            "the first exit is older than the wait, but the grace has not ended"
-        );
-
-        let before_wait_ends = now + chrono::Duration::seconds(600 + 299);
-        assert!(!completing_job_is_overdue(&job, before_wait_ends, wait));
-        let wait_ends = now + chrono::Duration::seconds(600 + 300);
-        assert!(completing_job_is_overdue(&job, wait_ends, wait));
-    }
-
-    #[test]
     fn busy_until_uses_the_timeout_wait_for_running_jobs() {
         let now = Utc::now();
         let job = |kill_wait, timeout_wait| {
@@ -4639,6 +4547,24 @@ mod tests {
             chrono::Duration::seconds(35),
             "nodes free at the deadline plus the kill wait and the five-second margin"
         );
+    }
+
+    #[test]
+    fn busy_until_skips_the_nodes_a_grace_victim_already_released() {
+        let now = Utc::now();
+        let mut job = in_grace(
+            running_job_on("node001", now, 600),
+            now + chrono::Duration::seconds(120),
+        );
+        job.allocated_nodes.push("node002".into());
+        job.node_completions.insert(
+            "node001".into(),
+            spur_core::job::NodeCompletion { code: 0, signal: 0 },
+        );
+
+        let busy_until = busy_until_from_running_jobs(&[job], 300, 30, 30);
+
+        assert_eq!(busy_until.keys().collect::<Vec<_>>(), ["node002"]);
     }
 
     #[test]
@@ -9810,10 +9736,8 @@ mod tests {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn grace_does_nothing_before_the_deadline() {
                 let f = victim_in_grace(PreemptMode::Cancel, None).await;
-                let mut cancelled = StragglerCancels::new();
-
                 let just_before = f.deadline() - chrono::Duration::seconds(1);
-                finalize_expired_graces(&f.cm, just_before, &mut cancelled).await;
+                finalize_expired_graces(&f.cm, just_before).await;
 
                 let job = f.cm.get_job(f.victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Running);
@@ -9824,9 +9748,7 @@ mod tests {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn grace_preempts_at_the_deadline_with_the_stored_mode() {
                 let f = victim_in_grace(PreemptMode::Cancel, None).await;
-                let mut cancelled = StragglerCancels::new();
-
-                finalize_expired_graces(&f.cm, f.deadline(), &mut cancelled).await;
+                finalize_expired_graces(&f.cm, f.deadline()).await;
 
                 wait_for("graceful cancel delivered", || {
                     !f.cancels.lock().unwrap().is_empty()
@@ -9843,9 +9765,7 @@ mod tests {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn grace_requeues_at_the_deadline_when_that_was_the_stored_mode() {
                 let f = victim_in_grace(PreemptMode::Requeue, None).await;
-                let mut cancelled = StragglerCancels::new();
-
-                finalize_expired_graces(&f.cm, f.deadline(), &mut cancelled).await;
+                finalize_expired_graces(&f.cm, f.deadline()).await;
 
                 wait_for("graceful cancel delivered", || {
                     !f.cancels.lock().unwrap().is_empty()
@@ -9875,9 +9795,7 @@ mod tests {
                 restored
                     .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
                     .unwrap();
-                let mut cancelled = StragglerCancels::new();
-
-                finalize_expired_graces(&restored, f.deadline(), &mut cancelled).await;
+                finalize_expired_graces(&restored, f.deadline()).await;
 
                 let job = restored.get_job(f.victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Running);
@@ -9892,9 +9810,7 @@ mod tests {
                 let dir = TempDir::new().unwrap();
                 let successor = test_cluster_with_config(&dir, preempting_config("cancel")).await;
                 successor.restore_from_snapshot(&snapshot).unwrap();
-                let mut cancelled = StragglerCancels::new();
-
-                finalize_expired_graces(&successor, f.deadline(), &mut cancelled).await;
+                finalize_expired_graces(&successor, f.deadline()).await;
 
                 wait_for("graceful cancel delivered", || {
                     !f.cancels.lock().unwrap().is_empty()
@@ -9909,8 +9825,9 @@ mod tests {
                 );
             }
 
-            /// A two-node victim in grace whose `n1` has already reported.
-            async fn completing_victim_with_a_straggler() -> (StragglerFixture, Job) {
+            /// A two-node victim in grace whose `n1` has already reported, and a
+            /// bystander job that took over `n1` once it was freed.
+            async fn victim_with_a_partial_exit(mode: PreemptMode) -> (PartialExitFixture, Job) {
                 let dir = TempDir::new().unwrap();
                 let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
                 let (addr, cancels, _) = spawn_mock_agent_recording_requests().await;
@@ -9949,119 +9866,66 @@ mod tests {
                 let victim = cm.get_job(job_id).unwrap();
                 let hunter = submit_preemptor(&cm);
                 let signaled_at = Utc::now();
-                let pending = pending_due(&victim, &hunter, PreemptMode::Cancel, signaled_at);
+                let pending = pending_due(&victim, &hunter, mode, signaled_at);
                 assert!(cm.signal_preemption(pending, job_id).unwrap());
                 cm.node_complete(job_id, "n1", 0, 0, victim.run_attempt)
                     .unwrap();
+                let bystander = run_victim(&cm, "bystander", "n1", None);
                 let victim = cm.get_job(job_id).unwrap();
                 let after_deadline = signaled_at + chrono::Duration::seconds(601);
                 (
-                    StragglerFixture {
+                    PartialExitFixture {
                         _dir: dir,
                         cm,
                         cancels,
+                        hunter,
+                        bystander,
                         after_deadline,
                     },
                     victim,
                 )
             }
 
-            struct StragglerFixture {
+            struct PartialExitFixture {
                 /// Keeps the controller's state directory alive for later writes.
                 _dir: TempDir,
                 cm: Arc<ClusterManager>,
                 cancels: Cancels,
+                hunter: Job,
+                /// Holds one cpu of `n1` after the victim's early exit freed it.
+                bystander: Job,
                 after_deadline: DateTime<Utc>,
             }
 
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn grace_stops_only_the_unreported_nodes_of_a_completing_victim() {
-                let (f, victim) = completing_victim_with_a_straggler().await;
-                assert_eq!(victim.state, JobState::Completing);
-                assert_eq!(unreported_nodes(&victim), ["n2".to_string()]);
-                let mut cancelled = StragglerCancels::new();
+            impl PartialExitFixture {
+                fn cpus_in_use(&self, node: &str) -> u32 {
+                    self.cm.get_node(node).unwrap().alloc_resources.cpus
+                }
+            }
 
-                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn the_deadline_preempts_only_the_unreported_nodes() {
+                let (f, victim) = victim_with_a_partial_exit(PreemptMode::Cancel).await;
+                assert_eq!(victim.state, JobState::Running);
+                assert_eq!(victim.held_nodes(), ["n2".to_string()]);
+                assert_eq!(f.cpus_in_use("n1"), 1, "the bystander's cpu");
+                assert_eq!(f.cpus_in_use("n2"), 1);
+
+                finalize_expired_graces(&f.cm, f.after_deadline).await;
 
                 wait_for("the terminate is delivered", || {
                     !f.cancels.lock().unwrap().is_empty()
                 });
-                let key = (victim.job_id, victim.run_attempt);
-                assert_eq!(cancelled.keys().copied().collect::<Vec<_>>(), [key]);
+                assert_eq!(
+                    f.cancels.lock().unwrap().len(),
+                    1,
+                    "one terminate, for the node still running"
+                );
                 let job = f.cm.get_job(victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Completing);
-                assert!(
-                    job.preempt_pending.is_some(),
-                    "node completion owns the finish"
-                );
-            }
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn grace_stragglers_are_recancelled_after_the_throttle() {
-                let (f, victim) = completing_victim_with_a_straggler().await;
-                let key = (victim.job_id, victim.run_attempt);
-                let mut cancelled = StragglerCancels::new();
-                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
-                wait_for("the first terminate is delivered", || {
-                    f.cancels.lock().unwrap().len() == 1
-                });
-                let first_sent = cancelled[&key];
-
-                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
-                assert_eq!(
-                    cancelled[&key], first_sent,
-                    "inside the throttle: no resend"
-                );
-
-                let budget = crate::server::cancel_reclaim_grace(
-                    f.cm.config().scheduler.effective_kill_wait_secs(),
-                )
-                .to_std()
-                .unwrap();
-                let Some(stale) = first_sent.checked_sub(budget + Duration::from_secs(1)) else {
-                    return;
-                };
-                cancelled.insert(key, stale);
-                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
-                assert!(
-                    cancelled[&key] > first_sent,
-                    "past the throttle: sent again"
-                );
-                wait_for("the terminate is repeated", || {
-                    f.cancels.lock().unwrap().len() >= 2
-                });
-                let seen: Vec<(i32, u32)> = f
-                    .cancels
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|r| (r.signal, r.kill_wait_secs))
-                    .collect();
-                assert!(seen.iter().all(|s| *s == (0, 5)));
-            }
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn straggler_throttle_entries_are_dropped_with_the_job() {
-                let (f, victim) = completing_victim_with_a_straggler().await;
-                let key = (victim.job_id, victim.run_attempt);
-                let mut cancelled = StragglerCancels::new();
-                cancelled.insert((victim.job_id + 100, 1), std::time::Instant::now());
-
-                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
-
-                assert_eq!(cancelled.keys().copied().collect::<Vec<_>>(), [key]);
-            }
-
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn partial_exit_then_deadline_still_preempts() {
-                let (f, victim) = completing_victim_with_a_straggler().await;
-                let mut cancelled = StragglerCancels::new();
-                finalize_expired_graces(&f.cm, f.after_deadline, &mut cancelled).await;
-                assert_eq!(
-                    f.cm.get_job(victim.job_id).unwrap().state,
-                    JobState::Completing,
-                    "the deadline leaves the finish to the stragglers' reports"
-                );
+                assert_eq!(job.preempted_by, Some(f.hunter.job_id));
+                assert!(job.preempt_pending.is_none());
+                assert_eq!(f.cpus_in_use("n1"), 1, "n1 is not subtracted a second time");
 
                 let result =
                     f.cm.node_complete(victim.job_id, "n2", -1, 15, victim.run_attempt)
@@ -10077,7 +9941,32 @@ mod tests {
                 let job = f.cm.get_job(victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Cancelled);
                 assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+                assert_eq!(f.cpus_in_use("n1"), 1, "still only the bystander");
+                assert_eq!(f.cpus_in_use("n2"), 0);
+                assert_eq!(f.bystander.state, JobState::Running);
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn the_deadline_requeues_a_partially_exited_requeue_victim() {
+                let (f, victim) = victim_with_a_partial_exit(PreemptMode::Requeue).await;
+
+                finalize_expired_graces(&f.cm, f.after_deadline).await;
+
+                wait_for("the terminate is delivered", || {
+                    !f.cancels.lock().unwrap().is_empty()
+                });
+                assert_eq!(
+                    f.cancels.lock().unwrap().len(),
+                    1,
+                    "one terminate, for the node still running"
+                );
+                let job = f.cm.get_job(victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Pending);
+                assert_eq!(job.preempted_by, Some(f.hunter.job_id));
                 assert!(job.preempt_pending.is_none());
+                assert!(job.allocated_nodes.is_empty());
+                assert_eq!(f.cpus_in_use("n1"), 1, "only the bystander still holds n1");
+                assert_eq!(f.cpus_in_use("n2"), 0);
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

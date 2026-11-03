@@ -1238,6 +1238,15 @@ impl Job {
         self.allocated_nodes.iter().any(|n| n == node) && !self.node_completions.contains_key(node)
     }
 
+    /// The allocated nodes still charged for this job, in allocation order.
+    pub fn held_nodes(&self) -> Vec<String> {
+        self.allocated_nodes
+            .iter()
+            .filter(|node| self.is_held_on(node))
+            .cloned()
+            .collect()
+    }
+
     /// A standalone `srun --pty` allocation, whose shell is its workload. A salloc
     /// parent (interactive) or a batch parent keeps its own lifecycle instead.
     pub fn is_standalone_pty(&self) -> bool {
@@ -1564,9 +1573,6 @@ impl Job {
             (JobState::Completing, JobState::Timeout) => true,
             (JobState::Completing, JobState::NodeFail) => true,
             (JobState::Completing, JobState::OutOfMemory) => true,
-            // A victim that exits during its preemption grace ends the run as
-            // preempted, whether it is then re-pended or cancelled.
-            (JobState::Completing, JobState::Preempted) => true,
             (JobState::Suspended, JobState::Running) => true,
             (JobState::Suspended, JobState::Cancelled) => true,
             // Completion routes through Completing like a running job (Slurm JOB_COMPLETING).
@@ -1684,6 +1690,16 @@ mod tests {
             !job.occupies_resources(),
             "a node that already reported completion is no longer charged"
         );
+    }
+
+    #[test]
+    fn held_nodes_leaves_out_the_nodes_that_reported() {
+        let mut job = make_job();
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        job.node_completions
+            .insert("n2".into(), NodeCompletion { code: 0, signal: 0 });
+
+        assert_eq!(job.held_nodes(), ["n1".to_string(), "n3".to_string()]);
     }
 
     #[test]
@@ -2490,10 +2506,9 @@ mod tests {
     }
 
     #[test]
-    fn a_completing_run_can_end_preempted_and_then_re_pend() {
+    fn a_running_run_can_end_preempted_and_then_re_pend() {
         let mut job = make_job();
         job.transition(JobState::Running).unwrap();
-        job.transition(JobState::Completing).unwrap();
 
         job.transition(JobState::Preempted).unwrap();
         job.transition(JobState::Pending).unwrap();

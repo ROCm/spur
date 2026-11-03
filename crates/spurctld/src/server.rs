@@ -636,7 +636,9 @@ impl ControllerService {
             return Ok(StepdRecoveryProbe::Retained);
         }
 
-        let expected_nodes = job.allocated_nodes.clone();
+        // A node that already reported its part of a victim's grace has no
+        // supervisor left to answer, which is not a lost cohort.
+        let expected_nodes = job.held_nodes();
         let mut missing = Vec::new();
         let mut set = tokio::task::JoinSet::new();
         let mut handle_to_node = HashMap::new();
@@ -1479,17 +1481,10 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
     }
     // A cancel this old that the node is still claiming never reached it
     // (an agent that was down when it was sent); the run is over regardless.
-    // Not inside a grace: a first-exit stamps the cancel time while the other
-    // nodes are still draining their warned step until the deadline.
     if job.cancel_signaled_at.is_some_and(|at| {
-        let now = Utc::now();
         let kill_wait =
             crate::scheduler_loop::graceful_kill_wait_secs(&cluster.config().scheduler, &job);
-        let in_grace = job
-            .preempt_pending
-            .as_ref()
-            .is_some_and(|p| p.deadline > now);
-        !in_grace && now - at > cancel_reclaim_grace(kill_wait)
+        Utc::now() - at > cancel_reclaim_grace(kill_wait)
     }) {
         return true;
     }
@@ -2700,7 +2695,9 @@ impl SlurmController for ControllerService {
         use crate::cluster::NodeCompleteResult;
 
         match completion_result {
-            Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
+            Some(Ok(NodeCompleteResult::AllDone { .. } | NodeCompleteResult::InGrace)) => {
+                Ok(Response::new(()))
+            }
             Some(Ok(NodeCompleteResult::Completing)) => {
                 if let Some(job) = self.cluster.get_job(req.job_id) {
                     if job
@@ -7672,7 +7669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn is_reclaimable_recovers_a_lost_terminate_for_a_completing_grace_victim() {
+    async fn is_reclaimable_recovers_a_lost_terminate_for_a_grace_victim_stopped_at_its_deadline() {
         use crate::raft::StateMachineApply;
         use spur_core::job::{JobSpec, JobState, PreemptPending};
         use spur_core::partition::PreemptMode;
@@ -7689,7 +7686,7 @@ mod tests {
             );
         };
         let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
-        let first_report_ago = |job_id: u32, ago_secs: i64| {
+        let stopped_ago = |job_id: u32, ago_secs: i64| {
             apply(&WalOperation::JobSubmit {
                 job_id,
                 spec: Box::new(JobSpec {
@@ -7736,13 +7733,19 @@ mod tests {
                 exit_code: 0,
                 signal: 0,
                 run_attempt: 0,
+                at: Some(signaled_at),
+            });
+            apply(&WalOperation::JobPreemptCancel {
+                job_id,
+                preempted_by: Some(99),
+                preempt_qos: None,
                 at: Some(Utc::now() - chrono::Duration::seconds(ago_secs)),
             });
             assert_eq!(cluster.get_job(job_id).unwrap().state, JobState::Completing);
         };
 
-        first_report_ago(91, 20);
-        first_report_ago(92, 70);
+        stopped_ago(91, 20);
+        stopped_ago(92, 70);
 
         assert!(
             !is_reclaimable(&cluster, "n2", &report_run(91, 0)),
@@ -7751,90 +7754,6 @@ mod tests {
         assert!(
             is_reclaimable(&cluster, "n2", &report_run(92, 0)),
             "a straggler past twice the kill wait never got the terminate"
-        );
-    }
-
-    #[tokio::test]
-    async fn is_reclaimable_spares_a_grace_straggler_until_the_deadline() {
-        use crate::raft::StateMachineApply;
-        use spur_core::job::{JobSpec, JobState, PreemptPending};
-        use spur_core::partition::PreemptMode;
-        use spur_core::wal::WalOperation;
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut config = test_slurm_config();
-        config.scheduler.kill_wait_secs = 30;
-        let cluster = Arc::new(crate::cluster::ClusterManager::new(config, dir.path()).unwrap());
-        let apply = |op: &WalOperation| {
-            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
-                cluster.as_ref(),
-                op,
-            );
-        };
-        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
-        // Node n1 reported 70 s ago; the grace deadline is `deadline_in` seconds from now.
-        let in_grace = |job_id: u32, deadline_in: i64| {
-            apply(&WalOperation::JobSubmit {
-                job_id,
-                spec: Box::new(JobSpec {
-                    name: "victim".into(),
-                    user: "alice".into(),
-                    num_nodes: 2,
-                    num_tasks: 2,
-                    cpus_per_task: 1,
-                    work_dir: "/tmp".into(),
-                    ..Default::default()
-                }),
-            });
-            let per_node = std::collections::HashMap::from([
-                ("n1".to_string(), res.clone()),
-                ("n2".to_string(), res.clone()),
-            ]);
-            apply(&WalOperation::job_start(
-                job_id,
-                vec!["n1".into(), "n2".into()],
-                res.clone(),
-                per_node,
-            ));
-            apply(&WalOperation::job_state_change(
-                job_id,
-                JobState::Pending,
-                JobState::Running,
-            ));
-            let deadline = Utc::now() + chrono::Duration::seconds(deadline_in);
-            apply(&WalOperation::JobPreemptSignaled {
-                job_id,
-                pending: PreemptPending {
-                    signaled_at: deadline - chrono::Duration::seconds(600),
-                    deadline,
-                    preempted_by: 99,
-                    preempt_qos: None,
-                    mode: PreemptMode::Cancel,
-                    run_attempt: cluster.get_job(job_id).unwrap().run_attempt,
-                    requeue_hold_secs: 30,
-                },
-            });
-            apply(&WalOperation::JobNodeComplete {
-                job_id,
-                node_name: "n1".into(),
-                exit_code: 0,
-                signal: 0,
-                run_attempt: 0,
-                at: Some(Utc::now() - chrono::Duration::seconds(70)),
-            });
-            assert_eq!(cluster.get_job(job_id).unwrap().state, JobState::Completing);
-        };
-
-        in_grace(93, 300);
-        in_grace(94, -70);
-
-        assert!(
-            !is_reclaimable(&cluster, "n2", &report_run(93, 0)),
-            "a straggler's grace has not ended; the deadline finalizer owns its terminate"
-        );
-        assert!(
-            is_reclaimable(&cluster, "n2", &report_run(94, 0)),
-            "a straggler well past the deadline never got the terminate"
         );
     }
 
@@ -8300,6 +8219,8 @@ mod tests {
         active: bool,
         step_response: Option<Result<spur_proto::proto::RunCommandResponse, Status>>,
         step_started: Option<Arc<tokio::sync::Notify>>,
+        /// Job ids this agent was told to cancel, for tests that assert on it.
+        cancelled: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
     }
 
     #[tonic::async_trait]
@@ -8361,8 +8282,11 @@ mod tests {
         }
         async fn cancel_job(
             &self,
-            _request: Request<AgentCancelJobRequest>,
+            request: Request<AgentCancelJobRequest>,
         ) -> Result<Response<()>, Status> {
+            if let Some(cancelled) = &self.cancelled {
+                cancelled.lock().unwrap().push(request.into_inner().job_id);
+            }
             Ok(Response::new(()))
         }
         async fn suspend_job(
@@ -8485,8 +8409,23 @@ mod tests {
             active,
             step_response,
             step_started: None,
+            cancelled: None,
         })
         .await
+    }
+
+    /// A probe agent that records the job ids it is told to cancel.
+    async fn spawn_cancel_recording_agent(
+    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<u32>>>) {
+        let cancelled = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = spawn_probe_agent_server(ProbeAgent {
+            active: false,
+            step_response: None,
+            step_started: None,
+            cancelled: Some(cancelled.clone()),
+        })
+        .await;
+        (addr, cancelled)
     }
 
     async fn spawn_probe_agent_server(agent: ProbeAgent) -> std::net::SocketAddr {
@@ -9896,6 +9835,140 @@ mod tests {
         assert_eq!(
             svc.cluster.get_job(job_id).expect("running job").state,
             JobState::Running
+        );
+    }
+
+    /// A job on n1 and n2, each served by the given agent port, running `script`.
+    async fn running_two_node_job(
+        svc: &ControllerService,
+        script: &str,
+        n1_port: u16,
+        n2_port: u16,
+    ) -> u32 {
+        use spur_core::resource::ResourceAllocations;
+
+        point_node_at_probe_agent(svc, "n1", n1_port).await;
+        point_node_at_probe_agent(svc, "n2", n2_port).await;
+        let spec = spur_core::job::JobSpec {
+            name: "two-node".into(),
+            user: "alice".into(),
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            script: Some(script.into()),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> = [
+            ("n1".to_string(), res.clone()),
+            ("n2".to_string(), res.clone()),
+        ]
+        .into_iter()
+        .collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into(), "n2".into()], res, per_node)
+            .expect("start two-node job");
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        job_id
+    }
+
+    fn warn_of_preemption(svc: &ControllerService, job_id: u32) {
+        let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+        let signaled_at = Utc::now();
+        let pending = spur_core::job::PreemptPending {
+            signaled_at,
+            deadline: signaled_at + chrono::Duration::seconds(600),
+            preempted_by: 99,
+            preempt_qos: None,
+            mode: spur_core::partition::PreemptMode::Cancel,
+            run_attempt,
+            requeue_hold_secs: 30,
+        };
+        assert!(svc
+            .cluster
+            .signal_preemption(pending, job_id)
+            .expect("record the grace"));
+    }
+
+    async fn report_node_finished(svc: &ControllerService, job_id: u32, node: &str) {
+        let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+        svc.report_job_status(Request::new(ReportJobStatusRequest {
+            job_id,
+            state: JobState::Completed.to_proto_i32(),
+            reporting_node: node.into(),
+            run_attempt,
+            ..Default::default()
+        }))
+        .await
+        .expect("completion report accepted");
+    }
+
+    /// A node finishing early leaves the others to run out the grace; a job that
+    /// is not in its grace still has them stopped. The second job's cancel is
+    /// awaited, so a cancel wrongly sent for the first would be seen too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_exit_in_grace_does_not_signal_the_other_nodes() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, _) = spawn_cancel_recording_agent().await;
+        let (n2, cancelled) = spawn_cancel_recording_agent().await;
+        let script = "srun ./train\n";
+        let in_grace = running_two_node_job(&svc, script, n1.port(), n2.port()).await;
+        warn_of_preemption(&svc, in_grace);
+        let ordinary = running_two_node_job(&svc, script, n1.port(), n2.port()).await;
+
+        report_node_finished(&svc, in_grace, "n1").await;
+        report_node_finished(&svc, ordinary, "n1").await;
+
+        wait_for_cancel(&cancelled, ordinary).await;
+        assert_eq!(
+            *cancelled.lock().unwrap(),
+            [ordinary],
+            "only the job outside a grace has its other node stopped"
+        );
+        let job = svc.cluster.get_job(in_grace).expect("job");
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_pending.is_some());
+    }
+
+    async fn wait_for_cancel(cancelled: &Arc<std::sync::Mutex<Vec<u32>>>, job_id: u32) {
+        for _ in 0..400 {
+            if cancelled.lock().unwrap().contains(&job_id) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("no cancel for job {job_id} arrived");
+    }
+
+    /// A node that already reported has no supervisor left to answer a
+    /// recovery probe, which must not read as a lost cohort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stepd_recovery_probe_ignores_a_node_that_already_reported_in_grace() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let finished = spawn_probe_agent(false).await;
+        let alive = spawn_probe_agent(true).await;
+        let job_id = running_two_node_job(&svc, "./train\n", finished.port(), alive.port()).await;
+        warn_of_preemption(&svc, job_id);
+        report_node_finished(&svc, job_id, "n1").await;
+        let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+
+        let probe = svc
+            .probe_stepd_recovery("n2", job_id, run_attempt, spur_core::step::STEP_BATCH)
+            .await
+            .expect("probe");
+
+        assert!(
+            matches!(probe, StepdRecoveryProbe::Retained),
+            "only n2 still holds the job, and it is alive"
         );
     }
 
@@ -11728,6 +11801,7 @@ mod tests {
             active: false,
             step_response: None,
             step_started: Some(started.clone()),
+            cancelled: None,
         })
         .await;
         let replay = tokio::spawn(completed_step_output(
