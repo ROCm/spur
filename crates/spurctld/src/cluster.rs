@@ -31301,7 +31301,7 @@ state = "UP"
         assert_eq!(job.preempt_mode, None);
         assert!(job.preempt_pending.is_none());
         assert_eq!(stats.snapshot().jobs_preempted, 0);
-        assert!(cm.preempt_freed_nodes_raw().get("n1").is_none());
+        assert!(!cm.preempt_freed_nodes_raw().contains_key("n1"));
         assert_eq!(cpus_in_use(cm, "n1"), 0);
     }
 
