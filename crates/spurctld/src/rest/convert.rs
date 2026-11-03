@@ -88,6 +88,13 @@ pub fn partition_to_json(part: &Partition) -> serde_json::Value {
         "priority_tier": part.priority_tier,
         "allow_accounts": part.allow_accounts,
         "deny_accounts": part.deny_accounts,
+        "max_cpus_per_node": part.max_tres_per_node.get(spur_core::partition::TRES_CPU),
+        "max_tres_per_node": part.max_tres_per_node,
+        "max_mem_per_node": part.max_mem_per_node,
+        "max_mem_per_cpu": part.max_mem_per_cpu,
+        "def_mem_per_node": part.def_mem_per_node,
+        "def_mem_per_cpu": part.def_mem_per_cpu,
+        "def_mem_per_gpu": part.def_mem_per_gpu,
     })
 }
 
@@ -145,6 +152,30 @@ mod tests {
         let json = partition_to_json(&part);
         assert_eq!(json["allow_accounts"], serde_json::json!(["research"]));
         assert_eq!(json["deny_accounts"], serde_json::json!(["student"]));
+    }
+
+    #[test]
+    fn partition_to_json_includes_resource_limits() {
+        let part = Partition {
+            name: "cpu".into(),
+            max_tres_per_node: [("cpu".to_string(), 64), ("gres/gpu".to_string(), 0)].into(),
+            max_mem_per_cpu: Some(2048),
+            def_mem_per_node: Some(4096),
+            ..Default::default()
+        };
+        let json = partition_to_json(&part);
+        assert_eq!(json["max_cpus_per_node"], 64);
+        assert_eq!(
+            json["max_tres_per_node"],
+            serde_json::json!({"cpu": 64, "gres/gpu": 0})
+        );
+        assert_eq!(json["max_mem_per_cpu"], 2048);
+        assert_eq!(json["def_mem_per_node"], 4096);
+        assert!(json["max_mem_per_node"].is_null());
+
+        let plain = partition_to_json(&Partition::default());
+        assert!(plain["max_cpus_per_node"].is_null());
+        assert_eq!(plain["max_tres_per_node"], serde_json::json!({}));
     }
 
     #[test]

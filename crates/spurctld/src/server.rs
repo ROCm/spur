@@ -3323,8 +3323,9 @@ impl SlurmController for ControllerService {
 
         let preempt_mode = spur_core::partition::parse_preempt_mode(&req.preempt_mode)
             .map_err(Status::invalid_argument)?;
+        let limits = create_request_limits(&req)?;
 
-        let partition = spur_core::partition::Partition {
+        let mut partition = spur_core::partition::Partition {
             name: req.name,
             state,
             is_default: req.is_default,
@@ -3347,6 +3348,7 @@ impl SlurmController for ControllerService {
             grace_time: req.grace_time,
             ..Default::default()
         };
+        limits.apply_to(&mut partition);
 
         self.cluster
             .create_partition(partition)
@@ -3380,6 +3382,7 @@ impl SlurmController for ControllerService {
             ),
         );
 
+        let limits = update_request_limits(&req);
         let state = req
             .state
             .map(|s| match s.to_uppercase().as_str() {
@@ -3462,6 +3465,7 @@ impl SlurmController for ControllerService {
                     req.preempt_exempt_time.map(Some)
                 },
                 grace_time,
+                limits,
             )
             .map_err(partition_rpc_status)?;
 
@@ -5808,6 +5812,60 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         priority_tier: part.priority_tier,
         preempt_exempt_time: part.preempt_exempt_time,
         grace_time: part.grace_time,
+        max_cpus_per_node: part
+            .max_tres_per_node
+            .get(spur_core::partition::TRES_CPU)
+            .map(|&cpus| u32::try_from(cpus).unwrap_or(u32::MAX)),
+        max_tres_per_node: part
+            .max_tres_per_node
+            .iter()
+            .map(|(key, limit)| (key.clone(), *limit))
+            .collect(),
+        max_mem_per_node: part.max_mem_per_node,
+        max_mem_per_cpu: part.max_mem_per_cpu,
+        def_mem_per_node: part.def_mem_per_node,
+        def_mem_per_cpu: part.def_mem_per_cpu,
+        def_mem_per_gpu: part.def_mem_per_gpu,
+    }
+}
+
+/// Resource caps and memory policy a partition is created with. The
+/// `max_cpus_per_node` alias and a `cpu` map key are rejected together, like
+/// in `spur.conf`.
+fn create_request_limits(
+    req: &CreatePartitionRequest,
+) -> Result<spur_core::partition_limits::PartitionResourceLimits, Status> {
+    let max_tres_per_node = spur_core::partition_limits::fold_max_cpus_per_node(
+        req.max_tres_per_node.clone().into_iter().collect(),
+        req.max_cpus_per_node,
+    )
+    .map_err(Status::invalid_argument)?;
+    // A zero memory knob has no meaning, so it reads as unset, like on update.
+    let set = |value: Option<u64>| value.filter(|v| *v != 0);
+    Ok(spur_core::partition_limits::PartitionResourceLimits {
+        max_tres_per_node,
+        max_mem_per_node: set(req.max_mem_per_node),
+        max_mem_per_cpu: set(req.max_mem_per_cpu),
+        def_mem_per_node: set(req.def_mem_per_node),
+        def_mem_per_cpu: set(req.def_mem_per_cpu),
+        def_mem_per_gpu: set(req.def_mem_per_gpu),
+    })
+}
+
+/// Resource-limit changes an update asks for. A `max_cpus_per_node` or memory
+/// knob of 0 clears it, matching the proto contract; the map is replaced only
+/// when asked to.
+fn update_request_limits(req: &UpdatePartitionRequest) -> crate::cluster::PartitionLimitsUpdate {
+    let clearable = |value: Option<u64>| value.map(|v| (v != 0).then_some(v));
+    let replace_map = req.set_max_tres_per_node || !req.max_tres_per_node.is_empty();
+    crate::cluster::PartitionLimitsUpdate {
+        max_tres_per_node: replace_map.then(|| req.max_tres_per_node.clone().into_iter().collect()),
+        max_cpus_per_node: req.max_cpus_per_node.map(|v| (v != 0).then_some(v)),
+        max_mem_per_node: clearable(req.max_mem_per_node),
+        max_mem_per_cpu: clearable(req.max_mem_per_cpu),
+        def_mem_per_node: clearable(req.def_mem_per_node),
+        def_mem_per_cpu: clearable(req.def_mem_per_cpu),
+        def_mem_per_gpu: clearable(req.def_mem_per_gpu),
     }
 }
 
@@ -7565,6 +7623,8 @@ mod tests {
             run_attempt: 2,
             idle_fill: false,
             at: None,
+            effective_partition: None,
+            memory_adjustment: None,
         });
         apply(&WalOperation::JobPriorityChange {
             job_id: 52,
@@ -7629,6 +7689,8 @@ mod tests {
                 run_attempt,
                 idle_fill: false,
                 at: None,
+                effective_partition: None,
+                memory_adjustment: None,
             });
             apply(&WalOperation::job_state_change(
                 60,
@@ -8165,6 +8227,8 @@ mod tests {
             srun_step_dispatch: false,
             run_attempt,
             idle_fill: false,
+            effective_partition: None,
+            memory_adjustment: None,
             at: None,
         });
     }
@@ -15206,6 +15270,149 @@ mod tests {
             !token_resp.into_inner().token_id.is_empty(),
             "the admin's token must be issued"
         );
+    }
+
+    async fn partition_info(svc: &ControllerService, name: &str) -> PartitionInfo {
+        svc.get_partitions(Request::new(GetPartitionsRequest { name: name.into() }))
+            .await
+            .unwrap()
+            .into_inner()
+            .partitions
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_resource_limits_round_trip_through_the_partition_api() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.create_partition(admin_request(CreatePartitionRequest {
+            name: "cpu".into(),
+            nodes: "ALL".into(),
+            max_cpus_per_node: Some(64),
+            max_tres_per_node: [("mem".to_string(), 131_072), ("gres/gpu".to_string(), 0)].into(),
+            max_mem_per_node: Some(65_536),
+            def_mem_per_cpu: Some(1024),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        let info = partition_info(&svc, "cpu").await;
+        assert_eq!(info.max_cpus_per_node, Some(64));
+        assert_eq!(
+            info.max_tres_per_node,
+            [
+                ("cpu".to_string(), 64),
+                ("mem".to_string(), 131_072),
+                ("gres/gpu".to_string(), 0)
+            ]
+            .into()
+        );
+        assert_eq!(info.max_mem_per_node, Some(65_536));
+        assert_eq!(info.def_mem_per_cpu, Some(1024));
+        assert_eq!(info.max_mem_per_cpu, None);
+
+        svc.update_partition(admin_request(UpdatePartitionRequest {
+            name: "cpu".into(),
+            max_cpus_per_node: Some(0),
+            max_mem_per_node: Some(0),
+            max_mem_per_cpu: Some(2048),
+            def_mem_per_gpu: Some(8192),
+            def_mem_per_cpu: Some(0),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let info = partition_info(&svc, "cpu").await;
+        assert_eq!(info.max_cpus_per_node, None, "0 clears the cpu cap");
+        assert!(info.max_tres_per_node.contains_key("mem"));
+        assert_eq!(info.max_mem_per_node, None);
+        assert_eq!(info.max_mem_per_cpu, Some(2048));
+        assert_eq!(info.def_mem_per_cpu, None);
+        assert_eq!(info.def_mem_per_gpu, Some(8192));
+
+        svc.update_partition(admin_request(UpdatePartitionRequest {
+            name: "cpu".into(),
+            set_max_tres_per_node: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        assert!(partition_info(&svc, "cpu")
+            .await
+            .max_tres_per_node
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_api_rejects_conflicting_or_invalid_limits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let alias_and_key = svc
+            .create_partition(admin_request(CreatePartitionRequest {
+                name: "cpu".into(),
+                nodes: "ALL".into(),
+                max_cpus_per_node: Some(8),
+                max_tres_per_node: [("cpu".to_string(), 8)].into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(alias_and_key.code(), Code::InvalidArgument);
+
+        let both_max = svc
+            .create_partition(admin_request(CreatePartitionRequest {
+                name: "cpu".into(),
+                nodes: "ALL".into(),
+                max_mem_per_node: Some(1),
+                max_mem_per_cpu: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(both_max.code(), Code::InvalidArgument);
+
+        svc.create_partition(admin_request(CreatePartitionRequest {
+            name: "cpu".into(),
+            nodes: "ALL".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let bad_key = svc
+            .update_partition(admin_request(UpdatePartitionRequest {
+                name: "cpu".into(),
+                max_tres_per_node: [("disk".to_string(), 1)].into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(bad_key.code(), Code::InvalidArgument);
+        let conflict = svc
+            .update_partition(admin_request(UpdatePartitionRequest {
+                name: "cpu".into(),
+                max_cpus_per_node: Some(4),
+                max_tres_per_node: [("cpu".to_string(), 4)].into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn partition_info_without_limits_encodes_no_new_fields() {
+        use prost::Message;
+        let info = partition_to_proto(&spur_core::partition::Partition {
+            name: "plain".into(),
+            ..Default::default()
+        });
+        assert_eq!(info.max_cpus_per_node, None);
+        assert!(info.max_tres_per_node.is_empty());
+        let decoded = PartitionInfo::decode(info.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, info);
     }
 
     // --- register_agent relabeling gate ---
