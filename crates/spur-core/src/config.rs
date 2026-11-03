@@ -875,14 +875,10 @@ impl SchedulerConfig {
             .max(MIN_EFFECTIVE_KILL_WAIT_SECS)
     }
 
-    /// Whether `complete_wait_secs` would force-finish a job before the longer
-    /// of its kill waits can elapse. Not a validation error so existing configs
-    /// keep loading.
-    pub fn complete_wait_too_short(&self) -> bool {
-        let longest_wait = self
-            .effective_kill_wait_secs()
-            .max(self.effective_timeout_kill_wait_secs());
-        self.complete_wait_secs <= longest_wait
+    /// The longer of the two SIGTERM-to-SIGKILL waits, floors enforced.
+    pub fn longest_effective_kill_wait_secs(&self) -> u32 {
+        self.effective_kill_wait_secs()
+            .max(self.effective_timeout_kill_wait_secs())
     }
 }
 
@@ -2335,6 +2331,21 @@ impl SlurmConfig {
         let config: Self = toml::from_str(s)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Seconds a node can need after SIGTERM before it reports completion:
+    /// the longer kill wait, then the cgroup cleanup spurd waits out first.
+    pub fn min_complete_wait_secs(&self) -> u32 {
+        self.scheduler
+            .longest_effective_kill_wait_secs()
+            .saturating_add(self.cgroup.cleanup_timeout_secs)
+    }
+
+    /// Whether `scheduler.complete_wait_secs` would drain healthy nodes that
+    /// are still being killed or cleaned up. Not a validation error so
+    /// existing configs keep loading.
+    pub fn complete_wait_too_short(&self) -> bool {
+        self.scheduler.complete_wait_secs <= self.min_complete_wait_secs()
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -4782,44 +4793,64 @@ inactive_limit_secs = 20
         SlurmConfig::load_from_str(&at_max).expect("the maximum must be accepted");
     }
 
-    #[test]
-    fn complete_wait_too_short_flags_a_wait_not_above_the_effective_kill_wait() {
-        let with = |kill_wait_secs, complete_wait_secs| SchedulerConfig {
-            kill_wait_secs,
-            timeout_kill_wait_secs: 0,
-            complete_wait_secs,
-            ..Default::default()
-        };
-        assert!(!SchedulerConfig::default().complete_wait_too_short());
-        assert!(with(300, 300).complete_wait_too_short());
-        assert!(with(30, 30).complete_wait_too_short());
-        assert!(!with(30, 31).complete_wait_too_short());
-        // The effective floor of 5 applies, so a configured 0 still flags 5.
-        assert!(with(0, 5).complete_wait_too_short());
-        assert!(!with(0, 6).complete_wait_too_short());
+    fn config_with_waits(
+        kill_wait_secs: u32,
+        timeout_kill_wait_secs: u32,
+        cleanup_timeout_secs: u32,
+        complete_wait_secs: u32,
+    ) -> SlurmConfig {
+        SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n\
+             [scheduler]\n\
+             kill_wait_secs = {kill_wait_secs}\n\
+             timeout_kill_wait_secs = {timeout_kill_wait_secs}\n\
+             complete_wait_secs = {complete_wait_secs}\n\
+             [cgroup]\n\
+             cleanup_timeout_secs = {cleanup_timeout_secs}\n"
+        ))
+        .expect("fixture config must load")
     }
 
     #[test]
-    fn complete_wait_too_short_uses_the_larger_wait() {
-        let scheduler = SchedulerConfig {
-            kill_wait_secs: 5,
-            timeout_kill_wait_secs: 40,
-            complete_wait_secs: 35,
-            ..Default::default()
-        };
-        assert!(scheduler.complete_wait_too_short());
-        let longer = SchedulerConfig {
-            complete_wait_secs: 41,
-            ..scheduler
-        };
-        assert!(!longer.complete_wait_too_short());
+    fn complete_wait_too_short_flags_a_wait_not_above_kill_wait_plus_cleanup() {
+        let defaults = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert!(!defaults.complete_wait_too_short());
+        assert!(config_with_waits(30, 0, 0, 30).complete_wait_too_short());
+        assert!(!config_with_waits(30, 0, 0, 31).complete_wait_too_short());
+        assert!(config_with_waits(30, 0, 60, 90).complete_wait_too_short());
+        assert!(!config_with_waits(30, 0, 60, 91).complete_wait_too_short());
+        // The effective floor of 5 applies, so a configured 0 still counts as 5.
+        assert!(config_with_waits(0, 0, 0, 5).complete_wait_too_short());
+        assert!(!config_with_waits(0, 0, 0, 6).complete_wait_too_short());
     }
 
     #[test]
-    fn complete_wait_not_above_kill_wait_still_loads() {
+    fn complete_wait_too_short_uses_the_larger_kill_wait() {
+        assert!(config_with_waits(5, 40, 0, 35).complete_wait_too_short());
+        assert!(!config_with_waits(5, 40, 0, 41).complete_wait_too_short());
+        assert!(config_with_waits(40, 5, 0, 35).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_counts_the_cgroup_cleanup_timeout() {
+        // A kill wait of 270 alone fits under 300, but a SIGKILLed job with a
+        // 35 s teardown does not.
+        assert!(config_with_waits(5, 270, 35, 300).complete_wait_too_short());
+        assert!(!config_with_waits(5, 270, 29, 300).complete_wait_too_short());
+        assert!(!config_with_waits(5, 270, 0, 300).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_does_not_overflow_on_extreme_waits() {
+        let config = config_with_waits(MAX_KILL_WAIT_SECS, MAX_KILL_WAIT_SECS, u32::MAX, u32::MAX);
+        assert!(config.complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_not_above_kill_wait_plus_cleanup_still_loads() {
         let toml = "cluster_name = \"test\"\n[scheduler]\ncomplete_wait_secs = 30\n";
         let parsed = SlurmConfig::load_from_str(toml).expect("a legacy config must still load");
-        assert!(parsed.scheduler.complete_wait_too_short());
+        assert!(parsed.complete_wait_too_short());
     }
 
     #[test]

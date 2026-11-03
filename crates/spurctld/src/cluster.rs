@@ -77,15 +77,16 @@ fn requeue_hold_secs(scheduler_interval_secs: u32, kill_wait_secs: u32) -> i64 {
     (scheduler_interval_secs as i64 * 2 + 3).max(kill_wait_secs as i64)
 }
 
-/// Warn about a `complete_wait_secs` that would force-finish a job before its
-/// kill wait elapses. Run on every config load, startup and reconfigure alike.
-pub(crate) fn warn_if_complete_wait_too_short(scheduler: &spur_core::config::SchedulerConfig) {
-    if scheduler.complete_wait_too_short() {
+/// Warn about a `complete_wait_secs` that would drain nodes still being killed
+/// or cleaned up. Run on every config load, startup and reconfigure alike.
+pub(crate) fn warn_if_complete_wait_too_short(config: &spur_core::config::SlurmConfig) {
+    if config.complete_wait_too_short() {
         warn!(
-            complete_wait_secs = scheduler.complete_wait_secs,
-            kill_wait_secs = scheduler.effective_kill_wait_secs(),
-            timeout_kill_wait_secs = scheduler.effective_timeout_kill_wait_secs(),
-            "scheduler.complete_wait_secs should exceed the larger kill wait, or jobs can be force-finished before SIGKILL"
+            complete_wait_secs = config.scheduler.complete_wait_secs,
+            kill_wait_secs = config.scheduler.effective_kill_wait_secs(),
+            timeout_kill_wait_secs = config.scheduler.effective_timeout_kill_wait_secs(),
+            cgroup_cleanup_timeout_secs = config.cgroup.cleanup_timeout_secs,
+            "scheduler.complete_wait_secs should exceed the larger kill wait plus cgroup.cleanup_timeout_secs, or a job still being killed or cleaned up is force-finished and its unreported nodes are drained"
         );
     }
 }
@@ -6204,7 +6205,7 @@ impl ClusterManager {
         if let Some(warning) = new_config.auth.private_data_warning() {
             warn!("{warning}");
         }
-        warn_if_complete_wait_too_short(&new_config.scheduler);
+        warn_if_complete_wait_too_short(&new_config);
         // Reject a broken submit hook before it goes live, so reconfigure can't
         // silently swap in a hook that fails every subsequent submission.
         crate::hooks::validate_submit_hooks(&new_config.hooks)?;
