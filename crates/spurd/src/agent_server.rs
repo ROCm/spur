@@ -419,6 +419,8 @@ async fn runtime_teardown_confirmed(
     descriptor: &crate::stepd::StepdDescriptor,
     stop_result: &std::io::Result<()>,
 ) -> bool {
+    let published = crate::stepd::republished(descriptor);
+    let descriptor = published.as_ref().unwrap_or(descriptor);
     // A derived path is still worth reaping — the supervisor may have created
     // the cgroup before dying — but its absence proves nothing, since it may
     // never have existed, so the workload itself has to answer for its death.
@@ -934,6 +936,12 @@ pub struct TrackedJob {
     /// The job's cgroup, owned here so every launch path into the job can reach
     /// it. `None` when cgroup enforcement is off or no cgroup was created.
     cgroup_path: Option<std::path::PathBuf>,
+}
+
+impl crate::reporter::HeldRun for TrackedJob {
+    fn run_attempt(&self) -> u32 {
+        self.run_attempt
+    }
 }
 
 impl TrackedJob {
@@ -11089,6 +11097,43 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// A redispatch onto the same node fences the old run through the copy taken
+    /// at its launch, which predates the workload; the supervisor's own record names it.
+    #[tokio::test]
+    async fn fencing_a_displaced_run_kills_the_workload_its_supervisor_published() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let session = store.session_dir(91, 1, spur_core::step::STEP_BATCH);
+        let mut at_launch = descriptor_for_workload(0);
+        at_launch.socket_path = session.join("runtime.sock");
+        let mut published = at_launch.clone();
+        published.workload_pid = child.id();
+        published.workload_start_ticks =
+            crate::stepd::process_start_ticks(child.id()).expect("workload start ticks");
+        store
+            .publish(&published)
+            .expect("publish started descriptor");
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&at_launch), at_launch);
+
+        fence_displaced_stepd(&sessions, 91, spur_core::step::STEP_BATCH, 2)
+            .await
+            .expect("fence the displaced run");
+
+        assert!(
+            !crate::stepd::process_is_live(published.workload_pid, published.workload_start_ticks),
+            "the old run's workload must not survive its replacement"
+        );
+        let _ = child.wait();
+    }
+
     #[tokio::test]
     async fn fencing_without_a_cgroup_accepts_a_supervisor_that_held_no_workload() {
         // An allocation runs nothing of its own, and a descriptor written
@@ -19439,7 +19484,7 @@ mod tests {
         );
 
         assert!(
-            reporter.held_job_ids().is_empty(),
+            reporter.held_jobs().is_empty(),
             "reporter sees no jobs before registration"
         );
 
@@ -19461,9 +19506,9 @@ mod tests {
         .expect("register");
 
         assert_eq!(
-            reporter.held_job_ids(),
-            vec![77],
-            "reporter's heartbeat must observe the agent-registered allocation-only job"
+            reporter.held_jobs(),
+            vec![(77, 9)],
+            "reporter's heartbeat must observe the agent-registered allocation-only job and its run"
         );
         assert_eq!(
             svc.running

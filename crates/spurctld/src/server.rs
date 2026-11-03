@@ -812,9 +812,8 @@ impl ControllerService {
         );
     }
 
-    /// Re-send a cancel to a node still holding an allocation the controller no
-    /// longer believes belongs to it there — job finished, job moved to
-    /// another node, or an id older than any this controller issued. Best-effort.
+    /// Re-send a cancel to a node still holding a run the controller no longer
+    /// believes belongs to it there (see `is_reclaimable`). Best-effort.
     fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
         let stale = stale_reported_jobs(&self.cluster, node, reported);
         if stale.is_empty() {
@@ -823,23 +822,24 @@ impl ControllerService {
         let cluster = self.cluster.clone();
         let node = node.to_string();
         tokio::spawn(async move {
-            for job_id in stale {
+            for report in stale {
                 // Re-check: a requeue since the snapshot above would otherwise
                 // send an unguarded cancel into the job's new run.
-                if !is_reclaimable(&cluster, &node, job_id) {
+                if !is_reclaimable(&cluster, &node, &report) {
                     continue;
                 }
                 warn!(
-                    job_id,
+                    job_id = report.job_id,
+                    run_attempt = report.run_attempt,
                     node = %node,
                     "agent still holds an allocation the controller no longer believes belongs to it there — re-sending cancel to reclaim it"
                 );
-                // Signal 0 is a graceful cancel at the agent, not a probe, and
-                // attempt 0 hits whichever is tracked — see is_reclaimable above.
+                // Signal 0 is a graceful cancel at the agent. The reported attempt
+                // spares a newer run launched since; 0 (an old agent) hits whatever is tracked.
                 crate::scheduler_loop::cancel_job_on_nodes(
                     &cluster,
-                    job_id,
-                    0,
+                    report.job_id,
+                    report.run_attempt,
                     std::slice::from_ref(&node),
                     0,
                 )
@@ -1484,9 +1484,10 @@ fn reservation_manager_ruling(
 /// still claiming the job missed the cancel rather than being mid-teardown.
 const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(16);
 
-/// Whether `node` may release what it holds for `job_id`: the run is over, the
-/// job is active elsewhere, or the id is untracked but was issued by us.
-fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
+/// Whether `node` may release the run it reported: the run is over, the job is
+/// back in the queue or active elsewhere, or the id is untracked but was issued by us.
+fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatus) -> bool {
+    let job_id = report.job_id;
     match cluster.get_job(job_id) {
         Some(job) if job.state.is_terminal() => true,
         // A cancel this old that the node is still claiming never reached it
@@ -1498,10 +1499,14 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, job_id: u32) -> bool {
         {
             true
         }
-        // An active job's nodelist is authoritative only once populated: state
-        // and allocation commit as two separate WAL entries, so a job can be
-        // observed as Running with `allocated_nodes` still empty. Spare it, same
-        // as a job earlier than active that may be mid-dispatch to this node.
+        // Requeued off a node that was down, its old run was never stopped; only a launch
+        // placed here now may hold it. An old agent names no run, so it cannot be told apart.
+        Some(job) if job.state == spur_core::job::JobState::Pending => {
+            report.run_attempt != 0
+                && (report.run_attempt < job.run_attempt || !job.is_held_on(node))
+        }
+        // State and allocation commit as two WAL entries, so an empty nodelist
+        // on an active job is not yet authoritative.
         Some(job) => {
             job.state.is_active()
                 && !job.allocated_nodes.is_empty()
@@ -1522,16 +1527,17 @@ fn reported_held_gpu_ids(reported: &[RunningJobStatus]) -> Vec<(u32, Vec<u64>)> 
         .collect()
 }
 
-/// Reported ids `node` may release; ids still allocated here, not yet started,
+/// Reported runs `node` may release; runs still allocated here, not yet started,
 /// and never issued by this controller are spared.
 fn stale_reported_jobs(
     cluster: &ClusterManager,
     node: &str,
     reported: &[RunningJobStatus],
-) -> Vec<u32> {
+) -> Vec<RunningJobStatus> {
     reported
         .iter()
-        .filter_map(|r| is_reclaimable(cluster, node, r.job_id).then_some(r.job_id))
+        .filter(|r| is_reclaimable(cluster, node, r))
+        .cloned()
         .collect()
 }
 
@@ -6976,6 +6982,24 @@ mod tests {
         assert!(spur_proto::controller_rpc_retryable(&status));
     }
 
+    fn report_for(job_id: u32) -> RunningJobStatus {
+        RunningJobStatus {
+            job_id,
+            ..Default::default()
+        }
+    }
+
+    fn stale_ids(
+        cluster: &crate::cluster::ClusterManager,
+        node: &str,
+        reported: &[RunningJobStatus],
+    ) -> Vec<u32> {
+        stale_reported_jobs(cluster, node, reported)
+            .into_iter()
+            .map(|r| r.job_id)
+            .collect()
+    }
+
     #[test]
     fn reported_held_gpu_ids_keeps_only_jobs_with_a_reported_set() {
         let reported = vec![
@@ -7069,7 +7093,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        assert_eq!(stale_reported_jobs(&cluster, "n1", &reported), vec![20]);
+        assert_eq!(stale_ids(&cluster, "n1", &reported), vec![20]);
     }
 
     /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,
@@ -7169,7 +7193,7 @@ mod tests {
             })
             .collect();
 
-        let stale = stale_reported_jobs(&cluster, "n1", &reported);
+        let stale = stale_ids(&cluster, "n1", &reported);
         assert_eq!(
             stale,
             vec![12],
@@ -7227,7 +7251,7 @@ mod tests {
             .collect();
 
         assert_eq!(
-            stale_reported_jobs(&cluster, "n1", &reported),
+            stale_ids(&cluster, "n1", &reported),
             vec![20],
             "the evicted id is reclaimed; ids at or above next_job_id were never issued here"
         );
@@ -7267,7 +7291,7 @@ mod tests {
         assert_eq!(job_state(&cluster, 30), None, "parent id is never stored");
         assert!(30 < cluster.peek_next_job_id());
         assert!(
-            is_reclaimable(&cluster, "n1", 30),
+            is_reclaimable(&cluster, "n1", &report_for(30)),
             "an unstored id below the watermark is reclaimable — reachable only if an agent reports it"
         );
     }
@@ -7330,7 +7354,7 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(
-            stale_reported_jobs(&cluster, "n1", &reported),
+            stale_ids(&cluster, "n1", &reported),
             vec![40],
             "the node it no longer runs on may release it"
         );
@@ -7479,7 +7503,10 @@ mod tests {
             JobState::Running,
             JobState::Timeout,
         ));
-        assert!(is_reclaimable(&cluster, "n1", 77), "snapshot sees Timeout");
+        assert!(
+            is_reclaimable(&cluster, "n1", &report_for(77)),
+            "snapshot sees Timeout"
+        );
 
         // Concurrent requeue lands before the reclaim loop's re-check.
         apply(&WalOperation::job_state_change(
@@ -7489,8 +7516,117 @@ mod tests {
         ));
 
         assert!(
-            !is_reclaimable(&cluster, "n1", 77),
-            "re-check must skip a job requeued since the snapshot"
+            !is_reclaimable(&cluster, "n1", &report_for(77)),
+            "an attempt-less re-check must skip a job requeued since the snapshot"
+        );
+    }
+
+    /// Submits job `id` and charges it on `nodes` under `run_attempt`, still Pending.
+    fn place(cluster: &crate::cluster::ClusterManager, id: u32, nodes: &[&str], run_attempt: u32) {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let res = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices: std::collections::HashMap::new(),
+            generation: 0,
+        };
+        let per_node_alloc = nodes.iter().map(|n| (n.to_string(), res.clone())).collect();
+        if cluster.get_job(id).is_none() {
+            cluster.apply_operation(&WalOperation::JobSubmit {
+                job_id: id,
+                spec: Box::new(JobSpec {
+                    name: "requeue".into(),
+                    user: "alice".into(),
+                    num_nodes: nodes.len() as u32,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    work_dir: "/tmp".into(),
+                    requeue: true,
+                    ..Default::default()
+                }),
+            });
+        }
+        cluster.apply_operation(&WalOperation::JobStart {
+            job_id: id,
+            nodes: nodes.iter().map(|n| n.to_string()).collect(),
+            resources: res,
+            per_node_alloc,
+            srun_step_dispatch: false,
+            run_attempt,
+            idle_fill: false,
+            at: None,
+        });
+    }
+
+    fn report_run(job_id: u32, run_attempt: u32) -> RunningJobStatus {
+        RunningJobStatus {
+            job_id,
+            run_attempt,
+            ..Default::default()
+        }
+    }
+
+    /// A node that was down when its job was requeued never got the kill; once it
+    /// reports back, its old run must be released or it holds the node forever.
+    #[tokio::test]
+    async fn stale_reported_jobs_reclaims_the_unstopped_run_of_a_requeued_job() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        place(&cluster, 80, &["n1"], 1);
+        for (from, to) in [
+            (JobState::Pending, JobState::Running),
+            (JobState::Running, JobState::NodeFail),
+            (JobState::NodeFail, JobState::Pending),
+        ] {
+            cluster.apply_operation(&WalOperation::job_state_change(80, from, to));
+        }
+        let job = cluster.get_job(80).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(!job.holds_a_placement(), "the requeue freed n1");
+
+        let stale = stale_reported_jobs(&cluster, "n1", &[report_run(80, 1)]);
+        assert_eq!(
+            stale
+                .iter()
+                .map(|r| (r.job_id, r.run_attempt))
+                .collect::<Vec<_>>(),
+            vec![(80, 1)],
+            "the reclaim must target the run the node named"
+        );
+        assert!(
+            stale_reported_jobs(&cluster, "n1", &[report_for(80)]).is_empty(),
+            "an old agent names no run, so it could be a launch in flight"
+        );
+    }
+
+    /// While a Pending job is being launched on this node, only an older run the
+    /// node still holds is stale; a placement elsewhere leaves this node's run stale.
+    #[tokio::test]
+    async fn stale_reported_jobs_spares_only_the_launch_placed_on_this_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        place(&cluster, 81, &["n1"], 2);
+        assert_eq!(job_state(&cluster, 81), Some(JobState::Pending));
+
+        assert!(
+            !is_reclaimable(&cluster, "n1", &report_run(81, 2)),
+            "the launch being placed here must be spared"
+        );
+        assert!(
+            is_reclaimable(&cluster, "n1", &report_run(81, 1)),
+            "an older run left on the node is stale even while a newer one is placed there"
+        );
+        assert!(
+            is_reclaimable(&cluster, "n2", &report_run(81, 2)),
+            "a node the placement does not name holds nothing it should keep"
         );
     }
 

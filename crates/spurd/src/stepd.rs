@@ -3201,6 +3201,22 @@ impl StepdStore {
     }
 }
 
+/// What the same supervisor last published for this session. A copy taken at
+/// launch predates its workload pid and cgroup, which it republishes once started.
+pub fn republished(descriptor: &StepdDescriptor) -> Option<StepdDescriptor> {
+    let session_dir = descriptor.socket_path.parent()?;
+    let store = StepdStore {
+        root: session_dir.parent()?.to_path_buf(),
+    };
+    let published = store.load_descriptor(session_dir).ok()?;
+    let same_supervisor = published.job_id == descriptor.job_id
+        && published.run_attempt == descriptor.run_attempt
+        && published.step_id == descriptor.step_id
+        && published.pid == descriptor.pid
+        && published.process_start_ticks == descriptor.process_start_ticks;
+    same_supervisor.then_some(published)
+}
+
 fn session_conflict(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::AlreadyExists, message)
 }
