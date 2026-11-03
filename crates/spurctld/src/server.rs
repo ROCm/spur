@@ -8253,6 +8253,7 @@ mod tests {
     }
 
     type CancelLog = Arc<std::sync::Mutex<Vec<AgentCancelJobRequest>>>;
+    type ExecLog = Arc<std::sync::Mutex<Vec<spur_proto::proto::ExecInJobRequest>>>;
 
     struct ProbeAgent {
         active: bool,
@@ -8260,6 +8261,8 @@ mod tests {
         step_started: Option<Arc<tokio::sync::Notify>>,
         /// Cancels this agent was sent, for tests that assert on them.
         cancelled: Option<CancelLog>,
+        /// Execs this agent was sent, for tests that assert on them.
+        execs: Option<ExecLog>,
     }
 
     #[tonic::async_trait]
@@ -8350,9 +8353,15 @@ mod tests {
         }
         async fn exec_in_job(
             &self,
-            _request: Request<spur_proto::proto::ExecInJobRequest>,
+            request: Request<spur_proto::proto::ExecInJobRequest>,
         ) -> Result<Response<spur_proto::proto::ExecInJobResponse>, Status> {
-            Err(Status::unimplemented("not used in tests"))
+            if let Some(execs) = &self.execs {
+                execs.lock().unwrap().push(request.into_inner());
+            }
+            Ok(Response::new(spur_proto::proto::ExecInJobResponse {
+                success: true,
+                ..Default::default()
+            }))
         }
         async fn run_command(
             &self,
@@ -8449,6 +8458,7 @@ mod tests {
             step_response,
             step_started: None,
             cancelled: None,
+            execs: None,
         })
         .await
     }
@@ -8461,9 +8471,24 @@ mod tests {
             step_response: None,
             step_started: None,
             cancelled: Some(cancelled.clone()),
+            execs: None,
         })
         .await;
         (addr, cancelled)
+    }
+
+    /// A probe agent that records the execs it is sent.
+    async fn spawn_exec_recording_agent() -> (std::net::SocketAddr, ExecLog) {
+        let execs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let addr = spawn_probe_agent_server(ProbeAgent {
+            active: false,
+            step_response: None,
+            step_started: None,
+            cancelled: None,
+            execs: Some(execs.clone()),
+        })
+        .await;
+        (addr, execs)
     }
 
     async fn spawn_probe_agent_server(agent: ProbeAgent) -> std::net::SocketAddr {
@@ -10027,28 +10052,28 @@ mod tests {
     async fn exec_in_job_skips_a_node_the_grace_victim_already_released() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service(&dir).await;
-        let released = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
-        let released_port = released.local_addr().expect("local addr").port();
-        drop(released);
-        let (n2, _) = spawn_cancel_recording_agent().await;
-        let job_id = running_two_node_job(&svc, "srun ./train\n", released_port, n2.port()).await;
+        let (n1, n1_execs) = spawn_exec_recording_agent().await;
+        let (n2, n2_execs) = spawn_exec_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
         warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
         report_node_finished(&svc, job_id, "n1").await;
 
-        let err = svc
-            .exec_in_job(Request::new(ExecInJobRequest {
-                job_id,
-                command: vec!["hostname".into()],
-                user: "alice".into(),
-            }))
-            .await
-            .expect_err("the probe agent answers every exec with an error");
+        svc.exec_in_job(Request::new(ExecInJobRequest {
+            job_id,
+            command: vec!["hostname".into()],
+            user: "alice".into(),
+        }))
+        .await
+        .expect("the command runs on the node the job still holds");
 
         assert!(
-            err.message().starts_with("exec failed"),
-            "the command must reach the node the job still holds, not n1: {}",
-            err.message()
+            n1_execs.lock().unwrap().is_empty(),
+            "n1 was released and may belong to another job"
         );
+        let n2_execs = n2_execs.lock().unwrap();
+        assert_eq!(n2_execs.len(), 1);
+        assert_eq!(n2_execs[0].job_id, job_id);
+        assert_eq!(n2_execs[0].command, ["hostname"]);
     }
 
     /// The batch script runs on the first node only; its ending ends the job, so
@@ -12138,6 +12163,7 @@ mod tests {
             step_response: None,
             step_started: Some(started.clone()),
             cancelled: None,
+            execs: None,
         })
         .await;
         let replay = tokio::spawn(completed_step_output(
