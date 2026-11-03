@@ -850,7 +850,7 @@ be force-finished before its kill wait elapses, and the controller logs a warnin
 on startup and on reconfigure. Both settings accept ``0``-``65533``, and a value
 below 5 acts as 5. See :doc:`/admin-guide/configuration` for the fields, including a
 known issue with requeue: a requeued job frees its nodes while the old run is
-still in its kill wait, so lower ``kill_wait_secs`` if that matters with
+still in its kill wait, so keep ``kill_wait_secs`` low if that matters with
 requeue-mode preemption.
 
 **Upgrade the leader last.** Every time limit and every inactivity-limit
@@ -901,7 +901,7 @@ the controller logs a warning naming the node, so setting ``GraceTime`` before
 the agents are upgraded silently does nothing for jobs on those nodes.
 
 **Kubernetes operator nodes get no grace.** Victims on nodes managed by
-``spur-k8s`` are preempted at once whatever the QOS ``GraceTime``.
+``spur-k8s`` are preempted at once whatever the QOS or partition ``GraceTime``.
 
 The ``grace_time`` column is added to the QOS table automatically with
 ``ADD COLUMN IF NOT EXISTS``, and a controller that predates this release

@@ -951,8 +951,8 @@ Rules that follow from this:
 * **No abort.** Once a grace starts, the job is preempted at the deadline even
   if the preemptor is cancelled or no longer needs the nodes.
 * **A job that exits during its grace** is recorded as ``PREEMPTED`` in
-  ``cancel`` mode, or re-queued in ``requeue`` mode, and frees its nodes as
-  soon as every node has finished.
+  ``cancel`` mode, or re-queued in ``requeue`` mode, once every node has
+  finished.
 * **A node that finishes early does not end the job.** The grace is not cut
   short: the job stays ``RUNNING``, and nothing is signalled on the other
   nodes. The finished node is freed at once (the preemptor is waiting for it)

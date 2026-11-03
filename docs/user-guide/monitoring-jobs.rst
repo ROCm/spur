@@ -832,7 +832,7 @@ The grace is shortened if the job's own time limit arrives first. Without a
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
   mode), and the preempting job starts as soon as the nodes are free.
 * **One node finishing early does not affect the others.** The job stays
-  ``R`` for the whole grace. A node whose work has finished is freed for the
+  ``R`` until every node has finished or the deadline. A node whose work has finished is freed for the
   preempting job, and the other nodes keep running undisturbed, so a rank that
   exits first does not cut short the ranks that are still writing their
   checkpoint. If your batch script launches ranks with ``srun``, ranks exiting
@@ -1266,7 +1266,7 @@ until its processes are gone, and ``--requeue`` still requeues it on timeout. Th
 SIGTERM is final, so use the wait to checkpoint and exit. The reaping of an idle
 interactive allocation (:ref:`inactive-limit`) waits the same time; a job reaped
 for inactivity also shows ``CG`` and ends ``TIMEOUT``. ``scancel``, ``scontrol
-requeue`` and the final kill of a preempted job use the shorter kill wait
+requeue`` and the final kill of a preempted job use the general kill wait
 (``kill_wait_secs``, default 5 seconds). An ``srun`` step that has no supervisor
 process gets the full wait that applies to it (5 seconds on ``scancel``, 30 at a
 time limit), where earlier releases gave it 2 seconds.

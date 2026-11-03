@@ -582,7 +582,7 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        issue: a requeued job (requeue-mode preemption, ``scontrol requeue``)
        frees its nodes at once, while the old run is still in its kill wait, so
        another job can be dispatched onto them during that window. The window
-       can last up to ``kill_wait_secs``; lower it if that matters with
+       can last up to ``kill_wait_secs``, so keep it low if that matters with
        requeue-mode preemption. A requeued job itself is held out of the queue
        for the larger of ``2 x interval_secs + 3`` and ``kill_wait_secs``
        seconds (5 with the defaults); that term follows ``kill_wait_secs`` live.
