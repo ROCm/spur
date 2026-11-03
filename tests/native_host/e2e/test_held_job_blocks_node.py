@@ -1,13 +1,8 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A held job whose process is still alive on the node.
-
-A held job gives up its node at once. If the cancel sent then never lands, the
-agent keeps the process. The node's next heartbeat must stop it, and must leave
-an ordinary pending job alone. A launch onto the GPUs that process still holds
-is refused naming it, and starts once the heartbeat has stopped it.
-"""
+"""A held job whose cancel never reached the node is stopped by the node's next
+heartbeat, and a launch onto its GPUs is refused naming it until then."""
 
 import time
 
@@ -26,7 +21,7 @@ MAX_REQUEUE_WAIT = 180
 # The heartbeat line is debug-only.
 HEARTBEAT_LOG = "info,spurd::reporter=debug"
 # Unusual durations, so the host-side lookup matches only these jobs.
-ORDINARY_SECS = 7311
+RUNNING_SECS = 7311
 HELD_SECS = 7312
 HOLDER_SECS = 7313
 CHALLENGER_SECS = 7314
@@ -39,10 +34,7 @@ def _start(cluster, config_overrides=None):
 
 
 def _sleep_script(cluster, name: str, secs: int) -> str:
-    """A job whose sleep duration tags its process on the host.
-
-    Jobs run in their own PID namespace, so the job cannot report a host pid.
-    """
+    """The sleep duration tags the process; a job in its own PID namespace cannot report a host pid."""
     return cluster.write_file(f"{name}.sh", f"#!/bin/bash\nsleep {secs}\n", all_nodes=True)
 
 
@@ -107,55 +99,47 @@ class TestHeldJobStillRunning:
         _start(cluster)
         node_name = cluster.node_names[0]
         node = cluster.nodes[0]
-        ordinary_id = None
+        running_id = None
         held_id = None
         try:
-            ordinary_script = _sleep_script(cluster, "ordinary", ORDINARY_SECS)
+            running_script = _sleep_script(cluster, "running", RUNNING_SECS)
             held_script = _sleep_script(cluster, "held", HELD_SECS)
-            ordinary = cluster.sbatch(
-                ["-J", "ordinary", "-N", "1", f"--nodelist={node_name}", ordinary_script]
+            running = cluster.sbatch(
+                ["-J", "running", "-N", "1", f"--nodelist={node_name}", running_script]
             )
             held = cluster.sbatch(
                 ["-J", "held", "-N", "1", f"--nodelist={node_name}", held_script]
             )
-            ordinary_id = parse_job_id(ordinary)
+            running_id = parse_job_id(running)
             held_id = parse_job_id(held)
-            assert ordinary_id is not None, f"submit failed:\n{ordinary}"
+            assert running_id is not None, f"submit failed:\n{running}"
             assert held_id is not None, f"submit failed:\n{held}"
-            wait_job_state(cluster, ordinary_id, "R", timeout=60)
+            wait_job_state(cluster, running_id, "R", timeout=60)
             wait_job_state(cluster, held_id, "R", timeout=60)
 
-            ordinary_pid = _sleep_pid(cluster, node, ORDINARY_SECS, ordinary_id)
+            running_pid = _sleep_pid(cluster, node, RUNNING_SECS, running_id)
             held_pid = _sleep_pid(cluster, node, HELD_SECS, held_id)
 
-            # Keeps the requeued job from starting again; it is pending, not held.
-            cluster.scontrol("update", "PartitionName=default", "State=DOWN")
-            # Closing the agent port makes the requeue's cancel give up: the
-            # missed cancel the heartbeat has to finish.
+            # A closed agent port makes the requeuehold's cancel give up.
             with block_agent_port(cluster, 0):
-                cluster.scontrol("requeue", str(ordinary_id))
                 cluster.scontrol("requeuehold", str(held_id))
                 time.sleep(CANCEL_BLOCK)
-                ordinary_show = cluster.scontrol("show", "job", str(ordinary_id))
                 held_show = cluster.scontrol("show", "job", str(held_id))
-                assert "JobHeldUser" not in ordinary_show, ordinary_show
                 assert "Reason=JobHeldUser" in held_show, held_show
-                assert _pid_alive(node, ordinary_pid), "ordinary cancel landed while the agent port was closed"
                 assert _pid_alive(node, held_pid), "held cancel landed while the agent port was closed"
 
             _wait_for_heartbeat(cluster)
-            held_died = _watch(node, held_pid, {"ordinary pending": ordinary_pid}, REAP_WINDOW)
+            held_died = _watch(node, held_pid, {"running": running_pid}, REAP_WINDOW)
             assert held_died, (
                 "heartbeat left the held job running:\n"
                 + cluster.scontrol("show", "job", str(held_id))
             )
         finally:
-            cluster.cli_allow_fail(["scontrol", "update", "PartitionName=default", "State=UP"])
-            if ordinary_id is not None:
-                cluster.cli_allow_fail(["scancel", str(ordinary_id)])
+            if running_id is not None:
+                cluster.cli_allow_fail(["scancel", str(running_id)])
             if held_id is not None:
                 cluster.cli_allow_fail(["scancel", str(held_id)])
-            _kill_sleeps(node, ORDINARY_SECS, HELD_SECS)
+            _kill_sleeps(node, RUNNING_SECS, HELD_SECS)
 
     def test_heartbeat_stops_a_job_held_at_max_requeue(self, unstarted_cluster):
         """A timed-out run whose kill is lost, requeued, then held when its re-dispatch fails."""

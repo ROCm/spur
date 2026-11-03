@@ -260,8 +260,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Maximum automatic requeues (excluding preemption) before a job is held with
        ``JobHoldMaxRequeue``. A held job's resources are released at once; a
        node that still runs its process is told to stop it on the node's next
-       heartbeat (see :ref:`held jobs still running <held-job-still-running>`). Must be ``>= 1``; ``0`` is a
-       validation error.
+       heartbeat (see
+       :ref:`held jobs still running <held-job-still-running>`). Must be
+       ``>= 1``; ``0`` is a validation error.
    * - ``max_launch_backoff_secs``
      - integer
      - ``300``
