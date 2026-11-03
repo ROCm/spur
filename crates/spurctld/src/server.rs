@@ -815,21 +815,16 @@ impl ControllerService {
     }
 
     /// Stop the nodes still running a job after one of its nodes reported (see
-    /// `step_launch_stragglers`).
-    fn stop_remaining_nodes(&self, job_id: u32, primary_only: Option<&str>) {
-        let Some(job) = self.cluster.get_job(job_id) else {
-            return;
-        };
-        let nodes = step_launch_stragglers(&job, primary_only);
-        if nodes.is_empty() {
-            return;
+    /// `stragglers_after_report`), in the background.
+    fn stop_remaining_nodes(
+        &self,
+        job_id: u32,
+        result: &crate::cluster::NodeCompleteResult,
+        reporting_node: &str,
+    ) {
+        if let Some(stop) = remaining_nodes_stop(&self.cluster, job_id, result, reporting_node) {
+            tokio::spawn(stop);
         }
-        let cluster = self.cluster.clone();
-        let run_attempt = job.run_attempt;
-        tokio::spawn(async move {
-            crate::scheduler_loop::cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, 15)
-                .await;
-        });
     }
 
     /// Send a cancel to a node still holding a run the controller no longer
@@ -2714,14 +2709,8 @@ impl SlurmController for ControllerService {
 
         match completion_result {
             Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
-            Some(Ok(NodeCompleteResult::Completing)) => {
-                self.stop_remaining_nodes(req.job_id, None);
-                Ok(Response::new(()))
-            }
-            // A rank exiting is a step event, not a node report: only the node
-            // running the batch script reporting means the job itself has ended.
-            Some(Ok(NodeCompleteResult::InGrace)) => {
-                self.stop_remaining_nodes(req.job_id, Some(&req.reporting_node));
+            Some(Ok(result @ (NodeCompleteResult::Completing | NodeCompleteResult::InGrace))) => {
+                self.stop_remaining_nodes(req.job_id, &result, &req.reporting_node);
                 Ok(Response::new(()))
             }
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
@@ -6043,6 +6032,46 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
     Status::new(code, message)
 }
 
+/// The nodes to stop after a node report took `job` to `result`. A job that is
+/// completing stops them whichever node reported; one still in its grace only
+/// when the batch script's node did, because a rank exiting elsewhere is a step
+/// event, not the end of the job.
+fn stragglers_after_report(
+    job: &spur_core::job::Job,
+    result: &crate::cluster::NodeCompleteResult,
+    reporting_node: &str,
+) -> Vec<String> {
+    use crate::cluster::NodeCompleteResult;
+
+    match result {
+        NodeCompleteResult::Completing => step_launch_stragglers(job, None),
+        NodeCompleteResult::InGrace => step_launch_stragglers(job, Some(reporting_node)),
+        _ => Vec::new(),
+    }
+}
+
+/// The stop for a job's remaining nodes, as a graceful cancel so the per-job
+/// kill wait applies. The job and its run are read now, so a requeue before the
+/// returned future runs cannot aim the cancel at the next run. `None` when no
+/// node needs stopping.
+fn remaining_nodes_stop(
+    cluster: &Arc<ClusterManager>,
+    job_id: u32,
+    result: &crate::cluster::NodeCompleteResult,
+    reporting_node: &str,
+) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+    let job = cluster.get_job(job_id)?;
+    let nodes = stragglers_after_report(&job, result, reporting_node);
+    if nodes.is_empty() {
+        return None;
+    }
+    let cluster = cluster.clone();
+    let run_attempt = job.run_attempt;
+    Some(async move {
+        crate::scheduler_loop::cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, 0).await;
+    })
+}
+
 /// Nodes to stop once one of a job's nodes has reported, for a batch script that
 /// launches its ranks with `srun`. With `primary_only` set, only a report from
 /// the batch script's node (the first allocated) counts: the other nodes run a
@@ -8225,12 +8254,14 @@ mod tests {
         }
     }
 
+    type CancelLog = Arc<std::sync::Mutex<Vec<AgentCancelJobRequest>>>;
+
     struct ProbeAgent {
         active: bool,
         step_response: Option<Result<spur_proto::proto::RunCommandResponse, Status>>,
         step_started: Option<Arc<tokio::sync::Notify>>,
-        /// Job ids this agent was told to cancel, for tests that assert on it.
-        cancelled: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
+        /// Cancels this agent was sent, for tests that assert on them.
+        cancelled: Option<CancelLog>,
     }
 
     #[tonic::async_trait]
@@ -8295,7 +8326,7 @@ mod tests {
             request: Request<AgentCancelJobRequest>,
         ) -> Result<Response<()>, Status> {
             if let Some(cancelled) = &self.cancelled {
-                cancelled.lock().unwrap().push(request.into_inner().job_id);
+                cancelled.lock().unwrap().push(request.into_inner());
             }
             Ok(Response::new(()))
         }
@@ -8424,9 +8455,8 @@ mod tests {
         .await
     }
 
-    /// A probe agent that records the job ids it is told to cancel.
-    async fn spawn_cancel_recording_agent(
-    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<u32>>>) {
+    /// A probe agent that records the cancels it is sent.
+    async fn spawn_cancel_recording_agent() -> (std::net::SocketAddr, CancelLog) {
         let cancelled = Arc::new(std::sync::Mutex::new(Vec::new()));
         let addr = spawn_probe_agent_server(ProbeAgent {
             active: false,
@@ -9942,7 +9972,7 @@ mod tests {
         report_node_finished(&svc, ordinary, "n1").await;
 
         wait_for_cancel(&n2_cancelled, ordinary).await;
-        assert_eq!(*n2_cancelled.lock().unwrap(), [ordinary]);
+        assert_eq!(cancelled_jobs(&n2_cancelled), [ordinary]);
         assert!(
             n1_cancelled.lock().unwrap().is_empty(),
             "a report from a non-primary node signals nobody in a grace"
@@ -9969,7 +9999,7 @@ mod tests {
             report_node_finished(&svc, job_id, "n1").await;
 
             wait_for_cancel(&n2_cancelled, job_id).await;
-            assert_eq!(*n2_cancelled.lock().unwrap(), [job_id], "{mode:?}");
+            assert_eq!(cancelled_jobs(&n2_cancelled), [job_id], "{mode:?}");
             assert!(n1_cancelled.lock().unwrap().is_empty(), "{mode:?}");
             assert_eq!(
                 svc.cluster.get_job(job_id).expect("job").state,
@@ -9987,6 +10017,144 @@ mod tests {
                 JobState::Pending
             };
             assert_eq!(job.state, expected, "{mode:?}");
+        }
+    }
+
+    /// Distinct from the defaults and from each other, so a cancel carrying the
+    /// wrong wait is told apart.
+    fn kill_wait_config() -> spur_core::config::SlurmConfig {
+        spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\n\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n\
+             [scheduler]\nkill_wait_secs = 7\ntimeout_kill_wait_secs = 40\n",
+        )
+        .unwrap()
+    }
+
+    fn record_node_report(
+        svc: &ControllerService,
+        job_id: u32,
+        node: &str,
+    ) -> crate::cluster::NodeCompleteResult {
+        let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+        svc.cluster
+            .node_complete(job_id, node, 0, 0, run_attempt)
+            .expect("node report recorded")
+    }
+
+    fn cancels_seen(cancelled: &CancelLog) -> Vec<(u32, i32, u32)> {
+        cancelled
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.job_id, r.signal, r.kill_wait_secs))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_remaining_nodes_get_a_graceful_cancel_with_the_kill_wait() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with(&dir, kill_wait_config()).await;
+        let (n1, _) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+
+        let result = record_node_report(&svc, job_id, "n1");
+        remaining_nodes_stop(&svc.cluster, job_id, &result, "n1")
+            .expect("the batch script's node ended; the companion is stopped")
+            .await;
+
+        assert_eq!(cancels_seen(&n2_cancelled), [(job_id, 0, 7)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_remaining_nodes_of_a_timed_out_job_get_the_timeout_wait() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with(&dir, kill_wait_config()).await;
+        let (n1, _) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+        let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
+        assert!(svc
+            .cluster
+            .expire_time_limit(job_id, run_attempt, Utc::now())
+            .expect("expiry recorded"));
+
+        let result = record_node_report(&svc, job_id, "n1");
+        remaining_nodes_stop(&svc.cluster, job_id, &result, "n1")
+            .expect("the companion is stopped")
+            .await;
+
+        assert_eq!(cancels_seen(&n2_cancelled), [(job_id, 0, 40)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_companion_reporting_in_grace_stops_nothing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with(&dir, kill_wait_config()).await;
+        let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
+
+        let result = record_node_report(&svc, job_id, "n2");
+
+        assert_eq!(result, crate::cluster::NodeCompleteResult::InGrace);
+        assert!(remaining_nodes_stop(&svc.cluster, job_id, &result, "n2").is_none());
+        assert!(n1_cancelled.lock().unwrap().is_empty());
+        assert!(n2_cancelled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_batch_scripts_node_reporting_in_grace_sends_the_graceful_cancel() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with(&dir, kill_wait_config()).await;
+        let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
+
+        let result = record_node_report(&svc, job_id, "n1");
+
+        assert_eq!(result, crate::cluster::NodeCompleteResult::InGrace);
+        remaining_nodes_stop(&svc.cluster, job_id, &result, "n1")
+            .expect("the primary ended; the companion is stopped")
+            .await;
+        assert_eq!(cancels_seen(&n2_cancelled), [(job_id, 0, 7)]);
+        assert!(n1_cancelled.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_a_completing_or_in_grace_report_has_stragglers_to_stop() {
+        use crate::cluster::NodeCompleteResult;
+
+        let mut job = spur_core::job::Job::new(1, spur_core::job::JobSpec::default());
+        job.spec.script = Some("srun ./train\n".into());
+        job.allocated_nodes = vec!["n1".into(), "n2".into()];
+        job.node_completions.insert(
+            "n2".into(),
+            spur_core::job::NodeCompletion { code: 0, signal: 0 },
+        );
+
+        assert_eq!(
+            stragglers_after_report(&job, &NodeCompleteResult::Completing, "n2"),
+            ["n1".to_string()],
+            "a completing job stops the rest whichever node reported"
+        );
+        assert!(
+            stragglers_after_report(&job, &NodeCompleteResult::InGrace, "n2").is_empty(),
+            "in a grace a companion's report is a step event"
+        );
+        for result in [
+            NodeCompleteResult::AlreadyTerminal,
+            NodeCompleteResult::StaleReport,
+            NodeCompleteResult::AllDone {
+                state: JobState::Completed,
+                exit_code: 0,
+            },
+        ] {
+            assert!(stragglers_after_report(&job, &result, "n2").is_empty());
         }
     }
 
@@ -10033,9 +10201,13 @@ mod tests {
         );
     }
 
-    async fn wait_for_cancel(cancelled: &Arc<std::sync::Mutex<Vec<u32>>>, job_id: u32) {
+    fn cancelled_jobs(cancelled: &CancelLog) -> Vec<u32> {
+        cancelled.lock().unwrap().iter().map(|r| r.job_id).collect()
+    }
+
+    async fn wait_for_cancel(cancelled: &CancelLog, job_id: u32) {
         for _ in 0..400 {
-            if cancelled.lock().unwrap().contains(&job_id) {
+            if cancelled_jobs(cancelled).contains(&job_id) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
