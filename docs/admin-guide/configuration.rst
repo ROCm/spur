@@ -567,7 +567,11 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Maximum seconds a job may sit in COMPLETING before it is force-finished.
        Nodes that have not confirmed completion are drained before their
        resources are released. If that drain cannot be committed, the job
-       retains its allocation and the controller retries.
+       retains its allocation and the controller retries. A node reports only
+       after the job is killed and its cgroup cleanup finishes, so this should
+       exceed the larger of ``kill_wait_secs`` and ``timeout_kill_wait_secs``
+       plus ``[cgroup] cleanup_timeout_secs``; the controller logs a warning
+       when it does not.
    * - ``kill_wait_secs``
      - integer
      - ``5``
@@ -578,8 +582,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        of a job whose batch script has exited, and other graceful stops.
        Ends early once the job's processes exit. Valid ``0``-``65533``; values
        below 5 act as 5. ``complete_wait_secs`` should exceed the larger of this
-       and ``timeout_kill_wait_secs``, or a job can be force-finished before its
-       kill wait elapses; the controller logs a warning when it does not. Known
+       and ``timeout_kill_wait_secs`` plus ``[cgroup] cleanup_timeout_secs``,
+       or a healthy node still being killed or cleaned up is drained when the
+       job is force-finished; the controller logs a warning when it does not. Known
        issue: a requeued job (requeue-mode preemption, ``scontrol requeue``)
        frees its nodes at once, while the old run is still in its kill wait, so
        another job can be dispatched onto them during that window. The window
@@ -597,7 +602,7 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        moves to COMPLETING straight away and spends this wait there before
        ending ``TIMEOUT``. Valid ``0``-``65533``; values below 5 act as 5.
        ``complete_wait_secs`` should exceed the larger of this and
-       ``kill_wait_secs``. In Slurm, ``KillWait`` also covers time limits; here
+       ``kill_wait_secs`` plus ``[cgroup] cleanup_timeout_secs``. In Slurm, ``KillWait`` also covers time limits; here
        that part is this setting.
    * - ``max_user_priority``
      - integer
@@ -2335,8 +2340,10 @@ cgroups.
        ``0`` requests a drain immediately if cleanup is incomplete. Cleanup
        continues after the deadline; it does not authorize resource reuse.
        Raise it on nodes where teardown is slow (large-memory jobs, GPU reset,
-       network filesystem unmounts), but keep it below ``[scheduler]
-       complete_wait_secs`` so the agent, not a force-finish, drains the node.
+       network filesystem unmounts), but keep ``[scheduler] complete_wait_secs``
+       above the larger kill wait plus this value so the agent, not a
+       force-finish, drains the node; the controller logs a warning when it is
+       not.
    * - ``oom_kill_job``
      - bool
      - ``true``
