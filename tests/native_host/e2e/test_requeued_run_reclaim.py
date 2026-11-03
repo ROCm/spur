@@ -1,16 +1,13 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A run left on a node that was DOWN when its job was requeued is stopped once
+"""A run left on a node that was Down when its job was requeued is stopped once
 the node reports back, even while the job is still waiting in the queue."""
-
-import contextlib
 
 import pytest
 
 from cluster import (
-    AGENT_PORT,
-    CONTROLLER_PORT,
+    cut_off_node,
     job_state,
     parse_job_id,
     wait_job,
@@ -22,28 +19,8 @@ from cluster import (
 HEARTBEAT_TIMEOUT_SECS = 40
 # Missed beats past the timeout, plus the health tick that acts on them.
 NODE_DOWN_BOUND = 180
-# Two heartbeat intervals: the first after the node is back may land before it is UP.
+# Heartbeats are every 30s; a beat on the dead connection may fail before one reconnects.
 RECLAIM_BOUND = 90
-
-
-@contextlib.contextmanager
-def cut_off_node(cluster, node_index):
-    """Drop the node's heartbeats and the controller's RPCs to it, at the controller."""
-    controller = cluster.nodes[0]
-    target = cluster.nodes[node_index].host
-    rules = [
-        f"INPUT -s {target} -p tcp --dport {CONTROLLER_PORT} -j DROP",
-        f"OUTPUT -d {target} -p tcp --dport {AGENT_PORT} -j DROP",
-    ]
-    added = []
-    try:
-        for rule in rules:
-            controller.exec(f"sudo iptables -A {rule}")
-            added.append(rule)
-        yield
-    finally:
-        for rule in added:
-            controller.exec_allow_fail(f"sudo iptables -D {rule}")
 
 
 def pid_alive(node, pid):

@@ -154,6 +154,27 @@ def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_
         controller.exec_allow_fail(f"sudo iptables -D OUTPUT {rule_args}")
 
 
+@contextlib.contextmanager
+def cut_off_node(cluster: "SpurCluster", node_index: int):
+    """Drop one node's heartbeats and the controller's RPCs to it, at the controller.
+    Inserted first so an earlier ESTABLISHED accept rule cannot keep live connections up."""
+    controller = cluster.nodes[0]
+    target = cluster.nodes[node_index].host
+    rules = [
+        f"INPUT -s {target} -p tcp --dport {CONTROLLER_PORT} -j DROP",
+        f"OUTPUT -d {target} -p tcp --dport {AGENT_PORT} -j DROP",
+    ]
+    added = []
+    try:
+        for rule in rules:
+            controller.exec(f"sudo iptables -I {rule}")
+            added.append(rule)
+        yield
+    finally:
+        for rule in added:
+            controller.exec_allow_fail(f"sudo iptables -D {rule}")
+
+
 class SshNode:
     """SSH connection to a single test node."""
 

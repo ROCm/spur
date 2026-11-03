@@ -199,7 +199,7 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--requeue``
      -
      - Allow the job to be requeued after a node failure or time limit.
-       Default off.
+       Default off. If the failed node comes back, the run it kept going is stopped.
    * - ``--no-requeue``
      -
      - Do not requeue the job after a node failure or time limit. This is the

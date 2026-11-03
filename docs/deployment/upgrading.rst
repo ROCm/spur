@@ -760,6 +760,24 @@ plus up to 5 seconds for the accounting flush, below ``TimeoutStopSec``. A step 
 finishes during the drain does not end it, so raising the value mostly lengthens the
 restart. A new value takes effect at the next start.
 
+.. _requeued-run-upgrade-notes:
+
+Stopping a requeued job's run on a recovered node
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a node misses heartbeats, its jobs end ``NODE_FAIL`` and a job submitted
+with ``--requeue`` goes back to the queue, but the node itself is never told to
+stop. From this release, the controller stops that run when the node heartbeats
+again, even while the job is still waiting in the queue. Before, the node kept
+the run and its GPUs until the job ended or started on another node, and
+refused every job placed on those GPUs in the meantime.
+
+This needs the agent to report which run it holds, so it takes effect per node
+as agents are upgraded; an agent from an earlier release keeps the old
+behavior. An upgraded agent also stops the old run's processes when the job is
+placed back on the same node, which an earlier agent could miss with
+``[cgroup] enabled = false``.
+
 See Also
 --------
 

@@ -246,12 +246,10 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - Restart
      - Seconds without a heartbeat before a node is marked Down. Unset by
        default; the controller applies a 90-second fallback when absent.
-       Jobs on a Down node end as ``NODE_FAIL`` and are requeued if they allow
-       it. A run the node kept going while it was unreachable is stopped once
-       the node heartbeats again, even while its job is still waiting in the
-       queue. An agent from an earlier release does not report which run it
-       holds, so its stale run is stopped only once the job ends or runs on
-       another node.
+       Jobs on a Down node end as ``NODE_FAIL``; one submitted with
+       ``--requeue`` goes back to the queue, up to ``max_batch_requeue`` times.
+       Any run the node kept going is stopped when it heartbeats again (see
+       :ref:`requeued-run-upgrade-notes` for older agents).
    * - ``health_tick_secs``
      - integer
      - ``30``

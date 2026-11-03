@@ -412,6 +412,25 @@ fn effective_cgroup_path(descriptor: &crate::stepd::StepdDescriptor) -> std::pat
     }
 }
 
+/// Fills in what a launch-time copy lacks from the supervisor's own record: its workload,
+/// and a cgroup that still exists. What the agent already holds wins.
+fn with_published_workload(
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> crate::stepd::StepdDescriptor {
+    let mut merged = descriptor.clone();
+    let Some(published) = crate::stepd::republished(descriptor) else {
+        return merged;
+    };
+    if merged.workload_pid == 0 {
+        merged.workload_pid = published.workload_pid;
+        merged.workload_start_ticks = published.workload_start_ticks;
+    }
+    if merged.cgroup_path.as_os_str().is_empty() && published.cgroup_path.is_dir() {
+        merged.cgroup_path = published.cgroup_path;
+    }
+    merged
+}
+
 /// Whether a torn-down stepd is confirmed dead. A recorded cgroup path is
 /// authoritative — a successful stop signal only reaches the supervisor, which
 /// by design ignores a raw SIGTERM for its job's cgroup.
@@ -419,8 +438,7 @@ async fn runtime_teardown_confirmed(
     descriptor: &crate::stepd::StepdDescriptor,
     stop_result: &std::io::Result<()>,
 ) -> bool {
-    let published = crate::stepd::republished(descriptor);
-    let descriptor = published.as_ref().unwrap_or(descriptor);
+    let descriptor = &with_published_workload(descriptor);
     // A derived path is still worth reaping — the supervisor may have created
     // the cgroup before dying — but its absence proves nothing, since it may
     // never have existed, so the workload itself has to answer for its death.
@@ -10158,9 +10176,11 @@ impl AgentService {
             }
             return;
         }
+        // A redispatch may have replaced the run since `run_attempt` was resolved.
         let allocation_only_attempt = {
             let jobs = self.running.lock().await;
             jobs.get(&job_id)
+                .filter(|tracked| tracked.run_attempt == run_attempt)
                 .filter(|tracked| tracked.job.is_allocation_only())
                 .map(|tracked| tracked.run_attempt)
         };
@@ -10171,7 +10191,10 @@ impl AgentService {
 
         let (tracked_attempt, sig) = {
             let jobs = self.running.lock().await;
-            let Some(tracked) = jobs.get(&job_id) else {
+            let Some(tracked) = jobs
+                .get(&job_id)
+                .filter(|tracked| tracked.run_attempt == run_attempt)
+            else {
                 return;
             };
             let sig = nix::sys::signal::Signal::try_from(signal)
@@ -10402,9 +10425,11 @@ impl AgentService {
             }
             return;
         }
+        // A redispatch may have replaced the run since `run_attempt` was resolved.
         let allocation_only_attempt = {
             let jobs = self.running.lock().await;
             jobs.get(&job_id)
+                .filter(|tracked| tracked.run_attempt == run_attempt)
                 .filter(|tracked| tracked.job.is_allocation_only())
                 .map(|tracked| tracked.run_attempt)
         };
@@ -10417,7 +10442,10 @@ impl AgentService {
         // touch a newer run that reused this job_id after a requeue.
         let (cancel_attempt, signaled_at) = {
             let jobs = self.running.lock().await;
-            let Some(tracked) = jobs.get(&job_id) else {
+            let Some(tracked) = jobs
+                .get(&job_id)
+                .filter(|tracked| tracked.run_attempt == run_attempt)
+            else {
                 return;
             };
             info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
@@ -11097,10 +11125,9 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// A redispatch onto the same node fences the old run through the copy taken
-    /// at its launch, which predates the workload; the supervisor's own record names it.
-    #[tokio::test]
-    async fn fencing_a_displaced_run_kills_the_workload_its_supervisor_published() {
+    /// Fences a displaced run tracked by its launch-time copy, after its supervisor
+    /// published `published_cgroup` and a live workload; returns whether that workload survived.
+    async fn workload_survives_fencing(published_cgroup: std::path::PathBuf) -> bool {
         let state_dir = tempfile::tempdir().expect("state dir");
         let store = crate::stepd::StepdStore::new(state_dir.path());
         let mut child = std::process::Command::new("sleep")
@@ -11114,6 +11141,7 @@ mod tests {
         published.workload_pid = child.id();
         published.workload_start_ticks =
             crate::stepd::process_start_ticks(child.id()).expect("workload start ticks");
+        published.cgroup_path = published_cgroup;
         store
             .publish(&published)
             .expect("publish started descriptor");
@@ -11123,15 +11151,37 @@ mod tests {
             .await
             .insert(stepd_key(&at_launch), at_launch);
 
-        fence_displaced_stepd(&sessions, 91, spur_core::step::STEP_BATCH, 2)
-            .await
-            .expect("fence the displaced run");
+        let fenced = fence_displaced_stepd(&sessions, 91, spur_core::step::STEP_BATCH, 2).await;
+        let survived =
+            crate::stepd::process_is_live(published.workload_pid, published.workload_start_ticks);
+        let _ = child.kill();
+        let _ = child.wait();
+        fenced.expect("fence the displaced run");
+        survived
+    }
 
+    /// A redispatch onto the same node fences the old run through the copy taken
+    /// at its launch, which predates the workload; the supervisor's own record names it.
+    #[tokio::test]
+    async fn fencing_a_displaced_run_kills_the_workload_its_supervisor_published() {
         assert!(
-            !crate::stepd::process_is_live(published.workload_pid, published.workload_start_ticks),
+            !workload_survives_fencing(std::path::PathBuf::new()).await,
             "the old run's workload must not survive its replacement"
         );
-        let _ = child.wait();
+    }
+
+    /// A recorded cgroup that is gone proves nothing (adoption drops it for that reason),
+    /// so the published one must not stand in for the workload check.
+    #[tokio::test]
+    async fn fencing_does_not_trust_a_published_cgroup_that_is_gone() {
+        let gone = tempfile::tempdir()
+            .expect("cgroup parent")
+            .path()
+            .join("job_91");
+        assert!(
+            !workload_survives_fencing(gone).await,
+            "a vanished cgroup must not confirm the workload dead"
+        );
     }
 
     #[tokio::test]

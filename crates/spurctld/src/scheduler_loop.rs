@@ -5713,6 +5713,29 @@ mod tests {
             settle(&cm, job.job_id, spur_core::job::JobState::Pending);
         }
 
+        /// A heartbeat reclaim names the run the node reported, so the agent can drop it
+        /// if a newer run has replaced that one.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_heartbeat_reclaim_cancels_the_run_the_node_reported() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancelled, _) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let job = run_on(&cm, "requeued", "n1");
+            assert_ne!(job.run_attempt, 0);
+            cm.requeue_job_by_user(job.job_id, "", true, true).unwrap();
+            settle(&cm, job.job_id, spur_core::job::JobState::Pending);
+            let report = spur_proto::proto::RunningJobStatus {
+                job_id: job.job_id,
+                run_attempt: job.run_attempt,
+                ..Default::default()
+            };
+
+            crate::server::cancel_stale_runs(cm.clone(), "n1".into(), vec![report]).await;
+
+            assert_eq!(*cancelled.lock().unwrap(), [job.run_attempt]);
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_late_requeue_cancels_the_old_run_even_after_the_job_runs_again() {
             let dir = TempDir::new().unwrap();
