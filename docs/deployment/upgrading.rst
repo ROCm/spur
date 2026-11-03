@@ -709,6 +709,31 @@ an older controller ran carry no keepalive mark, so they are reaped only if
 their client pings the upgraded controller. ``scontrol show config`` prints the
 value in effect as ``InactiveLimit``. See :ref:`inactive-limit`.
 
+GPU partition identities (CPX, QPX, DPX)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release changes the allocation id (``stable_id``) of partitions 1 and up of a
+GPU that runs in a partitioned compute mode. Partition 0 and GPUs in SPX mode keep
+their ids. The id is the GPU allocation key in the Raft log and in the job state of
+``spurd``. Old log entries still deserialize.
+
+The ids change when ``spurd`` regenerates the CDI spec (``spur k8s up``), or at a
+restart on a node that has no ``/etc/cdi/amd.json``. A binary swap alone does not
+change them while that file exists.
+
+.. warning::
+
+   **Drain nodes that run a GPU in a partitioned mode before you swap** ``spurd``.
+   When a job holds a partition across the id change, the controller offers that
+   partition a second time under its new id. The dispatch check of ``spurd``
+   rejects each launch on it, so no partition goes to two jobs, but the placed job
+   fails its dispatch, and after 5 attempts the controller holds it
+   (``JobHoldMaxRequeue``) until a user releases it. While such a job runs, the
+   other partitions of that GPU are not in the inventory.
+
+The rolling playbook drains agents before the swap. The single-host
+``spur self-update`` path does not, so drain by hand there.
+
 See Also
 --------
 
