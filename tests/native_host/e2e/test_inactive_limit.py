@@ -26,6 +26,8 @@ INACTIVE_LIMIT_SECS = 60
 KEEPALIVE_INTERVAL_SECS = 30
 TIMEOUT_KILL_WAIT_SECS = 40
 RUNNING_BOUND = 30
+# Past the 30 s default of timeout_kill_wait_secs, so a fallback to it would show.
+DEFAULT_TIMEOUT_WAIT_PROBE_SECS = 31
 # The last ping can be up to one interval old, and the reaper runs on a tick.
 SIGNAL_BOUND = INACTIVE_LIMIT_SECS + 2 * KEEPALIVE_INTERVAL_SECS
 FINISH_BOUND = TIMEOUT_KILL_WAIT_SECS + 40
@@ -183,6 +185,15 @@ def _states_until_terminal(cluster, job_id: int, timeout: int) -> list[str]:
     return seen
 
 
+def _assert_still_completing(cluster, job_id: int, since: float) -> None:
+    remaining = since + DEFAULT_TIMEOUT_WAIT_PROBE_SECS - time.time()
+    if remaining > 0:
+        time.sleep(remaining)
+    assert job_state(cluster.squeue_all(), job_id) == "CG", (
+        "a reaped job ignoring SIGTERM must stay COMPLETING for the whole timeout_kill_wait_secs"
+    )
+
+
 class TestInactiveLimitKillWait:
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -204,6 +215,7 @@ class TestInactiveLimitKillWait:
                        desc="the step to be sent SIGTERM after its client went silent")
             # The step ignores SIGTERM, so the job waits out the kill wait in COMPLETING.
             wait_job_state(cluster, job_id, "CG", timeout=RUNNING_BOUND)
+            _assert_still_completing(cluster, job_id, time.time())
 
             assert wait_job(cluster, job_id, timeout=FINISH_BOUND) == "TO", (
                 f"a reaped allocation ends TIMEOUT:\n{cluster.debug_job(job_id)}"
@@ -225,6 +237,7 @@ class TestInactiveLimitKillWait:
 
             # The client resumes and pings inside the kill wait; the SIGTERM is final.
             client.resume()
+            _assert_still_completing(cluster, job_id, time.time())
 
             states = _states_until_terminal(cluster, job_id, FINISH_BOUND)
             assert states[-1] == "TO", (

@@ -63,12 +63,18 @@ _DEADLINE_MARGIN_SECS = 10
 # Headroom for polling latency on top of an expected duration.
 _SLACK_SECS = 40
 
-# The partial-exit test needs a grace long enough to hold a checkpoint that outlasts
-# kill_wait_secs, with the job still ending well before the deadline.
-_PARTIAL_GRACE_SECS = 90
-_CHECKPOINT_SECS = 30
-# Margin past kill_wait_secs before asserting the job is still running.
+# The partial-exit checkpoint must outlast every kill path: kill_wait_secs, the 30 s
+# timeout wait and the agent's force-reclaim backstop at kill_wait_secs + 30 s. The
+# grace is long enough that the job still ends well before the deadline.
+_CHECKPOINT_SECS = 75
+_PARTIAL_GRACE_SECS = 120
+_BACKSTOP_SECS = 30
+# Margin past the last kill path before asserting the job is still running.
 _KILL_WAIT_MARGIN_SECS = 5
+
+# The zero-grace victim must end well before a grace would: it has to stay below
+# _GRACE_SECS + _KILL_WAIT_SECS, with room for scheduler and polling latency.
+_ZERO_GRACE_END_BOUND = _KILL_WAIT_SECS + 20
 
 _QUICK_SCRIPT = "#!/bin/bash\nsleep 5\n"
 
@@ -442,7 +448,8 @@ class TestGracePartialExitKeepsOtherRankRunning:
 
             # A rank exiting is a step event, not a node report: the job stays running and
             # the other rank is not signalled, well past the wait a kill would have used.
-            remaining = warned_at + _KILL_WAIT_SECS + _KILL_WAIT_MARGIN_SECS - time.time()
+            probe_at = warned_at + _KILL_WAIT_SECS + _BACKSTOP_SECS + _KILL_WAIT_MARGIN_SECS
+            remaining = probe_at - time.time()
             if remaining > 0:
                 time.sleep(remaining)
             assert job_state(cluster.squeue_all(), victim.job_id) == "R", (
@@ -456,6 +463,9 @@ class TestGracePartialExitKeepsOtherRankRunning:
             assert job_state(cluster.squeue_all(), aggressor_id) == "PD", (
                 "the preemptor must wait while the victim still has a rank running"
             )
+            assert _marker_lines(cluster, victim.step_marker).count("TERM") == 2, (
+                "each rank is warned exactly once, so a stray second SIGTERM must not appear"
+            )
 
             wait_until(
                 lambda: "done" in _read(cluster, done_marker),
@@ -468,6 +478,9 @@ class TestGracePartialExitKeepsOtherRankRunning:
             )
             assert terminal in ("CA", "GONE"), (
                 f"the victim must be recorded as preempted once its script exits; got {terminal!r}"
+            )
+            assert _marker_lines(cluster, victim.step_marker).count("TERM") == 2, (
+                "no rank may be sent a second SIGTERM"
             )
             assert len(_marker_lines(cluster, checkpoint_marker)) == _CHECKPOINT_SECS, (
                 "rank 1 must complete every checkpoint step, not be killed part-way"
@@ -516,7 +529,7 @@ def _observe_zero_grace(cluster, node: str) -> None:
     victim = _submit_victim(cluster, "pzero", sbatch_args=[f"--nodelist={node}"])
     aggressor_id = _queue_aggressor(cluster, "pzero", sbatch_args=[f"--nodelist={node}"])
     try:
-        saw_preempt_time = _watch_until_ended(cluster, victim.job_id, _GRACE_SECS - _DEADLINE_MARGIN_SECS)
+        saw_preempt_time = _watch_until_ended(cluster, victim.job_id, _ZERO_GRACE_END_BOUND)
         assert not saw_preempt_time, (
             "a QOS GraceTime of 0 overrides the partition's, so no grace and no PreemptTime"
         )
