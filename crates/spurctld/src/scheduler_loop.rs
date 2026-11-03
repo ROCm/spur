@@ -4539,7 +4539,7 @@ mod tests {
         let deadline = now + chrono::Duration::seconds(120);
         let job = in_grace(running_job_on("node001", now, 600), deadline);
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300, 30, 30);
+        let busy_until = busy_until_from_running_jobs(&[job], 300, 30, 90);
 
         assert_eq!(
             busy_until["node001"] - deadline,
@@ -4557,8 +4557,8 @@ mod tests {
 
         assert_eq!(preemptor_awaiting_release(&stale), None);
         assert_eq!(
-            busy_until_from_running_jobs(&[stale], 300, 30, 30),
-            busy_until_from_running_jobs(&[plain], 300, 30, 30),
+            busy_until_from_running_jobs(&[stale], 300, 30, 90),
+            busy_until_from_running_jobs(&[plain], 300, 30, 90),
         );
     }
 
@@ -4575,7 +4575,7 @@ mod tests {
             spur_core::job::NodeCompletion { code: 0, signal: 0 },
         );
 
-        let busy_until = busy_until_from_running_jobs(&[job], 300, 30, 30);
+        let busy_until = busy_until_from_running_jobs(&[job], 300, 30, 90);
 
         assert_eq!(busy_until.keys().collect::<Vec<_>>(), ["node002"]);
     }
@@ -4588,8 +4588,8 @@ mod tests {
         let graced = in_grace(plain.clone(), deadline);
 
         assert_eq!(
-            busy_until_from_running_jobs(&[graced], 300, 30, 30),
-            busy_until_from_running_jobs(&[plain], 300, 30, 30)
+            busy_until_from_running_jobs(&[graced], 300, 30, 90),
+            busy_until_from_running_jobs(&[plain], 300, 30, 90)
         );
     }
 
