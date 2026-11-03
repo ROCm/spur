@@ -1174,6 +1174,7 @@ address = "http://peer-a:6817"
             fabric: None,
             preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
+            partition_node_usage: &Default::default(),
             nodes: &nodes,
             partitions: &partitions,
             reservations: &[],

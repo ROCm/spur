@@ -11,6 +11,8 @@ use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceAllocations;
 use spur_core::topology::TopologyTree;
 
+use crate::partition_cap::PartitionNodeUsage;
+
 /// An assignment of a job to one or more nodes.
 #[derive(Debug, Clone)]
 pub struct Assignment {
@@ -18,6 +20,9 @@ pub struct Assignment {
     pub nodes: Vec<String>,
     /// Controller-selected per-node resource allocation (real device IDs).
     pub per_node_alloc: HashMap<String, ResourceAllocations>,
+    /// Partition the run is charged to, chosen among the job's candidates.
+    /// `None` when no requested partition contains the assigned nodes.
+    pub partition: Option<String>,
 }
 
 /// Cluster state visible to the scheduler.
@@ -33,6 +38,9 @@ pub struct ClusterState<'a> {
     pub busy_until: &'a HashMap<String, DateTime<Utc>>,
     /// Node name -> pending preemptor its victims' released capacity is held for.
     pub preemption_handoffs: &'a HashMap<String, JobId>,
+    /// What each partition's running jobs hold per node, charged against the
+    /// partition's `max_tres_per_node` until the node's `busy_until`.
+    pub partition_node_usage: &'a PartitionNodeUsage,
 }
 
 impl ClusterState<'_> {
