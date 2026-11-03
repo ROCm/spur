@@ -546,6 +546,26 @@ Out of the box the job's cgroup gets:
 A job submitted without ``--mem`` has no memory budget, so the memory ceilings are
 left unset.
 
+Job termination waits for all processes in the owned cgroup, including
+children that outlive the batch shell. The ``[cgroup] cleanup_timeout_secs``
+setting defaults to 60 seconds, matching Slurm's ``UnkillableStepTimeout``. The node agent blocks new launches while cleanup
+is pending. At the deadline, it requests a node drain independently of job
+completion, including when a supervisor is still busy with cleanup or exit hooks. An unreadable cgroup is treated as unresolved cleanup, rather than
+as empty.
+
+Pending cleanup is recorded on disk and retried after an agent or supervisor
+restart. The original deadline is preserved during recovery; the agent's
+force-reclaim timer does not prove that the workload has exited. The controller
+also drains unreported nodes before force-finishing a job at
+``complete_wait_secs``.
+The node remains drained for administrator investigation and explicit resume;
+resuming it does not bypass the agent's outstanding cleanup check.
+These guarantees require cgroup containment to be enabled and successfully
+established for the job. Upgrade controllers before node agents and supervisors
+so completion and timeout handling both enforce quarantine. A running job
+keeps the cleanup timeout captured at launch; changing the configuration applies
+to new jobs after the agent restarts.
+
 Inspect what a running job actually got:
 
 .. code-block:: bash

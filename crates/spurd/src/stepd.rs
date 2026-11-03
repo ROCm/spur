@@ -561,8 +561,8 @@ pub enum AgentNotification {
 pub enum AgentNotificationResponse {
     /// spurd forwarded the completion to the controller; safe to prune.
     Acknowledged,
-    /// spurd released its local tracking but could not reach the
-    /// controller; leave the durable record for the next startup scan.
+    /// Cleanup or controller acknowledgement is still pending; retain the
+    /// durable record so recovery can finish it.
     Deferred,
 }
 
@@ -884,6 +884,8 @@ impl StepdSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepdDescriptor {
+    #[serde(default = "spur_core::config::default_cgroup_cleanup_timeout")]
+    pub cleanup_timeout_secs: u32,
     pub format_version: u32,
     pub job_id: u32,
     pub run_attempt: u32,
@@ -949,6 +951,17 @@ pub struct StepdDescriptor {
 }
 
 impl StepdDescriptor {
+    pub fn cleanup_cgroup_path(&self) -> PathBuf {
+        if self.cgroup_path.as_os_str().is_empty() {
+            return crate::executor::reapable_cgroup_path(
+                self.job_id,
+                self.run_attempt,
+                self.step_id,
+            );
+        }
+        crate::cgroup_cleanup::owned_cgroup(&self.cgroup_path, self.step_id).to_path_buf()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_id: u32,
@@ -960,6 +973,7 @@ impl StepdDescriptor {
         cgroup_path: PathBuf,
     ) -> Self {
         Self {
+            cleanup_timeout_secs: spur_core::config::default_cgroup_cleanup_timeout(),
             format_version: FORMAT_VERSION,
             job_id,
             run_attempt,
@@ -1022,7 +1036,12 @@ pub(crate) fn record_resources_released(descriptor: &StepdDescriptor) -> io::Res
     {
         return prune_finalized_session(session_dir, &obligations, descriptor.step_id).map(|_| ());
     }
-    obligations.append(&StepdObligation::ResourcesReleased)?;
+    match obligations.append(&StepdObligation::ResourcesReleased) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !session_dir.try_exists()? => {
+            return Ok(());
+        }
+        result => result?,
+    }
     prune_finalized_session(session_dir, &obligations, descriptor.step_id).map(|_| ())
 }
 
@@ -1088,11 +1107,29 @@ enum SweptSession {
     RetainedAnswer { settled_at: SystemTime },
 }
 
+fn session_cleanup_pending(session_dir: &Path) -> io::Result<bool> {
+    let pending = session_dir
+        .parent()
+        .zip(session_dir.file_name())
+        .map(|(root, name)| {
+            root.join("cleanup")
+                .join(format!("{}.json", name.to_string_lossy()))
+        });
+    Ok(pending
+        .as_ref()
+        .map(|path| path.try_exists())
+        .transpose()?
+        .unwrap_or(false))
+}
+
 fn sweep_finalized_session(
     session_dir: &Path,
     obligations: &StepdObligationLog,
     step_id: spur_core::step::StepId,
 ) -> io::Result<SweptSession> {
+    if session_cleanup_pending(session_dir)? {
+        return Ok(SweptSession::Unfinalized);
+    }
     if !finalized_obligations(&obligations.read()?) {
         return Ok(SweptSession::Unfinalized);
     }
@@ -2182,6 +2219,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if !launch_spec.capability.is_empty() {
         descriptor.capability = launch_spec.capability.clone();
     }
+    descriptor.cleanup_timeout_secs = launch_spec.cgroup.cleanup_timeout_secs;
     descriptor.owner = launch_spec.user.clone();
     descriptor.uid = launch_spec.uid;
     descriptor.gid = launch_spec.gid;
@@ -2353,9 +2391,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // own — but the agent made one and recorded it, and it still has to go.
     let recorded_cgroup =
         (!descriptor.cgroup_path.as_os_str().is_empty()).then(|| descriptor.cgroup_path.clone());
+    let cleanup_timeout_secs = descriptor.cleanup_timeout_secs;
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
     let cgroup = session.take_cgroup().await.or(recorded_cgroup);
+    let cleanup_store = store.cleanup_store();
     let teardown = |cgroup: Option<PathBuf>| async move {
         // TaskEpilog runs as the job user inside the step cgroup before it is
         // reaped; the extern/allocation step runs no task hooks.
@@ -2377,13 +2417,26 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             pmix.stop();
         }
         if let Some(cgroup) = cgroup.as_ref() {
-            crate::executor::cleanup_cgroup(cgroup);
-            // The agent reaps the job node once its last step releases; this
-            // covers the case where teardown here runs and that never does.
-            // Removing an absent directory is a no-op, so both trying is safe.
-            if spur_core::step::owns_job_lifetime(step_id) {
-                if let Some(job_cgroup) = cgroup.parent() {
-                    crate::executor::cleanup_cgroup(job_cgroup);
+            let owned = crate::cgroup_cleanup::owned_cgroup(cgroup, step_id);
+            let pending = crate::cgroup_cleanup::PendingCleanup::new(
+                job_id,
+                run_attempt,
+                step_id,
+                owned.to_path_buf(),
+                cleanup_timeout_secs,
+            )?;
+            if !cleanup_store.prepare(&pending)? {
+                match crate::cgroup_cleanup::wait_until_reaped(
+                    owned,
+                    cleanup_store.remaining(&pending)?,
+                )
+                .await
+                {
+                    Ok(true) => cleanup_store.finish(&pending)?,
+                    Ok(false) => tracing::warn!(job_id, "cgroup cleanup outlived its grace period"),
+                    Err(error) => {
+                        tracing::warn!(job_id, %error, "cgroup cleanup could not be confirmed")
+                    }
                 }
             }
         }
@@ -2395,9 +2448,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if spur_core::step::owns_job_lifetime(step_id) {
             crate::executor::cleanup_job_spool(job_id);
         }
+        Ok::<(), io::Error>(())
     };
     if let Err(error) = result {
-        teardown(cgroup).await;
+        teardown(cgroup).await?;
         record_launch_failure(&session_dir, &stderr_path, &error);
         return Err(error.into());
     }
@@ -2417,7 +2471,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // Record the exit before teardown: cleanup, the epilog, and SPANK are
     // unbounded operator code, and a crash in them must not read as "never ran".
     obligations.append(&StepdObligation::ExitObserved { exit_code, signal })?;
-    teardown(cgroup).await;
+    teardown(cgroup).await?;
     // Per-job-per-node hooks: only the step owning the job's lifetime runs them.
     let owns_job_lifetime = spur_core::step::owns_job_lifetime(step_id);
     let epilog_failed = match hooks.epilog.as_deref().filter(|_| owns_job_lifetime) {
@@ -2533,6 +2587,81 @@ impl StepdStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn cleanup_store(&self) -> crate::cgroup_cleanup::CleanupStore {
+        crate::cgroup_cleanup::CleanupStore::new(self.root())
+    }
+
+    fn cleanup_record(
+        &self,
+        descriptor: &StepdDescriptor,
+    ) -> io::Result<crate::cgroup_cleanup::PendingCleanup> {
+        crate::cgroup_cleanup::PendingCleanup::new(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+            descriptor.cleanup_cgroup_path(),
+            descriptor.cleanup_timeout_secs,
+        )
+    }
+
+    pub fn prepare_cleanup(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        self.cleanup_store()
+            .prepare(&self.cleanup_record(descriptor)?)
+    }
+
+    pub(crate) fn cleanup_expired(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        self.cleanup_store()
+            .expired(&self.cleanup_record(descriptor)?)
+    }
+
+    pub(crate) fn cleanup_quarantined(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        self.cleanup_store()
+            .quarantine_acknowledged(&self.cleanup_record(descriptor)?)
+    }
+
+    pub(crate) fn acknowledge_cleanup_quarantine(
+        &self,
+        descriptor: &StepdDescriptor,
+    ) -> io::Result<()> {
+        self.cleanup_store()
+            .acknowledge_quarantine(&self.cleanup_record(descriptor)?)
+    }
+
+    pub fn prepare_orphan_cleanup(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: u32,
+        timeout_secs: u32,
+    ) -> io::Result<bool> {
+        let record = crate::cgroup_cleanup::PendingCleanup::new(
+            job_id,
+            run_attempt,
+            step_id,
+            crate::executor::reapable_cgroup_path(job_id, run_attempt, step_id),
+            timeout_secs,
+        )?;
+        self.cleanup_store().prepare(&record)
+    }
+
+    pub fn retry_cleanup(&self) -> io::Result<()> {
+        self.cleanup_store().retry()
+    }
+
+    pub fn ensure_cleanup_ready(&self) -> io::Result<()> {
+        if self.cleanup_store().is_pending()? {
+            return Err(io::Error::other("node has unfinished job cgroup cleanup"));
+        }
+        Ok(())
+    }
+
+    pub fn ensure_job_cleanup_ready(&self, job_id: u32, run_attempt: u32) -> io::Result<()> {
+        if self.cleanup_store().is_pending_for(job_id, run_attempt)? {
+            return Err(io::Error::other("job has unfinished cgroup cleanup"));
+        }
+        Ok(())
     }
 
     /// Both the agent's bind and the supervisor's connect must derive the
@@ -2740,6 +2869,7 @@ impl StepdStore {
         };
         Ok(entries
             .flatten()
+            .filter(|entry| entry.file_name() != "cleanup")
             .filter(|entry| match entry.file_type() {
                 Ok(kind) => kind.is_dir(),
                 // Kept so it surfaces as a rejected session and gets fenced,
@@ -2881,6 +3011,9 @@ impl StepdStore {
         now: SystemTime,
         retained: &mut Vec<(SystemTime, PathBuf)>,
     ) -> io::Result<bool> {
+        if session_cleanup_pending(session_dir)? {
+            return Ok(false);
+        }
         let descriptor = match self.load_descriptor(session_dir) {
             Ok(descriptor) => descriptor,
             // Nothing can ever finalize a session whose descriptor will not
@@ -2927,17 +3060,21 @@ impl StepdStore {
             completion.run_attempt,
             completion.step_id,
         );
-        obligations.append(&StepdObligation::CompletionAcknowledged)?;
-        prune_finalized_session(
-            &self.session_dir(
-                completion.job_id,
-                completion.run_attempt,
-                completion.step_id,
-            ),
-            &obligations,
+        let session_dir = self.session_dir(
+            completion.job_id,
+            completion.run_attempt,
             completion.step_id,
-        )
-        .map(|_| ())
+        );
+        // The agent may prune a settled session before the supervisor receives its ack.
+        match obligations.append(&StepdObligation::CompletionAcknowledged) {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && !session_dir.try_exists()? =>
+            {
+                return Ok(());
+            }
+            result => result?,
+        }
+        prune_finalized_session(&session_dir, &obligations, completion.step_id).map(|_| ())
     }
 
     /// Whether the exit this session recorded has already reached the
@@ -4096,6 +4233,20 @@ mod tests {
         assert!(restored.array_task_id.is_none());
         assert!(!restored.allocation_only);
         assert!(!restored.pmix_multi_task);
+    }
+
+    #[test]
+    fn cleanup_timeout_defaults_when_loading_a_frozen_old_descriptor() {
+        let old = r#"{"format_version":1,"job_id":7,"run_attempt":1,"pid":0,"process_start_ticks":0,"socket_path":"/fixture/runtime/7.1.4294967291/runtime.sock","cgroup_path":"/fixture/job_7_1/step_batch"}"#;
+        let restored: StepdDescriptor = serde_json::from_str(old).unwrap();
+        assert_eq!(restored.cleanup_timeout_secs, 60);
+        let configured = StepdDescriptor {
+            cleanup_timeout_secs: 120,
+            ..restored
+        };
+        let saved = serde_json::to_string(&configured).unwrap();
+        let recovered: StepdDescriptor = serde_json::from_str(&saved).unwrap();
+        assert_eq!(recovered.cleanup_timeout_secs, 120);
     }
 
     #[test]

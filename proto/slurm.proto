@@ -1727,6 +1727,8 @@ message GetFairshareFactorsResponse {
 // -- K8s Operator --
 
 message ReportJobStatusRequest {
+  // Zero requests only a node drain; no job or step is completed. Requires
+  // drain_node and reporting_node, with no step, attempt, exit code, or signal.
   uint32 job_id = 1;
   // Completion gate for per-node reports. Must be JOB_COMPLETED when
   // exit_code==0, or JOB_FAILED when exit_code!=0.
@@ -1748,9 +1750,8 @@ message ReportJobStatusRequest {
   // Step whose supervisor is reporting. Absent from a legacy agent, and from a
   // report that speaks for the whole node rather than one step.
   optional uint32 step_id = 10;
-  // Node identity token, as sent on Heartbeat. The controller verifies it only
-  // when node-identity enforcement is on, and only for the server-side
-  // standalone-PTY completion path; empty from a legacy agent.
+  // Node identity token, as sent on Heartbeat. Enforced for drain requests and
+  // standalone-PTY completion when controller node-identity enforcement is on.
   string node_token = 11;
   // For an interactive session's report (step_id = the interactive step), the
   // numbered step its `srun --pty` invocation created. Every invocation in a

@@ -1991,9 +1991,9 @@ enum DispatchError {
     /// own context, so the same failure recurs everywhere: Slurm drains the node
     /// and holds the job instead of retrying it onto the next one.
     PrologFailed(String),
-    /// The agent rejected the dispatch because the controller-allocated resources
-    /// are already in use locally — the controller's view of this node is stale.
-    ResourcesUnavailable,
+    /// The agent cannot provide the allocated resources right now: they are in use
+    /// locally, or a prior job's cleanup still holds the node. Carries the agent's reason.
+    ResourcesUnavailable(String),
     /// Connect failed, or the RPC timed out without a response, as opposed to
     /// the agent responding with an explicit rejection.
     Unreachable(anyhow::Error),
@@ -2012,11 +2012,19 @@ impl DispatchError {
     fn category(&self) -> &'static str {
         match self {
             Self::PrologFailed(_) => "prolog failure",
-            Self::ResourcesUnavailable => "gpu/resource allocation mismatch",
+            Self::ResourcesUnavailable(_) => "resources unavailable on agent",
             Self::Unreachable(_) => "agent unreachable",
             Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
             Self::Other(_) => "dispatch error",
+        }
+    }
+
+    /// The agent's own explanation, which the category alone cannot convey.
+    fn agent_reason(&self) -> Option<&str> {
+        match self {
+            Self::ResourcesUnavailable(reason) | Self::AgentRejected(reason) => Some(reason),
+            _ => None,
         }
     }
 }
@@ -2025,8 +2033,8 @@ impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PrologFailed(reason) => write!(f, "agent rejected job: {reason}"),
-            Self::ResourcesUnavailable => {
-                write!(f, "agent rejected job: allocated resources unavailable")
+            Self::ResourcesUnavailable(reason) => {
+                write!(f, "agent rejected job: resources unavailable: {reason}")
             }
             Self::Unreachable(e) => write!(f, "agent unreachable: {e:#}"),
             Self::TimedOut(limit) => {
@@ -2043,6 +2051,8 @@ impl<E: Into<anyhow::Error>> From<E> for DispatchError {
         Self::Other(e.into())
     }
 }
+
+const MAX_REPORTED_AGENT_REASONS: usize = 3;
 
 /// Ceiling on one agent RPC in a fan-out that is drained to completion. `0` disables it, matching
 /// the sibling `dispatch_reject_cooldown_secs` knob.
@@ -2207,7 +2217,9 @@ async fn dispatch_to_agent(
         })
         .await
         .map_err(|s| match s.code() {
-            tonic::Code::ResourceExhausted => DispatchError::ResourcesUnavailable,
+            tonic::Code::ResourceExhausted => {
+                DispatchError::ResourcesUnavailable(s.message().to_string())
+            }
             tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
                 DispatchError::Unreachable(s.into())
             }
@@ -2616,6 +2628,7 @@ async fn confirm_dispatch_on_nodes(
     let mut failures = 0u32;
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
+    let mut agent_reasons = std::collections::BTreeSet::new();
     let total = dispatch_nodes.len() as u32;
 
     // Batch stdout/stderr live on the primary node (task_offset == 0). Capture
@@ -2862,11 +2875,14 @@ async fn confirm_dispatch_on_nodes(
                 error!(job_id, node = %node_name, error = %e, "dispatch confirmation failed");
                 failures += 1;
                 *failure_categories.entry(e.category()).or_insert(0) += 1;
+                if let Some(reason) = e.agent_reason() {
+                    agent_reasons.insert(reason.to_string());
+                }
                 match e {
                     DispatchError::PrologFailed(reason) => {
                         prolog_failed.push((node_name, reason));
                     }
-                    DispatchError::ResourcesUnavailable | DispatchError::Unreachable(_) => {
+                    DispatchError::ResourcesUnavailable(_) | DispatchError::Unreachable(_) => {
                         cluster.cool_down_node(&node_name)
                     }
                     // Held for the deadline it actually burned: while assignments are processed
@@ -2909,11 +2925,21 @@ async fn confirm_dispatch_on_nodes(
         pmix_dispatch::release_pmix_on_agents(&agent_addrs, job_id).await;
     }
 
-    let category_summary = failure_categories
+    let mut category_summary = failure_categories
         .iter()
         .map(|(category, count)| format!("{count} {category}"))
         .collect::<Vec<_>>()
         .join(", ");
+    if !agent_reasons.is_empty() {
+        // Bounded: per-node reasons can differ (e.g. device ids) across a wide job.
+        let shown = agent_reasons
+            .iter()
+            .take(MAX_REPORTED_AGENT_REASONS)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        category_summary.push_str(&format!("; agent reported: {shown}"));
+    }
     let confirmation_detail = if needs_pmix_prepare {
         format!(
             "PMIx dispatch confirmation failed ({successes}/{total} confirmed): {category_summary}"
@@ -3235,6 +3261,16 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         .filter(|n| !job.node_completions.contains_key(*n))
         .cloned()
         .collect();
+
+    for node in &missing {
+        if let Err(error) = cluster.quarantine_node(
+            node,
+            "job cleanup was not confirmed before completion timeout",
+        ) {
+            warn!(job_id = job.job_id, node, %error, "cannot quarantine unreported node; retaining job resources");
+            return;
+        }
+    }
 
     // Empty when no nodes allocated; derived_completion falls back to worst completion.
     let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
@@ -4895,7 +4931,7 @@ mod tests {
     mod dispatch_trigger_tests {
         use super::*;
         use spur_core::config::SlurmConfig;
-        use spur_core::node::NodeSource;
+        use spur_core::node::{NodeSource, NodeState};
         use std::sync::atomic::{AtomicU32, Ordering};
         use tempfile::TempDir;
         use tonic::transport::server::TcpIncoming;
@@ -5849,6 +5885,10 @@ mod tests {
                 cm.get_job(job_id).unwrap().unreported_nodes,
                 vec!["n2".to_string()]
             );
+            let missing = cm.get_node("n2").unwrap();
+            assert_eq!(missing.state, NodeState::Drain);
+            assert!(missing.admin_locked);
+            assert!(cm.get_node("n1").unwrap().is_schedulable());
 
             wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
             assert_eq!(
@@ -5905,8 +5945,64 @@ mod tests {
 
             force_finish_completing_job(&cm, &job).await;
 
+            for name in ["n1", "n2"] {
+                let node = cm.get_node(name).unwrap();
+                assert_eq!(node.state, NodeState::Drain);
+                assert!(node.admin_locked);
+            }
             wait_for("n1 cancelled", || cancel1.load(Ordering::SeqCst) == 1);
             wait_for("n2 cancelled", || cancel2.load(Ordering::SeqCst) == 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn completing_timeout_retains_resources_when_quarantine_fails() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            register_node_at(&cm, "n2", addr);
+            let job_id = submit_and_wait(
+                &cm,
+                JobSpec {
+                    name: "completing-missing-node".into(),
+                    user: "testuser".into(),
+                    num_nodes: 3,
+                    num_tasks: 3,
+                    ..Default::default()
+                },
+            );
+            let nodes = vec![
+                "n1".to_string(),
+                "n2".to_string(),
+                "missing-node".to_string(),
+            ];
+            let per_node_allocs = nodes
+                .iter()
+                .map(|name| (name.clone(), ResourceAllocations::with_scalar(1, 0)))
+                .collect();
+            let run_attempt = cm
+                .start_job(
+                    job_id,
+                    nodes,
+                    ResourceAllocations::with_scalar(3, 0),
+                    per_node_allocs,
+                )
+                .unwrap();
+            cm.node_complete(job_id, "n1", 0, 0, run_attempt).unwrap();
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Completing);
+            let allocated_cpus = cm.get_node("n2").unwrap().alloc_resources.cpus;
+            assert!(allocated_cpus > 0);
+
+            force_finish_completing_job(&cm, &job).await;
+
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completing);
+            assert_eq!(
+                cm.get_node("n2").unwrap().alloc_resources.cpus,
+                allocated_cpus
+            );
         }
 
         // A completion report for the unreported node landing mid-force-finish must
@@ -6355,7 +6451,7 @@ mod tests {
             let reason = cm.get_job(job_id).unwrap().state_reason();
             assert!(
                 reason.contains("1 prolog failure")
-                    && reason.contains("1 gpu/resource allocation mismatch"),
+                    && reason.contains("1 resources unavailable on agent"),
                 "both failure categories from the two nodes must show up, not just one: {reason}"
             );
         }
@@ -7761,6 +7857,33 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn cleanup_admission_hold_retries_the_job_and_cools_down_the_node() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let addr = spawn_mock_agent_rejecting_with_status(tonic::Status::resource_exhausted(
+                "node has unfinished job cgroup cleanup",
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(&cm, batch_spec("cleanup-admission-hold", 1));
+
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(cm.nodes_on_dispatch_cooldown().contains("n1"));
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, spur_core::job::JobState::Pending);
+            assert_eq!(job.requeue_count, 1);
+            assert!(job.allocated_nodes.is_empty());
+            assert_eq!(
+                job.state_reason(),
+                "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
+                 1 resources unavailable on agent; \
+                 agent reported: node has unfinished job cgroup cleanup)"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn resources_unavailable_reject_cools_down_the_node() {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
@@ -7781,7 +7904,8 @@ mod tests {
             assert_eq!(
                 job.state_reason(),
                 "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
-                 1 gpu/resource allocation mismatch)",
+                 1 resources unavailable on agent; \
+                 agent reported: controller-allocated GPUs unavailable on this node)",
                 "operators need the specific failure category, not a generic count"
             );
         }
@@ -7797,6 +7921,7 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
 
+            let agent_message = status.message().to_string();
             let addr = spawn_mock_agent_rejecting_with_status(status).await;
             register_node_at(&cm, "n1", addr);
 
@@ -7811,8 +7936,10 @@ mod tests {
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(
                 job.state_reason(),
-                "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
-                 1 agent rejected launch)",
+                format!(
+                    "JobLaunchFailure (dispatch confirmation failed (0/1 confirmed): \
+                     1 agent rejected launch; agent reported: {agent_message})"
+                ),
                 "a refused launch must not read as an unreachable agent"
             );
         }
