@@ -67,7 +67,8 @@ impl CleanupStore {
         ))
     }
 
-    pub fn track(&self, record: &PendingCleanup) -> io::Result<()> {
+    /// Returns whether this call persisted the record, rather than finding it already tracked.
+    pub fn track(&self, record: &PendingCleanup) -> io::Result<bool> {
         validate_cgroup(&record.cgroup)?;
         fs::create_dir_all(&self.directory)?;
         if let Some(parent) = self.directory.parent() {
@@ -76,7 +77,7 @@ impl CleanupStore {
         let path = self.path(record);
         match fs::read(&path) {
             Ok(bytes) => {
-                return check_identity(&bytes, record);
+                return check_identity(&bytes, record).map(|()| false);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
@@ -84,7 +85,7 @@ impl CleanupStore {
         self.write_record(record, true)
     }
 
-    fn write_record(&self, record: &PendingCleanup, create_new: bool) -> io::Result<()> {
+    fn write_record(&self, record: &PendingCleanup, create_new: bool) -> io::Result<bool> {
         let path = self.path(record);
         let temporary = self
             .directory
@@ -98,20 +99,24 @@ impl CleanupStore {
                 .open(&temporary)?;
             file.write_all(&serde_json::to_vec(record)?)?;
             file.sync_all()?;
-            if create_new {
+            let written = if create_new {
                 // Concurrent supervisors and replay must keep the first persisted deadline.
-                match fs::hard_link(&temporary, &path) {
-                    Ok(()) => {}
+                let linked = match fs::hard_link(&temporary, &path) {
+                    Ok(()) => true,
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                         check_identity(&fs::read(&path)?, record)?;
+                        false
                     }
                     Err(error) => return Err(error),
-                }
+                };
                 fs::remove_file(&temporary)?;
+                linked
             } else {
                 fs::rename(&temporary, &path)?;
-            }
-            fs::File::open(&self.directory)?.sync_all()
+                true
+            };
+            fs::File::open(&self.directory)?.sync_all()?;
+            Ok(written)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -208,7 +213,16 @@ impl CleanupStore {
                 Ok(true)
             }
             remaining => {
-                self.track(record)?;
+                if self.track(record)? {
+                    tracing::warn!(
+                        job_id = record.job_id,
+                        run_attempt = record.run_attempt,
+                        step_id = record.step_id,
+                        cgroup = %record.cgroup.display(),
+                        deadline_secs = self.remaining(record)?.as_secs(),
+                        "job cgroup still populated; refusing new work until cleanup completes"
+                    );
+                }
                 if let Err(error) = remaining {
                     tracing::warn!(%error, "cgroup cleanup remains unresolved");
                 }
@@ -429,7 +443,7 @@ mod tests {
             deadline_unix_ms: u64::MAX,
             ..record.clone()
         };
-        restarted.track(&later).unwrap();
+        assert!(!restarted.track(&later).unwrap());
         assert!(restarted.expired(&later).unwrap());
         assert_eq!(restarted.remaining(&later).unwrap(), Duration::ZERO);
         assert!(restarted.is_pending().unwrap());
@@ -455,12 +469,12 @@ mod tests {
         assert!(!record.quarantine_acknowledged);
         let dir = tempfile::tempdir().unwrap();
         let store = CleanupStore::new(dir.path());
-        store.track(&record).unwrap();
+        assert!(store.track(&record).unwrap());
         store.acknowledge_quarantine(&record).unwrap();
         let restarted = CleanupStore::new(dir.path());
         assert!(restarted.quarantine_acknowledged(&record).unwrap());
         assert_eq!(restarted.records().unwrap()[0].deadline_unix_ms, 0);
-        restarted.track(&record).unwrap();
+        assert!(!restarted.track(&record).unwrap());
         assert!(restarted.quarantine_acknowledged(&record).unwrap());
     }
 

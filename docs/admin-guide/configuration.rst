@@ -2154,11 +2154,14 @@ cgroups.
        creating a cgroup so small the job dies during its own startup.
    * - ``cleanup_timeout_secs``
      - integer
-     - ``20``
+     - ``60``
      - Agent restart (new jobs)
      - Seconds to wait for job cgroup cleanup before requesting a node drain.
        ``0`` requests a drain immediately if cleanup is incomplete. Cleanup
        continues after the deadline; it does not authorize resource reuse.
+       Raise it on nodes where teardown is slow (large-memory jobs, GPU reset,
+       network filesystem unmounts), but keep it below ``[scheduler]
+       complete_wait_secs`` so the agent, not a force-finish, drains the node.
    * - ``oom_kill_job``
      - bool
      - ``true``

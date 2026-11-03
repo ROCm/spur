@@ -491,6 +491,29 @@ async fn expired_cleanup_requires_controller_acknowledgment_and_remains_quaranti
 }
 
 #[tokio::test]
+async fn expired_cleanup_keeps_an_earlier_drain_reason() {
+    let controller = ControllerFixture::new(true);
+    let fixture = SessionFixture::new(0);
+    let epilog = crate::agent_server::DrainRequest {
+        reason: "epilog script failed".into(),
+    };
+    let report = CompletionReport {
+        drain: Some(&epilog),
+        ..fixture.report()
+    };
+
+    assert!(report_runtime_completion(&fixture.store, &controller.address, report).await);
+
+    let reports = controller.reports();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].drain_node);
+    assert_eq!(
+        reports[0].drain_reason,
+        format!("epilog script failed; {DRAIN_REASON}")
+    );
+}
+
+#[tokio::test]
 async fn unreadable_cgroup_requires_drain_instead_of_successful_cleanup() {
     let controller = ControllerFixture::new(true);
     let fixture = SessionFixture::new(0);

@@ -1730,7 +1730,7 @@ pub struct CgroupConfig {
 }
 
 pub fn default_cgroup_cleanup_timeout() -> u32 {
-    20
+    60
 }
 
 fn default_min_ram_mb() -> u64 {
@@ -2125,6 +2125,13 @@ impl SlurmConfig {
         if self.controller.max_batch_requeue == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "controller.max_batch_requeue".into(),
+                value: "0 (must be at least 1)".into(),
+            });
+        }
+        // Job id 0 marks a node-only drain report, so a real job must never get it.
+        if self.controller.first_job_id == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "controller.first_job_id".into(),
                 value: "0 (must be at least 1)".into(),
             });
         }
@@ -2852,7 +2859,7 @@ mod tests {
     #[test]
     fn cgroup_cleanup_timeout_preserves_old_configs_and_accepts_overrides() {
         let old: CgroupConfig = toml::from_str("enabled = true\nrequired = false\n").unwrap();
-        assert_eq!(old.cleanup_timeout_secs, 20);
+        assert_eq!(old.cleanup_timeout_secs, 60);
         for seconds in [0, 120] {
             let config: CgroupConfig =
                 toml::from_str(&format!("cleanup_timeout_secs = {seconds}\n")).unwrap();
@@ -4346,6 +4353,16 @@ max_batch_requeue = 0
         let err = SlurmConfig::load_from_str(toml).unwrap_err();
         assert!(
             err.to_string().contains("max_batch_requeue"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn controller_config_rejects_zero_first_job_id() {
+        let toml = "cluster_name = \"test\"\n[controller]\nfirst_job_id = 0\n";
+        let err = SlurmConfig::load_from_str(toml).unwrap_err();
+        assert!(
+            err.to_string().contains("first_job_id"),
             "unexpected error: {err}"
         );
     }

@@ -4239,7 +4239,7 @@ mod tests {
     fn cleanup_timeout_defaults_when_loading_a_frozen_old_descriptor() {
         let old = r#"{"format_version":1,"job_id":7,"run_attempt":1,"pid":0,"process_start_ticks":0,"socket_path":"/fixture/runtime/7.1.4294967291/runtime.sock","cgroup_path":"/fixture/job_7_1/step_batch"}"#;
         let restored: StepdDescriptor = serde_json::from_str(old).unwrap();
-        assert_eq!(restored.cleanup_timeout_secs, 20);
+        assert_eq!(restored.cleanup_timeout_secs, 60);
         let configured = StepdDescriptor {
             cleanup_timeout_secs: 120,
             ..restored

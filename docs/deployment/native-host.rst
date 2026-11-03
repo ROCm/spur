@@ -548,7 +548,7 @@ left unset.
 
 Job termination waits for all processes in the owned cgroup, including
 children that outlive the batch shell. The ``[cgroup] cleanup_timeout_secs``
-setting defaults to 20 seconds. The node agent blocks new launches while cleanup
+setting defaults to 60 seconds, matching Slurm's ``UnkillableStepTimeout``. The node agent blocks new launches while cleanup
 is pending. At the deadline, it requests a node drain independently of job
 completion, including when a supervisor is still busy with cleanup or exit hooks. An unreadable cgroup is treated as unresolved cleanup, rather than
 as empty.

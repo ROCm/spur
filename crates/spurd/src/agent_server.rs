@@ -2089,7 +2089,9 @@ fn ensure_runtime_exit_ready(
     };
     let ready = match descriptor {
         Some(descriptor) => runtime_completion_ready(store, &descriptor),
-        None => store.ensure_cleanup_ready().is_ok(),
+        // Attempt 0 means the caller does not know the attempt, so only a clean node proves it.
+        None if run_attempt == 0 => store.ensure_cleanup_ready().is_ok(),
+        None => store.ensure_job_cleanup_ready(job_id, run_attempt).is_ok(),
     };
     if !ready {
         return Err(Status::unavailable(
@@ -2121,7 +2123,14 @@ async fn report_runtime_completion(
         false
     });
     let drain = DrainRequest {
-        reason: crate::cgroup_cleanup::DRAIN_REASON.into(),
+        reason: match report.drain {
+            Some(earlier) => format!(
+                "{}; {}",
+                earlier.reason,
+                crate::cgroup_cleanup::DRAIN_REASON
+            ),
+            None => crate::cgroup_cleanup::DRAIN_REASON.into(),
+        },
     };
     if !cleaned {
         if !store.cleanup_expired(&descriptor).unwrap_or(false) {
@@ -2230,6 +2239,7 @@ async fn fence_dead_stepd(
         },
     )
     .await;
+    // The first release is a no-op while cleanup is stalled; a recorded report now permits it.
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
     if !reported {
         warn!(
@@ -2389,6 +2399,7 @@ async fn handle_completion_notification(
                 },
             )
             .await;
+            // The first release is a no-op while cleanup is stalled; a recorded report now permits it.
             release_stepd_tracking(
                 &context.running,
                 &context.allocation,
@@ -6795,9 +6806,7 @@ impl SlurmAgent for AgentService {
         }
 
         for descriptor in &gated {
-            crate::stepd::StepdStore::new(&self.stepd_state_dir)
-                .ensure_cleanup_ready()
-                .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+            self.ensure_node_cleanup_ready()?;
             if descriptor.resources.fabric_binding.is_some()
                 || descriptor.resources.gpu_binding.is_some()
             {
@@ -7063,9 +7072,7 @@ impl SlurmAgent for AgentService {
             .await?;
 
         let entry = self.job_entry(req.job_id).await?;
-        crate::stepd::StepdStore::new(&self.stepd_state_dir)
-            .ensure_cleanup_ready()
-            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        self.ensure_node_cleanup_ready()?;
 
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
@@ -7150,9 +7157,7 @@ impl SlurmAgent for AgentService {
         if req.job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
         }
-        crate::stepd::StepdStore::new(&self.stepd_state_dir)
-            .ensure_cleanup_ready()
-            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        self.ensure_node_cleanup_ready()?;
         // Creates this id's cgroup, so it must not run while a prior run's teardown
         // still owns the directory.
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
@@ -7695,9 +7700,7 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        crate::stepd::StepdStore::new(&self.stepd_state_dir)
-            .ensure_cleanup_ready()
-            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        self.ensure_node_cleanup_ready()?;
         let step_epoch = next_step_epoch();
         {
             self.active_steps.lock().await.insert(
@@ -9128,9 +9131,7 @@ impl SlurmAgent for AgentService {
                     (master, interactive_exit_future(waiter), pid)
                 }
                 None => {
-                    crate::stepd::StepdStore::new(&self.stepd_state_dir)
-                        .ensure_cleanup_ready()
-                        .map_err(|error| Status::resource_exhausted(error.to_string()))?;
+                    self.ensure_node_cleanup_ready()?;
                     let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
                     let mut container_rootfs_mode = None;
                     let mut fresh_container_env: Option<HashMap<String, String>> = None;
@@ -9669,6 +9670,15 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    fn ensure_node_cleanup_ready(&self) -> Result<(), Status> {
+        crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_cleanup_ready()
+            .map_err(|error| {
+                warn!(%error, "refusing new work until pending job cleanup completes");
+                Status::resource_exhausted(error.to_string())
+            })
+    }
+
     /// Self-drains this node in the background when `error` condemns it,
     /// without blocking the caller's own failure response on the RPC.
     fn drain_on_node_fault(&self, error: &executor::LaunchError, job_id: u32) {
@@ -9880,9 +9890,7 @@ impl AgentService {
         cpus: u32,
         memory_mb: u64,
     ) -> Result<(AllocationResult, Vec<u64>), Status> {
-        crate::stepd::StepdStore::new(&self.stepd_state_dir)
-            .ensure_cleanup_ready()
-            .map_err(|e| Status::resource_exhausted(e.to_string()))?;
+        self.ensure_node_cleanup_ready()?;
         let controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
