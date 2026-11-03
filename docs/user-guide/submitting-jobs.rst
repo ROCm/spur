@@ -200,7 +200,7 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      -
      - Allow the job to be requeued after a node failure or time limit.
        Default off. If the failed node comes back, the job's earlier run there
-       is stopped.
+       is stopped (SIGTERM, then SIGKILL if it does not exit).
    * - ``--no-requeue``
      -
      - Do not requeue the job after a node failure or time limit. This is the

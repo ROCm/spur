@@ -1462,8 +1462,8 @@ fn reservation_manager_ruling(
 /// still claiming the job missed the cancel rather than being mid-teardown.
 const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(16);
 
-/// Whether `node` may release the run it reported: the run is over, the job is active
-/// elsewhere or queued with no launch placed here, or the id is untracked but was issued by us.
+/// Whether `node` may release its reported run (never one newer than this controller applied): the
+/// run is over, the job is active elsewhere or queued with no launch here, or unknown but ours.
 fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatus) -> bool {
     let Some(job) = cluster.get_job(report.job_id) else {
         return report.job_id < cluster.peek_next_job_id();

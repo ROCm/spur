@@ -766,18 +766,19 @@ Stopping a requeued job's run on a recovered node
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 When a node misses heartbeats, its jobs end ``NODE_FAIL`` and a job submitted
-with ``--requeue`` goes back to the queue, but the job's nodes are never told to
-stop. From this release, the controller stops that run when a node heartbeats
-again, even while the job is still waiting in the queue. Before, a node kept
-the run and its GPUs until the job ended or ran again, and refused every job
-placed on those GPUs in the meantime.
+with ``--requeue`` goes back to the queue, but the job's nodes are not told to
+stop when they go Down. From this release, the controller stops that run when a
+node heartbeats again, even while the job is still waiting in the queue. Before,
+a node kept the run and its GPUs until the job ended or ran again, and refused
+every job placed on those GPUs in the meantime.
 
-This needs the agent to report which run it holds, so it takes effect per node
-as agents are upgraded; an agent from an earlier release keeps the old
-behavior. An upgraded agent also stops the old run's processes, including its
-``srun`` steps, when the job is placed back on the same node, which an earlier
-agent could miss for a run without a cgroup (``[cgroup] enabled = false``, or
-``spurd`` cannot create cgroups, for example when not running as root).
+Stopping the run on heartbeat needs both an upgraded controller and an upgraded
+agent on that node, which reports the run it holds; with either side from an
+earlier release, the old behavior stays. An upgraded agent also stops the old
+run's processes, including its ``srun`` steps, when the job is placed back on
+the same node, which an earlier agent could miss for a run without a cgroup
+(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example
+when not running as root).
 
 See Also
 --------

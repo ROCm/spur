@@ -751,7 +751,7 @@ async fn fence_stepd(
         return match stop_result {
             Err(error) => Err(error),
             Ok(()) => Err(std::io::Error::other(
-                "could not confirm the displaced stepd's cgroup is empty",
+                "could not confirm the displaced stepd's workload is gone",
             )),
         };
     }
@@ -831,8 +831,8 @@ async fn settle_fenced_session(
     }
 }
 
-/// Fences every older run of the job, then this launch's own slot: a run's steps are
-/// tracked apart from the step that owns it.
+/// Fences every older run of the job, owner and steps alike; a newer run holding this
+/// launch's own slot refuses the launch.
 async fn fence_displaced_run(
     stepds: &Arc<Mutex<StepdMap>>,
     completions: &crate::step_completion::StepCompletions,
@@ -6843,8 +6843,6 @@ impl SlurmAgent for AgentService {
                 // older run. If its process ignored SIGTERM and outlived the
                 // requeue, kill and reap it here — the monitor loop no longer
                 // tracks it, so without this it would leak as an orphan/zombie.
-                // Its cgroup is deliberately left alone: the path is derived
-                // from job_id, so it is the cgroup the new run just joined.
                 if let Some(old) = displaced {
                     if old.run_attempt < run_attempt {
                         let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
@@ -7304,7 +7302,7 @@ impl SlurmAgent for AgentService {
         let supervise_allocation = !self.force_legacy_launch;
         #[cfg(not(test))]
         let supervise_allocation = true;
-        // Checked before fencing, so a repeat of this run never fences its own live supervisor.
+        // Refuses a duplicate before fencing or reserving anything.
         if tracks_run_at_or_after(&*self.running.lock().await, req.job_id, req.run_attempt) {
             return Err(Status::already_exists(format!(
                 "job {} already registered on this node",
