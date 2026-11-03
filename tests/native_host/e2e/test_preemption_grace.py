@@ -60,6 +60,8 @@ _WARNING_WAIT_SECS = 30
 # How far before the deadline the "still in grace" assertions run. The marker is
 # observed a few seconds after the signal, so this leaves room on both sides.
 _DEADLINE_MARGIN_SECS = 10
+# Bound on the victim's srun step starting and installing its traps once the job runs.
+_STEP_READY_WAIT_SECS = 60
 # Headroom for polling latency on top of an expected duration.
 _SLACK_SECS = 40
 
@@ -134,18 +136,22 @@ class _Victim:
 
 def _submit_victim(cluster, prefix: str, *, sbatch_args: list[str],
                    nodes: int = 1, step_on_term: str = ":") -> _Victim:
-    """Submit a long-running victim under the graced QOS and wait for it to run.
+    """Submit a long-running victim under the graced QOS and wait for its steps to be ready.
 
+    Ready means every node's srun step has installed its traps, so a warning sent right
+    after this returns cannot hit a step that has not started handling signals yet.
     *step_on_term* is the shell command the srun step runs after recording SIGTERM;
     ``:`` keeps the step alive, ``exit 0`` makes it leave on the warning.
     """
     step_marker = f"{cluster.remote_dir}/{prefix}-step.marker"
     batch_marker = f"{cluster.remote_dir}/{prefix}-batch.marker"
+    ready_marker = f"{cluster.remote_dir}/{prefix}-ready.marker"
     step_script = cluster.write_file(
         f"{prefix}-step.sh",
         "#!/bin/bash\n"
         f"trap 'echo CONT >> {step_marker}' CONT\n"
         f"trap 'echo TERM >> {step_marker}; {step_on_term}' TERM\n"
+        f"echo READY >> {ready_marker}\n"
         "while true; do sleep 1; done\n",
         all_nodes=True,
     )
@@ -163,6 +169,11 @@ def _submit_victim(cluster, prefix: str, *, sbatch_args: list[str],
     assert job_id is not None, "victim submit failed"
     wait_job_state(cluster, job_id, "R", timeout=60)
     _assert_scontrol_state(cluster, job_id, "RUNNING", "victim initial")
+    wait_until(
+        lambda: _marker_lines(cluster, ready_marker).count("READY") == nodes,
+        timeout_s=_STEP_READY_WAIT_SECS, interval_s=1,
+        desc=f"job {job_id}'s srun step to install its signal traps on {nodes} node(s)",
+    )
     return _Victim(job_id, step_marker, batch_marker)
 
 
