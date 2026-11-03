@@ -11700,6 +11700,13 @@ mod tests {
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
                 grace_time: None,
+                max_tres_per_node: Default::default(),
+                max_cpus_per_node: None,
+                max_mem_per_node: None,
+                max_mem_per_cpu: None,
+                def_mem_per_node: None,
+                def_mem_per_cpu: None,
+                def_mem_per_gpu: None,
             }],
             nodes: Vec::new(),
             network: Default::default(),
@@ -14307,6 +14314,13 @@ state = "UP"
             preempt_mode: String::new(),
             preempt_exempt_time: None,
             grace_time: None,
+            max_tres_per_node: Default::default(),
+            max_cpus_per_node: None,
+            max_mem_per_node: None,
+            max_mem_per_cpu: None,
+            def_mem_per_node: None,
+            def_mem_per_cpu: None,
+            def_mem_per_gpu: None,
         });
         config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"small"}'"#));
         let cm = test_cluster_with_config(&dir, config).await;
@@ -14582,6 +14596,13 @@ state = "UP"
             preempt_mode: String::new(),
             preempt_exempt_time: None,
             grace_time: None,
+            max_tres_per_node: Default::default(),
+            max_cpus_per_node: None,
+            max_mem_per_node: None,
+            max_mem_per_cpu: None,
+            def_mem_per_node: None,
+            def_mem_per_cpu: None,
+            def_mem_per_gpu: None,
         });
         config.hooks.job_submit_lua = Some(write_lua_script(
             &dir,
@@ -37594,6 +37615,13 @@ state = "UP"
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
                 grace_time: None,
+                max_tres_per_node: Default::default(),
+                max_cpus_per_node: None,
+                max_mem_per_node: None,
+                max_mem_per_cpu: None,
+                def_mem_per_node: None,
+                def_mem_per_cpu: None,
+                def_mem_per_gpu: None,
             },
             spur_core::config::PartitionConfig {
                 name: "train".into(),
@@ -37614,6 +37642,13 @@ state = "UP"
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
                 grace_time: None,
+                max_tres_per_node: Default::default(),
+                max_cpus_per_node: None,
+                max_mem_per_node: None,
+                max_mem_per_cpu: None,
+                def_mem_per_node: None,
+                def_mem_per_cpu: None,
+                def_mem_per_gpu: None,
             },
         ];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
@@ -37675,6 +37710,13 @@ state = "UP"
             preempt_mode: String::new(),
             preempt_exempt_time: None,
             grace_time: None,
+            max_tres_per_node: Default::default(),
+            max_cpus_per_node: None,
+            max_mem_per_node: None,
+            max_mem_per_cpu: None,
+            def_mem_per_node: None,
+            def_mem_per_cpu: None,
+            def_mem_per_gpu: None,
         }];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
