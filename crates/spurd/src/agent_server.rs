@@ -757,6 +757,26 @@ async fn fence_displaced_stepd(
     Ok(())
 }
 
+/// Fences every supervisor an older run of the job left on this node, then this
+/// launch's own slot: a run's steps are tracked apart from the step that owns it.
+async fn fence_displaced_run(
+    stepds: &Arc<Mutex<StepdMap>>,
+    job_id: u32,
+    step_id: spur_core::step::StepId,
+    run_attempt: u32,
+) -> std::io::Result<()> {
+    let older_steps: Vec<spur_core::step::StepId> = stepds_for_job(&*stepds.lock().await, job_id)
+        .into_iter()
+        .filter(|descriptor| descriptor.run_attempt < run_attempt)
+        .map(|descriptor| descriptor.step_id)
+        .filter(|step| *step != step_id)
+        .collect();
+    for step in older_steps {
+        fence_displaced_stepd(stepds, job_id, step, run_attempt).await?;
+    }
+    fence_displaced_stepd(stepds, job_id, step_id, run_attempt).await
+}
+
 fn displaced_runtime_attempt(
     displaced: &crate::stepd::StepdDescriptor,
     run_attempt: u32,
@@ -1781,6 +1801,7 @@ pub async fn recover_stepds(
         if !owns_lifetime {
             continue;
         }
+        tracked.run_attempt = descriptor.run_attempt;
         tracked.user = descriptor.owner.clone();
         tracked.fabric_binding = descriptor.resources.fabric_binding.clone();
         tracked.gpu_binding = descriptor.resources.gpu_binding.clone();
@@ -6536,7 +6557,7 @@ impl SlurmAgent for AgentService {
             .await;
 
         let launch_result = if stepd_enabled {
-            fence_displaced_stepd(&self.stepds, job_id, launch_step, run_attempt)
+            fence_displaced_run(&self.stepds, job_id, launch_step, run_attempt)
                 .await
                 .map_err(|error| {
                     Status::unavailable(format!(
@@ -7389,7 +7410,7 @@ impl SlurmAgent for AgentService {
             let admission = self
                 .admit_step_launch(req.job_id, req.run_attempt, spur_core::step::STEP_EXTERN)
                 .await;
-            fence_displaced_stepd(
+            fence_displaced_run(
                 &self.stepds,
                 req.job_id,
                 spur_core::step::STEP_EXTERN,
@@ -10177,14 +10198,13 @@ impl AgentService {
             return;
         }
         // A redispatch may have replaced the run since `run_attempt` was resolved.
-        let allocation_only_attempt = {
+        let allocation_only = {
             let jobs = self.running.lock().await;
-            jobs.get(&job_id)
-                .filter(|tracked| tracked.run_attempt == run_attempt)
-                .filter(|tracked| tracked.job.is_allocation_only())
-                .map(|tracked| tracked.run_attempt)
+            jobs.get(&job_id).is_some_and(|tracked| {
+                tracked.run_attempt == run_attempt && tracked.job.is_allocation_only()
+            })
         };
-        if let Some(run_attempt) = allocation_only_attempt {
+        if allocation_only {
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
@@ -10426,14 +10446,13 @@ impl AgentService {
             return;
         }
         // A redispatch may have replaced the run since `run_attempt` was resolved.
-        let allocation_only_attempt = {
+        let allocation_only = {
             let jobs = self.running.lock().await;
-            jobs.get(&job_id)
-                .filter(|tracked| tracked.run_attempt == run_attempt)
-                .filter(|tracked| tracked.job.is_allocation_only())
-                .map(|tracked| tracked.run_attempt)
+            jobs.get(&job_id).is_some_and(|tracked| {
+                tracked.run_attempt == run_attempt && tracked.job.is_allocation_only()
+            })
         };
-        if let Some(run_attempt) = allocation_only_attempt {
+        if allocation_only {
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
@@ -11125,18 +11144,21 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// Fences a displaced run tracked by its launch-time copy, after its supervisor
-    /// published `published_cgroup` and a live workload; returns whether that workload survived.
-    async fn workload_survives_fencing(published_cgroup: std::path::PathBuf) -> bool {
+    /// Launches run 2 over run 1's supervisor of `old_step`, tracked by its launch-time copy
+    /// while it published `published_cgroup` and a live workload; returns whether that survived.
+    async fn workload_survives_relaunch(
+        old_step: spur_core::step::StepId,
+        published_cgroup: std::path::PathBuf,
+    ) -> bool {
         let state_dir = tempfile::tempdir().expect("state dir");
         let store = crate::stepd::StepdStore::new(state_dir.path());
         let mut child = std::process::Command::new("sleep")
             .arg("300")
             .spawn()
             .expect("spawn a stand-in workload");
-        let session = store.session_dir(91, 1, spur_core::step::STEP_BATCH);
         let mut at_launch = descriptor_for_workload(0);
-        at_launch.socket_path = session.join("runtime.sock");
+        at_launch.step_id = old_step;
+        at_launch.socket_path = store.session_dir(91, 1, old_step).join("runtime.sock");
         let mut published = at_launch.clone();
         published.workload_pid = child.id();
         published.workload_start_ticks =
@@ -11151,12 +11173,14 @@ mod tests {
             .await
             .insert(stepd_key(&at_launch), at_launch);
 
-        let fenced = fence_displaced_stepd(&sessions, 91, spur_core::step::STEP_BATCH, 2).await;
+        let fenced = fence_displaced_run(&sessions, 91, spur_core::step::STEP_BATCH, 2).await;
         let survived =
             crate::stepd::process_is_live(published.workload_pid, published.workload_start_ticks);
+        let tracked = !sessions.lock().await.is_empty();
         let _ = child.kill();
         let _ = child.wait();
         fenced.expect("fence the displaced run");
+        assert!(!tracked, "the fenced supervisor must no longer be tracked");
         survived
     }
 
@@ -11165,7 +11189,8 @@ mod tests {
     #[tokio::test]
     async fn fencing_a_displaced_run_kills_the_workload_its_supervisor_published() {
         assert!(
-            !workload_survives_fencing(std::path::PathBuf::new()).await,
+            !workload_survives_relaunch(spur_core::step::STEP_BATCH, std::path::PathBuf::new())
+                .await,
             "the old run's workload must not survive its replacement"
         );
     }
@@ -11174,13 +11199,49 @@ mod tests {
     /// so the published one must not stand in for the workload check.
     #[tokio::test]
     async fn fencing_does_not_trust_a_published_cgroup_that_is_gone() {
-        let gone = tempfile::tempdir()
-            .expect("cgroup parent")
-            .path()
-            .join("job_91");
+        let parent = tempfile::tempdir().expect("cgroup parent");
+        let gone = parent.path().join("never-created").join("job_91");
         assert!(
-            !workload_survives_fencing(gone).await,
+            !workload_survives_relaunch(spur_core::step::STEP_BATCH, gone).await,
             "a vanished cgroup must not confirm the workload dead"
+        );
+    }
+
+    /// The old run's numbered steps have supervisors of their own, which the new
+    /// run's launch must fence too or their workloads outlive the run.
+    #[tokio::test]
+    async fn a_relaunch_fences_the_old_runs_step_supervisors() {
+        assert!(
+            !workload_survives_relaunch(0, std::path::PathBuf::new()).await,
+            "an old run's srun step must not survive the relaunch"
+        );
+    }
+
+    /// The job's own session decides which run is tracked, whatever order the sessions arrive in.
+    #[tokio::test]
+    async fn recovery_tracks_the_run_of_the_jobs_own_session() {
+        let session = |run_attempt, step_id| {
+            crate::stepd::StepdDescriptor::new(
+                79,
+                run_attempt,
+                step_id,
+                0,
+                0,
+                std::path::PathBuf::from("/tmp/unused.sock"),
+                std::path::PathBuf::new(),
+            )
+        };
+        let running = new_running_jobs();
+
+        recover_stepds(
+            &running,
+            vec![session(1, 0), session(2, spur_core::step::STEP_BATCH)],
+        )
+        .await;
+
+        assert_eq!(
+            running.lock().await.get(&79).expect("adopted").run_attempt,
+            2
         );
     }
 

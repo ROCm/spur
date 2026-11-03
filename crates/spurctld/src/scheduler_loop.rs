@@ -5713,8 +5713,8 @@ mod tests {
             settle(&cm, job.job_id, spur_core::job::JobState::Pending);
         }
 
-        /// A heartbeat reclaim names the run the node reported, so the agent can drop it
-        /// if a newer run has replaced that one.
+        /// A heartbeat reclaim names the run the node reported, so the agent can ignore the
+        /// cancel if a newer run has replaced that one.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_heartbeat_reclaim_cancels_the_run_the_node_reported() {
             let dir = TempDir::new().unwrap();

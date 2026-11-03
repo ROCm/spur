@@ -1462,37 +1462,37 @@ fn reservation_manager_ruling(
 /// still claiming the job missed the cancel rather than being mid-teardown.
 const CANCEL_RECLAIM_GRACE: chrono::Duration = chrono::Duration::seconds(16);
 
-/// Whether `node` may release the run it reported: the run is over, the job is
-/// back in the queue or active elsewhere, or the id is untracked but was issued by us.
+/// Whether `node` may release the run it reported: the run is over, the job is active
+/// elsewhere or queued with no launch placed here, or the id is untracked but was issued by us.
 fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatus) -> bool {
-    let job_id = report.job_id;
-    match cluster.get_job(job_id) {
-        Some(job) if job.state.is_terminal() => true,
-        // A cancel this old that the node is still claiming never reached it
-        // (an agent that was down when it was sent); the run is over regardless.
-        Some(job)
-            if job
-                .cancel_signaled_at
-                .is_some_and(|at| Utc::now() - at > CANCEL_RECLAIM_GRACE) =>
-        {
-            true
-        }
-        // A queued job has no run, e.g. one requeued off a node that was down. A batch launch
-        // placed here fences any older run itself; 0 (an old agent) or a newer run is spared.
-        Some(job) if job.state == spur_core::job::JobState::Pending => {
-            report.run_attempt != 0
-                && report.run_attempt <= job.run_attempt
-                && !job.is_held_on(node)
-        }
-        // State and allocation commit as two WAL entries, so an empty nodelist
-        // on an active job is not yet authoritative.
-        Some(job) => {
-            job.state.is_active()
-                && !job.allocated_nodes.is_empty()
-                && !job.allocated_nodes.iter().any(|n| n == node)
-        }
-        None => job_id < cluster.peek_next_job_id(),
+    let Some(job) = cluster.get_job(report.job_id) else {
+        return report.job_id < cluster.peek_next_job_id();
+    };
+    // Attempts only grow, so a run newer than any this controller applied means it is behind.
+    if report.run_attempt != 0 && job.run_attempt != 0 && report.run_attempt > job.run_attempt {
+        return false;
     }
+    if job.state.is_terminal() {
+        return true;
+    }
+    // A cancel this old that the node is still claiming never reached it
+    // (an agent that was down when it was sent); the run is over regardless.
+    if job
+        .cancel_signaled_at
+        .is_some_and(|at| Utc::now() - at > CANCEL_RECLAIM_GRACE)
+    {
+        return true;
+    }
+    // A queued job's reported run is stale unless a launch of the job is placed here; an old
+    // agent names no run (0), so its report cannot be told apart from that launch.
+    if job.state == spur_core::job::JobState::Pending {
+        return report.run_attempt != 0 && !job.is_held_on(node);
+    }
+    // State and allocation commit as two WAL entries, so an empty nodelist
+    // on an active job is not yet authoritative.
+    job.state.is_active()
+        && !job.allocated_nodes.is_empty()
+        && !job.allocated_nodes.iter().any(|n| n == node)
 }
 
 /// Jobs a heartbeat reported with a non-empty translated GPU set, for the
@@ -1520,7 +1520,7 @@ fn stale_reported_jobs(
 }
 
 /// Cancel each stale run on `node`, each scoped to the attempt the node reported so the
-/// agent drops it if a newer run replaced it. Best-effort.
+/// agent ignores the cancel if a newer run has replaced that one. Best-effort.
 pub(crate) async fn cancel_stale_runs(
     cluster: Arc<ClusterManager>,
     node: String,
@@ -1535,7 +1535,7 @@ pub(crate) async fn cancel_stale_runs(
             job_id = report.job_id,
             run_attempt = report.run_attempt,
             node = %node,
-            "agent still holds an allocation the controller no longer believes belongs to it there — re-sending cancel to reclaim it"
+            "agent still holds an allocation the controller no longer believes belongs to it there — sending cancel to reclaim it"
         );
         // Signal 0 is a graceful cancel at the agent.
         crate::scheduler_loop::cancel_job_on_nodes(
@@ -7652,6 +7652,43 @@ mod tests {
         assert!(
             !is_reclaimable(&cluster, "n2", &report_run(82, 2)),
             "a run the controller has not applied yet must not be killed"
+        );
+    }
+
+    /// A lagging controller must not end a newer run because it still sees the job's
+    /// last run as over or as running on another node.
+    #[tokio::test]
+    async fn no_arm_reclaims_a_run_newer_than_the_controller_knows() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        place(&cluster, 83, &["n1"], 1);
+        place(&cluster, 84, &["n2"], 1);
+        for job in [83, 84] {
+            cluster.apply_operation(&WalOperation::job_state_change(
+                job,
+                JobState::Pending,
+                JobState::Running,
+            ));
+        }
+        cluster.apply_operation(&WalOperation::job_state_change(
+            83,
+            JobState::Running,
+            JobState::NodeFail,
+        ));
+
+        assert!(is_reclaimable(&cluster, "n1", &report_run(83, 1)));
+        assert!(
+            !is_reclaimable(&cluster, "n1", &report_run(83, 2)),
+            "a terminal job's newer run is one this controller has not applied yet"
+        );
+        assert!(is_reclaimable(&cluster, "n1", &report_run(84, 1)));
+        assert!(
+            !is_reclaimable(&cluster, "n1", &report_run(84, 2)),
+            "a newer run than the one placed on n2 is not stale on n1"
         );
     }
 
