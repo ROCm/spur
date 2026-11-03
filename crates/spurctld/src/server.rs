@@ -3687,11 +3687,12 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        let node_name = job
-            .allocated_nodes
-            .first()
-            .ok_or_else(|| Status::internal(format!("job {} has no allocated nodes", job_id)))?
-            .clone();
+        // Not allocated_nodes: a node that already reported (a victim in its grace)
+        // was freed and may belong to another job now.
+        let node_name =
+            job.held_nodes().into_iter().next().ok_or_else(|| {
+                Status::internal(format!("job {} has no allocated nodes", job_id))
+            })?;
 
         let node = self
             .cluster
@@ -3761,7 +3762,10 @@ impl SlurmController for ControllerService {
         )
         .map_err(|e| Status::permission_denied(e.to_string()))?;
 
-        if job.allocated_nodes.is_empty() {
+        // Not allocated_nodes: a node that already reported (a victim in its grace)
+        // was freed and may belong to another job now.
+        let held_nodes = job.held_nodes();
+        if held_nodes.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "job {} has no allocated nodes — is the allocation still active?",
                 job_id
@@ -3783,14 +3787,8 @@ impl SlurmController for ControllerService {
                 .map(Response::new);
         }
 
-        validate_step_nodes_for_run(
-            job_id,
-            req.step_id,
-            step.state,
-            &step.nodes,
-            &job.allocated_nodes,
-        )
-        .map_err(Status::failed_precondition)?;
+        validate_step_nodes_for_run(job_id, req.step_id, step.state, &step.nodes, &held_nodes)
+            .map_err(Status::failed_precondition)?;
         self.cluster
             .validate_step_bindings(&job, &step.nodes)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -4917,7 +4915,7 @@ fn validate_step_nodes_for_run(
     step_id: u32,
     state: spur_core::step::StepState,
     step_nodes: &[String],
-    allocated: &[String],
+    held: &[String],
 ) -> Result<(), String> {
     if state != spur_core::step::StepState::Running {
         return Err(format!(
@@ -4929,7 +4927,7 @@ fn validate_step_nodes_for_run(
         return Err(format!("step {job_id}.{step_id} has no nodes"));
     }
     for node in step_nodes {
-        if !allocated.contains(node) {
+        if !held.contains(node) {
             return Err(format!(
                 "step node {node} is not in the job's current allocation"
             ));
@@ -9980,6 +9978,77 @@ mod tests {
         let job = svc.cluster.get_job(in_grace).expect("job");
         assert_eq!(job.state, JobState::Running);
         assert!(job.preempt_pending.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_refuses_a_step_on_a_node_the_grace_victim_already_released() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let (n1, _) = spawn_cancel_recording_agent().await;
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+        let step_id = svc
+            .create_job_step(Request::new(CreateJobStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                num_tasks: 2,
+                cpus_per_task: 1,
+                user: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("both nodes are held when the step is created")
+            .into_inner()
+            .step_id;
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
+        report_node_finished(&svc, job_id, "n2").await;
+
+        let err = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                step_id,
+                user: "alice".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("n2 was released, so the step must not launch onto it");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("n2 is not in the job's current allocation"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_in_job_skips_a_node_the_grace_victim_already_released() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let released = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+        let released_port = released.local_addr().expect("local addr").port();
+        drop(released);
+        let (n2, _) = spawn_cancel_recording_agent().await;
+        let job_id = running_two_node_job(&svc, "srun ./train\n", released_port, n2.port()).await;
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
+        report_node_finished(&svc, job_id, "n1").await;
+
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id,
+                command: vec!["hostname".into()],
+                user: "alice".into(),
+            }))
+            .await
+            .expect_err("the probe agent answers every exec with an error");
+
+        assert!(
+            err.message().starts_with("exec failed"),
+            "the command must reach the node the job still holds, not n1: {}",
+            err.message()
+        );
     }
 
     /// The batch script runs on the first node only; its ending ends the job, so
