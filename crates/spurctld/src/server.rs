@@ -6043,8 +6043,6 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
     Status::new(code, message)
 }
 
-/// Only the step that owns the job's lifetime may finalize it; a numbered
-/// step or the terminal placeholder speaks for itself, not the allocation.
 /// Nodes to stop once one of a job's nodes has reported, for a batch script that
 /// launches its ranks with `srun`. With `primary_only` set, only a report from
 /// the batch script's node (the first allocated) counts: the other nodes run a
@@ -6065,6 +6063,8 @@ fn step_launch_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>)
     }
 }
 
+/// Only the step that owns the job's lifetime may finalize it; a numbered
+/// step or the terminal placeholder speaks for itself, not the allocation.
 fn reports_whole_job(step_id: Option<spur_core::step::StepId>) -> bool {
     match step_id {
         Some(id) => spur_core::step::owns_job_lifetime(id),
