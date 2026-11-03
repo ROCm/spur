@@ -51,6 +51,9 @@ use crate::pmix_dispatch;
 use crate::raft::{ClientResponse, JobFinalized, SpurRaft, StateMachineApply};
 use crate::sched_stats::SchedStatsCollector;
 
+mod quota_ledger;
+use quota_ledger::QuotaLedger;
+
 /// Description shown for a job parked after a launch failure it would carry to
 /// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
 /// so operator runbooks and log greps written against Slurm keep working.
@@ -5371,11 +5374,12 @@ impl ClusterManager {
                         job.allocated_nodes.len() as u64;
                 }
             }
+            let ledger = QuotaLedger::from_jobs(jobs.values());
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 let admitted = match account_block_with(
                     job,
                     &self.association_cache,
-                    &jobs,
+                    &ledger,
                     &nodes,
                     &reserved,
                 ) {
@@ -5393,7 +5397,7 @@ impl ClusterManager {
                 let qos_charge = match qos_block_with(
                     job,
                     &qos_by_job[&job.job_id],
-                    &jobs,
+                    &ledger,
                     &nodes,
                     &reserved,
                     consumed_wall,
@@ -9537,7 +9541,7 @@ struct QosBlocked {
 fn qos_block_with(
     job: &mut Job,
     qos: &Qos,
-    jobs: &HashMap<JobId, Job>,
+    ledger: &QuotaLedger<'_>,
     nodes: &HashMap<String, Node>,
     reserved: &PassReservations,
     consumed_wall_minutes: Option<u64>,
@@ -9546,40 +9550,11 @@ fn qos_block_with(
         return Ok(0);
     };
     let user = &job.spec.user;
-    // Idle-fill borrowed jobs (`idle_fill` stamped) are held outside every QOS
-    // quota aggregate: a borrowed job runs on capacity outside the quota, so it
-    // must not count toward the quota that gates its team's legitimate jobs —
-    // otherwise a legitimate sibling is blocked at this gate and dropped from
-    // the pending list before reclaim can ever see it (§7, D1). The exclusion
-    // keys on the stamp alone; a job reclaimable only via `idle_fill_preemptable`
-    // is inside its quota and keeps counting in full (§4.1).
-    let mut running_count = jobs
-        .values()
-        .filter(|j| {
-            j.occupies_resources()
-                && !j.idle_fill
-                && j.spec.user == *user
-                && j.spec.qos.as_deref() == Some(qos_name.as_str())
-        })
-        .count() as u32;
-    // Count only earlier-submitted jobs (lower job_id) so a later job never
-    // makes an earlier, within-limit job retroactively blocked.
-    let submitted_count = jobs
-        .values()
-        .filter(|j| {
-            j.job_id < job.job_id
-                && !j.idle_fill
-                && (j.state == JobState::Pending || j.state == JobState::Running)
-                && j.spec.user == *user
-                && j.spec.qos.as_deref() == Some(qos_name.as_str())
-        })
-        .count() as u32;
-    let mut user_running_tres = sum_running_tres(jobs, |j| {
-        !j.idle_fill && j.spec.user == *user && j.spec.qos.as_deref() == Some(qos_name.as_str())
-    });
-    let mut qos_running_tres = sum_running_tres(jobs, |j| {
-        !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name.as_str())
-    });
+    let usage = ledger.qos(qos_name, user);
+    let mut running_count = usage.user_running_jobs();
+    let submitted_count = usage.user_submitted_before(job.job_id);
+    let mut user_running_tres = usage.user_running_tres();
+    let mut qos_running_tres = usage.scope_running_tres();
 
     let user_key = (user.clone(), qos_name.clone());
     running_count += reserved.qos_user_count.get(&user_key).copied().unwrap_or(0);
@@ -9591,12 +9566,11 @@ fn qos_block_with(
     }
 
     let already_claimed = reserved.qos_claimed_nodes.get(qos_name);
-    let qos_occupied: HashSet<String> = occupied_nodes(jobs, |j| {
-        !j.idle_fill && j.spec.qos.as_deref() == Some(qos_name.as_str())
-    })
-    .into_iter()
-    .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
-    .collect();
+    let qos_occupied: HashSet<String> = usage
+        .occupied()
+        .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
+        .map(str::to_owned)
+        .collect();
     let (grp_node_charge, reusable_nodes) = new_distinct_nodes_needed(job, &qos_occupied, nodes);
 
     match check_qos_limits_with_grp_node_charge(
@@ -9652,7 +9626,7 @@ struct AccountAdmitted {
 fn account_block_with(
     job: &mut Job,
     assoc_cache: &AssociationCache,
-    jobs: &HashMap<JobId, Job>,
+    ledger: &QuotaLedger<'_>,
     nodes: &HashMap<String, Node>,
     reserved: &PassReservations,
 ) -> Result<AccountAdmitted, spur_core::job::PendingReason> {
@@ -9665,37 +9639,10 @@ fn account_block_with(
     let user = &job.spec.user;
     let limits = assoc_cache.limits(user, account);
 
-    // Idle-fill borrowed jobs (`idle_fill` stamped) sit outside every quota
-    // aggregate, the association's included. The account gate runs first and
-    // returns early, so a borrowed job counted here blocks its team's legitimate
-    // job before it ever reaches the QOS gate — dropping it from the pending
-    // list where reclaim can never see it (§7, D1). The exclusion keys on the
-    // stamp alone; a job reclaimable only via `idle_fill_preemptable` is inside
-    // its quota and keeps counting in full (§4.1).
-    let mut running_count = jobs
-        .values()
-        .filter(|j| {
-            j.occupies_resources()
-                && !j.idle_fill
-                && j.spec.user == *user
-                && j.spec.account.as_deref() == Some(account)
-        })
-        .count() as u32;
-    // Count only earlier-submitted jobs (lower job_id) so a later job never
-    // makes an earlier, within-limit job retroactively blocked.
-    let submitted_count = jobs
-        .values()
-        .filter(|j| {
-            j.job_id < job.job_id
-                && !j.idle_fill
-                && (j.state == JobState::Pending || j.state == JobState::Running)
-                && j.spec.user == *user
-                && j.spec.account.as_deref() == Some(account)
-        })
-        .count() as u32;
-    let mut account_running_tres = sum_running_tres(jobs, |j| {
-        !j.idle_fill && j.spec.account.as_deref() == Some(account)
-    });
+    let usage = ledger.account(account, user);
+    let mut running_count = usage.user_running_jobs();
+    let submitted_count = usage.user_submitted_before(job.job_id);
+    let mut account_running_tres = usage.scope_running_tres();
 
     running_count += reserved
         .account_user_count
@@ -9707,12 +9654,11 @@ fn account_block_with(
     }
 
     let already_claimed = reserved.account_claimed_nodes.get(account);
-    let account_occupied: HashSet<String> = occupied_nodes(jobs, |j| {
-        !j.idle_fill && j.spec.account.as_deref() == Some(account)
-    })
-    .into_iter()
-    .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(n)))
-    .collect();
+    let account_occupied: HashSet<String> = usage
+        .occupied()
+        .filter(|n| !already_claimed.is_some_and(|claimed| claimed.contains(*n)))
+        .map(str::to_owned)
+        .collect();
     let (grp_node_charge, reusable_nodes) =
         new_distinct_nodes_needed(job, &account_occupied, nodes);
 
@@ -9876,16 +9822,16 @@ fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::
     None
 }
 
-/// Running-TRES accumulation with the distinct-node rule applied once at the
-/// end. Node TRES is the count of distinct nodes occupied (union of
+/// Running-TRES accumulation with the distinct-node rule applied when read.
+/// Node TRES is the count of distinct nodes occupied (union of
 /// `allocated_nodes`), not summed `num_nodes` — a node packed by two jobs counts
 /// once; CPU/Memory/GPU stay additive. A running job without recorded placement
 /// falls back to its requested `num_nodes` so the limit is never under-counted.
 ///
-/// Shared by `sum_running_tres` and the per-scope/per-user aggregation in
-/// `scope_usage` so a running job's footprint is counted identically whether it
-/// feeds a group total or a single user's, and the distinct-node union is taken
-/// per aggregate rather than summed across jobs.
+/// Shared by the `QuotaLedger` the admission gates read and the per-scope/per-user
+/// aggregation in `scope_usage` so a running job's footprint is counted identically
+/// whether it feeds a group total or a single user's, and the distinct-node union is
+/// taken per aggregate rather than summed across jobs.
 #[derive(Default)]
 struct RunningTresAccumulator<'a> {
     tres: TresRecord,
@@ -9904,12 +9850,17 @@ impl<'a> RunningTresAccumulator<'a> {
         }
     }
 
-    fn finish(mut self) -> TresRecord {
-        self.tres.set(
+    fn nodes(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.distinct_nodes.iter().copied()
+    }
+
+    fn tres(&self) -> TresRecord {
+        let mut tres = self.tres.clone();
+        tres.set(
             TresType::Node,
             self.distinct_nodes.len() as u64 + self.unplaced_nodes,
         );
-        self.tres
+        tres
     }
 }
 
@@ -9928,6 +9879,7 @@ fn running_array_counts(jobs: &HashMap<JobId, Job>) -> HashMap<JobId, u32> {
         })
 }
 
+#[cfg(test)]
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut acc = RunningTresAccumulator::default();
     for j in jobs.values() {
@@ -9935,7 +9887,7 @@ fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> 
             acc.add(j);
         }
     }
-    acc.finish()
+    acc.tres()
 }
 
 /// The limits-versus-usage snapshot behind `scontrol show assoc_mgr`. Usage is
@@ -10058,14 +10010,14 @@ fn scope_usage(
         scope: scope.to_owned(),
         grp_running_jobs,
         grp_submitted_jobs,
-        grp_running_tres: grp_tres.finish(),
+        grp_running_tres: grp_tres.tres(),
         users: per_user
             .into_iter()
             .map(|(user, agg)| UserLimitUsage {
                 user: user.to_owned(),
                 running_jobs: agg.running_jobs,
                 submitted_jobs: agg.submitted_jobs,
-                running_tres: agg.running_tres.finish(),
+                running_tres: agg.running_tres.tres(),
                 caps: caps_for(user),
             })
             .collect(),
@@ -24805,17 +24757,20 @@ state = "UP"
     }
 
     #[test]
-    fn sum_running_tres_counts_distinct_nodes_not_summed_num_nodes() {
+    fn ledger_scope_tres_counts_distinct_nodes_not_summed_num_nodes() {
         // Two running jobs share node n2: summed num_nodes = 4, distinct union = 3.
         let mut a = make_running_job(1, &["n1", "n2"], 1);
         a.spec.num_nodes = 2;
         let mut b = make_running_job(2, &["n2", "n3"], 1);
         b.spec.num_nodes = 2;
-        let mut jobs = HashMap::new();
-        jobs.insert(1, a);
-        jobs.insert(2, b);
+        let jobs = [a, b].map(|mut job| {
+            job.spec.qos = Some("normal".into());
+            job
+        });
 
-        let tres = sum_running_tres(&jobs, |_| true);
+        let tres = QuotaLedger::from_jobs(&jobs)
+            .qos("normal", "testuser")
+            .scope_running_tres();
         assert_eq!(
             tres.get(TresType::Node),
             3,
@@ -24824,7 +24779,7 @@ state = "UP"
     }
 
     #[test]
-    fn sum_running_tres_falls_back_to_num_nodes_when_placement_missing() {
+    fn ledger_scope_tres_falls_back_to_num_nodes_when_placement_missing() {
         // An unplaced job (num_nodes=3, no recorded placement) must not under-count via the
         // distinct-node union, so it still contributes its full requested count; the two placed
         // jobs share n2, so their contribution is deduped to {n1,n2,n3}=3 rather than summed 2+2=4.
@@ -24835,12 +24790,14 @@ state = "UP"
         b.spec.num_nodes = 2;
         let mut c = make_running_job(3, &["n2", "n3"], 1);
         c.spec.num_nodes = 2;
-        let mut jobs = HashMap::new();
-        jobs.insert(1, a);
-        jobs.insert(2, b);
-        jobs.insert(3, c);
+        let jobs = [a, b, c].map(|mut job| {
+            job.spec.qos = Some("normal".into());
+            job
+        });
 
-        let tres = sum_running_tres(&jobs, |_| true);
+        let tres = QuotaLedger::from_jobs(&jobs)
+            .qos("normal", "testuser")
+            .scope_running_tres();
         // Unplaced fallback 3 + placed distinct {n1,n2,n3}=3 = 6, not summed 3+2+2=7.
         assert_eq!(tres.get(TresType::Node), 6);
     }
@@ -35303,7 +35260,7 @@ mod idle_fill_aggregate_tests {
         qos_block_with(
             job,
             qos,
-            jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &HashMap::new(),
             &PassReservations::default(),
             None,
@@ -35482,7 +35439,7 @@ mod idle_fill_aggregate_tests {
         account_block_with(
             job,
             assoc,
-            jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &HashMap::new(),
             &PassReservations::default(),
         )
@@ -35648,7 +35605,7 @@ mod idle_fill_aggregate_tests {
         let charge = account_block_with(
             &mut cand,
             &assoc,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &nodes,
             &PassReservations::default(),
         )
@@ -35669,7 +35626,7 @@ mod idle_fill_aggregate_tests {
         let charge = account_block_with(
             &mut cand,
             &assoc,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &nodes,
             &PassReservations::default(),
         )
@@ -35942,7 +35899,7 @@ mod idle_fill_aggregate_tests {
         let blocked = qos_block_with(
             &mut bob,
             &qos,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &HashMap::new(),
             &PassReservations::default(),
             None,
@@ -35966,7 +35923,7 @@ mod idle_fill_aggregate_tests {
         let blocked = qos_block_with(
             &mut cand,
             &qos,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &HashMap::new(),
             &PassReservations::default(),
             None,
@@ -36000,7 +35957,7 @@ mod idle_fill_aggregate_tests {
         let blocked = qos_block_with(
             &mut cand,
             &qos,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &HashMap::new(),
             &PassReservations::default(),
             None,
@@ -36071,7 +36028,7 @@ mod idle_fill_aggregate_tests {
         let admitted = account_block_with(
             &mut cand,
             &assoc,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &nodes,
             &PassReservations::default(),
         )
@@ -36089,7 +36046,7 @@ mod idle_fill_aggregate_tests {
         let admitted = account_block_with(
             &mut cand,
             &assoc,
-            &jobs,
+            &QuotaLedger::from_jobs(jobs.values()),
             &nodes,
             &PassReservations::default(),
         )
