@@ -925,6 +925,12 @@ pub struct TrackedJob {
     cgroup_path: Option<std::path::PathBuf>,
 }
 
+impl crate::reporter::HeldRun for TrackedJob {
+    fn run_attempt(&self) -> u32 {
+        self.run_attempt
+    }
+}
+
 impl TrackedJob {
     /// Take the cgroup path, leaving `None`. Whichever teardown path reaches
     /// the job first takes it, so the removal it authorizes happens once.
@@ -17619,7 +17625,7 @@ mod tests {
         );
 
         assert!(
-            reporter.held_job_ids().is_empty(),
+            reporter.held_jobs().is_empty(),
             "reporter sees no jobs before registration"
         );
 
@@ -17639,9 +17645,9 @@ mod tests {
         .expect("register");
 
         assert_eq!(
-            reporter.held_job_ids(),
-            vec![77],
-            "reporter's heartbeat must observe the agent-registered allocation-only job"
+            reporter.held_jobs(),
+            vec![(77, 9)],
+            "reporter's heartbeat must observe the agent-registered allocation-only job and its run"
         );
         assert_eq!(
             svc.running
