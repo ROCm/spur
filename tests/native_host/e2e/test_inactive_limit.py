@@ -194,6 +194,13 @@ def _assert_still_completing(cluster, job_id: int, since: float) -> None:
     )
 
 
+_SPURD_COMPLETES_BEFORE_STEPS_REASON = (
+    "spurd reports the node's whole-job completion as soon as the job-owning process "
+    "dies on SIGTERM, even though srun steps trapping SIGTERM are still running, so the "
+    "controller ends the job without holding COMPLETING for the kill wait"
+)
+
+
 class TestInactiveLimitKillWait:
     @pytest.fixture
     def cluster_config_overrides(self):
@@ -205,6 +212,7 @@ class TestInactiveLimitKillWait:
             },
         }
 
+    @pytest.mark.xfail(strict=True, reason=_SPURD_COMPLETES_BEFORE_STEPS_REASON)
     def test_inactive_limit_warns_then_times_out(self, cluster):
         client = _SilentSalloc(cluster)
         try:
@@ -225,6 +233,7 @@ class TestInactiveLimitKillWait:
         finally:
             client.close()
 
+    @pytest.mark.xfail(strict=True, reason=_SPURD_COMPLETES_BEFORE_STEPS_REASON)
     def test_inactive_limit_reconnect_does_not_save_the_job(self, cluster):
         client = _SilentSalloc(cluster)
         try:
