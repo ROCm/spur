@@ -888,8 +888,8 @@ one.
 
 **Upgrade every controller before setting a partition ``GraceTime``.** The
 partition's ``grace_time`` is a new field in the partition entries of the Raft
-log and snapshots, including the entry that ``scontrol update partition
-GraceTime=`` writes. A controller that predates it ignores the field, so a
+log and snapshots, including the entry that
+``scontrol update partition GraceTime=`` writes. A controller that predates it ignores the field, so a
 change applied while a follower is not upgraded is lost on that follower, which
 would lack the grace if it became leader, until it replays from a new snapshot.
 This is already required before setting a QOS ``GraceTime`` (see below).
