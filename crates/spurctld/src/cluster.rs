@@ -83,10 +83,11 @@ pub(crate) fn warn_if_complete_wait_too_short(config: &spur_core::config::SlurmC
     if config.complete_wait_too_short() {
         warn!(
             complete_wait_secs = config.scheduler.complete_wait_secs,
+            complete_wait_floor_secs = config.complete_wait_floor_secs(),
             kill_wait_secs = config.scheduler.effective_kill_wait_secs(),
             timeout_kill_wait_secs = config.scheduler.effective_timeout_kill_wait_secs(),
             cgroup_cleanup_timeout_secs = config.cgroup.cleanup_timeout_secs,
-            "scheduler.complete_wait_secs should exceed the larger kill wait plus cgroup.cleanup_timeout_secs, or a job still being killed or cleaned up is force-finished and its unreported nodes are drained"
+            "scheduler.complete_wait_secs should exceed complete_wait_floor_secs (the larger kill wait plus cgroup.cleanup_timeout_secs), or a job still being killed or cleaned up is force-finished and its unreported nodes are drained"
         );
     }
 }

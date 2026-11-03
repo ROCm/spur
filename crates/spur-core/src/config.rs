@@ -2335,7 +2335,10 @@ impl SlurmConfig {
 
     /// Seconds a node can need after SIGTERM before it reports completion:
     /// the longer kill wait, then the cgroup cleanup spurd waits out first.
-    pub fn min_complete_wait_secs(&self) -> u32 {
+    /// `scheduler.complete_wait_secs` must exceed this.
+    pub fn complete_wait_floor_secs(&self) -> u32 {
+        // Counted even when `cgroup.enabled` is false: nodes read their own
+        // config, so the controller's flag says nothing about theirs.
         self.scheduler
             .longest_effective_kill_wait_secs()
             .saturating_add(self.cgroup.cleanup_timeout_secs)
@@ -2345,7 +2348,7 @@ impl SlurmConfig {
     /// are still being killed or cleaned up. Not a validation error so
     /// existing configs keep loading.
     pub fn complete_wait_too_short(&self) -> bool {
-        self.scheduler.complete_wait_secs <= self.min_complete_wait_secs()
+        self.scheduler.complete_wait_secs <= self.complete_wait_floor_secs()
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -4838,6 +4841,16 @@ inactive_limit_secs = 20
         assert!(config_with_waits(5, 270, 35, 300).complete_wait_too_short());
         assert!(!config_with_waits(5, 270, 29, 300).complete_wait_too_short());
         assert!(!config_with_waits(5, 270, 0, 300).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_floor_counts_cleanup_even_with_cgroups_disabled() {
+        let toml = "cluster_name = \"test\"\n\
+                    [scheduler]\nkill_wait_secs = 30\ncomplete_wait_secs = 90\n\
+                    [cgroup]\nenabled = false\ncleanup_timeout_secs = 60\n";
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.complete_wait_floor_secs(), 90);
+        assert!(config.complete_wait_too_short());
     }
 
     #[test]
