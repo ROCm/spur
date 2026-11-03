@@ -410,6 +410,11 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let schedule_time_us = schedule_start.elapsed().as_micros().min(u64::MAX as u128) as u64;
         cluster.set_planned_reservations(sched_ref.planned_starts());
         cluster.set_planned_job_starts(sched_ref.planned_job_starts());
+        let preempt_handoffs = without_released(&handoffs, sched_ref.released_handoffs());
+        let preempt_state = ClusterState {
+            preemption_handoffs: &preempt_handoffs,
+            ..cluster_state
+        };
 
         // Preemption: if high-priority jobs couldn't be scheduled,
         // cancel lower-priority running jobs to free resources.
@@ -472,7 +477,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         &cluster,
                         &reclaimers,
                         &borrow_ids,
-                        &cluster_state,
+                        &preempt_state,
                         sched_cfg.idle_fill_exempt_secs,
                     )
                     .await;
@@ -504,7 +509,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             if !unscheduled.is_empty() {
                 try_preempt_with_handoffs(
                     &cluster,
-                    &cluster_state,
+                    &preempt_state,
                     &unscheduled,
                     &cluster.config().scheduler,
                 )
@@ -1024,6 +1029,19 @@ pub(crate) fn trial_placement(
         .collect()
 }
 
+/// Pass-start handoffs minus the holds placement freed; the victim search would otherwise
+/// evict for nodes that are already free.
+pub(crate) fn without_released(
+    handoffs: &HashMap<String, spur_core::job::JobId>,
+    released: &[String],
+) -> HashMap<String, spur_core::job::JobId> {
+    handoffs
+        .iter()
+        .filter(|(node, _)| !released.contains(node))
+        .map(|(node, owner)| (node.clone(), *owner))
+        .collect()
+}
+
 /// The pass's placement, minus jobs that took no quota claim and so must not start.
 pub(crate) fn claimed_assignments(
     scheduler: &mut impl Scheduler,
@@ -1280,6 +1298,16 @@ pub(crate) async fn try_preempt(
         preemption_handoffs: &handoffs,
     };
     try_preempt_with_handoffs(cluster, &state, unscheduled, sched).await;
+}
+
+/// The victim search over a given pass state, as the scheduler loop runs it.
+#[cfg(test)]
+pub(crate) async fn try_preempt_in(
+    cluster: &Arc<ClusterManager>,
+    state: &ClusterState<'_>,
+    unscheduled: &[&spur_core::job::Job],
+) {
+    try_preempt_with_handoffs(cluster, state, unscheduled, &cluster.config().scheduler).await;
 }
 
 /// Preempt running jobs so a pending one can be placed (`preempt_type = qos_priority` only).

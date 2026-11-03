@@ -23212,6 +23212,111 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn victim_search_sees_handoffs_released_by_placement_in_the_same_pass() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        for node in ["n1", "n2", "n3", "n4"] {
+            register_node(&cm, node, 8, 16000);
+        }
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let mut wide_victim = basic_spec("wide-victim");
+        wide_victim.qos = Some("low".into());
+        wide_victim.nodelist = Some("n1,n2".into());
+        wide_victim.num_nodes = 2;
+        wide_victim.num_tasks = 2;
+        wide_victim.exclusive = true;
+        let wide_victim = submit_and_wait(&cm, wide_victim);
+        cm.start_job(
+            wide_victim,
+            vec!["n1".into(), "n2".into()],
+            scalar_alloc(16, 32000),
+            per_node_for(&["n1", "n2"], scalar_alloc(8, 16000)),
+        )
+        .unwrap();
+        settle(&cm, wide_victim, JobState::Running);
+        let mut owner = basic_spec("owner");
+        owner.qos = Some("high".into());
+        owner.exclusive = true;
+        let owner = submit_and_wait(&cm, owner);
+        cm.preempt_job_with_provenance(wide_victim, PreemptMode::Cancel, Some(owner), None)
+            .unwrap();
+        settle(&cm, wide_victim, JobState::Completing);
+        report_nodes_released(&cm, wide_victim);
+        settle(&cm, wide_victim, JobState::Cancelled);
+        let mut lows = Vec::new();
+        for node in ["n3", "n4"] {
+            let mut spec = basic_spec(node);
+            spec.qos = Some("low".into());
+            spec.nodelist = Some(node.into());
+            spec.exclusive = true;
+            let id = submit_and_wait(&cm, spec);
+            cm.start_job(
+                id,
+                vec![node.into()],
+                scalar_alloc(8, 16000),
+                per_node_for(&[node], scalar_alloc(8, 16000)),
+            )
+            .unwrap();
+            settle(&cm, id, JobState::Running);
+            lows.push(id);
+        }
+        let mut wide = basic_spec("wide-preemptor");
+        wide.qos = Some("high".into());
+        wide.num_nodes = 2;
+        wide.num_tasks = 2;
+        wide.exclusive = true;
+        let wide = submit_and_wait(&cm, wide);
+
+        cm.tick_preempt_freed_earmarks();
+        let pending = cm.pending_jobs();
+        let nodes = cm.get_nodes();
+        let partitions = cm.get_partitions();
+        let reservations = cm.get_reservations();
+        let busy_until = crate::scheduler_loop::running_jobs_busy_until(&cm);
+        let handoffs = cm.preemption_handoffs(&pending, &nodes, &reservations);
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+            fabric: None,
+            busy_until: &busy_until,
+            preemption_handoffs: &handoffs,
+        };
+        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(100);
+        let assignments = crate::scheduler_loop::claimed_assignments(
+            &mut scheduler,
+            &pending,
+            &state,
+            &HashSet::new(),
+        );
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id, owner);
+        let released =
+            crate::scheduler_loop::without_released(&handoffs, scheduler.released_handoffs());
+        let wide_job = cm.get_job(wide).unwrap();
+        crate::scheduler_loop::try_preempt_in(
+            &cm,
+            &spur_sched::traits::ClusterState {
+                preemption_handoffs: &released,
+                ..state
+            },
+            &[&wide_job],
+        )
+        .await;
+        let evicted = |cm: &ClusterManager| {
+            lows.iter()
+                .filter(|id| cm.get_job(**id).unwrap().preempted_by == Some(wide))
+                .count()
+        };
+        assert_eq!(
+            evicted(&cm),
+            1,
+            "the node the owner left unused counts as free"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn placed_handoff_owner_does_not_let_a_later_job_jump_a_wide_plan() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster_with_config(&dir, preempting_config()).await;

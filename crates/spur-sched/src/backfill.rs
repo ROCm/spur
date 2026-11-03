@@ -36,6 +36,8 @@ pub struct BackfillScheduler {
     last_outcome: HashMap<JobId, Unplaced>,
     /// Off for dry runs, whose outcomes must not reach the log or the dedup above.
     report_unplaced: bool,
+    /// Handed-off nodes the last pass freed because their owner was planned elsewhere.
+    released_handoffs: Vec<String>,
 }
 
 /// Scheduler's future-slot plan: job -> (nodes held, projected start).
@@ -105,6 +107,7 @@ struct ReservationCheck<'a> {
 struct HandoffGate<'a> {
     owners: &'a HashMap<String, JobId>,
     held_until: HashMap<&'a str, chrono::DateTime<Utc>>,
+    released: Vec<&'a str>,
 }
 
 impl<'a> HandoffGate<'a> {
@@ -112,6 +115,7 @@ impl<'a> HandoffGate<'a> {
         Self {
             owners,
             held_until: HashMap::new(),
+            released: Vec::new(),
         }
     }
 
@@ -140,7 +144,12 @@ impl<'a> HandoffGate<'a> {
         now: chrono::DateTime<Utc>,
     ) {
         for (node, _) in self.owners.iter().filter(|(_, o)| **o == owner) {
-            let until = if picked(node) { start } else { now };
+            let until = if picked(node) {
+                start
+            } else {
+                self.released.push(node);
+                now
+            };
             self.held_until.insert(node, until);
         }
     }
@@ -153,6 +162,7 @@ impl BackfillScheduler {
             max_jobs,
             last_outcome: HashMap::new(),
             report_unplaced: true,
+            released_handoffs: Vec::new(),
         }
     }
 
@@ -212,6 +222,12 @@ impl BackfillScheduler {
             );
         }
         self.last_outcome = current;
+    }
+
+    /// Handed-off nodes the last `schedule()` freed because their owner was planned on
+    /// other nodes; a victim search later in the same pass must not treat them as held.
+    pub fn released_handoffs(&self) -> &[String] {
+        &self.released_handoffs
     }
 
     /// Nodes with no resources currently allocated but a future reservation
@@ -559,6 +575,7 @@ impl BackfillScheduler {
                         max_jobs: 1,
                         last_outcome: HashMap::new(),
                         report_unplaced: false,
+                        released_handoffs: Vec::new(),
                     };
                     for (timeline, node) in trial.timelines.iter_mut().zip(&nodes) {
                         timeline.total = node.total_resources.clone();
@@ -1171,6 +1188,7 @@ impl BackfillScheduler {
 
         if initialize {
             self.log_unplaced(unplaced);
+            self.released_handoffs = handoffs.released.iter().map(|n| n.to_string()).collect();
         }
         assignments
     }
@@ -1508,6 +1526,30 @@ mod tests {
         assert_eq!(b_nodes, vec!["node001", "node003"]);
         assert!(b_in >= 300 + 3600 - 5, "job 2 planned in {b_in}s");
         assert!(plan_of(&sched, 5).is_some_and(|(_, at)| at > b_in));
+    }
+
+    #[test]
+    fn placed_owner_reports_only_the_held_nodes_it_left_unused() {
+        let mut nodes = make_nodes(3);
+        nodes[2].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let handoffs = HashMap::from([
+            ("node001".to_string(), 1),
+            ("node002".to_string(), 1),
+            ("node003".to_string(), 2),
+        ]);
+        let busy_until =
+            HashMap::from([("node003".to_string(), Utc::now() + Duration::minutes(5))]);
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let mut waiting = job_for(2, 1, Duration::hours(1));
+        waiting.spec.nodelist = Some("node003".into());
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&[job_for(1, 1, Duration::hours(1)), waiting], &state);
+        assert_eq!(placed(&assignments), vec![(1, vec!["node001".into()])]);
+        assert!(
+            plan_of(&sched, 2).is_some(),
+            "the waiting owner keeps its planned node"
+        );
+        assert_eq!(sched.released_handoffs(), ["node002"]);
     }
 
     #[test]
