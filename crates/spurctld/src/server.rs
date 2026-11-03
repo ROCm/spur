@@ -814,6 +814,24 @@ impl ControllerService {
         );
     }
 
+    /// Stop the nodes still running a job after one of its nodes reported (see
+    /// `step_launch_stragglers`).
+    fn stop_remaining_nodes(&self, job_id: u32, primary_only: Option<&str>) {
+        let Some(job) = self.cluster.get_job(job_id) else {
+            return;
+        };
+        let nodes = step_launch_stragglers(&job, primary_only);
+        if nodes.is_empty() {
+            return;
+        }
+        let cluster = self.cluster.clone();
+        let run_attempt = job.run_attempt;
+        tokio::spawn(async move {
+            crate::scheduler_loop::cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, 15)
+                .await;
+        });
+    }
+
     /// Send a cancel to a node still holding a run the controller no longer
     /// believes belongs to it there (see `is_reclaimable`). Best-effort.
     fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
@@ -2695,40 +2713,15 @@ impl SlurmController for ControllerService {
         use crate::cluster::NodeCompleteResult;
 
         match completion_result {
-            Some(Ok(NodeCompleteResult::AllDone { .. } | NodeCompleteResult::InGrace)) => {
+            Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
+            Some(Ok(NodeCompleteResult::Completing)) => {
+                self.stop_remaining_nodes(req.job_id, None);
                 Ok(Response::new(()))
             }
-            Some(Ok(NodeCompleteResult::Completing)) => {
-                if let Some(job) = self.cluster.get_job(req.job_id) {
-                    if job
-                        .spec
-                        .script
-                        .as_deref()
-                        .is_some_and(batch_script_uses_step_launch)
-                    {
-                        let missing: Vec<String> = job
-                            .allocated_nodes
-                            .iter()
-                            .filter(|node| !job.node_completions.contains_key(*node))
-                            .cloned()
-                            .collect();
-                        if !missing.is_empty() {
-                            let cluster = self.cluster.clone();
-                            let job_id = req.job_id;
-                            let run_attempt = job.run_attempt;
-                            tokio::spawn(async move {
-                                crate::scheduler_loop::cancel_job_on_nodes(
-                                    &cluster,
-                                    job_id,
-                                    run_attempt,
-                                    &missing,
-                                    15,
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                }
+            // A rank exiting is a step event, not a node report: only the node
+            // running the batch script reporting means the job itself has ended.
+            Some(Ok(NodeCompleteResult::InGrace)) => {
+                self.stop_remaining_nodes(req.job_id, Some(&req.reporting_node));
                 Ok(Response::new(()))
             }
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
@@ -3131,13 +3124,11 @@ impl SlurmController for ControllerService {
             )));
         }
 
-        let step_nodes = resolve_step_nodes(
-            &job.allocated_nodes,
-            req.num_nodes,
-            &req.nodelist,
-            &req.node,
-        )
-        .map_err(Status::invalid_argument)?;
+        // Not allocated_nodes: a node that already reported (a victim in its grace)
+        // was freed and may belong to another job now.
+        let step_nodes =
+            resolve_step_nodes(&job.held_nodes(), req.num_nodes, &req.nodelist, &req.node)
+                .map_err(Status::invalid_argument)?;
         self.cluster
             .validate_step_bindings(&job, &step_nodes)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
@@ -6055,6 +6046,26 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
 
 /// Only the step that owns the job's lifetime may finalize it; a numbered
 /// step or the terminal placeholder speaks for itself, not the allocation.
+/// Nodes to stop once one of a job's nodes has reported, for a batch script that
+/// launches its ranks with `srun`. With `primary_only` set, only a report from
+/// the batch script's node (the first allocated) counts: the other nodes run a
+/// hold script that never reports by itself, so a rank exiting there is a step
+/// event, not the end of the job.
+fn step_launch_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
+    let launches_steps = job
+        .spec
+        .script
+        .as_deref()
+        .is_some_and(batch_script_uses_step_launch);
+    let reporter_ended_the_job = primary_only
+        .is_none_or(|node| job.allocated_nodes.first().map(String::as_str) == Some(node));
+    if launches_steps && reporter_ended_the_job {
+        job.held_nodes()
+    } else {
+        Vec::new()
+    }
+}
+
 fn reports_whole_job(step_id: Option<spur_core::step::StepId>) -> bool {
     match step_id {
         Some(id) => spur_core::step::owns_job_lifetime(id),
@@ -9879,7 +9890,11 @@ mod tests {
         job_id
     }
 
-    fn warn_of_preemption(svc: &ControllerService, job_id: u32) {
+    fn warn_of_preemption(
+        svc: &ControllerService,
+        job_id: u32,
+        mode: spur_core::partition::PreemptMode,
+    ) {
         let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
         let signaled_at = Utc::now();
         let pending = spur_core::job::PreemptPending {
@@ -9887,7 +9902,7 @@ mod tests {
             deadline: signaled_at + chrono::Duration::seconds(600),
             preempted_by: 99,
             preempt_qos: None,
-            mode: spur_core::partition::PreemptMode::Cancel,
+            mode,
             run_attempt,
             requeue_hold_secs: 30,
         };
@@ -9910,32 +9925,113 @@ mod tests {
         .expect("completion report accepted");
     }
 
-    /// A node finishing early leaves the others to run out the grace; a job that
-    /// is not in its grace still has them stopped. The second job's cancel is
-    /// awaited, so a cancel wrongly sent for the first would be seen too.
+    /// A non-primary node finishing early leaves the others to run out the grace;
+    /// a job that is not in its grace still has them stopped. The ordinary job's
+    /// cancel is awaited, so a cancel wrongly sent for the first would be seen too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_partial_exit_in_grace_does_not_signal_the_other_nodes() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service(&dir).await;
-        let (n1, _) = spawn_cancel_recording_agent().await;
-        let (n2, cancelled) = spawn_cancel_recording_agent().await;
+        let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+        let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
         let script = "srun ./train\n";
         let in_grace = running_two_node_job(&svc, script, n1.port(), n2.port()).await;
-        warn_of_preemption(&svc, in_grace);
+        warn_of_preemption(&svc, in_grace, spur_core::partition::PreemptMode::Cancel);
         let ordinary = running_two_node_job(&svc, script, n1.port(), n2.port()).await;
 
-        report_node_finished(&svc, in_grace, "n1").await;
+        report_node_finished(&svc, in_grace, "n2").await;
         report_node_finished(&svc, ordinary, "n1").await;
 
-        wait_for_cancel(&cancelled, ordinary).await;
-        assert_eq!(
-            *cancelled.lock().unwrap(),
-            [ordinary],
-            "only the job outside a grace has its other node stopped"
+        wait_for_cancel(&n2_cancelled, ordinary).await;
+        assert_eq!(*n2_cancelled.lock().unwrap(), [ordinary]);
+        assert!(
+            n1_cancelled.lock().unwrap().is_empty(),
+            "a report from a non-primary node signals nobody in a grace"
         );
         let job = svc.cluster.get_job(in_grace).expect("job");
         assert_eq!(job.state, JobState::Running);
         assert!(job.preempt_pending.is_some());
+    }
+
+    /// The batch script runs on the first node only; its ending ends the job, so
+    /// the companions are stopped and the job ends preempted once they report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_primary_node_exiting_in_grace_stops_the_companions() {
+        use spur_core::partition::PreemptMode;
+
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let svc = test_service(&dir).await;
+            let (n1, n1_cancelled) = spawn_cancel_recording_agent().await;
+            let (n2, n2_cancelled) = spawn_cancel_recording_agent().await;
+            let job_id = running_two_node_job(&svc, "srun ./train\n", n1.port(), n2.port()).await;
+            warn_of_preemption(&svc, job_id, mode);
+
+            report_node_finished(&svc, job_id, "n1").await;
+
+            wait_for_cancel(&n2_cancelled, job_id).await;
+            assert_eq!(*n2_cancelled.lock().unwrap(), [job_id], "{mode:?}");
+            assert!(n1_cancelled.lock().unwrap().is_empty(), "{mode:?}");
+            assert_eq!(
+                svc.cluster.get_job(job_id).expect("job").state,
+                JobState::Running,
+                "{mode:?}: the companion has not reported yet"
+            );
+
+            report_node_finished(&svc, job_id, "n2").await;
+
+            let job = svc.cluster.get_job(job_id).expect("job");
+            assert_eq!(job.preempted_by, Some(99), "{mode:?}");
+            let expected = if mode == PreemptMode::Cancel {
+                JobState::Cancelled
+            } else {
+                JobState::Pending
+            };
+            assert_eq!(job.state, expected, "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_step_launching_script_has_stragglers_to_stop() {
+        let mut job = spur_core::job::Job::new(1, spur_core::job::JobSpec::default());
+        job.allocated_nodes = vec!["n1".into(), "n2".into(), "n3".into()];
+        job.node_completions.insert(
+            "n1".into(),
+            spur_core::job::NodeCompletion { code: 0, signal: 0 },
+        );
+
+        job.spec.script = Some("./train\n".into());
+        assert!(step_launch_stragglers(&job, None).is_empty());
+
+        job.spec.script = Some("srun ./train\n".into());
+        assert_eq!(
+            step_launch_stragglers(&job, None),
+            ["n2".to_string(), "n3".to_string()]
+        );
+    }
+
+    #[test]
+    fn in_a_grace_only_the_batch_scripts_node_ends_the_job() {
+        let reported = |node: &str| {
+            let mut job = spur_core::job::Job::new(1, spur_core::job::JobSpec::default());
+            job.spec.script = Some("srun ./train\n".into());
+            job.allocated_nodes = vec!["n1".into(), "n2".into()];
+            job.node_completions.insert(
+                node.into(),
+                spur_core::job::NodeCompletion { code: 0, signal: 0 },
+            );
+            job
+        };
+
+        assert!(
+            step_launch_stragglers(&reported("n2"), Some("n2")).is_empty(),
+            "a companion's report signals nobody"
+        );
+        assert_eq!(
+            step_launch_stragglers(&reported("n1"), Some("n1")),
+            ["n2".to_string()],
+            "the primary's report stops the rest"
+        );
     }
 
     async fn wait_for_cancel(cancelled: &Arc<std::sync::Mutex<Vec<u32>>>, job_id: u32) {
@@ -9957,7 +10053,7 @@ mod tests {
         let finished = spawn_probe_agent(false).await;
         let alive = spawn_probe_agent(true).await;
         let job_id = running_two_node_job(&svc, "./train\n", finished.port(), alive.port()).await;
-        warn_of_preemption(&svc, job_id);
+        warn_of_preemption(&svc, job_id, spur_core::partition::PreemptMode::Cancel);
         report_node_finished(&svc, job_id, "n1").await;
         let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
 
@@ -13127,6 +13223,26 @@ mod tests {
             .unwrap_err()
             .contains("only 2 allocated"));
         assert!(resolve_step_nodes(&allocated, 0, "node003", "")
+            .unwrap_err()
+            .contains("not allocated"));
+    }
+
+    #[test]
+    fn steps_are_placed_only_on_nodes_the_job_still_holds() {
+        let mut job = spur_core::job::Job::new(1, spur_core::job::JobSpec::default());
+        job.allocated_nodes = vec!["node001".into(), "node002".into(), "node003".into()];
+        job.node_completions.insert(
+            "node001".into(),
+            spur_core::job::NodeCompletion { code: 0, signal: 0 },
+        );
+        let held = job.held_nodes();
+
+        assert_eq!(
+            resolve_step_nodes(&held, 0, "", "").unwrap(),
+            vec!["node002".to_string(), "node003".to_string()],
+            "the default step skips the node that reported"
+        );
+        assert!(resolve_step_nodes(&held, 0, "node001", "")
             .unwrap_err()
             .contains("not allocated"));
     }

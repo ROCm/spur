@@ -8111,6 +8111,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let already_deallocated;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -8136,6 +8137,9 @@ impl ClusterManager {
                             freed_nodes = job.allocated_nodes.clone();
                             allocated_resources = job.allocated_resources.clone();
                             per_node_map = job.per_node_alloc.clone();
+                            // Nodes that reported during a grace were freed at their report.
+                            already_deallocated =
+                                job.node_completions.keys().cloned().collect::<Vec<_>>();
                         }
                         s if s.is_terminal() => {
                             // The slice was already freed at completion; freeing
@@ -8144,6 +8148,7 @@ impl ClusterManager {
                             freed_nodes = Vec::new();
                             allocated_resources = None;
                             per_node_map = HashMap::new();
+                            already_deallocated = Vec::new();
                         }
                         _ => {
                             // Pending, Completing, or an in-flight finalized
@@ -8177,7 +8182,7 @@ impl ClusterManager {
                     &freed_nodes,
                     allocated_resources.as_ref(),
                     &per_node_map,
-                    &[],
+                    &already_deallocated,
                     *job_id,
                 );
                 drop(jobs);
@@ -30920,7 +30925,7 @@ state = "UP"
     }
 
     /// Place a one-cpu job on `node`, as the preemptor does once a victim frees it.
-    fn take_over_node(cm: &ClusterManager, node: &str) {
+    fn take_over_node(cm: &ClusterManager, node: &str) -> JobId {
         let id = submit_and_wait(cm, basic_spec("takeover"));
         cm.start_job(
             id,
@@ -30930,6 +30935,7 @@ state = "UP"
         )
         .unwrap();
         settle(cm, id, JobState::Running);
+        id
     }
 
     fn earmark_owner(cm: &ClusterManager, node: &str) -> Option<JobId> {
@@ -31042,6 +31048,40 @@ state = "UP"
         assert_eq!(cpus_in_use(&cm, "n2"), 0);
         assert_eq!(earmark_owner(&cm, "n1"), Some(99));
         assert_eq!(earmark_owner(&cm, "n2"), Some(99));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_requeue_after_a_partial_exit_in_grace_frees_nothing_twice() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+        let bystander = take_over_node(&cm, "n1");
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id: id,
+            hold: false,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "the bystander is still charged");
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: bystander,
+            exit_code: 0,
+            state: JobState::Completed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            at: None,
+        });
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

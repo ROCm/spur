@@ -9830,8 +9830,9 @@ mod tests {
             async fn victim_with_a_partial_exit(mode: PreemptMode) -> (PartialExitFixture, Job) {
                 let dir = TempDir::new().unwrap();
                 let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
-                let (addr, cancels, _) = spawn_mock_agent_recording_requests().await;
-                for node in ["n1", "n2"] {
+                let (n1_addr, n1_cancels, _) = spawn_mock_agent_recording_requests().await;
+                let (n2_addr, n2_cancels, _) = spawn_mock_agent_recording_requests().await;
+                for (node, addr) in [("n1", n1_addr), ("n2", n2_addr)] {
                     register_node_with_capabilities(
                         &cm,
                         node,
@@ -9877,7 +9878,8 @@ mod tests {
                     PartialExitFixture {
                         _dir: dir,
                         cm,
-                        cancels,
+                        n1_cancels,
+                        n2_cancels,
                         hunter,
                         bystander,
                         after_deadline,
@@ -9890,7 +9892,9 @@ mod tests {
                 /// Keeps the controller's state directory alive for later writes.
                 _dir: TempDir,
                 cm: Arc<ClusterManager>,
-                cancels: Cancels,
+                /// What each node's agent was told to stop.
+                n1_cancels: Cancels,
+                n2_cancels: Cancels,
                 hunter: Job,
                 /// Holds one cpu of `n1` after the victim's early exit freed it.
                 bystander: Job,
@@ -9900,6 +9904,23 @@ mod tests {
             impl PartialExitFixture {
                 fn cpus_in_use(&self, node: &str) -> u32 {
                     self.cm.get_node(node).unwrap().alloc_resources.cpus
+                }
+
+                /// The run attempts `n2` was told to stop, once it has been told,
+                /// and the number `n1` was told (the node that already reported,
+                /// which is spawned first, so it would have arrived by now).
+                fn stops_after_deadline(&self) -> (Vec<u32>, usize) {
+                    wait_for("the terminate is delivered to n2", || {
+                        !self.n2_cancels.lock().unwrap().is_empty()
+                    });
+                    let n2: Vec<u32> = self
+                        .n2_cancels
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|r| r.run_attempt)
+                        .collect();
+                    (n2, self.n1_cancels.lock().unwrap().len())
                 }
             }
 
@@ -9913,12 +9934,9 @@ mod tests {
 
                 finalize_expired_graces(&f.cm, f.after_deadline).await;
 
-                wait_for("the terminate is delivered", || {
-                    !f.cancels.lock().unwrap().is_empty()
-                });
                 assert_eq!(
-                    f.cancels.lock().unwrap().len(),
-                    1,
+                    f.stops_after_deadline(),
+                    (vec![victim.run_attempt], 0),
                     "one terminate, for the node still running"
                 );
                 let job = f.cm.get_job(victim.job_id).unwrap();
@@ -9943,7 +9961,10 @@ mod tests {
                 assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
                 assert_eq!(f.cpus_in_use("n1"), 1, "still only the bystander");
                 assert_eq!(f.cpus_in_use("n2"), 0);
-                assert_eq!(f.bystander.state, JobState::Running);
+                assert_eq!(
+                    f.cm.get_job(f.bystander.job_id).unwrap().state,
+                    JobState::Running
+                );
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9952,12 +9973,9 @@ mod tests {
 
                 finalize_expired_graces(&f.cm, f.after_deadline).await;
 
-                wait_for("the terminate is delivered", || {
-                    !f.cancels.lock().unwrap().is_empty()
-                });
                 assert_eq!(
-                    f.cancels.lock().unwrap().len(),
-                    1,
+                    f.stops_after_deadline(),
+                    (vec![victim.run_attempt], 0),
                     "one terminate, for the node still running"
                 );
                 let job = f.cm.get_job(victim.job_id).unwrap();
