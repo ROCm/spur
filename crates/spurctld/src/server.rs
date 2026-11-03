@@ -7528,12 +7528,7 @@ mod tests {
         use spur_core::job::JobSpec;
         use spur_core::wal::WalOperation;
 
-        let res = spur_core::resource::ResourceAllocations {
-            cpus: 1,
-            memory_mb: 0,
-            devices: std::collections::HashMap::new(),
-            generation: 0,
-        };
+        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let per_node_alloc = nodes.iter().map(|n| (n.to_string(), res.clone())).collect();
         if cluster.get_job(id).is_none() {
             cluster.apply_operation(&WalOperation::JobSubmit {
