@@ -121,7 +121,8 @@ of the file. Use ``scontrol reconfigure`` to apply file edits.
 
 ``spur.conf`` is not rewritten. The next ``scontrol reconfigure`` makes the file
 authoritative again: it overwrites runtime edits to partitions the file defines
-(except a runtime ``PreemptExemptTime`` the file leaves unset), recreates file
+(except a runtime ``PreemptExemptTime`` or ``GraceTime`` the file leaves
+unset), recreates file
 partitions deleted at runtime, and deletes runtime-created partitions the file
 does not define unless they still have active jobs. Copy any runtime change you
 want to keep into ``spur.conf`` before running ``scontrol reconfigure``.
