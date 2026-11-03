@@ -165,7 +165,8 @@ Reclaim never takes a job that is in its preemption grace period
 (:ref:`preemption grace time <qos-preempt-grace>`): taking it would cut the grace short. The job that
 needs its nodes waits for the grace and kill wait to end, like any other
 preemptor, and reclaims only after they finish. Reclaim itself gives a borrowed
-run no grace; it is requeued at once.
+run no grace; it is requeued at once, and its processes get SIGTERM then, after up to
+``kill_wait_secs`` (default 5 seconds), SIGKILL.
 
 Priority inside the opportunistic tier
 --------------------------------------

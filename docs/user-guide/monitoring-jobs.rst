@@ -811,8 +811,10 @@ is omitted for a job that is not in a grace.
 How a job learns it is being preempted
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-If the QOS your job runs under has a ``GraceTime`` (ask your administrator; see
-:ref:`preemption grace time <qos-preempt-grace>`), a job selected for preemption in ``cancel`` or
+If the QOS your job runs under, or the partition it runs in, has a ``GraceTime``
+(ask your administrator; see :ref:`preemption grace time <qos-preempt-grace>`;
+the QOS value wins if it is set, otherwise the highest value among the job's
+partitions applies), a job selected for preemption in ``cancel`` or
 ``requeue`` mode is not killed at once. It gets SIGCONT then SIGTERM, one time,
 as a warning, stays ``RUNNING`` and keeps its nodes, and is preempted at the
 deadline shown as ``EndTime`` (``PreemptTime`` shows when the warning was sent).
@@ -824,11 +826,18 @@ The grace is shortened if the job's own time limit arrives first. Without a
   the batch script gets no warning and sees only the final kill. Run it as
   ``srun python train.py`` and handle SIGTERM there to checkpoint.
 * **Expect a second SIGTERM.** At the deadline Spur sends SIGTERM to every
-  process in the job, waits up to the kill wait (30 seconds by default), then
+  process in the job, waits up to the kill wait (5 seconds by default), then
   sends SIGKILL. A handler that is already shutting down should ignore a repeat.
 * **Exiting early is fine.** A job that exits during its grace is recorded as
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
   mode), and the preempting job starts as soon as the nodes are free.
+* **One node finishing early does not affect the others.** The job stays
+  ``R`` for the whole grace. A node whose work has finished is freed for the
+  preempting job, and the other nodes keep running undisturbed, so a rank that
+  exits first does not cut short the ranks that are still writing their
+  checkpoint. If your batch script launches ranks with ``srun``, ranks exiting
+  do not end the job: it ends when the batch script exits (the remaining nodes
+  are then stopped), or at the deadline.
 * **You can still cancel.** ``scancel`` during the grace ends the job as your
   cancel. ``scontrol suspend`` is refused.
 * **The grace is not withdrawn.** The job is preempted at the deadline even if
@@ -1249,17 +1258,18 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 
 **Time limits and the kill wait.** At its time limit a job moves from ``RUNNING``
 to ``COMPLETING`` (``CG`` in ``squeue``) straight away and is sent SIGTERM. It
-stays ``COMPLETING`` for up to the kill wait (``kill_wait_secs``, default 30
-seconds), then Spur sends SIGKILL. The wait ends early once every process has
+stays ``COMPLETING`` for up to the time-limit kill wait
+(``timeout_kill_wait_secs``, default 30 seconds), then Spur sends SIGKILL. The wait ends early once every process has
 exited, and the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits:
 a clean exit on SIGTERM does not make it ``COMPLETED``. Its nodes stay allocated
 until its processes are gone, and ``--requeue`` still requeues it on timeout. The
-SIGTERM is final, so use the wait to checkpoint and exit. ``scancel``, the final
-kill of a preempted job, and the reaping of an idle interactive allocation
-(:ref:`inactive-limit`) wait up to the same kill wait; a job reaped for
-inactivity also shows ``CG`` and ends ``TIMEOUT``. An ``srun`` step that has no
-supervisor process gets the full kill wait too, where earlier releases gave it 2
-seconds.
+SIGTERM is final, so use the wait to checkpoint and exit. The reaping of an idle
+interactive allocation (:ref:`inactive-limit`) waits the same time; a job reaped
+for inactivity also shows ``CG`` and ends ``TIMEOUT``. ``scancel``, ``scontrol
+requeue`` and the final kill of a preempted job use the shorter kill wait
+(``kill_wait_secs``, default 5 seconds). An ``srun`` step that has no supervisor
+process gets the full wait that applies to it (5 seconds on ``scancel``, 30 at a
+time limit), where earlier releases gave it 2 seconds.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 

@@ -619,8 +619,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Reap an interactive allocation (``salloc``, or a standalone ``srun`` with
        or without ``--pty``) whose client has sent no keepalive for this many
-       seconds, freeing the nodes. The reaper sends SIGTERM, waits ``kill_wait_secs``,
-       then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
+       seconds, freeing the nodes. The reaper sends SIGTERM, waits
+       ``timeout_kill_wait_secs``, then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
        Mirrors Slurm's ``InactiveLimit``; the value in effect is shown by
        ``scontrol show config``. Must be at least twice the client keepalive
        interval (60 seconds); smaller non-zero values are rejected at startup so a
@@ -758,8 +758,8 @@ Reaping abandoned interactive allocations (``inactive_limit_secs``)
 ``salloc`` and standalone ``srun`` (with or without ``--pty``) ping the
 controller every 30 seconds for as long as the client is running. When the pings
 stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
-allocation is reaped: SIGTERM, a wait of up to ``kill_wait_secs`` (default 30
-seconds, ending early once the job's processes exit), then SIGKILL. The node
+allocation is reaped: SIGTERM, a wait of up to ``timeout_kill_wait_secs``
+(default 30 seconds, ending early once the job's processes exit), then SIGKILL. The node
 keeps the wait. The job shows ``COMPLETING`` (``CG``) meanwhile and ends
 ``TIMEOUT``. The SIGTERM is final: a client that reconnects during the wait
 does not save the allocation, and the job ends ``TIMEOUT`` however its
@@ -1625,8 +1625,8 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
        the preemption warning and the kill. It applies only when the victim's QOS
        leaves ``GraceTime`` unset, and the QOS value wins otherwise, including an
        explicit ``0``. A job in several partitions takes the highest value among
-       them. ``0`` means no grace; unset contributes none. Applies to ``cancel`` and ``requeue`` preemption
-       and is capped at the victim's remaining time limit. A value in
+       them. ``0`` means no grace; unset contributes none. Applies to ``cancel`` and
+       ``requeue`` preemption and is capped at the victim's remaining time limit. A value in
        ``spur.conf`` is applied on startup and ``scontrol reconfigure``; omitting
        it later does not clear a value already set at runtime. Set it at runtime with
        ``scontrol update PartitionName=<name> GraceTime=<secs>`` and revert it with

@@ -795,12 +795,16 @@ their retained sessions. An unreadable exit record also refuses replacement.
 
 .. _kill-wait-upgrade-notes:
 
-Kill wait and the time-limit completing state (``kill_wait_secs``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Kill waits and the time-limit completing state (``kill_wait_secs``, ``timeout_kill_wait_secs``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-This release adds ``scheduler.kill_wait_secs`` (default ``30``) and makes it the
-wait between SIGTERM and SIGKILL everywhere Spur stops a job. Both changes apply
-to a ``spur.conf`` that is not edited.
+This release makes the wait between SIGTERM and SIGKILL configurable with two
+settings. ``scheduler.kill_wait_secs`` (default ``5``) covers ``scancel``,
+``scontrol requeue``, the final kill of a preemption, idle-fill reclaim,
+reservation end and the other graceful stops. ``scheduler.timeout_kill_wait_secs``
+(default ``30``) covers the stops that end ``TIMEOUT``: the time limit and the
+inactivity limit. Both changes apply to a ``spur.conf`` that is not edited, and
+with the defaults most waits are the ones a job had before.
 
 .. list-table::
    :header-rows: 1
@@ -812,16 +816,16 @@ to a ``spur.conf`` that is not edited.
      - Effect
    * - ``scancel`` and the final preemption kill
      - SIGKILL 5 seconds after SIGTERM
-     - SIGKILL up to ``kill_wait_secs`` (30 seconds) after SIGTERM; a job that
+     - SIGKILL up to ``kill_wait_secs`` (5 seconds) after SIGTERM; a job that
        exits on SIGTERM is gone as soon as it exits
-     - A job that ignores or is slow to handle SIGTERM holds its nodes up to 30
-       seconds longer. Set ``kill_wait_secs = 5`` for the old wait.
+     - Unchanged by default. Raise ``kill_wait_secs`` to give such jobs longer.
    * - A job at its time limit, or an idle interactive allocation reaped by
        ``inactive_limit_secs``
      - Stayed ``RUNNING`` for 30 seconds after SIGTERM, then ended ``TIMEOUT``
        and was SIGKILLed
-     - Moves to ``COMPLETING`` (``CG``) at once, waits up to ``kill_wait_secs``,
-       then ends ``TIMEOUT`` with reason ``TimeLimit``
+     - Moves to ``COMPLETING`` (``CG``) at once, waits up to
+       ``timeout_kill_wait_secs`` (30 seconds), then ends ``TIMEOUT`` with
+       reason ``TimeLimit``
      - ``squeue`` shows ``CG`` instead of ``R`` during the wait. The final state,
        reason, timing, and ``--requeue`` behavior are unchanged, and the nodes
        stay held until the processes are gone. The kill is now the agent's, so a
@@ -831,18 +835,20 @@ to a ``spur.conf`` that is not edited.
    * - A requeued job (requeue-mode preemption, ``scontrol requeue``)
      - Held out of the queue for ``2 x interval_secs + 3`` seconds (5 seconds
        with the default 1 second interval)
-     - Held for the larger of that and ``kill_wait_secs``: 30 seconds with the
-       defaults
-     - The job waits longer before it can start again, so it does not restart
-       into its own old run's kill wait.
+     - Held for the larger of that and ``kill_wait_secs``: still 5 seconds with
+       the defaults
+     - Unchanged by default. Raising ``kill_wait_secs`` raises the hold with it,
+       so the job does not restart into its own old run's kill wait.
    * - An unsupervised ``srun`` step on cancel or at a time limit
      - SIGKILL after 2 seconds
-     - SIGKILL after the full kill wait
+     - SIGKILL after the full kill wait that applies: 5 seconds on cancel, 30
+       at a time limit
      - A step that handles SIGTERM now has time to shut down cleanly.
 
-Keep ``complete_wait_secs`` above ``kill_wait_secs``; otherwise a job can be
-force-finished before its kill wait elapses, and the controller logs a warning
-on startup and on reconfigure. See :doc:`/admin-guide/configuration` for the field, including a
+Keep ``complete_wait_secs`` above the larger of the two waits; otherwise a job can
+be force-finished before its kill wait elapses, and the controller logs a warning
+on startup and on reconfigure. Both settings accept ``0``-``65533``, and a value
+below 5 acts as 5. See :doc:`/admin-guide/configuration` for the fields, including a
 known issue with requeue: a requeued job frees its nodes while the old run is
 still in its kill wait, so lower ``kill_wait_secs`` if that matters with
 requeue-mode preemption.
@@ -860,7 +866,7 @@ reaches its time limit on a node that is not yet upgraded gets 5 seconds
 between SIGTERM and SIGKILL instead of the 30 it had before, which can be too
 short for a checkpoint. Upgrade the agents promptly, or drain the nodes still
 on the old build before their jobs' limits arrive. Once a node is upgraded the
-job gets the full ``kill_wait_secs``.
+job gets the full ``timeout_kill_wait_secs``.
 
 .. _preempt-grace-upgrade-notes:
 
@@ -875,8 +881,11 @@ one.
 
 **Upgrade every controller before setting a partition ``GraceTime``.** The
 partition's ``grace_time`` is a new field in the partition entries of the Raft
-log and snapshots. A controller that predates it ignores the field, so a
-follower that is not upgraded would lack the grace if it became leader.
+log and snapshots, including the entry that ``scontrol update partition
+GraceTime=`` writes. A controller that predates it ignores the field, so a
+change applied while a follower is not upgraded is lost on that follower, which
+would lack the grace if it became leader, until it replays from a new snapshot.
+This is already required before setting a QOS ``GraceTime`` (see below).
 
 **Upgrade the leader last.** The first preemption that starts a grace writes a
 new Raft log entry, ``JobPreemptSignaled``. A controller that predates it

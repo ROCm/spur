@@ -905,9 +905,10 @@ choose ``cancel`` or ``requeue`` when the pending job needs capacity freed.
 ``sacctmgr modify qos name=<name> set GraceTime=600`` (keys are
 case-insensitive) and shown by ``sacctmgr show qos --long`` or
 ``format=GraceTime``. The victim's QOS value applies, not the preemptor's. A
-partition can carry one too (``grace_time`` under ``[[partitions]]``, or
-``scontrol update PartitionName=<name> GraceTime=600`` at runtime). Resolution
-order, as for ``preempt_exempt_time``:
+partition can carry one too (``grace_time`` under ``[[partitions]]``,
+``scontrol create PartitionName=<name> GraceTime=600``, or ``scontrol update
+PartitionName=<name> GraceTime=600`` at runtime). Resolution order, as for
+``preempt_exempt_time``:
 
 #. The victim's QOS ``GraceTime``, if set. ``GraceTime=0`` is a set value: it
    explicitly means no grace and overrides a partition's.
@@ -935,11 +936,12 @@ When a pending job selects a victim that has a grace:
    gets no warning and sees nothing until the final kill, so users who want
    to checkpoint on preemption must launch their work with ``srun``.
 #. The victim stays ``RUNNING`` (``R`` in ``squeue``) and keeps its nodes for
-   the whole grace. ``scontrol show job`` shows ``PreemptTime=`` (when the
+   the whole grace, until the deadline or until every node has reported the
+   job finished. ``scontrol show job`` shows ``PreemptTime=`` (when the
    warning was sent) and sets ``EndTime=`` to the grace deadline.
 #. At the deadline the normal preemption runs: SIGTERM to every process of the
-   job, a wait of up to ``kill_wait_secs`` (see :doc:`configuration`; it ends
-   early once the processes exit), then SIGKILL. The job therefore receives a
+   job, a wait of up to ``kill_wait_secs`` (default 5 seconds; see
+   :doc:`configuration`; it ends early once the processes exit), then SIGKILL. The job therefore receives a
    second SIGTERM and should tolerate it. In ``cancel`` mode the job ends
    ``CANCELLED`` (``PREEMPTED`` in ``sacct``, with ``PreemptedBy``); in
    ``requeue`` mode it returns to ``PENDING``.
@@ -950,7 +952,18 @@ Rules that follow from this:
   if the preemptor is cancelled or no longer needs the nodes.
 * **A job that exits during its grace** is recorded as ``PREEMPTED`` in
   ``cancel`` mode, or re-queued in ``requeue`` mode, and frees its nodes as
-  soon as it exits.
+  soon as every node has finished.
+* **A node that finishes early does not end the job.** The grace is not cut
+  short: the job stays ``RUNNING``, and nothing is signalled on the other
+  nodes. The finished node is freed at once (the preemptor is waiting for it)
+  and the other nodes are left alone. This matters for multi-node jobs where
+  one rank exits early, for example after writing its checkpoint, while the
+  others are still writing theirs. For a batch script that launches its ranks
+  with ``srun``, ranks exiting do not end the job: it ends when the batch
+  script exits, at which point the remaining nodes are stopped and the job is
+  recorded ``PREEMPTED`` (or re-queued), or at the deadline, whichever comes
+  first. At the deadline, only the nodes that have not yet finished are
+  stopped.
 * **A user cancel during the grace wins.** After ``scancel`` the job ends as the
   user's cancel, not as preempted.
 * **Suspending is refused.** ``scontrol suspend`` on a job in its grace fails.
