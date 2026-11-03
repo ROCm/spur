@@ -3618,6 +3618,35 @@ mod tests {
     }
 
     #[test]
+    fn republished_takes_only_the_same_supervisors_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let mut at_launch = descriptor(9, 1, std::process::id());
+        at_launch.socket_path = store
+            .session_dir(9, 1, spur_core::step::STEP_BATCH)
+            .join("runtime.sock");
+        let mut started = at_launch.clone();
+        started.workload_pid = 4242;
+        store.publish(&started).expect("publish started descriptor");
+
+        assert_eq!(
+            republished(&at_launch).map(|published| published.workload_pid),
+            Some(4242),
+            "the supervisor's own later record names its workload"
+        );
+
+        let mut reused_pid = started.clone();
+        reused_pid.process_start_ticks += 1;
+        store
+            .publish(&reused_pid)
+            .expect("publish another supervisor");
+        assert!(
+            republished(&at_launch).is_none(),
+            "a record from another supervisor must not name this run's workload"
+        );
+    }
+
+    #[test]
     fn claim_session_dir_refuses_a_directory_a_live_supervisor_owns() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = StepdStore::new(temp.path());
