@@ -122,6 +122,7 @@ class TestRequeuedRunReclaim:
                 wait_node_state(cluster, name, ["down"], timeout=NODE_DOWN_BOUND)
                 wait_job_state(cluster, job_id, "PD", timeout=60)
                 node.exec_allow_fail(f"rm -f {batch_pid}")
+                assert pid_alive(node, old_batch), "the batch script outlives its node going Down"
                 assert pid_alive(node, old_step), "the step outlives its node going Down"
 
             # Pinned to this node, the job runs here again; the old run must not run beside it.

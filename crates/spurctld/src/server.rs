@@ -7681,6 +7681,23 @@ mod tests {
             !is_reclaimable(&cluster, "n1", &report_run(84, 2)),
             "a newer run than the one placed on n2 is not stale on n1"
         );
+
+        place(&cluster, 87, &["n1"], 1);
+        cluster.apply_operation(&WalOperation::job_state_change(
+            87,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cluster.apply_operation(&WalOperation::JobCancelSignaled {
+            job_id: 87,
+            at: Utc::now() - chrono::Duration::seconds(300),
+            cancel: None,
+        });
+        assert!(is_reclaimable(&cluster, "n1", &report_run(87, 1)));
+        assert!(
+            !is_reclaimable(&cluster, "n1", &report_run(87, 2)),
+            "a long-ago cancel does not make a run the controller has not seen stale"
+        );
     }
 
     /// A lagging controller that has not applied a job's first placement must not end

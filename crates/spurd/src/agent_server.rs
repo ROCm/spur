@@ -782,6 +782,9 @@ async fn fence_older_runs(
             .filter(|descriptor| descriptor.run_attempt < run_attempt)
             .collect();
     older.sort_by_key(|descriptor| !spur_core::step::owns_job_lifetime(descriptor.step_id));
+    let mut older_runs: Vec<u32> = older.iter().map(|d| d.run_attempt).collect();
+    older_runs.sort_unstable();
+    older_runs.dedup();
     for descriptor in older {
         let still_tracked = stepds
             .lock()
@@ -793,6 +796,13 @@ async fn fence_older_runs(
         }
         fence_stepd(stepds, &descriptor).await?;
         settle_fenced_session(completions, &descriptor).await;
+    }
+    // Fencing reaps each supervisor's own leaf; the old run's job node above them is left.
+    for run_attempt in older_runs {
+        crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
+            job_id,
+            run_attempt,
+        ));
     }
     Ok(())
 }
@@ -857,10 +867,9 @@ async fn claim_stepd_slot(
     descriptor: crate::stepd::StepdDescriptor,
 ) -> Result<(), crate::stepd::StepdDescriptor> {
     let mut sessions = stepds.lock().await;
-    if stepds_for_job(&sessions, descriptor.job_id)
-        .iter()
-        .any(|existing| existing.run_attempt > descriptor.run_attempt)
-    {
+    if sessions.iter().any(|((job_id, _), existing)| {
+        *job_id == descriptor.job_id && existing.run_attempt > descriptor.run_attempt
+    }) {
         return Err(descriptor);
     }
     sessions.insert(stepd_key(&descriptor), descriptor);
@@ -6066,14 +6075,8 @@ impl SlurmAgent for AgentService {
                 runtime_attempt_already_tracked(&self.stepds, job_id, launch_step, run_attempt)
                     .await;
             if already_tracked {
-                // Idempotent retry: this exact attempt is already tracked and
-                // alive on this node (e.g. spurctld retried after losing the
-                // ack for a LaunchJob it had already delivered, since a
-                // dispatch failure never advances run_attempt before the next
-                // requeue). Report success without touching the live
-                // allocation or session — allocate_local_resources below
-                // would otherwise release and reallocate resources out from
-                // under the still-running process before fencing ever runs.
+                // A retried launch of a run already live here: the fence below accepts an
+                // equal attempt, so it would stop this very run's supervisor.
                 let paths = self
                     .running
                     .lock()
@@ -7603,7 +7606,7 @@ impl SlurmAgent for AgentService {
                 req.job_id
             )));
         }
-        jobs.insert(
+        let replaced = jobs.insert(
             req.job_id,
             TrackedJob {
                 fabric_binding: fabric_binding.clone(),
@@ -7641,6 +7644,12 @@ impl SlurmAgent for AgentService {
             .commit_job(req.job_id, req.run_attempt);
         reservation_guard.disarm();
         drop(jobs);
+        if let Some(older) = replaced {
+            self.interactive_launch_steps
+                .lock()
+                .await
+                .remove(&(req.job_id, older.run_attempt));
+        }
 
         Ok(Response::new(RegisterJobAllocationResponse {
             failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
@@ -11366,8 +11375,7 @@ mod tests {
         assert_eq!(sessions.lock().await.len(), 1);
     }
 
-    /// The newest run of the job's own session decides which run is tracked, in any arrival order.
-    /// A session of `run_attempt` whose resources and owner name that run.
+    /// A session of `run_attempt` whose resources and uid name that run.
     fn session_of_run(
         run_attempt: u32,
         step_id: spur_core::step::StepId,
@@ -11436,6 +11444,102 @@ mod tests {
                 .contains_key(&(79, spur_core::step::STEP_EXTERN)),
             "the live supervisor must still be tracked"
         );
+    }
+
+    /// A run-1 session of `step_id` whose teardown can never be confirmed, tracked by `svc`
+    /// together with run 1's ledger entry and job record.
+    async fn seed_unfenceable_run(
+        svc: &AgentService,
+        step_id: spur_core::step::StepId,
+        cgroup_root: &tempfile::TempDir,
+    ) {
+        let cgroup = TestCgroup::new(cgroup_root);
+        std::fs::write(cgroup.path().join("cgroup.procs"), "not-a-pid\n")
+            .expect("seed a permanent removal blocker");
+        let mut stuck = session_for(1, step_id);
+        stuck.cgroup_path = cgroup.path().to_path_buf();
+        svc.stepds.lock().await.insert(stepd_key(&stuck), stuck);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let mut ledger = svc.allocation.lock().await;
+        ledger
+            .allocate_for_job(79, 1, 1, 0, &[])
+            .expect("reserve run 1");
+        assert!(ledger.commit_job(79, 1));
+    }
+
+    async fn assert_run_one_kept(svc: &AgentService, step_id: spur_core::step::StepId) {
+        assert_eq!(svc.allocation.lock().await.owner_attempt(79), Some(1));
+        assert!(svc.stepds.lock().await.contains_key(&(79, step_id)));
+        assert_eq!(
+            svc.running.lock().await.get(&79).map(|t| t.run_attempt),
+            Some(1)
+        );
+    }
+
+    /// The fence runs before the new run reserves anything, so when it fails the old run,
+    /// still running, keeps its ledger entry rather than losing it to the abandoned launch.
+    #[tokio::test]
+    async fn a_launch_whose_fence_fails_leaves_the_old_run_reserved() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        seed_unfenceable_run(&svc, spur_core::step::STEP_BATCH, &cgroup_root).await;
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 79,
+                run_attempt: 2,
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unconfirmed fence must refuse the launch");
+
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_run_one_kept(&svc, spur_core::step::STEP_BATCH).await;
+    }
+
+    #[tokio::test]
+    async fn an_allocation_whose_fence_fails_leaves_the_old_run_reserved() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        seed_unfenceable_run(&svc, spur_core::step::STEP_EXTERN, &cgroup_root).await;
+
+        let refused = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 79,
+                cpus: 1,
+                run_attempt: 2,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unconfirmed fence must refuse the allocation");
+
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_run_one_kept(&svc, spur_core::step::STEP_EXTERN).await;
+    }
+
+    /// A late launch of an older run must not claim any slot of a job whose newer run is
+    /// tracked, not just the slot that newer run holds.
+    #[tokio::test]
+    async fn an_older_run_cannot_claim_a_slot_beside_a_newer_one() {
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        let newer = session_for(2, 0);
+        sessions.lock().await.insert(stepd_key(&newer), newer);
+
+        let late = session_for(1, spur_core::step::STEP_BATCH);
+        assert!(claim_stepd_slot(&sessions, late).await.is_err());
+        assert_eq!(sessions.lock().await.len(), 1);
     }
 
     #[tokio::test]

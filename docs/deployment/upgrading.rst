@@ -777,7 +777,7 @@ as agents are upgraded; an agent from an earlier release keeps the old
 behavior. An upgraded agent also stops the old run's processes, including its
 ``srun`` steps, when the job is placed back on the same node, which an earlier
 agent could miss for a run without a cgroup (``[cgroup] enabled = false``, or
-``spurd`` not running as root).
+``spurd`` cannot create cgroups, for example when not running as root).
 
 See Also
 --------
