@@ -14,9 +14,18 @@ from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job, wait_j
 
 @pytest.fixture
 def handoff_cluster(ssh_nodes, remote_bin_dir):
-    if len(ssh_nodes) < 3:
-        pytest.skip("handoff tests require three nodes")
-    c = SpurCluster(ssh_nodes[:3], make_remote_dir(), remote_bin_dir)
+    yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 3)
+
+
+@pytest.fixture
+def wide_handoff_cluster(ssh_nodes, remote_bin_dir):
+    yield from _handoff_cluster(ssh_nodes, remote_bin_dir, 4)
+
+
+def _handoff_cluster(ssh_nodes, remote_bin_dir, count):
+    if len(ssh_nodes) < count:
+        pytest.skip(f"this handoff test requires {count} nodes")
+    c = SpurCluster(ssh_nodes[:count], make_remote_dir(), remote_bin_dir)
     try:
         c.enable_accounting()
     except RuntimeError as exc:
@@ -28,7 +37,12 @@ def handoff_cluster(ssh_nodes, remote_bin_dir):
             '#!/bin/bash\n'
             f'gate={shlex.quote(c.remote_dir)}/hold-$SPUR_JOB_ID\n'
             'touch "$gate.entered"\n'
-            'while [ -e "$gate" ]; do sleep 0.1; done\n',
+            # A gate holding a deadline (epoch ns) opens itself, so nodes can release together.
+            'while [ -e "$gate" ]; do\n'
+            '  at=$(cat "$gate" 2>/dev/null)\n'
+            '  [ -n "$at" ] && [ "$(date +%s%N)" -ge "$at" ] && break\n'
+            '  sleep 0.02\n'
+            'done\n',
             all_nodes=True,
         )
         # A broad stale-daemon sweep would also stop unrelated Spur daemons sharing these hosts.
@@ -60,9 +74,9 @@ def handoff_cluster(ssh_nodes, remote_bin_dir):
         c.teardown()
 
 
-def _submit(c, name, qos, nodes=None, count=1, limit="10:00", sleep=600):
+def _submit(c, name, qos, nodes=None, count=1, limit="10:00", sleep=600, extra=()):
     script = c.write_file(f"{name}.sh", f"#!/bin/bash\nsleep {sleep}\n", all_nodes=True)
-    args = ["--exclusive", f"-N{count}", "-t", limit, "-J", name, "-q", qos]
+    args = ["--exclusive", f"-N{count}", "-t", limit, "-J", name, "-q", qos, *extra]
     if nodes:
         args.append(f"--nodelist={nodes}")
     jid = parse_job_id(c.sbatch(args + [script]))
@@ -212,3 +226,34 @@ def test_wide_job_behind_handoff_owner_keeps_its_planned_slot(handoff_cluster):
         time.sleep(0.5)
     assert "NumNodes=2" in _state(c, wide, "RUNNING")
     _state(c, narrow, "PENDING")
+
+
+def _preempted_by(c, job):
+    match = re.search(r"PreemptedBy=(\d+)", c.scontrol("show", "job", str(job)))
+    return int(match.group(1)) if match else None
+
+
+def test_wide_preemptor_uses_the_node_an_owner_left_unused(wide_handoff_cluster):
+    c = wide_handoff_cluster
+    n1, n2, n3, n4 = c.node_names
+    victim = _submit(c, "victim", "victim-a", f"{n1},{n2}", 2)
+    low = [_submit(c, f"low{i}", "victim-b", node) for i, node in ((3, n3), (4, n4))]
+    for jid in (victim, *low):
+        wait_job_state(c, jid, "R", timeout=60)
+    _gate(c, victim, [0, 1], True)
+    owner = _submit(c, "owner", "hunter-a")
+    _wait_epilog(c, victim, [0, 1])
+    assert f"PreemptedBy={owner}" in _state(c, victim, "COMPLETING")
+    # Eligible only once the victim ends, so it first searches in the pass the owner is placed.
+    wide = _submit(c, "wide", "hunter-b", count=2, extra=[f"--dependency=afterany:{victim}"])
+    _assert_pending_for_passes(c, [wide])
+    at = time.time_ns() + 2_000_000_000
+    path = shlex.quote(f"{c.remote_dir}/hold-{victim}")
+    for index in (0, 1):
+        c.nodes[index].exec(f"echo {at} > {path}")
+    wait_job_state(c, owner, "R", timeout=60)
+    wait_job_state(c, wide, "R", timeout=120)
+    evicted = [jid for jid in low if _preempted_by(c, jid) == wide]
+    assert len(evicted) == 1, f"wide job evicted {evicted} of {low}"
+    show = _state(c, wide, "RUNNING")
+    assert "NumNodes=2" in show, show
