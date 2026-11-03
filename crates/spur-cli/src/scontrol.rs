@@ -2564,11 +2564,22 @@ mod tests {
         }
         let out = format_job_detail(&job);
         assert!(
-            out.contains("FabricNode=n1 ") && out.contains("BindingVersion=1\n"),
-            "{out}"
+            out.lines()
+                .any(|line| line.starts_with("   FabricNode=n1 ")
+                    && line.ends_with(" BindingVersion=1")),
+            "native binding must include BindingVersion=1 on its node's line"
         );
-        assert!(out.contains("BindingVersion=2\n"), "{out}");
-        assert_eq!(out.matches("BlockFileRevision=").count(), 1, "{out}");
+        assert!(
+            out.lines()
+                .any(|line| line.starts_with("   FabricNode=n2 ")
+                    && line.ends_with(" BindingVersion=2")),
+            "file binding must include BindingVersion=2 on its node's line"
+        );
+        assert_eq!(
+            out.matches("BlockFileRevision=").count(),
+            1,
+            "only the file binding should include a block file revision"
+        );
     }
 
     #[test]
