@@ -258,7 +258,7 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             max_wall_minutes: limit_from_db(r.max_wall_min),
             grp_wall_minutes: limit_from_db(r.grp_wall_min),
             preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
-            grace_time: u32::try_from(r.grace_time).unwrap_or(0),
+            grace_time: r.grace_time.map(|v| v as u32),
         },
         usage_factor: r.usage_factor,
         deny_on_limit: parse_deny_on_limit(&r.flags),
@@ -383,7 +383,7 @@ mod tests {
             grp_tres: None,
             grp_wall_min: None,
             preempt_exempt_time: None,
-            grace_time: 0,
+            grace_time: None,
             idle_fill_preemptable: false,
             flags: String::new(),
         }
@@ -435,7 +435,7 @@ mod tests {
             grp_tres: Some("gpu=8".into()),
             grp_wall_min: Some(120),
             preempt_exempt_time: None,
-            grace_time: 600,
+            grace_time: Some(600),
             flags: "DenyOnLimit".into(),
         };
 
@@ -471,7 +471,7 @@ mod tests {
             64
         );
         assert!(qos.limits.grp_tres.is_some());
-        assert_eq!(qos.limits.grace_time, 600);
+        assert_eq!(qos.limits.grace_time, Some(600));
         assert!(qos.idle_fill_preemptable);
     }
 
@@ -497,7 +497,7 @@ mod tests {
             grp_tres: None,
             grp_wall_min: None,
             preempt_exempt_time: None,
-            grace_time: 0,
+            grace_time: None,
             flags: String::new(),
         };
 

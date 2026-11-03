@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS qos (
     max_wall_min    INTEGER,
     grp_wall_min    INTEGER,
     preempt_exempt_time INTEGER,
-    grace_time      INTEGER NOT NULL DEFAULT 0,
+    grace_time      INTEGER,
     flags           TEXT NOT NULL DEFAULT '',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -165,7 +165,7 @@ ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
-ALTER TABLE qos ADD COLUMN IF NOT EXISTS grace_time INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS grace_time INTEGER;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS idle_fill_preemptable BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
@@ -1859,8 +1859,7 @@ pub struct QosUpdate<'a> {
     pub grp_tres: Option<Option<&'a str>>,
     pub grp_wall_min: Option<Option<i32>>,
     pub preempt_exempt_time: Option<Option<i32>>,
-    /// Seconds; the column is NOT NULL, so there is no clear, only a new value.
-    pub grace_time: Option<i32>,
+    pub grace_time: Option<Option<i32>>,
     pub idle_fill_preemptable: Option<bool>,
     pub flags: Option<&'a str>,
 }
@@ -1924,7 +1923,7 @@ pub async fn upsert_qos<'a>(
         updates.push(("preempt_exempt_time", SqlVal::NullInt(v)));
     }
     if let Some(v) = u.grace_time {
-        updates.push(("grace_time", SqlVal::Int(v)));
+        updates.push(("grace_time", SqlVal::NullInt(v)));
     }
     if let Some(v) = u.flags {
         updates.push(("flags", SqlVal::Text(v)));
@@ -2023,7 +2022,7 @@ pub struct QosRecord {
     pub grp_tres: Option<String>,
     pub grp_wall_min: Option<i32>,
     pub preempt_exempt_time: Option<i32>,
-    pub grace_time: i32,
+    pub grace_time: Option<i32>,
     pub idle_fill_preemptable: bool,
     pub flags: String,
 }
@@ -3370,7 +3369,7 @@ mod job_history_tests {
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
-    async fn qos_grace_time_round_trips() -> anyhow::Result<()> {
+    async fn qos_grace_time_unset_vs_zero_round_trips() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let name = format!("spur_qos_grace_{}", std::process::id());
         sqlx::query("DELETE FROM qos WHERE name = $1")
@@ -3378,7 +3377,7 @@ mod job_history_tests {
             .execute(&pool)
             .await?;
 
-        async fn grace_time_of(pool: &PgPool, name: &str) -> anyhow::Result<i32> {
+        async fn grace_time_of(pool: &PgPool, name: &str) -> anyhow::Result<Option<i32>> {
             let got = list_qos(pool)
                 .await?
                 .into_iter()
@@ -3391,12 +3390,23 @@ mod job_history_tests {
             &mut *pool.acquire().await?,
             &name,
             QosUpdate {
-                grace_time: Some(600),
+                description: Some("created without a grace time"),
                 ..Default::default()
             },
         )
         .await?;
-        assert_eq!(grace_time_of(&pool, &name).await?, 600);
+        assert_eq!(grace_time_of(&pool, &name).await?, None);
+
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                grace_time: Some(Some(600)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(grace_time_of(&pool, &name).await?, Some(600));
 
         upsert_qos(
             &mut *pool.acquire().await?,
@@ -3407,18 +3417,29 @@ mod job_history_tests {
             },
         )
         .await?;
-        assert_eq!(grace_time_of(&pool, &name).await?, 600);
+        assert_eq!(grace_time_of(&pool, &name).await?, Some(600));
 
         upsert_qos(
             &mut *pool.acquire().await?,
             &name,
             QosUpdate {
-                grace_time: Some(0),
+                grace_time: Some(Some(0)),
                 ..Default::default()
             },
         )
         .await?;
-        assert_eq!(grace_time_of(&pool, &name).await?, 0);
+        assert_eq!(grace_time_of(&pool, &name).await?, Some(0));
+
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                grace_time: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(grace_time_of(&pool, &name).await?, None);
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)

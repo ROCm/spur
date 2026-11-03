@@ -1422,7 +1422,7 @@ pub(crate) async fn try_preempt(
             let grace_secs = victim_grace_secs(
                 candidate,
                 *mode,
-                candidate_qos.limits.grace_time,
+                candidate_qos.limits.grace_time.unwrap_or(0),
                 cluster_nodes,
                 now,
             );
@@ -9203,7 +9203,7 @@ mod tests {
                     name: "low".into(),
                     priority: 100,
                     limits: QosLimits {
-                        grace_time: victim_grace,
+                        grace_time: Some(victim_grace),
                         ..Default::default()
                     },
                     ..Default::default()

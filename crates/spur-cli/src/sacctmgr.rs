@@ -91,13 +91,15 @@ Fields (key=value), by entity:
   user      name, account, defaultaccount, adminlevel, defaultqos, qos,
             maxrunningjobs, maxsubmitjobs, grpsubmit, maxtresperjob, grptres, maxwall
   qos       name, description, priority, preemptmode, preempt, preemptexempttime,
-            clearpreemptexempttime, gracetime, idlefillpreemptable, usagefactor,
-            maxjobsperuser, maxwall, maxtresperjob, maxsubmitjobsperuser,
+            clearpreemptexempttime, gracetime, cleargracetime, idlefillpreemptable,
+            usagefactor, maxjobsperuser, maxwall, maxtresperjob, maxsubmitjobsperuser,
             maxsubmitjobsperaccount, grpsubmit, maxtresperuser, grptres, grpwall, flags
 
 Note: clearpreemptexempttime=1 clears a QOS preempt-exempt override back to NULL
 (inherit from partition/global); a bare clearpreemptexempttime does nothing.
-This differs from preemptexempttime=0, which sets an explicit zero exemption.";
+This differs from preemptexempttime=0, which sets an explicit zero exemption.
+cleargracetime=1 likewise resets a QOS GraceTime to unset (inherit the
+partition's), unlike gracetime=0, which means no grace.";
 
 /// `key=value` selectors `delete` accepts, per entity. Distinct from the write
 /// fields: delete only *selects* what to remove, and advertising a write field
@@ -210,6 +212,7 @@ const QOS_KEYS: &[&str] = &[
     "preempt",
     "preemptexempttime",
     "clearpreemptexempttime",
+    "cleargracetime",
     "gracetime",
     "idlefillpreemptable",
     "usagefactor",
@@ -799,6 +802,7 @@ fn build_add_qos_request(
             .map(|v| parse_u32("preemptexempttime", v))
             .transpose()?,
         clear_preempt_exempt_time: false,
+        clear_grace_time: false,
         grace_time: p
             .get("gracetime")
             .map(|v| parse_u32("gracetime", v))
@@ -874,6 +878,10 @@ fn build_modify_qos_request(
             .transpose()?,
         clear_preempt_exempt_time: p
             .get("clearpreemptexempttime")
+            .map(|v| is_truthy(v))
+            .unwrap_or(false),
+        clear_grace_time: p
+            .get("cleargracetime")
             .map(|v| is_truthy(v))
             .unwrap_or(false),
         grace_time: p
@@ -1579,7 +1587,7 @@ fn resolve_qos_field(q: &QosInfo, spec: char) -> String {
         'P' => q.preempt_mode.clone(),
         'Q' => q.preempt.clone(),
         'E' => q.preempt_exempt_time.map(blank_if_zero).unwrap_or_default(),
-        'g' => blank_if_zero(q.grace_time),
+        'g' => q.grace_time.map(|v| v.to_string()).unwrap_or_default(),
         'I' => if q.idle_fill_preemptable { "yes" } else { "no" }.into(),
         'U' => format!("{}", q.usage_factor),
         'G' => q.grp_tres.clone(),
@@ -3072,7 +3080,7 @@ mod tests {
         )
         .expect("all format resolves");
         let q = QosInfo {
-            grace_time: 600,
+            grace_time: Some(600),
             ..stub_qos()
         };
 
@@ -3093,7 +3101,7 @@ mod tests {
         let fields =
             format_engine::parse_named_format("Name,GraceTime", &qos_field_spec, &qos_header);
         let q = QosInfo {
-            grace_time: 600,
+            grace_time: Some(600),
             ..stub_qos()
         };
         let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&q, spec));
@@ -3102,10 +3110,46 @@ mod tests {
     }
 
     #[test]
-    fn zero_gracetime_renders_blank() {
+    fn show_qos_blank_when_grace_time_unset() {
         let fields = format_engine::parse_named_format("GraceTime", &qos_field_spec, &qos_header);
         let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&stub_qos(), spec));
         assert!(row.trim().is_empty(), "row: {row:?}");
+    }
+
+    #[test]
+    fn show_qos_shows_explicit_zero_as_0() {
+        let fields = format_engine::parse_named_format("GraceTime", &qos_field_spec, &qos_header);
+        let q = QosInfo {
+            grace_time: Some(0),
+            ..stub_qos()
+        };
+        let row = format_engine::format_row(&fields, &|spec| resolve_qos_field(&q, spec));
+        assert_eq!(row.trim(), "0");
+    }
+
+    #[test]
+    fn cleargracetime_requires_truthy_value() {
+        let params = |value: &str| -> std::collections::HashMap<String, String> {
+            [
+                ("name".into(), "q".into()),
+                ("cleargracetime".into(), value.into()),
+            ]
+            .into_iter()
+            .collect()
+        };
+        let bare = build_modify_qos_request(&params("")).unwrap();
+        assert!(!bare.clear_grace_time, "bare key must not clear");
+        let cleared = build_modify_qos_request(&params("1")).unwrap();
+        assert!(cleared.clear_grace_time);
+        assert_eq!(cleared.grace_time, None);
+    }
+
+    #[test]
+    fn add_qos_never_clears_grace_time() {
+        let p = parse_params(&["name=q".into(), "gracetime=0".into()]);
+        let req = build_add_qos_request(&p).unwrap();
+        assert!(!req.clear_grace_time);
+        assert_eq!(req.grace_time, Some(0));
     }
 
     #[test]

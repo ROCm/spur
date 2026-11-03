@@ -535,13 +535,15 @@ QOS keys
        exemption). To revert to inheriting from the partition or global default:
        ``sacctmgr modify qos name=<name> set clearpreemptexempttime=1``.
    * - ``gracetime``
-     - ``0`` (no grace)
+     - unset (inherits the partition's ``GraceTime``)
      - Seconds a job in this QOS is given to wind down (checkpoint, flush
        output) between the preemption warning and the kill, when it is
        preempted in ``cancel`` or ``requeue`` mode. The *victim's* QOS value
        applies, not the preemptor's. It is capped at the victim's remaining
-       time limit, and ``0`` means no grace period. See :ref:`preemption grace
-       time <qos-preempt-grace>`.
+       time limit. Unset inherits the partition's ``GraceTime``, and ``0``
+       means no grace period. To revert to unset:
+       ``sacctmgr modify qos name=<name> set cleargracetime=1``. See
+       :ref:`preemption grace time <qos-preempt-grace>`.
    * - ``usagefactor``
      - ``1.0``
      - Multiplier applied to both CPU and GPU usage charged under this QOS.
@@ -902,9 +904,13 @@ choose ``cancel`` or ``requeue`` when the pending job needs capacity freed.
 ``GraceTime`` is a per-QOS value in seconds, set with
 ``sacctmgr modify qos name=<name> set GraceTime=600`` (keys are
 case-insensitive) and shown by ``sacctmgr show qos --long`` or
-``format=GraceTime``. The victim's QOS value applies, not the preemptor's, and
-there is no per-partition ``GraceTime``. ``0`` (the default) means no grace: the
-victim is preempted at once, as in earlier releases.
+``format=GraceTime``. The victim's QOS value applies, not the preemptor's. A QOS
+with no ``GraceTime`` set (the default) inherits the partition's, and with none
+anywhere the victim is
+preempted at once, as in earlier releases. ``GraceTime=0`` explicitly means no
+grace. ``sacctmgr modify qos name=<name> set cleargracetime=1`` returns a QOS
+to unset; ``show qos`` leaves the column blank for unset and prints ``0`` for an
+explicit zero.
 
 The grace a victim gets is ``min(GraceTime, time left before the victim's own
 time limit)``; a victim with no time limit is not capped. It applies to

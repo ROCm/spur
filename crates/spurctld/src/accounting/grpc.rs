@@ -75,12 +75,18 @@ fn nullable_limit(field: Option<u32>, what: &str) -> Result<Option<Option<i32>>,
     }
 }
 
-/// Map the optional `grace_time` proto field to a column patch: unset -> keep,
-/// n -> store n (0 means no grace). Errors if `n` overflows i32.
-fn grace_time_patch(field: Option<u32>) -> Result<Option<i32>, Status> {
+/// Map the `grace_time` proto fields to a column patch: `clear` -> NULL
+/// (inherit the partition's), unset -> keep, n -> store n (0 means no grace).
+/// Errors if `n` overflows i32.
+fn grace_time_patch(field: Option<u32>, clear: bool) -> Result<Option<Option<i32>>, Status> {
+    if clear {
+        return Ok(Some(None));
+    }
     field
         .map(|n| {
-            i32::try_from(n).map_err(|_| Status::invalid_argument("grace_time exceeds i32::MAX"))
+            i32::try_from(n)
+                .map(Some)
+                .map_err(|_| Status::invalid_argument("grace_time exceeds i32::MAX"))
         })
         .transpose()
 }
@@ -105,7 +111,7 @@ fn qos_info_from_record(r: db::QosRecord) -> QosInfo {
         max_submit_jobs_per_account: limit_to_wire(r.max_submit_per_account),
         grp_submit_jobs: limit_to_wire(r.grp_submit_jobs),
         flags: r.flags,
-        grace_time: u32::try_from(r.grace_time).unwrap_or(0),
+        grace_time: r.grace_time.map(|v| v as u32),
     }
 }
 
@@ -1113,7 +1119,7 @@ impl SlurmAccounting for AccountingService {
             } else {
                 req.preempt_exempt_time.map(|v| Some(v as i32))
             },
-            grace_time: grace_time_patch(req.grace_time)?,
+            grace_time: grace_time_patch(req.grace_time, req.clear_grace_time)?,
             flags: flags.as_deref(),
         };
         let mut tx = pool.begin().await.map_err(internal)?;
@@ -1755,21 +1761,27 @@ mod tests {
 
     #[test]
     fn grace_time_patch_keeps_when_absent_and_stores_literal_zero() {
-        assert_eq!(grace_time_patch(None).unwrap(), None);
-        assert_eq!(grace_time_patch(Some(0)).unwrap(), Some(0));
-        assert_eq!(grace_time_patch(Some(600)).unwrap(), Some(600));
+        assert_eq!(grace_time_patch(None, false).unwrap(), None);
+        assert_eq!(grace_time_patch(Some(0), false).unwrap(), Some(Some(0)));
+        assert_eq!(grace_time_patch(Some(600), false).unwrap(), Some(Some(600)));
+    }
+
+    #[test]
+    fn grace_time_patch_clear_writes_null_and_wins_over_a_value() {
+        assert_eq!(grace_time_patch(None, true).unwrap(), Some(None));
+        assert_eq!(grace_time_patch(Some(600), true).unwrap(), Some(None));
     }
 
     #[test]
     fn grace_time_patch_rejects_over_i32_max() {
-        let err = grace_time_patch(Some(i32::MAX as u32 + 1)).unwrap_err();
+        let err = grace_time_patch(Some(i32::MAX as u32 + 1), false).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("grace_time"));
     }
 
     #[test]
-    fn qos_info_from_record_copies_grace_time() {
-        let record = db::QosRecord {
+    fn qos_info_from_record_keeps_unset_grace_time_distinct_from_zero() {
+        let record = |grace_time| db::QosRecord {
             name: "preemptible".into(),
             description: String::new(),
             priority: 0,
@@ -1786,11 +1798,16 @@ mod tests {
             grp_tres: None,
             grp_wall_min: None,
             preempt_exempt_time: None,
-            grace_time: 600,
+            grace_time,
             idle_fill_preemptable: false,
             flags: String::new(),
         };
-        assert_eq!(qos_info_from_record(record).grace_time, 600);
+        assert_eq!(
+            qos_info_from_record(record(Some(600))).grace_time,
+            Some(600)
+        );
+        assert_eq!(qos_info_from_record(record(Some(0))).grace_time, Some(0));
+        assert_eq!(qos_info_from_record(record(None)).grace_time, None);
     }
 
     #[test]

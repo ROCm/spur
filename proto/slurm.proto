@@ -2020,6 +2020,9 @@ message CreateQosRequest {
   // Seconds a preempted job in this QOS is given to wind down before it is
   // cancelled. 0 = no grace. Absent = no change on update.
   optional uint32 grace_time = 20;
+  // Set to true to clear grace_time back to NULL (inherit the partition's
+  // GraceTime). Takes precedence over grace_time.
+  bool clear_grace_time = 21;
 }
 
 message DeleteQosRequest {
@@ -2056,8 +2059,8 @@ message QosInfo {
   // never stamped, can still be called back for a job holding a quota claim.
   bool idle_fill_preemptable = 19;
   // Seconds a preempted job in this QOS is given to wind down before it is
-  // cancelled. 0 = no grace.
-  uint32 grace_time = 20;
+  // cancelled. Absent = unset (inherits the partition's GraceTime); 0 = no grace.
+  optional uint32 grace_time = 20;
 }
 
 // ============================================================
