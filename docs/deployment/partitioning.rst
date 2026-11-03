@@ -156,3 +156,11 @@ Verifying Membership
 
    # Partitions each node belongs to
    sinfo -N -o "%N %P"
+
+Sharing Nodes Between Partitions
+--------------------------------
+
+A node can belong to several partitions. To stop one partition from using up
+resources another one depends on (for example, CPU jobs taking every core of a
+GPU node), cap what each partition may use per node. See
+:doc:`/admin-guide/partition-resource-limits`.

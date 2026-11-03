@@ -166,6 +166,7 @@ forgeable
 forks
 gapped
 GiB
+TiB
 GPUs
 GrpTRES
 GrpWall
