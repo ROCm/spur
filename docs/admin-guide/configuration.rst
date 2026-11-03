@@ -569,9 +569,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        resources are released. If that drain cannot be committed, the job
        retains its allocation and the controller retries. A node reports only
        after the job is killed and its cgroup cleanup finishes, so this should
-       exceed the larger of ``kill_wait_secs`` and ``timeout_kill_wait_secs``
-       plus ``[cgroup] cleanup_timeout_secs``; the controller logs a warning
-       when it does not.
+       exceed the larger kill wait (``kill_wait_secs`` or
+       ``timeout_kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``; the
+       controller logs a warning when it does not.
    * - ``kill_wait_secs``
      - integer
      - ``5``
@@ -581,11 +581,12 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        preemption, idle-fill reclaim, reservation end, stopping the other nodes
        of a job whose batch script has exited, and other graceful stops.
        Ends early once the job's processes exit. Valid ``0``-``65533``; values
-       below 5 act as 5. ``complete_wait_secs`` should exceed the larger of this
-       and ``timeout_kill_wait_secs`` plus ``[cgroup] cleanup_timeout_secs``,
-       or a healthy node still being killed or cleaned up is drained when the
-       job is force-finished; the controller logs a warning when it does not. Known
-       issue: a requeued job (requeue-mode preemption, ``scontrol requeue``)
+       below 5 act as 5. ``complete_wait_secs`` should exceed the larger kill
+       wait (this or ``timeout_kill_wait_secs``) plus
+       ``[cgroup] cleanup_timeout_secs``, or a healthy node still being killed
+       or cleaned up is drained when the job is force-finished; the controller
+       logs a warning when it does not. Known issue: a requeued job
+       (requeue-mode preemption, ``scontrol requeue``)
        frees its nodes at once, while the old run is still in its kill wait, so
        another job can be dispatched onto them during that window. The window
        can last up to ``kill_wait_secs``, so keep it low if that matters with
@@ -601,9 +602,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        (``inactive_limit_secs``), the stops that end ``TIMEOUT``. Such a job
        moves to COMPLETING straight away and spends this wait there before
        ending ``TIMEOUT``. Valid ``0``-``65533``; values below 5 act as 5.
-       ``complete_wait_secs`` should exceed the larger of this and
-       ``kill_wait_secs`` plus ``[cgroup] cleanup_timeout_secs``. In Slurm, ``KillWait`` also covers time limits; here
-       that part is this setting.
+       ``complete_wait_secs`` should exceed the larger kill wait (this or
+       ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``. In Slurm,
+       ``KillWait`` also covers time limits; here that part is this setting.
    * - ``max_user_priority``
      - integer
      - ``1000``
@@ -2342,8 +2343,11 @@ cgroups.
        Raise it on nodes where teardown is slow (large-memory jobs, GPU reset,
        network filesystem unmounts), but keep ``[scheduler] complete_wait_secs``
        above the larger kill wait plus this value so the agent, not a
-       force-finish, drains the node; the controller logs a warning when it is
-       not.
+       force-finish, drains the node. The controller's warning checks its own
+       ``[cgroup] cleanup_timeout_secs``, while each agent uses the value in its
+       node's ``spur.conf`` (read at agent start, so ``scontrol reconfigure``
+       does not reach it). Set the controller's value to the largest any node
+       uses.
    * - ``oom_kill_job``
      - bool
      - ``true``

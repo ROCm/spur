@@ -570,7 +570,9 @@ restart. The original deadline is preserved during recovery; the agent's
 force-reclaim timer does not prove that the workload has exited. The controller
 also drains unreported nodes before force-finishing a job at
 ``complete_wait_secs``, so keep that above the larger kill wait plus
-``cleanup_timeout_secs``.
+``cleanup_timeout_secs``. The controller's warning for this uses its own
+``[cgroup] cleanup_timeout_secs``, so set it there to the largest value any
+node uses.
 The node remains drained for administrator investigation and explicit resume;
 resuming it does not bypass the agent's outstanding cleanup check.
 These guarantees require cgroup containment to be enabled and successfully

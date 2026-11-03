@@ -851,8 +851,11 @@ Keep ``complete_wait_secs`` above the larger of the two waits plus
 after the job is killed and its cgroup cleanup finishes, so a shorter
 ``complete_wait_secs`` force-finishes the job while healthy nodes are still
 working, and every node that has not reported is drained. The controller logs a
-warning on startup and on reconfigure. Both settings accept ``0``-``65533``, and a value
-below 5 acts as 5. See :doc:`/admin-guide/configuration` for the fields, including a
+warning on startup and on reconfigure. The warning uses the controller's own
+``[cgroup] cleanup_timeout_secs``, so set it there to the largest value any
+node uses. ``kill_wait_secs`` and ``timeout_kill_wait_secs`` both accept
+``0``-``65533``, and a value below 5 acts as 5. See
+:doc:`/admin-guide/configuration` for the fields, including a
 known issue with requeue: a requeued job frees its nodes while the old run is
 still in its kill wait, so keep ``kill_wait_secs`` low if that matters with
 requeue-mode preemption.
