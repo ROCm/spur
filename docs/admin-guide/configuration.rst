@@ -574,7 +574,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Seconds between SIGTERM and SIGKILL when Spur stops a job for any reason
        other than a time or inactivity limit: ``scancel``, ``scontrol requeue``,
-       preemption, idle-fill reclaim, reservation end and other graceful stops.
+       preemption, idle-fill reclaim, reservation end, stopping the other nodes
+       of a job whose batch script has exited, and other graceful stops.
        Ends early once the job's processes exit. Valid ``0``-``65533``; values
        below 5 act as 5. ``complete_wait_secs`` should exceed the larger of this
        and ``timeout_kill_wait_secs``, or a job can be force-finished before its

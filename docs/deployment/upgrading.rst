@@ -801,7 +801,8 @@ Kill waits and the time-limit completing state (``kill_wait_secs``, ``timeout_ki
 This release makes the wait between SIGTERM and SIGKILL configurable with two
 settings. ``scheduler.kill_wait_secs`` (default ``5``) covers ``scancel``,
 ``scontrol requeue``, the final kill of a preemption, idle-fill reclaim,
-reservation end and the other graceful stops. ``scheduler.timeout_kill_wait_secs``
+reservation end, the stop of a finished batch script's other nodes and the other
+graceful stops. ``scheduler.timeout_kill_wait_secs``
 (default ``30``) covers the stops that end ``TIMEOUT``: the time limit and the
 inactivity limit. Both changes apply to a ``spur.conf`` that is not edited, and
 with the defaults most waits are the ones a job had before.

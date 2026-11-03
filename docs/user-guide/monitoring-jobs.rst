@@ -818,8 +818,12 @@ partitions applies), a job selected for preemption in ``cancel`` or
 ``requeue`` mode is not killed at once. It gets SIGCONT then SIGTERM, one time,
 as a warning, stays ``RUNNING`` and keeps its nodes, and is preempted at the
 deadline shown as ``EndTime`` (``PreemptTime`` shows when the warning was sent).
-The grace is shortened if the job's own time limit arrives first. Without a
-``GraceTime`` there is no warning period and the job is preempted immediately.
+The grace is shortened if the job's own time limit arrives first; the deadline
+is fixed when the warning is sent, so lowering the time limit later does not
+shorten it. The warning is sent once: if it is lost (for example the node's agent
+is unreachable at that moment) the job is still preempted at the deadline, only
+without having been warned. Without a ``GraceTime`` there is no warning period and
+the job is preempted immediately.
 
 * **Launch your work with** ``srun``. The warning goes to the job's ``srun``
   steps, not to the batch script, so a training process started directly from
@@ -1267,7 +1271,8 @@ SIGTERM is final, so use the wait to checkpoint and exit. The reaping of an idle
 interactive allocation (:ref:`inactive-limit`) waits the same time; a job reaped
 for inactivity also shows ``CG`` and ends ``TIMEOUT``. ``scancel``, ``scontrol
 requeue`` and the final kill of a preempted job use the general kill wait
-(``kill_wait_secs``, default 5 seconds). An ``srun`` step that has no supervisor
+(``kill_wait_secs``, default 5 seconds), as does stopping the other nodes of a
+job whose batch script has exited. An ``srun`` step that has no supervisor
 process gets the full wait that applies to it (5 seconds on ``scancel``, 30 at a
 time limit), where earlier releases gave it 2 seconds.
 
