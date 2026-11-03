@@ -1477,8 +1477,8 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
         {
             true
         }
-        // A queued job has no run, e.g. one requeued off a node that was down. A launch placed
-        // here fences any older run itself; 0 (an old agent) or a newer run is spared.
+        // A queued job has no run, e.g. one requeued off a node that was down. A batch launch
+        // placed here fences any older run itself; 0 (an old agent) or a newer run is spared.
         Some(job) if job.state == spur_core::job::JobState::Pending => {
             report.run_attempt != 0
                 && report.run_attempt <= job.run_attempt
