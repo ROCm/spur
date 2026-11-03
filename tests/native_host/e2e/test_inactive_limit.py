@@ -9,7 +9,7 @@ kept its submit-time credential would fail every later keepalive and have its
 attended allocation reaped one limit later.
 
 A client that goes silent is reaped like a time-limited job: the srun step gets
-SIGTERM, the job sits in COMPLETING for up to kill_wait_secs, and it ends TIMEOUT.
+SIGTERM, the job sits in COMPLETING for up to timeout_kill_wait_secs, and it ends TIMEOUT.
 The SIGTERM is final, so a client that pings again afterwards does not save it.
 """
 
@@ -24,11 +24,11 @@ from cluster import _TERMINAL_STATE_CODES, job_state, wait_job, wait_job_state, 
 # The smallest limit the config accepts is two keepalive intervals (30 s each).
 INACTIVE_LIMIT_SECS = 60
 KEEPALIVE_INTERVAL_SECS = 30
-KILL_WAIT_SECS = 40
+TIMEOUT_KILL_WAIT_SECS = 40
 RUNNING_BOUND = 30
 # The last ping can be up to one interval old, and the reaper runs on a tick.
 SIGNAL_BOUND = INACTIVE_LIMIT_SECS + 2 * KEEPALIVE_INTERVAL_SECS
-FINISH_BOUND = KILL_WAIT_SECS + 40
+FINISH_BOUND = TIMEOUT_KILL_WAIT_SECS + 40
 
 
 class TestInactiveLimit:
@@ -190,7 +190,7 @@ class TestInactiveLimitKillWait:
             "auth": {"allow_root_jobs": True},
             "scheduler": {
                 "inactive_limit_secs": INACTIVE_LIMIT_SECS,
-                "kill_wait_secs": KILL_WAIT_SECS,
+                "timeout_kill_wait_secs": TIMEOUT_KILL_WAIT_SECS,
             },
         }
 
