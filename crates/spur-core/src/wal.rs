@@ -1535,6 +1535,25 @@ mod deregistration_wal_tests {
         }
     }
 
+    // Frozen wire forms of `grace_time` on a PartitionUpdate: they are what is
+    // already in deployed logs, so a change to how they read changes what a
+    // replay does. Never regenerate.
+    #[test]
+    fn partition_update_grace_time_wire_format_is_frozen() {
+        const CLEAR: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null,"grace_time":null}}"#;
+        const SET: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null,"grace_time":600}}"#;
+        const ABSENT: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null}}"#;
+
+        let replayed = |json: &str| match serde_json::from_str(json).expect("must deserialize") {
+            WalOperation::PartitionUpdate { grace_time, .. } => grace_time,
+            _ => panic!("wrong variant"),
+        };
+
+        assert_eq!(replayed(CLEAR), Some(None), "null clears the grace time");
+        assert_eq!(replayed(SET), Some(Some(600)));
+        assert_eq!(replayed(ABSENT), None, "an absent key leaves it unchanged");
+    }
+
     // A legacy entry that carried a real action must keep it.
     #[test]
     fn partition_create_pre_optional_preserves_configured_action() {
