@@ -17,6 +17,18 @@ fn default_port() -> u16 {
     6818
 }
 
+/// Deserializer for a patch field typed `Option<Option<T>>`: an absent key is
+/// "no change" (via `#[serde(default)]`), `null` clears, a value sets. Pair it
+/// with `skip_serializing_if = "Option::is_none"` so a clear is not written as
+/// the same `null` that plain serde reads back as "no change".
+fn clear_or_set<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// All state-mutating operations that get logged to the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOperation {
@@ -371,6 +383,12 @@ pub enum WalOperation {
         is_default: Option<bool>,
         #[serde(default)]
         preempt_exempt_time: Option<Option<u32>>,
+        #[serde(
+            default,
+            deserialize_with = "clear_or_set",
+            skip_serializing_if = "Option::is_none"
+        )]
+        grace_time: Option<Option<u32>>,
     },
     PartitionDelete {
         name: String,
@@ -1453,6 +1471,67 @@ mod deregistration_wal_tests {
                 );
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    // Frozen pre-grace_time PartitionUpdate entry; it must still replay or the
+    // controller cannot start after an upgrade. Never regenerate.
+    #[test]
+    fn partition_update_without_grace_time_replays() {
+        const PARTITION_UPDATE_PRE_GRACE_TIME: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":"DRAIN","max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":120}}"#;
+        let op: WalOperation = serde_json::from_str(PARTITION_UPDATE_PRE_GRACE_TIME)
+            .expect("legacy PartitionUpdate must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::PartitionUpdate {
+                state,
+                preempt_exempt_time,
+                grace_time,
+                ..
+            } => {
+                assert_eq!(state.as_deref(), Some("DRAIN"));
+                assert_eq!(preempt_exempt_time, Some(Some(120)));
+                assert_eq!(grace_time, None, "absent means leave unchanged");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    fn partition_update_with_grace(grace_time: Option<Option<u32>>) -> WalOperation {
+        WalOperation::PartitionUpdate {
+            name: "gpu".into(),
+            nodes: None,
+            selector: None,
+            state: None,
+            max_time_minutes: None,
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: None,
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            allow_qos: None,
+            priority_tier: None,
+            preempt_mode: None,
+            is_default: None,
+            preempt_exempt_time: None,
+            grace_time,
+        }
+    }
+
+    // The log stores JSON, where a bare `Option<Option<_>>` cannot tell a clear
+    // from "no change"; losing it would resurrect a cleared grace on replay.
+    #[test]
+    fn partition_update_grace_time_set_clear_and_unchanged_survive_the_log() {
+        for grace_time in [None, Some(None), Some(Some(0)), Some(Some(600))] {
+            let json = serde_json::to_string(&partition_update_with_grace(grace_time)).unwrap();
+            match serde_json::from_str(&json).unwrap() {
+                WalOperation::PartitionUpdate {
+                    grace_time: replayed,
+                    ..
+                } => assert_eq!(replayed, grace_time, "{json}"),
+                _ => panic!("wrong variant"),
+            }
         }
     }
 

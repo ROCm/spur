@@ -1618,6 +1618,20 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
        ``scontrol update PartitionName=<name> PreemptExemptTime=<secs>``;
        use ``scontrol update PartitionName=<name> ClearPreemptExemptTime=yes``
        to revert to the global default.
+   * - ``grace_time``
+     - integer or null
+     - ``null`` (unset)
+     - Seconds a job preempted from this partition is given to wind down between
+       the preemption warning and the kill. It applies only when the victim's QOS
+       leaves ``GraceTime`` unset, and the QOS value wins otherwise, including an
+       explicit ``0``. A job in several partitions takes the highest value among
+       them. ``0`` means no grace; unset contributes none. Applies to ``cancel`` and ``requeue`` preemption
+       and is capped at the victim's remaining time limit. A value in
+       ``spur.conf`` is applied on startup and ``scontrol reconfigure``; omitting
+       it later does not clear a value already set at runtime. Set it at runtime with
+       ``scontrol update PartitionName=<name> GraceTime=<secs>`` and revert it with
+       ``scontrol update PartitionName=<name> ClearGraceTime=yes``. See
+       :ref:`preemption grace time <qos-preempt-grace>`.
 
 ``[[nodes]]``
 -------------

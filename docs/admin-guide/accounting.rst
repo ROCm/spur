@@ -904,13 +904,24 @@ choose ``cancel`` or ``requeue`` when the pending job needs capacity freed.
 ``GraceTime`` is a per-QOS value in seconds, set with
 ``sacctmgr modify qos name=<name> set GraceTime=600`` (keys are
 case-insensitive) and shown by ``sacctmgr show qos --long`` or
-``format=GraceTime``. The victim's QOS value applies, not the preemptor's. A QOS
-with no ``GraceTime`` set (the default) inherits the partition's, and with none
-anywhere the victim is
-preempted at once, as in earlier releases. ``GraceTime=0`` explicitly means no
-grace. ``sacctmgr modify qos name=<name> set cleargracetime=1`` returns a QOS
-to unset; ``show qos`` leaves the column blank for unset and prints ``0`` for an
-explicit zero.
+``format=GraceTime``. The victim's QOS value applies, not the preemptor's. A
+partition can carry one too (``grace_time`` under ``[[partitions]]``, or
+``scontrol update PartitionName=<name> GraceTime=600`` at runtime). Resolution
+order, as for ``preempt_exempt_time``:
+
+#. The victim's QOS ``GraceTime``, if set. ``GraceTime=0`` is a set value: it
+   explicitly means no grace and overrides a partition's.
+#. Otherwise the highest ``GraceTime`` among the partitions the victim requested.
+#. Otherwise ``0``: the victim is preempted at once, as in earlier releases.
+
+Both layers are honored together. Slurm instead reads one value, the QOS's under
+``preempt/qos`` or the partition's under ``preempt/partition_prio``.
+
+``sacctmgr modify qos name=<name> set cleargracetime=1`` returns a QOS to unset,
+so it inherits the partition's; ``scontrol update PartitionName=<name>
+ClearGraceTime=yes`` does the same for a partition. ``show qos`` leaves the column
+blank for unset and prints ``0`` for an explicit zero, and ``scontrol show
+partition`` prints ``GraceTime=`` only when one is set.
 
 The grace a victim gets is ``min(GraceTime, time left before the victim's own
 time limit)``; a victim with no time limit is not capped. It applies to

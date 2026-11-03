@@ -159,6 +159,10 @@ pub enum ScontrolCommand {
         /// (0 = immediately preemptable; omit to use the global default)
         #[arg(long)]
         preempt_exempt_time: Option<u32>,
+        /// Seconds a preempted job gets to wind down before it is killed, when
+        /// its QOS leaves the grace time unset (0 = no grace; omit to leave unset)
+        #[arg(long)]
+        grace_time: Option<u32>,
     },
     /// Update a partition
     #[command(name = "update-partition")]
@@ -240,6 +244,13 @@ pub enum ScontrolCommand {
         /// global scheduler.preempt_exempt_time default.
         #[arg(long)]
         clear_preempt_exempt_time: bool,
+        /// Seconds a preempted job gets to wind down before it is killed, when
+        /// its QOS leaves the grace time unset. 0 is a valid value (no grace).
+        #[arg(long)]
+        grace_time: Option<u32>,
+        /// Clear the partition's grace_time, leaving it unset.
+        #[arg(long)]
+        clear_grace_time: bool,
     },
     /// Delete a partition
     #[command(name = "delete-partition")]
@@ -418,6 +429,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             priority_tier,
             preempt_mode,
             preempt_exempt_time,
+            grace_time,
         } => {
             create_partition(
                 &args.controller,
@@ -438,6 +450,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 priority_tier,
                 &preempt_mode,
                 preempt_exempt_time,
+                grace_time,
             )
             .await
         }
@@ -467,6 +480,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             preempt_mode,
             preempt_exempt_time,
             clear_preempt_exempt_time,
+            grace_time,
+            clear_grace_time,
         } => {
             let selector_map = match selector {
                 Some(ref s) => parse_selector(s)?,
@@ -498,6 +513,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 preempt_mode,
                 preempt_exempt_time,
                 clear_preempt_exempt_time,
+                grace_time,
+                clear_grace_time,
             };
             update_partition(&args.controller, req).await
         }
@@ -801,77 +818,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 .context("failed to get partitions")?;
 
             for part in resp.into_inner().partitions {
-                println!(
-                    "PartitionName={}{}",
-                    part.name,
-                    if part.is_default { " Default=YES" } else { "" }
-                );
-                println!(
-                    "   AllowGroups={} AllowAccounts={} AllowQos={}",
-                    if part.allow_groups.is_empty() {
-                        "ALL".into()
-                    } else {
-                        part.allow_groups.clone()
-                    },
-                    if part.allow_accounts.is_empty() {
-                        "ALL".into()
-                    } else {
-                        part.allow_accounts.clone()
-                    },
-                    if part.allow_qos.is_empty() {
-                        "ALL".into()
-                    } else {
-                        part.allow_qos.clone()
-                    },
-                );
-                if !part.deny_accounts.is_empty() {
-                    println!("   DenyAccounts={}", part.deny_accounts);
-                }
-                if !part.deny_qos.is_empty() {
-                    println!("   DenyQos={}", part.deny_qos);
-                }
-                println!("   State={}", part.state.to_uppercase());
-                println!("   Nodes={}", part.nodes);
-                println!(
-                    "   TotalNodes={} TotalCPUs={}",
-                    part.total_nodes, part.total_cpus
-                );
-                println!(
-                    "   MaxTime={} DefaultTime={}",
-                    part.max_time
-                        .as_ref()
-                        .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
-                        .unwrap_or_else(|| "UNLIMITED".into()),
-                    part.default_time
-                        .as_ref()
-                        .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
-                        .unwrap_or_else(|| "UNLIMITED".into()),
-                );
-                println!(
-                    "   MinNodes={} MaxNodes={}",
-                    part.min_nodes,
-                    if part.max_nodes == 0 {
-                        "UNLIMITED".into()
-                    } else {
-                        part.max_nodes.to_string()
-                    },
-                );
-                print!(
-                    "   PreemptMode={} PriorityTier={}",
-                    if part.preempt_mode.is_empty() {
-                        "NONE"
-                    } else {
-                        &part.preempt_mode
-                    },
-                    part.priority_tier
-                );
-                if let Some(t) = part.preempt_exempt_time {
-                    if t > 0 {
-                        print!(" PreemptExemptTime={t}");
-                    }
-                }
-                println!();
-                println!();
+                print!("{}", format_partition_detail(&part));
             }
         }
         "reservation" | "reservations" => {
@@ -1445,7 +1392,7 @@ async fn parse_and_create(controller: &str, params: &[String]) -> Result<()> {
 ///
 /// Slurm keys (case-insensitive): PartitionName, Nodes, State, Default,
 /// MaxTime, DefaultTime, MaxNodes, MinNodes, AllowAccounts, AllowGroups,
-/// AllowQos, DenyAccounts, DenyQos, PriorityTier, PreemptMode.
+/// AllowQos, DenyAccounts, DenyQos, PriorityTier, PreemptMode, PreemptExemptTime, GraceTime.
 async fn parse_and_create_partition(controller: &str, params: &[String]) -> Result<()> {
     let mut name = String::new();
     let mut nodes = String::new();
@@ -1463,6 +1410,7 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
     let mut priority_tier: u32 = 1;
     let mut preempt_mode = String::new();
     let mut preempt_exempt_time: Option<u32> = None;
+    let mut grace_time: Option<u32> = None;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1488,9 +1436,15 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                     })?);
                 }
                 "exclusivetopo" => reject_exclusive_topo(value)?,
+                "gracetime" => {
+                    grace_time =
+                        Some(value.parse::<u32>().map_err(|_| {
+                            anyhow::anyhow!("invalid value for GraceTime=: '{value}'")
+                        })?);
+                }
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-                | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser" | "lln"
+                | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln"
                 | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults" | "defmempernode"
                 | "maxmempernode" | "qos" | "tres" => {}
                 other => eprintln!("scontrol create partition: unknown key '{}'", other),
@@ -1521,6 +1475,7 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
         priority_tier,
         &preempt_mode,
         preempt_exempt_time,
+        grace_time,
     )
     .await?;
 
@@ -1828,8 +1783,14 @@ fn parse_node_state(state: &str) -> Result<i32> {
 /// Slurm keys accepted (all case-insensitive): PartitionName (required),
 /// Nodes, State, Default, MaxTime, DefaultTime, MaxNodes, MinNodes,
 /// AllowAccounts, AllowGroups, DenyAccounts, DenyQos, AllowQos,
-/// PriorityTier, PreemptMode.
+/// PriorityTier, PreemptMode, PreemptExemptTime, GraceTime, ClearGraceTime.
 async fn parse_and_update_partition(controller: &str, params: &[String]) -> Result<()> {
+    update_partition(controller, partition_update_request(params)?).await
+}
+
+fn partition_update_request(
+    params: &[String],
+) -> Result<spur_proto::proto::UpdatePartitionRequest> {
     let mut name = String::new();
     let mut nodes: Option<String> = None;
     let mut state: Option<String> = None;
@@ -1848,6 +1809,8 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     let mut preempt_mode: Option<String> = None;
     let mut preempt_exempt_time: Option<u32> = None;
     let mut clear_preempt_exempt_time = false;
+    let mut grace_time: Option<u32> = None;
+    let mut clear_grace_time = false;
 
     for param in params {
         let Some((key, value)) = param.split_once('=') else {
@@ -1892,11 +1855,17 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
                     || value.eq_ignore_ascii_case("true");
             }
             "exclusivetopo" => reject_exclusive_topo(value)?,
+            "gracetime" => grace_time = Some(value.parse().map_err(|_| invalid())?),
+            "cleargracetime" => {
+                clear_grace_time = value.eq_ignore_ascii_case("yes")
+                    || value == "1"
+                    || value.eq_ignore_ascii_case("true");
+            }
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-            | "overtimelimit" | "gracetime" | "disablerootjobs" | "exclusiveuser" | "lln"
-            | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults" | "defmempernode"
-            | "maxmempernode" | "qos" | "tres" => {}
+            | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln" | "maxcpuspernode"
+            | "maxcpuspersocket" | "jobdefaults" | "defmempernode" | "maxmempernode" | "qos"
+            | "tres" => {}
             _ => bail!("scontrol update: update of this parameter is not supported: '{param}'"),
         }
     }
@@ -1906,7 +1875,7 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
     }
 
     // An ACL is applied only when its key appeared; an empty value clears it.
-    let req = spur_proto::proto::UpdatePartitionRequest {
+    Ok(spur_proto::proto::UpdatePartitionRequest {
         name,
         nodes,
         selector: HashMap::new(), // selector not supported in inline syntax
@@ -1932,9 +1901,9 @@ async fn parse_and_update_partition(controller: &str, params: &[String]) -> Resu
         preempt_mode,
         preempt_exempt_time,
         clear_preempt_exempt_time,
-    };
-
-    update_partition(controller, req).await
+        grace_time,
+        clear_grace_time,
+    })
 }
 
 /// Update a node's state via the controller.
@@ -2020,6 +1989,7 @@ async fn create_partition(
     priority_tier: u32,
     preempt_mode: &str,
     preempt_exempt_time: Option<u32>,
+    grace_time: Option<u32>,
 ) -> Result<()> {
     let channel = crate::authclient::connect(controller)
         .await
@@ -2045,6 +2015,7 @@ async fn create_partition(
             priority_tier,
             preempt_mode: preempt_mode.to_string(),
             preempt_exempt_time,
+            grace_time,
         })
         .await
         .context("failed to create partition")?;
@@ -2235,6 +2206,93 @@ fn actor_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
         parts.push(format!("LastRequeue={}{by}", job.last_requeue));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Render one partition for `scontrol show partition`.
+fn format_partition_detail(part: &spur_proto::proto::PartitionInfo) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "PartitionName={}{}",
+        part.name,
+        if part.is_default { " Default=YES" } else { "" }
+    );
+    let _ = writeln!(
+        out,
+        "   AllowGroups={} AllowAccounts={} AllowQos={}",
+        if part.allow_groups.is_empty() {
+            "ALL".into()
+        } else {
+            part.allow_groups.clone()
+        },
+        if part.allow_accounts.is_empty() {
+            "ALL".into()
+        } else {
+            part.allow_accounts.clone()
+        },
+        if part.allow_qos.is_empty() {
+            "ALL".into()
+        } else {
+            part.allow_qos.clone()
+        },
+    );
+    if !part.deny_accounts.is_empty() {
+        let _ = writeln!(out, "   DenyAccounts={}", part.deny_accounts);
+    }
+    if !part.deny_qos.is_empty() {
+        let _ = writeln!(out, "   DenyQos={}", part.deny_qos);
+    }
+    let _ = writeln!(out, "   State={}", part.state.to_uppercase());
+    let _ = writeln!(out, "   Nodes={}", part.nodes);
+    let _ = writeln!(
+        out,
+        "   TotalNodes={} TotalCPUs={}",
+        part.total_nodes, part.total_cpus
+    );
+    let _ = writeln!(
+        out,
+        "   MaxTime={} DefaultTime={}",
+        part.max_time
+            .as_ref()
+            .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
+            .unwrap_or_else(|| "UNLIMITED".into()),
+        part.default_time
+            .as_ref()
+            .map(|t| spur_core::config::format_time(Some((t.seconds / 60) as u32)))
+            .unwrap_or_else(|| "UNLIMITED".into()),
+    );
+    let _ = writeln!(
+        out,
+        "   MinNodes={} MaxNodes={}",
+        part.min_nodes,
+        if part.max_nodes == 0 {
+            "UNLIMITED".into()
+        } else {
+            part.max_nodes.to_string()
+        },
+    );
+    let _ = write!(
+        out,
+        "   PreemptMode={} PriorityTier={}",
+        if part.preempt_mode.is_empty() {
+            "NONE"
+        } else {
+            &part.preempt_mode
+        },
+        part.priority_tier
+    );
+    if let Some(t) = part.preempt_exempt_time {
+        if t > 0 {
+            let _ = write!(out, " PreemptExemptTime={t}");
+        }
+    }
+    if let Some(t) = part.grace_time {
+        let _ = write!(out, " GraceTime={t}");
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out);
+    out
 }
 
 fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
@@ -3139,6 +3197,54 @@ mod tests {
 
     fn p(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn update_partition_parses_grace_time() {
+        let req = partition_update_request(&p(&["PartitionName=gpu", "gracetime=600"])).unwrap();
+        assert_eq!(req.grace_time, Some(600));
+        assert!(!req.clear_grace_time);
+
+        let zero = partition_update_request(&p(&["PartitionName=gpu", "GraceTime=0"])).unwrap();
+        assert_eq!(zero.grace_time, Some(0), "an explicit zero is not unset");
+
+        let absent = partition_update_request(&p(&["PartitionName=gpu", "MaxTime=60"])).unwrap();
+        assert_eq!(absent.grace_time, None);
+        assert!(!absent.clear_grace_time);
+    }
+
+    #[test]
+    fn update_partition_parses_clear_grace_time() {
+        let cleared =
+            partition_update_request(&p(&["PartitionName=gpu", "ClearGraceTime=yes"])).unwrap();
+        assert!(cleared.clear_grace_time);
+        assert_eq!(cleared.grace_time, None);
+
+        let no = partition_update_request(&p(&["PartitionName=gpu", "ClearGraceTime=no"])).unwrap();
+        assert!(!no.clear_grace_time);
+    }
+
+    #[test]
+    fn update_partition_rejects_a_malformed_grace_time() {
+        let err = partition_update_request(&p(&["PartitionName=gpu", "GraceTime=soon"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid value for GraceTime="), "{err}");
+    }
+
+    #[test]
+    fn show_partition_prints_grace_time_when_set() {
+        let part = |grace_time| spur_proto::proto::PartitionInfo {
+            name: "gpu".into(),
+            grace_time,
+            ..Default::default()
+        };
+        let set = format_partition_detail(&part(Some(600)));
+        assert!(set.contains(" GraceTime=600\n"), "{set}");
+        let zero = format_partition_detail(&part(Some(0)));
+        assert!(zero.contains(" GraceTime=0\n"), "{zero}");
+        let unset = format_partition_detail(&part(None));
+        assert!(!unset.contains("GraceTime"), "{unset}");
     }
 
     #[test]

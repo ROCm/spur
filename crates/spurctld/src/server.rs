@@ -3358,6 +3358,7 @@ impl SlurmController for ControllerService {
             priority_tier: req.priority_tier,
             preempt_mode,
             preempt_exempt_time: req.preempt_exempt_time,
+            grace_time: req.grace_time,
             ..Default::default()
         };
 
@@ -3472,6 +3473,11 @@ impl SlurmController for ControllerService {
                     Some(None)
                 } else {
                     req.preempt_exempt_time.map(Some)
+                },
+                if req.clear_grace_time {
+                    Some(None)
+                } else {
+                    req.grace_time.map(Some)
                 },
             )
             .map_err(partition_rpc_status)?;
@@ -5790,6 +5796,7 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
         preempt_mode: spur_core::partition::preempt_mode_str(part.preempt_mode).to_string(),
         priority_tier: part.priority_tier,
         preempt_exempt_time: part.preempt_exempt_time,
+        grace_time: part.grace_time,
     }
 }
 

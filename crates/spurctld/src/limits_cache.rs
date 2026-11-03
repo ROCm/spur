@@ -258,7 +258,7 @@ fn qos_from_record(r: crate::accounting::db::QosRecord) -> Qos {
             max_wall_minutes: limit_from_db(r.max_wall_min),
             grp_wall_minutes: limit_from_db(r.grp_wall_min),
             preempt_exempt_time: r.preempt_exempt_time.map(|v| v as u32),
-            grace_time: r.grace_time.map(|v| v as u32),
+            grace_time: r.grace_time.and_then(|v| u32::try_from(v).ok()),
         },
         usage_factor: r.usage_factor,
         deny_on_limit: parse_deny_on_limit(&r.flags),
@@ -497,7 +497,7 @@ mod tests {
             grp_tres: None,
             grp_wall_min: None,
             preempt_exempt_time: None,
-            grace_time: None,
+            grace_time: Some(-1),
             flags: String::new(),
         };
 
@@ -511,6 +511,7 @@ mod tests {
         assert!(qos.limits.max_tres_per_user.is_none());
         assert!(qos.limits.grp_tres.is_none());
         assert_eq!(qos.limits.grp_wall_minutes, None);
+        assert_eq!(qos.limits.grace_time, None);
         assert!(!qos.deny_on_limit);
         assert!(!qos.idle_fill_preemptable);
     }

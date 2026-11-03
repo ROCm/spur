@@ -111,7 +111,7 @@ fn qos_info_from_record(r: db::QosRecord) -> QosInfo {
         max_submit_jobs_per_account: limit_to_wire(r.max_submit_per_account),
         grp_submit_jobs: limit_to_wire(r.grp_submit_jobs),
         flags: r.flags,
-        grace_time: r.grace_time.map(|v| v as u32),
+        grace_time: r.grace_time.and_then(|v| u32::try_from(v).ok()),
     }
 }
 
@@ -1780,7 +1780,7 @@ mod tests {
     }
 
     #[test]
-    fn qos_info_from_record_keeps_unset_grace_time_distinct_from_zero() {
+    fn qos_info_from_record_maps_grace_time_unset_zero_and_negative() {
         let record = |grace_time| db::QosRecord {
             name: "preemptible".into(),
             description: String::new(),
@@ -1808,6 +1808,7 @@ mod tests {
         );
         assert_eq!(qos_info_from_record(record(Some(0))).grace_time, Some(0));
         assert_eq!(qos_info_from_record(record(None)).grace_time, None);
+        assert_eq!(qos_info_from_record(record(Some(-1))).grace_time, None);
     }
 
     #[test]

@@ -1213,6 +1213,11 @@ pub struct PartitionConfig {
     /// `None` defers to `scheduler.preempt_exempt_time`.
     #[serde(default)]
     pub preempt_exempt_time: Option<u32>,
+    /// Seconds a preempted job gets to wind down before it is killed. Used when
+    /// the victim's QOS leaves its grace time unset; the highest value among a
+    /// job's partitions applies. `None` means unset.
+    #[serde(default)]
+    pub grace_time: Option<u32>,
 }
 
 fn default_partition_state() -> String {
@@ -2920,6 +2925,7 @@ impl SlurmConfig {
                 preempt_mode: crate::partition::parse_preempt_mode(&pc.preempt_mode)
                     .unwrap_or(None),
                 preempt_exempt_time: pc.preempt_exempt_time,
+                grace_time: pc.grace_time,
                 ..Default::default()
             })
             .collect()
@@ -4578,6 +4584,19 @@ deny_accounts = ["student"]
             explicit.build_partitions()[0].preempt_mode,
             Some(crate::partition::PreemptMode::Off)
         );
+    }
+
+    #[test]
+    fn config_partition_grace_time_loads() {
+        let cfg = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\ngrace_time = 600\n\n\
+             [[partitions]]\nname = \"zero\"\ngrace_time = 0\n\n[[partitions]]\nname = \"unset\"\n",
+        )
+        .unwrap();
+        let parts = cfg.build_partitions();
+        assert_eq!(parts[0].grace_time, Some(600));
+        assert_eq!(parts[1].grace_time, Some(0));
+        assert_eq!(parts[2].grace_time, None);
     }
 
     #[test]

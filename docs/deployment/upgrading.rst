@@ -864,12 +864,19 @@ job gets the full ``kill_wait_secs``.
 
 .. _preempt-grace-upgrade-notes:
 
-Preemption grace time (QOS ``GraceTime``)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Preemption grace time (``GraceTime``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-This release makes the per-QOS ``GraceTime`` take effect (see
-:ref:`preemption grace time <qos-preempt-grace>`). It defaults to ``0``, so nothing changes until an
-administrator sets it.
+This release makes the per-QOS ``GraceTime`` take effect and adds a per-partition
+``GraceTime`` (see :ref:`preemption grace time <qos-preempt-grace>`). A victim's
+grace is its QOS value if set, else the highest value among its partitions, else
+``0``. Nothing is set by default, so nothing changes until an administrator sets
+one.
+
+**Upgrade every controller before setting a partition ``GraceTime``.** The
+partition's ``grace_time`` is a new field in the partition entries of the Raft
+log and snapshots. A controller that predates it ignores the field, so a
+follower that is not upgraded would lack the grace if it became leader.
 
 **Upgrade the leader last.** The first preemption that starts a grace writes a
 new Raft log entry, ``JobPreemptSignaled``. A controller that predates it

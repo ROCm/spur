@@ -1209,6 +1209,25 @@ fn effective_exempt_secs(
         .unwrap_or(sched.preempt_exempt_time)
 }
 
+/// Configured preemption grace for a running job: the QOS value if set (so an
+/// explicit 0 disables a partition's grace), else the highest value among the
+/// job's partitions, else 0. Like `effective_exempt_secs`, the maximum wins when
+/// the job spans partitions.
+fn effective_grace_time(
+    job: &spur_core::job::Job,
+    partitions: &[spur_core::partition::Partition],
+    qos: &spur_core::accounting::Qos,
+) -> u32 {
+    if let Some(t) = qos.limits.grace_time {
+        return t;
+    }
+    spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
+        .into_iter()
+        .filter_map(|p| p.grace_time)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Preempt running jobs to make room for pending ones. Only runs under
 /// `preempt_type = qos_priority`; eligibility and mode resolution follow the
 /// decision table in the admin guide. Victim selection proves the eviction
@@ -1422,7 +1441,7 @@ pub(crate) async fn try_preempt(
             let grace_secs = victim_grace_secs(
                 candidate,
                 *mode,
-                candidate_qos.limits.grace_time.unwrap_or(0),
+                effective_grace_time(candidate, partitions, candidate_qos),
                 cluster_nodes,
                 now,
             );
@@ -5065,6 +5084,24 @@ mod tests {
         }
     }
 
+    fn partition_with_grace(name: &str, secs: u32) -> spur_core::partition::Partition {
+        spur_core::partition::Partition {
+            name: name.into(),
+            grace_time: Some(secs),
+            ..Default::default()
+        }
+    }
+
+    fn qos_with_grace(secs: u32) -> spur_core::accounting::Qos {
+        spur_core::accounting::Qos {
+            limits: spur_core::accounting::QosLimits {
+                grace_time: Some(secs),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     fn qos_with_preempt_list(names: &[&str]) -> spur_core::accounting::Qos {
         spur_core::accounting::Qos {
             preempt: names.iter().map(|s| s.to_string()).collect(),
@@ -5100,6 +5137,42 @@ mod tests {
         let qos = qos_with_exempt(10);
         let sched = sched_config_with_exempt(300);
         assert_eq!(effective_exempt_secs(&job, &parts, &qos, &sched), 10);
+    }
+
+    #[test]
+    fn grace_time_prefers_the_qos_value() {
+        let job = job_in_partitions("gpu");
+        let parts = vec![partition_with_grace("gpu", 600)];
+        assert_eq!(effective_grace_time(&job, &parts, &qos_with_grace(30)), 30);
+    }
+
+    #[test]
+    fn grace_time_falls_back_to_the_highest_partition() {
+        let job = job_in_partitions("gpu,cpu");
+        let parts = vec![
+            partition_with_grace("gpu", 120),
+            partition_with_grace("cpu", 600),
+            partition_with_grace("other", 9000),
+        ];
+        assert_eq!(effective_grace_time(&job, &parts, &no_qos_override()), 600);
+    }
+
+    #[test]
+    fn qos_zero_overrides_a_partition_grace() {
+        let job = job_in_partitions("gpu");
+        let parts = vec![partition_with_grace("gpu", 600)];
+        assert_eq!(effective_grace_time(&job, &parts, &qos_with_grace(0)), 0);
+    }
+
+    #[test]
+    fn grace_time_defaults_to_zero() {
+        let job = job_in_partitions("gpu");
+        let unset = vec![partition_with_mode(
+            "gpu",
+            spur_core::partition::PreemptMode::Cancel,
+        )];
+        assert_eq!(effective_grace_time(&job, &unset, &no_qos_override()), 0);
+        assert_eq!(effective_grace_time(&job, &[], &no_qos_override()), 0);
     }
 
     #[test]
@@ -6323,6 +6396,7 @@ mod tests {
                     priority_tier: 1,
                     preempt_mode: String::new(),
                     preempt_exempt_time: None,
+                    grace_time: None,
                 }],
                 nodes: Vec::new(),
                 network: Default::default(),
@@ -9199,11 +9273,15 @@ mod tests {
             }
 
             fn insert_qos_pair(cm: &ClusterManager, victim_grace: u32) {
+                insert_qos_pair_with_grace(cm, Some(victim_grace));
+            }
+
+            fn insert_qos_pair_with_grace(cm: &ClusterManager, victim_grace: Option<u32>) {
                 cm.qos_cache().insert(Qos {
                     name: "low".into(),
                     priority: 100,
                     limits: QosLimits {
-                        grace_time: Some(victim_grace),
+                        grace_time: victim_grace,
                         ..Default::default()
                     },
                     ..Default::default()
@@ -9372,6 +9450,34 @@ mod tests {
                 assert_eq!(pending.mode, PreemptMode::Cancel);
                 assert_eq!(pending.run_attempt, victim.run_attempt);
                 assert_eq!(i64::from(pending.requeue_hold_secs), cm.requeue_hold_secs());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn try_preempt_uses_partition_grace_when_qos_unset() {
+                let dir = TempDir::new().unwrap();
+                let mut config = preempting_config("cancel");
+                config.partitions[0].grace_time = Some(600);
+                let cm = test_cluster_with_config(&dir, config).await;
+                let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
+                register_node_with_capabilities(
+                    &cm,
+                    "n1",
+                    addr,
+                    vec![SIGNAL_JOB_CAPABILITY.into()],
+                );
+                insert_qos_pair_with_grace(&cm, None);
+                let victim = run_victim(&cm, "victim", "n1", None);
+                let hunter = submit_preemptor(&cm);
+
+                preempt_for(&cm, &hunter).await;
+
+                wait_for("both warning signals delivered", || {
+                    signals.lock().unwrap().len() == 2
+                });
+                assert!(cancels.lock().unwrap().is_empty());
+                let job = cm.get_job(victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Running);
+                assert!(job.preempt_pending.is_some(), "the partition grace applies");
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

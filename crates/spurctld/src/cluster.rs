@@ -6037,6 +6037,7 @@ impl ClusterManager {
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
         preempt_exempt_time: Option<Option<u32>>,
+        grace_time: Option<Option<u32>>,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -6094,6 +6095,7 @@ impl ClusterManager {
             preempt_mode,
             is_default,
             preempt_exempt_time,
+            grace_time,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         Ok(())
@@ -6281,6 +6283,7 @@ impl ClusterManager {
                 // Only push a WAL change when TOML explicitly sets the field;
                 // absent means "leave whatever the runtime WAL already has".
                 preempt_exempt_time: part.preempt_exempt_time.map(Some),
+                grace_time: part.grace_time.map(Some),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -9119,6 +9122,7 @@ impl ClusterManager {
                 preempt_mode,
                 is_default,
                 preempt_exempt_time,
+                grace_time,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -9179,6 +9183,9 @@ impl ClusterManager {
                         }
                         if let Some(et) = preempt_exempt_time {
                             part.preempt_exempt_time = *et;
+                        }
+                        if let Some(gt) = grace_time {
+                            part.grace_time = *gt;
                         }
                         info!(name, "partition updated");
                     } else {
@@ -11438,6 +11445,7 @@ mod tests {
                 priority_tier: 1,
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
+                grace_time: None,
             }],
             nodes: Vec::new(),
             network: Default::default(),
@@ -11847,6 +11855,30 @@ mod tests {
         std::fs::write(&conf_path, format!("{base}preempt_mode = \"off\"\n")).unwrap();
         cm.reconfigure().unwrap();
         assert_eq!(gpu(&cm), Some(PreemptMode::Off));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_applies_partition_grace_time_from_the_conf() {
+        let dir = TempDir::new().unwrap();
+        let base = "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\nnodes = \"ALL\"\n";
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, base).await;
+
+        let gpu = |cm: &Arc<ClusterManager>| {
+            cm.get_partitions()
+                .into_iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .grace_time
+        };
+        assert_eq!(gpu(&cm), None);
+
+        std::fs::write(&conf_path, format!("{base}grace_time = 600\n")).unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu(&cm), Some(600));
+
+        std::fs::write(&conf_path, format!("{base}grace_time = 0\n")).unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu(&cm), Some(0));
     }
 
     #[tokio::test]
@@ -13999,6 +14031,7 @@ state = "UP"
             priority_tier: 1,
             preempt_mode: String::new(),
             preempt_exempt_time: None,
+            grace_time: None,
         });
         config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"small"}'"#));
         let cm = test_cluster_with_config(&dir, config).await;
@@ -14273,6 +14306,7 @@ state = "UP"
             priority_tier: 1,
             preempt_mode: String::new(),
             preempt_exempt_time: None,
+            grace_time: None,
         });
         config.hooks.job_submit_lua = Some(write_lua_script(
             &dir,
@@ -34706,6 +34740,7 @@ state = "UP"
                 priority_tier: 1,
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
+                grace_time: None,
             },
             spur_core::config::PartitionConfig {
                 name: "train".into(),
@@ -34725,6 +34760,7 @@ state = "UP"
                 priority_tier: 1,
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
+                grace_time: None,
             },
         ];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
@@ -34785,6 +34821,7 @@ state = "UP"
             priority_tier: 1,
             preempt_mode: String::new(),
             preempt_exempt_time: None,
+            grace_time: None,
         }];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
@@ -36725,6 +36762,7 @@ state = "UP"
             preempt_mode: None,
             is_default: None,
             preempt_exempt_time: None,
+            grace_time: None,
         });
 
         let gpu = cm
@@ -36848,6 +36886,7 @@ state = "UP"
             preempt_mode: None,
             is_default: None,
             preempt_exempt_time: None,
+            grace_time: None,
         });
 
         assert_eq!(
@@ -36893,6 +36932,7 @@ state = "UP"
             preempt_mode: None,
             is_default: Some(true),
             preempt_exempt_time: None,
+            grace_time: None,
         });
 
         let parts = cm.get_partitions();
@@ -36919,6 +36959,38 @@ state = "UP"
             matches!(err, PartitionError::AlreadyExists(_)),
             "expected AlreadyExists, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_grace_time_round_trips_through_update_and_clear() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.create_partition(spur_core::partition::Partition {
+            grace_time: Some(600),
+            ..gpu_partition()
+        })
+        .unwrap();
+        let grace = |cm: &ClusterManager| {
+            cm.get_partitions()
+                .into_iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .grace_time
+        };
+        assert_eq!(grace(&cm), Some(600));
+
+        let update = |grace_time: Option<Option<u32>>| {
+            cm.update_partition(
+                "gpu", None, None, None, None, None, None, None, false, None, None, None, None,
+                None, None, None, None, None, grace_time,
+            )
+        };
+        update(None).unwrap();
+        assert_eq!(grace(&cm), Some(600), "no grace_time means no change");
+        update(Some(Some(0))).unwrap();
+        assert_eq!(grace(&cm), Some(0), "an explicit zero is kept, not cleared");
+        update(Some(None)).unwrap();
+        assert_eq!(grace(&cm), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
