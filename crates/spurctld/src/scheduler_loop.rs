@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use nix::sys::signal::Signal;
 use tracing::{debug, error, info, warn};
 
 use spur_core::node::{Node, NodeSource};
@@ -1501,7 +1502,7 @@ pub(crate) async fn try_preempt(
 }
 
 /// SIGCONT first so a stopped step can run its handler, then SIGTERM as the warning.
-const PREEMPT_WARNING_SIGNALS: [i32; 2] = [18, 15];
+const PREEMPT_WARNING_SIGNALS: [i32; 2] = [Signal::SIGCONT as i32, Signal::SIGTERM as i32];
 
 /// The grace a victim is allowed: its QOS `GraceTime`, capped so it never
 /// outlives the time limit the watchdog enforces. No time limit means no cap.
