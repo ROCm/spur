@@ -379,8 +379,8 @@ pub struct ControllerConfig {
     #[serde(default = "default_agent_keepalive_timeout_secs")]
     pub agent_keepalive_timeout_secs: u64,
 
-    /// Seconds to let in-flight RPCs drain on SIGTERM before forcing shutdown (default 10, 0 waits
-    /// indefinitely). An `srun` step holds its RPC open for the step's whole runtime.
+    /// Seconds to let in-flight RPCs drain on SIGTERM/SIGINT before forcing shutdown (default 10, 0
+    /// waits indefinitely). An `srun` step holds its RPC open for the step's whole runtime.
     #[serde(default = "default_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
 }

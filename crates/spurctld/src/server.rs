@@ -4655,9 +4655,7 @@ pub async fn serve(
     };
     serve_with_drain_deadline(
         router.serve_with_shutdown(addr, shutdown),
-        async {
-            let _ = signalled_rx.await;
-        },
+        signal_sent(signalled_rx),
         shutdown_grace,
     )
     .await?;
@@ -4665,8 +4663,16 @@ pub async fn serve(
     Ok(())
 }
 
+/// Resolves once `rx` receives; a sender dropped without sending is not a shutdown signal.
+async fn signal_sent(rx: tokio::sync::oneshot::Receiver<()>) {
+    if rx.await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Awaits `serve`, abandoning its drain `grace` after `signalled` fires (zero waits indefinitely).
-/// Abandoning returns `Ok` so `main` still flushes accounting; process exit closes what's left.
+/// Abandoning returns `Ok` so `main` still flushes accounting, best-effort: tonic does not cancel
+/// its connection tasks, so abandoned handlers keep running until the runtime drops.
 async fn serve_with_drain_deadline<F, S, E>(
     serve: F,
     signalled: S,
@@ -4689,7 +4695,7 @@ where
             warn!(
                 ?grace,
                 "graceful shutdown drain exceeded controller.shutdown_grace_secs; forcing \
-                 shutdown with requests still in flight"
+                 shutdown with requests still in flight, whose accounting is best-effort"
             );
             Ok(())
         }
@@ -6126,16 +6132,16 @@ mod tests {
         );
     }
 
-    // These race against their own short outer timeout to prove the call is
-    // still pending; dropping a resource-free pending future there is clean.
-    #[tokio::test]
+    // Paused time jumps straight to the next timer, so these prove a call is
+    // still pending an hour on, and assert exact durations, without waiting.
+    #[tokio::test(start_paused = true)]
     async fn drain_deadline_does_not_start_before_the_signal() {
         let raced = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(3600),
             serve_with_drain_deadline(
                 std::future::pending::<Result<(), std::io::Error>>(),
                 std::future::pending(),
-                std::time::Duration::from_millis(10),
+                std::time::Duration::from_secs(10),
             ),
         )
         .await;
@@ -6145,10 +6151,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_deadline_of_zero_waits_indefinitely() {
         let raced = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(3600),
             serve_with_drain_deadline(
                 std::future::pending::<Result<(), std::io::Error>>(),
                 std::future::ready(()),
@@ -6162,29 +6168,67 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn drain_deadline_returns_once_the_drain_finishes_within_grace() {
+        let drain = std::time::Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        let result: Result<(), std::io::Error> = serve_with_drain_deadline(
+            async {
+                tokio::time::sleep(drain).await;
+                Ok(())
+            },
+            std::future::ready(()),
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            start.elapsed(),
+            drain,
+            "a drain that finishes inside the grace period must not wait it out"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn drain_deadline_forces_a_return_grace_after_the_signal() {
-        let signal_after = std::time::Duration::from_millis(100);
-        let grace = std::time::Duration::from_millis(50);
-        let start = std::time::Instant::now();
+        let signal_after = std::time::Duration::from_secs(30);
+        let grace = std::time::Duration::from_secs(10);
+        let start = tokio::time::Instant::now();
         let result = serve_with_drain_deadline(
             std::future::pending::<Result<(), std::io::Error>>(),
             tokio::time::sleep(signal_after),
             grace,
         )
         .await;
-        let elapsed = start.elapsed();
         assert!(
             result.is_ok(),
             "a forced shutdown must surface as success, not an error"
         );
-        assert!(
-            elapsed >= signal_after + grace,
-            "the grace period counts from the signal, not from startup: {elapsed:?}"
+        assert_eq!(
+            start.elapsed(),
+            signal_after + grace,
+            "the grace period counts from the signal, not from startup"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sent_shutdown_signal_resolves() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(()).expect("receiver is alive");
+        tokio::time::timeout(std::time::Duration::from_secs(3600), signal_sent(rx))
+            .await
+            .expect("a sent signal must resolve");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_shutdown_sender_is_not_a_signal() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        let raced =
+            tokio::time::timeout(std::time::Duration::from_secs(3600), signal_sent(rx)).await;
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "must not wait anywhere near the unbounded default: {elapsed:?}"
+            raced.is_err(),
+            "a sender dropped without sending must not start the drain deadline"
         );
     }
 

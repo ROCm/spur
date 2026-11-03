@@ -415,6 +415,7 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!("accounting writes still pending at shutdown; some rows were lost");
     }
+    info!("spurctld stopped");
     // Exit directly: runtime teardown would wait on any hung blocking call.
     if raft_fatal.is_some() {
         std::process::exit(1);

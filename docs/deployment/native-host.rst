@@ -352,11 +352,12 @@ Enable and start it:
 .. important::
 
    After ``SIGTERM``, ``spurctld`` waits at most ``[controller] shutdown_grace_secs``
-   (default 10s) for in-flight RPCs to drain, then flushes accounting and exits. An
-   ``srun`` step holds its RPC open for the step's whole runtime, so this is what keeps
-   ``systemctl restart spurctld`` short while steps are running. Keep ``TimeoutStopSec``
-   above ``shutdown_grace_secs`` plus a few seconds, as the 90-second default is: a
-   ``SIGKILL`` at that timeout skips the accounting flush.
+   (default 10s) for in-flight RPCs to drain, then flushes accounting for up to 5 seconds
+   and exits. An ``srun`` step holds its RPC open for the step's whole runtime, so this is
+   what keeps ``systemctl restart spurctld`` short while steps are running. Keep
+   ``TimeoutStopSec`` above ``shutdown_grace_secs`` plus those 5 seconds; systemd's
+   default of 90s, which the unit above leaves unchanged, is enough. A ``SIGKILL`` at that
+   timeout skips the accounting flush.
 
 High Availability
 ~~~~~~~~~~~~~~~~~

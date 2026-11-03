@@ -744,10 +744,15 @@ step's whole runtime, so restarting a controller while a step ran (for example d
 ``rolling_upgrade.yml``) hung until systemd's ``TimeoutStopSec`` killed it, skipping the
 accounting flush.
 
-An ``srun`` whose step is still running when the grace period ends loses its controller
-connection, as it did when that ``SIGKILL`` arrived. Raise ``shutdown_grace_secs`` to give
-longer steps time to finish, keeping it below ``TimeoutStopSec``; ``0`` restores the
-unbounded wait.
+A step still running when the grace period ends keeps running on its node. Its ``srun``
+loses the controller connection, retries for about a minute, and re-attaches to the step
+once the restarted controller answers, so a normal restart does not interrupt it.
+Accounting for requests still in flight at that point is best-effort: anything they write
+after the flush is lost.
+
+Raise ``shutdown_grace_secs`` to give longer steps time to finish, keeping it below
+``TimeoutStopSec``. ``0`` restores the unbounded wait, which a repeated ``SIGTERM`` or
+``SIGINT`` does not end; only ``SIGKILL`` does.
 
 See Also
 --------

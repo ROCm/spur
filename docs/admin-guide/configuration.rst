@@ -330,10 +330,13 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        in-flight RPCs to drain before forcing shutdown. An ``srun`` step holds
        its RPC open for the step's whole runtime, so this bounds how long a
        restart takes while steps are running. Range 0-86400; ``0`` waits
-       indefinitely. Keep it, plus a few seconds for the accounting flush that
-       follows, below your service manager's stop timeout (systemd
-       ``TimeoutStopSec``, Kubernetes ``terminationGracePeriodSeconds``): a
-       ``SIGKILL`` from that timeout skips the flush.
+       indefinitely, and a repeated ``SIGTERM`` or ``SIGINT`` does not end that
+       wait, only ``SIGKILL`` does. Keep it, plus up to 5 seconds for the
+       accounting flush that follows, below your service manager's stop timeout
+       (systemd ``TimeoutStopSec``, Kubernetes ``terminationGracePeriodSeconds``):
+       a ``SIGKILL`` from that timeout skips the flush. Requests still running
+       when the grace period ends are only cut off at exit, so the flush is
+       best-effort for accounting rows they write late.
 
        Also sets how long a newly elected leader waits before reclaiming a
        placement reserved by a dispatch the previous leader never

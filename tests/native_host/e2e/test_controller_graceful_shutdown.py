@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """SIGTERM must stop spurctld within shutdown_grace_secs, even while an srun
-step holds its RunStep RPC open for the step's whole runtime."""
+step holds its RunStep RPC open for the step's whole runtime, and the step
+must survive the restart that follows."""
 
 import re
 import shlex
@@ -10,11 +11,13 @@ import time
 
 import pytest
 
+from cluster import wait_until
+
 SHUTDOWN_GRACE_SECS = 5
 # Slack for SSH round-trips and process teardown: a bounded drain exits after
 # about SHUTDOWN_GRACE_SECS, an unbounded one only once the step ends.
 SHUTDOWN_DEADLINE_SECS = SHUTDOWN_GRACE_SECS + 20
-STEP_SECS = 60
+STEP_SECS = 40
 
 
 def _controller_pid(cluster) -> str:
@@ -32,13 +35,9 @@ def _uptime_secs(node, pid: str) -> int:
     return int(node.exec(f"ps -o etimes= -p {pid}").strip())
 
 
-def _wait_for_file(node, path: str, timeout: float):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if node.exec_allow_fail(f"test -e {shlex.quote(path)} && echo yes").strip() == "yes":
-            return
-        time.sleep(0.5)
-    raise TimeoutError(f"{path} did not appear within {timeout}s")
+def _srun_finished(node, log: str) -> str | None:
+    text = node.read_file(log)
+    return text if "srun-exit=" in text else None
 
 
 class TestControllerGracefulShutdown:
@@ -49,26 +48,26 @@ class TestControllerGracefulShutdown:
     def test_sigterm_does_not_wait_for_an_active_srun_step(self, cluster):
         node = cluster.nodes[0]
         started = f"{cluster.remote_dir}/step-started"
+        log = f"{cluster.remote_dir}/shutdown-hold.log"
         # The workload drops the marker itself: a job reaching R precedes the
         # RunStep dispatch, so job state alone does not prove the RPC is open.
-        step = f"touch {shlex.quote(started)}; exec sleep {STEP_SECS}"
-        srun = cluster._cli_env_assignments() + [
-            "nohup",
-            shlex.quote(f"{cluster.bin_dir}/srun"),
-            "-J",
-            "shutdown-hold",
-            "-w",
-            shlex.quote(cluster.node_names[0]),
-            "bash",
-            "-c",
-            shlex.quote(step),
-            ">",
-            shlex.quote(f"{cluster.remote_dir}/shutdown-hold.log"),
-            "2>&1",
-            "&",
-        ]
-        node.exec(" ".join(srun))
-        _wait_for_file(node, started, timeout=60)
+        step = f"echo started >> {shlex.quote(started)}; sleep {STEP_SECS}"
+        srun = " ".join(
+            cluster._cli_env_assignments()
+            + [
+                shlex.quote(f"{cluster.bin_dir}/srun"),
+                "-J",
+                "shutdown-hold",
+                "-w",
+                shlex.quote(cluster.node_names[0]),
+                "bash",
+                "-c",
+                shlex.quote(step),
+            ]
+        )
+        wrapper = shlex.quote(f"{srun}; echo srun-exit=$?")
+        node.exec(f"nohup sh -c {wrapper} > {shlex.quote(log)} 2>&1 &")
+        wait_until(lambda: node.read_file(started), timeout_s=60, interval_s=1, desc="the step to start")
 
         pid = _controller_pid(cluster)
         try:
@@ -91,8 +90,25 @@ class TestControllerGracefulShutdown:
                 f"spurctld exited {elapsed:.1f}s after SIGTERM, inside the grace period: "
                 "the step's RPC was not in flight, so the bounded drain was never exercised"
             )
-            log = re.sub(r"\x1b\[[0-9;]*m", "", node.read_file(f"{cluster.log_dir}/spurctld.log"))
-            assert "graceful shutdown drain exceeded" in log, log[-2000:]
+            # Read before the restart below truncates the log.
+            ctl_log = re.sub(r"\x1b\[[0-9;]*m", "", node.read_file(f"{cluster.log_dir}/spurctld.log"))
+            assert "graceful shutdown drain exceeded" in ctl_log, ctl_log[-2000:]
+            # Logged only after main's accounting flush, so an exit that skips it fails here.
+            assert "spurctld stopped" in ctl_log, ctl_log[-2000:]
+
+            cluster.restart_controller()
+            out = wait_until(
+                lambda: _srun_finished(node, log),
+                timeout_s=STEP_SECS + 60,
+                interval_s=2,
+                desc="srun to re-attach and finish after the restart",
+            )
+            assert "srun-exit=0" in out, out
+            runs = node.read_file(started).count("started")
+            assert runs == 1, f"the step started {runs} times: re-attaching must not relaunch it"
         finally:
-            # A controller stuck draining ignores the SIGTERM the fixture teardown sends.
-            node.exec_allow_fail(f"kill -9 {pid} 2>/dev/null || true")
+            # A controller stuck draining ignores the SIGTERM the fixture teardown
+            # sends, and a stray srun would retry into the next test's cluster.
+            node.exec_allow_fail(
+                f"kill -9 {pid} 2>/dev/null; pkill -9 -f '{cluster.bin_dir}/[s]run -J shutdown-hold'"
+            )
