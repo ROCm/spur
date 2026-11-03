@@ -199,8 +199,8 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--requeue``
      -
      - Allow the job to be requeued after a node failure or time limit.
-       Default off. If the failed node comes back running an up-to-date ``spurd``,
-       the run it kept going is stopped.
+       Default off. If the failed node comes back, the run it kept going is
+       stopped (see :ref:`requeued-run-upgrade-notes`).
    * - ``--no-requeue``
      -
      - Do not requeue the job after a node failure or time limit. This is the

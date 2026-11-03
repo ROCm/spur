@@ -812,7 +812,7 @@ impl ControllerService {
         );
     }
 
-    /// Re-send a cancel to a node still holding a run the controller no longer
+    /// Send a cancel to a node still holding a run the controller no longer
     /// believes belongs to it there (see `is_reclaimable`). Best-effort.
     fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
         let stale = stale_reported_jobs(&self.cluster, node, reported);
@@ -1469,7 +1469,7 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
         return report.job_id < cluster.peek_next_job_id();
     };
     // Attempts only grow, so a run newer than any this controller applied means it is behind.
-    if report.run_attempt != 0 && job.run_attempt != 0 && report.run_attempt > job.run_attempt {
+    if report.run_attempt > job.run_attempt {
         return false;
     }
     if job.state.is_terminal() {
@@ -1483,8 +1483,8 @@ fn is_reclaimable(cluster: &ClusterManager, node: &str, report: &RunningJobStatu
     {
         return true;
     }
-    // A queued job's reported run is stale unless a launch of the job is placed here; an old
-    // agent names no run (0), so its report cannot be told apart from that launch.
+    // A queued job's reported run is stale unless a launch of it is placed here. An attempt-0
+    // cancel would hit any run, including a launch placed after this check, so 0 is spared.
     if job.state == spur_core::job::JobState::Pending {
         return report.run_attempt != 0 && !job.is_held_on(node);
     }
@@ -7557,6 +7557,20 @@ mod tests {
         });
     }
 
+    /// Runs placed job `id`, then ends it NODE_FAIL and requeues it.
+    fn fail_and_requeue(cluster: &crate::cluster::ClusterManager, id: u32) {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        for (from, to) in [
+            (JobState::Pending, JobState::Running),
+            (JobState::Running, JobState::NodeFail),
+            (JobState::NodeFail, JobState::Pending),
+        ] {
+            cluster.apply_operation(&WalOperation::job_state_change(id, from, to));
+        }
+    }
+
     fn report_run(job_id: u32, run_attempt: u32) -> RunningJobStatus {
         RunningJobStatus {
             job_id,
@@ -7569,20 +7583,11 @@ mod tests {
     /// reports back, its old run must be released or it holds the node forever.
     #[tokio::test]
     async fn stale_reported_jobs_reclaims_the_unstopped_run_of_a_requeued_job() {
-        use crate::raft::StateMachineApply;
-        use spur_core::wal::WalOperation;
-
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
         place(&cluster, 80, &["n1"], 1);
-        for (from, to) in [
-            (JobState::Pending, JobState::Running),
-            (JobState::Running, JobState::NodeFail),
-            (JobState::NodeFail, JobState::Pending),
-        ] {
-            cluster.apply_operation(&WalOperation::job_state_change(80, from, to));
-        }
+        fail_and_requeue(&cluster, 80);
         let job = cluster.get_job(80).unwrap();
         assert_eq!(job.state, JobState::Pending);
         assert!(!job.holds_a_placement(), "the requeue freed n1");
@@ -7628,20 +7633,11 @@ mod tests {
     /// with yet (e.g. a new leader), never a stale one.
     #[tokio::test]
     async fn stale_reported_jobs_spares_a_run_newer_than_the_controller_knows() {
-        use crate::raft::StateMachineApply;
-        use spur_core::wal::WalOperation;
-
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
         place(&cluster, 82, &["n1"], 1);
-        for (from, to) in [
-            (JobState::Pending, JobState::Running),
-            (JobState::Running, JobState::NodeFail),
-            (JobState::NodeFail, JobState::Pending),
-        ] {
-            cluster.apply_operation(&WalOperation::job_state_change(82, from, to));
-        }
+        fail_and_requeue(&cluster, 82);
 
         assert!(is_reclaimable(&cluster, "n2", &report_run(82, 1)));
         assert!(
@@ -7685,6 +7681,33 @@ mod tests {
             !is_reclaimable(&cluster, "n1", &report_run(84, 2)),
             "a newer run than the one placed on n2 is not stale on n1"
         );
+    }
+
+    /// A lagging controller that has not applied a job's first placement must not end
+    /// that first run because the job still looks queued to it.
+    #[tokio::test]
+    async fn stale_reported_jobs_spares_the_first_run_of_a_job_never_placed_here() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::JobSpec;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        cluster.apply_operation(&WalOperation::JobSubmit {
+            job_id: 85,
+            spec: Box::new(JobSpec {
+                name: "queued".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+
+        assert!(!is_reclaimable(&cluster, "n1", &report_run(85, 1)));
     }
 
     /// GATE: `auth.jwt_key` is captured at startup and must NOT change on

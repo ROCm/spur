@@ -155,15 +155,10 @@ def block_agent_port(cluster: "SpurCluster", node_index: int, port: int = AGENT_
 
 
 @contextlib.contextmanager
-def cut_off_node(cluster: "SpurCluster", node_index: int):
-    """Drop one node's heartbeats and the controller's RPCs to it, at the controller.
-    Inserted first so an earlier ESTABLISHED accept rule cannot keep live connections up."""
+def _drop_at_controller(cluster: "SpurCluster", rules: list[str]):
+    """Inserts DROP `rules` first on the controller, so an earlier ESTABLISHED accept rule
+    cannot keep live connections up; always removes the ones it added."""
     controller = cluster.nodes[0]
-    target = cluster.nodes[node_index].host
-    rules = [
-        f"INPUT -s {target} -p tcp --dport {CONTROLLER_PORT} -j DROP",
-        f"OUTPUT -d {target} -p tcp --dport {AGENT_PORT} -j DROP",
-    ]
     added = []
     try:
         for rule in rules:
@@ -173,6 +168,25 @@ def cut_off_node(cluster: "SpurCluster", node_index: int):
     finally:
         for rule in added:
             controller.exec_allow_fail(f"sudo iptables -D {rule}")
+
+
+def drop_heartbeats(cluster: "SpurCluster", node_index: int):
+    """Drop everything one node sends to the controller, its heartbeats included."""
+    target = cluster.nodes[node_index].host
+    return _drop_at_controller(cluster, [f"INPUT -s {target} -p tcp --dport {CONTROLLER_PORT} -j DROP"])
+
+
+def drop_agent_rpcs(cluster: "SpurCluster", node_index: int):
+    """Drop the controller's RPCs to one node's agent."""
+    target = cluster.nodes[node_index].host
+    return _drop_at_controller(cluster, [f"OUTPUT -d {target} -p tcp --dport {AGENT_PORT} -j DROP"])
+
+
+@contextlib.contextmanager
+def cut_off_node(cluster: "SpurCluster", node_index: int):
+    """Drop one node's heartbeats and the controller's RPCs to it, at the controller."""
+    with drop_heartbeats(cluster, node_index), drop_agent_rpcs(cluster, node_index):
+        yield
 
 
 class SshNode:
