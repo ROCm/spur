@@ -8598,10 +8598,12 @@ impl ClusterManager {
                     }
                     // A victim that ends during its grace (an srun/PTY run whose
                     // client reports its exit, or a force-finish after some nodes
-                    // already reported) ends as the preemption it was warned of.
+                    // already reported) ends as the preemption it was warned of. A
+                    // completion carrying a cancel was ended on purpose instead,
+                    // and the cancel wins.
                     let grace = job
                         .preempt_grace()
-                        .filter(|_| job.state == JobState::Running)
+                        .filter(|_| job.state == JobState::Running && cancel.is_none())
                         .cloned();
                     if grace.is_some() {
                         Self::adopt_grace_provenance(job, timestamp);
@@ -31239,6 +31241,104 @@ state = "UP"
             Some(99),
             "the node that never reported is earmarked too"
         );
+    }
+
+    /// A one-node job in a reservation that ended minutes ago, warned of
+    /// preemption as `mode` and still RUNNING.
+    async fn reserved_grace_victim(
+        mode: PreemptMode,
+    ) -> (
+        TempDir,
+        Arc<ClusterManager>,
+        Arc<crate::sched_stats::SchedStatsCollector>,
+        JobId,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(crate::sched_stats::SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        register_node(&cm, "n1", 8, 16000);
+        let now = Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::hours(1),
+            end_time: now - chrono::Duration::minutes(5),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        })
+        .unwrap();
+        let mut spec = basic_spec("resv-victim");
+        spec.reservation = Some("r1".into());
+        let id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        signal_grace(&cm, id, mode);
+        (dir, cm, stats, id)
+    }
+
+    fn assert_ended_as_a_system_cancel(
+        cm: &ClusterManager,
+        stats: &crate::sched_stats::SchedStatsCollector,
+        id: JobId,
+    ) {
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(
+            job.end_reason(JobState::Cancelled).0,
+            EndReason::SystemCancel
+        );
+        assert_eq!(job.end_of_run_state(job.state), JobState::Cancelled);
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(job.preempt_mode, None);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(stats.snapshot().jobs_preempted, 0);
+        assert!(cm.preempt_freed_nodes_raw().get("n1").is_none());
+        assert_eq!(cpus_in_use(cm, "n1"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_ending_cancels_a_job_in_a_cancel_grace() {
+        let (_dir, cm, stats, id) = reserved_grace_victim(PreemptMode::Cancel).await;
+
+        cm.enforce_reservation_end_times();
+
+        assert_ended_as_a_system_cancel(&cm, &stats, id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_ending_cancels_a_job_in_a_requeue_grace_instead_of_repending_it() {
+        let (_dir, cm, stats, id) = reserved_grace_victim(PreemptMode::Requeue).await;
+
+        cm.enforce_reservation_end_times();
+
+        assert_ended_as_a_system_cancel(&cm, &stats, id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_completion_in_a_grace_accounts_the_run_as_cancelled() {
+        let (_dir, cm, _stats, id) = reserved_grace_victim(PreemptMode::Cancel).await;
+
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: -1,
+            state: JobState::Cancelled,
+            unreported_nodes: Vec::new(),
+            cancel: Some(CancelProvenance::system()),
+            at: Some(grace_exit_at()),
+        });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Cancelled);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
