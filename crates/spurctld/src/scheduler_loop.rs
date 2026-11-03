@@ -478,6 +478,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                         &reclaimers,
                         &borrow_ids,
                         &preempt_state,
+                        &assignments,
                         sched_cfg.idle_fill_exempt_secs,
                     )
                     .await;
@@ -511,6 +512,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
                     &cluster,
                     &preempt_state,
                     &unscheduled,
+                    &assignments,
                     &cluster.config().scheduler,
                 )
                 .await;
@@ -1032,13 +1034,19 @@ pub(crate) fn trial_placement(
 /// Pass-start handoffs minus the holds placement freed; the victim search would otherwise
 /// evict for nodes that are already free.
 pub(crate) fn without_released(
-    handoffs: &HashMap<String, spur_core::job::JobId>,
-    released: &[String],
-) -> HashMap<String, spur_core::job::JobId> {
+    handoffs: &HashMap<String, Vec<spur_core::job::JobId>>,
+    released: &[(String, spur_core::job::JobId)],
+) -> HashMap<String, Vec<spur_core::job::JobId>> {
     handoffs
         .iter()
-        .filter(|(node, _)| !released.contains(node))
-        .map(|(node, owner)| (node.clone(), *owner))
+        .filter_map(|(node, owners)| {
+            let held: Vec<_> = owners
+                .iter()
+                .copied()
+                .filter(|owner| !released.iter().any(|(n, o)| n == node && o == owner))
+                .collect();
+            (!held.is_empty()).then(|| (node.clone(), held))
+        })
         .collect()
 }
 
@@ -1285,6 +1293,19 @@ pub(crate) async fn try_preempt(
     unscheduled: &[&spur_core::job::Job],
     sched: &spur_core::config::SchedulerConfig,
 ) {
+    try_preempt_beside(cluster, partitions, cluster_nodes, unscheduled, &[], sched).await;
+}
+
+/// `try_preempt` in a pass that has already assigned `assigned`.
+#[cfg(test)]
+pub(crate) async fn try_preempt_beside(
+    cluster: &Arc<ClusterManager>,
+    partitions: &[spur_core::partition::Partition],
+    cluster_nodes: &[spur_core::node::Node],
+    unscheduled: &[&spur_core::job::Job],
+    assigned: &[Assignment],
+    sched: &spur_core::config::SchedulerConfig,
+) {
     let reservations = cluster.get_reservations();
     let handoffs =
         cluster.preemption_handoffs(&cluster.pending_jobs(), cluster_nodes, &reservations);
@@ -1297,7 +1318,30 @@ pub(crate) async fn try_preempt(
         busy_until: &HashMap::new(),
         preemption_handoffs: &handoffs,
     };
-    try_preempt_with_handoffs(cluster, &state, unscheduled, sched).await;
+    try_preempt_with_handoffs(cluster, &state, unscheduled, assigned, sched).await;
+}
+
+/// Node -> jobs holding it: running, suspended and draining jobs on the nodes they still
+/// hold, plus this pass's assignments, which hold their nodes before they are dispatched.
+fn node_occupants<'a>(
+    holders: &'a [spur_core::job::Job],
+    assigned: &'a [Assignment],
+) -> HashMap<&'a str, Vec<spur_core::job::JobId>> {
+    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
+    for job in holders {
+        for node in job.allocated_nodes.iter().filter(|n| job.is_held_on(n)) {
+            occupants.entry(node.as_str()).or_default().push(job.job_id);
+        }
+    }
+    for assignment in assigned {
+        for node in &assignment.nodes {
+            occupants
+                .entry(node.as_str())
+                .or_default()
+                .push(assignment.job_id);
+        }
+    }
+    occupants
 }
 
 /// The victim search over a given pass state, as the scheduler loop runs it.
@@ -1306,8 +1350,10 @@ pub(crate) async fn try_preempt_in(
     cluster: &Arc<ClusterManager>,
     state: &ClusterState<'_>,
     unscheduled: &[&spur_core::job::Job],
+    assigned: &[Assignment],
 ) {
-    try_preempt_with_handoffs(cluster, state, unscheduled, &cluster.config().scheduler).await;
+    let sched = cluster.config().scheduler.clone();
+    try_preempt_with_handoffs(cluster, state, unscheduled, assigned, &sched).await;
 }
 
 /// Preempt running jobs so a pending one can be placed (`preempt_type = qos_priority` only).
@@ -1316,6 +1362,7 @@ async fn try_preempt_with_handoffs(
     cluster: &Arc<ClusterManager>,
     state: &ClusterState<'_>,
     unscheduled: &[&spur_core::job::Job],
+    assigned: &[Assignment],
     sched: &spur_core::config::SchedulerConfig,
 ) {
     use spur_core::job::JobState;
@@ -1356,12 +1403,7 @@ async fn try_preempt_with_handoffs(
         .filter(|j| j.state == JobState::Running && j.preempt_grace().is_none())
         .cloned()
         .collect();
-    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
-    for job in &holders {
-        for node in &job.allocated_nodes {
-            occupants.entry(node.as_str()).or_default().push(job.job_id);
-        }
-    }
+    let occupants = node_occupants(&holders, assigned);
     // Resolve once, reused for the occupant map, the policy checks, and the
     // action decision below.
     let running_qos: std::collections::HashMap<spur_core::job::JobId, spur_core::accounting::Qos> =
@@ -1889,6 +1931,7 @@ async fn reclaim_for_unplaced(
     // recognised from its QOS rather than needing to be listed here.
     opportunistic: &HashSet<spur_core::job::JobId>,
     cluster_state: &ClusterState<'_>,
+    assigned: &[Assignment],
     exempt_secs: u32,
 ) -> (Vec<String>, Option<spur_core::job::JobId>) {
     let now = Utc::now();
@@ -1956,12 +1999,7 @@ async fn reclaim_for_unplaced(
         ],
         ..Default::default()
     });
-    let mut occupants: HashMap<&str, Vec<spur_core::job::JobId>> = HashMap::new();
-    for job in &holders {
-        for node in &job.allocated_nodes {
-            occupants.entry(node.as_str()).or_default().push(job.job_id);
-        }
-    }
+    let occupants = node_occupants(&holders, assigned);
     let reclaimable_ids: HashSet<spur_core::job::JobId> =
         reclaimable.iter().map(|r| r.job_id).collect();
     let victim_priority: HashMap<spur_core::job::JobId, i32> =
@@ -5556,6 +5594,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_released_handoff_drops_only_that_owner() {
+        let handoffs = HashMap::from([("n1".to_string(), vec![1, 2]), ("n2".to_string(), vec![1])]);
+        let released = [("n1".to_string(), 1), ("n2".to_string(), 1)];
+        let left = without_released(&handoffs, &released);
+        assert_eq!(left, HashMap::from([("n1".to_string(), vec![2])]));
+    }
+
     mod idle_fill_reclaim_tests {
         use super::*;
 
@@ -5567,7 +5613,7 @@ mod tests {
             reclaimer: &Job,
             pool: &VictimPool<'_>,
             nodes: &[Node],
-            handoffs: &HashMap<String, spur_core::job::JobId>,
+            handoffs: &HashMap<String, Vec<spur_core::job::JobId>>,
         ) -> Option<HashSet<spur_core::job::JobId>> {
             let state = ClusterState {
                 fabric: None,
@@ -5614,10 +5660,14 @@ mod tests {
             };
             let two_nodes = reclaimer(2, 4);
             assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &HashMap::new()).is_some());
-            let handed_off = HashMap::from([("n1".to_string(), two_nodes.job_id + 1)]);
+            let other = two_nodes.job_id + 1;
+            let held_by = |owners: Vec<_>| HashMap::from([("n1".to_string(), owners)]);
+            let handed_off = held_by(vec![other]);
             assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &handed_off).is_none());
-            let own = HashMap::from([("n1".to_string(), two_nodes.job_id)]);
+            let own = held_by(vec![two_nodes.job_id]);
             assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &own).is_some());
+            let co_owned = held_by(vec![other, two_nodes.job_id]);
+            assert!(victim_set_with_handoffs(&two_nodes, &pool, &nodes, &co_owned).is_some());
         }
 
         fn node(name: &str, cpus: u32) -> Node {
@@ -9960,7 +10010,7 @@ mod tests {
                 };
 
                 let (freed, freed_for) =
-                    reclaim_for_unplaced(&cm, &[&hunter], &HashSet::new(), &state, 0).await;
+                    reclaim_for_unplaced(&cm, &[&hunter], &HashSet::new(), &state, &[], 0).await;
 
                 assert!(freed.is_empty());
                 assert_eq!(freed_for, None);

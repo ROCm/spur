@@ -58,6 +58,7 @@ preempt
 preemption
 preemptable
 preemptor
+preemptor's
 prolog
 epilog
 QoS

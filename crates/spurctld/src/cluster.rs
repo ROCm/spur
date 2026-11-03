@@ -673,7 +673,7 @@ pub struct ClusterManager {
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
     /// Transient handoffs bridging victim release and placement, recorded on every replica
     /// at apply but aged only by the leader's passes; never included in snapshots.
-    preempt_freed_nodes: RwLock<HashMap<String, (JobId, u32)>>,
+    preempt_freed_nodes: RwLock<HashMap<String, HashMap<JobId, u32>>>,
     /// When each (check index, node name) last completed a check, so the pass
     /// knows when the next one is due. Leader-local and transient (like
     /// `node_dispatch_cooldowns`): reset on failover, which at worst re-runs one
@@ -1057,39 +1057,22 @@ impl ClusterManager {
         if freed_nodes.is_empty() || !owner_waiting {
             return;
         }
+        let waiting = |owner: &JobId| {
+            jobs.get(owner).is_some_and(|j| {
+                j.state == JobState::Pending && !j.pending_reason.is_scheduling_hold()
+            })
+        };
         let mut earmarks = self.preempt_freed_nodes.write();
         for node in freed_nodes {
-            earmarks.insert(
-                node.clone(),
-                (preemptor, Self::PREEMPT_FREED_EARMARK_PASSES),
-            );
+            // Followers never age earmarks, so drop owners that already left here.
+            let owners = earmarks.entry(node.clone()).or_default();
+            owners.retain(|owner, _| waiting(owner));
+            owners.insert(preemptor, Self::PREEMPT_FREED_EARMARK_PASSES);
         }
     }
 
-    /// Age freed-node earmarks by one scheduling pass: decrement each budget and
-    /// drop entries whose owner can no longer use the claim. Called once per
-    /// scheduler loop iteration so the budget counts real passes, not wall-clock.
-    /// Keeping the decrement here rather than in the read path means an unrelated
-    /// `classify_pending_jobs` caller (reason updates, burst-buffer staging)
-    /// cannot consume the budget.
-    ///
-    /// An entry is dropped as soon as its owner is not a schedulable pending job
-    /// (placed, cancelled, requeued, or on a scheduling hold such as Held /
-    /// JobHoldMaxRequeue): a claim held for an owner that cannot run would block
-    /// the node for no one's benefit.
-    ///
-    /// The bounded post-drain budget only starts once the preemptor has its full
-    /// allocation: while any victim is in grace or draining after cancel preemption,
-    /// the earmark is refreshed rather than aged. A multi-node preemptor whose
-    /// victims' nodes free at different times would otherwise spend the whole
-    /// budget on an early-freeing node while still waiting — unplaceable — for a
-    /// later one, letting a bystander take the early node when it expired.
-    ///
-    /// Both lookups (schedulable owner, owner-still-draining) are resolved from a
-    /// single O(jobs) scan built once, so the tick is O(jobs + claims) rather than
-    /// O(jobs x claims). Lock order is `jobs` then `preempt_freed_nodes`, matching
-    /// every other path (the read helper and the `apply_operation` insert), so the
-    /// two locks never deadlock against each other.
+    /// Age each owner's earmarks once per scheduler pass, dropping owners that can no longer
+    /// run; a budget only counts down once none of that owner's victims is still in grace or draining.
     pub(crate) fn tick_preempt_freed_earmarks(&self) {
         let jobs = self.jobs.read();
         let mut earmarks = self.preempt_freed_nodes.write();
@@ -1108,19 +1091,20 @@ impl ClusterManager {
                 owners_still_draining.insert(preemptor);
             }
         }
-        earmarks.retain(|_, (preemptor, remaining)| {
-            if !schedulable_owners.contains(preemptor) {
-                return false;
-            }
-            // Hold the node for the preemptor at full budget until it can
-            // actually run; only count down once nothing it preempted is still
-            // draining.
-            if owners_still_draining.contains(preemptor) {
-                *remaining = Self::PREEMPT_FREED_EARMARK_PASSES;
-                return true;
-            }
-            *remaining = remaining.saturating_sub(1);
-            *remaining > 0
+        earmarks.retain(|_, owners| {
+            owners.retain(|preemptor, remaining| {
+                if !schedulable_owners.contains(preemptor) {
+                    return false;
+                }
+                // Full budget while a victim still drains; count down only once the owner could run.
+                if owners_still_draining.contains(preemptor) {
+                    *remaining = Self::PREEMPT_FREED_EARMARK_PASSES;
+                    return true;
+                }
+                *remaining = remaining.saturating_sub(1);
+                *remaining > 0
+            });
+            !owners.is_empty()
         });
     }
 
@@ -1138,12 +1122,14 @@ impl ClusterManager {
     ) -> HashMap<JobId, Vec<String>> {
         let earmarks = self.preempt_freed_nodes.read();
         let mut by_owner: HashMap<JobId, Vec<String>> = HashMap::new();
-        for (node, (preemptor, _)) in earmarks.iter() {
-            let schedulable = jobs.get(preemptor).is_some_and(|j| {
-                j.state == JobState::Pending && !j.pending_reason.is_scheduling_hold()
-            });
-            if schedulable {
-                by_owner.entry(*preemptor).or_default().push(node.clone());
+        for (node, owners) in earmarks.iter() {
+            for preemptor in owners.keys() {
+                let schedulable = jobs.get(preemptor).is_some_and(|j| {
+                    j.state == JobState::Pending && !j.pending_reason.is_scheduling_hold()
+                });
+                if schedulable {
+                    by_owner.entry(*preemptor).or_default().push(node.clone());
+                }
             }
         }
         by_owner
@@ -1151,17 +1137,19 @@ impl ClusterManager {
 
     /// Limit handoffs to this pass's eligible owners and usable nodes; holds and
     /// changed placement constraints must not strand another job's capacity.
-    pub(crate) fn preemption_handoffs<'a>(
+    pub(crate) fn preemption_handoffs(
         &self,
-        in_quota_pending: impl IntoIterator<Item = &'a Job>,
+        in_quota_pending: &[Job],
         nodes: &[Node],
         reservations: &[Reservation],
-    ) -> HashMap<String, JobId> {
+    ) -> HashMap<String, Vec<JobId>> {
         let jobs = self.jobs.read();
         let earmarks = self.preempt_freed_nodes.read();
         let mut by_owner: HashMap<JobId, HashSet<&str>> = HashMap::new();
-        for (node, (owner, _)) in earmarks.iter() {
-            by_owner.entry(*owner).or_default().insert(node);
+        for (node, owners) in earmarks.iter() {
+            for owner in owners.keys() {
+                by_owner.entry(*owner).or_default().insert(node);
+            }
         }
         for victim in jobs.values() {
             if let Some(owner) = crate::scheduler_loop::preemptor_awaiting_release(victim) {
@@ -1171,8 +1159,12 @@ impl ClusterManager {
                     .extend(victim.allocated_nodes.iter().map(String::as_str));
             }
         }
+        let mut handoffs: HashMap<String, Vec<JobId>> = HashMap::new();
+        if by_owner.is_empty() {
+            return handoffs;
+        }
         let now = Utc::now();
-        let mut handoffs = HashMap::new();
+        let mut held: Vec<(&Job, Vec<&str>)> = Vec::new();
         for owner in in_quota_pending {
             let Some(claimed) = by_owner.get(&owner.job_id) else {
                 continue;
@@ -1185,22 +1177,34 @@ impl ClusterManager {
             }
             let placement = spur_sched::node_match::NodePlacement::new(owner);
             let required = spur_sched::backfill::job_resource_request(owner);
-            for node in nodes.iter().filter(|n| claimed.contains(n.name.as_str())) {
-                if placement.matches_for_reservation(node, reservations, now)
-                    && node.total_resources.can_satisfy(&required)
-                {
-                    // Queue order breaks ties if partial-node victims named different owners.
-                    handoffs.entry(node.name.clone()).or_insert(owner.job_id);
-                }
+            let usable: Vec<&str> = nodes
+                .iter()
+                .filter(|n| claimed.contains(n.name.as_str()))
+                .filter(|n| {
+                    placement.matches_for_reservation(n, reservations, now)
+                        && n.total_resources.can_satisfy(&required)
+                })
+                .map(|n| n.name.as_str())
+                .collect();
+            if !usable.is_empty() {
+                held.push((owner, usable));
+            }
+        }
+        for (owner, usable) in held {
+            for node in usable {
+                handoffs
+                    .entry(node.to_string())
+                    .or_default()
+                    .push(owner.job_id);
             }
         }
         handoffs
     }
 
-    /// Raw `node -> (preemptor, remaining)` earmark entries, for tests that need
+    /// Raw `node -> {preemptor -> remaining}` earmark entries, for tests that need
     /// to assert whether a node was earmarked regardless of owner state.
     #[cfg(test)]
-    pub(crate) fn preempt_freed_nodes_raw(&self) -> HashMap<String, (JobId, u32)> {
+    pub(crate) fn preempt_freed_nodes_raw(&self) -> HashMap<String, HashMap<JobId, u32>> {
         self.preempt_freed_nodes.read().clone()
     }
 
@@ -5503,7 +5507,7 @@ impl ClusterManager {
         drop(partitions);
 
         // Queue precedence offers a preemptor placement before ordinary bystanders;
-        // node handoffs separately keep every other job off its released capacity.
+        // node handoffs keep every other job, bar co-owners, off its released capacity.
         let hoisted: HashSet<JobId> = {
             let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
             for job in jobs.values() {
@@ -8555,9 +8559,10 @@ impl ClusterManager {
                     job.preempt_mode = None;
                     job.preempt_qos = None;
                     // Followers never age earmarks, so a placed owner must drop them on every replica.
-                    self.preempt_freed_nodes
-                        .write()
-                        .retain(|_, (owner, _)| *owner != *job_id);
+                    self.preempt_freed_nodes.write().retain(|_, owners| {
+                        owners.remove(job_id);
+                        !owners.is_empty()
+                    });
                     // Same reason, and it must be here rather than at requeue:
                     // the finished run's record is written after that apply.
                     job.derived_exit_code = 0;
@@ -22940,11 +22945,9 @@ state = "UP"
             .unwrap();
         assert_eq!(
             cm.preempt_freed_nodes_raw()
-                .into_iter()
-                .map(|(n, (id, _))| (n, id))
-                .collect::<HashMap<_, _>>()
-                .get("n2"),
-            Some(&pinned_id)
+                .get("n2")
+                .map(|o| o.keys().copied().collect::<Vec<_>>()),
+            Some(vec![pinned_id])
         );
         let victim_b = cm.get_job(victim_b_id).unwrap();
         assert!(victim_b.node_completions.contains_key("n2"));
@@ -22974,14 +22977,12 @@ state = "UP"
             );
             assert!(pending[2].priority > pending[0].priority);
             assert!(pending[0].priority > pending[1].priority);
-            let earmarks = cm
-                .preempt_freed_nodes_raw()
-                .into_iter()
-                .map(|(n, (id, _))| (n, id))
-                .collect::<HashMap<_, _>>();
+            let earmarks = cm.preempt_freed_nodes_raw();
             assert_eq!(
-                earmarks.get("n2"),
-                Some(&pinned_id),
+                earmarks
+                    .get("n2")
+                    .map(|o| o.keys().copied().collect::<Vec<_>>()),
+                Some(vec![pinned_id]),
                 "pass {pass}: drain must refresh n2"
             );
 
@@ -23152,7 +23153,7 @@ state = "UP"
             at: Some(Utc::now()),
             handoff: true,
         });
-        assert_eq!(cm.preempt_freed_nodes_raw()["n1"].0, owner);
+        assert!(cm.preempt_freed_nodes_raw()["n1"].contains_key(&owner));
         owner
     }
 
@@ -23232,6 +23233,256 @@ state = "UP"
         })
         .unwrap();
         assert!(handoffs().is_empty());
+    }
+
+    fn run_with_qos(cm: &ClusterManager, name: &str, qos: &str, node: &str, cpus: u32) -> JobId {
+        let mut spec = basic_spec(name);
+        spec.qos = Some(qos.into());
+        spec.nodelist = Some(node.into());
+        spec.num_tasks = cpus;
+        let id = submit_and_wait(cm, spec);
+        let res = scalar_alloc(cpus, 4000);
+        cm.start_job(
+            id,
+            vec![node.into()],
+            res.clone(),
+            per_node_for(&[node], res),
+        )
+        .unwrap();
+        settle(cm, id, JobState::Running);
+        id
+    }
+
+    fn pending_on(cm: &ClusterManager, name: &str, qos: &str, node: &str) -> JobId {
+        let mut spec = basic_spec(name);
+        spec.qos = Some(qos.into());
+        spec.nodelist = Some(node.into());
+        submit_and_wait(cm, spec)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_preemptions_on_one_node_keep_every_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let owners = [
+            pending_on(&cm, "a", "high", "n1"),
+            pending_on(&cm, "b", "high", "n1"),
+        ];
+        for (i, owner) in owners.iter().enumerate() {
+            let victim = run_with_qos(&cm, &format!("v{i}"), "low", "n1", 2);
+            cm.preempt_job_with_provenance(
+                victim,
+                cm.get_job(victim).unwrap().run_attempt,
+                PreemptMode::Requeue,
+                Some(*owner),
+                None,
+            )
+            .unwrap();
+        }
+        let mut earmarked: Vec<_> = cm.preempt_freed_nodes_raw()["n1"].keys().copied().collect();
+        earmarked.sort();
+        assert_eq!(earmarked, owners);
+        let handoffs = cm.preemption_handoffs(&cm.pending_jobs(), &cm.get_nodes(), &[]);
+        let mut held: Vec<_> = handoffs["n1"].clone();
+        held.sort();
+        assert_eq!(held, owners);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn co_owner_starts_beside_a_handoff_owner_still_waiting_on_its_victim() {
+        let dir = TempDir::new().unwrap();
+        let mut config = preempting_config();
+        config.scheduler.complete_wait_secs = 600;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let mut wide = basic_spec("wide-owner");
+        wide.qos = Some("high".into());
+        wide.nodelist = Some("n1".into());
+        wide.exclusive = true;
+        wide.priority = Some(50_000);
+        let wide = submit_and_wait(&cm, wide);
+        let mut short = basic_spec("short-owner");
+        short.qos = Some("high".into());
+        short.nodelist = Some("n1".into());
+        short.num_tasks = 4;
+        short.time_limit = Some(chrono::Duration::minutes(1));
+        let short = submit_and_wait(&cm, short);
+        let drains = run_with_qos(&cm, "drains", "low", "n1", 4);
+        let freed = run_with_qos(&cm, "freed", "low", "n1", 4);
+        cm.preempt_job_with_provenance(
+            drains,
+            cm.get_job(drains).unwrap().run_attempt,
+            PreemptMode::Cancel,
+            Some(wide),
+            None,
+        )
+        .unwrap();
+        settle(&cm, drains, JobState::Completing);
+        cm.preempt_job_with_provenance(
+            freed,
+            cm.get_job(freed).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(short),
+            None,
+        )
+        .unwrap();
+        let mut bystander = basic_spec("bystander");
+        bystander.nodelist = Some("n1".into());
+        bystander.time_limit = Some(chrono::Duration::minutes(1));
+        submit_and_wait(&cm, bystander);
+
+        cm.tick_preempt_freed_earmarks();
+        let placed: Vec<_> = run_one_scheduling_pass(&cm)
+            .iter()
+            .map(|a| a.job_id)
+            .collect();
+        assert_eq!(placed, vec![short]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn victim_search_does_not_count_a_node_assigned_this_pass_as_free() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        for node in ["n1", "n2"] {
+            register_node(&cm, node, 8, 16000);
+        }
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let bystander = run_with_qos(&cm, "bystander", "low", "n2", 8);
+        let mut wide = basic_spec("wide");
+        wide.qos = Some("high".into());
+        wide.nodelist = Some("n1,n2".into());
+        wide.num_nodes = 2;
+        wide.num_tasks = 2;
+        wide.exclusive = true;
+        let wide = submit_and_wait(&cm, wide);
+        let short = pending_on(&cm, "short", "low", "n1");
+        let assigned = [spur_sched::traits::Assignment {
+            job_id: short,
+            nodes: vec!["n1".into()],
+            per_node_alloc: HashMap::new(),
+        }];
+        let partitions = cm.get_partitions();
+        let pending = cm.get_job(wide).unwrap();
+        for (beside, evicted) in [(&assigned[..], None), (&[][..], Some(wide))] {
+            crate::scheduler_loop::try_preempt_beside(
+                &cm,
+                &partitions,
+                &cm.get_nodes(),
+                &[&pending],
+                beside,
+                &cm.config().scheduler,
+            )
+            .await;
+            assert_eq!(cm.get_job(bystander).unwrap().preempted_by, evicted);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_a_completing_job_already_released_counts_as_free_for_preemption() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        for node in ["n1", "n2", "n3"] {
+            register_node(&cm, node, 8, 16000);
+        }
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let mut wide = basic_spec("wide");
+        wide.nodelist = Some("n1,n3".into());
+        wide.num_nodes = 2;
+        wide.num_tasks = 2;
+        let wide = submit_and_wait(&cm, wide);
+        let res = scalar_alloc(2, 4000);
+        cm.start_job(
+            wide,
+            vec!["n1".into(), "n3".into()],
+            scalar_alloc(4, 8000),
+            per_node_for(&["n1", "n3"], res),
+        )
+        .unwrap();
+        settle(&cm, wide, JobState::Running);
+        cm.cancel_job(wide, "testuser").unwrap();
+        settle(&cm, wide, JobState::Completing);
+        let attempt = cm.get_job(wide).unwrap().run_attempt;
+        cm.node_complete(wide, "n1", -1, 15, attempt).unwrap();
+        let blocker = run_with_qos(&cm, "blocker", "low", "n2", 2);
+        let mut hunter = basic_spec("hunter");
+        hunter.qos = Some("high".into());
+        hunter.nodelist = Some("n1,n2".into());
+        hunter.num_nodes = 2;
+        hunter.num_tasks = 2;
+        let hunter = submit_and_wait(&cm, hunter);
+
+        crate::scheduler_loop::try_preempt(
+            &cm,
+            &cm.get_partitions(),
+            &cm.get_nodes(),
+            &[&cm.get_job(hunter).unwrap()],
+            &cm.config().scheduler,
+        )
+        .await;
+        assert_eq!(cm.get_job(blocker).unwrap().preempted_by, Some(hunter));
+        assert_eq!(cm.get_job(wide).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn freed_node_earmarks_age_and_clear_per_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+        let [gone, aged, kept, started] =
+            ["gone", "aged", "kept", "started"].map(|name| pending_on(&cm, name, "high", "n1"));
+        let free_for = |owner, name: &str| {
+            let victim = run_with_qos(&cm, name, "low", "n1", 2);
+            cm.preempt_job_with_provenance(
+                victim,
+                cm.get_job(victim).unwrap().run_attempt,
+                PreemptMode::Requeue,
+                Some(owner),
+                None,
+            )
+            .unwrap();
+        };
+        let owners = || {
+            cm.preempt_freed_nodes_raw()
+                .get("n1")
+                .map(|o| o.keys().copied().collect::<HashSet<_>>())
+                .unwrap_or_default()
+        };
+        free_for(gone, "v-gone");
+        cm.cancel_job(gone, "testuser").unwrap();
+        free_for(aged, "v-aged");
+        assert_eq!(
+            owners(),
+            HashSet::from([aged]),
+            "a cancelled owner is pruned"
+        );
+        cm.tick_preempt_freed_earmarks();
+        free_for(kept, "v-kept");
+        free_for(started, "v-started");
+        cm.tick_preempt_freed_earmarks();
+        cm.tick_preempt_freed_earmarks();
+        assert_eq!(
+            owners(),
+            HashSet::from([kept, started]),
+            "each owner ages alone"
+        );
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            started,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, started, JobState::Running);
+        assert_eq!(
+            owners(),
+            HashSet::from([kept]),
+            "a start drops only that owner"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -23331,6 +23582,7 @@ state = "UP"
                 ..state
             },
             &[&wide_job],
+            &assignments,
         )
         .await;
         let evicted = |cm: &ClusterManager| {
@@ -23616,12 +23868,7 @@ state = "UP"
             "while the victim drains, the preemptor must stay hoisted ahead of the bystander"
         );
 
-        // The freeing moment: the victim reports its node and finalizes, so n1
-        // is now free. A full scheduling pass must hand n1 to the preemptor, not
-        // the bystander. This exercises the one-cycle window of the proposal's
-        // open item [1]: while the victim still drained, the hoist held n1 for
-        // the preemptor via backfill's reservation, so the bystander could not
-        // claim it in the cycle the node frees.
+        // The pass in which the victim frees n1 must hand it to the preemptor, not the bystander.
         report_nodes_released(&cm, victim_id);
         settle(&cm, victim_id, JobState::Cancelled);
         let assignments = run_one_scheduling_pass(&cm);
@@ -23664,7 +23911,7 @@ state = "UP"
         assert_eq!(
             cm.preemption_handoffs(&pending, &cm.get_nodes(), &cm.get_reservations())
                 .get("n1"),
-            Some(&hunter_id),
+            Some(&vec![hunter_id]),
             "a victim in grace must protect its preemptor's handoff"
         );
     }
@@ -23688,8 +23935,11 @@ state = "UP"
         }
 
         assert_eq!(
-            cm.preempt_freed_nodes_raw().get("n2").copied(),
-            Some((hunter_id, ClusterManager::PREEMPT_FREED_EARMARK_PASSES))
+            cm.preempt_freed_nodes_raw().get("n2").cloned(),
+            Some(HashMap::from([(
+                hunter_id,
+                ClusterManager::PREEMPT_FREED_EARMARK_PASSES
+            )]))
         );
     }
 
@@ -24007,8 +24257,10 @@ state = "UP"
         )
         .unwrap();
         assert_eq!(
-            cm.preempt_freed_nodes_raw().get("n1").map(|(p, _)| *p),
-            Some(owner),
+            cm.preempt_freed_nodes_raw()
+                .get("n1")
+                .map(|o| o.keys().copied().collect::<Vec<_>>()),
+            Some(vec![owner]),
             "a genuine requeue-preemption must earmark the freed node for its preemptor"
         );
     }
@@ -24068,8 +24320,8 @@ state = "UP"
 
         let earmarks = cm.preempt_freed_nodes_raw();
         assert_eq!(
-            earmarks.get("n2").map(|(p, _)| *p),
-            Some(hunter_id),
+            earmarks.get("n2").map(|o| o.keys().copied().collect::<Vec<_>>()),
+            Some(vec![hunter_id]),
             "a node freed from a preempt-cancel victim by node failure must be earmarked for the preemptor"
         );
     }
@@ -32334,7 +32586,9 @@ state = "UP"
 
             let earmarks = cm.preempt_freed_nodes_raw();
             assert_eq!(
-                earmarks.get("n3").map(|(owner, _)| *owner),
+                earmarks
+                    .get("n3")
+                    .and_then(|owners| owners.keys().next().copied()),
                 Some(99),
                 "{mode:?}"
             );
@@ -32364,7 +32618,12 @@ state = "UP"
         assert_eq!(resp.jobs_finalized.len(), 1);
         let earmarks = cm.preempt_freed_nodes_raw();
         for node in ["n1", "n2"] {
-            assert_eq!(earmarks.get(node).map(|(owner, _)| *owner), Some(99));
+            assert_eq!(
+                earmarks
+                    .get(node)
+                    .and_then(|owners| owners.keys().next().copied()),
+                Some(99)
+            );
         }
     }
 
@@ -32460,7 +32719,7 @@ state = "UP"
         assert_eq!(
             cm.preempt_freed_nodes_raw()
                 .get("n2")
-                .map(|(owner, _)| *owner),
+                .and_then(|owners| owners.keys().next().copied()),
             Some(99),
             "the node that never reported is earmarked for the preemptor"
         );
@@ -32489,7 +32748,7 @@ state = "UP"
         assert_eq!(
             cm.preempt_freed_nodes_raw()
                 .get("n1")
-                .map(|(owner, _)| *owner),
+                .and_then(|owners| owners.keys().next().copied()),
             Some(99),
             "the preemptor still gets the node the failed run released"
         );
@@ -32550,7 +32809,7 @@ state = "UP"
         assert_eq!(
             cm.preempt_freed_nodes_raw()
                 .get("n1")
-                .map(|(owner, _)| *owner),
+                .and_then(|owners| owners.keys().next().copied()),
             Some(99),
             "the freed node is earmarked for the preemptor"
         );
@@ -32625,7 +32884,7 @@ state = "UP"
         assert_eq!(
             cm.preempt_freed_nodes_raw()
                 .get("n1")
-                .map(|(owner, _)| *owner),
+                .and_then(|owners| owners.keys().next().copied()),
             Some(99),
             "the freed node is earmarked for the preemptor"
         );
@@ -32671,7 +32930,7 @@ state = "UP"
         assert_eq!(
             cm.preempt_freed_nodes_raw()
                 .get("n1")
-                .map(|(owner, _)| *owner),
+                .and_then(|owners| owners.keys().next().copied()),
             Some(99),
             "the freed node is earmarked for the preemptor"
         );
@@ -32731,7 +32990,7 @@ state = "UP"
     fn earmark_owner(cm: &ClusterManager, node: &str) -> Option<JobId> {
         cm.preempt_freed_nodes_raw()
             .get(node)
-            .map(|(owner, _)| *owner)
+            .and_then(|owners| owners.keys().next().copied())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33045,7 +33304,7 @@ state = "UP"
         assert_eq!(
             cm.preempt_freed_nodes_raw()
                 .get("n2")
-                .map(|(owner, _)| *owner),
+                .and_then(|owners| owners.keys().next().copied()),
             Some(99),
             "the node that never reported is earmarked too"
         );

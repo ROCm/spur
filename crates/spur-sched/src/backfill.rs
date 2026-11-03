@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Duration, Utc};
 use tracing::{debug, info};
@@ -37,7 +37,7 @@ pub struct BackfillScheduler {
     /// Off for dry runs, whose outcomes must not reach the log or the dedup above.
     report_unplaced: bool,
     /// Handed-off nodes the last pass freed because their owner was planned elsewhere.
-    released_handoffs: Vec<String>,
+    released_handoffs: Vec<(String, JobId)>,
 }
 
 /// Scheduler's future-slot plan: job -> (nodes held, projected start).
@@ -102,41 +102,54 @@ struct ReservationCheck<'a> {
     reservations: &'a [Reservation],
 }
 
-/// Per-pass handoff view: a handed-off node is hidden from other jobs until its
-/// owner is planned, then only blocked for them until the owner's start.
+/// Per-pass handoff view: a node is hidden from non-owners until its owners are planned;
+/// after that, non-owners wait for the planned owners' starts there.
 #[derive(Clone)]
 struct HandoffGate<'a> {
-    owners: &'a HashMap<String, JobId>,
-    held_until: HashMap<&'a str, chrono::DateTime<Utc>>,
-    released: Vec<&'a str>,
+    owners: &'a HashMap<String, Vec<JobId>>,
+    owner_ids: HashSet<JobId>,
+    held_until: HashMap<&'a str, HashMap<JobId, chrono::DateTime<Utc>>>,
+    released: Vec<(&'a str, JobId)>,
 }
 
 impl<'a> HandoffGate<'a> {
-    fn new(owners: &'a HashMap<String, JobId>) -> Self {
+    fn new(owners: &'a HashMap<String, Vec<JobId>>) -> Self {
         Self {
             owners,
+            owner_ids: owners.values().flatten().copied().collect(),
             held_until: HashMap::new(),
             released: Vec::new(),
         }
     }
 
-    fn foreign_owner(&self, job: &Job, node: &str) -> bool {
-        self.owners.get(node).is_some_and(|o| *o != job.job_id)
+    /// Owners of `node` that hold it against `job`; none when `job` is one of them.
+    fn blockers(&self, job: &Job, node: &str) -> &'a [JobId] {
+        match self.owners.get(node) {
+            Some(owners) if !owners.contains(&job.job_id) => owners,
+            _ => &[],
+        }
+    }
+
+    fn held_for(&self, node: &str, owner: JobId) -> Option<chrono::DateTime<Utc>> {
+        self.held_until.get(node)?.get(&owner).copied()
     }
 
     fn hides(&self, job: &Job, node: &str) -> bool {
-        self.foreign_owner(job, node) && !self.held_until.contains_key(node)
+        self.blockers(job, node)
+            .iter()
+            .any(|o| self.held_for(node, *o).is_none())
     }
 
     /// Earliest time `job` may be planned on `node`.
     fn floor(&self, job: &Job, node: &str, now: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
-        match self.held_until.get(node) {
-            Some(until) if self.foreign_owner(job, node) => (*until).max(now),
-            _ => now,
-        }
+        self.blockers(job, node)
+            .iter()
+            .filter_map(|o| self.held_for(node, *o))
+            .fold(now, chrono::DateTime::max)
     }
 
-    /// Once `owner` is planned, its picked nodes are held until `start`; the rest are freed.
+    /// Once `owner` is planned, its picked nodes are held until `start` and its hold on
+    /// its other nodes ends.
     fn owner_planned(
         &mut self,
         owner: JobId,
@@ -144,14 +157,22 @@ impl<'a> HandoffGate<'a> {
         start: chrono::DateTime<Utc>,
         now: chrono::DateTime<Utc>,
     ) {
-        for (node, _) in self.owners.iter().filter(|(_, o)| **o == owner) {
-            let until = if picked(node) {
-                start
-            } else {
-                self.released.push(node);
-                now
-            };
-            self.held_until.insert(node, until);
+        if !self.owner_ids.contains(&owner) {
+            return;
+        }
+        for (node, owners) in self.owners {
+            if owners.contains(&owner) {
+                let until = if picked(node) {
+                    start
+                } else {
+                    self.released.push((node, owner));
+                    now
+                };
+                self.held_until
+                    .entry(node)
+                    .or_default()
+                    .insert(owner, until);
+            }
         }
     }
 }
@@ -227,7 +248,7 @@ impl BackfillScheduler {
 
     /// Handed-off nodes the last `schedule()` freed because their owner was planned on
     /// other nodes; a victim search later in the same pass must not treat them as held.
-    pub fn released_handoffs(&self) -> &[String] {
+    pub fn released_handoffs(&self) -> &[(String, JobId)] {
         &self.released_handoffs
     }
 
@@ -799,10 +820,15 @@ impl BackfillScheduler {
             }
         }
 
-        // Build a set of job indices to skip (part of a het group that can't fully schedule)
-        let mut skip_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // Single-component "het" jobs are treated normally.
+        let group_of: HashMap<usize, JobId> = het_groups
+            .iter()
+            .filter(|(_, indices)| indices.len() > 1)
+            .flat_map(|(group, indices)| indices.iter().map(|&idx| (idx, *group)))
+            .collect();
+        let mut checked_groups: HashSet<JobId> = HashSet::new();
+        let mut skip_indices: HashSet<usize> = HashSet::new();
 
-        // Pre-check het groups: if any component can't find suitable nodes, skip all
         for indices in het_groups.values() {
             if indices.iter().any(|index| {
                 cluster
@@ -810,20 +836,6 @@ impl BackfillScheduler {
                     .is_some_and(|context| context.requires_binding(&pending[*index]))
             }) {
                 skip_indices.extend(indices.iter().copied());
-                continue;
-            }
-            if indices.len() <= 1 {
-                continue; // Single-component "het" job, treat normally
-            }
-            let all_have_nodes = indices.iter().all(|&idx| {
-                let job = &pending[idx];
-                let suitable = self.find_suitable_nodes(job, cluster, &handoffs, now);
-                suitable.len() >= job.spec.num_nodes as usize
-            });
-            if !all_have_nodes {
-                for &idx in indices {
-                    skip_indices.insert(idx);
-                }
             }
         }
 
@@ -844,7 +856,21 @@ impl BackfillScheduler {
                 );
             };
 
-            // Skip jobs that are part of an unschedulable het group
+            // Checked at the group's first member: the handoff gate only opens during a
+            // pass, so a group that fits then still fits for its later members.
+            if let Some(group) = group_of.get(&job_idx) {
+                if checked_groups.insert(*group) {
+                    let indices = &het_groups[group];
+                    let all_have_nodes = indices.iter().all(|&idx| {
+                        let member = &pending[idx];
+                        let suitable = self.find_suitable_nodes(member, cluster, &handoffs, now);
+                        suitable.len() >= member.spec.num_nodes as usize
+                    });
+                    if !all_have_nodes {
+                        skip_indices.extend(indices.iter().copied());
+                    }
+                }
+            }
             if skip_indices.contains(&job_idx) {
                 note(UnplacedKind::HetGroupIncomplete, 0, None);
                 continue;
@@ -1135,14 +1161,12 @@ impl BackfillScheduler {
                 }
             }
 
-            if earliest <= now || !job.idle_fill {
-                let picked = |node: &str| {
-                    assigned_nodes
-                        .iter()
-                        .any(|(ni, _)| cluster.nodes[*ni].name == node)
-                };
-                handoffs.owner_planned(job.job_id, picked, earliest, now);
-            }
+            let picked = |node: &str| {
+                assigned_nodes
+                    .iter()
+                    .any(|(ni, _)| cluster.nodes[*ni].name == node)
+            };
+            handoffs.owner_planned(job.job_id, picked, earliest, now);
 
             if earliest <= now {
                 let node_names: Vec<String> = assigned_nodes
@@ -1204,7 +1228,11 @@ impl BackfillScheduler {
 
         if initialize {
             self.log_unplaced(unplaced);
-            self.released_handoffs = handoffs.released.iter().map(|n| n.to_string()).collect();
+            self.released_handoffs = handoffs
+                .released
+                .iter()
+                .map(|(node, owner)| (node.to_string(), *owner))
+                .collect();
         }
         assignments
     }
@@ -1394,7 +1422,7 @@ mod tests {
         for job in [&mut owner, &mut competitor] {
             job.spec.reservation = Some("reserved".into());
         }
-        let handoffs = HashMap::from([("node001".into(), owner.job_id)]);
+        let handoffs = owned(&[("node001", owner.job_id)]);
         let state = ClusterState {
             fabric: None,
             nodes: &nodes,
@@ -1424,17 +1452,25 @@ mod tests {
             reservations: &[],
             topology: None,
             busy_until: &HashMap::new(),
-            preemption_handoffs: &HashMap::from([("node001".into(), 1)]),
+            preemption_handoffs: &owned(&[("node001", 1)]),
         };
         let mut scheduler = BackfillScheduler::new(100);
         assert!(state.listed_node_handed_off(&competitor, &NodePlacement::new(&competitor)));
         assert!(scheduler.schedule(&[competitor], &state).is_empty());
     }
 
+    fn owned(pairs: &[(&str, JobId)]) -> HashMap<String, Vec<JobId>> {
+        let mut handoffs: HashMap<String, Vec<JobId>> = HashMap::new();
+        for (node, owner) in pairs {
+            handoffs.entry(node.to_string()).or_default().push(*owner);
+        }
+        handoffs
+    }
+
     fn handoff_state<'a>(
         nodes: &'a [Node],
         busy_until: &'a HashMap<String, chrono::DateTime<Utc>>,
-        handoffs: &'a HashMap<String, JobId>,
+        handoffs: &'a HashMap<String, Vec<JobId>>,
     ) -> ClusterState<'a> {
         ClusterState {
             fabric: None,
@@ -1474,7 +1510,7 @@ mod tests {
     #[test]
     fn placed_handoff_owner_leaves_its_node_in_later_jobs_forward_plans() {
         let nodes = make_nodes(2);
-        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let handoffs = owned(&[("node001", 1)]);
         let busy_until = HashMap::new();
         let state = handoff_state(&nodes, &busy_until, &handoffs);
         let pending = [
@@ -1494,7 +1530,7 @@ mod tests {
     #[test]
     fn short_work_still_backfills_before_a_plan_built_on_a_released_handoff() {
         let nodes = make_nodes(2);
-        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let handoffs = owned(&[("node001", 1)]);
         let busy_until = HashMap::new();
         let state = handoff_state(&nodes, &busy_until, &handoffs);
         let pending = [
@@ -1515,7 +1551,7 @@ mod tests {
     fn waiting_handoff_owner_blocks_its_nodes_only_until_its_planned_start() {
         let mut nodes = make_nodes(3);
         nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
-        let handoffs = HashMap::from([("node001".to_string(), 1), ("node002".to_string(), 1)]);
+        let handoffs = owned(&[("node001", 1), ("node002", 1)]);
         let busy_until =
             HashMap::from([("node002".to_string(), Utc::now() + Duration::minutes(5))]);
         let state = handoff_state(&nodes, &busy_until, &handoffs);
@@ -1548,11 +1584,7 @@ mod tests {
     fn placed_owner_reports_only_the_held_nodes_it_left_unused() {
         let mut nodes = make_nodes(3);
         nodes[2].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
-        let handoffs = HashMap::from([
-            ("node001".to_string(), 1),
-            ("node002".to_string(), 1),
-            ("node003".to_string(), 2),
-        ]);
+        let handoffs = owned(&[("node001", 1), ("node002", 1), ("node003", 2)]);
         let busy_until =
             HashMap::from([("node003".to_string(), Utc::now() + Duration::minutes(5))]);
         let state = handoff_state(&nodes, &busy_until, &handoffs);
@@ -1565,13 +1597,13 @@ mod tests {
             plan_of(&sched, 2).is_some(),
             "the waiting owner keeps its planned node"
         );
-        assert_eq!(sched.released_handoffs(), ["node002"]);
+        assert_eq!(sched.released_handoffs(), [("node002".to_string(), 1)]);
     }
 
     #[test]
     fn unplaceable_handoff_owner_keeps_its_node_hidden() {
         let nodes = make_nodes(2);
-        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let handoffs = owned(&[("node001", 1)]);
         let busy_until = HashMap::new();
         let state = handoff_state(&nodes, &busy_until, &handoffs);
         let pending = [
@@ -1581,6 +1613,53 @@ mod tests {
         let mut sched = BackfillScheduler::new(100);
         assert!(sched.schedule(&pending, &state).is_empty());
         assert!(plan_of(&sched, 2).is_none());
+    }
+
+    #[test]
+    fn het_group_needing_a_handed_off_node_plans_once_its_owner_is_planned() {
+        let nodes = make_nodes(2);
+        let handoffs = owned(&[("node001", 1)]);
+        let busy_until = HashMap::new();
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let mut anchor = job_for(10, 1, Duration::hours(1));
+        anchor.het_group = Some(0);
+        anchor.spec.nodelist = Some("node001".into());
+        let mut component = job_for(11, 1, Duration::hours(1));
+        component.het_job_id = Some(10);
+        component.het_group = Some(1);
+        component.spec.nodelist = Some("node002".into());
+        let pending = [
+            job_for(1, 1, Duration::minutes(1)),
+            anchor,
+            component,
+            job_for(4, 1, Duration::hours(1)),
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        let started: Vec<_> = sched
+            .schedule(&pending, &state)
+            .iter()
+            .map(|a| a.job_id)
+            .collect();
+        assert!(started.contains(&1) && !started.contains(&4), "{started:?}");
+        assert!(plan_of(&sched, 10).is_some_and(|(_, at)| (55..=60).contains(&at)));
+    }
+
+    #[test]
+    fn co_owner_starts_beside_a_waiting_owner_while_a_bystander_waits() {
+        let mut nodes = make_nodes(2);
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let handoffs = owned(&[("node001", 1), ("node002", 1), ("node001", 2)]);
+        let busy_until =
+            HashMap::from([("node002".to_string(), Utc::now() + Duration::minutes(5))]);
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let mut bystander = make_job(3, 1, 32);
+        bystander.spec.nodelist = Some("node001".into());
+        let pending = [make_job(1, 2, 32), make_job(2, 1, 32), bystander];
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&pending, &state);
+        assert_eq!(placed(&assignments), vec![(2, vec!["node001".into()])]);
+        assert!(plan_of(&sched, 1).is_some_and(|(_, at)| (295..=300).contains(&at)));
+        assert!(plan_of(&sched, 3).is_some_and(|(_, at)| at >= 3590));
     }
 
     #[test]

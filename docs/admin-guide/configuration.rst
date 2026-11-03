@@ -712,7 +712,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 
    A pending job that needs more nodes than currently have free capacity is
    re-evaluated every scheduling cycle, but does not hold a reservation on
-   any node while it waits. In practice this means: as soon as any node the
+   any node while it waits (except nodes freed by its own cancel or requeue
+   preemption, described below). In practice this means: as soon as any node the
    job could use becomes free, that capacity is available to any other
    pending job that fits it right now — including one submitted after the
    larger job and with lower priority. A large multi-node job can therefore
@@ -745,7 +746,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    least two scheduling passes after the last one releases its resources,
    other pending jobs, including competing
    preemptors, cannot be placed on those nodes. A pass runs every
-   ``interval_secs``, or sooner when a job is submitted, so the post-release
+   ``interval_secs``, or sooner when an event such as a submission or requeue
+   wakes the scheduler, so the post-release
    window can be well under ``interval_secs``. This protects a multi-node
    preemptor whose victims finish at different times. Jobs queued behind the
    preemptor still plan future starts on those nodes once the preemptor has a
@@ -753,7 +755,13 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 
    The handoff is held for the whole node, not only the released resources.
    On nodes shared by several jobs, capacity left over beside the victim stays
-   unused until the preemptor is placed or the handoff ends.
+   unused by other pending jobs until every preemptor holding the node is
+   placed or its handoff ends.
+
+   The exception is other preemptors whose own victims ran on the same node:
+   each of them may use the node, and they are not ordered against each other.
+   A job whose QOS could evict the preemptor is held off like any other job;
+   once the preemptor starts, it may preempt it under the usual rules.
 
    A handoff ends when its preemptor starts, is cancelled or held, or is still
    unplaced after the post-release passes. It is skipped for any pass in which
@@ -761,14 +769,18 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    node in an active reservation is handed off only to a preemptor allowed to
    use that reservation, and idle-fill reclaim creates no handoff.
 
-   A handoff whose victims are still in grace or draining survives a controller
-   restart.
-   Post-release handoffs are kept in controller memory, so a restart or leader
-   change can drop one, or renew it for two more passes (longer if the
-   preemptor still has other victims in grace or draining).
+   A handoff whose victims are still in grace or draining after cancel
+   preemption survives a controller restart. Once a requeue takes effect, its
+   victim releases the remaining nodes at once, so the handoff is post-release
+   only. Post-release handoffs are kept in controller memory, so a restart or
+   leader change can drop one, or renew it for two more passes (longer if the
+   preemptor still has other victims in grace or draining). A renewed handoff
+   can also put back a preemptor whose hold had already ended, so it again
+   shares the node with any newer preemptor there.
 
-   Eviction eligibility uses the QOS allow-list and priority. Fair-share and
-   age only order the queue; they never make a job eligible to preempt.
+   Eviction eligibility uses the QOS allow-list and priority, plus the preempt
+   mode, exempt-time and reservation-tier rules. Fair-share and age only order the
+   queue; they never make a job eligible to preempt.
 
 .. note::
 
