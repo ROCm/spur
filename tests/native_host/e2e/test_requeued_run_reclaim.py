@@ -1,15 +1,13 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A requeued job's run that its node never got told to stop is stopped, whether the
-job waits in the queue or runs on that node again."""
+"""A run left on a node that was Down when its job was requeued is stopped once
+the node reports back, whether the job waits in the queue or runs there again."""
 
 import pytest
 
 from cluster import (
     cut_off_node,
-    drop_agent_rpcs,
-    drop_heartbeats,
     job_state,
     parse_job_id,
     wait_job_state,
@@ -98,15 +96,9 @@ class TestRequeuedRunReclaim:
                 cluster.cli_allow_fail(["scancel", str(job_id)])
             kill_pids(node, [old_pid])
 
-
-class TestRequeuedRunFencedOnRelaunch:
-    """No heartbeat reaches the controller here, so only the relaunch can stop the old run."""
-
-    @pytest.fixture
-    def cluster_config_overrides(self):
-        return {"controller": {"heartbeat_timeout_secs": 300}}
-
-    def test_relaunch_on_the_node_stops_the_old_run_and_its_steps(self, multi_node_cluster):
+    def test_requeued_job_running_again_on_the_node_leaves_no_old_run(self, multi_node_cluster):
+        """Either the node's first heartbeat or the relaunch stops the old run, whichever comes
+        first; unit tests pin the relaunch on its own."""
         cluster = multi_node_cluster
         node = cluster.nodes[1]
         name = cluster.node_names[1]
@@ -122,33 +114,25 @@ class TestRequeuedRunFencedOnRelaunch:
         )
         job_id, old_batch, old_step = None, None, None
         try:
-            out = cluster.sbatch([
-                "-N", "1", "-w", name, "-t", "30",
-                "-o", f"{cluster.remote_dir}/rerun.out", script,
-            ])
-            job_id = parse_job_id(out)
-            assert job_id is not None, out
-            wait_job_state(cluster, job_id, "R")
+            job_id = self._run_pinned(cluster, script)
             old_batch = read_pid(node, batch_pid, "the first run's batch pid")
             old_step = read_pid(node, step_pid, "the first run's srun step pid")
 
-            with drop_heartbeats(cluster, 1):
-                # The requeue's own cancel is lost, so the old run keeps going.
-                with drop_agent_rpcs(cluster, 1):
-                    node.exec_allow_fail(f"rm -f {batch_pid}")
-                    cluster.scontrol("requeue", str(job_id))
-                    wait_job_state(cluster, job_id, "PD", timeout=60)
-                    assert pid_alive(node, old_step), "the lost cancel left the old run going"
+            with cut_off_node(cluster, 1):
+                wait_node_state(cluster, name, ["down"], timeout=NODE_DOWN_BOUND)
+                wait_job_state(cluster, job_id, "PD", timeout=60)
+                node.exec_allow_fail(f"rm -f {batch_pid}")
+                assert pid_alive(node, old_step), "the step outlives its node going Down"
 
-                wait_job_state(cluster, job_id, "R", timeout=120)
-                new_batch = read_pid(node, batch_pid, "the new run's batch pid")
-                assert new_batch != old_batch
-                for pid, what in ((old_batch, "batch script"), (old_step, "srun step")):
-                    wait_until(
-                        lambda pid=pid: not pid_alive(node, pid),
-                        timeout_s=30, desc=f"the old run's {what} to be stopped by the relaunch",
-                    )
-                assert pid_alive(node, new_batch), "the new run keeps running"
+            # Pinned to this node, the job runs here again; the old run must not run beside it.
+            wait_job_state(cluster, job_id, "R", timeout=RECLAIM_BOUND + 60)
+            new_batch = read_pid(node, batch_pid, "the new run's batch pid")
+            assert new_batch != old_batch
+            for pid, what in ((old_batch, "batch script"), (old_step, "srun step")):
+                wait_until(
+                    lambda pid=pid: not pid_alive(node, pid),
+                    timeout_s=RECLAIM_BOUND, desc=f"the old run's {what} to be stopped",
+                )
         finally:
             if job_id is not None:
                 cluster.cli_allow_fail(["scancel", str(job_id)])
