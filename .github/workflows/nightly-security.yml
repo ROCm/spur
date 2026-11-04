@@ -61,7 +61,7 @@ jobs:
           cache-from: type=gha,scope=nightly-docker
 
       - name: Install Trivy
-        uses: ./.github/actions/install-trivy
+        uses: $/.github/actions/install-trivy
 
       - name: Scan image for vulnerabilities and secrets
         id: scan

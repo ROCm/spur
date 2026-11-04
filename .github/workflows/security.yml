@@ -60,7 +60,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Trivy
-        uses: ./.github/actions/install-trivy
+        uses: $/.github/actions/install-trivy
 
       - name: Scan Kubernetes manifests and Dockerfiles for misconfigurations
         id: scan
