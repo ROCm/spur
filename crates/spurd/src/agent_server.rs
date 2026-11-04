@@ -19438,8 +19438,9 @@ mod tests {
             false, // allow_root_jobs
         );
 
-        assert!(
-            reporter.held_job_ids().is_empty(),
+        assert_eq!(
+            reporter.held_job_ids(),
+            Some(Vec::new()),
             "reporter sees no jobs before registration"
         );
 
@@ -19462,7 +19463,7 @@ mod tests {
 
         assert_eq!(
             reporter.held_job_ids(),
-            vec![77],
+            Some(vec![77]),
             "reporter's heartbeat must observe the agent-registered allocation-only job"
         );
         assert_eq!(

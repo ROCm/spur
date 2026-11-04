@@ -58,17 +58,25 @@ fn write_recover<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     m.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Attempts to read the running-job set for one heartbeat before giving up and
+/// reporting the list as incomplete. With the backoff below this is about half
+/// a second, well inside the 30-second beat interval.
+const HELD_JOBS_READ_ATTEMPTS: u32 = 5;
+const HELD_JOBS_READ_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Source of the job ids this node currently holds. The controller decides from
-/// its own authoritative state whether any reported id is stale.
+/// its own authoritative state whether any reported id is stale. `None` means
+/// the set could not be read right now (a contended lock); the caller must not
+/// treat that as "no jobs", or the controller would see a false clean report.
 pub trait HeldJobs: Send + Sync {
-    fn held_job_ids(&self) -> Vec<u32>;
+    fn held_job_ids(&self) -> Option<Vec<u32>>;
 }
 
 impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
-    fn held_job_ids(&self) -> Vec<u32> {
+    fn held_job_ids(&self) -> Option<Vec<u32>> {
         match self.try_lock() {
-            Ok(jobs) => jobs.keys().copied().collect(),
-            Err(_) => Vec::new(),
+            Ok(jobs) => Some(jobs.keys().copied().collect()),
+            Err(_) => None,
         }
     }
 }
@@ -273,9 +281,27 @@ impl NodeReporter {
         spur_net::wireguard::interface_public_key(&self.wg_iface).unwrap_or_default()
     }
 
-    /// Job ids this heartbeat would report, from the shared running map.
-    pub fn held_job_ids(&self) -> Vec<u32> {
+    /// Job ids this heartbeat would report, from the shared running map. `None`
+    /// when the map could not be read this instant (a contended lock).
+    pub fn held_job_ids(&self) -> Option<Vec<u32>> {
         self.held_jobs.held_job_ids()
+    }
+
+    /// Held-job ids for a heartbeat, retrying briefly when the running map is
+    /// momentarily locked. Returns `(ids, incomplete)`; `incomplete` is true
+    /// only when the set still could not be read, so the controller treats the
+    /// report as unknown rather than as "no jobs".
+    async fn held_ids_for_heartbeat(&self) -> (Vec<u32>, bool) {
+        for _ in 1..HELD_JOBS_READ_ATTEMPTS {
+            if let Some(ids) = self.held_job_ids() {
+                return (ids, false);
+            }
+            tokio::time::sleep(HELD_JOBS_READ_BACKOFF).await;
+        }
+        match self.held_job_ids() {
+            Some(ids) => (ids, false),
+            None => (Vec::new(), true),
+        }
     }
 
     pub fn snapshot_resources(&self) -> ResourceSet {
@@ -400,12 +426,14 @@ impl NodeReporter {
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = read_recover(&self.node_token).clone();
-            let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
+            let (held_ids, running_jobs_incomplete) = self.held_ids_for_heartbeat().await;
+            let running_jobs = build_running_jobs(held_ids, &self.held_job_gpu_ids());
             let req = spur_proto::proto::HeartbeatRequest {
                 hostname: self.hostname.clone(),
                 cpu_load: load,
                 free_memory_mb: free_mem,
                 running_jobs,
+                running_jobs_incomplete,
                 node_token: current_token,
                 wg_pubkey: self.wg_pubkey(),
                 k0s_status: self.k0s_status.get().map(|s| {
@@ -1679,14 +1707,64 @@ mod tests {
         // Cell is Send but !Sync; this fails to compile if the bound re-tightens to Sync.
         let map: Mutex<HashMap<u32, std::cell::Cell<u8>>> =
             Mutex::new(HashMap::from([(7, std::cell::Cell::new(0))]));
-        assert_eq!(map.held_job_ids(), vec![7]);
+        assert_eq!(map.held_job_ids(), Some(vec![7]));
+    }
+
+    #[test]
+    fn a_contended_running_map_reads_as_unknown_not_empty() {
+        let map: Mutex<HashMap<u32, ()>> = Mutex::new(HashMap::from([(7, ())]));
+        let _held = map.try_lock().expect("first lock");
+        // A second reader cannot take the lock, so it must report None rather
+        // than an empty set the controller would read as a clean report.
+        assert_eq!(HeldJobs::held_job_ids(&map), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_reports_a_running_map_locked_through_its_retries_as_incomplete() {
+        let running = Arc::new(Mutex::new(HashMap::from([(7, ())])));
+        let reporter = test_reporter_holding(running.clone());
+
+        let held = running.lock().await;
+        assert_eq!(reporter.held_ids_for_heartbeat().await, (Vec::new(), true));
+
+        drop(held);
+        assert_eq!(reporter.held_ids_for_heartbeat().await, (vec![7], false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_waits_out_a_brief_lock_on_the_running_map() {
+        let running = Arc::new(Mutex::new(HashMap::from([(7, ())])));
+        let reporter = test_reporter_holding(running.clone());
+
+        let held = running.clone().lock_owned().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(HELD_JOBS_READ_BACKOFF * 2).await;
+            drop(held);
+        });
+        assert_eq!(reporter.held_ids_for_heartbeat().await, (vec![7], false));
     }
 
     fn test_reporter(resources: ResourceSet) -> NodeReporter {
         test_reporter_with_addr(resources, "http://localhost:6817".into())
     }
 
+    fn test_reporter_holding(running: Arc<Mutex<HashMap<u32, ()>>>) -> NodeReporter {
+        test_reporter_with(rset(8, 0, vec![]), "http://localhost:6817".into(), running)
+    }
+
     fn test_reporter_with_addr(resources: ResourceSet, controller_addr: String) -> NodeReporter {
+        test_reporter_with(
+            resources,
+            controller_addr,
+            Arc::new(Mutex::new(HashMap::<u32, ()>::new())),
+        )
+    }
+
+    fn test_reporter_with(
+        resources: ResourceSet,
+        controller_addr: String,
+        held_jobs: Arc<dyn HeldJobs>,
+    ) -> NodeReporter {
         NodeReporter::new(
             "test-node".into(),
             controller_addr,
@@ -1701,7 +1779,7 @@ mod tests {
             String::new(),
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
-            Arc::new(Mutex::new(HashMap::<u32, ()>::new())),
+            held_jobs,
             ReporterTimeouts::default(),
         )
     }

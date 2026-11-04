@@ -636,9 +636,10 @@ pub struct ClusterManager {
     /// flag is unset (a keepalive-sending client predating the flag). Reset on
     /// leadership regain, like `interactive_last_seen`.
     pinged_this_term: RwLock<HashSet<JobId>>,
-    /// Nodes whose latest heartbeat still reported jobs the controller ended or
-    /// moved. Leader-local soft state, like `Node::last_heartbeat`.
-    stale_reporting_nodes: RwLock<HashSet<String>>,
+    /// Nodes whose latest heartbeat was not a clean report: still running jobs
+    /// the controller ended, or unable to enumerate its jobs. Absent means
+    /// clean. Leader-local soft state, like `Node::last_heartbeat`.
+    stale_reporting_nodes: RwLock<HashMap<String, NodeReport>>,
     /// When the health pass began withholding each node's recovery. Only the
     /// health pass writes it, so a leadership change can reset it without
     /// racing heartbeats.
@@ -963,7 +964,7 @@ impl ClusterManager {
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             pinged_this_term: RwLock::new(HashSet::new()),
-            stale_reporting_nodes: RwLock::new(HashSet::new()),
+            stale_reporting_nodes: RwLock::new(HashMap::new()),
             recovery_holds: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             preempt_freed_nodes: RwLock::new(HashMap::new()),
@@ -3951,21 +3952,28 @@ impl ClusterManager {
         self.interactive_last_seen.read().get(&job_id).copied()
     }
 
-    /// Notes whether `node`'s latest heartbeat still reported jobs the
-    /// controller ended or moved, which holds back its recovery from Down.
-    pub(crate) fn record_stale_report(&self, node: &str, reports_stale: bool) {
-        if !reports_stale {
-            self.stale_reporting_nodes.write().remove(node);
-            return;
-        }
-        if self.nodes.read().contains_key(node) {
-            self.stale_reporting_nodes.write().insert(node.to_string());
+    /// Record what `node`'s latest heartbeat said about jobs the controller
+    /// ended: `None` is a clean report (clears any hold), `Some` holds its
+    /// recovery. Ignored for an unknown node, so a report cannot resurrect one
+    /// the controller already dropped.
+    pub(crate) fn record_node_report(&self, node: &str, report: Option<NodeReport>) {
+        match report {
+            None => {
+                self.stale_reporting_nodes.write().remove(node);
+            }
+            Some(report) => {
+                if self.nodes.read().contains_key(node) {
+                    self.stale_reporting_nodes
+                        .write()
+                        .insert(node.to_string(), report);
+                }
+            }
         }
     }
 
     #[cfg(test)]
     pub(crate) fn reports_stale_jobs(&self, node: &str) -> bool {
-        self.stale_reporting_nodes.read().contains(node)
+        self.stale_reporting_nodes.read().contains_key(node)
     }
 
     /// Clear recovery holds on leadership (re)gain: their start times were set
@@ -8636,7 +8644,11 @@ impl ClusterManager {
                     }
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
-                    node.last_heartbeat = Some(Utc::now());
+                    // A stamp would recover a Down node at the next pass, on any
+                    // leader or after replay, before a heartbeat reports its jobs.
+                    if !matches!(node.state, NodeState::Down | NodeState::Error) {
+                        node.last_heartbeat = Some(Utc::now());
+                    }
                     // Re-clamp against config: NodeUpdate carries a fresh detected
                     // report and must honor caps just like NodeRegister does.
                     self.apply_node_config_policy(node);
@@ -10594,23 +10606,36 @@ pub(crate) fn monitored_node_count(nodes: &[&Node]) -> usize {
 
 const HOLD_RELEASE_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Withholds recovery from nodes still reporting jobs the controller ended, so
-/// nothing new lands beside them before the reclaim cancel does. `holds` keeps
-/// when each hold began; past `cap` the node recovers anyway, so a job that
-/// will not die cannot keep its node out of service.
+/// What a node's latest heartbeat said about jobs the controller has ended. A
+/// node absent from the stale-report map reported clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeReport {
+    /// Still running jobs the controller ended or moved; these ids are reclaimed
+    /// and its recovery is held until it reports clean.
+    StaleJobs(Vec<u32>),
+    /// The heartbeat could not enumerate the node's jobs (a contended running-job
+    /// lock, or a registration before the first complete report), so a clean
+    /// recovery cannot be confirmed and recovery is held, same as stale jobs.
+    Unknown,
+}
+
+/// Withholds recovery from nodes that did not report clean, so nothing new lands
+/// beside jobs the reclaim cancel has not stopped. `holds` keeps when each hold
+/// began; past `cap` the node recovers anyway, so a job that will not die cannot
+/// keep its node out of service.
 pub(crate) fn withhold_recoveries(
     actions: &mut Vec<HealthAction>,
-    reporting_stale: &HashSet<String>,
+    reporting_stale: &HashMap<String, NodeReport>,
     holds: &mut HashMap<String, std::time::Instant>,
     cap: std::time::Duration,
     now: std::time::Instant,
 ) {
-    holds.retain(|node, _| reporting_stale.contains(node));
+    holds.retain(|node, _| reporting_stale.contains_key(node));
     actions.retain(|action| {
         let HealthAction::Recover { name, .. } = action else {
             return true;
         };
-        if !reporting_stale.contains(name) {
+        if !reporting_stale.contains_key(name) {
             return true;
         }
         let held_for = now.saturating_duration_since(*holds.entry(name.clone()).or_insert(now));
@@ -30101,10 +30126,17 @@ state = "UP"
         }
     }
 
+    fn reporting(names: &[&str]) -> HashMap<String, super::NodeReport> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), super::NodeReport::StaleJobs(vec![1])))
+            .collect()
+    }
+
     #[test]
     fn a_recovery_waits_while_the_node_still_reports_ended_jobs() {
         let now = std::time::Instant::now();
-        let reporting = HashSet::from(["held".to_string()]);
+        let reporting = reporting(&["held"]);
         let mut holds = HashMap::new();
         let gone = super::HealthAction::MarkDown {
             name: "gone".into(),
@@ -30143,7 +30175,7 @@ state = "UP"
 
         super::withhold_recoveries(
             &mut actions,
-            &HashSet::new(),
+            &HashMap::new(),
             &mut holds,
             std::time::Duration::from_secs(90),
             started + std::time::Duration::from_secs(5),
@@ -30157,7 +30189,7 @@ state = "UP"
     fn a_recovery_proceeds_after_the_hold_cap_while_ended_jobs_linger() {
         let started = std::time::Instant::now();
         let cap = std::time::Duration::from_secs(90);
-        let reporting = HashSet::from(["stuck".to_string()]);
+        let reporting = reporting(&["stuck"]);
         let mut holds = HashMap::new();
         let pass = |holds: &mut HashMap<String, std::time::Instant>, at| {
             let mut actions = vec![recover("stuck")];
@@ -30181,7 +30213,7 @@ state = "UP"
     fn a_pass_due_at_the_hold_cap_releases_even_if_it_runs_a_hair_early() {
         let started = std::time::Instant::now();
         let cap = std::time::Duration::from_secs(45);
-        let reporting = HashSet::from(["stuck".to_string()]);
+        let reporting = reporting(&["stuck"]);
         let mut holds = HashMap::from([("stuck".to_string(), started)]);
         let mut actions = vec![recover("stuck")];
 
@@ -30212,13 +30244,91 @@ state = "UP"
         });
         set_last_heartbeat(&cm, "back", Some(Utc::now()));
 
-        cm.record_stale_report("back", true);
+        cm.record_node_report("back", Some(super::NodeReport::StaleJobs(vec![1])));
         cm.check_node_health(90, super::MarkDownPolicy::Allowed);
         assert_eq!(cm.get_node("back").unwrap().state, NodeState::Down);
 
-        cm.record_stale_report("back", false);
+        cm.record_node_report("back", None);
         cm.check_node_health(90, super::MarkDownPolicy::Allowed);
         wait_for("recovered after a clean report", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_down_node_re_registering_stays_down_until_a_heartbeat_reports() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        // An upgraded agent re-registers with a new version, which replicates a
+        // NodeUpdate to every controller and replays on restart.
+        cm.register_node(
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            "9.9.9".into(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
+        wait_for("update applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.version.as_deref() == Some("9.9.9"))
+        });
+
+        assert_eq!(cm.get_node("n1").unwrap().last_heartbeat, None);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(
+            cm.get_node("n1").unwrap().state,
+            NodeState::Down,
+            "recovery waits for a heartbeat that reports the node's jobs"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_report_holds_recovery_until_a_clean_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "back".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        set_last_heartbeat(&cm, "back", Some(Utc::now()));
+
+        // A heartbeat that could not enumerate the node's jobs is Unknown, not
+        // clean, so recovery stays held even though no stale job was named.
+        cm.record_node_report("back", Some(super::NodeReport::Unknown));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("back").unwrap().state, NodeState::Down);
+
+        cm.record_node_report("back", None);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("recovered after a complete clean report", || {
             cm.get_node("back")
                 .is_some_and(|n| n.state == NodeState::Idle)
         });
@@ -30229,7 +30339,7 @@ state = "UP"
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        cm.record_stale_report("ghost", true);
+        cm.record_node_report("ghost", Some(super::NodeReport::StaleJobs(vec![1])));
 
         assert!(!cm.reports_stale_jobs("ghost"));
     }
