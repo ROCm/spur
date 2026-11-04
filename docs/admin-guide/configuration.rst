@@ -593,7 +593,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        requeue-mode preemption. A requeued job itself is held out of the queue
        for the larger of ``2 x interval_secs + 3`` and ``kill_wait_secs``
        seconds (5 with the defaults); that term follows ``kill_wait_secs`` live.
-       Mirrors Slurm's ``KillWait`` for these stops.
+       Mirrors Slurm's ``KillWait`` for these stops, but does not yet reach
+       ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
    * - ``timeout_kill_wait_secs``
      - integer
      - ``30``
@@ -605,6 +606,7 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        ``complete_wait_secs`` should exceed the larger kill wait (this or
        ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``. In Slurm,
        ``KillWait`` also covers time limits; here that part is this setting.
+       Does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
    * - ``max_user_priority``
      - integer
      - ``1000``
@@ -626,8 +628,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Reap an interactive allocation (``salloc``, or a standalone ``srun`` with
        or without ``--pty``) whose client has sent no keepalive for this many
-       seconds, freeing the nodes. The reaper sends SIGTERM, waits
-       ``timeout_kill_wait_secs``, then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
+       seconds, freeing the nodes. The reaper sends SIGTERM, then SIGKILLs after
+       up to ``timeout_kill_wait_secs``; the job ends ``TIMEOUT``, normally at
+       once (:ref:`kill wait note <kill-wait-steps-caveat>`). ``0`` disables reaping.
        Mirrors Slurm's ``InactiveLimit``; the value in effect is shown by
        ``scontrol show config``. Must be at least twice the client keepalive
        interval (60 seconds); smaller non-zero values are rejected at startup so a
@@ -765,16 +768,15 @@ Reaping abandoned interactive allocations (``inactive_limit_secs``)
 ``salloc`` and standalone ``srun`` (with or without ``--pty``) ping the
 controller every 30 seconds for as long as the client is running. When the pings
 stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
-allocation is reaped: SIGTERM, a wait of up to ``timeout_kill_wait_secs``
-(default 30 seconds, ending early once the job's own process exits), then
-SIGKILL. The wait does not yet reach work in the job's ``srun`` steps (see the
-note under *Time limits and the kill wait* in :doc:`/user-guide/monitoring-jobs`).
-The job shows ``COMPLETING`` (``CG``) meanwhile and ends
-``TIMEOUT``. The SIGTERM is final: a client that reconnects during the wait
-does not save the allocation, and the job ends ``TIMEOUT`` however its
-processes exit. With the defaults, an abandoned allocation is signalled 270 to
-310 seconds after its client is lost (the last ping can be up to 30 seconds
-old) and is finished within about 40 seconds of the signal.
+allocation is reaped: SIGTERM, then SIGKILL after up to
+``timeout_kill_wait_secs`` (default 30 seconds). An allocation's own process
+exits on SIGTERM and its work runs in ``srun`` steps, which the wait does not
+yet reach (:ref:`kill wait note <kill-wait-steps-caveat>`), so an allocation normally ends
+``TIMEOUT`` right away, without showing ``COMPLETING`` (``CG``) or waiting. The
+SIGTERM is final: a client that reconnects after it does not save the
+allocation, and the job ends ``TIMEOUT`` however its processes exit. With the
+defaults, an abandoned allocation is signalled 270 to 310 seconds after its
+client is lost (the last ping can be up to 30 seconds old).
 
 The limit measures the client, not the job. A busy job whose client is gone is
 reaped, and so is one whose client is only stopped, such as a foreground

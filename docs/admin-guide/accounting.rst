@@ -941,7 +941,9 @@ When a pending job selects a victim that has a grace:
    warning was sent) and sets ``EndTime=`` to the grace deadline.
 #. At the deadline the normal preemption runs: SIGTERM to every process of the
    job, a wait of up to ``kill_wait_secs`` (default 5 seconds; see
-   :doc:`configuration`; it ends early once the processes exit), then SIGKILL. The job therefore receives a
+   :doc:`configuration`; it ends early once the processes exit), then SIGKILL.
+   The wait does not yet reach ``srun`` steps
+   (:ref:`kill wait note <kill-wait-steps-caveat>`). The job therefore receives a
    second SIGTERM and should tolerate it. In ``cancel`` mode the job ends
    ``CANCELLED`` (``PREEMPTED`` in ``sacct``, with ``PreemptedBy``); in
    ``requeue`` mode it returns to ``PENDING``.
@@ -968,7 +970,8 @@ Rules that follow from this:
   user's cancel, not as preempted.
 * **Suspending is refused.** ``scontrol suspend`` on a job in its grace fails.
 * **The preemptor waits.** It stays at the front of the queue until the grace
-  and kill wait finish. No other job is placed on the victim's nodes, no second
+  and kill wait finish (the node is freed once the batch script exits, before
+  its ``srun`` steps get the wait: :ref:`kill wait note <kill-wait-steps-caveat>`). No other job is placed on the victim's nodes, no second
   preemptor selects the same victim, and idle-fill reclaim
   (:doc:`idle-fill-scheduling`) waits for the grace too.
 * **A grace shortened by the time limit** still ends as a preemption, not a

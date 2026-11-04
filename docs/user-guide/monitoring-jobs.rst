@@ -832,6 +832,7 @@ the job is preempted immediately.
 * **Expect a second SIGTERM.** At the deadline Spur sends SIGTERM to every
   process in the job, waits up to the kill wait (5 seconds by default), then
   sends SIGKILL. A handler that is already shutting down should ignore a repeat.
+  The wait does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
 * **Exiting early is fine.** A job that exits during its grace is recorded as
   ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
   mode), and the preempting job starts as soon as the nodes are free.
@@ -1268,24 +1269,29 @@ wait ends early once the job's own process (its batch script) has exited, and
 the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits: a clean
 exit on SIGTERM does not make it ``COMPLETED``. ``--requeue`` still requeues it
 on timeout. The SIGTERM is final, so a batch script can use the wait to
-checkpoint and exit. The reaping of an idle
-interactive allocation (:ref:`inactive-limit`) waits the same time; a job reaped
-for inactivity also shows ``CG`` and ends ``TIMEOUT``. ``scancel``, ``scontrol
-requeue`` and the final kill of a preempted job use the general kill wait
-(``kill_wait_secs``, default 5 seconds), as does stopping the other nodes of a
-job whose batch script has exited. An ``srun`` step that has no supervisor
-process gets the full wait that applies to it (5 seconds on ``scancel``, 30 at a
-time limit), where earlier releases gave it 2 seconds.
+checkpoint and exit. An idle interactive allocation reaped for inactivity
+(:ref:`inactive-limit`) does not show ``CG`` or wait: its work runs in ``srun``
+steps and its own process exits on SIGTERM, so it ends ``TIMEOUT`` at once (see
+the note below). ``scancel``, ``scontrol requeue`` and the final kill of a
+preempted job use the general kill wait (``kill_wait_secs``, default 5 seconds),
+as does stopping the other nodes of a job whose batch script has exited. Where a
+stop does reach an ``srun`` step that has no supervisor process (the note below
+says where it does not), the step gets the full wait that applies to it (5
+seconds on ``scancel``, 30 at a time limit), where earlier releases gave it 2
+seconds.
+
+.. _kill-wait-steps-caveat:
 
 .. note::
 
-   The kill wait currently reaches only the batch script's own processes, not
-   work running in the job's ``srun`` steps. Those steps can be stopped without
-   the wait, and on nodes without cgroup enforcement they can outlive the job and
-   keep running beside a newly placed job. This applies to every stop that uses a
-   kill wait: a time limit, the inactivity limit, ``scancel``, and the final kill
-   of a preempted job. The preemption grace is not affected. See
-   `ROCm/spur#1180 <https://github.com/ROCm/spur/issues/1180>`__.
+   A job does not yet wait for its ``srun`` steps: it ends and frees its nodes
+   once its batch script (or, for an allocation, its placeholder process) exits.
+   On nodes where Spur runs as root, the steps are then stopped with the job
+   without getting the kill wait. On nodes without cgroup enforcement, they can
+   outlive the job and keep running beside a newly placed job. This affects every
+   stop that uses a kill wait: a time limit, the inactivity limit, ``scancel``,
+   and the final kill of a preempted job. The preemption grace is not affected.
+   See `ROCm/spur#1180 <https://github.com/ROCm/spur/issues/1180>`__.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 

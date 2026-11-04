@@ -820,21 +820,27 @@ with the defaults most waits are the ones a job had before.
      - SIGKILL up to ``kill_wait_secs`` (5 seconds) after SIGTERM; a job that
        exits on SIGTERM is gone as soon as it exits
      - Unchanged by default. Raise ``kill_wait_secs`` to give such jobs longer.
-   * - A job at its time limit, or an idle interactive allocation reaped by
-       ``inactive_limit_secs``
+   * - A batch job at its time limit
      - Stayed ``RUNNING`` for 30 seconds after SIGTERM, then ended ``TIMEOUT``
        and was SIGKILLed
      - Moves to ``COMPLETING`` (``CG``) at once, waits up to
        ``timeout_kill_wait_secs`` (30 seconds), then ends ``TIMEOUT`` with
        reason ``TimeLimit``
      - ``squeue`` shows ``CG`` instead of ``R`` during the wait. The final state,
-       reason, timing, and ``--requeue`` behavior are unchanged. The wait does
-       not yet reach a job's ``srun`` steps, only the batch script's own
-       processes (`ROCm/spur#1180 <https://github.com/ROCm/spur/issues/1180>`__).
+       reason, timing, and ``--requeue`` behavior are unchanged. The job does
+       not yet wait for its ``srun`` steps: it ends once its batch script exits
+       (:ref:`kill wait note <kill-wait-steps-caveat>`).
        The kill is now the agent's, so a
        job on a hung or unreachable agent stays in ``CG`` for up to
        ``complete_wait_secs`` (300 seconds by default) before it ends ``TIMEOUT``,
        where the controller used to end it 30 seconds after SIGTERM.
+   * - An idle interactive allocation reaped by ``inactive_limit_secs``
+     - Stayed ``RUNNING`` for 30 seconds after SIGTERM, then ended ``TIMEOUT``
+       and was SIGKILLed
+     - Ends ``TIMEOUT`` as soon as its own process exits on SIGTERM, without
+       showing ``CG``, as its work runs in ``srun`` steps that the wait does not
+       yet reach (:ref:`kill wait note <kill-wait-steps-caveat>`)
+     - The allocation is freed sooner than before. ``--requeue`` does not apply.
    * - A requeued job (requeue-mode preemption, ``scontrol requeue``)
      - Held out of the queue for ``2 x interval_secs + 3`` seconds (5 seconds
        with the default 1 second interval)

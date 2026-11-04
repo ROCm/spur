@@ -2335,7 +2335,7 @@ impl SlurmConfig {
 
     /// Seconds a node can need after SIGTERM before it reports completion:
     /// the longer kill wait, then the cgroup cleanup spurd waits out first.
-    /// `scheduler.complete_wait_secs` must exceed this.
+    /// `scheduler.complete_wait_secs` should exceed this.
     pub fn complete_wait_floor_secs(&self) -> u32 {
         // Counted even when `cgroup.enabled` is false: nodes read their own
         // config, so the controller's flag says nothing about theirs.

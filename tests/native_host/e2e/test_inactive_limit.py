@@ -196,8 +196,8 @@ def _assert_still_completing(cluster, job_id: int, since: float) -> None:
 
 _SPURD_COMPLETES_BEFORE_STEPS_REASON = (
     "spurd reports the node's whole-job completion as soon as the job-owning process "
-    "dies on SIGTERM, even though srun steps trapping SIGTERM are still running, so the "
-    "controller ends the job without holding COMPLETING for the kill wait"
+    "dies on SIGTERM, so the controller ends the job before srun steps trapping SIGTERM "
+    "have had their kill wait, without holding COMPLETING"
 )
 
 
