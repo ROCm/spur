@@ -1089,9 +1089,9 @@ type PlanResult = Result<PlacementPlan, (UnplacedKind, usize)>;
 impl BackfillScheduler {
     /// Pick the candidate partition the job should run in when any of them is
     /// capped or reshapes the request: each is planned under its own cap and
-    /// memory policy, and the best by priority tier then earliest start wins.
-    /// A partition whose cap could never hold the job drops out; a merely full
-    /// one stays and ranks by its later start.
+    /// memory policy, and the best by [`resolution_rank`] wins. A partition
+    /// whose cap could never hold the job drops out; a merely full one stays
+    /// and competes on its later start.
     fn resolve_partition(
         &self,
         job: &Job,
@@ -1117,8 +1117,8 @@ impl BackfillScheduler {
             match self.plan_placement(job, cluster, handoffs, now, Some(scope)) {
                 Ok(plan) => {
                     let better = best.as_ref().is_none_or(|(held, held_partition)| {
-                        resolution_rank(partition, plan.start)
-                            < resolution_rank(held_partition, held.start)
+                        resolution_rank(partition, plan.start, now)
+                            < resolution_rank(held_partition, held.start, now)
                     });
                     if better {
                         best = Some((plan, partition));

@@ -183,17 +183,28 @@ pub fn candidate_partitions<'a>(job: &Job, partitions: &'a [Partition]) -> Vec<&
         .collect()
 }
 
-/// Ordering key for choosing among candidate partitions: highest priority tier
-/// first, then the earliest start; the name only makes ties deterministic.
+/// Ordering key for choosing among candidate partitions, as Slurm does for a
+/// multi-partition request: the highest-tier partition that can start the job
+/// now wins; when none can, the earliest start wins (ties to the higher tier).
+/// Request order is ignored; the name only makes ties deterministic.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResolutionRank<'a> {
+    StartsNow(Reverse<u32>, DateTime<Utc>, &'a str),
+    Reserves(DateTime<Utc>, Reverse<u32>, &'a str),
+}
+
 pub fn resolution_rank(
     partition: &Partition,
     start: DateTime<Utc>,
-) -> (Reverse<u32>, DateTime<Utc>, &str) {
-    (
-        Reverse(partition.priority_tier),
-        start,
-        partition.name.as_str(),
-    )
+    now: DateTime<Utc>,
+) -> ResolutionRank<'_> {
+    let tier = Reverse(partition.priority_tier);
+    let name = partition.name.as_str();
+    if start <= now {
+        ResolutionRank::StartsNow(tier, start, name)
+    } else {
+        ResolutionRank::Reserves(start, tier, name)
+    }
 }
 
 #[cfg(test)]
@@ -407,29 +418,37 @@ mod tests {
         assert_eq!(names(&job_with(Some(""), &[])), ["debug"]);
     }
 
+    fn tiered(name: &str, priority_tier: u32) -> Partition {
+        Partition {
+            name: name.into(),
+            priority_tier,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn rank_prefers_priority_tier_then_earliest_start_ignoring_list_order() {
+    fn rank_prefers_a_partition_starting_now_over_a_higher_tier_that_waits() {
         let now = Utc::now();
-        let low = Partition {
-            name: "a".into(),
-            priority_tier: 1,
-            ..Default::default()
-        };
-        let high = Partition {
-            name: "z".into(),
-            priority_tier: 5,
-            ..Default::default()
-        };
-        assert!(
-            resolution_rank(&high, now + chrono::Duration::hours(2)) < resolution_rank(&low, now)
-        );
-        let other = Partition {
-            name: "b".into(),
-            priority_tier: 1,
-            ..Default::default()
-        };
-        assert!(
-            resolution_rank(&other, now) < resolution_rank(&low, now + chrono::Duration::hours(1))
-        );
+        let later = now + chrono::Duration::hours(2);
+        let (low, high) = (tiered("a", 1), tiered("z", 5));
+        assert!(resolution_rank(&low, now, now) < resolution_rank(&high, later, now));
+    }
+
+    #[test]
+    fn rank_among_partitions_starting_now_prefers_the_higher_tier() {
+        let now = Utc::now();
+        let (low, high) = (tiered("a", 1), tiered("z", 5));
+        assert!(resolution_rank(&high, now, now) < resolution_rank(&low, now, now));
+    }
+
+    #[test]
+    fn rank_among_waiting_partitions_prefers_earliest_start_then_tier() {
+        let now = Utc::now();
+        let h1 = now + chrono::Duration::hours(1);
+        let h2 = now + chrono::Duration::hours(2);
+        let (low, high, other) = (tiered("a", 1), tiered("z", 5), tiered("b", 1));
+        assert!(resolution_rank(&low, h1, now) < resolution_rank(&high, h2, now));
+        assert!(resolution_rank(&high, h1, now) < resolution_rank(&low, h1, now));
+        assert!(resolution_rank(&low, h1, now) < resolution_rank(&other, h1, now));
     }
 }
