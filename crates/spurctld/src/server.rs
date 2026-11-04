@@ -7021,12 +7021,7 @@ mod tests {
                 ..Default::default()
             }),
         });
-        let res = spur_core::resource::ResourceAllocations {
-            cpus: 1,
-            memory_mb: 0,
-            devices: std::collections::HashMap::new(),
-            generation: 0,
-        };
+        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
         let mut per_node = std::collections::HashMap::new();
         per_node.insert("n1".to_string(), res.clone());
         apply(&WalOperation::JobStart {
@@ -7091,12 +7086,7 @@ mod tests {
             );
         };
         let start_on_n1 = |run_attempt: u32| {
-            let res = spur_core::resource::ResourceAllocations {
-                cpus: 1,
-                memory_mb: 0,
-                devices: std::collections::HashMap::new(),
-                generation: 0,
-            };
+            let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
             let per_node_alloc = std::collections::HashMap::from([("n1".to_string(), res.clone())]);
             apply(&WalOperation::JobStart {
                 job_id: 60,
