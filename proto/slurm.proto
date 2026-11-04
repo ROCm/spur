@@ -494,6 +494,11 @@ message NodeInfo {
   // Port the node's agent listens on, so a client dialling it directly does not
   // have to assume the default.
   uint32 agent_port = 58;
+
+  // The leader's heartbeats from this node have gone stale, so it is given no
+  // new work until they resume (Slurm's NOT_RESPONDING, the `*` suffix). Its
+  // base `state` and running jobs are unaffected. Leader-local, never persisted.
+  bool not_responding = 59;
 }
 
 message PartitionInfo {

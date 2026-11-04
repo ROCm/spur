@@ -67,9 +67,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         let mut unhealthy_count = 0u32;
         for node in &nodes {
             let state_str = node_state_str(node);
-            let is_unhealthy = node.state == NodeState::NodeDown as i32
-                || node.state == NodeState::NodeError as i32
-                || node.state == NodeState::NodeDrain as i32;
+            let is_unhealthy = is_unhealthy(node);
 
             if is_unhealthy {
                 unhealthy_count += 1;
@@ -107,14 +105,69 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn node_state_str(node: &NodeInfo) -> &'static str {
-    if !node.active_reservation.is_empty() && node.state == NodeState::NodeIdle as i32 {
+/// A node the controller is not hearing from counts even before it is marked
+/// Down: it takes no new work, so it is the earliest sign worth surfacing.
+fn is_unhealthy(node: &NodeInfo) -> bool {
+    node.not_responding
+        || node.state == NodeState::NodeDown as i32
+        || node.state == NodeState::NodeError as i32
+        || node.state == NodeState::NodeDrain as i32
+}
+
+fn node_state_str(node: &NodeInfo) -> String {
+    let base = if !node.active_reservation.is_empty() && node.state == NodeState::NodeIdle as i32 {
         if node.reservation_maint {
-            return "maint";
+            "maint"
+        } else {
+            "resv"
         }
-        return "resv";
+    } else {
+        spur_core::node::NodeState::from_proto_i32(node.state)
+            .map(|s| s.short())
+            .unwrap_or("???")
+    };
+    // Slurm's `*`: the node is not responding and takes no new work.
+    if node.not_responding {
+        format!("{base}*")
+    } else {
+        base.to_string()
     }
-    spur_core::node::NodeState::from_proto_i32(node.state)
-        .map(|s| s.short())
-        .unwrap_or("???")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(state: NodeState, not_responding: bool) -> NodeInfo {
+        NodeInfo {
+            state: state as i32,
+            not_responding,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_not_responding_node_is_unhealthy_and_starred() {
+        let silent = node(NodeState::NodeMixed, true);
+        assert!(is_unhealthy(&silent));
+        assert_eq!(node_state_str(&silent), "mix*");
+    }
+
+    #[test]
+    fn a_responding_up_node_is_healthy() {
+        let up = node(NodeState::NodeIdle, false);
+        assert!(!is_unhealthy(&up));
+        assert_eq!(node_state_str(&up), "idle");
+    }
+
+    #[test]
+    fn down_error_and_drained_nodes_are_unhealthy() {
+        for state in [
+            NodeState::NodeDown,
+            NodeState::NodeError,
+            NodeState::NodeDrain,
+        ] {
+            assert!(is_unhealthy(&node(state, false)), "{state:?}");
+        }
+    }
 }

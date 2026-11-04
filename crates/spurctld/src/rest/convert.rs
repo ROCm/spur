@@ -48,6 +48,7 @@ pub fn node_to_json(
     serde_json::json!({
         "name": node.name,
         "state": node.state.display(),
+        "not_responding": node.not_responding,
         "reason": node.state_reason,
         "reason_uid": node.reason_uid,
         "reason_time": node.reason_time.map(|t| t.to_rfc3339()),
