@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use spur_core::job::{Job, JobState};
-use spur_core::node::Node;
+use spur_core::node::{Node, NodeState};
 use spur_core::partition::Partition;
 
 pub fn job_to_json(job: &Job) -> serde_json::Value {
@@ -45,14 +45,25 @@ pub fn node_to_json(
     node: &Node,
     planned: Option<(spur_core::job::JobId, chrono::DateTime<chrono::Utc>)>,
 ) -> serde_json::Value {
+    let layout_drain = node.layout_drain_reason();
+    let (state, reason, reason_uid, reason_time) = match &layout_drain {
+        Some(reason) => (NodeState::Drain.display(), Some(reason.clone()), None, None),
+        None => (
+            node.state.display(),
+            node.state_reason.clone(),
+            node.reason_uid,
+            node.reason_time.map(|t| t.to_rfc3339()),
+        ),
+    };
     serde_json::json!({
         "name": node.name,
-        "state": node.state.display(),
-        "reason": node.state_reason,
-        "reason_uid": node.reason_uid,
-        "reason_time": node.reason_time.map(|t| t.to_rfc3339()),
+        "state": state,
+        "reason": reason,
+        "reason_uid": reason_uid,
+        "reason_time": reason_time,
         "partitions": node.partitions,
-        "cpus": node.total_resources.cpus,
+        "cpus": node.cpu_tot(),
+        "effective_cpus": node.total_resources.cpus,
         "alloc_cpus": node.alloc_resources.cpus,
         "real_memory": node.total_resources.memory_mb,
         "free_mem": node.free_memory_mb,
@@ -108,6 +119,20 @@ pub fn parse_states_query(s: &str) -> Result<Vec<JobState>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_to_json_projects_a_core_layout_block_like_scontrol() {
+        let mut node = Node::new("n1".into(), Default::default());
+        node.state = NodeState::Idle;
+        node.layout_enforce_error = Some("root write failed".into());
+
+        let json = node_to_json(&node, None);
+        assert_eq!(json["state"], NodeState::Drain.display());
+        assert_eq!(
+            json["reason"],
+            "core-layout: not enforced: root write failed"
+        );
+    }
 
     #[test]
     fn partition_to_json_includes_access_control_fields() {

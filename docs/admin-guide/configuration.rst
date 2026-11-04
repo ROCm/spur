@@ -1633,11 +1633,44 @@ matches, and the first matching entry wins.
    * - ``reserved_memory_mb``
      - integer
      - ``0``
-     - Live
+     - Live; Restart on an entry that sets spec cores
      - Memory in MB held back from the detected total for the OS and runtime
        (e.g. ROCm), so jobs cannot be packed into headroom the host needs. Applied
        together with ``memory_mb``; the smaller resulting value wins. Must be less
        than ``memory_mb`` when both are set (rejected at config load otherwise).
+       Accepts the Slurm name ``mem_spec_limit`` as an alias. When the node also
+       sets spec cores it is enforced on the ``spur`` cgroup root, and changing it
+       is restart-only (see `Core and memory specialization`_).
+   * - ``core_spec_count``
+     - integer
+     - ``0``
+     - Restart
+     - Number of physical cores reserved for node services (e.g. a WEKA client)
+       and excluded from jobs — Slurm's ``CoreSpecCount``. Reserves whole cores
+       (every hyperthread), picked as Slurm does: the highest core index within a
+       socket first, alternating across sockets. ``CPUSpecList`` in
+       ``scontrol show node`` shows the CPUs chosen. ``0`` means unset. Mutually
+       exclusive with ``cpu_spec_list``.
+   * - ``cpu_spec_list``
+     - string
+     - ``""``
+     - Restart
+     - Specific OS CPU IDs reserved for node services, e.g. ``"127,255"`` —
+       Slurm's ``CpuSpecList`` (OS CPU IDs, not abstract indices). Every listed
+       CPU must be online, and the list is widened to whole cores, so a CPU's
+       hyperthread siblings are reserved with it. Mutually exclusive with
+       ``core_spec_count``.
+   * - ``daemons_off_spec``
+     - bool
+     - ``true``
+     - Restart
+     - Keep ``spurd``'s threads off the spec cores, so the daemon does not
+       contend with the service that owns them. ``spurstepd`` supervisors inherit
+       the mask in effect when they start; running supervisors are not re-pinned
+       when the setting changes. This differs from Slurm, where the daemons run
+       *on* the specialized cores unless ``SlurmdOffSpec`` is set: Spur defaults
+       to keeping them off, since the service that owns the cores (e.g. a WEKA
+       client) expects them to itself.
    * - ``gres``
      - [string]
      - ``[]``
@@ -1688,6 +1721,64 @@ These service states are also reconciled whenever the controller applies node
 resource policy, including live ``scontrol reconfigure``, agent inventory updates,
 and snapshot restore. Restored states reflect the current controller's resource
 caps; unavailable and administratively held states are preserved.
+
+Core and memory specialization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``core_spec_count`` / ``cpu_spec_list`` and ``reserved_memory_mb`` reserve CPUs
+and memory on a node for services that run alongside jobs — a WEKA client
+frontend, for example. The controller computes the node's core layout from the
+CPU topology the agent reports, and ``spurd`` enforces it on the ``spur`` cgroup
+root, which every job runs under:
+
+* ``cpuset.cpus`` excludes the spec CPUs, so no job can land on them.
+* ``memory.high`` is set to the node's memory minus ``reserved_memory_mb``. It
+  only throttles jobs. ``memory.max`` is lowered to the same value only at a
+  moment when no job runs on the node, because lowering a hard limit below a
+  running job's usage can OOM-kill it. Until then the reservation is pending
+  (throttled, not hard-capped); drain the node once to make it hard right away.
+  A restarted ``spurd`` keeps a ``memory.max`` its predecessor set. Without
+  ``reserved_memory_mb`` the root's memory limits stay at ``max``.
+
+The service itself still has to pin to the reserved CPUs (e.g. WEKA's own
+``isolate_cpusets`` / frontend core setting); Spur guarantees only that jobs stay
+off them.
+
+**Prerequisites.** ``[cgroup] enabled = true`` is required: jobs join the
+enforced root only through managed cgroups, so spec cores with cgroups disabled
+are rejected at config load. A node refuses launches (``failed_precondition``)
+until its layout is written to the root.
+
+**Showing it.** ``scontrol show node`` reports ``CPUTot`` (all CPUs),
+``CPUEfctv`` (CPUs left for jobs), ``CoreSpecCount``, ``CPUSpecList`` (the source
+of truth for which CPUs are reserved) and ``MemSpecLimit``.
+
+**Changing it.** ``core_spec_count``, ``cpu_spec_list`` and ``daemons_off_spec``
+are restart-only, and so is ``reserved_memory_mb`` on an entry that sets spec
+cores, because the layout is part of the inventory agent and controller agree on.
+``scontrol reconfigure`` with such a change is rejected as a whole and applies
+nothing, including unrelated live edits in the same file. Change the settings and
+restart the controllers; agents pick up the new layout when they re-register.
+
+**When it cannot be enforced.** A node is excluded from scheduling and shown as
+``DRAIN`` with a ``core-layout:`` reason (in ``sinfo -R``, ``scontrol show node``
+and the REST API) when:
+
+* its settings cannot yield a layout — spec cores covering every core, a listed
+  CPU that is offline, no reported topology, or ``reserved_memory_mb`` covering
+  all of the node's memory. The node keeps the last layout it enforced, so running
+  jobs stay off the reserved CPUs;
+* ``spurd`` reports it cannot enforce the layout (``core-layout: not enforced:``),
+  for example because the root is not writable or the node's own ``[cgroup]`` is
+  disabled. A corrected policy still reaches such a node when it re-registers.
+
+This is derived state, not an operator drain, and clears once the cause is fixed.
+A restarted ``spurd`` leaves the root exactly as it found it until it has
+received the node's policy; if the controller cannot compute it, ``spurd`` keeps
+the existing limits and refuses new jobs. ``spurd`` resets only root limits it
+wrote itself (a marker in its state directory records them, and is removed if
+the root is gone after a reboot); limits an operator set on the ``spur`` root on
+a node without specialization are left alone.
 
 ``[network]``
 -------------

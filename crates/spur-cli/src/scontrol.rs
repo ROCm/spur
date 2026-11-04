@@ -729,7 +729,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 }
                 println!(
                     "   CPUTot={} CPUAlloc={} RealMemory={} FreeMem={}",
-                    total.map(|r| r.cpus).unwrap_or(0),
+                    cpu_tot(&node),
                     alloc.map(|r| r.cpus).unwrap_or(0),
                     total.map(|r| r.memory_mb).unwrap_or(0),
                     node.free_memory_mb,
@@ -755,6 +755,22 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     for gpu in &resources.gpus {
                         print!("{}", format_gpu_topology(gpu));
                     }
+                }
+                if !node.spec_cpus.is_empty() || node.core_spec_count > 0 || node.mem_spec_mb > 0 {
+                    // CPUEfctv is the schedulable CPU count (spec cores already
+                    // excluded upstream). Show whichever spec knobs are set.
+                    let mut parts =
+                        vec![format!("CPUEfctv={}", total.map(|r| r.cpus).unwrap_or(0))];
+                    if node.core_spec_count > 0 {
+                        parts.push(format!("CoreSpecCount={}", node.core_spec_count));
+                    }
+                    if !node.spec_cpus.is_empty() {
+                        parts.push(format!("CPUSpecList={}", node.spec_cpus));
+                    }
+                    if node.mem_spec_mb > 0 {
+                        parts.push(format!("MemSpecLimit={}", node.mem_spec_mb));
+                    }
+                    println!("   {}", parts.join(" "));
                 }
                 println!("   Arch={} OS={}", node.arch, node.os);
                 if !node.labels.is_empty() {
@@ -1297,6 +1313,15 @@ fn node_state_name(state: i32) -> &'static str {
     spur_core::node::NodeState::from_proto_i32(state)
         .map(|s| s.display_upper())
         .unwrap_or("UNKNOWN")
+}
+
+/// `CPUTot`: CPUs before spec cores are set aside; a controller that predates
+/// the field reports 0, so fall back to the schedulable count.
+fn cpu_tot(node: &spur_proto::proto::NodeInfo) -> u32 {
+    if node.cpu_tot > 0 {
+        return node.cpu_tot;
+    }
+    node.total_resources.as_ref().map_or(0, |r| r.cpus)
 }
 
 /// `State=` value for `scontrol show node`, composited the way real Slurm

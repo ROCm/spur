@@ -188,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
 
     let raft_handle = Arc::new(handle);
     cluster.set_raft(raft_handle.raft.clone());
+    cluster.set_boot_epoch(raft_handle.boot_epoch);
     crate::native_keys::install(
         &config.cluster_name,
         raft_handle.clone(),

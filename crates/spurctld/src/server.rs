@@ -2570,7 +2570,13 @@ impl SlurmController for ControllerService {
         let caller_privileged = self.caller_is_privileged(Self::verified_identity(&request));
 
         let req = request.into_inner();
-        let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
+        let mut resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
+        // Carry the agent's reported CPU topology into the inventory so the
+        // controller can compute this node's core layout. Absent
+        // from agents that predate topology reporting.
+        if let Some(topology) = req.topology {
+            resources.topology = Some(topology.into());
+        }
 
         let reject_loopback = self.cluster.config().network.reject_loopback_comm_addr;
         let advertised = req.address.clone();
@@ -2601,10 +2607,17 @@ impl SlurmController for ControllerService {
             )
             .map_err(register_node_rpc_status)?;
 
+        // Deliver the node's freshly computed layout so the agent can enforce
+        // spec cores/memory immediately, before its first heartbeat.
+        let delivery = self.cluster.node_layout_delivery(&req.hostname);
+
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
             message: "registered".into(),
             node_token: node_token_response,
+            core_layout: delivery.layout,
+            layout_revision: Some(delivery.revision),
+            layout_error: delivery.error,
         }))
     }
 
@@ -2776,7 +2789,12 @@ impl SlurmController for ControllerService {
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
-            Ok(Response::new(HeartbeatResponse {}))
+            let reregister = self.cluster.record_layout_heartbeat(
+                &req.hostname,
+                req.core_layout_fingerprint,
+                &req.spec_enforcement_error,
+            );
+            Ok(Response::new(HeartbeatResponse { reregister }))
         } else {
             Err(Status::not_found(format!(
                 "node {} not found — is the node registered?",
@@ -5224,6 +5242,7 @@ fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resour
         generation: r.generation,
         fabric_binding_version: r.fabric_binding_version,
         block_file_revision: r.block_file_revision.clone(),
+        topology: None,
     };
     rs.backfill_stable_ids();
     rs
@@ -5659,10 +5678,45 @@ fn cap_names(caps: Vec<spur_core::accounting::Cap>, scope: AssocMgrScope) -> Vec
 }
 
 fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
+    // Core-spec display fields come from the CPU layout; the memory reservation
+    // is shown for memory-only nodes too, which have no CPU layout.
+    let (spec_cpus_display, spec_core_count) = match &node.core_layout {
+        Some(layout) if !layout.spec_cpus.is_empty() => {
+            let list = spur_core::cpu_topology::format_cpu_list(&layout.spec_cpus);
+            let cores = node
+                .detected_resources
+                .topology
+                .as_ref()
+                .map(|t| {
+                    t.cores
+                        .iter()
+                        .filter(|c| c.cpus.iter().any(|cpu| layout.spec_cpus.contains(cpu)))
+                        .count() as u32
+                })
+                .unwrap_or(0);
+            (list, cores)
+        }
+        _ => (String::new(), 0),
+    };
+    let spec_mem_mb = node.spec_memory_mb;
+    let layout_drain = node.layout_drain_reason();
+    let state = if layout_drain.is_some() {
+        spur_core::node::NodeState::Drain.to_proto_i32()
+    } else {
+        node.state.to_proto_i32()
+    };
+    let (state_reason, reason_uid, reason_time) = match layout_drain {
+        Some(reason) => (reason, None, None),
+        None => (
+            node.state_reason.clone().unwrap_or_default(),
+            node.reason_uid,
+            node.reason_time.map(datetime_to_proto),
+        ),
+    };
     NodeInfo {
         name: node.name.clone(),
-        state: node.state.to_proto_i32(),
-        state_reason: node.state_reason.clone().unwrap_or_default(),
+        state,
+        state_reason,
         partitions: node.partitions.clone(),
         total_resources: Some(resource_to_proto(&node.total_resources)),
         alloc_resources: Some(allocations_to_proto(&node.alloc_resources)),
@@ -5680,9 +5734,13 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         features: node.features.clone(),
         planned_job_id: 0,
         planned_start: None,
-        reason_uid: node.reason_uid,
-        reason_time: node.reason_time.map(datetime_to_proto),
+        reason_uid,
+        reason_time,
         agent_port: u32::from(node.port),
+        spec_cpus: spec_cpus_display,
+        core_spec_count: spec_core_count,
+        mem_spec_mb: spec_mem_mb,
+        cpu_tot: node.cpu_tot(),
     }
 }
 
@@ -6349,6 +6407,7 @@ mod tests {
             }],
             generic: Default::default(),
             generation: 42,
+            topology: None,
         };
         let back = proto_to_resource_set(resource_to_proto(&rs));
         assert_eq!(back.generation, 42);
@@ -13076,6 +13135,47 @@ mod tests {
             spur_core::node::Node::new(name.into(), spur_core::resource::ResourceSet::default());
         n.partitions = vec![partition.into()];
         n
+    }
+
+    #[test]
+    fn a_layout_blocked_idle_node_reads_as_drain_with_a_core_layout_reason() {
+        let mut node = core_node("n1", "cpu");
+        node.state = spur_core::node::NodeState::Idle;
+        node.layout_error = Some("spec cores would take all 4 cores".into());
+
+        let info = node_to_proto(&node);
+        assert_eq!(info.state, spur_core::node::NodeState::Drain.to_proto_i32());
+        assert_eq!(
+            info.state_reason,
+            "core-layout: spec cores would take all 4 cores"
+        );
+    }
+
+    #[test]
+    fn a_layout_error_never_masks_an_admin_drain() {
+        let mut node = core_node("n1", "cpu");
+        node.state = spur_core::node::NodeState::Down;
+        node.state_reason = Some("hardware swap".into());
+        node.layout_enforce_error = Some("root write failed".into());
+
+        let info = node_to_proto(&node);
+        assert_eq!(info.state, spur_core::node::NodeState::Down.to_proto_i32());
+        assert_eq!(info.state_reason, "hardware swap");
+    }
+
+    #[test]
+    fn node_info_reports_cpu_tot_before_spec_cores_and_a_ranged_spec_list() {
+        let mut node = core_node("n1", "cpu");
+        node.total_resources.cpus = 6;
+        node.core_layout = Some(spur_core::core_layout::CoreLayout {
+            spec_cpus: vec![6, 7],
+            general_cpus: (0..6).collect(),
+            ..Default::default()
+        });
+
+        let info = node_to_proto(&node);
+        assert_eq!(info.cpu_tot, 8);
+        assert_eq!(info.spec_cpus, "6-7");
     }
 
     #[test]

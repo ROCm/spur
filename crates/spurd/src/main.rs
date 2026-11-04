@@ -553,18 +553,29 @@ async fn main() -> anyhow::Result<()> {
         controller_rpc_timeout: spurd_config.controller_rpc_timeout(),
         failover_cooldown: spurd_config.controller_failover_cooldown(),
     };
-    let reporter = Arc::new(NodeReporter::new(
-        hostname.clone(),
-        args.controller.clone(),
-        resources,
-        node_address,
-        labels,
-        args.token.unwrap_or_default(),
-        wg_iface,
-        wg_config_dir,
-        running_jobs.clone(),
-        reporter_timeouts,
-    ));
+    let cgroup_config = config
+        .as_ref()
+        .map(|c| c.cgroup.clone())
+        .unwrap_or_default();
+    let reporter = Arc::new(
+        NodeReporter::new(
+            hostname.clone(),
+            args.controller.clone(),
+            resources,
+            node_address,
+            labels,
+            args.token.unwrap_or_default(),
+            wg_iface,
+            wg_config_dir,
+            running_jobs.clone(),
+            reporter_timeouts,
+        )
+        .with_spec_enforcement(
+            std::path::PathBuf::from(spurd::executor::CGROUP_ROOT),
+            std::path::Path::new(&stepd_state_dir).join("spec-root-applied"),
+            cgroup_config.enabled,
+        ),
+    );
 
     // Register with controller
     reporter.register().await?;
@@ -611,10 +622,6 @@ async fn main() -> anyhow::Result<()> {
         None => spur_core::config::JobLimits::default(),
     };
     log_memlock_status(limits.memlock);
-    let cgroup_config = config
-        .as_ref()
-        .map(|c| c.cgroup.clone())
-        .unwrap_or_default();
     log_cgroup_status(&cgroup_config);
     let cluster_config = config
         .as_ref()
@@ -1030,7 +1037,11 @@ fn spawn_inventory_refresh(
                     // after a failed register re-applies safely.
                     let change = {
                         let mut a = allocation.lock().await;
-                        a.update_capacity(&fresh)
+                        let change = a.update_capacity(&fresh);
+                        // The rebuild resets the per-CPU allocation bitmap, so
+                        // re-apply the spec-core exclusions to the current layout.
+                        a.set_spec_exclusions(&reporter.held_spec_cpus());
+                        change
                     };
                     match change {
                         CapacityChange::Applied => {
@@ -1365,6 +1376,7 @@ mod tests {
                 .collect(),
             generic: Default::default(),
             generation: 0,
+            topology: None,
         }
     }
 

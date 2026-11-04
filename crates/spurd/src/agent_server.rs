@@ -684,11 +684,10 @@ fn rewrite_descriptor_gpu_ids(
 /// were persisted; the lowest free cores keep occupancy right if not identity.
 fn fallback_cpu_ids(allocation: &NodeAllocation, cpus: u32) -> Vec<u32> {
     allocation
-        .allocated_cpus
+        .cpu_ids()
         .iter()
-        .enumerate()
-        .filter(|(_, &taken)| !taken)
-        .map(|(index, _)| index as u32)
+        .copied()
+        .filter(|&cpu| !allocation.is_allocated(cpu))
         .take(cpus as usize)
         .collect()
 }
@@ -6026,7 +6025,15 @@ impl SlurmAgent for AgentService {
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
         Self::require_controller(&request)?;
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        // A launch may carry a layout newer than our last registration adopted;
+        // take it so this job lands under current spec enforcement.
+        self.reporter.adopt_core_layout(
+            req.core_layout.take(),
+            req.layout_revision.take(),
+            crate::spec::Delivery::Launch,
+        );
+        self.require_spec_enforced().await?;
         let gpu_binding = req
             .allocated
             .as_ref()
@@ -7368,6 +7375,7 @@ impl SlurmAgent for AgentService {
             return Err(Status::invalid_argument("job_id is required"));
         }
         self.ensure_node_cleanup_ready()?;
+        self.require_spec_enforced().await?;
         // Creates this id's cgroup, so it must not run while a prior run's teardown
         // still owns the directory.
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
@@ -7446,6 +7454,9 @@ impl SlurmAgent for AgentService {
         }
         let alloc_result = {
             let mut alloc = self.allocation.lock().await;
+            // Keep spec cores out of this allocation too — standalone srun binds
+            // here, not through allocate_local_resources.
+            self.apply_spec_exclusions(&mut alloc);
             // Inventory may change during preflight; publication takes this
             // same lock, keeping the generation check atomic with reservation.
             if let Some(a) = allocated {
@@ -9902,6 +9913,21 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    /// Refuse a new workload unless the node's core/memory specialization layout
+    /// is in effect, independent of `[cgroup] required`.
+    async fn require_spec_enforced(&self) -> Result<(), Status> {
+        if self.reporter.ensure_spec_enforced().await {
+            return Ok(());
+        }
+        let why = self
+            .reporter
+            .spec_enforcement_error()
+            .unwrap_or_else(|| "its layout is not applied yet".into());
+        Err(Status::failed_precondition(format!(
+            "node is not enforcing its core/memory specialization layout ({why}); refusing launch"
+        )))
+    }
+
     fn ensure_node_cleanup_ready(&self) -> Result<(), Status> {
         crate::stepd::StepdStore::new(&self.stepd_state_dir)
             .ensure_cleanup_ready()
@@ -10111,6 +10137,11 @@ impl AgentService {
         crate::reporter::allocations_to_proto(&allocation)
     }
 
+    /// Exclude exactly the held layout's spec CPUs, under the allocation lock.
+    fn apply_spec_exclusions(&self, alloc: &mut NodeAllocation) {
+        alloc.set_spec_exclusions(&self.reporter.held_spec_cpus());
+    }
+
     /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
     /// `cpus`/`memory_mb` are the resolved grant, so the core IDs match it.
     async fn allocate_local_resources(
@@ -10148,6 +10179,10 @@ impl AgentService {
         let live: std::collections::HashSet<u32> = running.keys().copied().collect();
 
         let mut alloc = self.allocation.lock().await;
+
+        // Keep spec cores out of every allocation, replacing any stale set so
+        // removing or moving specialization frees the CPUs again.
+        self.apply_spec_exclusions(&mut alloc);
 
         // Recheck after preflight: inventory publication uses this same lock,
         // so no newer generation can interleave with the reservation.
@@ -18686,6 +18721,10 @@ mod tests {
     }
 
     fn test_reporter_with_gpus(device_ids: &[u32]) -> Arc<NodeReporter> {
+        Arc::new(unwrapped_test_reporter(device_ids))
+    }
+
+    fn unwrapped_test_reporter(device_ids: &[u32]) -> NodeReporter {
         use spur_core::resource::{GpuLinkType, GpuResource};
         let gpus = device_ids
             .iter()
@@ -18699,7 +18738,7 @@ mod tests {
                 stable_id: device_id as u64,
             })
             .collect();
-        Arc::new(NodeReporter::new(
+        NodeReporter::new(
             "test-node".into(),
             "http://localhost:6817".into(),
             ResourceSet {
@@ -18720,7 +18759,7 @@ mod tests {
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
             crate::reporter::ReporterTimeouts::default(),
-        ))
+        )
     }
 
     // A dispatch that records GPUs but fails before the job is
@@ -19487,6 +19526,7 @@ mod tests {
                 }],
                 generic: Default::default(),
                 generation: 7,
+                topology: None,
             },
             spur_net::NodeAddress {
                 ip: "127.0.0.1".into(),
@@ -23084,6 +23124,99 @@ mod tests {
             reloaded.resources.gpu_devices,
             vec![0x0063_0000, 0x0083_0000]
         );
+    }
+
+    fn spec_service(root: std::path::PathBuf, cgroup_enabled: bool) -> AgentService {
+        let marker = root.with_extension("marker");
+        let reporter =
+            unwrapped_test_reporter(&[]).with_spec_enforcement(root, marker, cgroup_enabled);
+        AgentService::new(
+            Arc::new(reporter),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    fn deliver_spec_core(svc: &AgentService) {
+        svc.reporter.adopt_core_layout(
+            Some(spur_proto::proto::CoreLayout {
+                spec_cpus: vec![3],
+                general_cpus: vec![0, 1, 2],
+                ..Default::default()
+            }),
+            None,
+            crate::spec::Delivery::Launch,
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_cores_refuse_workloads_when_this_nodes_cgroups_are_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = spec_service(dir.path().join("spur"), false);
+        assert!(svc.require_spec_enforced().await.is_ok());
+
+        deliver_spec_core(&svc);
+        let err = svc.require_spec_enforced().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("[cgroup]"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn a_launch_applies_the_layout_before_it_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spur");
+        let svc = spec_service(root.clone(), true);
+        deliver_spec_core(&svc);
+
+        assert!(svc.require_spec_enforced().await.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(root.join("cpuset.cpus")).unwrap(),
+            "0-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_root_write_refuses_the_workload_with_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "").unwrap();
+        let svc = spec_service(file.join("spur"), true);
+        deliver_spec_core(&svc);
+
+        let err = svc.require_spec_enforced().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("spur cgroup root"),
+            "{}",
+            err.message()
+        );
+        assert!(svc.reporter.spec_enforcement_error().is_some());
+    }
+
+    #[test]
+    fn fallback_cpu_ids_returns_real_ids_on_a_sparse_online_set() {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        let records: Vec<CpuRecord> = [0, 2, 5]
+            .iter()
+            .enumerate()
+            .map(|(i, &cpu)| CpuRecord {
+                cpu,
+                socket: 0,
+                core_id: i as u32,
+                numa_node: None,
+            })
+            .collect();
+        let resources = ResourceSet {
+            cpus: 3,
+            memory_mb: 1024,
+            topology: Some(CpuTopology::from_cpus(&records)),
+            ..Default::default()
+        };
+        let mut alloc = NodeAllocation::new("n1".into(), &resources);
+        alloc.mark_cpus_unavailable(&[0]);
+
+        assert_eq!(fallback_cpu_ids(&alloc, 2), vec![2, 5]);
     }
 
     // An empty ledger was only correct while a restart killed every job: it now
