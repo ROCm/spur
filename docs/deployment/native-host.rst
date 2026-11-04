@@ -388,16 +388,20 @@ Each agent sends a heartbeat every 30 seconds, and only the Raft leader records 
 silent node is not always a dead one: in an HA cluster heartbeats often reach the leader
 through a follower, and a broken forward or an overloaded leader looks the same as a dead
 host. So when a node's heartbeats stop reaching the leader for
-``controller.heartbeat_timeout_secs`` (default 90), the leader asks the node's agent
-directly before acting:
+``controller.heartbeat_timeout_secs`` (default 90), it is flagged not-responding (shown as
+a ``*`` suffix in ``sinfo`` and ``+NOT_RESPONDING`` in ``scontrol show node``), which stops
+new work landing on it while its running jobs continue, and the leader asks the node's
+agent directly before marking it down:
 
-- **The agent answers.** The node and its jobs are kept, and the leader logs a warning that
-  the node's heartbeats stop reaching it but its agent answers. Look for ``heartbeat
-  failed`` in the agent's log to find the broken path.
+- **The agent answers.** The node and its jobs are kept and it is not marked ``DOWN``,
+  though it stays not-responding and takes no new work until its heartbeats resume. The
+  leader logs a warning that the node's heartbeats stop reaching it but its agent answers.
+  Look for ``heartbeat failed`` in the agent's log to find the broken path.
 - **The agent does not answer on two consecutive health passes**
-  (``controller.health_tick_secs``, default 30). The node is marked ``DOWN`` with reason
-  ``Not responding``, and its jobs end ``NODE_FAIL``, or are requeued if they were
-  submitted with ``--requeue``.
+  (``controller.health_tick_secs``, default 30; the second failed probe counts only if it ran
+  at least one pass after the first). The node is marked ``DOWN`` with reason
+  ``Not responding``, and its jobs end ``NODE_FAIL``, or are requeued if they were submitted
+  with ``--requeue``.
 - **Many nodes go silent at once.** When more than ``controller.max_stale_node_fraction``
   (default half) of the watched nodes go silent in the same pass, the leader assumes the
   fault is on its side, marks none of them ``DOWN``, and logs ``suspecting the control
