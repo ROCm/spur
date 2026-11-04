@@ -1292,10 +1292,13 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        ``"accounts"`` or ``"users"`` is also set.
    * - ``"users"``
      - ``sacctmgr show user`` and ``show association`` list only the caller's
-       rows. ``user=`` for someone else prints nothing.
+       rows. ``user=`` for someone else prints nothing. ``sshare`` leaves the
+       per-user ``NormShares`` blank, because that split counts only the caller.
    * - ``"accounts"``
      - ``sacctmgr show account`` lists only accounts the caller is associated
        with. Until the association cache has loaded, that list is empty.
+       ``sshare`` leaves account and per-user ``NormShares`` blank, because
+       the weights it received are not the cluster total.
    * - ``"reservations"``
      - ``scontrol show reservation`` lists reservations the caller is named on,
        or whose accounts include one of the caller's. A reservation with no
@@ -1339,6 +1342,10 @@ leader. Accounting reads (``sacct``, ``sacctmgr show user`` and
 forwarded, so a follower answers them with the ``private_data`` it loaded at
 startup. It does the same for REST, and for controller reads while the leader
 is unreachable. Restart every follower after changing ``private_data``.
+Upgrade ``sshare`` together with ``spurctld`` before enabling ``"users"`` or
+``"accounts"``. An older controller does not set ``scoped_to_user`` on those
+lists, so this ``sshare`` would divide by the filtered weights and print
+``NormShares`` as if they were the cluster total.
 ``spurctld`` refuses to start, or to reconfigure, on a category it does not
 support; agents and the CLI ignore unknown category names.
 

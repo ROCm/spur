@@ -299,18 +299,6 @@ impl AccountingService {
         self.inner.assoc.read().as_ref()?.accounts_for(user)
     }
 
-    /// `None` lists every account. `Some` is the caller's associations, and an
-    /// empty vec shows nothing — including while the cache has not loaded.
-    fn account_allowlist<T>(&self, request: &Request<T>) -> Option<Vec<String>> {
-        let scope = self.caller_read_scope(request, self.current_auth().accounts_private());
-        match scope {
-            spur_core::rbac::ReadScope::All => None,
-            spur_core::rbac::ReadScope::Caller(user) => {
-                Some(self.accounts_for(&user).unwrap_or_default())
-            }
-        }
-    }
-
     fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
         let auth = self.current_auth();
         let cache = self.inner.assoc.read().clone();
@@ -771,10 +759,20 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<ListAccountsRequest>,
     ) -> Result<Response<ListAccountsResponse>, Status> {
-        let allowed = self.account_allowlist(&request);
+        let scope = self.caller_read_scope(&request, self.current_auth().accounts_private());
+        let pinned = scoped_to_user(&scope);
+        // `None` lists every account. `Some` is the caller's associations, and an
+        // empty vec shows nothing — including while the cache has not loaded.
+        let allowed = match &scope {
+            spur_core::rbac::ReadScope::All => None,
+            spur_core::rbac::ReadScope::Caller(user) => {
+                Some(self.accounts_for(user).unwrap_or_default())
+            }
+        };
         if allowed.as_ref().is_some_and(|names| names.is_empty()) {
             return Ok(Response::new(ListAccountsResponse {
                 accounts: Vec::new(),
+                scoped_to_user: pinned,
             }));
         }
         let pool = self.pool()?;
@@ -797,7 +795,10 @@ impl SlurmAccounting for AccountingService {
             })
             .collect();
 
-        Ok(Response::new(ListAccountsResponse { accounts }))
+        Ok(Response::new(ListAccountsResponse {
+            accounts,
+            scoped_to_user: pinned,
+        }))
     }
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
@@ -957,10 +958,14 @@ impl SlurmAccounting for AccountingService {
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
         let scope = self.caller_read_scope(&request, self.current_auth().users_private());
+        let pinned = scoped_to_user(&scope);
         let req = request.into_inner();
         let requested = (!req.user.is_empty()).then_some(req.user.as_str());
         let Some(scoped_user) = scope.job_user_filter(requested) else {
-            return Ok(Response::new(ListUsersResponse { users: Vec::new() }));
+            return Ok(Response::new(ListUsersResponse {
+                users: Vec::new(),
+                scoped_to_user: pinned,
+            }));
         };
         let user = scoped_user.as_deref();
         #[cfg(test)]
@@ -999,7 +1004,10 @@ impl SlurmAccounting for AccountingService {
             })
             .collect();
 
-        Ok(Response::new(ListUsersResponse { users }))
+        Ok(Response::new(ListUsersResponse {
+            users,
+            scoped_to_user: pinned,
+        }))
     }
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
@@ -1708,8 +1716,9 @@ mod tests {
             account: String::new(),
         });
         other.extensions_mut().insert(identity("alice", false));
-        let users = service.list_users(other).await.unwrap().into_inner().users;
-        assert!(users.is_empty());
+        let listed = service.list_users(other).await.unwrap().into_inner();
+        assert!(listed.users.is_empty());
+        assert_eq!(listed.scoped_to_user.as_deref(), Some("alice"));
 
         let mut own = Request::new(ListUsersRequest::default());
         own.extensions_mut().insert(identity("alice", false));
@@ -1766,13 +1775,13 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unavailable);
 
         users_private.store(true, std::sync::atomic::Ordering::Relaxed);
-        let users = service
+        let listed = service
             .list_users(ask_for_bob())
             .await
             .unwrap()
-            .into_inner()
-            .users;
-        assert!(users.is_empty());
+            .into_inner();
+        assert!(listed.users.is_empty());
+        assert_eq!(listed.scoped_to_user.as_deref(), Some("alice"));
     }
 
     #[tokio::test]
@@ -1782,16 +1791,12 @@ mod tests {
 
         let mut alice = Request::new(ListAccountsRequest {});
         alice.extensions_mut().insert(identity("alice", false));
-        let accounts = service
-            .list_accounts(alice)
-            .await
-            .unwrap()
-            .into_inner()
-            .accounts;
+        let listed = service.list_accounts(alice).await.unwrap().into_inner();
         assert!(
-            accounts.is_empty(),
+            listed.accounts.is_empty(),
             "a cold association cache shows no accounts"
         );
+        assert_eq!(listed.scoped_to_user.as_deref(), Some("alice"));
 
         let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
         cache.insert_association("alice", "physics");

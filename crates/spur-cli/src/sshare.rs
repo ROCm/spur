@@ -71,7 +71,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .list_accounts(ListAccountsRequest {})
         .await
         .context("failed to list accounts")?;
-    let accounts = accounts_resp.into_inner().accounts;
+    let accounts_reply = accounts_resp.into_inner();
+    let accounts = accounts_reply.accounts;
 
     // Get users
     let users_resp = client
@@ -81,7 +82,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         })
         .await
         .context("failed to list users")?;
-    let users = users_resp.into_inner().users;
+    let users_reply = users_resp.into_inner();
+    let users = users_reply.users;
 
     // Get usage data
     let usage_resp = client
@@ -93,6 +95,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .await
         .context("failed to get usage")?;
     let usage = usage_resp.into_inner();
+
+    // Share ratios divide by the accounts and users the controller returned.
+    // A pinned directory is not the cluster, so those ratios stay blank.
+    let (accounts_open, shares_open) = share_ratios_visible(
+        accounts_reply.scoped_to_user.as_deref(),
+        users_reply.scoped_to_user.as_deref(),
+    );
 
     let (fairshare_map, factors_scoped_to): (HashMap<(String, String), f64>, Option<String>) =
         match client
@@ -110,10 +119,25 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 )
             }
             Err(e) => {
-                eprintln!(
-                    "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
-                     Values shown are local approximations and may differ from the scheduler."
-                );
+                // The account-row fallback is the only approximation this warning
+                // can be about. Usage pin and account pin blank it for different reasons.
+                let usage_open = usage.scoped_to_user.is_none();
+                if account_fair_shown(false, usage_open, accounts_open) {
+                    eprintln!(
+                        "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
+                         Values shown are local approximations and may differ from the scheduler."
+                    );
+                } else if !usage_open {
+                    eprintln!(
+                        "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
+                         FairShare is blank; the usage reply is only this caller."
+                    );
+                } else {
+                    eprintln!(
+                        "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
+                         FairShare is blank; the account list is not the cluster share total."
+                    );
+                }
                 (HashMap::new(), None)
             }
         };
@@ -203,16 +227,15 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             .copied()
             .unwrap_or(0.0);
         let norm_usage = raw_usage / total_cpu_usage;
-        let fair_share = account_fairshare
-            .get(account.name.as_str())
-            .copied()
-            .unwrap_or_else(|| {
-                if norm_usage > 0.001 {
-                    (norm_shares / norm_usage).min(10.0)
-                } else {
-                    (norm_shares / 0.001).min(10.0)
-                }
-            });
+        let account_factor = account_fairshare.get(account.name.as_str()).copied();
+        let fair_fallback = if norm_usage > 0.001 {
+            (norm_shares / norm_usage).min(10.0)
+        } else {
+            (norm_shares / 0.001).min(10.0)
+        };
+        let fair_share = account_factor.unwrap_or(fair_fallback);
+        let totals = scope.totals_visible();
+        let fair_shown = account_fair_shown(account_factor.is_some(), totals, accounts_open);
 
         let cpu_raw = account_cpu_secs
             .get(account.name.as_str())
@@ -223,30 +246,38 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             .copied()
             .unwrap_or(0.0);
 
-        let totals = scope.totals_visible();
         let raw_long = cell(totals, 12, || format!("{raw_usage:>12.1}"));
         let raw_short = cell(totals, 12, || format!("{raw_usage:>12.0}"));
+        let norm_shares_cell = cell(accounts_open, 12, || format!("{norm_shares:>12.6}"));
         let norm = cell(totals, 12, || format!("{norm_usage:>12.6}"));
-        let fair = cell(totals, 12, || format!("{fair_share:>12.6}"));
+        let fair = cell(fair_shown, 12, || format!("{fair_share:>12.6}"));
         let cpu = cell(totals, 12, || format!("{cpu_raw:>12.1}"));
         let gpu = cell(totals, 12, || format!("{gpu_raw:>12.1}"));
 
         // Account-level row
         if args.long {
             println!(
-                "{:<15} {:<15} {:>12} {:>12.6} {} {} {} {} {}",
-                account.name, "", raw_shares as u32, norm_shares, raw_long, norm, fair, cpu, gpu,
+                "{:<15} {:<15} {:>12} {} {} {} {} {} {}",
+                account.name,
+                "",
+                raw_shares as u32,
+                norm_shares_cell,
+                raw_long,
+                norm,
+                fair,
+                cpu,
+                gpu,
             );
         } else {
             println!(
-                "{:<15} {:<15} {:>12} {:>12.6} {} {} {}",
-                account.name, "", raw_shares as u32, norm_shares, raw_short, norm, fair,
+                "{:<15} {:<15} {:>12} {} {} {} {}",
+                account.name, "", raw_shares as u32, norm_shares_cell, raw_short, norm, fair,
             );
         }
 
         // User-level rows under this account
-        let account_users: Vec<_> = users.iter().filter(|u| u.account == account.name).collect();
-        for user in &account_users {
+        let members: Vec<_> = users.iter().filter(|u| u.account == account.name).collect();
+        for user in &members {
             // Filter by user if specified
             if let Some(ref filter_user) = args.user {
                 if &user.name != filter_user {
@@ -260,7 +291,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .unwrap_or(0.0);
             let user_norm_usage = user_usage / total_cpu_usage;
             // Each user within an account gets an equal sub-share
-            let user_count = account_users.len().max(1) as f64;
+            let user_count = members.len().max(1) as f64;
             let user_norm_shares = norm_shares / user_count;
             let user_factor = fairshare_map
                 .get(&(user.name.clone(), account.name.clone()))
@@ -283,11 +314,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .unwrap_or(0.0);
 
             let mine = scope.user_visible(&user.name);
-            // The local approximation divides by the reply's usage total, which
-            // is only the caller's own once pinned.
-            let fair_shown = mine && (totals || user_factor.is_some());
+            let fair_shown = user_fair_shown(mine, user_factor.is_some(), totals, shares_open);
             let raw_long = cell(mine, 12, || format!("{user_usage:>12.1}"));
             let raw_short = cell(mine, 12, || format!("{user_usage:>12.0}"));
+            let user_shares = cell(shares_open, 12, || format!("{user_norm_shares:>12.6}"));
             let norm = cell(mine && totals, 12, || format!("{user_norm_usage:>12.6}"));
             let fair = cell(fair_shown, 12, || format!("{user_fair_share:>12.6}"));
             let cpu = cell(mine, 12, || format!("{user_cpu:>12.1}"));
@@ -295,27 +325,45 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
             if args.long {
                 println!(
-                    " {:<14} {:<15} {:>12} {:>12.6} {} {} {} {} {}",
-                    "",
-                    user.name,
-                    raw_shares as u32,
-                    user_norm_shares,
-                    raw_long,
-                    norm,
-                    fair,
-                    cpu,
-                    gpu,
+                    " {:<14} {:<15} {:>12} {} {} {} {} {} {}",
+                    "", user.name, raw_shares as u32, user_shares, raw_long, norm, fair, cpu, gpu,
                 );
             } else {
                 println!(
-                    " {:<14} {:<15} {:>12} {:>12.6} {} {} {}",
-                    "", user.name, raw_shares as u32, user_norm_shares, raw_short, norm, fair,
+                    " {:<14} {:<15} {:>12} {} {} {} {}",
+                    "", user.name, raw_shares as u32, user_shares, raw_short, norm, fair,
                 );
             }
         }
     }
 
     Ok(())
+}
+
+/// `(account NormShares, per-user NormShares)`.
+/// A pinned account list is not the cluster total, so both ratios are wrong.
+/// A pinned user list still has that total, but the per-user split counts
+/// only the caller.
+fn share_ratios_visible(accounts_scoped: Option<&str>, users_scoped: Option<&str>) -> (bool, bool) {
+    let account_shares = UsageScope::from_replies([accounts_scoped]).totals_visible();
+    let user_shares = account_shares && UsageScope::from_replies([users_scoped]).totals_visible();
+    (account_shares, user_shares)
+}
+
+/// A controller factor averages the factor reply. The local fallback divides
+/// by NormShares, which a pinned account list inflates.
+fn account_fair_shown(has_factor: bool, usage_open: bool, account_shares: bool) -> bool {
+    if has_factor {
+        usage_open
+    } else {
+        usage_open && account_shares
+    }
+}
+
+/// The caller's own factor is real. The local approximation divides by a
+/// share ratio, which a pinned account or user list inflates.
+fn user_fair_shown(mine: bool, has_factor: bool, usage_open: bool, user_shares: bool) -> bool {
+    mine && (has_factor || (usage_open && user_shares))
 }
 
 #[cfg(test)]
@@ -333,6 +381,27 @@ mod tests {
     fn short_h_means_noheader() {
         let args = SshareArgs::try_parse_from(["sshare", "-h"]).expect("-h is accepted");
         assert!(args.noheader);
+    }
+
+    #[test]
+    fn pinned_directories_hide_the_share_ratios_they_inflate() {
+        assert_eq!(share_ratios_visible(None, None), (true, true));
+        assert_eq!(share_ratios_visible(Some("alice"), None), (false, false));
+        assert_eq!(share_ratios_visible(None, Some("alice")), (true, false));
+        assert_eq!(share_ratios_visible(Some(""), Some("")), (false, false));
+    }
+
+    #[test]
+    fn local_fairshare_is_hidden_when_its_share_ratio_is() {
+        assert!(account_fair_shown(true, true, false));
+        assert!(!account_fair_shown(true, false, true));
+        assert!(!account_fair_shown(false, true, false));
+        assert!(account_fair_shown(false, true, true));
+
+        assert!(user_fair_shown(true, true, false, false));
+        assert!(!user_fair_shown(true, false, true, false));
+        assert!(user_fair_shown(true, false, true, true));
+        assert!(!user_fair_shown(false, true, true, true));
     }
 
     #[test]

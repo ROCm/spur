@@ -1798,6 +1798,9 @@ message ListAccountsRequest { }
 
 message ListAccountsResponse {
   repeated AccountInfo accounts = 1;
+  // Set when `[auth] private_data = ["accounts"]` pinned the reply to this
+  // user. The weights then omit other accounts, so they are not a cluster total.
+  optional string scoped_to_user = 2;
 }
 
 message AccountInfo {
@@ -1852,6 +1855,9 @@ message ListUsersRequest {
 
 message ListUsersResponse {
   repeated UserInfo users = 1;
+  // Set when `[auth] private_data = ["users"]` pinned the reply to this user.
+  // A per-account headcount from `users` is then only the caller.
+  optional string scoped_to_user = 2;
 }
 
 message UserInfo {
