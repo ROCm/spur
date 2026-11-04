@@ -60,11 +60,14 @@ jobs:
           tags: spur:nightly-scan
           cache-from: type=gha,scope=nightly-docker
 
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
       - name: Scan image for vulnerabilities and secrets
         id: scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: v0.74.0
+          skip-setup-trivy: true
           image-ref: spur:nightly-scan
           scanners: vuln,secret
           format: sarif
