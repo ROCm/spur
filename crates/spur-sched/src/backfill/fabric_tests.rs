@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::tests::{holds_a_slot, Asked, Recorder};
 use super::*;
 use crate::traits::FabricSchedulingContext;
 use spur_core::fabric::FabricView;
@@ -101,6 +102,16 @@ fn run_with_view(
     enforce: bool,
     view: FabricView,
 ) -> (BackfillScheduler, Vec<Assignment>) {
+    run_admitting(nodes, jobs, enforce, view, &mut AdmitAll)
+}
+
+fn run_admitting(
+    nodes: &[Node],
+    jobs: &[Job],
+    enforce: bool,
+    view: FabricView,
+    admission: &mut dyn StartAdmission,
+) -> (BackfillScheduler, Vec<Assignment>) {
     let partitions = [Partition {
         name: "rack".into(),
         is_default: true,
@@ -142,7 +153,7 @@ fn run_with_view(
             job
         })
         .collect();
-    let assignments = scheduler.schedule_jobs(&jobs, &cluster, now(), true);
+    let assignments = scheduler.schedule_with(&jobs, &cluster, now(), admission);
     (scheduler, assignments)
 }
 
@@ -319,6 +330,77 @@ fn backfill_preserves_exact_future_devices_and_admits_only_a_short_gap() {
     let mut long = job(3, 1, 1);
     long.spec.time_limit = Some(Duration::seconds(90));
     assert!(run(&nodes, &[job(1, 2, 4), long]).1.is_empty());
+}
+
+#[test]
+fn a_fabric_job_starting_now_is_admitted_once_and_never_for_its_probes() {
+    let mut nodes = nodes(2);
+    nodes[0].alloc_resources = ResourceAllocations {
+        cpus: 1,
+        devices: [(
+            "gpu".into(),
+            vec![
+                AllocatedDevice::injectable(42),
+                AllocatedDevice::injectable(43),
+            ],
+        )]
+        .into(),
+        ..Default::default()
+    };
+    nodes[0].state = NodeState::Mixed;
+    let view = FabricView::from_nodes("test", &nodes, now(), 90);
+    let mut admission = Recorder::default();
+
+    let (_, assignments) = run_admitting(
+        &nodes,
+        &[job(1, 2, 4), job(2, 1, 1)],
+        true,
+        view,
+        &mut admission,
+    );
+
+    assert_eq!(
+        assignments.iter().map(|a| a.job_id).collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(
+        admission.asked,
+        [vec![Asked {
+            job_id: 2,
+            nodes: assignments[0].nodes.clone(),
+            start: now(),
+            end: now() + Duration::seconds(30),
+        }]]
+    );
+}
+
+#[test]
+fn a_refused_fabric_job_reserves_nothing_and_leaves_its_block_to_later_jobs() {
+    let nodes = nodes(4);
+    let view = FabricView::from_nodes("test", &nodes, now(), 90);
+    let mut admission = Recorder::refusing(1);
+
+    let (scheduler, assignments) = run_admitting(
+        &nodes,
+        &[job(1, 2, 3), job(2, 2, 3)],
+        true,
+        view,
+        &mut admission,
+    );
+
+    assert_eq!(
+        assignments
+            .iter()
+            .map(|a| (a.job_id, a.nodes.clone()))
+            .collect::<Vec<_>>(),
+        [(2, vec!["n0".to_string(), "n1".to_string()])]
+    );
+    assert_eq!(
+        scheduler.last_outcome[&1].kind,
+        UnplacedKind::RefusedAtStart
+    );
+    assert!(scheduler.fabric_unavailable_jobs().is_empty());
+    assert!(!holds_a_slot(&scheduler, 1));
 }
 
 #[test]
@@ -613,7 +695,8 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
     };
     let plain = job(1, 4, 6);
     let mut scheduler = BackfillScheduler::new(100);
-    let assignments = scheduler.schedule_jobs(std::slice::from_ref(&plain), &cluster, now(), true);
+    let assignments =
+        scheduler.schedule_with(std::slice::from_ref(&plain), &cluster, now(), &mut AdmitAll);
     assert_eq!(assignments.len(), 1);
     assert!(assignments[0]
         .per_node_alloc
@@ -624,13 +707,13 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
         same.spec.constraint = Some(format!("same(gpu.{field})"));
         let mut scheduler = BackfillScheduler::new(100);
         assert!(scheduler
-            .schedule_jobs(std::slice::from_ref(&same), &cluster, now(), true)
+            .schedule_with(std::slice::from_ref(&same), &cluster, now(), &mut AdmitAll)
             .is_empty());
         same.spec.num_nodes = 2;
         same.spec.num_tasks = 2;
         same.spec.gpus = Some(GpuRequest::new(3, None));
         let assignments =
-            scheduler.schedule_jobs(std::slice::from_ref(&same), &cluster, now(), true);
+            scheduler.schedule_with(std::slice::from_ref(&same), &cluster, now(), &mut AdmitAll);
         assert_eq!(assignments.len(), 1);
         assert!(assignments[0]
             .per_node_alloc
@@ -641,7 +724,7 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
             ..cluster
         };
         assert!(scheduler
-            .schedule_jobs(&[same], &unavailable, now(), true)
+            .schedule_with(&[same], &unavailable, now(), &mut AdmitAll)
             .is_empty());
     }
 }
@@ -698,7 +781,7 @@ fn property_run(nodes: &[Node], jobs: &[Job]) -> (BackfillScheduler, Vec<Assignm
         busy_until: &busy,
     };
     let mut scheduler = BackfillScheduler::new(100);
-    let assignments = scheduler.schedule_jobs(jobs, &cluster, now(), true);
+    let assignments = scheduler.schedule_with(jobs, &cluster, now(), &mut AdmitAll);
     (scheduler, assignments)
 }
 
