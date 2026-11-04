@@ -783,6 +783,10 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    node in an active reservation is handed off only to a preemptor allowed to
    use that reservation, and idle-fill reclaim creates no handoff.
 
+   While its victims run out their grace or drain, and for the post-release
+   passes, the preemptor also keeps its share of its QOS and account
+   ``grptres`` caps, so another job under the same cap can't take that room.
+
    A handoff whose victims are still running out a grace, or draining after
    cancel preemption, survives a controller restart. Once a requeue takes effect, its
    victim releases the remaining nodes at once, so the handoff is post-release
