@@ -282,8 +282,15 @@ impl GpuSharing {
                 Err(e) => Err(e),
             };
             if let Err(e) = result {
-                warn!(error = %e, "cannot label the Node as not shared; retrying");
-                return;
+                if carries_label {
+                    warn!(error = %e, "cannot label the Node as not shared; retrying");
+                    return;
+                }
+                // No kubelet or no GPUs here now, for example after
+                // `spur k8s down --reset`, so the GPU operator does not
+                // select this node. The label must not keep the links.
+                warn!(error = %e, "cannot label the Node as not shared; removing the links anyway");
+                lock(&self.labeled).take();
             }
         }
         if !self.links.any_ours() {
@@ -647,6 +654,33 @@ mod tests {
         assert!(sharing
             .heartbeat_report(&ResourceSet::default(), &HashMap::new())
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn opt_out_without_a_kubelet_removes_links_the_label_cannot_reach() {
+        let server = FakeApiServer::answering(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &serde_json::json!({"kind": "Status", "apiVersion": "v1", "status": "Failure",
+                                "reason": "ServiceUnavailable", "code": 503}),
+        );
+        let root = tempfile::tempdir().unwrap();
+        KubeletLinks::under(root.path()).ensure().unwrap();
+        let sharing = sharing(&server, root.path());
+        *lock(&sharing.labeled) = Some(true);
+        sharing.set_desired(false);
+
+        sharing.converge_as(true).await;
+        assert!(
+            KubeletLinks::under(root.path()).any_ours(),
+            "a node with a kubelet keeps the links until it is labelled false"
+        );
+
+        sharing.converge_as(false).await;
+        sharing.converge_as(false).await;
+
+        assert!(!KubeletLinks::under(root.path()).any_ours());
+        assert_eq!(*lock(&sharing.labeled), None);
+        assert_eq!(server.requests().len(), 2, "no label retry after the reset");
     }
 
     #[tokio::test]
