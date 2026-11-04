@@ -249,8 +249,8 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        the controller applies a 90-second fallback when absent. A ``spurd`` node
        whose agent still answers is kept; one that fails the check on two
        consecutive health passes is marked Down. Also caps how long a returning
-       node stays Down while it still reports jobs the controller ended. See
-       :ref:`node-liveness`.
+       node's recovery is held while it still reports jobs the controller ended,
+       after which it is drained for an operator. See :ref:`node-liveness`.
    * - ``health_tick_secs``
      - integer
      - ``30``

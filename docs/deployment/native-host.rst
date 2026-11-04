@@ -406,11 +406,18 @@ Nodes managed by the Kubernetes operator are not checked this way; they are mark
 on the heartbeat timeout alone.
 
 A node marked ``DOWN`` for not responding returns to service on the next health pass after
-its heartbeats resume. If it still runs jobs the controller already ended, for example
-because it was unreachable when they ended, the controller cancels them again and keeps the
-node ``DOWN`` until it stops reporting them, so no new job lands beside them. The hold lasts at most
-``controller.heartbeat_timeout_secs``; after that the node returns anyway and the leader
-logs ``recovering it after the hold cap``.
+its heartbeats resume and it reports a clean job list. If it still runs jobs the controller
+already ended, for example because it was unreachable when they ended, the controller
+cancels them again and keeps the node ``DOWN`` until it reports clean, so no new job lands
+beside them. A heartbeat that cannot enumerate the node's jobs (a momentarily contended
+agent lock, or a just-restarted agent still adopting its jobs) does not count as clean.
+
+The hold lasts at most ``controller.heartbeat_timeout_secs``. If the ended jobs still have
+not cleared by then, usually a process that will not die, the node is drained rather than
+returned (it shows as ``DRAINED``), with reason ``Kill task failed (JobId=...)``, or with
+``Agent job list unavailable`` when it cannot report its jobs at all. The node takes no new
+work until an operator clears it with ``scontrol update nodename=<node> state=resume`` once
+it is sound; reclaim cancels keep running in the meantime.
 
 Joining Worker Nodes
 --------------------
