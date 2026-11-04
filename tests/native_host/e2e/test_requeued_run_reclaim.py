@@ -15,7 +15,9 @@ from cluster import (
     wait_until,
 )
 
-HEARTBEAT_TIMEOUT_SECS = 40
+# Also the recovery hold cap, past which a node not yet reporting clean is drained;
+# leave room for its clean heartbeat to land just after a health tick.
+HEARTBEAT_TIMEOUT_SECS = 60
 # Missed beats past the timeout, then two failed liveness probes a health tick apart.
 NODE_DOWN_BOUND = 180
 # Up to one 30s heartbeat interval (the first may fail on the dead connection) plus the 30s health tick.
