@@ -198,7 +198,15 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Submit the job held; it will not start until released. Default off.
    * - ``--requeue``
      -
-     - Allow the job to be requeued after a node failure. Default off.
+     - Allow the job to be requeued after a node failure or time limit.
+       Default off.
+   * - ``--no-requeue``
+     -
+     - Do not requeue the job after a node failure or time limit. This is the
+       default. Unlike Slurm, preemption and ``scontrol requeue`` still requeue
+       the job, as do reclaim and launch failures. Either flag overrides the
+       other, including a ``#SBATCH`` line, and the later flag wins when both
+       appear on the command line.
    * - ``--begin``
      -
      - Defer start until a time, e.g. ``now+2hours`` or an ISO 8601 timestamp.
