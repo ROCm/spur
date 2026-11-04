@@ -494,6 +494,10 @@ message NodeInfo {
   // Port the node's agent listens on, so a client dialling it directly does not
   // have to assume the default.
   uint32 agent_port = 58;
+
+  // An active reservation covers the node. Set even when `active_reservation`
+  // is blank because `[auth] private_data = ["reservations"]` hides its name.
+  bool in_reservation = 59;
 }
 
 message PartitionInfo {
@@ -1705,6 +1709,9 @@ message UsageEntry {
 
 message GetUsageResponse {
   repeated UsageEntry entries = 1;
+  // Set when `[auth] private_data = ["usage"]` pinned the reply to this user.
+  // Entries then omit everyone else, so they do not sum to account totals.
+  optional string scoped_to_user = 2;
 }
 
 message GetFairshareFactorsRequest {
@@ -1722,6 +1729,8 @@ message GetFairshareFactorsResponse {
   // The half-life the server actually used (may differ from the request
   // when the request sent 0, meaning "use the configured default").
   uint32 effective_halflife_days = 2;
+  // Set when `[auth] private_data = ["usage"]` pinned the reply to this user.
+  optional string scoped_to_user = 3;
 }
 
 // -- K8s Operator --

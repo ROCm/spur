@@ -184,6 +184,9 @@ Show accounts
 
    sacctmgr show account
 
+With ``private_data = ["accounts"]``, a User sees only accounts they belong to
+(see :ref:`private-data`).
+
 .. code-block:: text
 
    Account      Descr            Org      Parent  Share  GrpTRES
@@ -297,7 +300,8 @@ Omit ``account=`` to remove the user from **all** accounts.
 Show users
 ~~~~~~~~~~~
 
-Filter by ``account=`` or ``name=``.
+Filter by ``account=`` or ``name=``. With ``private_data = ["users"]``, a User
+sees only their own rows (see :ref:`private-data`).
 
 .. code-block:: bash
 

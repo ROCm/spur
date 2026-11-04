@@ -7,6 +7,7 @@ use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::{GetUsageRequest, ListAccountsRequest, ListUsersRequest};
 
 use crate::timearg::{datetime_to_proto, parse_time_arg};
+use crate::usage_scope::{cell, UsageScope};
 
 /// Generate usage reports from accounting data.
 #[derive(Parser, Debug)]
@@ -178,22 +179,24 @@ async fn report_account_utilization_by_user(
         );
     }
 
+    let scope = UsageScope::from_replies([usage.scoped_to_user.as_deref()]);
     for account in &accounts {
         let &(acct_cpu, acct_gpu, acct_jobs) = acct_agg
             .get(account.name.as_str())
             .unwrap_or(&(0.0, 0.0, 0));
+        let totals = scope.totals_visible();
 
         println!(
-            "{:<20}{}{:<15}{}{:>12.0}{}{:>12.0}{}{:>10}",
+            "{:<20}{}{:<15}{}{}{}{}{}{}",
             account.name,
             delimiter,
             "",
             delimiter,
-            acct_cpu,
+            cell(totals, 12, || format!("{acct_cpu:>12.0}")),
             delimiter,
-            acct_gpu,
+            cell(totals, 12, || format!("{acct_gpu:>12.0}")),
             delimiter,
-            acct_jobs
+            cell(totals, 10, || format!("{acct_jobs:>10}")),
         );
 
         let account_users: Vec<_> = users.iter().filter(|u| u.account == account.name).collect();
@@ -201,18 +204,19 @@ async fn report_account_utilization_by_user(
             let &(user_cpu, user_gpu, user_jobs) = user_agg
                 .get(&(user.name.as_str(), account.name.as_str()))
                 .unwrap_or(&(0.0, 0.0, 0));
+            let mine = scope.user_visible(&user.name);
 
             println!(
-                " {:<19}{}{:<15}{}{:>12.0}{}{:>12.0}{}{:>10}",
+                " {:<19}{}{:<15}{}{}{}{}{}{}",
                 "",
                 delimiter,
                 user.name,
                 delimiter,
-                user_cpu,
+                cell(mine, 12, || format!("{user_cpu:>12.0}")),
                 delimiter,
-                user_gpu,
+                cell(mine, 12, || format!("{user_gpu:>12.0}")),
                 delimiter,
-                user_jobs
+                cell(mine, 10, || format!("{user_jobs:>10}")),
             );
         }
     }
@@ -273,14 +277,24 @@ async fn report_user_utilization_by_account(
         );
     }
 
+    let scope = UsageScope::from_replies([usage.scoped_to_user.as_deref()]);
     for user in &users {
         let &(cpu, gpu, jobs) = user_agg
             .get(&(user.name.as_str(), user.account.as_str()))
             .unwrap_or(&(0.0, 0.0, 0));
+        let mine = scope.user_visible(&user.name);
 
         println!(
-            "{:<15}{}{:<20}{}{:>12.0}{}{:>12.0}{}{:>10}",
-            user.name, delimiter, user.account, delimiter, cpu, delimiter, gpu, delimiter, jobs
+            "{:<15}{}{:<20}{}{}{}{}{}{}",
+            user.name,
+            delimiter,
+            user.account,
+            delimiter,
+            cell(mine, 12, || format!("{cpu:>12.0}")),
+            delimiter,
+            cell(mine, 12, || format!("{gpu:>12.0}")),
+            delimiter,
+            cell(mine, 10, || format!("{jobs:>10}")),
         );
     }
 
@@ -330,6 +344,7 @@ async fn report_job_sizes_by_account(
         }
     }
 
+    let totals = UsageScope::from_replies([usage.scoped_to_user.as_deref()]).totals_visible();
     for account in &accounts {
         let &(cpu, jobs) = acct_agg.get(account.name.as_str()).unwrap_or(&(0.0, 0));
         let pct = if total_cpu > 0.0 {
@@ -339,16 +354,28 @@ async fn report_job_sizes_by_account(
         };
 
         println!(
-            "{:<20}{}{:>10}{}{:>12.0}{}{:>7.1}%",
-            account.name, delimiter, jobs, delimiter, cpu, delimiter, pct
+            "{:<20}{}{}{}{}{}{}",
+            account.name,
+            delimiter,
+            cell(totals, 10, || format!("{jobs:>10}")),
+            delimiter,
+            cell(totals, 12, || format!("{cpu:>12.0}")),
+            delimiter,
+            cell(totals, 8, || format!("{pct:>7.1}%")),
         );
     }
 
     if !args.parsable {
         println!("{}", "-".repeat(56));
         println!(
-            "{:<20}{}{:>10}{}{:>12.0}{}{:>7.1}%",
-            "TOTAL", delimiter, total_jobs, delimiter, total_cpu, delimiter, 100.0
+            "{:<20}{}{}{}{}{}{}",
+            "TOTAL",
+            delimiter,
+            cell(totals, 10, || format!("{total_jobs:>10}")),
+            delimiter,
+            cell(totals, 12, || format!("{total_cpu:>12.0}")),
+            delimiter,
+            cell(totals, 8, || format!("{:>7.1}%", 100.0)),
         );
     }
 
@@ -409,6 +436,8 @@ async fn report_job_sizes_by_user(
         }
     }
 
+    let scope = UsageScope::from_replies([usage.scoped_to_user.as_deref()]);
+    let totals = scope.totals_visible();
     for user in &users {
         let &(cpu, jobs) = user_agg
             .get(&(user.name.as_str(), user.account.as_str()))
@@ -418,18 +447,35 @@ async fn report_job_sizes_by_user(
         } else {
             0.0
         };
+        let mine = scope.user_visible(&user.name);
 
         println!(
-            "{:<15}{}{:<20}{}{:>10}{}{:>12.0}{}{:>7.1}%",
-            user.name, delimiter, user.account, delimiter, jobs, delimiter, cpu, delimiter, pct
+            "{:<15}{}{:<20}{}{}{}{}{}{}",
+            user.name,
+            delimiter,
+            user.account,
+            delimiter,
+            cell(mine, 10, || format!("{jobs:>10}")),
+            delimiter,
+            cell(mine, 12, || format!("{cpu:>12.0}")),
+            delimiter,
+            cell(mine && totals, 8, || format!("{pct:>7.1}%")),
         );
     }
 
     if !args.parsable {
         println!("{}", "-".repeat(71));
         println!(
-            "{:<15}{}{:<20}{}{:>10}{}{:>12.0}{}{:>7.1}%",
-            "TOTAL", delimiter, "", delimiter, total_jobs, delimiter, total_cpu, delimiter, 100.0
+            "{:<15}{}{:<20}{}{}{}{}{}{}",
+            "TOTAL",
+            delimiter,
+            "",
+            delimiter,
+            cell(totals, 10, || format!("{total_jobs:>10}")),
+            delimiter,
+            cell(totals, 12, || format!("{total_cpu:>12.0}")),
+            delimiter,
+            cell(totals, 8, || format!("{:>7.1}%", 100.0)),
         );
     }
 

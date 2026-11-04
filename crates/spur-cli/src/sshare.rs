@@ -9,6 +9,8 @@ use spur_proto::proto::{
     GetFairshareFactorsRequest, GetUsageRequest, ListAccountsRequest, ListUsersRequest,
 };
 
+use crate::usage_scope::{cell, UsageScope};
+
 /// Display fair-share information by account and user.
 #[derive(Parser, Debug)]
 // -h is sshare's --noheader (Slurm convention), so disable clap's auto -h and
@@ -92,24 +94,33 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("failed to get usage")?;
     let usage = usage_resp.into_inner();
 
-    let fairshare_map: HashMap<(String, String), f64> = match client
-        .get_fairshare_factors(GetFairshareFactorsRequest { halflife_days: 0 })
-        .await
-    {
-        Ok(resp) => resp
-            .into_inner()
-            .entries
-            .into_iter()
-            .map(|e| ((e.user, e.account), e.factor))
-            .collect(),
-        Err(e) => {
-            eprintln!(
-                "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
-                 Values shown are local approximations and may differ from the scheduler."
-            );
-            HashMap::new()
-        }
-    };
+    let (fairshare_map, factors_scoped_to): (HashMap<(String, String), f64>, Option<String>) =
+        match client
+            .get_fairshare_factors(GetFairshareFactorsRequest { halflife_days: 0 })
+            .await
+        {
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                (
+                    resp.entries
+                        .into_iter()
+                        .map(|e| ((e.user, e.account), e.factor))
+                        .collect(),
+                    resp.scoped_to_user,
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
+                     Values shown are local approximations and may differ from the scheduler."
+                );
+                (HashMap::new(), None)
+            }
+        };
+    let scope = UsageScope::from_replies([
+        usage.scoped_to_user.as_deref(),
+        factors_scoped_to.as_deref(),
+    ]);
 
     let account_fairshare: HashMap<&str, f64> = {
         let mut sums: HashMap<&str, (f64, usize)> = HashMap::new();
@@ -212,24 +223,24 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             .copied()
             .unwrap_or(0.0);
 
+        let totals = scope.totals_visible();
+        let raw_long = cell(totals, 12, || format!("{raw_usage:>12.1}"));
+        let raw_short = cell(totals, 12, || format!("{raw_usage:>12.0}"));
+        let norm = cell(totals, 12, || format!("{norm_usage:>12.6}"));
+        let fair = cell(totals, 12, || format!("{fair_share:>12.6}"));
+        let cpu = cell(totals, 12, || format!("{cpu_raw:>12.1}"));
+        let gpu = cell(totals, 12, || format!("{gpu_raw:>12.1}"));
+
         // Account-level row
         if args.long {
             println!(
-                "{:<15} {:<15} {:>12} {:>12.6} {:>12.1} {:>12.6} {:>12.6} {:>12.1} {:>12.1}",
-                account.name,
-                "",
-                raw_shares as u32,
-                norm_shares,
-                raw_usage,
-                norm_usage,
-                fair_share,
-                cpu_raw,
-                gpu_raw,
+                "{:<15} {:<15} {:>12} {:>12.6} {} {} {} {} {}",
+                account.name, "", raw_shares as u32, norm_shares, raw_long, norm, fair, cpu, gpu,
             );
         } else {
             println!(
-                "{:<15} {:<15} {:>12} {:>12.6} {:>12.0} {:>12.6} {:>12.6}",
-                account.name, "", raw_shares as u32, norm_shares, raw_usage, norm_usage, fair_share,
+                "{:<15} {:<15} {:>12} {:>12.6} {} {} {}",
+                account.name, "", raw_shares as u32, norm_shares, raw_short, norm, fair,
             );
         }
 
@@ -251,16 +262,16 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             // Each user within an account gets an equal sub-share
             let user_count = account_users.len().max(1) as f64;
             let user_norm_shares = norm_shares / user_count;
-            let user_fair_share = fairshare_map
+            let user_factor = fairshare_map
                 .get(&(user.name.clone(), account.name.clone()))
-                .copied()
-                .unwrap_or_else(|| {
-                    if user_norm_usage > 0.001 {
-                        (user_norm_shares / user_norm_usage).min(10.0)
-                    } else {
-                        (user_norm_shares / 0.001).min(10.0)
-                    }
-                });
+                .copied();
+            let user_fair_share = user_factor.unwrap_or_else(|| {
+                if user_norm_usage > 0.001 {
+                    (user_norm_shares / user_norm_usage).min(10.0)
+                } else {
+                    (user_norm_shares / 0.001).min(10.0)
+                }
+            });
 
             let user_cpu = user_account_cpu_secs
                 .get(&(user.name.as_str(), account.name.as_str()))
@@ -271,29 +282,34 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .copied()
                 .unwrap_or(0.0);
 
+            let mine = scope.user_visible(&user.name);
+            // The local approximation divides by the reply's usage total, which
+            // is only the caller's own once pinned.
+            let fair_shown = mine && (totals || user_factor.is_some());
+            let raw_long = cell(mine, 12, || format!("{user_usage:>12.1}"));
+            let raw_short = cell(mine, 12, || format!("{user_usage:>12.0}"));
+            let norm = cell(mine && totals, 12, || format!("{user_norm_usage:>12.6}"));
+            let fair = cell(fair_shown, 12, || format!("{user_fair_share:>12.6}"));
+            let cpu = cell(mine, 12, || format!("{user_cpu:>12.1}"));
+            let gpu = cell(mine, 12, || format!("{user_gpu:>12.1}"));
+
             if args.long {
                 println!(
-                    " {:<14} {:<15} {:>12} {:>12.6} {:>12.1} {:>12.6} {:>12.6} {:>12.1} {:>12.1}",
+                    " {:<14} {:<15} {:>12} {:>12.6} {} {} {} {} {}",
                     "",
                     user.name,
                     raw_shares as u32,
                     user_norm_shares,
-                    user_usage,
-                    user_norm_usage,
-                    user_fair_share,
-                    user_cpu,
-                    user_gpu,
+                    raw_long,
+                    norm,
+                    fair,
+                    cpu,
+                    gpu,
                 );
             } else {
                 println!(
-                    " {:<14} {:<15} {:>12} {:>12.6} {:>12.0} {:>12.6} {:>12.6}",
-                    "",
-                    user.name,
-                    raw_shares as u32,
-                    user_norm_shares,
-                    user_usage,
-                    user_norm_usage,
-                    user_fair_share,
+                    " {:<14} {:<15} {:>12} {:>12.6} {} {} {}",
+                    "", user.name, raw_shares as u32, user_norm_shares, raw_short, norm, fair,
                 );
             }
         }

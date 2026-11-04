@@ -92,6 +92,24 @@ impl AssociationCache {
         snapshot.admin_level.get(user).cloned()
     }
 
+    /// Accounts `user` belongs to. `None` when the cache has not loaded, so a
+    /// caller can hide account-scoped records instead of treating everyone as
+    /// a member.
+    pub fn accounts_for(&self, user: &str) -> Option<Vec<String>> {
+        let snapshot = self.snapshot.read();
+        if !snapshot.loaded {
+            return None;
+        }
+        let mut accounts: Vec<String> = snapshot
+            .memberships
+            .iter()
+            .filter(|(member, _)| member == user)
+            .map(|(_, account)| account.clone())
+            .collect();
+        accounts.sort_unstable();
+        Some(accounts)
+    }
+
     /// Whether `user` is associated with `account`. An unloaded cache reports `CacheUnavailable`
     /// rather than guessing; see `validate_user_account` in `cluster.rs` for how callers must treat that.
     pub fn account_membership(&self, user: &str, account: &str) -> AccountMembership {
@@ -376,6 +394,23 @@ mod tests {
             cache.resolve("alice", Some("research")),
             (Some("research".into()), None, HashSet::new())
         );
+    }
+
+    #[test]
+    fn accounts_for_is_none_until_the_cache_loads() {
+        let cache = AssociationCache::new();
+        assert!(cache.accounts_for("alice").is_none());
+
+        cache.set_loaded_without_associations();
+        assert_eq!(cache.accounts_for("alice").as_deref(), Some([].as_slice()));
+
+        cache.insert_association("alice", "physics");
+        cache.insert_association("alice", "ml");
+        assert_eq!(
+            cache.accounts_for("alice").as_deref(),
+            Some(["ml".to_string(), "physics".to_string()].as_slice())
+        );
+        assert_eq!(cache.accounts_for("bob").as_deref(), Some([].as_slice()));
     }
 
     #[test]

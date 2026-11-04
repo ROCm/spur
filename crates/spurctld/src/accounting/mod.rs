@@ -52,6 +52,8 @@ pub(crate) fn start(
     let service = AccountingService::unavailable("connecting to accounting database");
     service.attach_association_cache(cluster.association_cache().clone());
     service.attach_auth(config.auth.clone());
+    let live = cluster.clone();
+    service.attach_auth_source(move || live.config().auth.clone());
     service.attach_fairshare_halflife(config.scheduler.fairshare_halflife_days);
     let bringup = service.clone();
     let url = config.accounting.database_url.clone();

@@ -93,12 +93,13 @@ Accounting entities map directly from Slurm:
 - The ``default_qos`` setting is the equivalent of Slurm's fallback QOS.
 - The ``[auth] private_data`` setting is the equivalent of the ``slurm.conf``
   side of Slurm's ``PrivateData`` (see :ref:`private-data`). Like Slurm, it is
-  unset by default, so every user sees every job. ``"jobs"`` and ``"usage"`` are
-  supported, written as a TOML list (``private_data = ["jobs", "usage"]``), not a
-  comma-separated string. ``sacct``, ``sshare``, and ``sreport``, which Slurm
-  restricts through ``slurmdbd.conf``, are not restricted yet. Unlike Slurm, root
-  has no implicit exemption: grant it a role (``cluster_admins``,
-  ``admin_groups``, an accounting admin level, or
+  unset by default, so every user sees every job. ``"jobs"``, ``"usage"``,
+  ``"users"``, ``"accounts"``, and ``"reservations"`` are supported, written as
+  a TOML list (``private_data = ["jobs", "usage"]``), not a comma-separated
+  string. ``sacct`` follows ``"jobs"``. ``sshare`` and ``sreport`` usage follows
+  ``"usage"``; their user and account listings follow ``"users"`` and
+  ``"accounts"``. Unlike Slurm, root has no implicit exemption: grant it a role
+  (``cluster_admins``, ``admin_groups``, an accounting admin level, or
   ``allow_uid_zero_administrator``). Account coordinators are not exempt from
   ``"jobs"``.
 

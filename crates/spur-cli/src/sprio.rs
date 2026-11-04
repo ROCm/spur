@@ -9,6 +9,8 @@ use spur_proto::proto::{
     GetFairshareFactorsRequest, GetJobsRequest, GetPartitionsRequest, JobState,
 };
 
+use crate::usage_scope::{cell, UsageScope};
+
 /// View job priority breakdown for pending jobs.
 #[derive(Parser, Debug)]
 // -h is sprio's --noheader (Slurm convention), so disable clap's auto -h and
@@ -95,24 +97,28 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let partitions = partitions_resp.into_inner().partitions;
 
     // Fetch fairshare factors from the accounting service (same endpoint)
-    let fairshare_map: HashMap<(String, String), f64> = {
+    let (fairshare_map, scope): (HashMap<(String, String), f64>, UsageScope) = {
         let mut acct_client = spur_proto::accounting_client(channel);
         match acct_client
             .get_fairshare_factors(GetFairshareFactorsRequest { halflife_days: 0 })
             .await
         {
-            Ok(resp) => resp
-                .into_inner()
-                .entries
-                .into_iter()
-                .map(|e| ((e.user, e.account), e.factor))
-                .collect(),
+            Ok(resp) => {
+                let resp = resp.into_inner();
+                (
+                    resp.entries
+                        .into_iter()
+                        .map(|e| ((e.user, e.account), e.factor))
+                        .collect(),
+                    UsageScope::from_replies([resp.scoped_to_user.as_deref()]),
+                )
+            }
             Err(e) => {
                 eprintln!(
                     "sprio: warning: could not fetch fair-share factors: {e}\n\
                      FAIRSHARE column will show 1.0 (neutral)."
                 );
-                HashMap::new()
+                (HashMap::new(), UsageScope::default())
             }
         }
     };
@@ -143,28 +149,32 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .unwrap_or(1);
 
             let base = job.priority;
-            let fair_share = fairshare_map
-                .get(&(job.user.clone(), job.account.clone()))
-                .copied()
-                .unwrap_or(1.0);
-            let effective =
+            let fair_share = fair_share_for(&scope, &fairshare_map, &job.user, &job.account);
+            let effective = fair_share.map(|fair_share| {
                 (base as f64 * fair_share.min(10.0) * age_factor * partition_tier.max(1) as f64)
-                    as u32;
+                    as u32
+            });
 
             println!(
-                "{:>10} {:>10} {:>10} {:>10.4} {:>10.4} {:>12} {:>10} {:>10}",
+                "{:>10} {:>10} {:>10} {:>10.4} {} {:>12} {:>10} {}",
                 job.job_id,
                 job.user,
                 base,
                 age_factor,
-                fair_share,
+                cell(fair_share.is_some(), 10, || format!(
+                    "{:>10.4}",
+                    fair_share.unwrap_or_default()
+                )),
                 format!("{}(T{})", job.partition, partition_tier),
                 if job.qos.is_empty() {
                     "normal"
                 } else {
                     &job.qos
                 },
-                effective,
+                cell(effective.is_some(), 10, || format!(
+                    "{:>10}",
+                    effective.unwrap_or_default()
+                )),
             );
         }
     } else {
@@ -190,14 +200,19 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 .map(|p| p.priority_tier)
                 .unwrap_or(1);
 
-            let fair_share = fairshare_map
-                .get(&(job.user.clone(), job.account.clone()))
-                .copied()
-                .unwrap_or(1.0);
+            let fair_share = fair_share_for(&scope, &fairshare_map, &job.user, &job.account);
 
             println!(
-                "{:>10} {:>10} {:>10} {:>10.4} {:>10.4} {:>10}",
-                job.job_id, job.user, job.priority, age_factor, fair_share, partition_tier,
+                "{:>10} {:>10} {:>10} {:>10.4} {} {:>10}",
+                job.job_id,
+                job.user,
+                job.priority,
+                age_factor,
+                cell(fair_share.is_some(), 10, || format!(
+                    "{:>10.4}",
+                    fair_share.unwrap_or_default()
+                )),
+                partition_tier,
             );
         }
     }
@@ -205,9 +220,40 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// `None` when a pinned reply withheld this job's user: the neutral `1.0`
+/// would read as "exactly on share" and feed EFFECTIVE a made-up value.
+fn fair_share_for(
+    scope: &UsageScope,
+    factors: &HashMap<(String, String), f64>,
+    user: &str,
+    account: &str,
+) -> Option<f64> {
+    if !scope.user_visible(user) {
+        return None;
+    }
+    Some(
+        factors
+            .get(&(user.to_string(), account.to_string()))
+            .copied()
+            .unwrap_or(1.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fair_share_is_withheld_only_for_another_user_under_a_pinned_reply() {
+        let factors = HashMap::from([(("alice".to_string(), "ml".to_string()), 2.5)]);
+        let open = UsageScope::default();
+        assert_eq!(fair_share_for(&open, &factors, "alice", "ml"), Some(2.5));
+        assert_eq!(fair_share_for(&open, &factors, "bob", "ml"), Some(1.0));
+
+        let pinned = UsageScope::from_replies([Some("alice")]);
+        assert_eq!(fair_share_for(&pinned, &factors, "alice", "ml"), Some(2.5));
+        assert_eq!(fair_share_for(&pinned, &factors, "bob", "ml"), None);
+    }
 
     #[test]
     fn short_h_means_noheader() {

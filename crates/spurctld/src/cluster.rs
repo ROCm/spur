@@ -11897,13 +11897,28 @@ state = "UP"
 
         std::fs::write(
             &conf_path,
-            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"accounts\"]\n",
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\n\
+             private_data = [\"users\", \"accounts\", \"reservations\"]\n",
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.config().auth.users_private());
+        assert!(cm.config().auth.accounts_private());
+        assert!(cm.config().auth.reservations_private());
+        assert!(
+            !cm.config().auth.jobs_private(),
+            "the new file replaces the previous category list"
+        );
+
+        std::fs::write(
+            &conf_path,
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"nodes\"]\n",
         )
         .unwrap();
         cm.reconfigure()
             .expect_err("an unsupported category must not go live");
         assert!(
-            cm.config().auth.jobs_private(),
+            cm.config().auth.accounts_private(),
             "a rejected reconfigure keeps the running config"
         );
     }

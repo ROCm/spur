@@ -47,6 +47,7 @@ mod submitline;
 mod timearg;
 mod timefmt;
 mod token;
+mod usage_scope;
 
 use std::path::Path;
 

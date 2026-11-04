@@ -69,6 +69,31 @@ pub fn resolve_role(
     }
 }
 
+/// Role for a verified caller, with NSS groups filled in when `[auth]` names any.
+///
+/// Account coordinators stay Users here. `private_data` does not exempt them,
+/// and the live queue and accounting reads share this so the exemption cannot drift.
+pub fn resolve_caller_role(
+    identity: &Identity,
+    auth: &AuthConfig,
+    accounting_level: Option<&str>,
+    accounting_loaded: bool,
+) -> Role {
+    let groups = if auth.admin_groups.is_empty() && auth.operator_groups.is_empty() {
+        Vec::new()
+    } else {
+        crate::privilege::named_user_groups(&identity.user).unwrap_or_default()
+    };
+    resolve_role(
+        identity,
+        auth,
+        accounting_level,
+        accounting_loaded,
+        &groups,
+        false,
+    )
+}
+
 /// Which records a read may return under a `PrivateData` category.
 ///
 /// `All` is the unrestricted view: the caller may see every tenant's records.
@@ -276,6 +301,14 @@ mod tests {
         cfg.allow_uid_zero_administrator = false;
         assert_eq!(
             resolve_role(&id("root", 0, false), &cfg, None, true, &[], false),
+            Role::User
+        );
+    }
+
+    #[test]
+    fn resolve_caller_role_leaves_a_plain_user_as_user() {
+        assert_eq!(
+            resolve_caller_role(&id("dave", 1000, false), &auth(), None, true),
             Role::User
         );
     }
