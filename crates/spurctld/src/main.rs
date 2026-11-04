@@ -248,15 +248,18 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_secs(health_tick_secs));
-        // A pass that probes many nodes can outlast a tick; catching up in a
-        // burst would land a node's two failed probes moments apart.
+        // Delay (not Burst) avoids a catch-up burst after a long sweep. It does not
+        // space a node's probes: the strike tracker does, by when each probe ran.
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Floored at one tick: health still runs once per tick, so a shorter
         // grace could elapse before the first post-election check runs.
         let grace = cluster::LeadershipGrace::new(std::time::Duration::from_secs(
             hb_timeout.max(health_tick_secs),
         ));
-        let mut liveness = node_liveness::NodeLiveness::new(max_stale_fraction);
+        let mut liveness = node_liveness::NodeLiveness::new(
+            max_stale_fraction,
+            std::time::Duration::from_secs(health_tick_secs),
+        );
         let mut liveness_term = None;
         loop {
             interval.tick().await;
@@ -279,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
                     hb_timeout,
                     mark_down,
                     &node_liveness::AgentProbe,
+                    || health_raft.current_term() == live_term,
                 )
                 .await;
             for fin in &evicted {

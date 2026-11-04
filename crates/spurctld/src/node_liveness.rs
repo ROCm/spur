@@ -17,6 +17,7 @@ use std::time::Duration;
 use spur_core::node::NodeSource;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 use crate::cluster::{ClusterManager, MarkDownPolicy, StaleNodes};
@@ -28,6 +29,9 @@ const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_PROBES: usize = 64;
 /// Consecutive passes a node must fail to answer before it is marked Down.
 const FAILED_PROBES_TO_MARK_DOWN: u32 = 2;
+/// Tolerance on the gap between a node's two failed probes, so a pass that lands
+/// a hair under one tick still counts.
+const STRIKE_SPACING_SLACK: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 pub(crate) enum ProbeOutcome {
@@ -113,16 +117,35 @@ pub(crate) enum Verdict {
     MarkDown,
 }
 
+/// A node's run of consecutive failed probes: how many, and when the first one
+/// in the run landed, so later failures can be checked for spacing.
+#[derive(Debug)]
+struct FailureRun {
+    count: u32,
+    first: Instant,
+}
+
 /// Per-node probe history across passes. Only consecutive failures count, so a
-/// node that answers, or stops being stale, starts over.
+/// node that answers, or stops being stale, starts over. A second failure marks
+/// the node Down only when that probe ran at least `min_gap` after the first
+/// failed one, so a probe queued late in one pass and run early in the next
+/// cannot count one outage twice.
 #[derive(Debug, Default)]
 pub(crate) struct StrikeTracker {
-    failures: HashMap<String, u32>,
+    failures: HashMap<String, FailureRun>,
     answering: HashSet<String>,
+    min_gap: Duration,
 }
 
 impl StrikeTracker {
-    pub(crate) fn record(&mut self, node: &str, outcome: &ProbeOutcome) -> Verdict {
+    fn new(min_gap: Duration) -> Self {
+        Self {
+            min_gap,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn record(&mut self, node: &str, outcome: &ProbeOutcome, now: Instant) -> Verdict {
         match outcome {
             ProbeOutcome::Alive => {
                 self.failures.remove(node);
@@ -132,9 +155,17 @@ impl StrikeTracker {
             }
             ProbeOutcome::Unreachable(_) => {
                 self.answering.remove(node);
-                let failures = self.failures.entry(node.to_string()).or_insert(0);
-                *failures += 1;
-                if *failures >= FAILED_PROBES_TO_MARK_DOWN {
+                let run = self.failures.entry(node.to_string()).or_insert(FailureRun {
+                    count: 0,
+                    first: now,
+                });
+                run.count += 1;
+                // A sweep that overran its tick lets the next start at once, so
+                // a node probed late in one and early in the next would strike
+                // twice in moments; the gap keeps the two a health pass apart.
+                let spaced =
+                    now.saturating_duration_since(run.first) + STRIKE_SPACING_SLACK >= self.min_gap;
+                if run.count >= FAILED_PROBES_TO_MARK_DOWN && spaced {
                     Verdict::MarkDown
                 } else {
                     Verdict::Wait
@@ -163,9 +194,9 @@ pub(crate) struct NodeLiveness {
 }
 
 impl NodeLiveness {
-    pub(crate) fn new(max_stale_fraction: f64) -> Self {
+    pub(crate) fn new(max_stale_fraction: f64, min_strike_gap: Duration) -> Self {
         Self {
-            strikes: StrikeTracker::default(),
+            strikes: StrikeTracker::new(min_strike_gap),
             max_stale_fraction,
         }
     }
@@ -174,14 +205,18 @@ impl NodeLiveness {
         self.strikes.clear();
     }
 
-    /// One health pass: confirms which stale nodes are really gone, then
-    /// applies the pass with only those allowed to go Down.
-    pub(crate) async fn sweep<P: Prober>(
+    /// One health pass: confirms which stale nodes are really gone, then applies
+    /// the pass with only those allowed to go Down. `still_leading` is re-checked
+    /// after the probes: a probe sweep can take seconds, and a leadership change
+    /// in that window means these decisions were judged by a leadership that no
+    /// longer holds, so the whole pass is dropped.
+    pub(crate) async fn sweep<P: Prober, F: Fn() -> bool>(
         &mut self,
         cluster: &ClusterManager,
         timeout_secs: u64,
         mark_down: MarkDownPolicy,
         prober: &P,
+        still_leading: F,
     ) -> Vec<JobFinalized> {
         let mark_down = match mark_down {
             MarkDownPolicy::Allowed => {
@@ -190,6 +225,10 @@ impl NodeLiveness {
             }
             other => other,
         };
+        if !still_leading() {
+            self.strikes.clear();
+            return Vec::new();
+        }
         cluster.check_node_health(timeout_secs, mark_down)
     }
 
@@ -232,9 +271,21 @@ impl NodeLiveness {
             });
         }
 
-        for (target, outcome) in probe_all(targets, prober).await {
+        confirmed.extend(self.judge_probes(probe_all(targets, prober).await));
+        confirmed
+    }
+
+    /// Records each probe's outcome and returns the nodes now confirmed gone.
+    fn judge_probes(&mut self, results: Vec<ProbeResult>) -> HashSet<String> {
+        let mut confirmed = HashSet::new();
+        for ProbeResult {
+            target,
+            outcome,
+            at,
+        } in results
+        {
             let node = target.node;
-            match self.strikes.record(&node, &outcome) {
+            match self.strikes.record(&node, &outcome, at) {
                 Verdict::Keep { first: true } => warn!(
                     node = %node,
                     "heartbeats from this node stopped reaching the leader, but its agent answers; not marking it Down"
@@ -261,12 +312,16 @@ impl NodeLiveness {
     }
 }
 
+/// One probe's outcome and when it ran.
+struct ProbeResult {
+    target: ProbeTarget,
+    outcome: ProbeOutcome,
+    at: Instant,
+}
+
 /// Probes every target, at most [`MAX_CONCURRENT_PROBES`] at a time. A probe
 /// task that dies yields no outcome, so its node waits for the next pass.
-async fn probe_all<P: Prober>(
-    targets: Vec<ProbeTarget>,
-    prober: &P,
-) -> Vec<(ProbeTarget, ProbeOutcome)> {
+async fn probe_all<P: Prober>(targets: Vec<ProbeTarget>, prober: &P) -> Vec<ProbeResult> {
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_PROBES));
     let mut probes = JoinSet::new();
     for target in targets {
@@ -274,8 +329,15 @@ async fn probe_all<P: Prober>(
         let permits = permits.clone();
         probes.spawn(async move {
             let _permit = permits.acquire_owned().await;
+            // Stamped once the probe has a slot, not when the pass began: a probe
+            // queued behind others runs later, and strike spacing must see that.
+            let at = Instant::now();
             let outcome = prober.probe(target.clone()).await;
-            (target, outcome)
+            ProbeResult {
+                target,
+                outcome,
+                at,
+            }
         });
     }
     let mut outcomes = Vec::new();
@@ -291,6 +353,7 @@ async fn probe_all<P: Prober>(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -332,35 +395,38 @@ mod tests {
     #[test]
     fn a_node_is_marked_down_only_after_two_consecutive_failed_probes() {
         let mut strikes = StrikeTracker::default();
-        assert_eq!(strikes.record("n1", &unreachable()), Verdict::Wait);
-        assert_eq!(strikes.record("n1", &unreachable()), Verdict::MarkDown);
+        let now = Instant::now();
+        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
+        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::MarkDown);
     }
 
     #[test]
     fn an_answer_between_failures_starts_the_count_over() {
         let mut strikes = StrikeTracker::default();
-        assert_eq!(strikes.record("n1", &unreachable()), Verdict::Wait);
+        let now = Instant::now();
+        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
         assert_eq!(
-            strikes.record("n1", &ProbeOutcome::Alive),
+            strikes.record("n1", &ProbeOutcome::Alive, now),
             Verdict::Keep { first: true }
         );
-        assert_eq!(strikes.record("n1", &unreachable()), Verdict::Wait);
+        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
     }
 
     #[test]
     fn an_answering_node_is_reported_new_once_per_silence() {
         let mut strikes = StrikeTracker::default();
+        let now = Instant::now();
         assert_eq!(
-            strikes.record("n1", &ProbeOutcome::Alive),
+            strikes.record("n1", &ProbeOutcome::Alive, now),
             Verdict::Keep { first: true }
         );
         assert_eq!(
-            strikes.record("n1", &ProbeOutcome::Alive),
+            strikes.record("n1", &ProbeOutcome::Alive, now),
             Verdict::Keep { first: false }
         );
         strikes.retain(&HashSet::new());
         assert_eq!(
-            strikes.record("n1", &ProbeOutcome::Alive),
+            strikes.record("n1", &ProbeOutcome::Alive, now),
             Verdict::Keep { first: true }
         );
     }
@@ -368,9 +434,125 @@ mod tests {
     #[test]
     fn a_node_that_stops_being_stale_loses_its_strike() {
         let mut strikes = StrikeTracker::default();
-        assert_eq!(strikes.record("n1", &unreachable()), Verdict::Wait);
+        let now = Instant::now();
+        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
         strikes.retain(&HashSet::new());
-        assert_eq!(strikes.record("n1", &unreachable()), Verdict::Wait);
+        assert_eq!(strikes.record("n1", &unreachable(), now), Verdict::Wait);
+    }
+
+    #[test]
+    fn a_second_failure_in_a_catch_up_burst_does_not_mark_down_but_a_spaced_one_does() {
+        let gap = Duration::from_secs(15);
+        let mut strikes = StrikeTracker::new(gap);
+        let t0 = Instant::now();
+        assert_eq!(strikes.record("n1", &unreachable(), t0), Verdict::Wait);
+        // A sweep that overran its tick probes again almost at once: the same
+        // outage seen twice, not a second independent pass.
+        assert_eq!(
+            strikes.record("n1", &unreachable(), t0 + Duration::from_secs(1)),
+            Verdict::Wait
+        );
+        // A genuine second pass, a health tick later, marks it Down.
+        assert_eq!(
+            strikes.record("n1", &unreachable(), t0 + Duration::from_secs(16)),
+            Verdict::MarkDown
+        );
+    }
+
+    #[test]
+    fn a_second_failure_a_hair_under_one_tick_still_marks_down() {
+        let gap = Duration::from_secs(15);
+        let mut strikes = StrikeTracker::new(gap);
+        let t0 = Instant::now();
+        assert_eq!(strikes.record("n1", &unreachable(), t0), Verdict::Wait);
+        // Just under a full tick, within the spacing slack: a timer landing
+        // early must not push Down a whole pass later.
+        assert_eq!(
+            strikes.record("n1", &unreachable(), t0 + Duration::from_millis(14_700)),
+            Verdict::MarkDown
+        );
+    }
+
+    /// Fails every probe after `delay`, like an agent that never answers.
+    #[derive(Clone)]
+    struct SlowFailingProber {
+        delay: Duration,
+    }
+
+    impl Prober for SlowFailingProber {
+        async fn probe(&self, _target: ProbeTarget) -> ProbeOutcome {
+            tokio::time::sleep(self.delay).await;
+            unreachable()
+        }
+    }
+
+    /// One more silent node than can be probed at once, so one probe queues.
+    fn one_past_the_probe_limit() -> Vec<ProbeTarget> {
+        (0..=MAX_CONCURRENT_PROBES)
+            .map(|i| ProbeTarget {
+                node: format!("n{i}"),
+                endpoint: None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_queued_behind_the_limit_is_stamped_when_it_runs() {
+        let t0 = Instant::now();
+        let results = probe_all(
+            one_past_the_probe_limit(),
+            &SlowFailingProber {
+                delay: NODE_PROBE_TIMEOUT,
+            },
+        )
+        .await;
+
+        let mut started: Vec<Duration> = results.iter().map(|r| r.at - t0).collect();
+        started.sort();
+        assert_eq!(started.len(), MAX_CONCURRENT_PROBES + 1);
+        assert!(started[..MAX_CONCURRENT_PROBES]
+            .iter()
+            .all(|offset| offset.is_zero()));
+        assert_eq!(started[MAX_CONCURRENT_PROBES], NODE_PROBE_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_queued_late_in_an_overrun_pass_is_not_struck_twice_by_the_next() {
+        let tick = Duration::from_secs(15);
+        let mut liveness = NodeLiveness::new(1.0, tick);
+
+        // Every probe times out, so the queued one starts a full probe bound late
+        // and the pass overruns its tick.
+        let first = probe_all(
+            one_past_the_probe_limit(),
+            &SlowFailingProber {
+                delay: NODE_PROBE_TIMEOUT,
+            },
+        )
+        .await;
+        let late = first
+            .iter()
+            .max_by_key(|r| r.at)
+            .map(|r| r.target.node.clone())
+            .unwrap();
+        assert!(liveness.judge_probes(first).is_empty());
+
+        // The overdue tick fires the next pass at once, and now every probe
+        // fails fast: the queued node's two failures are 10 s apart, not a tick.
+        let confirmed = liveness.judge_probes(
+            probe_all(
+                one_past_the_probe_limit(),
+                &SlowFailingProber {
+                    delay: Duration::ZERO,
+                },
+            )
+            .await,
+        );
+        assert_eq!(confirmed.len(), MAX_CONCURRENT_PROBES);
+        assert!(
+            !confirmed.contains(&late),
+            "{late} failed twice within one tick"
+        );
     }
 
     type ProbeHook = Box<dyn Fn(&str) + Send + Sync>;
@@ -430,11 +612,11 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         silence(&cm, &["n1"]);
         let prober = ScriptedProber::answering(&["n1"]);
-        let mut liveness = NodeLiveness::new(0.5);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
 
         for _ in 0..3 {
             let evicted = liveness
-                .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+                .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
                 .await;
             assert!(evicted.is_empty());
         }
@@ -449,10 +631,10 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         silence(&cm, &["n1"]);
         let prober = ScriptedProber::default();
-        let mut liveness = NodeLiveness::new(0.5);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
 
         liveness
-            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
         assert_eq!(
             state(&cm, "n1"),
@@ -461,7 +643,7 @@ mod tests {
         );
 
         liveness
-            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
         wait_for("second failed probe marks the node down", || {
             cm.get_node("n1")
@@ -476,9 +658,9 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         silence(&cm, &["n1"]);
         let prober = ScriptedProber::default();
-        let mut liveness = NodeLiveness::new(0.5);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
         liveness
-            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
 
         let hook_cluster = cm.clone();
@@ -486,7 +668,7 @@ mod tests {
             hook_cluster.update_heartbeat(node, 0, 8000);
         }));
         let evicted = liveness
-            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
 
         assert!(evicted.is_empty());
@@ -502,11 +684,11 @@ mod tests {
         }
         silence(&cm, &["n1", "n2", "n3"]);
         let prober = ScriptedProber::default();
-        let mut liveness = NodeLiveness::new(0.5);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
 
         for _ in 0..3 {
             let evicted = liveness
-                .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+                .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
                 .await;
             assert!(evicted.is_empty());
         }
@@ -528,11 +710,11 @@ mod tests {
         }
         silence(&cm, &["n1", "n2"]);
         let prober = ScriptedProber::default();
-        let mut liveness = NodeLiveness::new(0.5);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
 
         for _ in 0..2 {
             liveness
-                .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+                .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
                 .await;
         }
         wait_for("both silent nodes marked down", || {
@@ -571,10 +753,10 @@ mod tests {
         wait_for("operator node registered", || cm.get_node("k1").is_some());
         silence(&cm, &["k1"]);
         let prober = ScriptedProber::default();
-        let mut liveness = NodeLiveness::new(0.5);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
 
         liveness
-            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
         wait_for("operator node marked down on the first sweep", || {
             cm.get_node("k1")
@@ -590,10 +772,10 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         silence(&cm, &["n1"]);
         let prober = ScriptedProber::default();
-        let mut liveness = NodeLiveness::new(0.5);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
 
         let evicted = liveness
-            .sweep(&cm, 90, MarkDownPolicy::Suppressed, &prober)
+            .sweep(&cm, 90, MarkDownPolicy::Suppressed, &prober, || true)
             .await;
 
         assert!(evicted.is_empty());
@@ -608,17 +790,84 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         silence(&cm, &["n1"]);
         let prober = ScriptedProber::default();
-        let mut liveness = NodeLiveness::new(0.5);
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
 
         liveness
-            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
         liveness.reset();
         liveness
-            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober)
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
             .await;
 
         assert_eq!(state(&cm, "n1"), NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn back_to_back_sweeps_do_not_count_one_outage_twice() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        silence(&cm, &["n1"]);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::from_secs(15));
+
+        // An overran sweep fires the next at once; both probes see the same outage.
+        for _ in 0..2 {
+            liveness
+                .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
+                .await;
+        }
+        assert_eq!(prober.probed(), vec!["n1", "n1"]);
+        assert_eq!(
+            state(&cm, "n1"),
+            NodeState::Idle,
+            "two probes moments apart are one strike"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leadership_change_during_the_probe_discards_the_pass() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        silence(&cm, &["n1"]);
+        let prober = ScriptedProber::default();
+        let mut liveness = NodeLiveness::new(0.5, Duration::ZERO);
+        let leading = Arc::new(AtomicBool::new(true));
+        let lose_leadership = leading.clone();
+        *prober.during_probe.lock() = Some(Box::new(move |_| {
+            lose_leadership.store(false, Ordering::SeqCst);
+        }));
+
+        // Two failed sweeps would mark n1 Down, but leadership is lost while
+        // each sweep's probe is in flight, so neither pass is applied.
+        for _ in 0..2 {
+            leading.store(true, Ordering::SeqCst);
+            let evicted = liveness
+                .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || {
+                    leading.load(Ordering::SeqCst)
+                })
+                .await;
+            assert!(evicted.is_empty());
+        }
+        assert_eq!(
+            state(&cm, "n1"),
+            NodeState::Idle,
+            "a pass judged under a lost term must not be applied"
+        );
+
+        // Strikes were cleared on the term change, so a dead node still needs
+        // two fresh failed probes once leadership is regained.
+        *prober.during_probe.lock() = None;
+        liveness
+            .sweep(&cm, 90, MarkDownPolicy::Allowed, &prober, || true)
+            .await;
+        assert_eq!(
+            state(&cm, "n1"),
+            NodeState::Idle,
+            "one fresh strike after regaining leadership only waits"
+        );
     }
 
     fn target(node: &str, addr: std::net::SocketAddr) -> ProbeTarget {
