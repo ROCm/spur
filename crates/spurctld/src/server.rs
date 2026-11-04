@@ -15422,6 +15422,82 @@ mod tests {
         assert_eq!(conflict.code(), Code::InvalidArgument);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_limit_fields_are_gated_like_every_other_partition_field() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        fn as_mallory<T>(inner: T) -> Request<T> {
+            let mut r = Request::new(inner);
+            r.extensions_mut().insert(viewer("mallory", false));
+            r
+        }
+        svc.create_partition(admin_request(CreatePartitionRequest {
+            name: "cpu".into(),
+            nodes: "ALL".into(),
+            max_cpus_per_node: Some(8),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        let configured = partition_info(&svc, "cpu").await;
+
+        let plain_create = CreatePartitionRequest {
+            name: "pwn".into(),
+            nodes: "ALL".into(),
+            ..Default::default()
+        };
+        let capped_create = CreatePartitionRequest {
+            max_cpus_per_node: Some(64),
+            max_tres_per_node: [("mem".to_string(), 1)].into(),
+            def_mem_per_cpu: Some(1),
+            ..plain_create.clone()
+        };
+        let plain = svc
+            .create_partition(as_mallory(plain_create))
+            .await
+            .unwrap_err();
+        let capped = svc
+            .create_partition(as_mallory(capped_create))
+            .await
+            .unwrap_err();
+        assert_eq!(capped.code(), Code::PermissionDenied);
+        assert_eq!(capped.message(), plain.message());
+
+        let plain_update = UpdatePartitionRequest {
+            name: "cpu".into(),
+            priority_tier: Some(9),
+            ..Default::default()
+        };
+        let capped_update = UpdatePartitionRequest {
+            max_cpus_per_node: Some(64),
+            max_tres_per_node: [("gres/gpu".to_string(), 8)].into(),
+            set_max_tres_per_node: true,
+            max_mem_per_node: Some(1),
+            ..plain_update.clone()
+        };
+        let plain = svc
+            .update_partition(as_mallory(plain_update))
+            .await
+            .unwrap_err();
+        let capped = svc
+            .update_partition(as_mallory(capped_update.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(capped.code(), Code::PermissionDenied);
+        assert_eq!(capped.message(), plain.message());
+
+        assert!(svc.cluster.get_partitions().iter().all(|p| p.name != "pwn"));
+        assert_eq!(partition_info(&svc, "cpu").await, configured);
+
+        svc.update_partition(admin_request(capped_update))
+            .await
+            .expect("an admin may set the same fields");
+        assert_eq!(
+            partition_info(&svc, "cpu").await.max_cpus_per_node,
+            Some(64)
+        );
+    }
+
     #[test]
     fn create_treats_a_zero_max_cpus_per_node_as_unset() {
         let limits = create_request_limits(&CreatePartitionRequest {

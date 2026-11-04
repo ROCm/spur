@@ -705,3 +705,485 @@ fn partition_limit_block_reports_a_max_mem_per_node_violation() {
         Some(PendingReason::PartitionConfig)
     );
 }
+
+/// One scheduling pass composed from the loop's own steps, minus agent RPCs:
+/// every placement is reserved and activated as a confirmed dispatch would be.
+fn run_pass(cm: &ClusterManager) -> Vec<JobId> {
+    use spur_sched::backfill::BackfillScheduler;
+
+    let mut trial = BackfillScheduler::new(100);
+    let (classification, unclaimed) =
+        crate::scheduler_loop::classify_without_phantom_claims(cm, |c| {
+            crate::scheduler_loop::trial_placement(cm, &mut trial, c)
+        });
+    let (pending, _) = cm.apply_classification(classification);
+    let nodes = cm.nodes_off_dispatch_cooldown(&pending);
+    let partitions = cm.get_partitions();
+    let reservations = cm.get_reservations();
+    let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
+    let usage = crate::scheduler_loop::running_partition_usage(cm);
+    let handoffs = cm.preemption_handoffs(&pending, &nodes, &reservations);
+    let state = spur_sched::traits::ClusterState {
+        nodes: &nodes,
+        partitions: &partitions,
+        reservations: &reservations,
+        topology: None,
+        fabric: None,
+        busy_until: &busy_until,
+        preemption_handoffs: &handoffs,
+        partition_node_usage: &usage,
+    };
+    let mut scheduler = BackfillScheduler::new(100);
+    let assignments =
+        crate::scheduler_loop::claimed_assignments(&mut scheduler, &pending, &state, &unclaimed);
+    let unscheduled: Vec<&Job> = pending
+        .iter()
+        .filter(|j| !assignments.iter().any(|a| a.job_id == j.job_id))
+        .collect();
+    cm.update_pending_reasons(&unscheduled, &state);
+    cm.annotate_partition_cap_pending(&unscheduled, scheduler.partition_cap_blocks());
+    for a in &assignments {
+        let job = cm.get_job(a.job_id).unwrap();
+        let partition = a
+            .partition
+            .as_deref()
+            .and_then(|name| partitions.iter().find(|p| p.name == name));
+        let attribution = RunAttribution::for_partition(&job, partition, false);
+        let resources =
+            crate::scheduler_loop::compute_job_allocation(&job, &a.nodes, &a.per_node_alloc);
+        activate(
+            cm,
+            a.job_id,
+            &a.nodes,
+            resources,
+            &a.per_node_alloc,
+            attribution,
+        );
+    }
+    assignments.iter().map(|a| a.job_id).collect()
+}
+
+fn activate(
+    cm: &ClusterManager,
+    id: JobId,
+    nodes: &[String],
+    resources: ResourceAllocations,
+    per_node_alloc: &HashMap<String, ResourceAllocations>,
+    attribution: RunAttribution,
+) {
+    let run_attempt = cm
+        .reserve_attributed_placement(
+            id,
+            nodes.to_vec(),
+            resources.clone(),
+            per_node_alloc.clone(),
+            false,
+            attribution,
+        )
+        .unwrap();
+    cm.activate_job(
+        id,
+        run_attempt,
+        nodes.to_vec(),
+        resources,
+        per_node_alloc.clone(),
+        false,
+        false,
+    )
+    .unwrap();
+    settle(cm, id, JobState::Running);
+}
+
+/// Submit `spec` and run it on `node` holding `cpus`, charged to its partition.
+fn run_on(cm: &ClusterManager, spec: JobSpec, node: &str, cpus: u32) -> JobId {
+    let partition = spec.partition.clone();
+    let id = submit_and_wait(cm, spec);
+    let res = scalar_alloc(cpus, GIB);
+    activate(
+        cm,
+        id,
+        &[node.to_string()],
+        res.clone(),
+        &per_node_for(&[node], res),
+        RunAttribution {
+            effective_partition: partition,
+            ..Default::default()
+        },
+    );
+    id
+}
+
+/// CPUs each node holds against `partition`'s cap in the next pass's usage map.
+fn cap_usage(cm: &ClusterManager, partition: &str) -> BTreeMap<String, u64> {
+    crate::scheduler_loop::running_partition_usage(cm)
+        .get(partition)
+        .map(|by_node| {
+            by_node
+                .iter()
+                .map(|(node, charges)| {
+                    let cpus = charges.iter().map(|c| c.tres.get("cpu")).sum();
+                    (node.clone(), cpus)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn reason(cm: &ClusterManager, id: JobId) -> (PendingReason, String) {
+    let job = cm.get_job(id).unwrap();
+    (job.pending_reason.clone(), job.state_reason_display())
+}
+
+fn in_account(spec: JobSpec, account: &str) -> JobSpec {
+    JobSpec {
+        account: Some(account.into()),
+        ..spec
+    }
+}
+
+fn limit_account_cpus(cm: &ClusterManager, cpus: u64) {
+    let mut grp = TresRecord::new();
+    grp.set(TresType::Cpu, cpus);
+    cm.association_cache().insert_limits(
+        "testuser",
+        "research",
+        spur_core::accounting::AccountLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        },
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_association_limit_still_blocks_a_job_the_cap_admits() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    run_on(&cm, in_account(spec_in("default", 4), "research"), "n1", 4);
+    limit_account_cpus(&cm, 8);
+    let id = submit_and_wait(&cm, in_account(spec_in("cpu", 6), "research"));
+
+    assert!(run_pass(&cm).is_empty());
+    assert_eq!(reason(&cm, id).0, PendingReason::AssocGrpCpuLimit);
+
+    limit_account_cpus(&cm, 16);
+    assert_eq!(run_pass(&cm), [id], "the cap alone admits the job");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_qos_limit_still_blocks_a_job_the_cap_admits() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    let mut per_job = TresRecord::new();
+    per_job.set(TresType::Cpu, 4);
+    cm.qos_cache().insert(Qos {
+        name: "small".into(),
+        limits: spur_core::accounting::QosLimits {
+            max_tres_per_job: Some(per_job),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let id = submit_and_wait(
+        &cm,
+        JobSpec {
+            qos: Some("small".into()),
+            ..spec_in("cpu", 6)
+        },
+    );
+
+    assert!(run_pass(&cm).is_empty());
+    assert_eq!(reason(&cm, id).0, PendingReason::QosMaxCpuPerJobLimit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_failing_gate_names_the_pending_reason() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 32, 64 * GIB);
+    run_on(&cm, spec_in("cpu", 6), "n1", 6);
+    run_on(
+        &cm,
+        in_account(spec_in("default", 10), "research"),
+        "n1",
+        10,
+    );
+    limit_account_cpus(&cm, 12);
+    let never = submit_and_wait(&cm, in_account(spec_in("cpu", 12), "research"));
+    let full = submit_and_wait(&cm, in_account(spec_in("cpu", 4), "research"));
+
+    assert!(run_pass(&cm).is_empty());
+    let (code, desc) = reason(&cm, never);
+    assert_eq!(code, PendingReason::PartitionTresLimit);
+    assert!(desc.contains("can never run"), "{desc}");
+    assert_eq!(
+        reason(&cm, full).0,
+        PendingReason::AssocGrpCpuLimit,
+        "the association gate runs before placement checks the cap"
+    );
+
+    limit_account_cpus(&cm, 100);
+    assert!(run_pass(&cm).is_empty());
+    assert_eq!(
+        reason(&cm, full),
+        (
+            PendingReason::PartitionTresLimit,
+            "Partition cpu limit reached on n1: cpu 6 in use + 4 requested = 10 > max 8".into()
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_blocked_only_by_a_full_cap_holds_no_grp_node_quota() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 4)])],
+    )
+    .await;
+    for n in ["n1", "n2", "n3"] {
+        register_node(&cm, n, 16, 64 * GIB);
+    }
+    let mut grp = TresRecord::new();
+    grp.set(TresType::Node, 2);
+    cm.qos_cache().insert(Qos {
+        name: "pool".into(),
+        limits: spur_core::accounting::QosLimits {
+            grp_tres: Some(grp),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let pool = |cpus: u32| JobSpec {
+        qos: Some("pool".into()),
+        ..spec_in("cpu", cpus)
+    };
+    // Fills n1's cap and leaves it too little room for `fits` to be credited
+    // reuse of n1, so `fits` needs a node of the group's quota.
+    run_on(&cm, pool(4), "n1", 4);
+    run_on(&cm, spec_in("default", 10), "n1", 10);
+    let capped = submit_and_wait(
+        &cm,
+        JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            nodelist: Some("n1,n2".into()),
+            ..pool(1)
+        },
+    );
+    let fits = submit_and_wait(&cm, pool(4));
+
+    let single: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+    assert_eq!(
+        single,
+        [capped],
+        "one classification charges capped's claim"
+    );
+
+    assert_eq!(run_pass(&cm), [fits]);
+    assert_eq!(
+        reason(&cm, capped),
+        (
+            PendingReason::PartitionTresLimit,
+            "Partition cpu limit reached on n1: cpu 4 in use + 1 requested = 5 > max 4".into()
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preemption_hands_a_full_cap_to_the_preemptor_without_double_counting() {
+    let dir = TempDir::new().unwrap();
+    let mut config = test_config();
+    config.scheduler.preempt_type = spur_core::partition::PreemptType::QosPriority;
+    let cm = test_cluster_with_config(&dir, config).await;
+    cm.create_partition(Partition {
+        preempt_mode: Some(PreemptMode::Requeue),
+        ..partition("cpu", &[("cpu", 8)])
+    })
+    .unwrap();
+    register_node(&cm, "n1", 16, 64 * GIB);
+    cm.qos_cache().insert(Qos {
+        name: "low".into(),
+        priority: 100,
+        ..Default::default()
+    });
+    cm.qos_cache().insert(Qos {
+        name: "high".into(),
+        priority: 10_000,
+        preempt: vec!["low".into()],
+        ..Default::default()
+    });
+    let in_qos = |qos: &str| JobSpec {
+        qos: Some(qos.into()),
+        time_limit: Some(chrono::Duration::hours(1)),
+        ..spec_in("cpu", 8)
+    };
+    let low = run_on(&cm, in_qos("low"), "n1", 8);
+    let high = submit_and_wait(&cm, in_qos("high"));
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n1".into(), 8)]));
+
+    assert!(
+        run_pass(&cm).is_empty(),
+        "8 CPUs are free, but the cap is full"
+    );
+    assert_eq!(reason(&cm, high).0, PendingReason::PartitionTresLimit);
+
+    let high_job = cm.get_job(high).unwrap();
+    crate::scheduler_loop::try_preempt(
+        &cm,
+        &cm.get_partitions(),
+        &cm.get_nodes(),
+        &[&high_job],
+        &cm.config().scheduler,
+    )
+    .await;
+    settle(&cm, low, JobState::Pending);
+    assert!(
+        cap_usage(&cm, "cpu").is_empty(),
+        "the requeued victim holds nothing against the cap"
+    );
+
+    assert_eq!(run_pass(&cm), [high]);
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n1".into(), 8)]));
+    assert_eq!(cm.get_job(low).unwrap().state, JobState::Pending);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn array_tasks_run_up_to_the_cap_and_start_one_per_freed_slot() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("array", &[("cpu", 4)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    let parent = cm
+        .submit_job(JobSpec {
+            array_spec: Some("0-9".into()),
+            time_limit: Some(chrono::Duration::hours(1)),
+            ..spec_in("array", 1)
+        })
+        .unwrap()
+        .job_id;
+    let tasks = || -> Vec<Job> {
+        cm.get_jobs(&JobFilter::default())
+            .into_iter()
+            .filter(|j| j.spec.array_job_id == Some(parent))
+            .collect()
+    };
+    wait_for("array tasks applied", || tasks().len() == 10);
+
+    let mut running = run_pass(&cm);
+    for finished_so_far in 0..10 {
+        assert_eq!(running.len(), (10 - finished_so_far).min(4));
+        assert_eq!(
+            cap_usage(&cm, "array").get("n1").copied().unwrap_or(0),
+            running.len() as u64
+        );
+        for task in tasks().iter().filter(|j| j.state == JobState::Pending) {
+            assert_eq!(task.pending_reason, PendingReason::PartitionTresLimit);
+        }
+        let finished = running.remove(0);
+        cm.complete_job(finished, 0, JobState::Completed).unwrap();
+        settle(&cm, finished, JobState::Completed);
+        running.extend(run_pass(&cm));
+    }
+    assert!(running.is_empty());
+    assert!(tasks().iter().all(|j| j.state == JobState::Completed));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_submission_cannot_set_or_borrow_a_partition_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![
+            partition("low", &[("cpu", 8)]),
+            partition("high", &[("cpu", 64)]),
+        ],
+    )
+    .await;
+    register_node(&cm, "n1", 64, 256 * GIB);
+    let caps = || -> Vec<_> {
+        cm.get_partitions()
+            .into_iter()
+            .map(|p| (p.name, p.max_tres_per_node, p.max_mem_per_node))
+            .collect()
+    };
+    let configured = caps();
+    run_on(&cm, spec_in("low", 4), "n1", 4);
+    let id = submit_and_wait(
+        &cm,
+        JobSpec {
+            comment: Some("max_tres_per_node=cpu=64".into()),
+            environment: [("SPUR_MAX_CPUS_PER_NODE".to_string(), "64".to_string())].into(),
+            ..spec_in("low", 6)
+        },
+    );
+
+    assert!(run_pass(&cm).is_empty());
+    assert_eq!(caps(), configured);
+    assert_eq!(
+        reason(&cm, id).1,
+        "Partition low limit reached on n1: cpu 4 in use + 6 requested = 10 > max 8",
+        "judged against its own partition's configured cap, never high's"
+    );
+    assert!(cap_usage(&cm, "high").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_node_leaves_no_partition_usage_behind() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    register_node(&cm, "n2", 16, 64 * GIB);
+    let on_n1 = run_on(&cm, spec_in("cpu", 8), "n1", 8);
+    run_on(&cm, spec_in("cpu", 4), "n2", 4);
+    assert_eq!(
+        cap_usage(&cm, "cpu"),
+        BTreeMap::from([("n1".into(), 8), ("n2".into(), 4)])
+    );
+
+    cm.remove_node("n1", true, Some("decommissioned".into()))
+        .unwrap();
+    wait_for("n1 removed", || cm.get_node("n1").is_none());
+    assert_eq!(cm.get_job(on_n1).unwrap().state, JobState::NodeFail);
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n2".into(), 4)]));
+
+    let one_hour = |cpus| JobSpec {
+        time_limit: Some(chrono::Duration::hours(1)),
+        ..spec_in("cpu", cpus)
+    };
+    let too_big = submit_and_wait(&cm, one_hour(6));
+    let fits = submit_and_wait(&cm, one_hour(4));
+    assert_eq!(run_pass(&cm), [fits]);
+    assert_eq!(
+        reason(&cm, too_big).1,
+        "Partition cpu limit reached on n2: cpu 4 in use + 6 requested = 10 > max 8"
+    );
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n2".into(), 8)]));
+}

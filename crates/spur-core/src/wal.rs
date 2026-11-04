@@ -1301,6 +1301,27 @@ mod tests {
         }
     }
 
+    // Frozen JobStart entry from before partition limits. Never regenerate.
+    #[test]
+    fn job_start_pre_partition_limits_payload_still_deserializes() {
+        const JOB_START_PRE_LIMITS: &str = r#"{"JobStart":{"job_id":5,"nodes":["n1"],"resources":{"cpus":4,"memory_mb":1024,"devices":{}},"per_node_alloc":{"n1":{"cpus":4,"memory_mb":1024,"devices":{}}},"srun_step_dispatch":false,"run_attempt":1,"idle_fill":false,"at":null}}"#;
+        let op: WalOperation = serde_json::from_str(JOB_START_PRE_LIMITS)
+            .expect("pre-limits JobStart must deserialize");
+        match op {
+            WalOperation::JobStart {
+                job_id,
+                effective_partition,
+                memory_adjustment,
+                ..
+            } => {
+                assert_eq!(job_id, 5);
+                assert_eq!(effective_partition, None);
+                assert_eq!(memory_adjustment, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
     #[test]
     fn job_submit_mpi_pmix_round_trips() {
         use crate::job::JobSpec;
