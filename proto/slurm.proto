@@ -494,6 +494,11 @@ message NodeInfo {
   // Port the node's agent listens on, so a client dialling it directly does not
   // have to assume the default.
   uint32 agent_port = 58;
+
+  // The leader's heartbeats from this node have gone stale, so it is given no
+  // new work until they resume (Slurm's NOT_RESPONDING, the `*` suffix). Its
+  // base `state` and running jobs are unaffected. Leader-local, never persisted.
+  bool not_responding = 59;
 }
 
 message PartitionInfo {
@@ -1062,6 +1067,11 @@ message HeartbeatRequest {
   string wg_pubkey = 6;
   // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
   optional K0sNodeStatus k0s_status = 7;
+  // The agent could not enumerate its running jobs for this heartbeat (a
+  // contended local lock), so `running_jobs` is not a complete set. The
+  // controller then treats the node as not-yet-clean rather than assuming it
+  // holds nothing. Older agents never set it, so their lists read as complete.
+  bool running_jobs_incomplete = 8;
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.

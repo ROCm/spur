@@ -815,8 +815,7 @@ impl ControllerService {
     /// Re-send a cancel to a node still holding an allocation the controller no
     /// longer believes belongs to it there — job finished, job moved to
     /// another node, or an id older than any this controller issued. Best-effort.
-    fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
-        let stale = stale_reported_jobs(&self.cluster, node, reported);
+    fn reclaim_stale_agent_jobs(&self, node: &str, stale: Vec<u32>) {
         if stale.is_empty() {
             return;
         }
@@ -2584,6 +2583,12 @@ impl SlurmController for ControllerService {
             )
             .map_err(register_node_rpc_status)?;
 
+        // Hold the node's recovery until its first heartbeat enumerates its jobs:
+        // a just-restarted agent may still be adopting runtime supervisors, and a
+        // clean report cannot be assumed before one arrives.
+        self.cluster
+            .record_node_report(&req.hostname, Some(crate::cluster::NodeReport::Unknown));
+
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
             message: "registered".into(),
@@ -2735,6 +2740,19 @@ impl SlurmController for ControllerService {
 
         self.verify_node_identity(&req.hostname, &req.node_token)?;
 
+        // Noted before the heartbeat lands, so a health pass never sees the node
+        // back without also seeing it is not a clean report. An incomplete job
+        // list (a contended lock on the agent) is Unknown, not clean, so a busy
+        // read cannot release the hold with jobs still on the node.
+        let stale_jobs = stale_reported_jobs(&self.cluster, &req.hostname, &req.running_jobs);
+        let report = if !stale_jobs.is_empty() {
+            Some(crate::cluster::NodeReport::StaleJobs(stale_jobs.clone()))
+        } else if req.running_jobs_incomplete {
+            Some(crate::cluster::NodeReport::Unknown)
+        } else {
+            None
+        };
+        self.cluster.record_node_report(&req.hostname, report);
         if self
             .cluster
             .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
@@ -2748,14 +2766,14 @@ impl SlurmController for ControllerService {
                 info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
             }
             // Converge the used-view to the agent's translated held GPU set
-            // before the stale-job scan, so an upgraded node's live GPUs stop
-            // reading free. Only jobs that reported a set participate.
+            // before stale jobs are reclaimed, so an upgraded node's live GPUs
+            // stop reading free. Only jobs that reported a set participate.
             let reported_gpu_ids = reported_held_gpu_ids(&req.running_jobs);
             if !reported_gpu_ids.is_empty() {
                 self.cluster
                     .reconcile_node_gpu_allocations(&req.hostname, &reported_gpu_ids);
             }
-            self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
+            self.reclaim_stale_agent_jobs(&req.hostname, stale_jobs);
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
@@ -5592,6 +5610,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         reason_uid: node.reason_uid,
         reason_time: node.reason_time.map(datetime_to_proto),
         agent_port: u32::from(node.port),
+        not_responding: node.not_responding,
     }
 }
 
@@ -8333,6 +8352,93 @@ mod tests {
             svc.cluster.get_node("n1").is_some(),
             "the unauthenticated call must not have removed the node"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_records_whether_the_node_still_reports_ended_jobs() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                svc.cluster.as_ref(),
+                op,
+            );
+        };
+        apply(&WalOperation::JobSubmit {
+            job_id: 30,
+            spec: Box::new(spur_core::job::JobSpec {
+                name: "ended".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        apply(&WalOperation::job_state_change(
+            30,
+            JobState::Pending,
+            JobState::Cancelled,
+        ));
+        let beat = |running: &[u32]| {
+            Request::new(HeartbeatRequest {
+                hostname: "n1".into(),
+                running_jobs: running
+                    .iter()
+                    .map(|&job_id| RunningJobStatus {
+                        job_id,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+        };
+
+        svc.heartbeat(beat(&[30])).await.expect("heartbeat");
+        assert!(svc.cluster.reports_stale_jobs("n1"));
+
+        svc.heartbeat(beat(&[])).await.expect("heartbeat");
+        assert!(!svc.cluster.reports_stale_jobs("n1"));
+
+        // An incomplete list (the agent's running-job map was locked) is not a
+        // clean report, even when empty, so it must not release a hold.
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            hostname: "n1".into(),
+            running_jobs: vec![],
+            running_jobs_incomplete: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("heartbeat");
+        assert!(svc.cluster.reports_stale_jobs("n1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_is_not_a_clean_report_until_the_first_heartbeat() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("register");
+        assert!(svc.cluster.reports_stale_jobs("n1"));
+
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            hostname: "n1".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect("heartbeat");
+        assert!(!svc.cluster.reports_stale_jobs("n1"));
     }
 
     // Open admission issues no credential whether or not a key is configured, so

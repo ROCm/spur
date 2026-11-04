@@ -37,7 +37,7 @@ fn node_comm_socket(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_socket(host, node.port))
 }
 
-fn node_comm_http_url(node: &Node) -> Option<String> {
+pub(crate) fn node_comm_http_url(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
     Some(spur_net::format_comm_http_url(host, node.port))
 }
@@ -3785,7 +3785,7 @@ pub async fn send_suspend_to_agents(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use spur_core::job::{Job, JobSpec};
     use spur_core::resource::{
@@ -4928,7 +4928,7 @@ mod tests {
         }
     }
 
-    mod dispatch_trigger_tests {
+    pub(crate) mod dispatch_trigger_tests {
         use super::*;
         use spur_core::config::SlurmConfig;
         use spur_core::node::{NodeSource, NodeState};
@@ -4966,6 +4966,8 @@ mod tests {
             reject_start: bool,
             cancelled_attempts: Arc<std::sync::Mutex<Vec<u32>>>,
             suspend_calls: Arc<AtomicU32>,
+            /// Hostname `ping` answers with, as a real agent reports its node name.
+            ping_hostname: String,
         }
 
         #[tonic::async_trait]
@@ -4990,9 +4992,10 @@ mod tests {
                 _request: tonic::Request<()>,
             ) -> Result<tonic::Response<spur_proto::proto::PingResponse>, tonic::Status>
             {
-                Ok(tonic::Response::new(
-                    spur_proto::proto::PingResponse::default(),
-                ))
+                Ok(tonic::Response::new(spur_proto::proto::PingResponse {
+                    hostname: self.ping_hostname.clone(),
+                    ..Default::default()
+                }))
             }
 
             async fn await_step(
@@ -5339,6 +5342,7 @@ mod tests {
                 cancel_delay,
                 cancelled_attempts: Default::default(),
                 suspend_calls: Default::default(),
+                ping_hostname: String::new(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -5369,6 +5373,38 @@ mod tests {
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
                 suspend_calls: Default::default(),
+                ping_hostname: String::new(),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            addr
+        }
+
+        /// Mock agent whose `ping` answers with `hostname`, for liveness probes.
+        pub(crate) async fn spawn_mock_agent_answering_ping(
+            hostname: &str,
+        ) -> std::net::SocketAddr {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let agent = MockAgent {
+                cancel_calls: Arc::new(AtomicU32::new(0)),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_with_status: None,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                cancel_delay: Duration::ZERO,
+                cancelled_attempts: Default::default(),
+                suspend_calls: Default::default(),
+                ping_hostname: hostname.to_string(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -5399,6 +5435,7 @@ mod tests {
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: Default::default(),
                 suspend_calls: Default::default(),
+                ping_hostname: String::new(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()
@@ -5433,6 +5470,7 @@ mod tests {
                 cancel_delay: Duration::ZERO,
                 cancelled_attempts: cancelled_attempts.clone(),
                 suspend_calls: suspend_calls.clone(),
+                ping_hostname: String::new(),
             };
             tokio::spawn(async move {
                 let _ = Server::builder()

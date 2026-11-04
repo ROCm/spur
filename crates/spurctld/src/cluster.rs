@@ -636,6 +636,14 @@ pub struct ClusterManager {
     /// flag is unset (a keepalive-sending client predating the flag). Reset on
     /// leadership regain, like `interactive_last_seen`.
     pinged_this_term: RwLock<HashSet<JobId>>,
+    /// Nodes whose latest heartbeat was not a clean report: still running jobs
+    /// the controller ended, or unable to enumerate its jobs. Absent means
+    /// clean. Leader-local soft state, like `Node::last_heartbeat`.
+    stale_reporting_nodes: RwLock<HashMap<String, NodeReport>>,
+    /// When the health pass began withholding each node's recovery. Only the
+    /// health pass writes it, so a leadership change can reset it without
+    /// racing heartbeats.
+    recovery_holds: RwLock<HashMap<String, std::time::Instant>>,
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
@@ -956,6 +964,8 @@ impl ClusterManager {
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             pinged_this_term: RwLock::new(HashSet::new()),
+            stale_reporting_nodes: RwLock::new(HashMap::new()),
+            recovery_holds: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
@@ -3909,6 +3919,8 @@ impl ClusterManager {
             node.cpu_load = cpu_load;
             node.free_memory_mb = free_memory_mb;
             node.last_heartbeat = Some(Utc::now());
+            // The leader is hearing this node again, so it may take work.
+            node.not_responding = false;
             true
         } else {
             false
@@ -3938,6 +3950,36 @@ impl ClusterManager {
     #[cfg(test)]
     pub(crate) fn keepalive_last_seen(&self, job_id: JobId) -> Option<DateTime<Utc>> {
         self.interactive_last_seen.read().get(&job_id).copied()
+    }
+
+    /// Record what `node`'s latest heartbeat said about jobs the controller
+    /// ended: `None` is a clean report (clears any hold), `Some` holds its
+    /// recovery. Ignored for an unknown node, so a report cannot resurrect one
+    /// the controller already dropped.
+    pub(crate) fn record_node_report(&self, node: &str, report: Option<NodeReport>) {
+        match report {
+            None => {
+                self.stale_reporting_nodes.write().remove(node);
+            }
+            Some(report) => {
+                if self.nodes.read().contains_key(node) {
+                    self.stale_reporting_nodes
+                        .write()
+                        .insert(node.to_string(), report);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reports_stale_jobs(&self, node: &str) -> bool {
+        self.stale_reporting_nodes.read().contains_key(node)
+    }
+
+    /// Clear recovery holds on leadership (re)gain: their start times were set
+    /// by another leadership's health passes.
+    pub(crate) fn reset_recovery_holds(&self) {
+        self.recovery_holds.write().clear();
     }
 
     /// Prune the keepalive map to the given live interactive allocations and
@@ -4758,8 +4800,10 @@ impl ClusterManager {
         )
     }
 
-    /// Marks stale nodes Down unless `mark_down` is `Suppressed`, and recovers
-    /// nodes whose heartbeat resumed. Returns finalized jobs for cancel RPCs.
+    /// Marks stale nodes Down as `mark_down` allows, and recovers nodes whose
+    /// heartbeat resumed unless [`withhold_recoveries`] holds them. Staleness is
+    /// judged here, when the pass applies, so a node confirmed gone that has
+    /// heartbeated since is kept. Returns finalized jobs for cancel RPCs.
     pub fn check_node_health(
         &self,
         timeout_secs: u64,
@@ -4770,18 +4814,79 @@ impl ClusterManager {
             let refs: Vec<&Node> = nodes.values().collect();
             evaluate_node_health(&refs, Utc::now(), timeout_secs)
         };
-        if mark_down == MarkDownPolicy::Suppressed {
-            let before = actions.len();
-            actions.retain(|a| !matches!(a, HealthAction::MarkDown { .. }));
-            let deferred = before - actions.len();
-            if deferred > 0 {
-                info!(
-                    nodes = deferred,
-                    "deferring node DOWN during leadership grace period"
-                );
+        match &mark_down {
+            MarkDownPolicy::Allowed => {}
+            MarkDownPolicy::Suppressed => {
+                let before = actions.len();
+                actions.retain(|a| !matches!(a, HealthAction::MarkDown { .. }));
+                let deferred = before - actions.len();
+                if deferred > 0 {
+                    info!(
+                        nodes = deferred,
+                        "deferring node DOWN during leadership grace period"
+                    );
+                }
+            }
+            MarkDownPolicy::Only(confirmed) => actions.retain(|a| match a {
+                HealthAction::MarkDown { name, .. } => confirmed.contains(name),
+                HealthAction::Recover { .. } | HealthAction::Drain { .. } => true,
+            }),
+        }
+        // Outside the grace window, flag silent nodes NOT_RESPONDING so they take
+        // no new work while the leader cannot hear them, DOWN or not.
+        if !matches!(mark_down, MarkDownPolicy::Suppressed) {
+            self.refresh_not_responding(timeout_secs, Utc::now());
+        }
+        withhold_recoveries(
+            &mut actions,
+            &self.stale_reporting_nodes.read(),
+            &mut self.recovery_holds.write(),
+            std::time::Duration::from_secs(timeout_secs),
+            std::time::Instant::now(),
+        );
+        self.apply_health_actions(actions)
+    }
+
+    /// Flags a node NOT_RESPONDING when its heartbeat is stale and clears the
+    /// flag on one heard from within the timeout. A node with no heartbeat on
+    /// record (already Down) is left alone. A flagged node keeps its running
+    /// jobs but takes no new work until heartbeats resume (Slurm's `*`).
+    fn refresh_not_responding(&self, timeout_secs: u64, now: DateTime<Utc>) {
+        let threshold = chrono::Duration::seconds(timeout_secs as i64);
+        let mut nodes = self.nodes.write();
+        for node in nodes.values_mut() {
+            if let Some(hb) = node.last_heartbeat {
+                node.not_responding = now - hb > threshold;
             }
         }
-        self.apply_health_actions(actions)
+    }
+
+    /// Clear NOT_RESPONDING on every node, on leadership (re)gain: a new
+    /// leadership must recompute it from the heartbeats it itself sees.
+    pub(crate) fn clear_not_responding(&self) {
+        for node in self.nodes.write().values_mut() {
+            node.not_responding = false;
+        }
+    }
+
+    /// The stale nodes a health pass would mark Down, read before anything is
+    /// applied so they can be confirmed first.
+    pub(crate) fn stale_nodes(&self, timeout_secs: u64) -> StaleNodes {
+        let nodes = self.nodes.read();
+        let refs: Vec<&Node> = nodes.values().collect();
+        let names = evaluate_node_health(&refs, Utc::now(), timeout_secs)
+            .into_iter()
+            .filter_map(|action| match action {
+                HealthAction::MarkDown { name, .. } => Some(name),
+                // evaluate_node_health only proposes MarkDown/Recover; the hold
+                // pass adds any Drain later, so it cannot appear here.
+                HealthAction::Recover { .. } | HealthAction::Drain { .. } => None,
+            })
+            .collect();
+        StaleNodes {
+            names,
+            monitored: monitored_node_count(&refs),
+        }
     }
 
     fn apply_health_actions(&self, actions: Vec<HealthAction>) -> Vec<JobFinalized> {
@@ -4845,6 +4950,27 @@ impl ClusterManager {
                         at: None,
                     }) {
                         warn!(error = %e, "failed to propose node recovery");
+                    }
+                }
+                HealthAction::Drain {
+                    name,
+                    old_state,
+                    reason,
+                } => {
+                    warn!(node = %name, reason = %reason, "node drained: jobs the controller ended were not released within the hold cap");
+                    // Admin-locked so it will not auto-recover; an operator clears
+                    // it with `scontrol update state=resume` once the node is sound.
+                    if let Err(e) = self.propose(WalOperation::NodeStateChange {
+                        name,
+                        old_state,
+                        new_state: NodeState::Drain,
+                        reason: Some(reason),
+                        admin_locked: true,
+                        reason_uid: Some(0),
+                        reason_time: Some(Utc::now()),
+                        at: None,
+                    }) {
+                        warn!(error = %e, "failed to propose node drain");
                     }
                 }
             }
@@ -6669,10 +6795,11 @@ impl ClusterManager {
                 continue;
             }
 
-            // Eligible nodes exist but none are up. is_up() keeps a busy
-            // `Allocated` cluster out of NodeDown; a nodelist pin to down nodes
-            // is ReqNodeNotAvail (Slurm parity).
-            if eligible.iter().all(|n| !n.state.is_up()) {
+            // Eligible nodes exist but none can take work. is_up_for_work keeps a
+            // busy `Allocated` cluster out of NodeDown while also treating a
+            // not-responding node as unavailable; a nodelist pin to such nodes is
+            // ReqNodeNotAvail (Slurm parity).
+            if eligible.iter().all(|n| !n.is_up_for_work()) {
                 job_entry.set_pending_reason(
                     if job.spec.nodelist.as_deref().is_some_and(|s| !s.is_empty()) {
                         PendingReason::ReqNodeNotAvail
@@ -8540,7 +8667,11 @@ impl ClusterManager {
                     }
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
-                    node.last_heartbeat = Some(Utc::now());
+                    // A stamp would recover a Down node at the next pass, on any
+                    // leader or after replay, before a heartbeat reports its jobs.
+                    if !matches!(node.state, NodeState::Down | NodeState::Error) {
+                        node.last_heartbeat = Some(Utc::now());
+                    }
                     // Re-clamp against config: NodeUpdate carries a fresh detected
                     // report and must honor caps just like NodeRegister does.
                     self.apply_node_config_policy(node);
@@ -10376,10 +10507,19 @@ pub(crate) fn node_config_matches(
     matches_names || matches_selector
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkDownPolicy {
     Allowed,
     Suppressed,
+    /// Only these stale nodes may be marked Down this pass.
+    Only(HashSet<String>),
+}
+
+/// The nodes one health pass would mark Down, and how many nodes it watches.
+#[derive(Debug)]
+pub(crate) struct StaleNodes {
+    pub(crate) names: Vec<String>,
+    pub(crate) monitored: usize,
 }
 
 /// Withholds DOWN marking for `grace` after leadership is won: a non-leader
@@ -10420,6 +10560,14 @@ pub(crate) enum HealthAction {
     Recover {
         name: String,
         old_state: NodeState,
+    },
+    /// A returning node that never released jobs the controller ended within the
+    /// hold cap: drained (admin-locked) with `reason` so an operator resumes it,
+    /// rather than recovered with processes that would not die.
+    Drain {
+        name: String,
+        old_state: NodeState,
+        reason: String,
     },
 }
 
@@ -10470,6 +10618,87 @@ pub(crate) fn recovered_node_state(node: Option<&Node>) -> NodeState {
     recovered.state = NodeState::Idle;
     recovered.update_state_from_alloc();
     recovered.state
+}
+
+/// Nodes a heartbeat timeout could still move to Down: a heartbeat is on
+/// record and the node is not already Down or held in Drain.
+pub(crate) fn monitored_node_count(nodes: &[&Node]) -> usize {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.last_heartbeat.is_some()
+                && node
+                    .state
+                    .transition(&NodeEvent::HeartbeatTimeout, node.admin_locked)
+                    .is_some()
+        })
+        .count()
+}
+
+const HOLD_RELEASE_SLACK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What a node's latest heartbeat said about jobs the controller has ended. A
+/// node absent from the stale-report map reported clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeReport {
+    /// Still running jobs the controller ended or moved; these ids are reclaimed
+    /// and its recovery is held until it reports clean.
+    StaleJobs(Vec<u32>),
+    /// The heartbeat could not enumerate the node's jobs (a contended running-job
+    /// lock, or a registration before the first complete report), so a clean
+    /// recovery cannot be confirmed and recovery is held, same as stale jobs.
+    Unknown,
+}
+
+/// Withholds recovery from nodes that did not report clean, so nothing new lands
+/// beside jobs the reclaim cancel has not stopped. `holds` keeps when each hold
+/// began; past `cap` the node is drained for an operator instead, so a job that
+/// will not die neither keeps it Down forever nor gets new work beside it.
+pub(crate) fn withhold_recoveries(
+    actions: &mut Vec<HealthAction>,
+    reporting_stale: &HashMap<String, NodeReport>,
+    holds: &mut HashMap<String, std::time::Instant>,
+    cap: std::time::Duration,
+    now: std::time::Instant,
+) {
+    holds.retain(|node, _| reporting_stale.contains_key(node));
+    for action in std::mem::take(actions) {
+        let HealthAction::Recover { name, old_state } = action else {
+            actions.push(action);
+            continue;
+        };
+        let Some(report) = reporting_stale.get(&name) else {
+            actions.push(HealthAction::Recover { name, old_state });
+            continue;
+        };
+        let held_for = now.saturating_duration_since(*holds.entry(name.clone()).or_insert(now));
+        // Passes land on a fixed tick, so the one due exactly at the cap can run a
+        // hair early; the slack keeps the decision from slipping a whole pass.
+        if held_for + HOLD_RELEASE_SLACK < cap {
+            info!(node = %name, "holding node recovery until it releases jobs the controller ended");
+            continue;
+        }
+        // Past the cap and still not a clean report: drain it for an operator
+        // instead of recovering with jobs that would not die.
+        let reason = match report {
+            NodeReport::StaleJobs(ids) => {
+                let ids = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                format!("Kill task failed (JobId={ids})")
+            }
+            NodeReport::Unknown => "Agent job list unavailable".to_string(),
+        };
+        warn!(
+            node = %name,
+            held_secs = held_for.as_secs(),
+            reason = %reason,
+            "draining a node that did not release jobs the controller ended within the hold cap"
+        );
+        actions.push(HealthAction::Drain {
+            name,
+            old_state,
+            reason,
+        });
+    }
 }
 
 pub(crate) fn evaluate_node_health(
@@ -10918,7 +11147,7 @@ pub(crate) mod gated {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
@@ -11018,7 +11247,7 @@ mod tests {
         }
     }
 
-    async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
+    pub(crate) async fn test_cluster(dir: &TempDir) -> Arc<ClusterManager> {
         test_cluster_with_config(dir, test_config()).await
     }
 
@@ -11986,7 +12215,7 @@ state = "UP"
     /// has finished its initial self-election, causing `client_write` to
     /// fail silently. This helper retries until the election completes
     /// and the mutation is applied.
-    fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
+    pub(crate) fn wait_for<F: Fn() -> bool>(label: &str, f: F) {
         for _ in 0..200 {
             if f() {
                 return;
@@ -12020,7 +12249,13 @@ state = "UP"
         )
     }
 
-    fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
+    pub(crate) fn set_last_heartbeat(cm: &ClusterManager, name: &str, at: Option<DateTime<Utc>>) {
+        if let Some(node) = cm.nodes.write().get_mut(name) {
+            node.last_heartbeat = at;
+        }
+    }
+
+    pub(crate) fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
         try_register_node(cm, name, cpus, mem).unwrap();
         let n = name.to_string();
         wait_for(&format!("node '{n}' registered"), || {
@@ -19516,6 +19751,37 @@ state = "UP"
         n1.state = NodeState::Drain;
         let n2 = cm.get_node("n2").unwrap();
         let nodes = vec![n1, n2];
+        let state = spur_sched::traits::ClusterState {
+            fabric: None,
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::ReqNodeNotAvail
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_pinned_to_a_not_responding_node_reports_req_node_not_avail() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        let mut spec = basic_spec("pinned");
+        spec.nodelist = Some("n1".into());
+        let job_id = submit_and_wait(&cm, spec);
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        // n1 stays Idle but is not responding, so it takes no new work and a
+        // job pinned to it waits with ReqNodeNotAvail, not Resources.
+        let mut n1 = cm.get_node("n1").unwrap();
+        n1.not_responding = true;
+        let nodes = vec![n1];
         let state = spur_sched::traits::ClusterState {
             fabric: None,
             busy_until: &std::collections::HashMap::new(),
@@ -29865,6 +30131,408 @@ state = "UP"
         assert_eq!(
             cm.get_job(id).unwrap().allocated_nodes,
             vec!["n1".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_policy_marks_down_just_the_listed_stale_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "gone", 4, 8000);
+        register_node(&cm, "kept", 4, 8000);
+        for name in ["gone", "kept"] {
+            set_last_heartbeat(&cm, name, Some(Utc::now() - chrono::Duration::seconds(200)));
+        }
+
+        let confirmed = HashSet::from(["gone".to_string()]);
+        cm.check_node_health(90, super::MarkDownPolicy::Only(confirmed));
+        wait_for("confirmed node marked down", || {
+            cm.get_node("gone")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        assert_eq!(cm.get_node("kept").unwrap().state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_policy_spares_a_listed_node_whose_heartbeat_returned() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.update_heartbeat("back", 0, 8000);
+
+        let confirmed = HashSet::from(["back".to_string()]);
+        let evicted = cm.check_node_health(90, super::MarkDownPolicy::Only(confirmed));
+        assert!(evicted.is_empty());
+        assert_eq!(cm.get_node("back").unwrap().state, NodeState::Idle);
+    }
+
+    fn recover(name: &str) -> super::HealthAction {
+        super::HealthAction::Recover {
+            name: name.into(),
+            old_state: NodeState::Down,
+        }
+    }
+
+    fn reporting(names: &[&str]) -> HashMap<String, super::NodeReport> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), super::NodeReport::StaleJobs(vec![1])))
+            .collect()
+    }
+
+    fn drain(name: &str, reason: &str) -> super::HealthAction {
+        super::HealthAction::Drain {
+            name: name.into(),
+            old_state: NodeState::Down,
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn a_recovery_waits_while_the_node_still_reports_ended_jobs() {
+        let now = std::time::Instant::now();
+        let reporting = reporting(&["held"]);
+        let mut holds = HashMap::new();
+        let gone = super::HealthAction::MarkDown {
+            name: "gone".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        };
+        let mut actions = vec![recover("held"), recover("clean"), gone];
+
+        super::withhold_recoveries(
+            &mut actions,
+            &reporting,
+            &mut holds,
+            std::time::Duration::from_secs(90),
+            now,
+        );
+
+        assert_eq!(
+            actions,
+            vec![
+                recover("clean"),
+                super::HealthAction::MarkDown {
+                    name: "gone".into(),
+                    old_state: NodeState::Idle,
+                    admin_locked: false,
+                },
+            ]
+        );
+        assert_eq!(holds.get("held"), Some(&now));
+    }
+
+    #[test]
+    fn a_recovery_proceeds_once_the_node_reports_clean() {
+        let started = std::time::Instant::now();
+        let mut holds = HashMap::from([("back".to_string(), started)]);
+        let mut actions = vec![recover("back")];
+
+        super::withhold_recoveries(
+            &mut actions,
+            &HashMap::new(),
+            &mut holds,
+            std::time::Duration::from_secs(90),
+            started + std::time::Duration::from_secs(5),
+        );
+
+        assert_eq!(actions, vec![recover("back")]);
+        assert!(holds.is_empty(), "a clean report ends the hold");
+    }
+
+    #[test]
+    fn a_node_is_drained_after_the_hold_cap_while_ended_jobs_linger() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(90);
+        let reporting = reporting(&["stuck"]);
+        let mut holds = HashMap::new();
+        let pass = |holds: &mut HashMap<String, std::time::Instant>, at| {
+            let mut actions = vec![recover("stuck")];
+            super::withhold_recoveries(&mut actions, &reporting, holds, cap, at);
+            actions
+        };
+
+        assert!(pass(&mut holds, started).is_empty());
+        assert!(
+            pass(
+                &mut holds,
+                started + cap - std::time::Duration::from_secs(1)
+            )
+            .is_empty(),
+            "the hold lasts until the cap"
+        );
+        assert_eq!(
+            pass(&mut holds, started + cap),
+            vec![drain("stuck", "Kill task failed (JobId=1)")],
+            "past the cap the node is drained, not recovered"
+        );
+    }
+
+    #[test]
+    fn a_pass_due_at_the_hold_cap_drains_even_if_it_runs_a_hair_early() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(45);
+        let reporting = reporting(&["stuck"]);
+        let mut holds = HashMap::from([("stuck".to_string(), started)]);
+        let mut actions = vec![recover("stuck")];
+
+        super::withhold_recoveries(
+            &mut actions,
+            &reporting,
+            &mut holds,
+            cap,
+            started + cap - std::time::Duration::from_micros(180),
+        );
+
+        assert_eq!(actions, vec![drain("stuck", "Kill task failed (JobId=1)")]);
+    }
+
+    #[test]
+    fn an_unknown_report_drains_with_agent_job_list_unavailable_after_the_cap() {
+        let started = std::time::Instant::now();
+        let cap = std::time::Duration::from_secs(45);
+        let reporting = HashMap::from([("stuck".to_string(), super::NodeReport::Unknown)]);
+        let mut holds = HashMap::from([("stuck".to_string(), started)]);
+        let mut actions = vec![recover("stuck")];
+
+        super::withhold_recoveries(&mut actions, &reporting, &mut holds, cap, started + cap);
+
+        assert_eq!(actions, vec![drain("stuck", "Agent job list unavailable")]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_returning_node_stays_down_until_it_stops_reporting_ended_jobs() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "back".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        set_last_heartbeat(&cm, "back", Some(Utc::now()));
+
+        cm.record_node_report("back", Some(super::NodeReport::StaleJobs(vec![1])));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("back").unwrap().state, NodeState::Down);
+
+        cm.record_node_report("back", None);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("recovered after a clean report", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_down_node_re_registering_stays_down_until_a_heartbeat_reports() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        // An upgraded agent re-registers with a new version, which replicates a
+        // NodeUpdate to every controller and replays on restart.
+        cm.register_node(
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            "9.9.9".into(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            true,
+        )
+        .unwrap();
+        wait_for("update applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.version.as_deref() == Some("9.9.9"))
+        });
+
+        assert_eq!(cm.get_node("n1").unwrap().last_heartbeat, None);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(
+            cm.get_node("n1").unwrap().state,
+            NodeState::Down,
+            "recovery waits for a heartbeat that reports the node's jobs"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_report_holds_recovery_until_a_clean_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "back", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "back".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+        set_last_heartbeat(&cm, "back", Some(Utc::now()));
+
+        // A heartbeat that could not enumerate the node's jobs is Unknown, not
+        // clean, so recovery stays held even though no stale job was named.
+        cm.record_node_report("back", Some(super::NodeReport::Unknown));
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("back").unwrap().state, NodeState::Down);
+
+        cm.record_node_report("back", None);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        wait_for("recovered after a complete clean report", || {
+            cm.get_node("back")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_capped_out_node_admin_locks_it_until_resume() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_health_actions(vec![super::HealthAction::MarkDown {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            admin_locked: false,
+        }]);
+        wait_for("down applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Down)
+        });
+
+        cm.apply_health_actions(vec![super::HealthAction::Drain {
+            name: "n1".into(),
+            old_state: NodeState::Down,
+            reason: "Kill task failed (JobId=7)".into(),
+        }]);
+        wait_for("drain applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Drain)
+        });
+        let node = cm.get_node("n1").unwrap();
+        assert!(node.admin_locked, "a cap-out drain must not auto-recover");
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("Kill task failed (JobId=7)")
+        );
+        assert_eq!(node.reason_uid, Some(0), "system-initiated, like a DOWN");
+        assert!(node.reason_time.is_some());
+
+        // A fresh heartbeat must not lift the admin drain.
+        cm.update_heartbeat("n1", 0, 8000);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Drain);
+
+        // Only an operator resume returns it to service.
+        cm.update_node_state("n1", NodeState::Idle, None, None)
+            .unwrap();
+        wait_for("resumed to idle", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.state == NodeState::Idle)
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_report_from_an_unknown_node_is_not_kept() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.record_node_report("ghost", Some(super::NodeReport::StaleJobs(vec![1])));
+
+        assert!(!cm.reports_stale_jobs("ghost"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_health_pass_flags_a_silent_node_not_responding_and_a_heartbeat_clears_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+
+        // Kept alive by the probe (Only with nobody confirmed), but still silent:
+        // the node is flagged and stops taking work, though its state stays up.
+        cm.check_node_health(90, super::MarkDownPolicy::Only(HashSet::new()));
+        let node = cm.get_node("n1").unwrap();
+        assert!(node.not_responding);
+        assert!(node.state.is_up() && !node.is_schedulable());
+
+        cm.update_heartbeat("n1", 0, 8000);
+        assert!(!cm.get_node("n1").unwrap().not_responding);
+        cm.check_node_health(90, super::MarkDownPolicy::Allowed);
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_grace_window_does_not_flag_nodes_not_responding() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+
+        // A just-elected leader has not heard from anyone yet; it must not flag
+        // the whole cluster not-responding during its grace window.
+        cm.check_node_health(90, super::MarkDownPolicy::Suppressed);
+        assert!(!cm.get_node("n1").unwrap().not_responding);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_not_responding_restores_scheduling() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        set_last_heartbeat(&cm, "n1", Some(Utc::now() - chrono::Duration::seconds(200)));
+        cm.check_node_health(90, super::MarkDownPolicy::Only(HashSet::new()));
+        assert!(cm.get_node("n1").unwrap().not_responding);
+
+        cm.clear_not_responding();
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_nodes_counts_only_nodes_a_timeout_would_mark_down() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        for name in ["fresh", "stale", "drained", "down"] {
+            register_node(&cm, name, 4, 8000);
+        }
+        let old = Utc::now() - chrono::Duration::seconds(200);
+        {
+            let mut nodes = cm.nodes.write();
+            nodes.get_mut("stale").unwrap().last_heartbeat = Some(old);
+            let drained = nodes.get_mut("drained").unwrap();
+            drained.state = NodeState::Drain;
+            drained.last_heartbeat = Some(old);
+            let down = nodes.get_mut("down").unwrap();
+            down.state = NodeState::Down;
+            down.last_heartbeat = None;
+        }
+
+        let stale = cm.stale_nodes(90);
+        assert_eq!(stale.names, vec!["stale".to_string()]);
+        assert_eq!(
+            stale.monitored, 2,
+            "fresh and stale are watched; a drained or down node is not"
         );
     }
 
