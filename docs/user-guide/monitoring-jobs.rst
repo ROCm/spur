@@ -1270,15 +1270,14 @@ the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits: a clean
 exit on SIGTERM does not make it ``COMPLETED``. ``--requeue`` still requeues it
 on timeout. The SIGTERM is final, so a batch script can use the wait to
 checkpoint and exit. An idle interactive allocation reaped for inactivity
-(:ref:`inactive-limit`) does not show ``CG`` or wait: its work runs in ``srun``
-steps and its own process exits on SIGTERM, so it ends ``TIMEOUT`` at once (see
-the note below). ``scancel``, ``scontrol requeue`` and the final kill of a
-preempted job use the general kill wait (``kill_wait_secs``, default 5 seconds),
-as does stopping the other nodes of a job whose batch script has exited. Where a
-stop does reach an ``srun`` step that has no supervisor process (the note below
-says where it does not), the step gets the full wait that applies to it (5
-seconds on ``scancel``, 30 at a time limit), where earlier releases gave it 2
-seconds.
+(:ref:`inactive-limit`) normally ends ``TIMEOUT`` within a moment of the
+SIGTERM, without spending the wait in ``COMPLETING``: its work runs in ``srun``
+steps and its own process exits on SIGTERM (see the note below). ``scancel``,
+``scontrol requeue`` and the final kill of a preempted job use the general kill
+wait (``kill_wait_secs``, default 5 seconds), as does stopping the other nodes
+of a job whose batch script has exited. An ``srun`` step with no supervisor process gets the full wait that applies to it
+when a stop reaches it (see the note below): 5 seconds on ``scancel``, 30 at a
+time limit, where earlier releases gave it 2 seconds.
 
 .. _kill-wait-steps-caveat:
 

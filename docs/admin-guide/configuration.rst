@@ -600,13 +600,14 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - ``30``
      - Live
      - The same wait for a job stopped by its time limit or the inactivity limit
-       (``inactive_limit_secs``), the stops that end ``TIMEOUT``. Such a job
-       moves to COMPLETING straight away and spends this wait there before
-       ending ``TIMEOUT``. Valid ``0``-``65533``; values below 5 act as 5.
-       ``complete_wait_secs`` should exceed the larger kill wait (this or
-       ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``. In Slurm,
-       ``KillWait`` also covers time limits; here that part is this setting.
-       Does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+       (``inactive_limit_secs``), the stops that end ``TIMEOUT``. A
+       time-limited batch job moves to COMPLETING straight away and spends this
+       wait there before ending ``TIMEOUT``. Valid ``0``-``65533``; values below
+       5 act as 5. ``complete_wait_secs`` should exceed the larger kill wait
+       (this or ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``. In
+       Slurm, ``KillWait`` also covers time limits; here that part is this
+       setting. Does not yet reach ``srun`` steps
+       (:ref:`kill wait note <kill-wait-steps-caveat>`).
    * - ``max_user_priority``
      - integer
      - ``1000``
@@ -771,12 +772,13 @@ stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
 allocation is reaped: SIGTERM, then SIGKILL after up to
 ``timeout_kill_wait_secs`` (default 30 seconds). An allocation's own process
 exits on SIGTERM and its work runs in ``srun`` steps, which the wait does not
-yet reach (:ref:`kill wait note <kill-wait-steps-caveat>`), so an allocation normally ends
-``TIMEOUT`` right away, without showing ``COMPLETING`` (``CG``) or waiting. The
-SIGTERM is final: a client that reconnects after it does not save the
-allocation, and the job ends ``TIMEOUT`` however its processes exit. With the
-defaults, an abandoned allocation is signalled 270 to 310 seconds after its
-client is lost (the last ping can be up to 30 seconds old).
+yet reach (:ref:`kill wait note <kill-wait-steps-caveat>`), so an allocation
+normally ends ``TIMEOUT`` within a moment of the SIGTERM, without spending the
+wait in ``COMPLETING`` (``CG``). The SIGTERM is final: a client that
+reconnects after it does not save the allocation, and the job ends ``TIMEOUT``
+however its processes exit. With the defaults, an abandoned allocation is
+signalled 270 to 310 seconds after its client is lost (the last ping can be up
+to 30 seconds old).
 
 The limit measures the client, not the job. A busy job whose client is gone is
 reaped, and so is one whose client is only stopped, such as a foreground

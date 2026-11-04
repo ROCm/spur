@@ -970,10 +970,11 @@ Rules that follow from this:
   user's cancel, not as preempted.
 * **Suspending is refused.** ``scontrol suspend`` on a job in its grace fails.
 * **The preemptor waits.** It stays at the front of the queue until the grace
-  and kill wait finish (the node is freed once the batch script exits, before
-  its ``srun`` steps get the wait: :ref:`kill wait note <kill-wait-steps-caveat>`). No other job is placed on the victim's nodes, no second
-  preemptor selects the same victim, and idle-fill reclaim
-  (:doc:`idle-fill-scheduling`) waits for the grace too.
+  and kill wait finish (the preemptor can start once the victim's batch script
+  exits, even while its ``srun`` steps are still running: see the
+  :ref:`kill wait note <kill-wait-steps-caveat>`). No other job is placed on the
+  victim's nodes, no second preemptor selects the same victim, and idle-fill
+  reclaim (:doc:`idle-fill-scheduling`) waits for the grace too.
 * **A grace shortened by the time limit** still ends as a preemption, not a
   time limit.
 

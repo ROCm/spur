@@ -837,9 +837,11 @@ with the defaults most waits are the ones a job had before.
    * - An idle interactive allocation reaped by ``inactive_limit_secs``
      - Stayed ``RUNNING`` for 30 seconds after SIGTERM, then ended ``TIMEOUT``
        and was SIGKILLed
-     - Ends ``TIMEOUT`` as soon as its own process exits on SIGTERM, without
-       showing ``CG``, as its work runs in ``srun`` steps that the wait does not
-       yet reach (:ref:`kill wait note <kill-wait-steps-caveat>`)
+     - Normally ends ``TIMEOUT`` within a moment of the SIGTERM, without
+       spending the wait in ``COMPLETING``, as its work runs in ``srun`` steps
+       that the wait does not yet reach (:ref:`kill wait note
+       <kill-wait-steps-caveat>`). Like the batch row above, it stays ``CG``
+       for up to ``complete_wait_secs`` on a hung or unreachable agent.
      - The allocation is freed sooner than before. ``--requeue`` does not apply.
    * - A requeued job (requeue-mode preemption, ``scontrol requeue``)
      - Held out of the queue for ``2 x interval_secs + 3`` seconds (5 seconds
@@ -852,7 +854,8 @@ with the defaults most waits are the ones a job had before.
      - SIGKILL after 2 seconds
      - SIGKILL after the full kill wait that applies: 5 seconds on cancel, 30
        at a time limit
-     - A step that handles SIGTERM now has time to shut down cleanly.
+     - A step that handles SIGTERM now has time to shut down cleanly, where a
+       stop reaches it (:ref:`kill wait note <kill-wait-steps-caveat>`).
 
 Keep ``complete_wait_secs`` above the larger of the two waits plus
 ``[cgroup] cleanup_timeout_secs`` (60 seconds by default). A node reports only
