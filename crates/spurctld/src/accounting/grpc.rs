@@ -663,6 +663,7 @@ impl SlurmAccounting for AccountingService {
                 user: r.user_name.clone(),
                 uid: 0,
                 partition: r.partition.clone(),
+                effective_partition: String::new(),
                 account: r.account.clone(),
                 state: db_job_state_str_to_proto(&r.state),
                 state_reason: String::new(),

@@ -494,6 +494,9 @@ message JobInfo {
   // When the job was signaled to start its preemption grace. Set only while
   // the grace runs; `end_time` then carries the grace deadline.
   google.protobuf.Timestamp preempt_time = 90;
+  // Partition the run is charged to for partition caps, chosen among the
+  // requested ones at start. Empty while pending.
+  string effective_partition = 91;
 }
 
 message NodeInfo {
@@ -2233,10 +2236,11 @@ message CreatePartitionRequest {
   // Seconds a preempted job gets to wind down before it is killed. Used when the
   // victim's QOS leaves its grace_time unset. 0 = no grace. Absent = unset.
   optional uint32 grace_time = 18;
-  // Shorthand for max_tres_per_node["cpu"]; setting both is rejected.
+  // Shorthand for max_tres_per_node["cpu"]; absent or 0 = unset (a "cpu"
+  // map entry of 0 forbids CPUs). Setting both is rejected.
   optional uint32 max_cpus_per_node = 19;
   map<string, uint64> max_tres_per_node = 20;  // keys: cpu, mem (MiB), gres/gpu, gres/gpu:<type>
-  // Per-job memory policy (MiB); absent = unset.
+  // Per-job memory policy (MiB); absent or 0 = unset.
   optional uint64 max_mem_per_node = 21;
   optional uint64 max_mem_per_cpu = 22;
   optional uint64 def_mem_per_node = 23;

@@ -10448,9 +10448,9 @@ fn node_tres_capacity(resources: &ResourceSet, key: &str) -> u64 {
     }
 }
 
-/// The request each candidate's quota gates should see: the largest one its
-/// candidate partitions' memory policies produce, so quota is never
-/// under-charged. Returns the original requests of the jobs it changed.
+/// The request each candidate's quota gates should see: the most CPUs and
+/// the most memory its candidate partitions' memory policies produce, so
+/// quota is never under-charged. Returns the original requests it changed.
 fn apply_quota_memory_requests(
     candidates: &mut [PendingJobCandidate],
     partitions: &[Partition],
@@ -10467,16 +10467,38 @@ fn apply_quota_memory_requests(
     originals
 }
 
-/// Largest memory-policy-adjusted request among the job's candidate
-/// partitions, or `None` when no policy changes it.
+/// The most CPUs per task and, separately, the most total memory any candidate
+/// partition's memory policy gives the job, or `None` when no policy changes
+/// the request. The two maxima may come from different partitions, so memory
+/// is restated per node (rounded up) to stay independent of the CPU count.
 fn quota_memory_request(job: &Job, partitions: &[Partition]) -> Option<MemoryAdjustment> {
     let original = MemoryAdjustment::of(&job.spec);
-    spur_sched::partition_cap::candidate_partitions(job, partitions)
-        .into_iter()
-        .filter(|p| p.has_memory_policy())
-        .map(|p| p.memory_adjusted(&job.spec))
-        .max_by_key(|adjusted| adjusted.node_footprint(&job.spec))
-        .filter(|adjusted| *adjusted != original)
+    let adjusted: Vec<MemoryAdjustment> =
+        spur_sched::partition_cap::candidate_partitions(job, partitions)
+            .into_iter()
+            .filter(|p| p.has_memory_policy())
+            .map(|p| p.memory_adjusted(&job.spec))
+            .filter(|adjusted| *adjusted != original)
+            .collect();
+    if adjusted.is_empty() {
+        return None;
+    }
+    let requests = || adjusted.iter().chain([&original]);
+    let cpus_per_task = requests().map(|a| a.cpus_per_task).max()?;
+    let memory_mb = requests().map(|a| quota_memory_mb(&job.spec, a)).max()?;
+    let nodes = u64::from(job.spec.num_nodes.max(1));
+    Some(MemoryAdjustment {
+        cpus_per_task,
+        memory_per_node_mb: (memory_mb > 0).then(|| memory_mb.div_ceil(nodes)),
+        memory_per_cpu_mb: None,
+    })
+}
+
+/// Total memory (MiB) quota charges for `spec` reshaped by `adjustment`.
+fn quota_memory_mb(spec: &JobSpec, adjustment: &MemoryAdjustment) -> u64 {
+    let mut probe = spec.clone();
+    adjustment.apply_to(&mut probe);
+    effective_memory_mb(&probe, probe.num_nodes)
 }
 
 fn restore_original_requests<'a>(
@@ -10550,7 +10572,8 @@ fn partition_cap_never_runs(
 }
 
 /// "Partition cpu can never run this job as configured: exclusive job needs
-/// 128 CPUs, max_cpus_per_node is 64 on every eligible node".
+/// 128 CPUs, max_tres_per_node.cpu is 64 on every eligible node". The
+/// `max_cpus_per_node` alias is folded into the map, so the map key is named.
 fn cap_never_runs_desc(
     job: &Job,
     partition: &Partition,
@@ -10574,20 +10597,12 @@ fn cap_never_runs_desc(
     } else {
         "job"
     };
-    let (amount, knob) = match closest.resource.as_str() {
-        spur_core::partition::TRES_CPU => (
-            format!("{} CPUs", closest.requested),
-            "max_cpus_per_node".to_string(),
-        ),
-        spur_core::partition::TRES_MEM => (
-            format!("{}M mem", closest.requested),
-            format!("max_tres_per_node.{}", closest.resource),
-        ),
-        resource => (
-            format!("{} {resource}", closest.requested),
-            format!("max_tres_per_node.{resource}"),
-        ),
+    let amount = match closest.resource.as_str() {
+        spur_core::partition::TRES_CPU => format!("{} CPUs", closest.requested),
+        spur_core::partition::TRES_MEM => format!("{}M mem", closest.requested),
+        resource => format!("{} {resource}", closest.requested),
     };
+    let knob = format!("max_tres_per_node.{}", closest.resource);
     let unit = if closest.resource == spur_core::partition::TRES_MEM {
         "M"
     } else {

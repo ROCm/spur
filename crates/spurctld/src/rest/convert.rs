@@ -13,6 +13,7 @@ pub fn job_to_json(job: &Job) -> serde_json::Value {
         "user_name": job.spec.user,
         "user_id": job.spec.uid,
         "partition": job.spec.partition,
+        "effective_partition": job.effective_partition,
         "account": job.spec.account,
         "job_state": job.state.display(),
         "state_reason": job.state_reason(),
@@ -152,6 +153,22 @@ mod tests {
         let json = partition_to_json(&part);
         assert_eq!(json["allow_accounts"], serde_json::json!(["research"]));
         assert_eq!(json["deny_accounts"], serde_json::json!(["student"]));
+    }
+
+    #[test]
+    fn job_to_json_reports_the_effective_partition() {
+        let mut job = Job::new(
+            7,
+            spur_core::job::JobSpec {
+                partition: Some("cpu,wide".into()),
+                ..Default::default()
+            },
+        );
+        assert!(job_to_json(&job)["effective_partition"].is_null());
+        job.effective_partition = Some("wide".into());
+        let json = job_to_json(&job);
+        assert_eq!(json["partition"], "cpu,wide");
+        assert_eq!(json["effective_partition"], "wide");
     }
 
     #[test]

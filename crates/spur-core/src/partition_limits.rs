@@ -97,15 +97,6 @@ impl MemoryAdjustment {
         spec.memory_per_node_mb = self.memory_per_node_mb;
         spec.memory_per_cpu_mb = self.memory_per_cpu_mb;
     }
-
-    /// Per-node CPUs and memory (MiB) of `spec` with this adjustment applied,
-    /// for comparing the adjusted requests of several partitions.
-    pub fn node_footprint(&self, spec: &JobSpec) -> (u64, u64) {
-        let mut adjusted = spec.clone();
-        self.apply_to(&mut adjusted);
-        let cpus = node_cpus(&adjusted);
-        (cpus, node_memory_mb(&adjusted, cpus))
-    }
 }
 
 /// Tasks per node as the scheduler sizes a node's share (at least one).
@@ -153,6 +144,10 @@ impl Partition {
     /// same partition changes nothing.
     pub fn memory_adjusted(&self, spec: &JobSpec) -> MemoryAdjustment {
         let mut adjusted = MemoryAdjustment::of(spec);
+        // Spur has no whole-node `--mem=0`: the API already reads 0 as "no
+        // memory request", so the policy must too.
+        adjusted.memory_per_node_mb = adjusted.memory_per_node_mb.filter(|m| *m > 0);
+        adjusted.memory_per_cpu_mb = adjusted.memory_per_cpu_mb.filter(|m| *m > 0);
         if adjusted.memory_per_node_mb.is_none() && adjusted.memory_per_cpu_mb.is_none() {
             self.apply_default_memory(spec, &mut adjusted);
         }
@@ -370,6 +365,29 @@ mod tests {
         assert!(defaulted
             .max_mem_per_node_exceeded(&spec(1, None, None))
             .is_some());
+    }
+
+    #[test]
+    fn a_zero_memory_request_is_checked_like_no_memory_request() {
+        let p = Partition {
+            max_mem_per_node: Some(64 * GIB),
+            def_mem_per_node: Some(100 * GIB),
+            ..Default::default()
+        };
+        let unset = p.max_mem_per_node_exceeded(&spec(1, None, None));
+        assert_eq!(unset, Some((100 * GIB, 64 * GIB)));
+        assert_eq!(p.max_mem_per_node_exceeded(&spec(1, Some(0), None)), unset);
+        assert_eq!(p.max_mem_per_node_exceeded(&spec(1, None, Some(0))), unset);
+
+        let per_cpu_default = Partition {
+            def_mem_per_cpu: Some(GIB),
+            ..Default::default()
+        };
+        let adjusted = per_cpu_default.memory_adjusted(&spec(2, Some(0), None));
+        assert_eq!(
+            (adjusted.memory_per_node_mb, adjusted.memory_per_cpu_mb),
+            (None, Some(GIB))
+        );
     }
 
     #[test]
