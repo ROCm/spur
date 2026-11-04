@@ -1263,11 +1263,12 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 **Time limits and the kill wait.** At its time limit a job moves from ``RUNNING``
 to ``COMPLETING`` (``CG`` in ``squeue``) straight away and is sent SIGTERM. It
 stays ``COMPLETING`` for up to the time-limit kill wait
-(``timeout_kill_wait_secs``, default 30 seconds), then Spur sends SIGKILL. The wait ends early once every process has
-exited, and the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits:
-a clean exit on SIGTERM does not make it ``COMPLETED``. Its nodes stay allocated
-until its processes are gone, and ``--requeue`` still requeues it on timeout. The
-SIGTERM is final, so use the wait to checkpoint and exit. The reaping of an idle
+(``timeout_kill_wait_secs``, default 30 seconds), then Spur sends SIGKILL. The
+wait ends early once the job's own process (its batch script) has exited, and
+the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits: a clean
+exit on SIGTERM does not make it ``COMPLETED``. ``--requeue`` still requeues it
+on timeout. The SIGTERM is final, so a batch script can use the wait to
+checkpoint and exit. The reaping of an idle
 interactive allocation (:ref:`inactive-limit`) waits the same time; a job reaped
 for inactivity also shows ``CG`` and ends ``TIMEOUT``. ``scancel``, ``scontrol
 requeue`` and the final kill of a preempted job use the general kill wait
@@ -1275,6 +1276,16 @@ requeue`` and the final kill of a preempted job use the general kill wait
 job whose batch script has exited. An ``srun`` step that has no supervisor
 process gets the full wait that applies to it (5 seconds on ``scancel``, 30 at a
 time limit), where earlier releases gave it 2 seconds.
+
+.. note::
+
+   The kill wait currently reaches only the batch script's own processes, not
+   work running in the job's ``srun`` steps. Those steps can be stopped without
+   the wait, and on nodes without cgroup enforcement they can outlive the job and
+   keep running beside a newly placed job. This applies to every stop that uses a
+   kill wait: a time limit, the inactivity limit, ``scancel``, and the final kill
+   of a preempted job. The preemption grace is not affected. See
+   `ROCm/spur#1180 <https://github.com/ROCm/spur/issues/1180>`__.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 

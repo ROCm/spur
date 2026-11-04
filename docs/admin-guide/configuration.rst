@@ -766,8 +766,10 @@ Reaping abandoned interactive allocations (``inactive_limit_secs``)
 controller every 30 seconds for as long as the client is running. When the pings
 stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
 allocation is reaped: SIGTERM, a wait of up to ``timeout_kill_wait_secs``
-(default 30 seconds, ending early once the job's processes exit), then SIGKILL. The node
-keeps the wait. The job shows ``COMPLETING`` (``CG``) meanwhile and ends
+(default 30 seconds, ending early once the job's own process exits), then
+SIGKILL. The wait does not yet reach work in the job's ``srun`` steps (see the
+note under *Time limits and the kill wait* in :doc:`/user-guide/monitoring-jobs`).
+The job shows ``COMPLETING`` (``CG``) meanwhile and ends
 ``TIMEOUT``. The SIGTERM is final: a client that reconnects during the wait
 does not save the allocation, and the job ends ``TIMEOUT`` however its
 processes exit. With the defaults, an abandoned allocation is signalled 270 to

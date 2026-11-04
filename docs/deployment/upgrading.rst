@@ -828,8 +828,10 @@ with the defaults most waits are the ones a job had before.
        ``timeout_kill_wait_secs`` (30 seconds), then ends ``TIMEOUT`` with
        reason ``TimeLimit``
      - ``squeue`` shows ``CG`` instead of ``R`` during the wait. The final state,
-       reason, timing, and ``--requeue`` behavior are unchanged, and the nodes
-       stay held until the processes are gone. The kill is now the agent's, so a
+       reason, timing, and ``--requeue`` behavior are unchanged. The wait does
+       not yet reach a job's ``srun`` steps, only the batch script's own
+       processes (`ROCm/spur#1180 <https://github.com/ROCm/spur/issues/1180>`__).
+       The kill is now the agent's, so a
        job on a hung or unreachable agent stays in ``CG`` for up to
        ``complete_wait_secs`` (300 seconds by default) before it ends ``TIMEOUT``,
        where the controller used to end it 30 seconds after SIGTERM.
