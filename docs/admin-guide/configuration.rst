@@ -244,11 +244,11 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
      - integer
      - none
      - Restart
-     - Seconds without a heartbeat before the leader checks on a node. Unset by
-       default; the controller applies a 90-second fallback when absent. A
-       ``spurd`` node whose agent still answers is kept; one that fails the
-       check on two consecutive health passes is marked Down. See
-       :ref:`node-liveness`.
+     - Seconds without a heartbeat before the leader flags a node not-responding
+       (no new work, running jobs untouched) and checks on it. Unset by default;
+       the controller applies a 90-second fallback when absent. A ``spurd`` node
+       whose agent still answers is kept; one that fails the check on two
+       consecutive health passes is marked Down. See :ref:`node-liveness`.
    * - ``health_tick_secs``
      - integer
      - ``30``
