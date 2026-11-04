@@ -147,7 +147,7 @@ impl Fixture {
             preemption_handoffs: &Default::default(),
             partition_node_usage: &self.usage,
         };
-        sched.schedule_jobs(jobs, &cluster, now(), true)
+        sched.schedule_with(jobs, &cluster, now(), &mut AdmitAll)
     }
 }
 
