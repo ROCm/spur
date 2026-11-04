@@ -135,6 +135,13 @@ These knobs use Slurm's names and meaning (``MaxMemPerNode``,
    Memory a job gets in this partition when it requests none. ``def_mem_per_gpu``
    is multiplied by the job's GPUs per node and applies only to GPU jobs.
 
+.. note::
+
+   In Slurm, ``--mem=0`` asks for all of a node's memory and is checked
+   against ``MaxMemPerNode`` as such. Spur has no whole-node memory request:
+   ``--mem=0`` is the same as giving no ``--mem``, so the ``def_mem_*``
+   default applies and that amount is checked against ``max_mem_per_node``.
+
 ``max_mem_per_node`` and ``max_mem_per_cpu`` are mutually exclusive. At most
 one of the three ``def_mem_*`` knobs may be set. Both rules are checked when
 the config loads and when a partition is created or updated.
@@ -194,6 +201,11 @@ because the CPU count is multiplied, as in Slurm. The extra CPUs count against
 the partition's ``cpu`` cap and against association and QOS limits like any
 other CPUs.
 
+While a job that lists several partitions is pending, association and QOS
+limits are checked against the most CPUs and, separately, the most memory any
+of its partitions would give it, so neither is under-counted whichever
+partition it ends up in.
+
 The adjustment is made separately for each partition a job may run in. When the
 job starts, the adjusted CPU and memory request of the partition it runs in is
 recorded on the job and shown by ``scontrol show job``. If the job is requeued,
@@ -209,13 +221,25 @@ each scheduling pass:
 1. Partitions whose limits could never hold the job are skipped. This includes
    a cap the job would exceed even on an idle node and a ``max_mem_per_node``
    it exceeds. A partition that is only full right now is not skipped.
-2. Among the rest, the partition with the highest ``priority_tier`` wins. Ties
-   go to the partition where the job could start earliest, taking the caps
-   into account. The order of names in ``--partition`` is not used.
+2. The rest are tried in ``priority_tier`` order, highest first. The job starts
+   in the first one where it can start now, so a lower-tier partition with
+   room runs it while a higher-tier one is busy. This matches Slurm's
+   behaviour for multi-partition jobs.
+3. If the job cannot start now in any of them, it waits in the partition where
+   it could start earliest, taking the caps into account. Ties go to the higher
+   ``priority_tier``.
+
+The order of names in ``--partition`` is not used.
 
 Nothing is fixed while the job waits. If another candidate partition frees up
 first, the job starts there. The partition is recorded only when the job starts,
 and the job's usage counts against that partition until it ends.
+
+``scontrol show job`` keeps the requested list in ``Partition=`` and adds
+``EffectivePartition=`` with the chosen one once the job has started; Slurm
+has no separate field for it. The same value is the ``effective_partition``
+field of the REST job object (``null`` while pending) and of ``JobInfo`` in the
+gRPC API (empty while pending).
 
 A job blocked by a cap is never dropped. It stays ``PENDING`` and is checked
 again on every pass. Backfill reserves a future start for it within the cap, so
@@ -254,7 +278,7 @@ Under ``ALL`` and ``ANY`` the submit is refused with one of these messages:
 .. code-block:: text
 
    Memory specification can not be satisfied: 131072M per node exceeds max_mem_per_node 65536M of partition 'cpu'
-   Partition cpu can never run this job as configured: exclusive job needs 128 CPUs, max_cpus_per_node is 64 on every eligible node
+   Partition cpu can never run this job as configured: exclusive job needs 128 CPUs, max_tres_per_node.cpu is 64 on every eligible node
 
 Under ``NO`` the job is accepted and pends. A job that no requested partition's
 cap could ever hold pends with reason ``PartitionTresLimit`` and a description
@@ -280,7 +304,7 @@ code, naming the partition, node, resource, and numbers:
    Partition cpu limit reached on n03: cpu 48 in use + 24 requested = 72 > max 64
    Partition gpu limit reached on n07: gres/gpu:a100 2 in use + 1 requested = 3 > max 2
    Partition cpu memory limit reached on n03: mem 120G in use + 16G requested = 136G > max 128G (7 other nodes also over limit)
-   Partition cpu can never run this job as configured: exclusive job needs 128 CPUs, max_cpus_per_node is 64 on every eligible node
+   Partition cpu can never run this job as configured: exclusive job needs 128 CPUs, max_tres_per_node.cpu is 64 on every eligible node
 
 When several nodes block the job, the description names the node closest to
 fitting and counts the others. When several resources are over on that node,
@@ -311,10 +335,12 @@ spelling, with ``UNLIMITED`` for anything unset. ``MaxCPUsPerNode`` shows the
 
 - ``MaxTRESPerNode=`` replaces the whole cap table. ``MaxTRESPerNode=`` with an
   empty value removes every cap.
-- On update, ``UNLIMITED`` or ``0`` clears ``MaxCPUsPerNode``, ``MaxMemPerNode``,
-  ``MaxMemPerCPU``, ``DefMemPerNode``, ``DefMemPerCPU``, or ``DefMemPerGPU``. To
-  forbid a resource, use ``MaxTRESPerNode`` with a ``0`` limit, for example
-  ``MaxTRESPerNode=gres/gpu=0``.
+- ``UNLIMITED`` or ``0`` leaves ``MaxCPUsPerNode``, ``MaxMemPerNode``,
+  ``MaxMemPerCPU``, ``DefMemPerNode``, ``DefMemPerCPU``, or ``DefMemPerGPU``
+  unset on create and clears it on update. To forbid a resource, use
+  ``MaxTRESPerNode`` with a ``0`` limit, for example
+  ``MaxTRESPerNode=gres/gpu=0``. ``MaxTRESPerNode`` entries take numbers only;
+  leave a key out to make it unlimited.
 - The same rules as in ``spur.conf`` apply: unknown keys, ``MaxCPUsPerNode``
   and a ``cpu`` key in the same command, and conflicting memory knobs are
   rejected.

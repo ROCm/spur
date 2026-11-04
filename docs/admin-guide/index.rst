@@ -23,5 +23,6 @@ Configuring and operating a Spur cluster.
 - :doc:`tres-billing-weights` — configurable TRES billing weights for fairshare,
   so GPU-heavy clusters bill GPU-seconds at a higher rate than CPU-seconds.
 
-Partitions are defined statically in ``spur.conf`` (see
-:doc:`/deployment/partitioning`), not created at runtime.
+Partitions are defined in ``spur.conf`` (see :doc:`/deployment/partitioning`).
+``scontrol create/update/delete partition`` change them at runtime until the
+next ``scontrol reconfigure``.
