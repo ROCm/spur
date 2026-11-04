@@ -688,6 +688,16 @@ fn property_run_with_handoffs(
     jobs: &[Job],
     handoffs: &HashMap<String, Vec<JobId>>,
 ) -> (BackfillScheduler, Vec<Assignment>) {
+    property_run_in(Partition::default(), nodes, jobs, handoffs)
+}
+
+/// [`property_run_with_handoffs`] with `policy`'s limits on the `rack` partition.
+fn property_run_in(
+    policy: Partition,
+    nodes: &[Node],
+    jobs: &[Job],
+    handoffs: &HashMap<String, JobId>,
+) -> (BackfillScheduler, Vec<Assignment>) {
     let context = FabricSchedulingContext {
         view: FabricView::from_nodes("test", nodes, now(), 90),
     };
@@ -695,7 +705,7 @@ fn property_run_with_handoffs(
         name: "rack".into(),
         is_default: true,
         nodes: "ALL".into(),
-        ..Default::default()
+        ..policy
     }];
     let busy = nodes
         .iter()
@@ -731,6 +741,40 @@ fn gpu_properties_filter_devices_without_imposing_a_fabric_boundary() {
     }
     request.spec.constraint = Some("gpu.type=test&gpu.vram>=192GiB&same(gpu.vpod_id)".into());
     assert!(property_run(&nodes, &[request]).1.is_empty());
+}
+
+#[test]
+fn gpu_bound_placement_applies_the_partition_memory_policy() {
+    let nodes = property_nodes(1);
+    let mut request = job(1, 1, 1);
+    request.spec.constraint = Some("gpu.type=test&gpu.vram>=192GiB".into());
+    request.spec.cpus_per_task = 1;
+    request.spec.memory_per_cpu_mb = Some(300);
+    let policy = Partition {
+        max_mem_per_cpu: Some(100),
+        ..Default::default()
+    };
+    let (_, assignments) = property_run_in(policy, &nodes, &[request], &HashMap::new());
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].partition.as_deref(), Some("rack"));
+    let alloc = &assignments[0].per_node_alloc["n0"];
+    assert!(alloc.gpu_binding.is_some());
+    assert_eq!((alloc.cpus, alloc.memory_mb), (3, 300));
+}
+
+#[test]
+fn gpu_bound_placement_skips_a_partition_whose_max_mem_per_node_is_exceeded() {
+    let nodes = property_nodes(1);
+    let mut request = job(1, 1, 1);
+    request.spec.constraint = Some("gpu.type=test&gpu.vram>=192GiB".into());
+    request.spec.memory_per_node_mb = Some(512);
+    let policy = Partition {
+        max_mem_per_node: Some(256),
+        ..Default::default()
+    };
+    assert!(property_run_in(policy, &nodes, &[request], &HashMap::new())
+        .1
+        .is_empty());
 }
 
 #[test]

@@ -551,7 +551,7 @@ fn a_cap_block_names_only_the_chosen_partition() {
         ],
         vec![partition("cpu", &[("cpu", 8)]), wide],
     )
-    .running_cpus("cpu", "n1", 8, 1)
+    .running_cpus("cpu", "n1", 8, 3)
     .running_cpus("wide", "n2", 64, 2);
     let mut sched = BackfillScheduler::new(100);
     assert!(fx
@@ -621,28 +621,73 @@ fn feasibility_filter_keeps_a_merely_full_partition_as_candidate() {
     assert_eq!(reserved(&sched, 2), None);
 }
 
-#[test]
-fn resolution_ranks_priority_tier_then_earliest_start() {
+/// `hi` (tier 2) on n1 and `lo` (tier 0) on n2, both capped at 8 CPUs.
+fn tiered_fixture() -> Fixture {
     let mut hi = partition("hi", &[("cpu", 8)]);
     hi.priority_tier = 2;
-    let lo = partition("lo", &[("cpu", 8)]);
-    let nodes = || {
+    Fixture::new(
         vec![
             node("n1", 64, 256_000, &["hi"]),
             node("n2", 64, 256_000, &["lo"]),
-        ]
-    };
-    let fx = Fixture::new(nodes(), vec![hi, lo]).running_cpus("hi", "n1", 8, 2);
+        ],
+        vec![hi, partition("lo", &[("cpu", 8)])],
+    )
+}
 
+#[test]
+fn a_lower_tier_that_can_start_now_beats_a_busy_higher_tier() {
+    let fx = tiered_fixture().running_cpus("hi", "n1", 8, 2);
     for list in ["hi,lo", "lo,hi"] {
         let mut sched = BackfillScheduler::new(100);
-        assert!(
-            fx.schedule(&mut sched, &[job(1, list, 8, 1)]).is_empty(),
-            "a higher tier wins over an earlier start ({list})"
+        let a = fx.schedule(&mut sched, &[job(1, list, 8, 1)]);
+        assert_eq!(started(&a), [1], "{list}");
+        assert_eq!(a[0].partition.as_deref(), Some("lo"), "{list}");
+        assert_eq!(a[0].nodes, ["n2"]);
+    }
+}
+
+#[test]
+fn when_both_can_start_now_the_higher_tier_wins() {
+    let fx = tiered_fixture();
+    for list in ["hi,lo", "lo,hi"] {
+        let mut sched = BackfillScheduler::new(100);
+        let a = fx.schedule(&mut sched, &[job(1, list, 8, 1)]);
+        assert_eq!(a[0].partition.as_deref(), Some("hi"), "{list}");
+        assert_eq!(a[0].nodes, ["n1"]);
+    }
+}
+
+#[test]
+fn when_neither_can_start_now_the_earliest_cap_aware_start_is_reserved() {
+    let fx = tiered_fixture()
+        .running_cpus("hi", "n1", 8, 3)
+        .running_cpus("lo", "n2", 8, 1);
+    for list in ["hi,lo", "lo,hi"] {
+        let mut sched = BackfillScheduler::new(100);
+        assert!(fx.schedule(&mut sched, &[job(1, list, 8, 1)]).is_empty());
+        assert_eq!(
+            reserved(&sched, 1),
+            Some((vec!["n2".into()], hours(1))),
+            "{list}"
         );
-        assert_eq!(reserved(&sched, 1), Some((vec!["n1".into()], hours(2))));
     }
 
+    let tie = tiered_fixture()
+        .running_cpus("hi", "n1", 8, 2)
+        .running_cpus("lo", "n2", 8, 2);
+    let mut sched = BackfillScheduler::new(100);
+    assert!(tie
+        .schedule(&mut sched, &[job(1, "lo,hi", 8, 1)])
+        .is_empty());
+    assert_eq!(
+        reserved(&sched, 1),
+        Some((vec!["n1".into()], hours(2))),
+        "an equal start goes to the higher tier"
+    );
+}
+
+#[test]
+fn same_tier_partitions_ignore_request_order() {
     let same_tier = vec![partition("x", &[("cpu", 8)]), partition("y", &[("cpu", 8)])];
     let fx = Fixture::new(
         vec![
