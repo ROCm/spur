@@ -188,7 +188,7 @@ impl<'a> NodePlacement<'a> {
         reservations: &[Reservation],
         now: DateTime<Utc>,
     ) -> bool {
-        !node.is_k0s_reserved() && self.eligible(node, reservations, now) && node.state.is_up()
+        !node.is_k0s_reserved() && self.eligible(node, reservations, now) && node.is_up_for_work()
     }
 
     /// True when a listed node can't satisfy the request in an additive

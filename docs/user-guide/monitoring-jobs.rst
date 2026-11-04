@@ -306,9 +306,16 @@ Flags:
      - Filter by partition.
    * - ``--states``
      - ``-t``
-     - Filter by node state (comma-separated). Accepts the base states and the
+     - Filter by node state (comma-separated). Accepts the base states, the
        display-only labels ``resv`` (or ``reserved``), ``maint``, and ``plnd``
-       (or ``planned``). ``all`` disables the filter.
+       (or ``planned``), and ``no_respond`` (or ``noresp``) for nodes the
+       controller is not hearing from. ``all`` disables the filter.
+   * - ``--dead``
+     - ``-d``
+     - Only nodes the controller is not hearing from.
+   * - ``--responding``
+     - ``-r``
+     - Only nodes the controller is hearing from.
    * - ``--nodes``
      - ``-n``
      - Filter by node.
@@ -374,6 +381,15 @@ and ``planned`` are accepted as aliases for ``resv`` and ``plnd``. ``-t resv``
 also matches ``maint`` nodes (a maintenance reservation is still a reservation),
 while ``-t maint`` matches only maintenance nodes. ``-t idle`` returns all idle
 nodes, including those shown as ``resv``, ``maint``, or ``plnd``.
+
+A trailing ``*`` on the state (``idle*``, ``mix*``, ``down*``) marks a node the
+controller is not currently hearing from: its heartbeats have gone stale, so it
+is given no new work until they resume, while its running jobs are untouched.
+Filter on it with ``-t no_respond``, ``--dead`` (``-d``, only non-responding
+nodes), or ``--responding`` (``-r``, only responding nodes). ``scontrol show
+node`` shows the same condition as a ``+NOT_RESPONDING`` suffix on ``State=``,
+the REST node object carries a ``not_responding`` boolean, and ``spur health``
+stars the node and counts it as unhealthy.
 
 Accounting History — ``sacct``
 -------------------------------
