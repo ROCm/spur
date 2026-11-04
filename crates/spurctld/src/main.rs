@@ -237,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start node health checker (only on leader).
     let health_tick_secs = config.controller.health_tick_secs;
-    let hb_timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
+    let hb_timeout = config.controller.effective_heartbeat_timeout_secs();
     let health_cluster = cluster.clone();
     let health_raft = raft_handle.clone();
     let leader_since_rx = raft_handle.spawn_leadership_watcher();
@@ -387,6 +387,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(warning) = config.auth.private_data_warning() {
         tracing::warn!("{warning}");
     }
+    if let Some(warning) = config.controller.shutdown_grace_warning() {
+        tracing::warn!("{warning}");
+    }
     if !addr.ip().is_loopback() && config.auth.mode != spur_core::config::AuthMode::Required {
         tracing::warn!(
             %addr,
@@ -403,24 +406,31 @@ async fn main() -> anyhow::Result<()> {
         fatal = raft_handle.wait_fatal() => {
             tracing::error!(error = %fatal, "Raft core hit an unrecoverable error; exiting");
             raft_fatal = Some(fatal);
-            Ok(())
+            Ok(server::Drain::Abandoned)
         }
     };
 
     sched_handle.abort();
     // Audit rows are written off the request path; the runtime would drop them.
     if !cluster
-        .drain_accounting(std::time::Duration::from_secs(5))
+        .drain_accounting(std::time::Duration::from_secs(
+            spur_core::config::SHUTDOWN_FLUSH_SECS,
+        ))
         .await
     {
         tracing::warn!("accounting writes still pending at shutdown; some rows were lost");
     }
-    info!("spurctld stopped");
     // Exit directly: runtime teardown would wait on any hung blocking call.
     if raft_fatal.is_some() {
         std::process::exit(1);
     }
-    serve_result
+    let drain = serve_result?;
+    info!("spurctld stopped");
+    // An abandoned handler can still hold such a call, so skip teardown here too.
+    if drain == server::Drain::Abandoned {
+        std::process::exit(0);
+    }
+    Ok(())
 }
 
 fn default_config() -> spur_core::config::SlurmConfig {

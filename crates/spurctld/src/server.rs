@@ -4616,7 +4616,7 @@ pub async fn serve(
     service: ControllerService,
     accounting_service: Option<crate::accounting::AccountingService>,
     bearer: spur_core::auth::BearerAuth,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Drain> {
     let audit_cluster = service.cluster.clone();
     let audit_rpcs = service.cluster.config().logging.audit_rpcs;
     let shutdown_grace =
@@ -4646,21 +4646,42 @@ pub async fn serve(
         router = router.add_service(crate::accounting::accounting_server(service));
     }
 
-    // tonic consumes the shutdown future, so the drain deadline learns that
-    // draining began through this channel.
-    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel();
-    let shutdown = async move {
-        shutdown_signal().await;
-        let _ = signalled_tx.send(());
-    };
-    serve_with_drain_deadline(
+    let (shutdown, signalled) = fan_out_shutdown(shutdown_signal());
+    let drain = serve_with_drain_deadline(
         router.serve_with_shutdown(addr, shutdown),
-        signal_sent(signalled_rx),
+        signal_sent(signalled),
         shutdown_grace,
     )
     .await?;
 
-    Ok(())
+    Ok(drain)
+}
+
+/// How a shutdown drain ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drain {
+    Completed,
+    /// The grace period ran out; the abandoned handlers keep running until the process exits.
+    Abandoned,
+}
+
+/// Splits `signal` into the future tonic consumes and a receiver that tells the drain deadline
+/// when it fired.
+fn fan_out_shutdown<S>(
+    signal: S,
+) -> (
+    impl std::future::Future<Output = ()>,
+    tokio::sync::oneshot::Receiver<()>,
+)
+where
+    S: std::future::Future<Output = ()>,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let shutdown = async move {
+        signal.await;
+        let _ = tx.send(());
+    };
+    (shutdown, rx)
 }
 
 /// Resolves once `rx` receives; a sender dropped without sending is not a shutdown signal.
@@ -4671,33 +4692,33 @@ async fn signal_sent(rx: tokio::sync::oneshot::Receiver<()>) {
 }
 
 /// Awaits `serve`, abandoning its drain `grace` after `signalled` fires (zero waits indefinitely).
-/// Abandoning returns `Ok` so `main` still flushes accounting, best-effort: tonic does not cancel
-/// its connection tasks, so abandoned handlers keep running until the runtime drops.
+/// Abandoning is `Ok(Drain::Abandoned)` so `main` still flushes accounting, best-effort: tonic
+/// does not cancel its connection tasks, so abandoned handlers keep running until exit.
 async fn serve_with_drain_deadline<F, S, E>(
     serve: F,
     signalled: S,
     grace: std::time::Duration,
-) -> Result<(), E>
+) -> Result<Drain, E>
 where
     F: std::future::Future<Output = Result<(), E>>,
     S: std::future::Future<Output = ()>,
 {
     if grace.is_zero() {
-        return serve.await;
+        return serve.await.map(|()| Drain::Completed);
     }
     let deadline = async {
         signalled.await;
         tokio::time::sleep(grace).await;
     };
     tokio::select! {
-        result = serve => result,
+        result = serve => result.map(|()| Drain::Completed),
         () = deadline => {
             warn!(
                 ?grace,
                 "graceful shutdown drain exceeded controller.shutdown_grace_secs; forcing \
                  shutdown with requests still in flight, whose accounting is best-effort"
             );
-            Ok(())
+            Ok(Drain::Abandoned)
         }
     }
 }
@@ -6109,13 +6130,13 @@ mod tests {
 
     #[tokio::test]
     async fn drain_deadline_returns_what_serve_returns_before_any_signal() {
-        let result: Result<(), std::io::Error> = serve_with_drain_deadline(
+        let result: Result<Drain, std::io::Error> = serve_with_drain_deadline(
             std::future::ready(Ok(())),
             std::future::pending(),
             std::time::Duration::from_secs(5),
         )
         .await;
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(Drain::Completed)), "{result:?}");
     }
 
     #[tokio::test]
@@ -6172,7 +6193,7 @@ mod tests {
     async fn drain_deadline_returns_once_the_drain_finishes_within_grace() {
         let drain = std::time::Duration::from_secs(2);
         let start = tokio::time::Instant::now();
-        let result: Result<(), std::io::Error> = serve_with_drain_deadline(
+        let result: Result<Drain, std::io::Error> = serve_with_drain_deadline(
             async {
                 tokio::time::sleep(drain).await;
                 Ok(())
@@ -6181,7 +6202,7 @@ mod tests {
             std::time::Duration::from_secs(10),
         )
         .await;
-        assert!(result.is_ok());
+        assert!(matches!(result, Ok(Drain::Completed)), "{result:?}");
         assert_eq!(
             start.elapsed(),
             drain,
@@ -6201,13 +6222,39 @@ mod tests {
         )
         .await;
         assert!(
-            result.is_ok(),
-            "a forced shutdown must surface as success, not an error"
+            matches!(result, Ok(Drain::Abandoned)),
+            "a forced shutdown must report the abandoned drain, not an error: {result:?}"
         );
         assert_eq!(
             start.elapsed(),
             signal_after + grace,
             "the grace period counts from the signal, not from startup"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_shutdown_future_tells_the_drain_deadline_once_it_fires() {
+        let (shutdown, signalled) = fan_out_shutdown(std::future::ready(()));
+        shutdown.await;
+        tokio::time::timeout(std::time::Duration::from_secs(3600), signal_sent(signalled))
+            .await
+            .expect("the drain deadline must learn that the signal fired");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_deadline_hears_nothing_before_the_signal() {
+        let (shutdown, signalled) = fan_out_shutdown(std::future::pending());
+        // Polls tonic's side as serve does, so a send ahead of the signal would show here.
+        let raced = tokio::time::timeout(std::time::Duration::from_secs(3600), async {
+            tokio::select! {
+                () = shutdown => {}
+                () = signal_sent(signalled) => {}
+            }
+        })
+        .await;
+        assert!(
+            raced.is_err(),
+            "the deadline must not start before tonic's shutdown future fires"
         );
     }
 

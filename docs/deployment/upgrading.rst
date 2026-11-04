@@ -744,15 +744,19 @@ step's whole runtime, so restarting a controller while a step ran (for example d
 ``rolling_upgrade.yml``) hung until systemd's ``TimeoutStopSec`` killed it, skipping the
 accounting flush.
 
-A step still running when the grace period ends keeps running on its node. Its ``srun``
-loses the controller connection, retries for about a minute, and re-attaches to the step
-once the restarted controller answers, so a normal restart does not interrupt it.
-Accounting for requests still in flight at that point is best-effort: anything they write
-after the flush is lost.
+A step still running when the grace period ends keeps running on its node. A buffered
+``srun`` re-attaches to it if the restarted controller answers within the client's retry
+window (see :ref:`srun-controller-restart`); ``srun --pty`` is not covered. Accounting for
+requests still in flight at that point is best-effort: anything they write after the flush
+is lost.
 
-Raise ``shutdown_grace_secs`` to give longer steps time to finish, keeping it below
-``TimeoutStopSec``. ``0`` restores the unbounded wait, which a repeated ``SIGTERM`` or
-``SIGINT`` does not end; only ``SIGKILL`` does.
+The default suits most sites. Keep it well below ``heartbeat_timeout_secs``: the controller
+answers no heartbeats while it drains, so a grace within about 35 seconds of that timeout
+lets a full drain mark nodes DOWN and fail their jobs, and ``spurctld`` warns at startup.
+A step that finishes during the drain does not end it, so raising the value mostly
+lengthens the restart. A new value takes effect at the next start. ``0`` restores the
+unbounded wait, which a repeated ``SIGTERM`` or ``SIGINT`` does not end; only ``SIGKILL``
+does.
 
 See Also
 --------

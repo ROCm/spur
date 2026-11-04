@@ -409,6 +409,16 @@ fn default_shutdown_grace_secs() -> u64 {
     10
 }
 
+/// `heartbeat_timeout_secs` when unset.
+pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
+
+/// How often `spurd` heartbeats the controller. Shared with the controller so
+/// `shutdown_grace_secs` can be checked against `heartbeat_timeout_secs`.
+pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+/// How long `spurctld` waits for pending accounting writes once its shutdown drain ends.
+pub const SHUTDOWN_FLUSH_SECS: u64 = 5;
+
 /// Shared with `spurctld`'s agent channel builder, which needs these before any config is loaded.
 /// A dial budget or ping interval beyond this is indistinguishable from disabling it.
 pub const MAX_AGENT_CHANNEL_TIMEOUT_SECS: u64 = 600;
@@ -500,6 +510,35 @@ impl Default for ControllerConfig {
 }
 
 impl ControllerConfig {
+    pub fn effective_heartbeat_timeout_secs(&self) -> u64 {
+        self.heartbeat_timeout_secs
+            .unwrap_or(DEFAULT_HEARTBEAT_TIMEOUT_SECS)
+    }
+
+    /// A warning when a shutdown drain can outlast agent heartbeats: the draining controller
+    /// answers none, yet keeps checking node health, so it marks nodes DOWN and fails their jobs.
+    pub fn shutdown_grace_warning(&self) -> Option<String> {
+        let timeout = self.effective_heartbeat_timeout_secs();
+        if self.shutdown_grace_secs == 0 {
+            return Some(format!(
+                "[controller] shutdown_grace_secs = 0 lets a shutdown drain outlast \
+                 heartbeat_timeout_secs ({timeout}s); the draining controller answers no \
+                 heartbeats, so it would mark nodes DOWN and fail their jobs"
+            ));
+        }
+        // A node's last heartbeat can be one interval old at the signal, and the flush follows.
+        let margin = HEARTBEAT_INTERVAL_SECS + SHUTDOWN_FLUSH_SECS;
+        if self.shutdown_grace_secs.saturating_add(margin) < timeout {
+            return None;
+        }
+        Some(format!(
+            "[controller] shutdown_grace_secs ({}s) is within {margin}s of heartbeat_timeout_secs \
+             ({timeout}s); the draining controller answers no heartbeats, so a full drain would \
+             mark nodes DOWN and fail their jobs",
+            self.shutdown_grace_secs
+        ))
+    }
+
     /// Client-facing controller endpoints, one per `hosts` entry, each combined
     /// with the port from `listen_addr`. Used for client-side failover across an
     /// HA quorum.
@@ -2323,8 +2362,8 @@ impl SlurmConfig {
                 ),
             });
         }
-        // Same ceiling as the other duration fields: a shutdown wait beyond a
-        // day is not a bounded drain.
+        // Same day-scale ceiling as `dispatch_timeout_secs`: a shutdown wait beyond
+        // a day is not a bounded drain.
         if self.controller.shutdown_grace_secs > MAX_LAUNCH_BACKOFF_SECS {
             return Err(ConfigError::InvalidValue {
                 field: "controller.shutdown_grace_secs".into(),
@@ -5111,6 +5150,60 @@ shutdown_grace_secs = {}
             err.to_string().contains("shutdown_grace_secs"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn heartbeat_timeout_falls_back_to_its_default() {
+        assert_eq!(
+            ControllerConfig::default().effective_heartbeat_timeout_secs(),
+            DEFAULT_HEARTBEAT_TIMEOUT_SECS
+        );
+        let set = ControllerConfig {
+            heartbeat_timeout_secs: Some(120),
+            ..Default::default()
+        };
+        assert_eq!(set.effective_heartbeat_timeout_secs(), 120);
+    }
+
+    #[test]
+    fn default_shutdown_grace_leaves_room_before_the_heartbeat_timeout() {
+        assert_eq!(ControllerConfig::default().shutdown_grace_warning(), None);
+    }
+
+    #[test]
+    fn shutdown_grace_warns_once_a_drain_can_outlast_every_heartbeat() {
+        let limit = DEFAULT_HEARTBEAT_TIMEOUT_SECS - HEARTBEAT_INTERVAL_SECS - SHUTDOWN_FLUSH_SECS;
+        let at_limit = ControllerConfig {
+            shutdown_grace_secs: limit,
+            ..Default::default()
+        };
+        assert!(at_limit.shutdown_grace_warning().is_some());
+        let below = ControllerConfig {
+            shutdown_grace_secs: limit - 1,
+            ..Default::default()
+        };
+        assert_eq!(below.shutdown_grace_warning(), None);
+    }
+
+    #[test]
+    fn shutdown_grace_warning_follows_the_configured_heartbeat_timeout() {
+        let short = ControllerConfig {
+            heartbeat_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        assert!(
+            short.shutdown_grace_warning().is_some(),
+            "a 30s timeout leaves no room even for the default grace"
+        );
+    }
+
+    #[test]
+    fn unbounded_shutdown_grace_warns() {
+        let unbounded = ControllerConfig {
+            shutdown_grace_secs: 0,
+            ..Default::default()
+        };
+        assert!(unbounded.shutdown_grace_warning().is_some());
     }
 
     #[test]
