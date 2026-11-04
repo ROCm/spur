@@ -90,7 +90,7 @@ async fn never_runnable_exclusive_job_pends_with_a_description_until_the_cap_is_
     assert_eq!(
         job.state_reason_display(),
         "Partition cpu can never run this job as configured: exclusive job needs 16 CPUs, \
-         max_cpus_per_node is 4 on every eligible node"
+         max_tres_per_node.cpu is 4 on every eligible node"
     );
 
     update_limits(
@@ -293,6 +293,28 @@ fn quota_gates_see_the_largest_adjusted_request_among_candidates() {
     assert_eq!(candidates[0].job.spec.cpus_per_task, 6);
     restore_original_requests(candidates.iter_mut().map(|c| &mut c.job), &originals);
     assert_eq!(MemoryAdjustment::of(&candidates[0].job.spec), original);
+}
+
+#[test]
+fn quota_gates_charge_the_most_cpus_and_the_most_memory_independently() {
+    let partitions = vec![
+        Partition {
+            def_mem_per_cpu: Some(GIB),
+            max_mem_per_cpu: Some(GIB / 4),
+            ..partition("cpus", &[])
+        },
+        Partition {
+            def_mem_per_node: Some(8 * GIB),
+            ..partition("mem", &[])
+        },
+    ];
+    let mut job = Job::new(1, spec_in("cpus,mem", 1));
+    let charged = quota_memory_request(&job, &partitions).unwrap();
+    charged.apply_to(&mut job.spec);
+    let cpus = job.spec.num_tasks * job.spec.cpus_per_task;
+    let mem = spur_core::job::effective_memory_mb(&job.spec, job.spec.num_nodes);
+    assert_eq!(cpus, 4, "`cpus` raises 1 CPU to 4 for its 256M/CPU limit");
+    assert_eq!(mem, 8 * GIB, "`mem` defaults to 8G, more than cpus' 1G");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

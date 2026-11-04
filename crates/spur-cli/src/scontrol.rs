@@ -2524,7 +2524,11 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         }
     }
     let _ = writeln!(out, "   UserId={} Account={}", job.user, job.account);
-    let _ = writeln!(out, "   Partition={} QOS={}", job.partition, job.qos);
+    let _ = write!(out, "   Partition={} QOS={}", job.partition, job.qos);
+    if !job.effective_partition.is_empty() {
+        let _ = write!(out, " EffectivePartition={}", job.effective_partition);
+    }
+    out.push('\n');
     let _ = writeln!(
         out,
         "   JobState={} Reason={} Dependency={}",
@@ -2871,6 +2875,28 @@ mod tests {
         // Slurm prints a bare 0 when no per-node floor was requested.
         let unset = format_job_detail(&spur_proto::proto::JobInfo::default());
         assert!(unset.contains("MinMemoryNode=0\n"), "{unset}");
+    }
+
+    #[test]
+    fn job_detail_shows_the_effective_partition_only_once_chosen() {
+        let mut job = spur_proto::proto::JobInfo {
+            partition: "cpu,wide".into(),
+            qos: "normal".into(),
+            ..Default::default()
+        };
+        let pending = format_job_detail(&job);
+        assert!(
+            pending.contains("   Partition=cpu,wide QOS=normal\n"),
+            "{pending}"
+        );
+        assert!(!pending.contains("EffectivePartition"), "{pending}");
+
+        job.effective_partition = "wide".into();
+        let running = format_job_detail(&job);
+        assert!(
+            running.contains("   Partition=cpu,wide QOS=normal EffectivePartition=wide\n"),
+            "{running}"
+        );
     }
 
     #[test]

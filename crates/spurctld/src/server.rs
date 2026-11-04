@@ -5377,6 +5377,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         user: job.spec.user.clone(),
         uid: job.spec.uid,
         partition: job.spec.partition.clone().unwrap_or_default(),
+        effective_partition: job.effective_partition.clone().unwrap_or_default(),
         account: job.spec.account.clone().unwrap_or_default(),
         state: job.state.to_proto_i32(),
         state_reason: job.state_reason(),
@@ -5835,13 +5836,14 @@ fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
 fn create_request_limits(
     req: &CreatePartitionRequest,
 ) -> Result<spur_core::partition_limits::PartitionResourceLimits, Status> {
+    // 0 is how scontrol sends UNLIMITED, and it clears on update, so a 0 alias
+    // or memory knob reads as unset; only an explicit map entry of 0 forbids.
+    let set = |value: Option<u64>| value.filter(|v| *v != 0);
     let max_tres_per_node = spur_core::partition_limits::fold_max_cpus_per_node(
         req.max_tres_per_node.clone().into_iter().collect(),
-        req.max_cpus_per_node,
+        req.max_cpus_per_node.filter(|cpus| *cpus != 0),
     )
     .map_err(Status::invalid_argument)?;
-    // A zero memory knob has no meaning, so it reads as unset, like on update.
-    let set = |value: Option<u64>| value.filter(|v| *v != 0);
     Ok(spur_core::partition_limits::PartitionResourceLimits {
         max_tres_per_node,
         max_mem_per_node: set(req.max_mem_per_node),
@@ -14140,6 +14142,24 @@ mod tests {
     }
 
     #[test]
+    fn job_to_proto_reports_the_effective_partition_beside_the_request() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(
+            7,
+            JobSpec {
+                partition: Some("cpu,wide".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(job_to_proto(&job).effective_partition, "");
+        job.start_in_partition(Some("wide".into()), None);
+        let info = job_to_proto(&job);
+        assert_eq!(info.partition, "cpu,wide");
+        assert_eq!(info.effective_partition, "wide");
+    }
+
+    #[test]
     fn requested_tres_summarizes_cpu_memory_nodes_and_gpus() {
         use spur_core::job::JobSpec;
 
@@ -15400,6 +15420,34 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(conflict.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn create_treats_a_zero_max_cpus_per_node_as_unset() {
+        let limits = create_request_limits(&CreatePartitionRequest {
+            name: "cpu".into(),
+            max_cpus_per_node: Some(0),
+            max_tres_per_node: [("mem".to_string(), 1024)].into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            limits.max_tres_per_node,
+            [("mem".to_string(), 1024)].into(),
+            "UNLIMITED (0) must not become a 0-CPU cap"
+        );
+    }
+
+    #[test]
+    fn create_keeps_an_explicit_zero_cpu_tres_entry() {
+        let limits = create_request_limits(&CreatePartitionRequest {
+            name: "nocpu".into(),
+            max_cpus_per_node: Some(0),
+            max_tres_per_node: [("cpu".to_string(), 0)].into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(limits.max_tres_per_node, [("cpu".to_string(), 0)].into());
     }
 
     #[test]
