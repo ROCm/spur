@@ -361,11 +361,14 @@ jobs:
       - name: Load image
         run: docker load -i /tmp/spur-image.tar
 
+      - name: Install Trivy
+        uses: $/.github/actions/install-trivy
+
       - name: Scan image for vulnerabilities and secrets
         id: scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          version: v0.74.0
+          skip-setup-trivy: true
           image-ref: spur:ci
           scanners: vuln,secret
           format: sarif
