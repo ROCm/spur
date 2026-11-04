@@ -2446,7 +2446,7 @@ OpenMetrics HTTP export from ``spurctld``.
 
 Prolog/epilog and job-submit scripts. Each field is an optional fully-qualified
 path; unset means no hook. The prolog/epilog fields map one-to-one to Slurm's
-parameters.
+parameters. A multi-tenant GPU node example is in ``examples/hooks/gpu-node/``.
 
 Reload scope follows whichever process executes the hook: controller hooks are
 live, node hooks need an agent restart, and ``srun`` hooks are read from the
