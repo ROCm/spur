@@ -16,7 +16,7 @@ from cluster import (
 )
 
 HEARTBEAT_TIMEOUT_SECS = 40
-# Missed beats past the timeout, plus the health tick that acts on them.
+# Missed beats past the timeout, then two failed liveness probes a health tick apart.
 NODE_DOWN_BOUND = 180
 # Up to one 30s heartbeat interval (the first may fail on the dead connection) plus the 30s health tick.
 RECLAIM_BOUND = 90

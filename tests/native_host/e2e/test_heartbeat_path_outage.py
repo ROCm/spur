@@ -55,6 +55,15 @@ def _start_long_job(cluster, node_name: str, label: str) -> int:
     return job_id
 
 
+def _submit_pinned(cluster, node_name: str, label: str) -> int:
+    """Submit a short job pinned to one node without waiting for it to run."""
+    script = cluster.write_file(f"{label}.sh", "#!/bin/bash\nsleep 60\n")
+    out = cluster.sbatch(["-J", label, "-N", "1", "-w", node_name, script])
+    job_id = parse_job_id(out)
+    assert job_id is not None, f"sbatch failed:\n{out}"
+    return job_id
+
+
 def _leader_view(cluster, leader: int) -> tuple[dict[str, str], str]:
     """Node states and the job table as the leader itself serves them, so the
     check does not depend on a follower's forwarding having recovered."""
@@ -77,9 +86,23 @@ class TestHeartbeatPathOutage:
         name = cluster.node_names[target]
         job_id = _start_long_job(cluster, name, "hb-path-survivor")
         log_start = len(cluster.spurctld_log(leader))
+        addr = f"http://{cluster.nodes[leader].host}:6817"
 
         with block_heartbeats_from(cluster, target):
             time.sleep(OUTAGE_SECS)
+            # The leader cannot hear the node, so it is flagged not-responding
+            # and takes no new work, while its running job is untouched.
+            show = cluster.cli(["scontrol", "show", "node", name], controller_addr=addr)
+            assert "NOT_RESPONDING" in show, f"{name} not flagged:\n{show}"
+            pinned_id = _submit_pinned(cluster, name, "hb-pinned")
+            # Watched across several scheduler passes: it must never start.
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                jobs = cluster.cli(["squeue", "-t", "all"], controller_addr=addr)
+                assert (
+                    job_state(jobs, pinned_id) == "PD"
+                ), f"a job pinned to a not-responding node must wait, not run:\n{jobs}"
+                time.sleep(2)
 
         assert cluster._current_raft_leader() == leader, "leadership moved mid-test"
         nodes, jobs = _leader_view(cluster, leader)
