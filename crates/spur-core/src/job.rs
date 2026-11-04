@@ -3539,4 +3539,29 @@ mod tests {
         let back: Job = serde_json::from_str(&json).expect("deserialize job");
         assert_eq!(back.pending_reason, PendingReason::PartitionTresLimit);
     }
+
+    // The variant name is the persisted and API-visible code; renaming it
+    // breaks WAL replay and every client matching on the reason.
+    #[test]
+    fn partition_tres_limit_has_a_stable_wire_name() {
+        assert_eq!(
+            serde_json::to_value(PendingReason::PartitionTresLimit).unwrap(),
+            serde_json::json!("PartitionTresLimit")
+        );
+        let back: PendingReason =
+            serde_json::from_value(serde_json::json!("PartitionTresLimit")).unwrap();
+        assert_eq!(back, PendingReason::PartitionTresLimit);
+    }
+
+    #[test]
+    fn a_job_snapshot_from_before_partition_limits_deserializes_with_defaults() {
+        let mut value = serde_json::to_value(make_job()).expect("serialize job");
+        let fields = value.as_object_mut().expect("job serializes as an object");
+        for field in ["effective_partition", "original_request"] {
+            assert!(fields.remove(field).is_some(), "{field} must serialize");
+        }
+        let back: Job = serde_json::from_value(value).expect("deserialize job");
+        assert_eq!(back.effective_partition, None);
+        assert_eq!(back.original_request, None);
+    }
 }
