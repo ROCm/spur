@@ -14,7 +14,7 @@ use spur_devices::cdi::cache::CdiCache;
 use spur_devices::DeviceRegistry;
 
 use spurd::reporter::NodeReporter;
-use spurd::{agent_server, auth_middleware, controller_auth, reporter, stepd};
+use spurd::{agent_server, auth_middleware, cdi_owner, controller_auth, reporter, stepd};
 
 /// Raise spurd's own `RLIMIT_MEMLOCK` as high as it is allowed to go.
 ///
@@ -503,6 +503,13 @@ async fn main() -> anyhow::Result<()> {
         "node address detected"
     );
 
+    // Rewrite a stale Spur-owned CDI spec (e.g. after a GPU partition/id change) before the
+    // registry loads it, so startup doesn't advertise devices that no longer exist.
+    cdi_owner::resync(
+        std::path::Path::new("/etc/cdi"),
+        devices_auto_detect(config.as_ref()),
+    );
+
     // Initialize device registry (CDI cache, GRES config, and discovery).
     let registry = init_device_registry(config.as_ref());
     let registry = Arc::new(Mutex::new(registry));
@@ -518,6 +525,29 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|t| t.external.as_ref())
         .and_then(|e| e.block_file.clone());
     reporter::refresh_block_file(&mut resources, block_file.as_deref());
+    // Exactly the sessions replay puts back on the ledger: pinning a GPU no
+    // job holds would advertise it as free.
+    let held_gpu_ids = agent_server::startup_held_gpu_ids(&recovered_stepds, &resources.gpus);
+    let startup = reporter::startup_inventory(
+        &resources,
+        reporter::load_baseline(stepds.root()).as_ref(),
+        &held_gpu_ids,
+        &reporter::load_fences(stepds.root()),
+    );
+    resources = startup.reported;
+    // A pinned id's device is gone or reused by the new layout; a step must
+    // fail to resolve it rather than inject other silicon.
+    {
+        let mut reg = registry.lock().await;
+        let discovered = std::mem::take(&mut *reg);
+        let reported = resources.gpus.iter().map(|g| g.stable_id).collect();
+        *reg = discovered.with_pinned(
+            &DeviceRegistry::new(),
+            "gpu",
+            &reported,
+            &startup.fences.pinned_ids(),
+        );
+    }
     info!(
         cpus = resources.cpus,
         memory_mb = resources.memory_mb,
@@ -574,7 +604,9 @@ async fn main() -> anyhow::Result<()> {
             std::path::PathBuf::from(spurd::executor::CGROUP_ROOT),
             std::path::Path::new(&stepd_state_dir).join("spec-root-applied"),
             cgroup_config.enabled,
-        ),
+        )
+        .with_baseline_dir(stepds.root().to_path_buf())
+        .with_fences(startup.fences),
     );
 
     // Register with controller
@@ -657,7 +689,7 @@ async fn main() -> anyhow::Result<()> {
         limits,
         cgroup_config,
         mpi_config,
-        running_jobs,
+        running_jobs.clone(),
         allow_root_jobs,
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
@@ -669,9 +701,14 @@ async fn main() -> anyhow::Result<()> {
     // translated GPU stable_ids. Wired before the replay below records adopted
     // jobs; the OnceLock only shares the handle, so the ordering is immaterial.
     reporter.set_allocation(agent_service.allocation_handle());
+    agent_service
+        .allocation_handle()
+        .lock()
+        .await
+        .set_fenced(reporter.fences().pinned_ids());
     agent_service.adopt_stepds(&recovered_stepds).await;
     agent_service
-        .replay_adopted_allocations(&recovered_stepds)
+        .replay_adopted_allocations(&recovered_stepds, &startup.renamed)
         .await;
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
@@ -680,6 +717,11 @@ async fn main() -> anyhow::Result<()> {
     // hasn't set SPUR_STEPD_STATE_DIR, so it can't be required to be
     // exclusively spurd's — use the runtime/ subdir spurd already owns.
     stepd::create_private_dir_all(stepds.root())?;
+    // Saved only now: the registration above is the first controller ack, and
+    // the runtime dir may not have existed before this point.
+    if reporter::save_fences(stepds.root(), &reporter.fences()) {
+        reporter::save_baseline(stepds.root(), &reporter.snapshot_resources());
+    }
     let agent_notify_socket = stepds.agent_socket();
     if agent_notify_socket.exists() {
         std::fs::remove_file(&agent_notify_socket)?;
@@ -768,7 +810,9 @@ async fn main() -> anyhow::Result<()> {
         registry.clone(),
         reporter.clone(),
         agent_service.allocation_handle(),
+        running_jobs,
         config.clone(),
+        std::path::PathBuf::from(&stepd_state_dir),
     );
 
     // `agent_service` is moved into the gRPC server below, so anything the
@@ -935,6 +979,16 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `devices.auto_detect` applies for this config, falling back to the default
+/// (`DevicesConfig::default()`) when no `[devices]` section was loaded.
+fn devices_auto_detect(config: Option<&SlurmConfig>) -> bool {
+    let default_devices = spur_core::config::DevicesConfig::default();
+    config
+        .map(|c| &c.devices)
+        .unwrap_or(&default_devices)
+        .auto_detect
+}
+
 fn init_device_registry(config: Option<&SlurmConfig>) -> DeviceRegistry {
     let default_devices = spur_core::config::DevicesConfig::default();
     let devices_config = config.map(|c| &c.devices).unwrap_or(&default_devices);
@@ -976,19 +1030,29 @@ fn spawn_inventory_refresh(
     registry: Arc<Mutex<DeviceRegistry>>,
     reporter: Arc<NodeReporter>,
     allocation: Arc<Mutex<spur_sched::cons_tres::NodeAllocation>>,
+    running_jobs: agent_server::RunningJobs,
     config: Option<SlurmConfig>,
+    stepd_state_dir: std::path::PathBuf,
 ) {
     use spur_sched::cons_tres::CapacityChange;
 
     tokio::spawn(async move {
         let mut last_delta = reporter::InventoryDelta::Unchanged;
         let mut last_fp: reporter::InventoryFingerprint = Default::default();
+        let mut fence_ages = reporter::FenceAges::default();
         let mut interval = tokio::time::interval(reporter::inventory_refresh_interval());
         // `interval` fires immediately on the first tick; skip it so the first
         // real refresh is one full interval in, not at startup.
         interval.tick().await;
         loop {
             interval.tick().await;
+
+            // Rewrite a stale Spur-owned CDI spec before building the candidate, so this
+            // tick's discovery already sees any post-partition-change id rename.
+            cdi_owner::resync(
+                std::path::Path::new("/etc/cdi"),
+                devices_auto_detect(config.as_ref()),
+            );
 
             // Build the candidate registry locally WITHOUT swapping the shared
             // one: GPU injection must keep using the old positional mapping until
@@ -1019,13 +1083,40 @@ fn spawn_inventory_refresh(
 
             reporter::retain_native_fabric_loss(&old, &mut fresh);
             reporter::refresh_block_file(&mut fresh, block_path);
-            let held: std::collections::HashSet<u64> = {
+            let held_raw: std::collections::HashSet<u64> = {
                 let a = allocation.lock().await;
                 a.allocated_gpu_ids().into_iter().collect()
             };
-            let delta = reporter::classify(&old, &fresh, &held);
+            let committed = reporter.fences();
+            let tick = reporter::plan_tick(&old, &fresh, &held_raw, &committed);
+            let (plan, delta) = (&tick.plan, tick.delta.clone());
+            // Every tick, not only on a converge: a holder may exit before the
+            // inventory that withholds its released id is applied.
+            {
+                let mut a = allocation.lock().await;
+                let ids: Vec<u64> = a.gpus.iter().map(|g| g.stable_id).collect();
+                a.set_fenced(tick.ledger_fenced(&committed, &ids));
+            }
+            if delta == reporter::InventoryDelta::Unchanged && tick.fences != committed {
+                reporter.commit_fences(&tick.fences);
+            }
+            let pinned = tick.fences.pinned_by_anchor();
+            tracing::debug!(fences = ?pinned, "gpu fences");
+            let overdue = fence_ages.overdue(
+                &tick.fences,
+                std::time::Instant::now(),
+                reporter::FENCE_WARN_AFTER,
+            );
+            for anchor in overdue {
+                warn!(
+                    anchor = format_args!("{anchor:#x}"),
+                    pinned = ?pinned.get(&anchor),
+                    "a repartitioned gpu has been withheld for over an hour; \
+                     a job may be leaking its pre-change partition"
+                );
+            }
 
-            let fresh_fp = fresh.schedulable_fingerprint();
+            let fresh_fp = tick.effective.schedulable_fingerprint();
             let (action, next_last) =
                 reporter::next_refresh_action(&delta, &fresh_fp, &last_delta, &last_fp);
             last_delta = next_last;
@@ -1035,21 +1126,42 @@ fn spawn_inventory_refresh(
                 reporter::RefreshAction::ApplyCapacity => {
                     // Applying the same fresh set twice is idempotent, so a retry
                     // after a failed register re-applies safely.
+                    let reported = tick.reported();
                     let change = {
                         let mut a = allocation.lock().await;
-                        let change = a.update_capacity(&fresh);
-                        // The rebuild resets the per-CPU allocation bitmap, so
-                        // re-apply the spec-core exclusions to the current layout.
-                        a.set_spec_exclusions(&reporter.held_spec_cpus());
-                        change
+                        reporter::apply_to_ledger(
+                            &mut a,
+                            &tick,
+                            &reported,
+                            &reporter.held_spec_cpus(),
+                        )
                     };
                     match change {
                         CapacityChange::Applied => {
-                            let commit =
-                                converge(&reporter, &allocation, &fresh, &delta, &mut last_delta)
-                                    .await;
+                            agent_server::rename_descriptor_gpu_ids(
+                                &stepd_state_dir,
+                                &plan.renamed,
+                            );
+                            agent_server::rename_tracked_gpu_ids(&running_jobs, &plan.renamed)
+                                .await;
+                            let commit = converge(
+                                &reporter,
+                                &allocation,
+                                &reported,
+                                &tick.fences,
+                                &delta,
+                                &mut last_delta,
+                            )
+                            .await;
                             if !suspect_dropout {
-                                publish_registry(&registry, candidate, commit).await;
+                                publish_registry(
+                                    &registry,
+                                    candidate,
+                                    &reported,
+                                    &tick.pinned_ids(),
+                                    commit,
+                                )
+                                .await;
                             }
                         }
                         // A concurrent allocation grabbed a device that the fresh
@@ -1061,11 +1173,20 @@ fn spawn_inventory_refresh(
                 }
                 reporter::RefreshAction::ReportLost => {
                     let lost: Vec<u64> = {
+                        let ids = |set: &spur_core::resource::ResourceSet| -> Vec<u64> {
+                            set.gpus.iter().map(|g| g.stable_id).collect()
+                        };
                         let new_ids: std::collections::HashSet<u64> =
-                            fresh.gpus.iter().map(|g| g.stable_id).collect();
-                        held.iter()
+                            ids(&fresh).into_iter().collect();
+                        // A surviving id on a repartitioned GPU is lost too.
+                        let layout = spur_core::gpu_identity::diff_layout(
+                            &ids(&plan.baseline),
+                            &ids(&fresh),
+                        );
+                        plan.held
+                            .iter()
                             .copied()
-                            .filter(|id| !new_ids.contains(id))
+                            .filter(|&id| !layout.is_intact(id, &new_ids))
                             .collect()
                     };
                     // A change to a held device is not an inventory event: pin
@@ -1073,7 +1194,7 @@ fn spawn_inventory_refresh(
                     // stays ⊇ allocated (dropping it would let the controller
                     // double-book the still-held silicon). Only the free pool
                     // converges.
-                    let reconciled = reporter::reconcile_free_pool(&fresh, &old, &held);
+                    let reconciled = tick.reported();
                     // Register only when the reconciled set differs from what the
                     // controller already has (schedulable content, ignoring
                     // generation). While a held device stays held the reconciled
@@ -1084,30 +1205,62 @@ fn spawn_inventory_refresh(
                     if reconciled.schedulable_fingerprint() == old.schedulable_fingerprint() {
                         continue;
                     }
+                    // Keep the ledger equal to the reported set so a fenced
+                    // GPU's stale partitions are never reserved as free.
+                    let change = {
+                        let mut a = allocation.lock().await;
+                        reporter::apply_to_ledger(
+                            &mut a,
+                            &tick,
+                            &reconciled,
+                            &reporter.held_spec_cpus(),
+                        )
+                    };
+                    if let CapacityChange::AllocatedDevicesLost(v) = change {
+                        warn!(?v, "inventory change raced an allocation; deferring");
+                        continue;
+                    }
+                    agent_server::rename_descriptor_gpu_ids(&stepd_state_dir, &plan.renamed);
+                    agent_server::rename_tracked_gpu_ids(&running_jobs, &plan.renamed).await;
                     warn!(
                         ?lost,
                         "allocated device changed; pinning held gpus, converging free pool only"
                     );
-                    // Do NOT publish `candidate`: the still-held job injects from
-                    // the shared registry, which the fresh discovery may no longer
-                    // contain. Converge the reconciled REPORTED inventory but leave
-                    // the registry as-is so injection keeps resolving the held device.
-                    let _ = converge(&reporter, &allocation, &reconciled, &delta, &mut last_delta)
+                    let commit = converge(
+                        &reporter,
+                        &allocation,
+                        &reconciled,
+                        &tick.fences,
+                        &delta,
+                        &mut last_delta,
+                    )
+                    .await;
+                    if !suspect_dropout {
+                        publish_registry(
+                            &registry,
+                            candidate,
+                            &reconciled,
+                            &tick.pinned_ids(),
+                            commit,
+                        )
                         .await;
+                    }
                 }
             }
         }
     });
 }
 
-/// Converge the controller on `fresh`, then commit the reporter baseline ONLY
-/// if the controller acknowledged. On failure the baseline is left untouched so
-/// the next tick re-detects the same delta and retries; `last_delta` is set from
-/// `post_converge` so a failed register re-arms rather than being lost.
+/// Converge the controller on `fresh`, then commit the reporter baseline and
+/// `fences` ONLY if the controller acknowledged. On failure both are left
+/// untouched so the next tick re-detects the same delta and retries;
+/// `last_delta` is set from `post_converge` so a failed register re-arms rather
+/// than being lost.
 async fn converge(
     reporter: &NodeReporter,
     allocation: &Mutex<spur_sched::cons_tres::NodeAllocation>,
     fresh: &spur_core::resource::ResourceSet,
+    fences: &reporter::Fences,
     acted_delta: &reporter::InventoryDelta,
     last_delta: &mut reporter::InventoryDelta,
 ) -> reporter::BaselineCommit {
@@ -1118,7 +1271,9 @@ async fn converge(
     let (commit, next_last) = reporter::post_converge(acted_delta, registered.is_ok());
     *last_delta = next_last;
     if commit == reporter::BaselineCommit::Commit {
-        reporter.publish_resources(allocation, fresh.clone()).await;
+        reporter
+            .publish_resources(allocation, fresh.clone(), fences)
+            .await;
     }
     commit
 }
@@ -1135,17 +1290,23 @@ fn is_suspect_gpu_dropout(
 
 /// Swap the candidate registry into the shared one ONLY once the tick committed
 /// (controller acked + baseline advanced), so GPU injection never adopts a new
-/// positional mapping the controller has not yet scheduled from. Lock held only
-/// for the swap, never across an await.
+/// positional mapping the controller has not yet scheduled from. A `pinned`
+/// gpu keeps its old entry: the new layout may reuse its id for other silicon.
+/// Lock held only for the swap, never across an await.
 async fn publish_registry(
     registry: &Arc<Mutex<DeviceRegistry>>,
     candidate: DeviceRegistry,
+    reported: &spur_core::resource::ResourceSet,
+    pinned: &std::collections::HashSet<u64>,
     commit: reporter::BaselineCommit,
 ) {
-    if commit == reporter::BaselineCommit::Commit {
-        let mut reg = registry.lock().await;
-        *reg = candidate;
+    if commit != reporter::BaselineCommit::Commit {
+        return;
     }
+    let ids = reported.gpus.iter().map(|g| g.stable_id).collect();
+    let mut reg = registry.lock().await;
+    let previous = std::mem::take(&mut *reg);
+    *reg = candidate.with_pinned(&previous, "gpu", &ids, pinned);
 }
 
 #[cfg(test)]
@@ -1405,11 +1566,14 @@ mod tests {
     #[tokio::test]
     async fn publish_registry_swaps_only_on_commit() {
         let shared = Arc::new(Mutex::new(DeviceRegistry::new()));
+        let reported = spur_core::resource::ResourceSet::default();
 
         // Keep signal must NOT publish, even though the candidate is non-empty.
         publish_registry(
             &shared,
             registry_with_one_countable_pool(),
+            &reported,
+            &Default::default(),
             reporter::BaselineCommit::Keep,
         )
         .await;
@@ -1423,6 +1587,8 @@ mod tests {
         publish_registry(
             &shared,
             registry_with_one_countable_pool(),
+            &reported,
+            &Default::default(),
             reporter::BaselineCommit::Commit,
         )
         .await;
@@ -1431,5 +1597,108 @@ mod tests {
             1,
             "commit swaps the candidate in"
         );
+    }
+
+    fn gpu_registry(files: &str) -> DeviceRegistry {
+        let gres = spur_devices::GresEntry {
+            name: "gpu".into(),
+            file: Some(files.into()),
+            ..Default::default()
+        };
+        let mut reg = DeviceRegistry::new();
+        reg.populate(
+            &CdiCache::new(),
+            &spur_devices::GresCache::from_entries(&[gres]),
+        );
+        reg
+    }
+
+    fn device_paths(registry: &DeviceRegistry) -> Vec<(u64, Vec<String>)> {
+        registry
+            .list()
+            .iter()
+            .map(|e| (e.stable_id, e.device_paths.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn publish_registry_keeps_a_pinned_gpu_on_its_old_device() {
+        let previous = gpu_registry("/dev/dri/renderD[128-130]");
+        let old_device = device_paths(&previous)[1].clone();
+        let shared = Arc::new(Mutex::new(previous));
+        let candidate = gpu_registry("/dev/dri/renderD[200-202]");
+        let new_devices = device_paths(&candidate);
+        let mut reported = rs_with_gpus(2);
+        reported.gpus[0].stable_id = 0;
+        reported.gpus[1].stable_id = 1;
+
+        publish_registry(
+            &shared,
+            candidate,
+            &reported,
+            &[1].into(),
+            reporter::BaselineCommit::Commit,
+        )
+        .await;
+
+        let shared = device_paths(&*shared.lock().await);
+        assert_eq!(shared, vec![new_devices[0].clone(), old_device]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_register_commits_neither_the_baseline_nor_the_fences() {
+        let dir = tempfile::tempdir().expect("runtime dir");
+        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("ephemeral port")
+            .port();
+        let old = rs_with_gpus(2);
+        let reporter = NodeReporter::new(
+            "test-node".into(),
+            format!("http://127.0.0.1:{closed_port}"),
+            old.clone(),
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            HashMap::new(),
+            String::new(),
+            String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
+            Arc::new(Mutex::new(HashMap::<u32, agent_server::TrackedJob>::new())),
+            reporter::ReporterTimeouts::default(),
+        )
+        .with_baseline_dir(dir.path().to_path_buf());
+        let allocation = Mutex::new(spur_sched::cons_tres::NodeAllocation::new(
+            "test-node".into(),
+            &old,
+        ));
+        let mut reported = old.clone();
+        reported.gpus.truncate(1);
+        let fences = reporter::Fences {
+            anchors: [(128, vec![reported.gpus[0].clone()])].into(),
+        };
+        let mut last = reporter::InventoryDelta::Unchanged;
+
+        let commit = converge(
+            &reporter,
+            &allocation,
+            &reported,
+            &fences,
+            &reporter::InventoryDelta::AllocatedDevicesLost,
+            &mut last,
+        )
+        .await;
+
+        assert_eq!(commit, reporter::BaselineCommit::Keep);
+        assert_eq!(reporter.fences(), reporter::Fences::default());
+        assert_eq!(
+            reporter::load_fences(dir.path()),
+            reporter::Fences::default()
+        );
+        assert!(reporter::load_baseline(dir.path()).is_none());
+        assert_eq!(reporter.snapshot_resources(), old);
     }
 }

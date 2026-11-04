@@ -2289,6 +2289,29 @@ converges to the new device count without restarting ``spurd``.
    GPU-property constraints require automatic discovery or equivalent CDI specs
    containing the requested GPU properties.
 
+.. _gpu-partition-mode-change:
+
+Changing a GPU's partition mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A compute-partition change (SPX/CPX/QPX/DPX, in any direction) or a
+memory-partition change that reshapes the compute partitions is destructive to
+silicon identity. Perform it only on a node with no GPU jobs running.
+
+* ``spurd`` needs no restart: its periodic inventory refresh (see above)
+  picks up the new partitions and re-registers the node, and the controller
+  then schedules against the new layout.
+* With ``auto_detect = true``, ``spurd`` rewrites ``/etc/cdi/amd.json`` to
+  match the new hardware, but only if that file carries the
+  ``spur.amd.com/auto-detected: "true"`` annotation, which ``spur k8s up``
+  writes. A spec written by another tool is left untouched; ``spurd`` logs a
+  warning, and that tool must regenerate the spec itself.
+* If GPU jobs are still running when the partitions change, ``spurd`` keeps
+  reporting each partition they hold under its old id and advertises none of
+  that GPU's new partitions, nor an old partition a finished job released,
+  until every job that held the GPU before the change ends. This holds across
+  a ``spurd`` restart. The jobs themselves are not failed or requeued.
+
 ``[isolation]``
 ---------------
 

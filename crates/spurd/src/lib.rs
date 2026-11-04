@@ -10,6 +10,7 @@
 pub mod admission;
 pub mod agent_server;
 pub mod auth_middleware;
+pub mod cdi_owner;
 pub(crate) mod cgroup_cleanup;
 pub mod cluster;
 pub mod container;

@@ -92,6 +92,34 @@ impl DeviceRegistry {
         Ok((host, container))
     }
 
+    /// The registry to inject from while `pinned` ids still name the silicon
+    /// their jobs were given: those keep `previous`'s device even where the new
+    /// layout reuses the id, and a `gres_name` device not `reported` is dropped.
+    pub fn with_pinned(
+        mut self,
+        previous: &DeviceRegistry,
+        gres_name: &str,
+        reported: &std::collections::HashSet<u64>,
+        pinned: &std::collections::HashSet<u64>,
+    ) -> DeviceRegistry {
+        // Exact name, as the reported inventory is built from it.
+        let is_gres = |e: &DeviceEntry| e.is_injectable() && e.gres_name == gres_name;
+        self.devices.retain(|e| {
+            !is_gres(e) || (reported.contains(&e.stable_id) && !pinned.contains(&e.stable_id))
+        });
+        let kept: Vec<DeviceEntry> = previous
+            .devices
+            .iter()
+            .filter(|e| is_gres(e) && pinned.contains(&e.stable_id))
+            .cloned()
+            .collect();
+        self.devices.extend(kept);
+        for (i, entry) in self.devices.iter_mut().enumerate() {
+            entry.index = i as u32;
+        }
+        self
+    }
+
     pub fn list(&self) -> &[DeviceEntry] {
         &self.devices
     }
@@ -283,6 +311,84 @@ mod tests {
             gid: None,
         });
         entry
+    }
+
+    #[test]
+    fn a_pinned_id_the_new_layout_reuses_keeps_its_old_device() {
+        let gpu = |stable_id: u64, node: &str| {
+            let mut entry = partition_entry(stable_id, node);
+            entry.capability = DeviceCapability::Injectable;
+            entry
+        };
+        let previous = DeviceRegistry {
+            devices: vec![
+                gpu(0x110000, "/dev/dri/renderD128"),
+                gpu(0x110001, "/dev/dri/renderD129"),
+            ],
+        };
+        let candidate = DeviceRegistry {
+            devices: vec![
+                gpu(0x110000, "/dev/dri/renderD200"),
+                gpu(0x110001, "/dev/dri/renderD201"),
+            ],
+        };
+        let pinned: HashSet<u64> = [0x110000].into();
+
+        let merged = candidate.with_pinned(&previous, "gpu", &pinned, &pinned);
+
+        let entries: Vec<(u64, &str)> = merged
+            .list()
+            .iter()
+            .map(|e| (e.stable_id, primary_device_path(e)))
+            .collect();
+        assert_eq!(entries, vec![(0x110000, "/dev/dri/renderD128")]);
+    }
+
+    #[test]
+    fn pinned_ids_come_from_the_previous_registry_and_only_reported_ids_stay() {
+        let gpu = |stable_id: u64, node: &str| {
+            let mut entry = partition_entry(stable_id, node);
+            entry.capability = DeviceCapability::Injectable;
+            entry
+        };
+        let mut nic = gpu(0x110003, "/dev/infiniband/uverbs0");
+        nic.gres_name = "nic".into();
+        let previous = DeviceRegistry {
+            devices: vec![
+                gpu(0x110000, "/dev/dri/renderD128"),
+                gpu(0x120300, "/dev/dri/renderD131"),
+                gpu(0x110005, "/dev/dri/renderD133"),
+            ],
+        };
+        let candidate = DeviceRegistry {
+            devices: vec![
+                gpu(0x110000, "/dev/dri/renderD200"),
+                gpu(0x110001, "/dev/dri/renderD201"),
+                gpu(0x120000, "/dev/dri/renderD202"),
+                nic,
+            ],
+        };
+        let reported: HashSet<u64> = [0x110000, 0x110001, 0x120300].into();
+        let pinned: HashSet<u64> = [0x120300].into();
+
+        let merged = candidate.with_pinned(&previous, "gpu", &reported, &pinned);
+
+        let entries: Vec<(u64, &str)> = merged
+            .list()
+            .iter()
+            .map(|e| (e.stable_id, primary_device_path(e)))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                (0x110000, "/dev/dri/renderD200"),
+                (0x110001, "/dev/dri/renderD201"),
+                (0x110003, "/dev/infiniband/uverbs0"),
+                (0x120300, "/dev/dri/renderD131"),
+            ]
+        );
+        let indices: Vec<u32> = merged.list().iter().map(|e| e.index).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
     }
 
     #[test]

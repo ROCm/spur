@@ -234,6 +234,17 @@ impl ResourceSet {
         }
     }
 
+    /// The same inventory with GPU ids moved to their current encoding.
+    pub fn with_renamed_gpus(&self, renamed: &HashMap<u64, u64>) -> ResourceSet {
+        let mut out = self.clone();
+        for gpu in &mut out.gpus {
+            if let Some(&id) = renamed.get(&gpu.stable_id) {
+                gpu.stable_id = id;
+            }
+        }
+        out
+    }
+
     /// Identity of the schedulable set, independent of `generation`. Two ticks
     /// with an equal fingerprint observed the same topology, so a debounce can
     /// tell "same change seen twice" from "two different partial reads".
@@ -306,6 +317,9 @@ impl ResourceSet {
         if avail_cpus < request.cpus || avail_mem < request.memory_mb {
             return false;
         }
+        if !request.gpus.is_empty() && self.holds_unknown_gpu(allocated) {
+            return false;
+        }
 
         let mut avail_gpus = self.gpu_counts();
         let total_avail: u32 = avail_gpus.values().sum();
@@ -344,6 +358,15 @@ impl ResourceSet {
         true
     }
 
+    /// An allocated id the inventory lost means a held device may now be
+    /// reported under another id, so none of this node's GPUs can be trusted free.
+    fn holds_unknown_gpu(&self, allocated: &ResourceAllocations) -> bool {
+        allocated
+            .device_ids("gpu")
+            .iter()
+            .any(|id| !self.gpus.iter().any(|g| g.stable_id == *id))
+    }
+
     /// Return unallocated device IDs for an injectable gres type.
     pub fn available_device_ids(
         &self,
@@ -358,6 +381,9 @@ impl ResourceSet {
             .unwrap_or_default();
 
         if gres_name == "gpu" {
+            if self.holds_unknown_gpu(allocated) {
+                return Vec::new();
+            }
             self.gpus
                 .iter()
                 .filter(|g| {
@@ -524,6 +550,15 @@ mod tests {
         assert!(inventory.gpus[0].topology.is_none());
         assert_eq!(inventory.generation, 7);
         assert_eq!(inventory.gpus[0].stable_id, 128);
+    }
+
+    #[test]
+    fn with_renamed_gpus_moves_only_mapped_ids() {
+        let inventory = sample_inventory();
+        let renamed = HashMap::from([(0, 100)]);
+        let out = inventory.with_renamed_gpus(&renamed);
+        assert_eq!(out.gpus[0].stable_id, 100);
+        assert_eq!(out.gpus[1].stable_id, 1);
     }
 
     #[test]
@@ -848,6 +883,50 @@ mod tests {
         let allocated = ResourceAllocations::from_device_ids("gpu", &[128]);
         let free = inventory.available_device_ids(&allocated, "gpu", Some("mi300x"));
         assert_eq!(free, vec![129]);
+    }
+
+    fn two_gpu_inventory(a: u64, b: u64) -> ResourceSet {
+        let mut inventory = sample_inventory();
+        inventory.gpus[0].stable_id = a;
+        inventory.gpus[1].stable_id = b;
+        inventory
+    }
+
+    #[test]
+    fn a_node_holding_an_id_it_no_longer_has_offers_no_gpu() {
+        let inventory = two_gpu_inventory(0x11_0000, 0x12_0000);
+
+        let orphaned = ResourceAllocations::from_device_ids("gpu", &[0x11_0100]);
+        assert!(inventory
+            .available_device_ids(&orphaned, "gpu", None)
+            .is_empty());
+
+        let held = ResourceAllocations::from_device_ids("gpu", &[0x11_0000]);
+        assert_eq!(
+            inventory.available_device_ids(&held, "gpu", None),
+            vec![0x12_0000]
+        );
+    }
+
+    #[test]
+    fn a_node_holding_an_id_it_no_longer_has_cannot_satisfy_a_gpu_request() {
+        let inventory = two_gpu_inventory(0x11_0000, 0x12_0000);
+        let mut one_gpu = ResourceSet {
+            cpus: 1,
+            ..Default::default()
+        };
+        one_gpu.gpus.push(inventory.gpus[0].clone());
+        let cpu_only = ResourceSet {
+            cpus: 1,
+            ..Default::default()
+        };
+
+        let orphaned = ResourceAllocations::from_device_ids("gpu", &[0x11_0100]);
+        assert!(!inventory.can_satisfy_with_allocated(&orphaned, &one_gpu));
+        assert!(inventory.can_satisfy_with_allocated(&orphaned, &cpu_only));
+
+        let held = ResourceAllocations::from_device_ids("gpu", &[0x11_0000]);
+        assert!(inventory.can_satisfy_with_allocated(&held, &one_gpu));
     }
 
     #[test]

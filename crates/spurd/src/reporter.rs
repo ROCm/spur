@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -124,6 +124,9 @@ pub struct NodeReporter {
     /// is widened back to all online CPUs when the setting is removed.
     daemons_pinned: std::sync::atomic::AtomicBool,
     timeouts: ReporterTimeouts,
+    baseline_dir: Option<std::path::PathBuf>,
+    /// Committed with `resources`: the repartitioned GPUs that set withholds.
+    fences: RwLock<Fences>,
 }
 
 impl NodeReporter {
@@ -170,7 +173,37 @@ impl NodeReporter {
             spec_cpus: RwLock::new(Vec::new()),
             daemons_pinned: std::sync::atomic::AtomicBool::new(false),
             timeouts,
+            baseline_dir: None,
+            fences: RwLock::new(Fences::default()),
         }
+    }
+
+    /// The fences the startup inventory was reported with.
+    pub fn with_fences(mut self, fences: Fences) -> Self {
+        self.fences = RwLock::new(fences);
+        self
+    }
+
+    pub fn fences(&self) -> Fences {
+        read_recover(&self.fences).clone()
+    }
+
+    /// Commit fences whose reported set the controller already has.
+    pub fn commit_fences(&self, fences: &Fences) -> bool {
+        if let Some(dir) = &self.baseline_dir {
+            if !save_fences(dir, fences) {
+                return false;
+            }
+        }
+        *write_recover(&self.fences) = fences.clone();
+        true
+    }
+
+    /// Persist every controller-acked inventory under `dir`, so a restart can
+    /// tell a re-encoded or repartitioned GPU from the one a job was given.
+    pub fn with_baseline_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.baseline_dir = Some(dir);
+        self
     }
 
     /// The learned node-identity token, read live (it is set at registration and
@@ -417,9 +450,22 @@ impl NodeReporter {
         read_recover(&self.resources).generation
     }
 
-    pub async fn publish_resources(&self, allocation: &Mutex<NodeAllocation>, fresh: ResourceSet) {
+    pub async fn publish_resources(
+        &self,
+        allocation: &Mutex<NodeAllocation>,
+        fresh: ResourceSet,
+        fences: &Fences,
+    ) {
         // Dispatch checks generation while reserving under this same mutex.
         let _allocation = allocation.lock().await;
+        if let Some(dir) = &self.baseline_dir {
+            // Fences first: a baseline already reduced to the pinned ids
+            // cannot reveal the repartition on its own after a crash.
+            if save_fences(dir, fences) {
+                save_baseline(dir, &fresh);
+            }
+        }
+        *write_recover(&self.fences) = fences.clone();
         self.update_resources(fresh);
     }
 
@@ -800,7 +846,13 @@ pub fn classify(
         return InventoryDelta::Unchanged;
     }
     let new_ids: std::collections::HashSet<u64> = new.gpus.iter().map(|g| g.stable_id).collect();
-    let lost_held = allocated_stable_ids.iter().any(|id| !new_ids.contains(id));
+    let old_ids: Vec<u64> = old.gpus.iter().map(|g| g.stable_id).collect();
+    let new_list: Vec<u64> = new.gpus.iter().map(|g| g.stable_id).collect();
+    // A held id that survives a repartition names different silicon now.
+    let layout = spur_core::gpu_identity::diff_layout(&old_ids, &new_list);
+    let lost_held = allocated_stable_ids
+        .iter()
+        .any(|&id| !layout.is_intact(id, &new_ids));
     if lost_held {
         InventoryDelta::AllocatedDevicesLost
     } else {
@@ -811,7 +863,404 @@ pub fn classify(
 /// Physical-GPU identity (BDF anchor) of a stable_id: mask off the low
 /// partition bits so two ids on the same silicon compare equal.
 fn bdf_anchor(stable_id: u64) -> u64 {
-    stable_id & !spur_devices::cdi::STABLE_ID_PARTITION_MASK
+    spur_core::gpu_identity::anchor(stable_id)
+}
+
+/// Held ids moved to the current encoding, so a re-encoded id is the same
+/// device, not a loss. `baseline` renames only held entries: fully renamed it
+/// would equal `fresh` and hide the rename from the controller.
+pub struct RefreshPlan {
+    pub renamed: HashMap<u64, u64>,
+    pub baseline: ResourceSet,
+    pub held: HashSet<u64>,
+}
+
+pub fn plan_refresh(old: &ResourceSet, fresh: &ResourceSet, held: &HashSet<u64>) -> RefreshPlan {
+    let ids = |set: &ResourceSet| set.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>();
+    let renamed = spur_core::gpu_identity::diff_layout(&ids(old), &ids(fresh)).safe_renames();
+    // After a failed register the ledger already holds the new id.
+    let held_renamed: HashMap<u64, u64> = renamed
+        .iter()
+        .filter(|(id, to)| held.contains(id) || held.contains(to))
+        .map(|(&id, &to)| (id, to))
+        .collect();
+    let held = held
+        .iter()
+        .map(|id| renamed.get(id).copied().unwrap_or(*id))
+        .collect();
+    RefreshPlan {
+        baseline: old.with_renamed_gpus(&held_renamed),
+        renamed,
+        held,
+    }
+}
+
+pub const BASELINE_FILE: &str = "inventory-baseline.json";
+
+/// The last inventory the controller acknowledged. Absent or unreadable both
+/// mean "no baseline": startup then falls back to the legacy id rule.
+pub fn load_baseline(dir: &std::path::Path) -> Option<ResourceSet> {
+    let contents = std::fs::read(dir.join(BASELINE_FILE)).ok()?;
+    match serde_json::from_slice(&contents) {
+        Ok(set) => Some(set),
+        Err(error) => {
+            warn!(%error, "unreadable inventory baseline; ignoring it");
+            None
+        }
+    }
+}
+
+/// Best-effort: a missing baseline only costs the next restart its precision.
+pub fn save_baseline(dir: &std::path::Path, set: &ResourceSet) {
+    let written = serde_json::to_vec(set)
+        .map_err(std::io::Error::other)
+        .and_then(|contents| crate::stepd::publish_private(dir, BASELINE_FILE, &contents));
+    if let Err(error) = written {
+        warn!(%error, dir = %dir.display(), "could not save the inventory baseline");
+    }
+}
+
+pub const FENCES_FILE: &str = "inventory-fences.json";
+
+/// GPUs repartitioned under running jobs, keyed by BDF anchor. Each keeps only
+/// the entries its pre-change holders still hold and offers nothing else until
+/// they exit: any id of the new layout may name silicon they still use.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Fences {
+    #[serde(default)]
+    pub anchors: std::collections::BTreeMap<u64, Vec<GpuResource>>,
+}
+
+impl Fences {
+    pub fn pinned_by_anchor(&self) -> std::collections::BTreeMap<u64, Vec<u64>> {
+        self.anchors
+            .iter()
+            .map(|(&anchor, pinned)| (anchor, pinned.iter().map(|g| g.stable_id).collect()))
+            .collect()
+    }
+
+    pub fn pinned_ids(&self) -> HashSet<u64> {
+        self.anchors
+            .values()
+            .flatten()
+            .map(|g| g.stable_id)
+            .collect()
+    }
+
+    fn pruned(&self, held: &HashSet<u64>) -> Fences {
+        let anchors = self
+            .anchors
+            .iter()
+            .map(|(&anchor, pinned)| {
+                let kept: Vec<GpuResource> = pinned
+                    .iter()
+                    .filter(|g| held.contains(&g.stable_id))
+                    .cloned()
+                    .collect();
+                (anchor, kept)
+            })
+            .filter(|(_, kept)| !kept.is_empty())
+            .collect();
+        Fences { anchors }
+    }
+
+    fn pin(&mut self, anchor: u64, gpu: &GpuResource) {
+        let pinned = self.anchors.entry(anchor).or_default();
+        if !pinned.iter().any(|g| g.stable_id == gpu.stable_id) {
+            pinned.push(gpu.clone());
+            pinned.sort_by_key(|g| g.stable_id);
+        }
+    }
+
+    /// `fresh` with every fenced GPU reduced to its still-pinned entries, in
+    /// the order `reconcile_free_pool` reports them.
+    pub fn apply(&self, fresh: &ResourceSet) -> ResourceSet {
+        let pinned_ids = self.pinned_ids();
+        let mut effective = fresh.clone();
+        effective.gpus.retain(|g| {
+            !self.anchors.contains_key(&bdf_anchor(g.stable_id))
+                && !pinned_ids.contains(&g.stable_id)
+        });
+        let mut pinned: Vec<&GpuResource> = self.anchors.values().flatten().collect();
+        pinned.sort_by_key(|g| g.stable_id);
+        effective
+            .gpus
+            .extend(pinned.into_iter().map(|g| pinned_gpu(g, fresh)));
+        effective
+    }
+}
+
+/// A fence older than this likely means a pinned id whose holder leaked.
+pub const FENCE_WARN_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// When each fenced GPU was first seen, so one held far longer than a job
+/// should run is surfaced once instead of withholding the GPU silently.
+#[derive(Default)]
+pub struct FenceAges {
+    since: HashMap<u64, Instant>,
+    warned: HashSet<u64>,
+}
+
+impl FenceAges {
+    /// Anchors of `fences` older than `limit` not yet reported.
+    pub fn overdue(&mut self, fences: &Fences, now: Instant, limit: Duration) -> Vec<u64> {
+        self.since
+            .retain(|anchor, _| fences.anchors.contains_key(anchor));
+        self.warned
+            .retain(|anchor| fences.anchors.contains_key(anchor));
+        let mut overdue = Vec::new();
+        for &anchor in fences.anchors.keys() {
+            let since = *self.since.entry(anchor).or_insert(now);
+            if now.saturating_duration_since(since) >= limit && self.warned.insert(anchor) {
+                overdue.push(anchor);
+            }
+        }
+        overdue
+    }
+}
+
+/// Absent or unreadable both mean "no fences", as for the baseline.
+pub fn load_fences(dir: &std::path::Path) -> Fences {
+    let Ok(contents) = std::fs::read(dir.join(FENCES_FILE)) else {
+        return Fences::default();
+    };
+    serde_json::from_slice(&contents).unwrap_or_else(|error| {
+        warn!(%error, "unreadable inventory fences; ignoring them");
+        Fences::default()
+    })
+}
+
+/// Best-effort like `save_baseline`; returns whether the fences were saved.
+pub fn save_fences(dir: &std::path::Path, fences: &Fences) -> bool {
+    let written = serde_json::to_vec(fences)
+        .map_err(std::io::Error::other)
+        .and_then(|contents| crate::stepd::publish_private(dir, FENCES_FILE, &contents));
+    if let Err(error) = &written {
+        warn!(%error, dir = %dir.display(), "could not save the inventory fences");
+    }
+    written.is_ok()
+}
+
+/// One refresh tick's view: `effective` is `fresh` with fenced GPUs reduced to
+/// their pinned entries, and is what `delta` classifies against `old`.
+pub struct TickPlan {
+    pub plan: RefreshPlan,
+    pub fences: Fences,
+    pub effective: ResourceSet,
+    pub delta: InventoryDelta,
+    fresh_anchors: HashSet<u64>,
+    /// Held ids `fresh` no longer names as the same silicon.
+    lost_held: HashSet<u64>,
+}
+
+impl TickPlan {
+    /// Ids in `ledger_ids` the ledger must refuse this tick: every old id of
+    /// a GPU repartitioned under a holder, from its first sighting, before
+    /// any debounce or commit lets the inventory drop them.
+    pub fn ledger_fenced(&self, committed: &Fences, ledger_ids: &[u64]) -> HashSet<u64> {
+        let anchors: HashSet<u64> = committed
+            .anchors
+            .keys()
+            .chain(self.fences.anchors.keys())
+            .copied()
+            .collect();
+        let mut fenced: HashSet<u64> = ledger_ids
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let anchor = spur_core::gpu_identity::current_anchor(id, &self.fresh_anchors);
+                anchors.contains(&anchor)
+            })
+            .collect();
+        fenced.extend(committed.pinned_ids());
+        fenced.extend(self.fences.pinned_ids());
+        fenced
+    }
+
+    /// Ids reported from the pre-change set rather than the fresh discovery.
+    pub fn pinned_ids(&self) -> HashSet<u64> {
+        let mut pinned = self.fences.pinned_ids();
+        if self.delta == InventoryDelta::AllocatedDevicesLost {
+            pinned.extend(&self.lost_held);
+        }
+        pinned
+    }
+
+    /// The set to report: a held device the effective set lost is pinned.
+    pub fn reported(&self) -> ResourceSet {
+        match self.delta {
+            InventoryDelta::AllocatedDevicesLost => {
+                reconcile_free_pool(&self.effective, &self.plan.baseline, &self.plan.held)
+            }
+            _ => self.effective.clone(),
+        }
+    }
+}
+
+/// A repartition is only visible against the layout before it; once the
+/// report shrinks to the pinned ids it is not, so the fence must carry it.
+pub fn plan_tick(
+    old: &ResourceSet,
+    fresh: &ResourceSet,
+    held: &HashSet<u64>,
+    fences: &Fences,
+) -> TickPlan {
+    // A pinned id must not read as a re-encoding of the GPU's new layout.
+    let plan = plan_refresh(old, &fences.apply(fresh), held);
+    let mut next = fences.pruned(&plan.held);
+    for (anchor, gpu) in repartitioned_held(old, fresh, &plan) {
+        next.pin(anchor, gpu);
+    }
+    let effective = next.apply(fresh);
+    let delta = refresh_delta(old, &effective, &plan);
+    let ids = |set: &ResourceSet| set.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>();
+    let layout = spur_core::gpu_identity::diff_layout(&ids(&plan.baseline), &ids(fresh));
+    let fresh_ids: HashSet<u64> = ids(fresh).into_iter().collect();
+    let lost_held = plan
+        .held
+        .iter()
+        .copied()
+        .filter(|&id| !layout.is_intact(id, &fresh_ids))
+        .collect();
+    TickPlan {
+        plan,
+        fences: next,
+        effective,
+        delta,
+        fresh_anchors: fresh.gpus.iter().map(|g| bdf_anchor(g.stable_id)).collect(),
+        lost_held,
+    }
+}
+
+/// Install `reported` on the ledger. Once installed, the gate follows the
+/// fences it was built from: a GPU they no longer fence has no pre-change
+/// holder left, and gating it until the next tick would refuse dispatches
+/// onto the layout just offered. A deferral keeps the wider gate.
+pub fn apply_to_ledger(
+    ledger: &mut NodeAllocation,
+    tick: &TickPlan,
+    reported: &ResourceSet,
+    spec_cpus: &[u32],
+) -> spur_sched::cons_tres::CapacityChange {
+    ledger.rename_gpus(&tick.plan.renamed);
+    let change = ledger.update_capacity(reported);
+    // The rebuild resets the per-CPU allocation bitmap, so re-apply the
+    // spec-core exclusions to the current layout.
+    ledger.set_spec_exclusions(spec_cpus);
+    if change == spur_sched::cons_tres::CapacityChange::Applied {
+        let ids: Vec<u64> = ledger.gpus.iter().map(|g| g.stable_id).collect();
+        ledger.set_fenced(tick.ledger_fenced(&tick.fences, &ids));
+    }
+    change
+}
+
+/// Held entries of `plan.baseline` on GPUs `fresh` repartitioned, by anchor.
+fn repartitioned_held<'a>(
+    old: &ResourceSet,
+    fresh: &ResourceSet,
+    plan: &'a RefreshPlan,
+) -> Vec<(u64, &'a GpuResource)> {
+    let ids = |set: &ResourceSet| set.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>();
+    let layout = spur_core::gpu_identity::diff_layout(&ids(old), &ids(fresh));
+    let anchors: HashSet<u64> = fresh.gpus.iter().map(|g| bdf_anchor(g.stable_id)).collect();
+    plan.baseline
+        .gpus
+        .iter()
+        .filter(|g| plan.held.contains(&g.stable_id))
+        .map(|g| {
+            let anchor = spur_core::gpu_identity::current_anchor(g.stable_id, &anchors);
+            (anchor, g)
+        })
+        .filter(|(anchor, _)| layout.repartitioned.contains(anchor))
+        .collect()
+}
+
+pub struct StartupInventory {
+    pub reported: ResourceSet,
+    pub renamed: HashMap<u64, u64>,
+    pub fences: Fences,
+}
+
+/// Whether anything changed is judged on the unrenamed `old`: once its held
+/// ids are renamed it can equal `fresh`, and the node would never converge.
+pub fn refresh_delta(old: &ResourceSet, fresh: &ResourceSet, plan: &RefreshPlan) -> InventoryDelta {
+    classify(old, fresh, &plan.held)
+}
+
+/// What to report at startup while adopted jobs hold `held`, and how their
+/// recorded ids map onto `fresh`. Reuses the refresh path against the saved
+/// baseline; without one only the legacy id rule and anchor pinning apply.
+pub fn startup_inventory(
+    fresh: &ResourceSet,
+    baseline: Option<&ResourceSet>,
+    held: &HashSet<u64>,
+    fences: &Fences,
+) -> StartupInventory {
+    let Some(baseline) = baseline else {
+        return startup_inventory_without_baseline(fresh, held);
+    };
+    let tick = plan_tick(baseline, fresh, held, fences);
+    StartupInventory {
+        reported: tick.reported(),
+        renamed: tick.plan.renamed,
+        fences: tick.fences,
+    }
+}
+
+/// Without a baseline a repartition cannot be detected, so a held id missing
+/// from `fresh` is pinned on its GPU if that GPU is still there.
+fn startup_inventory_without_baseline(
+    fresh: &ResourceSet,
+    held: &HashSet<u64>,
+) -> StartupInventory {
+    let fresh_ids: HashSet<u64> = fresh.gpus.iter().map(|g| g.stable_id).collect();
+    let renamed: HashMap<u64, u64> = held
+        .iter()
+        .filter(|id| !fresh_ids.contains(id))
+        .filter_map(|&id| {
+            Some((
+                id,
+                spur_core::gpu_identity::legacy_partition_id(id, &fresh_ids)?,
+            ))
+        })
+        .collect();
+    let current = |id: &u64| renamed.get(id).copied().unwrap_or(*id);
+    let pinned: Vec<GpuResource> = held
+        .iter()
+        .map(current)
+        .filter(|id| !fresh_ids.contains(id))
+        .filter_map(|id| {
+            let gpu = fresh
+                .gpus
+                .iter()
+                .find(|g| bdf_anchor(g.stable_id) == bdf_anchor(id))?;
+            Some(GpuResource {
+                stable_id: id,
+                ..gpu.clone()
+            })
+        })
+        .collect();
+    if pinned.is_empty() {
+        return StartupInventory {
+            reported: fresh.clone(),
+            renamed,
+            fences: Fences::default(),
+        };
+    }
+    let pinned_anchors: HashSet<u64> = pinned.iter().map(|g| bdf_anchor(g.stable_id)).collect();
+    let mut synthetic = fresh.clone();
+    synthetic.gpus.extend(pinned);
+    // Only GPUs with a pinned id are fenced; other held GPUs keep their siblings.
+    let fenced: HashSet<u64> = held
+        .iter()
+        .map(current)
+        .filter(|&id| pinned_anchors.contains(&bdf_anchor(id)))
+        .collect();
+    StartupInventory {
+        reported: reconcile_free_pool(fresh, &synthetic, &fenced),
+        renamed,
+        fences: Fences::default(),
+    }
 }
 
 /// Plain GPUs without fabric evidence stay untouched, so a failed scan does not churn their inventory.
@@ -878,8 +1327,8 @@ pub fn reconcile_free_pool(
     baseline: &ResourceSet,
     held_ids: &std::collections::HashSet<u64>,
 ) -> ResourceSet {
-    let held_bdfs: std::collections::HashSet<u64> =
-        held_ids.iter().map(|&id| bdf_anchor(id)).collect();
+    let held_bdfs =
+        spur_core::gpu_identity::held_anchors(held_ids, fresh.gpus.iter().map(|g| g.stable_id));
 
     let mut reconciled = fresh.clone();
     reconciled
@@ -897,16 +1346,20 @@ pub fn reconcile_free_pool(
 
     for id in missing {
         if let Some(gpu) = baseline.gpus.iter().find(|g| g.stable_id == id) {
-            let mut pinned = gpu.clone();
-            // Accounting keeps the held identity; observations describe the current device.
-            match fresh.gpus.iter().find(|g| g.stable_id == id) {
-                Some(current) => pinned.topology = current.topology.clone(),
-                None => mark_gpu_fabric_unavailable(&mut pinned),
-            }
-            reconciled.gpus.push(pinned);
+            reconciled.gpus.push(pinned_gpu(gpu, fresh));
         }
     }
     reconciled
+}
+
+/// Accounting keeps the held identity; observations describe the current device.
+fn pinned_gpu(held: &GpuResource, fresh: &ResourceSet) -> GpuResource {
+    let mut pinned = held.clone();
+    match fresh.gpus.iter().find(|g| g.stable_id == held.stable_id) {
+        Some(current) => pinned.topology = current.topology.clone(),
+        None => mark_gpu_fabric_unavailable(&mut pinned),
+    }
+    pinned
 }
 
 /// Discover local node resources from sysfs / /proc + device registry.
@@ -1774,6 +2227,81 @@ mod tests {
         assert_eq!(sets, vec![vec![0, 1, 2], vec![4, 5]]);
     }
 
+    fn stable_registry(devices: &[(u64, &str)]) -> DeviceRegistry {
+        let spec = CdiSpec {
+            cdi_version: "0.6.0".into(),
+            kind: "amd.com/gpu".into(),
+            annotations: Default::default(),
+            devices: devices
+                .iter()
+                .map(|&(stable_id, path)| CdiDevice {
+                    name: format!("{stable_id:x}"),
+                    annotations: [(annotations::STABLE_ID.into(), stable_id.to_string())].into(),
+                    container_edits: Some(ContainerEdits {
+                        device_nodes: vec![DeviceNode {
+                            path: path.into(),
+                            host_path: None,
+                            r#type: None,
+                            major: None,
+                            minor: None,
+                            file_mode: None,
+                            permissions: None,
+                            uid: None,
+                            gid: None,
+                        }],
+                        ..Default::default()
+                    }),
+                })
+                .collect(),
+            container_edits: None,
+        };
+        let mut cache = CdiCache::new();
+        cache.add_specs(&[spec]);
+        let mut reg = DeviceRegistry::new();
+        reg.populate(&cache, &GresCache::from_entries(&[]));
+        reg
+    }
+
+    #[test]
+    fn a_renamed_held_gpu_injects_its_new_entry_while_a_lost_one_keeps_its_old() {
+        use std::collections::HashSet;
+        let old_rank1 = (0x11 << 16) | (1 << 8);
+        let old = rset(
+            8,
+            1,
+            vec![
+                gpu(0, sid(0x11, 0)),
+                gpu(1, old_rank1),
+                gpu(2, sid(0x12, 0)),
+            ],
+        );
+        let fresh = rset(8, 2, vec![gpu(0, sid(0x11, 0)), gpu(1, sid(0x11, 1))]);
+        let held: HashSet<u64> = [old_rank1, sid(0x12, 0)].into();
+        let tick = plan_tick(&old, &fresh, &held, &Fences::default());
+        assert_eq!(tick.delta, InventoryDelta::AllocatedDevicesLost);
+        assert_eq!(tick.pinned_ids(), HashSet::from([sid(0x12, 0)]));
+
+        let previous = stable_registry(&[
+            (sid(0x11, 0), "/dev/dri/renderD128"),
+            (old_rank1, "/dev/dri/renderD129"),
+            (sid(0x12, 0), "/dev/dri/renderD130"),
+        ]);
+        let candidate = stable_registry(&[
+            (sid(0x11, 0), "/dev/dri/renderD200"),
+            (sid(0x11, 1), "/dev/dri/renderD201"),
+        ]);
+        let reported: HashSet<u64> = tick.reported().gpus.iter().map(|g| g.stable_id).collect();
+        let published = candidate.with_pinned(&previous, "gpu", &reported, &tick.pinned_ids());
+
+        let path = |id: u64| {
+            published.resolve_by_ids("gpu", &[id]).unwrap()[0]
+                .device_paths
+                .clone()
+        };
+        assert_eq!(path(sid(0x11, 1)), vec!["/dev/dri/renderD201".to_string()]);
+        assert_eq!(path(sid(0x12, 0)), vec!["/dev/dri/renderD130".to_string()]);
+    }
+
     #[test]
     fn test_gpus_from_registry_link_type() {
         let spec = CdiSpec {
@@ -2535,6 +3063,23 @@ mod tests {
     }
 
     #[test]
+    fn positional_gpu_ids_change_count_without_fencing_the_node() {
+        use std::collections::HashSet;
+        let positional = |n: u32| rset(8, 1, (0..n).map(|i| gpu(i, i as u64)).collect());
+        let (old, fresh) = (positional(8), positional(7));
+        let held: HashSet<u64> = [0].into_iter().collect();
+        assert_eq!(
+            classify(&old, &fresh, &held),
+            InventoryDelta::FreeCapacityChanged
+        );
+        let dropped: HashSet<u64> = [7].into_iter().collect();
+        assert_eq!(
+            classify(&old, &fresh, &dropped),
+            InventoryDelta::AllocatedDevicesLost
+        );
+    }
+
+    #[test]
     fn reconcile_pins_missing_held_and_keeps_fresh_free() {
         use std::collections::HashSet;
         // Job holds a device on BDF 5. The fresh scan dropped it; free devices on
@@ -2693,42 +3238,556 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_held_partition_id_reports_lost_and_hides_the_new_siblings() {
+    fn a_changed_held_partition_id_is_renamed_and_keeps_the_new_siblings() {
         use std::collections::HashSet;
         // The upgrade case: the baseline carries the old encoding, where the
         // rank sat in the function bits, so rank 1 has its own BDF anchor.
         let old_rank1 = (0x11 << 16) | (1 << 8);
-        let baseline = rset(
+        let mut legacy: Vec<GpuResource> = (0..8)
+            .map(|f| gpu(f as u32, (0x11 << 16) | (f << 8)))
+            .collect();
+        legacy.push(gpu(8, sid(0x12, 0)));
+        let baseline = rset(8, 1, legacy);
+        let fresh = cpx_node(2);
+        let held: HashSet<u64> = [sid(0x11, 0), old_rank1].into_iter().collect();
+
+        let plan = plan_refresh(&baseline, &fresh, &held);
+
+        assert_eq!(plan.renamed[&old_rank1], sid(0x11, 1));
+        assert_eq!(
+            classify(&plan.baseline, &fresh, &plan.held),
+            InventoryDelta::FreeCapacityChanged
+        );
+        assert_eq!(refresh_once(&baseline, &fresh, &held).gpus.len(), 9);
+    }
+
+    fn layout_node(partitions: u64) -> ResourceSet {
+        let mut gpus: Vec<GpuResource> = (0..partitions)
+            .map(|r| gpu(r as u32, sid(0x11, r)))
+            .collect();
+        gpus.push(gpu(partitions as u32, sid(0x12, 0)));
+        rset(8, 1, gpus)
+    }
+
+    /// Mirrors the refresh loop: plan, classify, act; returns the reported set.
+    fn refresh_once(
+        old: &ResourceSet,
+        fresh: &ResourceSet,
+        held: &std::collections::HashSet<u64>,
+    ) -> ResourceSet {
+        plan_tick(old, fresh, held, &Fences::default()).reported()
+    }
+
+    fn overlaps(old_parts: u64, p: u64, new_parts: u64, q: u64) -> bool {
+        let (a0, a1) = (p * 8 / old_parts, (p + 1) * 8 / old_parts);
+        let (b0, b1) = (q * 8 / new_parts, (q + 1) * 8 / new_parts);
+        a0 < b1 && b0 < a1
+    }
+
+    #[test]
+    fn no_partition_change_offers_silicon_a_job_still_holds() {
+        use std::collections::HashSet;
+        for a in [1u64, 2, 4, 8] {
+            for b in [1u64, 2, 4, 8] {
+                if a == b {
+                    continue;
+                }
+                for p in [0, a - 1] {
+                    let old = layout_node(a);
+                    let mut fresh = layout_node(b);
+                    fresh.generation = 2;
+                    let held: HashSet<u64> = [sid(0x11, p)].into();
+                    let reported = refresh_once(&old, &fresh, &held);
+                    let offered: Vec<u64> = reported
+                        .gpus
+                        .iter()
+                        .map(|g| g.stable_id)
+                        .filter(|id| !held.contains(id) && id >> 16 == 0x11)
+                        .collect();
+                    for id in offered {
+                        assert!(
+                            !overlaps(a, p, b, id & 0xFF),
+                            "{a}->{b} held p{p}: offered overlapping {id:#x}"
+                        );
+                    }
+                    assert!(
+                        reported.gpus.iter().any(|g| g.stable_id == sid(0x11, p)),
+                        "{a}->{b}: held device must stay reported"
+                    );
+                    assert!(reported.gpus.iter().any(|g| g.stable_id == sid(0x12, 0)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_partition_change_with_nothing_held_adopts_the_fresh_ids() {
+        use std::collections::HashSet;
+        for (a, b) in [(1u64, 8u64), (8, 1), (2, 4), (4, 2), (8, 2), (1, 2)] {
+            let old = layout_node(a);
+            let fresh = layout_node(b);
+            let held = HashSet::new();
+            assert_eq!(
+                classify(&old, &fresh, &held),
+                InventoryDelta::FreeCapacityChanged
+            );
+            assert_eq!(refresh_once(&old, &fresh, &held).gpus, fresh.gpus);
+        }
+    }
+
+    #[test]
+    fn the_legacy_encoding_renames_held_partitions_and_keeps_the_free_ones() {
+        use std::collections::HashSet;
+        let old_rank1 = (0x11 << 16) | (1 << 8);
+        let mut legacy: Vec<GpuResource> = (0..8)
+            .map(|f| gpu(f as u32, (0x11 << 16) | (f << 8)))
+            .collect();
+        legacy.push(gpu(8, sid(0x12, 0)));
+        let baseline = rset(8, 1, legacy);
+        let fresh = cpx_node(2);
+        let held: HashSet<u64> = [old_rank1].into();
+        let plan = plan_refresh(&baseline, &fresh, &held);
+        assert_eq!(plan.renamed[&old_rank1], sid(0x11, 1));
+        assert_eq!(plan.held, HashSet::from([sid(0x11, 1)]));
+        assert_eq!(
+            classify(&plan.baseline, &fresh, &plan.held),
+            InventoryDelta::FreeCapacityChanged
+        );
+    }
+
+    #[test]
+    fn a_re_encoding_converges_when_every_changed_id_is_held() {
+        use std::collections::HashSet;
+        // DPX with partition 1 held: partition 0's id is the same in both
+        // encodings, so the only changed id is the held one.
+        let old_rank1 = (0x11 << 16) | (1 << 8);
+        let baseline = rset(8, 1, vec![gpu(0, sid(0x11, 0)), gpu(1, old_rank1)]);
+        let fresh = rset(8, 2, vec![gpu(0, sid(0x11, 0)), gpu(1, sid(0x11, 1))]);
+        let held: HashSet<u64> = [old_rank1].into();
+        let plan = plan_refresh(&baseline, &fresh, &held);
+        assert_eq!(plan.held, HashSet::from([sid(0x11, 1)]));
+        assert_eq!(
+            refresh_delta(&baseline, &fresh, &plan),
+            InventoryDelta::FreeCapacityChanged
+        );
+        assert_eq!(refresh_once(&baseline, &fresh, &held).gpus, fresh.gpus);
+    }
+
+    #[test]
+    fn a_legacy_held_partition_on_a_repartitioned_gpu_keeps_its_id_and_hides_the_gpu() {
+        use std::collections::HashSet;
+        let legacy_rank3 = (0x11 << 16) | (3 << 8);
+        let mut legacy: Vec<GpuResource> = (0..8)
+            .map(|f| gpu(f as u32, (0x11 << 16) | (f << 8)))
+            .collect();
+        legacy.push(gpu(8, sid(0x12, 0)));
+        let baseline = rset(8, 1, legacy);
+        let mut fresh = layout_node(4);
+        fresh.generation = 2;
+        let held: HashSet<u64> = [legacy_rank3].into();
+
+        let plan = plan_refresh(&baseline, &fresh, &held);
+        let reported = refresh_once(&baseline, &fresh, &held);
+
+        assert!(plan.renamed.is_empty());
+        assert_eq!(plan.held, held);
+        let ids: Vec<u64> = reported.gpus.iter().map(|g| g.stable_id).collect();
+        assert!(ids.contains(&legacy_rank3), "held device stays reported");
+        assert!(
+            !ids.iter().any(|id| id >> 16 == 0x11 && *id != legacy_rank3),
+            "no fresh partition of the held GPU is offered: {ids:#x?}"
+        );
+        assert!(ids.contains(&sid(0x12, 0)));
+    }
+
+    #[test]
+    fn a_job_on_unchanged_partition_zero_hides_no_sibling() {
+        use std::collections::HashSet;
+        let baseline = cpx_node(1);
+        let fresh = cpx_node(2);
+        let held: HashSet<u64> = [sid(0x11, 0)].into();
+        assert_eq!(refresh_once(&baseline, &fresh, &held).gpus.len(), 9);
+    }
+
+    /// The refresh loop with every register acked: what the controller has,
+    /// the fences committed with it, and the node's ledger.
+    struct Agent {
+        reported: ResourceSet,
+        fences: Fences,
+        ledger: spur_sched::cons_tres::NodeAllocation,
+    }
+
+    impl Agent {
+        fn new(inventory: ResourceSet, holders: &[(u32, u64)]) -> Self {
+            let mut ledger = spur_sched::cons_tres::NodeAllocation::new("n".into(), &inventory);
+            for &(job, id) in holders {
+                ledger.allocate_for_job(job, 1, 0, 0, &[id]).unwrap();
+                assert!(ledger.commit_job(job, 1));
+            }
+            Self {
+                reported: inventory,
+                fences: Fences::default(),
+                ledger,
+            }
+        }
+
+        fn ledger_ids(&self) -> Vec<u64> {
+            self.ledger.gpus.iter().map(|g| g.stable_id).collect()
+        }
+
+        fn held(&self) -> std::collections::HashSet<u64> {
+            self.ledger.allocated_gpu_ids().into_iter().collect()
+        }
+
+        fn tick(&mut self, fresh: &ResourceSet) {
+            self.tick_racing(fresh, |_| {});
+        }
+
+        /// A tick the debounce holds back: only the ledger's gate moves.
+        fn observe(&mut self, fresh: &ResourceSet) {
+            let tick = plan_tick(&self.reported, fresh, &self.held(), &self.fences);
+            self.ledger
+                .set_fenced(tick.ledger_fenced(&self.fences, &self.ledger_ids()));
+        }
+
+        /// One tick, with `race` run on the ledger between planning and applying.
+        fn tick_racing(
+            &mut self,
+            fresh: &ResourceSet,
+            race: impl FnOnce(&mut spur_sched::cons_tres::NodeAllocation),
+        ) {
+            let tick = plan_tick(&self.reported, fresh, &self.held(), &self.fences);
+            self.ledger
+                .set_fenced(tick.ledger_fenced(&self.fences, &self.ledger_ids()));
+            if tick.delta == InventoryDelta::Unchanged {
+                self.fences = tick.fences;
+                return;
+            }
+            race(&mut self.ledger);
+            let reported = tick.reported();
+            let change = apply_to_ledger(&mut self.ledger, &tick, &reported, &[]);
+            if change != spur_sched::cons_tres::CapacityChange::Applied {
+                return;
+            }
+            self.reported = reported;
+            self.fences = tick.fences;
+        }
+
+        /// Free ids on GPU `bus` a dispatch could be handed.
+        fn offered(&self, bus: u64) -> Vec<u64> {
+            let held = self.held();
+            self.reported
+                .gpus
+                .iter()
+                .map(|g| g.stable_id)
+                .filter(|id| id >> 16 == bus && !held.contains(id))
+                .collect()
+        }
+
+        fn on_gpu(&self, bus: u64) -> Vec<u64> {
+            self.reported
+                .gpus
+                .iter()
+                .map(|g| g.stable_id)
+                .filter(|id| id >> 16 == bus)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_repartitioned_gpu_stays_fenced_until_its_last_old_holder_exits() {
+        let dpx = layout_node(2);
+        let mut agent = Agent::new(layout_node(8), &[(1, sid(0x11, 0)), (2, sid(0x11, 1))]);
+        for _ in 0..4 {
+            agent.tick(&dpx);
+            assert_eq!(agent.on_gpu(0x11), vec![sid(0x11, 0), sid(0x11, 1)]);
+        }
+
+        // DPX rank 0 overlaps the old CPX rank 1 job 2 still runs on.
+        assert!(agent.ledger.release_job(1));
+        for _ in 0..4 {
+            agent.tick(&dpx);
+            assert_eq!(agent.on_gpu(0x11), vec![sid(0x11, 1)]);
+            assert!(agent.offered(0x11).is_empty());
+        }
+        assert!(agent
+            .reported
+            .gpus
+            .iter()
+            .any(|g| g.stable_id == sid(0x12, 0)));
+
+        assert!(agent.ledger.release_job(2));
+        agent.tick(&dpx);
+        assert_eq!(agent.reported.gpus, dpx.gpus);
+        assert_eq!(agent.fences, Fences::default());
+    }
+
+    #[test]
+    fn a_tick_pins_the_held_ids_whose_silicon_changed_and_not_intact_ones() {
+        let held: HashSet<u64> = [sid(0x11, 0), sid(0x11, 1), sid(0x12, 0)].into();
+        let tick = plan_tick(&layout_node(8), &layout_node(2), &held, &Fences::default());
+        assert_eq!(tick.delta, InventoryDelta::AllocatedDevicesLost);
+        assert_eq!(
+            tick.pinned_ids(),
+            HashSet::from([sid(0x11, 0), sid(0x11, 1)])
+        );
+        let none_held = plan_tick(
+            &layout_node(8),
+            &layout_node(2),
+            &HashSet::new(),
+            &Fences::default(),
+        );
+        assert!(none_held.pinned_ids().is_empty());
+    }
+
+    /// The repartitioned GPU sorts last, so a fence that keeps every old
+    /// partition reports exactly what was reported before.
+    fn split_last_gpu(partitions: u64) -> ResourceSet {
+        let mut gpus = vec![gpu(0, sid(0x11, 0))];
+        gpus.extend((0..partitions).map(|r| gpu(r as u32 + 1, sid(0x12, r))));
+        rset(8, 1, gpus)
+    }
+
+    #[test]
+    fn a_fence_that_changes_nothing_reported_still_guards_a_released_id() {
+        let cpx = split_last_gpu(8);
+        let mut agent = Agent::new(split_last_gpu(2), &[(1, sid(0x12, 0)), (2, sid(0x12, 1))]);
+        let tick = plan_tick(&agent.reported, &cpx, &agent.held(), &agent.fences);
+        assert_eq!(tick.delta, InventoryDelta::Unchanged);
+        agent.tick(&cpx);
+        assert!(agent.ledger.release_job(1));
+
+        assert_eq!(
+            agent.ledger.allocate_for_job(3, 1, 0, 0, &[sid(0x12, 0)]),
+            Err(spur_sched::cons_tres::AllocError::GpusUnavailable)
+        );
+        agent.tick(&cpx);
+        agent.tick(&cpx);
+        assert_eq!(agent.on_gpu(0x12), vec![sid(0x12, 1)]);
+    }
+
+    #[test]
+    fn a_repartition_seen_once_gates_every_old_id_of_the_gpu() {
+        use spur_sched::cons_tres::AllocError;
+        let dpx = layout_node(2);
+        let mut agent = Agent::new(layout_node(8), &[(1, sid(0x11, 0)), (2, sid(0x11, 1))]);
+        agent.observe(&dpx);
+        assert!(agent.ledger.release_job(1));
+        agent.observe(&dpx);
+
+        for id in [sid(0x11, 0), sid(0x11, 5)] {
+            assert_eq!(
+                agent.ledger.allocate_for_job(3, 1, 0, 0, &[id]),
+                Err(AllocError::GpusUnavailable),
+                "{id:#x}"
+            );
+        }
+        assert!(agent
+            .ledger
+            .allocate_for_job(4, 1, 0, 0, &[sid(0x12, 0)])
+            .is_ok());
+    }
+
+    #[test]
+    fn positional_gpus_are_never_gated() {
+        let positional = |n: u32| rset(8, 1, (0..n).map(|i| gpu(i, i as u64)).collect());
+        let mut agent = Agent::new(positional(8), &[(1, 0)]);
+        agent.observe(&positional(7));
+        assert!(agent.ledger.allocate_for_job(2, 1, 0, 0, &[3]).is_ok());
+    }
+
+    #[test]
+    fn a_repartition_nothing_holds_is_not_gated() {
+        let dpx = layout_node(2);
+        let mut agent = Agent::new(layout_node(8), &[]);
+        agent.observe(&dpx);
+        assert!(agent
+            .ledger
+            .allocate_for_job(3, 1, 0, 0, &[sid(0x11, 5)])
+            .is_ok());
+        assert!(agent.ledger.release_job(3));
+        agent.tick(&dpx);
+        assert_eq!(agent.reported.gpus, dpx.gpus);
+    }
+
+    #[test]
+    fn the_tick_that_lifts_a_fence_offers_the_new_layout_at_once() {
+        use spur_sched::cons_tres::AllocError;
+        let dpx = layout_node(2);
+        let mut lifted = Agent::new(layout_node(8), &[(1, sid(0x11, 0))]);
+        lifted.tick(&dpx);
+        assert!(lifted.ledger.release_job(1));
+        lifted.tick(&dpx);
+        assert_eq!(lifted.reported.gpus, dpx.gpus);
+        // DPX rank 0 reuses the id the fence pinned.
+        for id in [sid(0x11, 0), sid(0x11, 1)] {
+            assert!(
+                lifted.ledger.allocate_for_job(3, 1, 0, 0, &[id]).is_ok(),
+                "{id:#x}"
+            );
+            assert!(lifted.ledger.release_job(3));
+        }
+
+        let mut held = Agent::new(layout_node(8), &[(1, sid(0x11, 0)), (2, sid(0x11, 1))]);
+        held.tick(&dpx);
+        assert!(held.ledger.release_job(1));
+        held.tick(&dpx);
+        assert!(held
+            .ledger
+            .allocate_for_job(3, 1, 0, 0, &[sid(0x11, 0)])
+            .is_err());
+        assert_eq!(
+            held.ledger.allocate_for_job(3, 1, 0, 0, &[sid(0x11, 1)]),
+            Err(AllocError::GpusUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_deferred_refresh_keeps_a_released_id_fenced() {
+        let mut agent = Agent::new(layout_node(8), &[(1, sid(0x11, 0)), (2, sid(0x11, 1))]);
+        agent.tick(&layout_node(2));
+        assert!(agent.ledger.release_job(1));
+
+        // GPU 0x12 drops out while a launch takes it, so the apply defers.
+        let mut without_0x12 = layout_node(2);
+        without_0x12.gpus.retain(|g| g.stable_id >> 16 != 0x12);
+        agent.tick_racing(&without_0x12, |ledger| {
+            ledger
+                .allocate_for_job(3, 1, 0, 0, &[sid(0x12, 0)])
+                .unwrap();
+        });
+
+        assert_eq!(
+            agent.ledger.allocate_for_job(4, 1, 0, 0, &[sid(0x11, 0)]),
+            Err(spur_sched::cons_tres::AllocError::GpusUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_released_fenced_id_cannot_be_dispatched_before_the_next_refresh() {
+        let dpx = layout_node(2);
+        let mut agent = Agent::new(layout_node(8), &[(1, sid(0x11, 0)), (2, sid(0x11, 1))]);
+        agent.tick(&dpx);
+        assert!(agent.ledger.release_job(1));
+
+        assert_eq!(
+            agent.ledger.allocate_for_job(3, 1, 0, 0, &[sid(0x11, 0)]),
+            Err(spur_sched::cons_tres::AllocError::GpusUnavailable)
+        );
+        agent.tick(&dpx);
+        assert_eq!(agent.on_gpu(0x11), vec![sid(0x11, 1)]);
+    }
+
+    #[test]
+    fn no_repartition_offers_silicon_an_old_holder_still_uses_after_a_sibling_exits() {
+        for a in [1u64, 2, 4, 8] {
+            for b in [1u64, 2, 4, 8] {
+                if a == b {
+                    continue;
+                }
+                // Old ranks matching the new layout's hide the repartition.
+                let patterns: [Vec<u64>; 2] = [(0..a.min(b)).collect(), vec![0, a - 1]];
+                for ranks in patterns {
+                    let ranks: std::collections::BTreeSet<u64> = ranks.into_iter().collect();
+                    let holders: Vec<(u32, u64)> = ranks
+                        .into_iter()
+                        .enumerate()
+                        .map(|(job, p)| (job as u32 + 1, sid(0x11, p)))
+                        .collect();
+                    let mut fresh = layout_node(b);
+                    fresh.generation = 2;
+                    let mut agent = Agent::new(layout_node(a), &holders);
+                    for (exited, &(job, released)) in holders.iter().enumerate() {
+                        for _ in 0..3 {
+                            agent.tick(&fresh);
+                            for &(_, id) in &holders[exited..] {
+                                for offered in agent.offered(0x11) {
+                                    assert!(
+                                        !overlaps(a, id & 0xFF, b, offered & 0xFF),
+                                        "{a}->{b}: offered {offered:#x} over held {id:#x}"
+                                    );
+                                }
+                                assert!(agent.on_gpu(0x11).contains(&id), "{a}->{b}");
+                            }
+                        }
+                        assert!(agent.ledger.release_job(job));
+                        assert_eq!(
+                            agent.ledger.allocate_for_job(99, 1, 0, 0, &[released]),
+                            Err(spur_sched::cons_tres::AllocError::GpusUnavailable),
+                            "{a}->{b}: released {released:#x} offered before the refresh"
+                        );
+                    }
+                    agent.tick(&fresh);
+                    assert_eq!(agent.reported.gpus, fresh.gpus, "{a}->{b}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fences_carry_a_repartition_across_a_restart() {
+        let dpx = layout_node(2);
+        let mut agent = Agent::new(layout_node(8), &[(1, sid(0x11, 0)), (2, sid(0x11, 1))]);
+        agent.tick(&dpx);
+        assert!(agent.ledger.release_job(1));
+
+        // The saved baseline already lists only the pinned ids, which match
+        // DPX's ranks: only the saved fences still know the GPU changed.
+        let held = agent.held();
+        let out = startup_inventory(&dpx, Some(&agent.reported), &held, &agent.fences);
+        let on_gpu: Vec<u64> = out
+            .reported
+            .gpus
+            .iter()
+            .map(|g| g.stable_id)
+            .filter(|id| id >> 16 == 0x11)
+            .collect();
+        assert_eq!(on_gpu, vec![sid(0x11, 1)]);
+        assert_eq!(out.fences.pinned_ids(), held);
+    }
+
+    #[test]
+    fn a_retry_after_a_failed_register_keeps_every_held_id() {
+        use spur_sched::cons_tres::{CapacityChange, NodeAllocation};
+        use std::collections::HashSet;
+        // 0x11 is re-encoded in place; 0x12 is repartitioned under a job.
+        let old_rank1 = (0x11 << 16) | (1 << 8);
+        let old = rset(
             8,
             1,
             vec![
                 gpu(0, sid(0x11, 0)),
                 gpu(1, old_rank1),
-                gpu(8, sid(0x12, 0)),
+                gpu(2, sid(0x12, 0)),
             ],
         );
-        let fresh = cpx_node(2);
-        let held: HashSet<u64> = [sid(0x11, 0), old_rank1].into_iter().collect();
-
-        let delta = classify(&baseline, &fresh, &held);
-        let fp = fresh.schedulable_fingerprint();
-        let (first, armed) = next_refresh_action(
-            &delta,
-            &fp,
-            &InventoryDelta::Unchanged,
-            &baseline.schedulable_fingerprint(),
+        let fresh = rset(
+            8,
+            2,
+            vec![
+                gpu(0, sid(0x11, 0)),
+                gpu(1, sid(0x11, 1)),
+                gpu(2, sid(0x12, 0)),
+                gpu(3, sid(0x12, 1)),
+            ],
         );
-        let (second, _) = next_refresh_action(&delta, &fp, &armed, &fp);
-        let reconciled = reconcile_free_pool(&fresh, &baseline, &held);
+        let mut ledger = NodeAllocation::new("n".into(), &old);
+        for (job, id) in [(1, old_rank1), (2, sid(0x12, 0))] {
+            ledger.allocate_for_job(job, 1, 1, 0, &[id]).unwrap();
+            assert!(ledger.commit_job(job, 1));
+        }
+        let held = |l: &NodeAllocation| l.allocated_gpu_ids().into_iter().collect::<HashSet<_>>();
 
-        assert_eq!(delta, InventoryDelta::AllocatedDevicesLost);
-        assert_eq!(first, RefreshAction::Wait);
-        assert_eq!(second, RefreshAction::ReportLost);
-        let ids: HashSet<u64> = reconciled.gpus.iter().map(|g| g.stable_id).collect();
-        assert!(ids.contains(&sid(0x11, 0)) && ids.contains(&old_rank1));
-        assert!((1..8).all(|r| !ids.contains(&sid(0x11, r))));
-        assert!(ids.contains(&sid(0x12, 0)));
-        assert_eq!(ids.len(), 3);
+        // The first attempt renames the ledger; its register fails, so `old` stays.
+        let before = held(&ledger);
+        ledger.rename_gpus(&plan_refresh(&old, &fresh, &before).renamed);
+        let reported = refresh_once(&old, &fresh, &before);
+        assert_eq!(ledger.update_capacity(&reported), CapacityChange::Applied);
+
+        let retried = refresh_once(&old, &fresh, &held(&ledger));
+        let ids: HashSet<u64> = retried.gpus.iter().map(|g| g.stable_id).collect();
+        assert!(ids.contains(&sid(0x11, 1)) && ids.contains(&sid(0x12, 0)));
+        assert_eq!(ledger.update_capacity(&retried), CapacityChange::Applied);
     }
 
     #[test]
@@ -2816,7 +3875,8 @@ mod tests {
             generation: 8,
             ..resources
         };
-        let mut publish = Box::pin(reporter.publish_resources(&allocation, fresh));
+        let fences = Fences::default();
+        let mut publish = Box::pin(reporter.publish_resources(&allocation, fresh, &fences));
         assert!(matches!(
             publish
                 .as_mut()
@@ -2967,5 +4027,169 @@ mod tests {
             DEFAULT_INVENTORY_REFRESH_SECS
         );
         assert_eq!(parse_refresh_secs(Some("5".into())), 5);
+    }
+
+    #[test]
+    fn startup_without_a_baseline_translates_legacy_cpx_ids() {
+        use std::collections::HashSet;
+        let fresh = cpx_node(1);
+        let held: HashSet<u64> = [(0x11 << 16) | (3 << 8)].into();
+        let out = startup_inventory(&fresh, None, &held, &Fences::default());
+        assert_eq!(out.renamed[&((0x11 << 16) | (3 << 8))], sid(0x11, 3));
+        assert_eq!(out.reported.gpus, fresh.gpus);
+    }
+
+    #[test]
+    fn startup_with_a_baseline_fences_a_gpu_repartitioned_while_stopped() {
+        use std::collections::HashSet;
+        for (a, b) in [(1u64, 8u64), (8, 1), (2, 4), (4, 8), (8, 2)] {
+            let baseline = layout_node(a);
+            let fresh = layout_node(b);
+            let held: HashSet<u64> = [sid(0x11, a - 1)].into();
+            let out = startup_inventory(&fresh, Some(&baseline), &held, &Fences::default());
+            let on_gpu: Vec<u64> = out
+                .reported
+                .gpus
+                .iter()
+                .map(|g| g.stable_id)
+                .filter(|id| id >> 16 == 0x11)
+                .collect();
+            assert_eq!(on_gpu, vec![sid(0x11, a - 1)], "{a}->{b}");
+        }
+    }
+
+    #[test]
+    fn startup_without_a_baseline_pins_a_held_id_whose_gpu_is_still_there() {
+        use std::collections::HashSet;
+        let fresh = layout_node(1); // was CPX, now SPX
+        let held: HashSet<u64> = [sid(0x11, 7)].into();
+        let out = startup_inventory(&fresh, None, &held, &Fences::default());
+        let on_gpu: Vec<u64> = out
+            .reported
+            .gpus
+            .iter()
+            .map(|g| g.stable_id)
+            .filter(|id| id >> 16 == 0x11)
+            .collect();
+        assert_eq!(on_gpu, vec![sid(0x11, 7)]);
+    }
+
+    #[test]
+    fn startup_without_a_baseline_keeps_the_siblings_of_an_intact_held_gpu() {
+        use std::collections::HashSet;
+        let mut fresh = layout_node(8);
+        fresh.gpus.retain(|g| g.stable_id != sid(0x12, 0));
+        fresh.gpus.push(gpu(9, sid(0x13, 0)));
+        let held: HashSet<u64> = [sid(0x11, 2), sid(0x12, 0)].into();
+        let out = startup_inventory(&fresh, None, &held, &Fences::default());
+        let ids: Vec<u64> = out.reported.gpus.iter().map(|g| g.stable_id).collect();
+        assert_eq!(
+            ids,
+            fresh.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>()
+        );
+        assert!(out.renamed.is_empty());
+    }
+
+    #[test]
+    fn startup_with_nothing_held_reports_the_fresh_inventory() {
+        let fresh = layout_node(8);
+        let out = startup_inventory(
+            &fresh,
+            Some(&layout_node(1)),
+            &Default::default(),
+            &Fences::default(),
+        );
+        assert_eq!(out.reported.gpus, fresh.gpus);
+        assert!(out.renamed.is_empty());
+    }
+
+    #[test]
+    fn the_baseline_round_trips_through_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_baseline(dir.path()).is_none());
+        save_baseline(dir.path(), &cpx_node(3));
+        assert_eq!(load_baseline(dir.path()), Some(cpx_node(3)));
+    }
+
+    #[tokio::test]
+    async fn publishing_resources_saves_them_as_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = test_reporter(cpx_node(1)).with_baseline_dir(dir.path().to_path_buf());
+        let allocation = Mutex::new(NodeAllocation::new("n".into(), &cpx_node(1)));
+        let fences = Fences {
+            anchors: [(sid(0x11, 0), vec![gpu(1, sid(0x11, 1))])].into(),
+        };
+        reporter
+            .publish_resources(&allocation, layout_node(2), &fences)
+            .await;
+        assert_eq!(load_baseline(dir.path()), Some(layout_node(2)));
+        assert_eq!(load_fences(dir.path()), fences);
+        assert_eq!(reporter.fences(), fences);
+    }
+
+    #[tokio::test]
+    async fn a_baseline_is_not_saved_without_its_fences() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(FENCES_FILE)).unwrap();
+        let reporter = test_reporter(cpx_node(1)).with_baseline_dir(dir.path().to_path_buf());
+        let allocation = Mutex::new(NodeAllocation::new("n".into(), &cpx_node(1)));
+        reporter
+            .publish_resources(&allocation, layout_node(2), &Fences::default())
+            .await;
+        assert!(load_baseline(dir.path()).is_none());
+    }
+
+    #[test]
+    fn a_fence_is_reported_once_when_it_outlives_the_limit() {
+        let hour = Duration::from_secs(3600);
+        let fenced = Fences {
+            anchors: [(sid(0x11, 0), vec![gpu(1, sid(0x11, 1))])].into(),
+        };
+        let start = Instant::now();
+        let mut ages = FenceAges::default();
+        assert!(ages.overdue(&fenced, start, hour).is_empty());
+        assert_eq!(
+            ages.overdue(&fenced, start + 2 * hour, hour),
+            vec![sid(0x11, 0)]
+        );
+        assert!(ages.overdue(&fenced, start + 3 * hour, hour).is_empty());
+
+        assert!(ages
+            .overdue(&Fences::default(), start + 4 * hour, hour)
+            .is_empty());
+        assert!(ages.overdue(&fenced, start + 4 * hour, hour).is_empty());
+        assert!(ages
+            .overdue(&fenced, start + 4 * hour + hour / 2, hour)
+            .is_empty());
+    }
+
+    #[test]
+    fn committing_fences_alone_saves_and_holds_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let reporter = test_reporter(cpx_node(1)).with_baseline_dir(dir.path().to_path_buf());
+        let fences = Fences {
+            anchors: [(sid(0x11, 0), vec![gpu(0, sid(0x11, 0))])].into(),
+        };
+        assert!(reporter.commit_fences(&fences));
+        assert_eq!(load_fences(dir.path()), fences);
+        assert_eq!(reporter.fences(), fences);
+        assert!(load_baseline(dir.path()).is_none());
+    }
+
+    #[test]
+    fn fences_round_trip_through_their_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_fences(dir.path()), Fences::default());
+        let fences = Fences {
+            anchors: [(
+                sid(0x11, 0),
+                vec![gpu(0, sid(0x11, 0)), gpu(1, sid(0x11, 1))],
+            )]
+            .into(),
+        };
+        save_fences(dir.path(), &fences);
+        assert_eq!(load_fences(dir.path()), fences);
+        std::fs::write(dir.path().join(FENCES_FILE), b"{").unwrap();
+        assert_eq!(load_fences(dir.path()), Fences::default());
     }
 }
