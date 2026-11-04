@@ -984,3 +984,31 @@ fn a_memory_driven_cpu_raise_counts_toward_the_cpu_cap() {
     let o = overshoot(&sched, 1).expect("the cap is reported");
     assert_eq!((o.resource.as_str(), o.requested, o.limit), ("cpu", 6, 4));
 }
+
+#[test]
+fn array_tasks_are_charged_one_by_one_against_the_cap() {
+    let fx = Fixture::new(
+        vec![node("n1", 64, 256_000, &["array"])],
+        vec![partition("array", &[("cpu", 4)])],
+    );
+    let tasks: Vec<Job> = (0..10u32)
+        .map(|task| {
+            let mut j = job(100 + task, "array", 1, 1);
+            j.spec.array_job_id = Some(99);
+            j.spec.array_task_id = Some(task);
+            j
+        })
+        .collect();
+
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &tasks);
+    assert_eq!(started(&a), [100, 101, 102, 103]);
+    for id in 104..110 {
+        let o = overshoot(&sched, id).expect("every waiting task names the cap");
+        assert_eq!(
+            (o.resource.as_str(), o.used, o.requested, o.limit),
+            ("cpu", 4, 1, 4),
+            "task {id}"
+        );
+    }
+}
