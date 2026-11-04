@@ -4,7 +4,7 @@
 //! Download + install a pinned k0s release binary from GitHub so `spur k8s up` is self-contained
 //! on bare-metal nodes.
 //!
-//! k0s ships one raw binary per arch (`k0s-<version>-<arch>`, e.g. `k0s-v1.36.2+k0s.0-amd64`) plus a
+//! k0s ships one raw binary per arch (`k0s-<version>-<arch>`, e.g. `k0s-v1.36.5+k0s.0-amd64`) plus a
 //! combined `sha256sums.txt` (lines are `<hex>  <name>` or `<hex> *<name>` in binary mode). This
 //! fetches the binary for the host arch, verifies its SHA-256 against that manifest, and installs
 //! it atomically (write temp -> chmod 0755 -> rename over dest). Version-agnostic: the caller
@@ -35,7 +35,7 @@ fn host_arch() -> Result<&'static str> {
     }
 }
 
-/// The k0s asset filename for `version` on the host arch, e.g. `k0s-v1.36.2+k0s.0-amd64`.
+/// The k0s asset filename for `version` on the host arch, e.g. `k0s-v1.36.5+k0s.0-amd64`.
 pub fn asset_name(version: &str) -> Result<String> {
     Ok(format!("k0s-{version}-{}", host_arch()?))
 }
@@ -184,20 +184,20 @@ mod tests {
 
     #[test]
     fn asset_name_is_k0s_version_arch() {
-        let n = asset_name("v1.36.2+k0s.0").unwrap();
-        assert!(n.starts_with("k0s-v1.36.2+k0s.0-"), "got {n}");
+        let n = asset_name("v1.36.5+k0s.0").unwrap();
+        assert!(n.starts_with("k0s-v1.36.5+k0s.0-"), "got {n}");
         assert!(n.ends_with("amd64") || n.ends_with("arm64"), "got {n}");
     }
 
     #[test]
     fn expected_hash_binary_mode() {
-        let sums = "8b5d985f *k0s-v1.36.2+k0s.0-amd64\nb00b425a *k0s-v1.36.2+k0s.0-arm64\n";
+        let sums = "8b5d985f *k0s-v1.36.5+k0s.0-amd64\nb00b425a *k0s-v1.36.5+k0s.0-arm64\n";
         assert_eq!(
-            expected_hash(sums, "k0s-v1.36.2+k0s.0-amd64").unwrap(),
+            expected_hash(sums, "k0s-v1.36.5+k0s.0-amd64").unwrap(),
             "8b5d985f"
         );
         assert_eq!(
-            expected_hash(sums, "k0s-v1.36.2+k0s.0-arm64").unwrap(),
+            expected_hash(sums, "k0s-v1.36.5+k0s.0-arm64").unwrap(),
             "b00b425a"
         );
     }

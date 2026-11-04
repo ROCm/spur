@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// k0s release SPUR installs/runs by default — pinned to a known-good version and bumped with each
 /// spur release. Override per node via `[cluster] k0s_version` (accepts a tag or "latest").
-pub const K0S_PINNED_VERSION: &str = "v1.36.2+k0s.0";
+pub const K0S_PINNED_VERSION: &str = "v1.36.5+k0s.0";
 
 /// Default filesystem path for the k0s binary (install target + what the spurd-owned unit runs).
 pub const K0S_DEFAULT_BINARY: &str = "/usr/local/bin/k0s";
