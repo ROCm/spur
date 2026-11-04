@@ -6098,6 +6098,9 @@ impl SlurmAgent for AgentService {
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                 }));
             }
+            if let Some(allocation) = req.allocated.as_ref() {
+                self.check_dispatch_allocation(allocation).await?;
+            }
             // Before reserving: the reservation drops the old run's ledger entry, which a
             // failed fence would otherwise leave its still-running workload without.
             fence_displaced_run(
@@ -7302,6 +7305,10 @@ impl SlurmAgent for AgentService {
         let supervise_allocation = !self.force_legacy_launch;
         #[cfg(not(test))]
         let supervise_allocation = true;
+        let allocated = req.allocated.as_ref();
+        if let Some(allocation) = allocated {
+            self.check_dispatch_allocation(allocation).await?;
+        }
         // Refuses a duplicate before fencing or reserving anything.
         if tracks_run_at_or_after(&*self.running.lock().await, req.job_id, req.run_attempt) {
             return Err(Status::already_exists(format!(
@@ -7309,23 +7316,6 @@ impl SlurmAgent for AgentService {
                 req.job_id
             )));
         }
-        // Before reserving, for the same reason as the batch launch.
-        if supervise_allocation {
-            fence_older_runs(
-                &self.stepds,
-                &self.step_completions,
-                req.job_id,
-                req.run_attempt,
-            )
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!(
-                    "failed to fence displaced stepd before allocation launch: {error}"
-                ))
-            })?;
-        }
-
-        let allocated = req.allocated.as_ref();
         // The generation check is performed under the allocation lock below, so a
         // refresh publish cannot slip a newer topology between it and the bind.
         let mut controller_gpu_ids: Vec<u64> = allocated
@@ -7353,6 +7343,21 @@ impl SlurmAgent for AgentService {
             .map(|p| p.device_paths.clone())
             .unwrap_or_default();
 
+        // Before reserving, for the same reason as the batch launch.
+        if supervise_allocation {
+            fence_older_runs(
+                &self.stepds,
+                &self.step_completions,
+                req.job_id,
+                req.run_attempt,
+            )
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "failed to fence displaced stepd before allocation launch: {error}"
+                ))
+            })?;
+        }
         if let Some(allocation) = allocated {
             self.check_dispatch_allocation(allocation).await?;
         }
@@ -11525,6 +11530,49 @@ mod tests {
 
         assert_eq!(refused.code(), tonic::Code::Unavailable);
         assert_run_one_kept(&svc, spur_core::step::STEP_EXTERN).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_dispatch_does_not_fence_an_older_run() {
+        for step_id in [spur_core::step::STEP_BATCH, spur_core::step::STEP_EXTERN] {
+            let (svc, _, mut allocation) = fabric_dispatch_fixture();
+            let svc = svc.with_supervised_launch();
+            allocation.generation += 1;
+            let cgroup_root = tempfile::tempdir().expect("cgroup root");
+            seed_unfenceable_run(&svc, step_id, &cgroup_root).await;
+
+            let refused = if step_id == spur_core::step::STEP_BATCH {
+                svc.launch_job(Request::new(LaunchJobRequest {
+                    job_id: 79,
+                    run_attempt: 2,
+                    spec: Some(JobSpec {
+                        uid: 1000,
+                        name: "j".into(),
+                        script: "#!/bin/bash\ntrue\n".into(),
+                        num_tasks: 1,
+                        num_nodes: 1,
+                        cpus_per_task: 1,
+                        ..Default::default()
+                    }),
+                    allocated: Some(allocation),
+                    ..Default::default()
+                }))
+                .await
+                .expect_err("stale dispatch must be refused")
+            } else {
+                svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                    job_id: 79,
+                    run_attempt: 2,
+                    allocated: Some(allocation),
+                    ..Default::default()
+                }))
+                .await
+                .expect_err("stale dispatch must be refused")
+            };
+
+            assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+            assert_run_one_kept(&svc, step_id).await;
+        }
     }
 
     /// A late launch of an older run must not claim any slot of a job whose newer run is
