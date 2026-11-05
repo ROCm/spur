@@ -2297,11 +2297,10 @@ mod tests {
         job.transition(JobState::Cancelled).unwrap();
     }
 
-    // Frozen pre-`cancel_signaled_at` payload: replay of an older Raft log or
-    // snapshot must still deserialize, or spurctld crashes on restart.
-    #[test]
-    fn job_deserializes_without_cancel_signaled_at_field() {
-        let json = r#"{
+    /// A job as an older controller serialized it, before `cancel_signaled_at` and
+    /// `preempt_pending` existed. Never regenerate: a failure means the new field
+    /// needs a default, not a new fixture.
+    const FROZEN_PRE_GRACE_JOB: &str = r#"{
             "job_id": 7,
             "spec": {
                 "name": "old", "user": "alice", "uid": 0, "gid": 0,
@@ -2346,6 +2345,12 @@ mod tests {
             "time_limit_signaled_at": null,
             "suspended_secs": 0
         }"#;
+
+    // Replay of an older Raft log or snapshot must still deserialize, or
+    // spurctld crashes on restart.
+    #[test]
+    fn job_deserializes_without_cancel_signaled_at_field() {
+        let json = FROZEN_PRE_GRACE_JOB;
         let job: Job = serde_json::from_str(json).unwrap();
         assert_eq!(job.job_id, 7);
         assert_eq!(job.state, JobState::Running);
@@ -2354,11 +2359,16 @@ mod tests {
     }
 
     #[test]
-    fn job_without_preempt_pending_deserializes() {
+    fn a_frozen_job_from_before_preempt_pending_has_no_grace() {
+        let job: Job = serde_json::from_str(FROZEN_PRE_GRACE_JOB).unwrap();
+        assert!(job.preempt_pending.is_none());
+        assert!(job.preempt_grace().is_none());
+    }
+
+    #[test]
+    fn a_job_without_a_grace_omits_preempt_pending_when_serialized() {
         let json = serde_json::to_value(make_job()).unwrap();
         assert!(json.get("preempt_pending").is_none());
-        let back: Job = serde_json::from_value(json).unwrap();
-        assert!(back.preempt_pending.is_none());
     }
 
     #[test]

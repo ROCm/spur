@@ -580,12 +580,15 @@ mod tests {
         assert_eq!(back.k0s_last_error, None);
     }
 
+    // Frozen pre-`capabilities` node as stored in a Raft snapshot; it must still
+    // load or a new controller cannot restore an old snapshot. Never regenerate.
     #[test]
     fn a_node_snapshot_without_capabilities_still_deserializes() {
-        let node = Node::new("n1".into(), ResourceSet::default());
-        let mut value = serde_json::to_value(&node).expect("serialize node");
-        value.as_object_mut().unwrap().remove("capabilities");
-        let back: Node = serde_json::from_value(value).expect("deserialize node");
+        const NODE_PRE_CAPABILITIES: &str = r#"{"name":"n1","hostname":"host1","state":"IDLE","state_reason":null,"reason_uid":null,"reason_time":null,"admin_locked":false,"partitions":["gpu"],"source":{"type":"NativeHost"},"total_resources":{"cpus":8,"memory_mb":16000,"gpus":[],"generic":{},"generation":0,"fabric_binding_version":0,"block_file_revision":null},"detected_resources":{"cpus":8,"memory_mb":16000,"gpus":[],"generic":{},"generation":0,"fabric_binding_version":0,"block_file_revision":null},"alloc_resources":{"cpus":0,"memory_mb":0,"devices":{},"generation":0,"fabric_binding":null,"gpu_binding":null},"features":[],"labels":{},"arch":"x86_64","os":"linux","cpu_load":0,"free_memory_mb":16000,"boot_time":null,"last_busy":null,"agent_start_time":null,"last_heartbeat":null,"address":"10.0.0.1","port":6818,"wg_pubkey":null,"version":null,"weight":1,"switch_name":null,"k0s_role":null,"k0s_mesh_ip":null,"k0s_pod_cidr":null,"k0s_last_error":null}"#;
+        let back: Node = serde_json::from_str(NODE_PRE_CAPABILITIES)
+            .expect("a pre-capabilities node must load; a new field needs #[serde(default)]");
+        assert_eq!(back.name, "n1");
+        assert_eq!(back.total_resources.cpus, 8);
         assert!(back.capabilities.is_empty());
         assert!(!back.supports(CAP_SIGNAL_JOB));
     }
