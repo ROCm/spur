@@ -240,7 +240,7 @@ that still needs its nodes starts a fresh grace.
 The kill waits do not yet reach `srun` steps: when a job is stopped (time limit, `scancel`, inactivity
 limit or preempt-cancel), `spurd` reports the job finished on the node within milliseconds while its
 `srun` steps are still running or already killed, so the controller ends the job and frees the node
-before the steps get their wait. Tracked in ROCm/spur#1180. Two e2e tests assert the intended
+before the steps get their wait. Two e2e tests assert the intended
 behaviour and are marked `xfail` until it is fixed (see the test inventory).
 
 ## Follow-ups

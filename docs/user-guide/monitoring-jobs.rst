@@ -1292,7 +1292,6 @@ time limit, where earlier releases gave it 2 seconds.
    outlive the job and keep running beside a newly placed job. This affects every
    stop that uses a kill wait: a time limit, the inactivity limit, ``scancel``,
    and the final kill of a preempted job. The preemption grace is not affected.
-   See `ROCm/spur#1180 <https://github.com/ROCm/spur/issues/1180>`__.
 
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
