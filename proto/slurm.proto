@@ -1086,6 +1086,8 @@ message RunningJobStatus {
   // controller converge its per-node used-view to the ids the job actually
   // occupies. Empty from an old agent or a job with no GPUs.
   repeated uint64 gpu_stable_ids = 4;
+  // The run this node holds, so a reclaim can target it alone. 0 from an old agent.
+  uint32 run_attempt = 5;
 }
 
 message HeartbeatResponse {}

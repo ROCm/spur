@@ -336,6 +336,7 @@ jobs:
           mkdir -p "$root/examples"
           cp -r tests "$root/"
           cp -r scripts "$root/"
+          cp -r proto "$root/"
           cp -r examples/k8s "$root/examples/"
 
       - name: Upload E2E assets

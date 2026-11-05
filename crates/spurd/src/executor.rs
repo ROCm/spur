@@ -113,7 +113,7 @@ pub(crate) fn classify_spool_error(
 use crate::container::ContainerConfig;
 
 /// Cgroup root for slurmd-managed jobs.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
+pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 
 /// Node-local spool root for spurd's per-job scratch (job script, namespace
 /// wrapper). Deliberately off the user's work_dir so these root-side writes

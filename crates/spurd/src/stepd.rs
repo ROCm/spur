@@ -2902,6 +2902,41 @@ impl StepdStore {
         })
     }
 
+    pub(crate) fn older_sessions(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> io::Result<Vec<StepdDescriptor>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let mut fields = name.split('.');
+            if fields.next().and_then(|v| v.parse::<u32>().ok()) != Some(job_id)
+                || fields
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .is_none_or(|v| v >= run_attempt)
+                || fields.next().and_then(|v| v.parse::<u32>().ok()).is_none()
+                || fields.next().is_some()
+            {
+                continue;
+            }
+            if !entry.file_type()?.is_dir() {
+                return Err(io::Error::other("runtime session is not a directory"));
+            }
+            // A damaged old descriptor cannot establish which supervisor must stop.
+            sessions.push(self.load_descriptor(&entry.path())?);
+        }
+        Ok(sessions)
+    }
+
     pub fn discover_unacknowledged_completions(&self) -> io::Result<Vec<PendingStepdCompletion>> {
         let mut completions = Vec::new();
         for session_dir in self.session_dirs()? {
@@ -3199,6 +3234,34 @@ impl StepdStore {
         }
         Ok(descriptor)
     }
+}
+
+/// What the same supervisor last published for this session. A copy taken at
+/// launch predates its workload pid and cgroup, which it republishes once started.
+pub(crate) fn republished(descriptor: &StepdDescriptor) -> Option<StepdDescriptor> {
+    let session_dir = descriptor.socket_path.parent()?;
+    let store = StepdStore {
+        root: session_dir.parent()?.to_path_buf(),
+    };
+    let published = match store.load_descriptor(session_dir) {
+        Ok(published) => published,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                %error,
+                "cannot read the supervisor's published runtime descriptor"
+            );
+            return None;
+        }
+    };
+    let same_supervisor = published.job_id == descriptor.job_id
+        && published.run_attempt == descriptor.run_attempt
+        && published.step_id == descriptor.step_id
+        && published.pid == descriptor.pid
+        && published.process_start_ticks == descriptor.process_start_ticks;
+    same_supervisor.then_some(published)
 }
 
 fn session_conflict(message: String) -> io::Error {
@@ -3599,6 +3662,35 @@ mod tests {
             PathBuf::from("/run/spur/runtime.sock"),
             PathBuf::from("/sys/fs/cgroup/spur/test"),
         )
+    }
+
+    #[test]
+    fn republished_takes_only_the_same_supervisors_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let mut at_launch = descriptor(9, 1, std::process::id());
+        at_launch.socket_path = store
+            .session_dir(9, 1, spur_core::step::STEP_BATCH)
+            .join("runtime.sock");
+        let mut started = at_launch.clone();
+        started.workload_pid = 4242;
+        store.publish(&started).expect("publish started descriptor");
+
+        assert_eq!(
+            republished(&at_launch).map(|published| published.workload_pid),
+            Some(4242),
+            "the supervisor's own later record names its workload"
+        );
+
+        let mut reused_pid = started.clone();
+        reused_pid.process_start_ticks += 1;
+        store
+            .publish(&reused_pid)
+            .expect("publish another supervisor");
+        assert!(
+            republished(&at_launch).is_none(),
+            "a record from another supervisor must not name this run's workload"
+        );
     }
 
     #[test]

@@ -58,16 +58,24 @@ fn write_recover<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     m.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Source of the job ids this node currently holds. The controller decides from
-/// its own authoritative state whether any reported id is stale.
-pub trait HeldJobs: Send + Sync {
-    fn held_job_ids(&self) -> Vec<u32>;
+/// The run a held job belongs to, so a reclaim can target that run alone.
+pub trait HeldRun {
+    fn run_attempt(&self) -> u32;
 }
 
-impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
-    fn held_job_ids(&self) -> Vec<u32> {
+/// Source of the (job id, run attempt) pairs this node currently holds. The
+/// controller decides from its own authoritative state whether any is stale.
+pub trait HeldJobs: Send + Sync {
+    fn held_jobs(&self) -> Vec<(u32, u32)>;
+}
+
+impl<T: HeldRun + Send> HeldJobs for Mutex<HashMap<u32, T>> {
+    fn held_jobs(&self) -> Vec<(u32, u32)> {
         match self.try_lock() {
-            Ok(jobs) => jobs.keys().copied().collect(),
+            Ok(jobs) => jobs
+                .iter()
+                .map(|(job_id, job)| (*job_id, job.run_attempt()))
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -273,9 +281,9 @@ impl NodeReporter {
         spur_net::wireguard::interface_public_key(&self.wg_iface).unwrap_or_default()
     }
 
-    /// Job ids this heartbeat would report, from the shared running map.
-    pub fn held_job_ids(&self) -> Vec<u32> {
-        self.held_jobs.held_job_ids()
+    /// (job id, run attempt) pairs this heartbeat would report, from the shared running map.
+    pub fn held_jobs(&self) -> Vec<(u32, u32)> {
+        self.held_jobs.held_jobs()
     }
 
     pub fn snapshot_resources(&self) -> ResourceSet {
@@ -402,7 +410,7 @@ impl NodeReporter {
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = read_recover(&self.node_token).clone();
-            let running_jobs = build_running_jobs(self.held_job_ids(), &self.held_job_gpu_ids());
+            let running_jobs = build_running_jobs(self.held_jobs(), &self.held_job_gpu_ids());
             let req = spur_proto::proto::HeartbeatRequest {
                 hostname: self.hostname.clone(),
                 cpu_load: load,
@@ -466,17 +474,16 @@ impl NodeReporter {
     }
 }
 
-/// Build the heartbeat's per-job status list. Each held job carries its
-/// translated GPU stable_ids (empty when it holds no GPUs), so the controller
-/// can converge its per-node used-view to what the job actually occupies.
+/// The heartbeat's per-job status list. Each job carries its run and translated GPU
+/// stable_ids, so the controller can reclaim that run and converge its used-view.
 fn build_running_jobs(
-    held_ids: Vec<u32>,
+    held: Vec<(u32, u32)>,
     gpu_ids: &HashMap<u32, Vec<u64>>,
 ) -> Vec<RunningJobStatus> {
-    held_ids
-        .into_iter()
-        .map(|job_id| RunningJobStatus {
+    held.into_iter()
+        .map(|(job_id, run_attempt)| RunningJobStatus {
             job_id,
+            run_attempt,
             gpu_stable_ids: gpu_ids.get(&job_id).cloned().unwrap_or_default(),
             ..Default::default()
         })
@@ -1631,8 +1638,7 @@ mod tests {
     fn build_running_jobs_carries_each_jobs_translated_gpu_ids() {
         // A held job reports the (translated) stable_ids its allocation owns; a
         // held job with no GPUs reports an empty list.
-        let mut held = vec![7u32, 9u32];
-        held.sort_unstable();
+        let held = vec![(7u32, 1u32), (9u32, 3u32)];
         let gpu_ids: HashMap<u32, Vec<u64>> = [(7u32, vec![0x63_0000u64, 0x83_0000u64])]
             .into_iter()
             .collect();
@@ -1643,6 +1649,11 @@ mod tests {
         assert_eq!(jobs[0].job_id, 7);
         assert_eq!(jobs[0].gpu_stable_ids, vec![0x63_0000, 0x83_0000]);
         assert_eq!(jobs[1].job_id, 9);
+        assert_eq!(
+            (jobs[0].run_attempt, jobs[1].run_attempt),
+            (1, 3),
+            "each job names the run it holds"
+        );
         assert!(
             jobs[1].gpu_stable_ids.is_empty(),
             "a job with no GPUs carries an empty list"
@@ -1676,12 +1687,20 @@ mod tests {
         assert!(reporter.held_job_gpu_ids().is_empty());
     }
 
+    struct CellRun(std::cell::Cell<u32>);
+
+    impl HeldRun for CellRun {
+        fn run_attempt(&self) -> u32 {
+            self.0.get()
+        }
+    }
+
     #[test]
-    fn held_job_ids_accepts_send_but_not_sync_values() {
+    fn held_jobs_accepts_send_but_not_sync_values() {
         // Cell is Send but !Sync; this fails to compile if the bound re-tightens to Sync.
-        let map: Mutex<HashMap<u32, std::cell::Cell<u8>>> =
-            Mutex::new(HashMap::from([(7, std::cell::Cell::new(0))]));
-        assert_eq!(map.held_job_ids(), vec![7]);
+        let map: Mutex<HashMap<u32, CellRun>> =
+            Mutex::new(HashMap::from([(7, CellRun(std::cell::Cell::new(2)))]));
+        assert_eq!(map.held_jobs(), vec![(7, 2)]);
     }
 
     fn test_reporter(resources: ResourceSet) -> NodeReporter {
@@ -1703,7 +1722,7 @@ mod tests {
             String::new(),
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
-            Arc::new(Mutex::new(HashMap::<u32, ()>::new())),
+            Arc::new(Mutex::new(HashMap::<u32, CellRun>::new())),
             ReporterTimeouts::default(),
         )
     }

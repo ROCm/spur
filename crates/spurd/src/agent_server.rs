@@ -15,6 +15,9 @@ use tracing::{error, info, trace, warn};
 #[cfg(test)]
 #[path = "cleanup_lifecycle_tests.rs"]
 mod cleanup_lifecycle_tests;
+#[cfg(test)]
+#[path = "run_fence_tests.rs"]
+mod run_fence_tests;
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -412,6 +415,28 @@ fn effective_cgroup_path(descriptor: &crate::stepd::StepdDescriptor) -> std::pat
     }
 }
 
+/// Fills in what a launch-time copy lacks from the supervisor's own record: its workload,
+/// and a cgroup that still exists. What the agent already holds wins.
+fn with_published_workload(
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> crate::stepd::StepdDescriptor {
+    let mut merged = descriptor.clone();
+    if merged.workload_pid != 0 && !merged.cgroup_path.as_os_str().is_empty() {
+        return merged;
+    }
+    let Some(published) = crate::stepd::republished(descriptor) else {
+        return merged;
+    };
+    if merged.workload_pid == 0 {
+        merged.workload_pid = published.workload_pid;
+        merged.workload_start_ticks = published.workload_start_ticks;
+    }
+    if merged.cgroup_path.as_os_str().is_empty() && published.cgroup_path.is_dir() {
+        merged.cgroup_path = published.cgroup_path;
+    }
+    merged
+}
+
 /// Whether a torn-down stepd is confirmed dead. A recorded cgroup path is
 /// authoritative — a successful stop signal only reaches the supervisor, which
 /// by design ignores a raw SIGTERM for its job's cgroup.
@@ -419,16 +444,17 @@ async fn runtime_teardown_confirmed(
     descriptor: &crate::stepd::StepdDescriptor,
     stop_result: &std::io::Result<()>,
 ) -> bool {
+    let descriptor = &with_published_workload(descriptor);
     // A derived path is still worth reaping — the supervisor may have created
     // the cgroup before dying — but its absence proves nothing, since it may
     // never have existed, so the workload itself has to answer for its death.
     if descriptor.cgroup_path.as_os_str().is_empty() {
-        runtime_cgroup_reaped(&effective_cgroup_path(descriptor));
-        return stop_result.is_ok() && workload_confirmed_gone(descriptor).await;
+        let reaped = runtime_cgroup_reaped(&effective_cgroup_path(descriptor)).await;
+        return reaped && stop_result.is_ok() && workload_confirmed_gone(descriptor).await;
     }
     // The retrying rmdir only succeeds once the cgroup is empty, so its
     // absence is what confirms the job's processes are actually gone.
-    runtime_cgroup_reaped(&descriptor.cgroup_path)
+    runtime_cgroup_reaped(&descriptor.cgroup_path).await
 }
 
 /// With no cgroup to watch empty, killing the supervisor says nothing about the
@@ -465,9 +491,19 @@ async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> 
 }
 
 /// Reap a supervisor's cgroup and report whether it is confirmed gone.
-fn runtime_cgroup_reaped(cgroup_path: &std::path::Path) -> bool {
-    crate::executor::cleanup_cgroup(cgroup_path);
-    !cgroup_path.exists()
+async fn runtime_cgroup_reaped(cgroup_path: &std::path::Path) -> bool {
+    match crate::cgroup_cleanup::wait_until_reaped(
+        cgroup_path,
+        WORKLOAD_DEATH_POLL_INTERVAL * WORKLOAD_DEATH_POLLS,
+    )
+    .await
+    {
+        Ok(reaped) => reaped,
+        Err(error) => {
+            warn!(path = %cgroup_path.display(), %error, "failed to reap runtime cgroup");
+            false
+        }
+    }
 }
 
 /// Supervisors are per (job, step): a job may hold several at once.
@@ -715,12 +751,20 @@ async fn fence_displaced_stepd(
         return Ok(());
     };
     displaced_runtime_attempt(&displaced, run_attempt)?;
-    let stop_result = stop_stepd_process(&displaced).await;
-    if !runtime_teardown_confirmed(&displaced, &stop_result).await {
+    fence_stepd(stepds, &displaced).await
+}
+
+/// Stops `displaced`, confirms its workload is gone, then drops its entry if still current.
+async fn fence_stepd(
+    stepds: &Arc<Mutex<StepdMap>>,
+    displaced: &crate::stepd::StepdDescriptor,
+) -> std::io::Result<()> {
+    let stop_result = stop_stepd_process(displaced).await;
+    if !runtime_teardown_confirmed(displaced, &stop_result).await {
         return match stop_result {
             Err(error) => Err(error),
             Ok(()) => Err(std::io::Error::other(
-                "could not confirm the displaced stepd's cgroup is empty",
+                "could not confirm the displaced stepd's workload is gone",
             )),
         };
     }
@@ -729,12 +773,143 @@ async fn fence_displaced_stepd(
     // was in flight, and that entry must not be dropped.
     let mut sessions = stepds.lock().await;
     if sessions
-        .get(&(job_id, step_id))
-        .is_some_and(|current| stepd_is_current(current, &displaced))
+        .get(&stepd_key(displaced))
+        .is_some_and(|current| stepd_is_current(current, displaced))
     {
-        sessions.remove(&(job_id, step_id));
+        sessions.remove(&stepd_key(displaced));
     }
     Ok(())
+}
+
+/// Fences the supervisors an older run of the job left on this node, stopping at the first that
+/// fails; the ones owning the run go first so its script cannot react to its steps dying.
+async fn fence_older_runs(
+    stepds: &Arc<Mutex<StepdMap>>,
+    completions: &crate::step_completion::StepCompletions,
+    store: &crate::stepd::StepdStore,
+    cgroup_root: &std::path::Path,
+    job_id: u32,
+    run_attempt: u32,
+) -> std::io::Result<()> {
+    let mut older: Vec<crate::stepd::StepdDescriptor> =
+        stepds_for_job(&*stepds.lock().await, job_id)
+            .into_iter()
+            .filter(|descriptor| descriptor.run_attempt < run_attempt)
+            .collect();
+    for descriptor in store.older_sessions(job_id, run_attempt)? {
+        if !older.iter().any(|tracked| {
+            tracked.run_attempt == descriptor.run_attempt
+                && tracked.step_id == descriptor.step_id
+                && tracked.pid == descriptor.pid
+                && tracked.process_start_ticks == descriptor.process_start_ticks
+        }) {
+            older.push(descriptor);
+        }
+    }
+    let cgroups = older_run_cgroups(cgroup_root, job_id, run_attempt)?;
+    older.sort_by_key(|descriptor| !spur_core::step::owns_job_lifetime(descriptor.step_id));
+    for descriptor in older {
+        fence_stepd(stepds, &descriptor).await?;
+        settle_fenced_session(completions, store, &descriptor).await?;
+    }
+    for path in cgroups {
+        if !crate::cgroup_cleanup::wait_until_reaped(
+            &path,
+            WORKLOAD_DEATH_POLL_INTERVAL * WORKLOAD_DEATH_POLLS,
+        )
+        .await?
+        {
+            return Err(std::io::Error::other(format!(
+                "old run cgroup remains: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn older_run_cgroups(
+    root: &std::path::Path,
+    job_id: u32,
+    run_attempt: u32,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let prefix = format!("job_{job_id}_");
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let attempt = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|value| value.parse::<u32>().ok());
+        if attempt.is_none_or(|attempt| attempt >= run_attempt) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(std::io::Error::other("old run cgroup is not a directory"));
+        }
+        paths.push(entry.path());
+    }
+    Ok(paths)
+}
+
+/// Fencing can stop a supervisor before its completion push reaches the agent,
+/// so pending callers still need an outcome when the workload is gone.
+async fn settle_fenced_session(
+    completions: &crate::step_completion::StepCompletions,
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> std::io::Result<()> {
+    match durable_runtime_exit(store, descriptor)? {
+        Some((exit_code, signal)) => {
+            completions
+                .complete(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                    crate::step_completion::StepOutcome { exit_code, signal },
+                )
+                .await;
+        }
+        None => {
+            completions
+                .complete_if_unsettled(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                    crate::step_completion::StepOutcome {
+                        exit_code: 0,
+                        signal: nix::sys::signal::Signal::SIGKILL as i32,
+                    },
+                )
+                .await;
+        }
+    }
+    if let Err(error) = crate::stepd::record_resources_released(descriptor) {
+        warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt,
+            step_id = descriptor.step_id, %error, "failed to release a fenced session");
+    }
+    Ok(())
+}
+
+/// Fences every older run of the job, owner and steps alike; a newer run holding this
+/// launch's own slot refuses the launch.
+async fn fence_displaced_run(
+    stepds: &Arc<Mutex<StepdMap>>,
+    completions: &crate::step_completion::StepCompletions,
+    store: &crate::stepd::StepdStore,
+    cgroup_root: &std::path::Path,
+    job_id: u32,
+    step_id: spur_core::step::StepId,
+    run_attempt: u32,
+) -> std::io::Result<()> {
+    fence_older_runs(stepds, completions, store, cgroup_root, job_id, run_attempt).await?;
+    fence_displaced_stepd(stepds, job_id, step_id, run_attempt).await
 }
 
 fn displaced_runtime_attempt(
@@ -753,21 +928,16 @@ fn displaced_runtime_attempt(
     Ok(displaced.run_attempt)
 }
 
-/// Atomically claims this job's `stepds` slot for `descriptor`,
-/// refusing to clobber an already-tracked strictly-newer attempt. Two
-/// concurrent LaunchJob calls for the same job (e.g. a re-dispatch racing the
-/// tail of a slow, now-superseded launch) can both pass fencing before either
-/// is tracked; without this check whichever finishes last would silently
-/// overwrite a newer, already-tracked session.
+/// Claims `descriptor`'s slot unless a newer run of the job is tracked: a superseded
+/// launch or step that passed fencing late must not be tracked beside its replacement.
 async fn claim_stepd_slot(
     stepds: &Arc<Mutex<StepdMap>>,
     descriptor: crate::stepd::StepdDescriptor,
 ) -> Result<(), crate::stepd::StepdDescriptor> {
     let mut sessions = stepds.lock().await;
-    if sessions
-        .get(&stepd_key(&descriptor))
-        .is_some_and(|existing| existing.run_attempt > descriptor.run_attempt)
-    {
+    if sessions.iter().any(|((job_id, _), existing)| {
+        *job_id == descriptor.job_id && existing.run_attempt > descriptor.run_attempt
+    }) {
         return Err(descriptor);
     }
     sessions.insert(stepd_key(&descriptor), descriptor);
@@ -934,6 +1104,12 @@ pub struct TrackedJob {
     /// The job's cgroup, owned here so every launch path into the job can reach
     /// it. `None` when cgroup enforcement is off or no cgroup was created.
     cgroup_path: Option<std::path::PathBuf>,
+}
+
+impl crate::reporter::HeldRun for TrackedJob {
+    fn run_attempt(&self) -> u32 {
+        self.run_attempt
+    }
 }
 
 impl TrackedJob {
@@ -1696,13 +1872,30 @@ async fn discard_stepd_session(descriptor: &crate::stepd::StepdDescriptor) {
     if let Err(error) = stop_stepd_process(descriptor).await {
         warn!(job_id, run_attempt, %error, "failed to stop abandoned stepd");
     }
-    if !runtime_cgroup_reaped(&effective_cgroup_path(descriptor)) {
+    if !runtime_cgroup_reaped(&effective_cgroup_path(descriptor)).await {
         warn!(
             job_id,
             run_attempt, "could not confirm the abandoned stepd's cgroup is empty"
         );
     }
     cleanup_stepd_files(descriptor);
+}
+
+/// The job's tracked run if it is still `run_attempt`: a redispatch may have replaced it.
+fn tracked_run(
+    jobs: &HashMap<u32, TrackedJob>,
+    job_id: u32,
+    run_attempt: u32,
+) -> Option<&TrackedJob> {
+    jobs.get(&job_id)
+        .filter(|tracked| tracked.run_attempt == run_attempt)
+}
+
+/// Whether the node already tracks this run of the job or a newer one; an older run is
+/// superseded by the incoming one, not a duplicate of it.
+fn tracks_run_at_or_after(jobs: &HashMap<u32, TrackedJob>, job_id: u32, run_attempt: u32) -> bool {
+    jobs.get(&job_id)
+        .is_some_and(|tracked| tracked.run_attempt >= run_attempt)
 }
 
 /// Build an empty running-jobs map to share between the reporter and the agent.
@@ -1717,57 +1910,56 @@ pub async fn recover_stepds(
     let mut jobs = running.lock().await;
     for descriptor in descriptors {
         let owns_lifetime = spur_core::step::owns_job_lifetime(descriptor.step_id);
-        let cgroup_path = (!descriptor.cgroup_path.as_os_str().is_empty())
-            .then(|| descriptor.cgroup_path.clone());
-        let tracked = jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
-            fabric_binding: descriptor.resources.fabric_binding.clone(),
-            gpu_binding: descriptor.resources.gpu_binding.clone(),
-            job: executor::RunningJob::AllocationOnly,
-            // Only the job-owning step's cgroup is the job's own; a step
-            // arriving first in directory order must not seed this from its
-            // own per-step leaf.
-            cgroup_path: owns_lifetime.then(|| cgroup_path.clone()).flatten(),
-            rootfs_mode: crate::container::RootfsMode::Extracted,
-            stdout_path: String::new(),
-            stderr_path: String::new(),
-            has_pid_namespace: descriptor.has_pid_namespace,
-            has_user_namespace: descriptor.has_user_namespace,
-            has_mount_namespace: descriptor.has_mount_namespace,
-            _pty_master: None,
-            work_dir: descriptor.work_dir.clone(),
-            uid: descriptor.uid,
-            gid: descriptor.gid,
-            user: if owns_lifetime {
-                descriptor.owner.clone()
-            } else {
-                String::new()
-            },
-            partition: descriptor.resources.partition.clone(),
-            gpu_devices: descriptor.resources.gpu_devices.clone(),
-            cpus: descriptor.resources.cpus,
-            memory_mb: descriptor.resources.memory_mb,
-            nodelist: descriptor.resources.nodelist.clone(),
-            mpi: descriptor.resources.mpi.clone(),
-            run_attempt: descriptor.run_attempt,
-        });
-        // Sessions arrive in directory order, so only take these from the job's
-        // own: a step's spool file and rootfs are the step's, not the job's.
-        if !owns_lifetime {
+        let tracked = jobs
+            .entry(descriptor.job_id)
+            .or_insert_with(|| tracked_from_session(&descriptor, owns_lifetime));
+        // Sessions arrive in directory order; only the newest run's own session sets the job.
+        if !owns_lifetime || descriptor.run_attempt < tracked.run_attempt {
             continue;
         }
-        tracked.user = descriptor.owner.clone();
-        tracked.fabric_binding = descriptor.resources.fabric_binding.clone();
-        tracked.gpu_binding = descriptor.resources.gpu_binding.clone();
-        tracked.cgroup_path = cgroup_path;
-        if !descriptor.stdout_path.is_empty() {
-            tracked.stdout_path = descriptor.stdout_path.clone();
+        *tracked = tracked_from_session(&descriptor, true);
+    }
+}
+
+/// The job as one of its sessions describes it. Only the session that owns the job speaks for
+/// its cgroup, owner, spool and rootfs; a step's are its own.
+fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bool) -> TrackedJob {
+    let cgroup_path = (owns_job && !descriptor.cgroup_path.as_os_str().is_empty())
+        .then(|| descriptor.cgroup_path.clone());
+    let own = |value: &String| {
+        if owns_job {
+            value.clone()
+        } else {
+            String::new()
         }
-        if !descriptor.stderr_path.is_empty() {
-            tracked.stderr_path = descriptor.stderr_path.clone();
-        }
-        if let Some(mode) = descriptor.container_rootfs_mode.clone() {
-            tracked.rootfs_mode = mode;
-        }
+    };
+    TrackedJob {
+        fabric_binding: descriptor.resources.fabric_binding.clone(),
+        gpu_binding: descriptor.resources.gpu_binding.clone(),
+        job: executor::RunningJob::AllocationOnly,
+        cgroup_path,
+        rootfs_mode: descriptor
+            .container_rootfs_mode
+            .clone()
+            .filter(|_| owns_job)
+            .unwrap_or(crate::container::RootfsMode::Extracted),
+        stdout_path: own(&descriptor.stdout_path),
+        stderr_path: own(&descriptor.stderr_path),
+        has_pid_namespace: descriptor.has_pid_namespace,
+        has_user_namespace: descriptor.has_user_namespace,
+        has_mount_namespace: descriptor.has_mount_namespace,
+        _pty_master: None,
+        work_dir: descriptor.work_dir.clone(),
+        uid: descriptor.uid,
+        gid: descriptor.gid,
+        user: own(&descriptor.owner),
+        partition: descriptor.resources.partition.clone(),
+        gpu_devices: descriptor.resources.gpu_devices.clone(),
+        cpus: descriptor.resources.cpus,
+        memory_mb: descriptor.resources.memory_mb,
+        nodelist: descriptor.resources.nodelist.clone(),
+        mpi: descriptor.resources.mpi.clone(),
+        run_attempt: descriptor.run_attempt,
     }
 }
 
@@ -4186,6 +4378,12 @@ impl AgentService {
                 );
                 descriptor.cgroup_path = std::path::PathBuf::new();
             }
+            if sessions
+                .get(&stepd_key(&descriptor))
+                .is_some_and(|newer| newer.run_attempt > descriptor.run_attempt)
+            {
+                continue;
+            }
             sessions.insert(stepd_key(&descriptor), descriptor.clone());
             if let (Some(id), Some(digest)) = (
                 decode_fixed_b64::<{ spur_core::native_cred::CREDENTIAL_ID_LEN }>(
@@ -4398,9 +4596,13 @@ impl AgentService {
         pmix: Option<crate::stepd::StepdPmix>,
         container_rootfs_mode: Option<crate::container::RootfsMode>,
         step_files: crate::executor::StepOutputFiles,
-        admission: StepLaunchAdmission,
+        admission: (
+            StepLaunchAdmission,
+            Option<crate::job_lifecycle::KeyedLifecycleGuard<u32>>,
+        ),
         persist_cred: (String, String, String),
     ) -> Result<Option<std::process::ExitStatus>, Status> {
+        let (admission, lifecycle) = admission;
         let (job_id, _, step_id) = *admission.key();
         let run_attempt = cfg.run_attempt;
         let step_key = (job_id, step_id);
@@ -4509,6 +4711,7 @@ impl AgentService {
         // The session is tracked, so a duplicate can be refused outright rather
         // than parked here for the whole of the step's runtime.
         drop(admission);
+        drop(lifecycle);
 
         // Record the workload's pid, not the supervisor's, so the existing
         // cancel path signals the step's own tree and leaves its reporter alive.
@@ -5947,14 +6150,8 @@ impl SlurmAgent for AgentService {
                 runtime_attempt_already_tracked(&self.stepds, job_id, launch_step, run_attempt)
                     .await;
             if already_tracked {
-                // Idempotent retry: this exact attempt is already tracked and
-                // alive on this node (e.g. spurctld retried after losing the
-                // ack for a LaunchJob it had already delivered, since a
-                // dispatch failure never advances run_attempt before the next
-                // requeue). Report success without touching the live
-                // allocation or session — allocate_local_resources below
-                // would otherwise release and reallocate resources out from
-                // under the still-running process before fencing ever runs.
+                // A retried launch of a run already live here: the fence below accepts an
+                // equal attempt, so it would stop this very run's supervisor.
                 let paths = self
                     .running
                     .lock()
@@ -5976,6 +6173,26 @@ impl SlurmAgent for AgentService {
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                 }));
             }
+            if let Some(allocation) = req.allocated.as_ref() {
+                self.check_dispatch_allocation(allocation).await?;
+            }
+            // Before reserving: the reservation drops the old run's ledger entry, which a
+            // failed fence would otherwise leave its still-running workload without.
+            fence_displaced_run(
+                &self.stepds,
+                &self.step_completions,
+                &crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                std::path::Path::new(executor::CGROUP_ROOT),
+                job_id,
+                launch_step,
+                run_attempt,
+            )
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "failed to fence displaced stepd before launch: {error}"
+                ))
+            })?;
         }
 
         // Left empty rather than defaulted to a flat, shared DEFAULT_WORK_DIR
@@ -6512,13 +6729,6 @@ impl SlurmAgent for AgentService {
             .await;
 
         let launch_result = if stepd_enabled {
-            fence_displaced_stepd(&self.stepds, job_id, launch_step, run_attempt)
-                .await
-                .map_err(|error| {
-                    Status::unavailable(format!(
-                        "failed to fence displaced stepd before launch: {error}"
-                    ))
-                })?;
             launch_stepd(
                 &launch_cfg,
                 run_attempt,
@@ -6706,8 +6916,6 @@ impl SlurmAgent for AgentService {
                 // older run. If its process ignored SIGTERM and outlived the
                 // requeue, kill and reap it here — the monitor loop no longer
                 // tracks it, so without this it would leak as an orphan/zombie.
-                // Its cgroup is deliberately left alone: the path is derived
-                // from job_id, so it is the cgroup the new run just joined.
                 if let Some(old) = displaced {
                     if old.run_attempt < run_attempt {
                         let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
@@ -7163,8 +7371,21 @@ impl SlurmAgent for AgentService {
         // Creates this id's cgroup, so it must not run while a prior run's teardown
         // still owns the directory.
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
-
+        #[cfg(test)]
+        let supervise_allocation = !self.force_legacy_launch;
+        #[cfg(not(test))]
+        let supervise_allocation = true;
         let allocated = req.allocated.as_ref();
+        if let Some(allocation) = allocated {
+            self.check_dispatch_allocation(allocation).await?;
+        }
+        // Refuses a duplicate before fencing or reserving anything.
+        if tracks_run_at_or_after(&*self.running.lock().await, req.job_id, req.run_attempt) {
+            return Err(Status::already_exists(format!(
+                "job {} already registered on this node",
+                req.job_id
+            )));
+        }
         // The generation check is performed under the allocation lock below, so a
         // refresh publish cannot slip a newer topology between it and the bind.
         let mut controller_gpu_ids: Vec<u64> = allocated
@@ -7192,6 +7413,23 @@ impl SlurmAgent for AgentService {
             .map(|p| p.device_paths.clone())
             .unwrap_or_default();
 
+        // Before reserving, for the same reason as the batch launch.
+        if supervise_allocation {
+            fence_older_runs(
+                &self.stepds,
+                &self.step_completions,
+                &crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                std::path::Path::new(executor::CGROUP_ROOT),
+                req.job_id,
+                req.run_attempt,
+            )
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "failed to fence displaced stepd before allocation launch: {error}"
+                ))
+            })?;
+        }
         if let Some(allocation) = allocated {
             self.check_dispatch_allocation(allocation).await?;
         }
@@ -7200,7 +7438,7 @@ impl SlurmAgent for AgentService {
         // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
         let mut jobs = self.running.lock().await;
-        if jobs.contains_key(&req.job_id) {
+        if tracks_run_at_or_after(&jobs, req.job_id, req.run_attempt) {
             return Err(Status::already_exists(format!(
                 "job {} already registered on this node",
                 req.job_id
@@ -7320,10 +7558,6 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        #[cfg(test)]
-        let supervise_allocation = !self.force_legacy_launch;
-        #[cfg(not(test))]
-        let supervise_allocation = true;
         let runtime_descriptor = if supervise_allocation {
             let config = executor::JobLaunchConfig {
                 job_id: req.job_id,
@@ -7365,18 +7599,6 @@ impl SlurmAgent for AgentService {
             let admission = self
                 .admit_step_launch(req.job_id, req.run_attempt, spur_core::step::STEP_EXTERN)
                 .await;
-            fence_displaced_stepd(
-                &self.stepds,
-                req.job_id,
-                spur_core::step::STEP_EXTERN,
-                req.run_attempt,
-            )
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!(
-                    "failed to fence displaced stepd before allocation launch: {error}"
-                ))
-            })?;
             let (_, mut descriptor) = launch_stepd(
                 &config,
                 req.run_attempt,
@@ -7440,7 +7662,7 @@ impl SlurmAgent for AgentService {
         };
 
         let mut jobs = self.running.lock().await;
-        if jobs.contains_key(&req.job_id) {
+        if tracks_run_at_or_after(&jobs, req.job_id, req.run_attempt) {
             drop(jobs);
             if runtime_descriptor {
                 let removed = self
@@ -7459,7 +7681,7 @@ impl SlurmAgent for AgentService {
                 req.job_id
             )));
         }
-        jobs.insert(
+        let replaced = jobs.insert(
             req.job_id,
             TrackedJob {
                 fabric_binding: fabric_binding.clone(),
@@ -7497,6 +7719,12 @@ impl SlurmAgent for AgentService {
             .commit_job(req.job_id, req.run_attempt);
         reservation_guard.disarm();
         drop(jobs);
+        if let Some(older) = replaced {
+            self.interactive_launch_steps
+                .lock()
+                .await
+                .remove(&(req.job_id, older.run_attempt));
+        }
 
         Ok(Response::new(RegisterJobAllocationResponse {
             failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
@@ -7529,6 +7757,12 @@ impl SlurmAgent for AgentService {
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
         }
+        let job_id = req.job_id;
+        if job_id == 0 {
+            return Err(Status::invalid_argument("job_id is required"));
+        }
+        // Credential validation and startup must refer to the same attempt.
+        let mut lifecycle = Some(self.lifecycle.acquire(job_id).await);
         let mut persist_cred = (String::new(), String::new(), String::new());
         if let Some(keys) = &self.cred_keys {
             if req.execution_credential.is_empty() {
@@ -7586,10 +7820,6 @@ impl SlurmAgent for AgentService {
             req.work_dir
         };
 
-        let job_id = req.job_id;
-        if job_id == 0 {
-            return Err(Status::invalid_argument("job_id is required"));
-        }
         if identity.as_ref().is_some_and(|id| !id.is_controller()) {
             self.check_job_access(job_id, identity.as_ref(), "", "run a step of")
                 .await?;
@@ -7677,6 +7907,7 @@ impl SlurmAgent for AgentService {
                         "step still running; joining existing supervisor"
                     );
                     drop(admission);
+                    drop(lifecycle);
                     return match waiter.await {
                         Ok(outcome) => Ok(Response::new(
                             awaited_step_response(
@@ -7900,6 +8131,9 @@ impl SlurmAgent for AgentService {
         let supervise_step = true;
         #[cfg(test)]
         let supervise_step = supervise_step && !self.force_legacy_launch;
+        if !supervise_step {
+            drop(lifecycle.take());
+        }
 
         // A supervised step hosts its own server, so the agent only forwards the
         // plan: an agent restart must not take the rendezvous down with it.
@@ -8267,7 +8501,7 @@ impl SlurmAgent for AgentService {
                 supervised_pmix.take(),
                 supervised_rootfs_mode,
                 step_files,
-                admission,
+                (admission, lifecycle),
                 persist_cred,
             )
             .await?
@@ -8975,6 +9209,8 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        // The attempt and its namespaces must remain current through supervisor startup.
+        let _lifecycle = self.lifecycle.acquire(init.job_id).await;
         let entry = self.job_entry(init.job_id).await?;
 
         let winsize = init.winsize.as_ref().map(|ws| PtyWinSize {
@@ -9034,12 +9270,6 @@ impl SlurmAgent for AgentService {
             run_attempt,
             step_id,
         );
-
-        // Held from before the decision through the fresh-launch path's own
-        // `live_ptys` insert below, so a second attach racing this one blocks
-        // instead of reading a stale "nothing live yet" and fencing what this
-        // call just started.
-        let _lifecycle = self.lifecycle.acquire(init.job_id).await;
 
         // Resume rather than open a new one: a terminal held for a job this
         // agent is not already bridging was either just launched (and just
@@ -10152,20 +10382,16 @@ impl AgentService {
             }
             return;
         }
-        let allocation_only_attempt = {
-            let jobs = self.running.lock().await;
-            jobs.get(&job_id)
-                .filter(|tracked| tracked.job.is_allocation_only())
-                .map(|tracked| tracked.run_attempt)
-        };
-        if let Some(run_attempt) = allocation_only_attempt {
+        let allocation_only = tracked_run(&*self.running.lock().await, job_id, run_attempt)
+            .is_some_and(|tracked| tracked.job.is_allocation_only());
+        if allocation_only {
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
 
         let (tracked_attempt, sig) = {
             let jobs = self.running.lock().await;
-            let Some(tracked) = jobs.get(&job_id) else {
+            let Some(tracked) = tracked_run(&jobs, job_id, run_attempt) else {
                 return;
             };
             let sig = nix::sys::signal::Signal::try_from(signal)
@@ -10396,13 +10622,9 @@ impl AgentService {
             }
             return;
         }
-        let allocation_only_attempt = {
-            let jobs = self.running.lock().await;
-            jobs.get(&job_id)
-                .filter(|tracked| tracked.job.is_allocation_only())
-                .map(|tracked| tracked.run_attempt)
-        };
-        if let Some(run_attempt) = allocation_only_attempt {
+        let allocation_only = tracked_run(&*self.running.lock().await, job_id, run_attempt)
+            .is_some_and(|tracked| tracked.job.is_allocation_only());
+        if allocation_only {
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
@@ -10411,7 +10633,7 @@ impl AgentService {
         // touch a newer run that reused this job_id after a requeue.
         let (cancel_attempt, signaled_at) = {
             let jobs = self.running.lock().await;
-            let Some(tracked) = jobs.get(&job_id) else {
+            let Some(tracked) = tracked_run(&jobs, job_id, run_attempt) else {
                 return;
             };
             info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
@@ -11091,6 +11313,452 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Fences run 1's supervisor of `old_step` as run 2's launch would, tracked by its launch-time
+    /// copy while it published `published_cgroup` and a live workload; returns whether that survived.
+    async fn workload_survives_relaunch(
+        old_step: spur_core::step::StepId,
+        published_cgroup: std::path::PathBuf,
+    ) -> bool {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let mut at_launch = descriptor_for_workload(0);
+        at_launch.step_id = old_step;
+        at_launch.socket_path = store.session_dir(91, 1, old_step).join("runtime.sock");
+        let mut published = at_launch.clone();
+        published.workload_pid = child.id();
+        published.workload_start_ticks =
+            crate::stepd::process_start_ticks(child.id()).expect("workload start ticks");
+        published.cgroup_path = published_cgroup;
+        store
+            .publish(&published)
+            .expect("publish started descriptor");
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&at_launch), at_launch);
+        let completions = crate::step_completion::StepCompletions::new();
+        let mut waiter = completions.register(91, 1, old_step).await;
+
+        let fenced = fence_displaced_run(
+            &sessions,
+            &completions,
+            &store,
+            state_dir.path(),
+            91,
+            spur_core::step::STEP_BATCH,
+            2,
+        )
+        .await;
+        let survived =
+            crate::stepd::process_is_live(published.workload_pid, published.workload_start_ticks);
+        let tracked = !sessions.lock().await.is_empty();
+        let _ = child.kill();
+        let _ = child.wait();
+        fenced.expect("fence the displaced run");
+        assert!(!tracked, "the fenced supervisor must no longer be tracked");
+        assert!(
+            waiter.try_recv().is_ok(),
+            "the fenced supervisor's parked caller must be released"
+        );
+        survived
+    }
+
+    /// A redispatch onto the same node fences the old run through the copy taken
+    /// at its launch, which predates the workload; the supervisor's own record names it.
+    #[tokio::test]
+    async fn fencing_a_displaced_run_kills_the_workload_its_supervisor_published() {
+        assert!(
+            !workload_survives_relaunch(spur_core::step::STEP_BATCH, std::path::PathBuf::new())
+                .await,
+            "the old run's workload must not survive its replacement"
+        );
+    }
+
+    /// A recorded cgroup that is gone proves nothing (adoption drops it for that reason),
+    /// so the published one must not stand in for the workload check.
+    #[tokio::test]
+    async fn fencing_does_not_trust_a_published_cgroup_that_is_gone() {
+        let parent = tempfile::tempdir().expect("cgroup parent");
+        let gone = parent.path().join("never-created").join("job_91");
+        assert!(
+            !workload_survives_relaunch(spur_core::step::STEP_BATCH, gone).await,
+            "a vanished cgroup must not confirm the workload dead"
+        );
+    }
+
+    /// The old run's numbered steps have supervisors of their own, which the new
+    /// run's launch must fence too or their workloads outlive the run.
+    #[tokio::test]
+    async fn a_relaunch_fences_the_old_runs_step_supervisors() {
+        assert!(
+            !workload_survives_relaunch(0, std::path::PathBuf::new()).await,
+            "an old run's srun step must not survive the relaunch"
+        );
+    }
+
+    fn session_for(
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> crate::stepd::StepdDescriptor {
+        crate::stepd::StepdDescriptor::new(
+            79,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent/runtime.sock"),
+            std::path::PathBuf::new(),
+        )
+    }
+
+    /// Only an older run is fenced: the launching run's own steps and a newer run's are left alone.
+    #[tokio::test]
+    async fn a_relaunch_leaves_the_same_and_newer_runs_alone() {
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        for (run_attempt, step_id) in [(2, 0), (3, 1)] {
+            let descriptor = session_for(run_attempt, step_id);
+            sessions
+                .lock()
+                .await
+                .insert(stepd_key(&descriptor), descriptor);
+        }
+        let completions = crate::step_completion::StepCompletions::new();
+
+        let roots = tempfile::tempdir().expect("fence roots");
+        let store = crate::stepd::StepdStore::new(roots.path());
+        fence_displaced_run(
+            &sessions,
+            &completions,
+            &store,
+            roots.path(),
+            79,
+            spur_core::step::STEP_BATCH,
+            2,
+        )
+        .await
+        .expect("nothing older to fence");
+
+        assert_eq!(sessions.lock().await.len(), 2);
+    }
+
+    /// An old run whose teardown cannot be confirmed blocks the launch and stays tracked,
+    /// rather than being dropped while it may still hold the node.
+    #[tokio::test]
+    async fn a_relaunch_refuses_while_an_old_runs_teardown_is_unconfirmed() {
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        let cgroup = TestCgroup::new(&cgroup_root);
+        std::fs::write(cgroup.path().join("cgroup.procs"), "not-a-pid\n")
+            .expect("seed a permanent removal blocker");
+        let mut stuck = session_for(1, 0);
+        stuck.cgroup_path = cgroup.path().to_path_buf();
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        sessions.lock().await.insert(stepd_key(&stuck), stuck);
+        let completions = crate::step_completion::StepCompletions::new();
+
+        let store = crate::stepd::StepdStore::new(cgroup_root.path());
+        let fenced = fence_displaced_run(
+            &sessions,
+            &completions,
+            &store,
+            cgroup_root.path(),
+            79,
+            spur_core::step::STEP_BATCH,
+            2,
+        )
+        .await;
+
+        assert!(
+            fenced.is_err(),
+            "an unconfirmed teardown must fail the launch"
+        );
+        assert_eq!(sessions.lock().await.len(), 1);
+    }
+
+    /// A session of `run_attempt` whose resources and uid name that run.
+    fn session_of_run(
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> crate::stepd::StepdDescriptor {
+        let mut session = session_for(run_attempt, step_id);
+        session.uid = 1000 + run_attempt;
+        session.resources.gpu_devices = vec![u64::from(run_attempt)];
+        session.resources.cpus = run_attempt;
+        session
+    }
+
+    /// The newest run of the job's own session decides the whole tracked job, in any arrival order.
+    #[tokio::test]
+    async fn recovery_tracks_the_newest_run_of_the_jobs_own_session() {
+        let batch = spur_core::step::STEP_BATCH;
+        let orders = [
+            vec![session_of_run(1, 0), session_of_run(2, batch)],
+            vec![session_of_run(2, batch), session_of_run(1, 0)],
+            vec![session_of_run(2, batch), session_of_run(1, batch)],
+            vec![session_of_run(1, batch), session_of_run(2, batch)],
+        ];
+        for order in orders {
+            let running = new_running_jobs();
+            recover_stepds(&running, order).await;
+            let jobs = running.lock().await;
+            let tracked = jobs.get(&79).expect("adopted");
+            assert_eq!(
+                (
+                    tracked.run_attempt,
+                    tracked.uid,
+                    tracked.gpu_devices.clone(),
+                    tracked.cpus
+                ),
+                (2, 1002, vec![2], 2),
+                "every field comes from run 2's own session"
+            );
+        }
+    }
+
+    /// A repeat of the allocation run this node already tracks must leave its live
+    /// supervisor alone rather than fence it and then refuse the repeat.
+    #[tokio::test]
+    async fn a_repeated_allocation_run_keeps_its_supervisor() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let live = session_for(1, spur_core::step::STEP_EXTERN);
+        svc.stepds.lock().await.insert(stepd_key(&live), live);
+
+        let repeat = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 79,
+                cpus: 1,
+                run_attempt: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the same run is a duplicate");
+
+        assert_eq!(repeat.code(), tonic::Code::AlreadyExists);
+        assert!(
+            svc.stepds
+                .lock()
+                .await
+                .contains_key(&(79, spur_core::step::STEP_EXTERN)),
+            "the live supervisor must still be tracked"
+        );
+    }
+
+    /// A run-1 session of `step_id` whose teardown can never be confirmed, tracked by `svc`
+    /// together with run 1's ledger entry and job record.
+    async fn seed_unfenceable_run(
+        svc: &AgentService,
+        step_id: spur_core::step::StepId,
+        cgroup_root: &tempfile::TempDir,
+    ) {
+        let cgroup = TestCgroup::new(cgroup_root);
+        std::fs::write(cgroup.path().join("cgroup.procs"), "not-a-pid\n")
+            .expect("seed a permanent removal blocker");
+        let mut stuck = session_for(1, step_id);
+        stuck.cgroup_path = cgroup.path().to_path_buf();
+        svc.stepds.lock().await.insert(stepd_key(&stuck), stuck);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let mut ledger = svc.allocation.lock().await;
+        ledger
+            .allocate_for_job(79, 1, 1, 0, &[])
+            .expect("reserve run 1");
+        assert!(ledger.commit_job(79, 1));
+    }
+
+    async fn assert_run_one_kept(svc: &AgentService, step_id: spur_core::step::StepId) {
+        assert_eq!(svc.allocation.lock().await.owner_attempt(79), Some(1));
+        assert!(svc.stepds.lock().await.contains_key(&(79, step_id)));
+        assert_eq!(
+            svc.running.lock().await.get(&79).map(|t| t.run_attempt),
+            Some(1)
+        );
+    }
+
+    /// The fence runs before the new run reserves anything, so when it fails the old run,
+    /// still running, keeps its ledger entry rather than losing it to the abandoned launch.
+    #[tokio::test]
+    async fn a_launch_whose_fence_fails_leaves_the_old_run_reserved() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        seed_unfenceable_run(&svc, spur_core::step::STEP_BATCH, &cgroup_root).await;
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 79,
+                run_attempt: 2,
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unconfirmed fence must refuse the launch");
+
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_run_one_kept(&svc, spur_core::step::STEP_BATCH).await;
+    }
+
+    #[tokio::test]
+    async fn an_allocation_whose_fence_fails_leaves_the_old_run_reserved() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        seed_unfenceable_run(&svc, spur_core::step::STEP_EXTERN, &cgroup_root).await;
+
+        let refused = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 79,
+                cpus: 1,
+                run_attempt: 2,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unconfirmed fence must refuse the allocation");
+
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_run_one_kept(&svc, spur_core::step::STEP_EXTERN).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_dispatch_does_not_fence_an_older_run() {
+        for step_id in [spur_core::step::STEP_BATCH, spur_core::step::STEP_EXTERN] {
+            let (svc, _, mut allocation) = fabric_dispatch_fixture();
+            let svc = svc.with_supervised_launch();
+            allocation.generation += 1;
+            let cgroup_root = tempfile::tempdir().expect("cgroup root");
+            seed_unfenceable_run(&svc, step_id, &cgroup_root).await;
+
+            let refused = if step_id == spur_core::step::STEP_BATCH {
+                svc.launch_job(Request::new(LaunchJobRequest {
+                    job_id: 79,
+                    run_attempt: 2,
+                    spec: Some(JobSpec {
+                        uid: 1000,
+                        name: "j".into(),
+                        script: "#!/bin/bash\ntrue\n".into(),
+                        num_tasks: 1,
+                        num_nodes: 1,
+                        cpus_per_task: 1,
+                        ..Default::default()
+                    }),
+                    allocated: Some(allocation),
+                    ..Default::default()
+                }))
+                .await
+                .expect_err("stale dispatch must be refused")
+            } else {
+                svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                    job_id: 79,
+                    run_attempt: 2,
+                    allocated: Some(allocation),
+                    ..Default::default()
+                }))
+                .await
+                .expect_err("stale dispatch must be refused")
+            };
+
+            assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+            assert_run_one_kept(&svc, step_id).await;
+        }
+    }
+
+    /// A late launch of an older run must not claim any slot of a job whose newer run is
+    /// tracked, not just the slot that newer run holds.
+    #[tokio::test]
+    async fn an_older_run_cannot_claim_a_slot_beside_a_newer_one() {
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        let newer = session_for(2, 0);
+        sessions.lock().await.insert(stepd_key(&newer), newer);
+
+        let late = session_for(1, spur_core::step::STEP_BATCH);
+        assert!(claim_stepd_slot(&sessions, late).await.is_err());
+        assert_eq!(sessions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn adoption_keeps_the_newer_run_of_a_step() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.adopt_stepds(&[
+            session_for(2, spur_core::step::STEP_BATCH),
+            session_for(1, spur_core::step::STEP_BATCH),
+        ])
+        .await;
+
+        let stepds = svc.stepds.lock().await;
+        let kept = stepds
+            .get(&(79, spur_core::step::STEP_BATCH))
+            .expect("adopted");
+        assert_eq!(kept.run_attempt, 2);
+    }
+
+    /// A newer run of an allocation replaces the older one this node still tracks; only the
+    /// same or a newer run is a duplicate.
+    #[tokio::test]
+    async fn a_newer_allocation_run_replaces_the_tracked_older_one() {
+        let running = new_running_jobs();
+        let svc = AgentService::with_cluster_config(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            running.clone(),
+            false,
+        );
+        let register = |run_attempt| RegisterJobAllocationRequest {
+            job_id: 78,
+            cpus: 1,
+            run_attempt,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        svc.register_job_allocation(Request::new(register(1)))
+            .await
+            .expect("first run");
+        let duplicate = svc
+            .register_job_allocation(Request::new(register(1)))
+            .await
+            .expect_err("the same run is a duplicate");
+        assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
+        svc.register_job_allocation(Request::new(register(2)))
+            .await
+            .expect("a newer run replaces the older one");
+
+        assert_eq!(
+            running.lock().await.get(&78).expect("tracked").run_attempt,
+            2
+        );
+    }
+
     #[tokio::test]
     async fn fencing_without_a_cgroup_accepts_a_supervisor_that_held_no_workload() {
         // An allocation runs nothing of its own, and a descriptor written
@@ -11472,6 +12140,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_reads_the_attempt_after_acquiring_the_job_gate() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let mut svc = test_agent_service(test_reporter());
+        let root = tempfile::tempdir().expect("state");
+        svc.stepd_state_dir = root.path().to_path_buf();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let held = svc.lifecycle.acquire(79).await;
+        let command = svc.run_command(Request::new(RunCommandRequest {
+            job_id: 79,
+            step_id: 0,
+            command: vec!["true".into()],
+            ..Default::default()
+        }));
+        tokio::pin!(command);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(command.as_mut().poll(&mut context), Poll::Pending));
+        assert!(svc.active_steps.lock().await.is_empty());
+
+        svc.running
+            .lock()
+            .await
+            .get_mut(&79)
+            .expect("tracked")
+            .run_attempt = 2;
+        svc.step_completions
+            .complete(
+                79,
+                2,
+                0,
+                crate::step_completion::StepOutcome {
+                    exit_code: 23,
+                    signal: 0,
+                },
+            )
+            .await;
+        drop(held);
+        assert_eq!(
+            command
+                .await
+                .expect("settled new attempt")
+                .into_inner()
+                .exit_code,
+            23
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_credential_is_checked_after_a_replacement_releases_the_job_gate() {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential, NodeResourceSlice};
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let root = tempfile::tempdir().expect("state");
+        let mut svc = test_agent_service(test_reporter());
+        svc.stepd_state_dir = root.path().to_path_buf();
+        svc.cluster_id = "fence-test".into();
+        let now = spur_core::native_mint::unix_now().expect("time");
+        let (private, public) =
+            spur_core::native_jwks::generate_ed25519_jwks("fixture").expect("keys");
+        let signing =
+            spur_core::native_jwks::Ed25519SigningKeySet::from_bytes(private.as_bytes(), now)
+                .expect("signing");
+        svc.cred_keys = Some(Arc::new(
+            spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(public.as_bytes(), now)
+                .expect("verification"),
+        ));
+        let argv = vec!["true".to_string()];
+        let credential = ExecutionCredential {
+            kind: CredentialKind::Step,
+            cluster_id: svc.cluster_id.clone(),
+            key_id: String::new(),
+            job_id: 79,
+            step_id: 0,
+            run_attempt: 1,
+            user: "fixture".into(),
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![],
+            account: String::new(),
+            partition: String::new(),
+            qos: String::new(),
+            resources_by_node: vec![NodeResourceSlice {
+                node: svc.reporter.hostname.clone(),
+                cpus: 1,
+                memory_mb: 1,
+                devices: vec![],
+            }],
+            command_digest: spur_core::native_exec::command_digest("", &argv, ""),
+            container_digest: None,
+            issued_at: now,
+            not_before: now,
+            expires_at: now + 3600,
+            credential_id: [1; 16],
+        };
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let held = svc.lifecycle.acquire(79).await;
+        let command = svc.run_command(Request::new(RunCommandRequest {
+            job_id: 79,
+            step_id: 0,
+            uid: 1000,
+            gid: 1000,
+            command: argv,
+            execution_credential: spur_core::native_exec::sign_execution(credential, &signing, now)
+                .expect("token"),
+            ..Default::default()
+        }));
+        tokio::pin!(command);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(command.as_mut().poll(&mut context), Poll::Pending));
+        svc.running
+            .lock()
+            .await
+            .get_mut(&79)
+            .expect("tracked")
+            .run_attempt = 2;
+        svc.step_completions
+            .complete(
+                79,
+                2,
+                0,
+                crate::step_completion::StepOutcome {
+                    exit_code: 23,
+                    signal: 0,
+                },
+            )
+            .await;
+        drop(held);
+        let error = command
+            .await
+            .expect_err("old credential must not enter the replacement");
+        assert!(error.message().contains("run_attempt mismatch"), "{error}");
+        assert!(svc.active_steps.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_step_launch_admission_blocks_a_duplicate_until_it_is_released() {
         let svc = Arc::new(AgentService::new(
             test_reporter(),
@@ -11645,13 +12454,6 @@ mod tests {
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
         // Named as the real thing: cleanup refuses a path that is not ours.
         let cgroup = TestCgroup::new(&cgroup_root);
-        let blocker = cgroup.path().join("cgroup.kill");
-        std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
-        let blocker_removed = blocker.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
-        });
         let displaced = crate::stepd::StepdDescriptor::new(
             42,
             1,
@@ -11941,19 +12743,6 @@ mod tests {
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
         // Named as the real thing: cleanup refuses a path that is not ours.
         let cgroup = TestCgroup::new(&cgroup_root);
-        // A plain tempdir can't model real cgroupfs, where writing to the
-        // kernel-provided "cgroup.kill" never leaves a stray directory
-        // entry. A directory at that path makes the write fail cleanly
-        // instead (no file created), and removing it shortly after — same
-        // technique as cleanup_cgroup_retries_past_a_transient_removal_failure
-        // — lets the directory end up genuinely empty once retried.
-        let blocker = cgroup.path().join("cgroup.kill");
-        std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
-        let blocker_removed = blocker.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
-        });
         let descriptor = crate::stepd::StepdDescriptor::new(
             42,
             7,
@@ -16091,6 +16880,157 @@ mod tests {
         assert_eq!(response.into_inner().exit_code, 7);
     }
 
+    async fn await_fenced_step(
+        memo: Option<crate::step_completion::StepOutcome>,
+        recorded: Option<crate::step_completion::StepOutcome>,
+    ) -> (i32, crate::step_completion::StepOutcome) {
+        let root = tempfile::tempdir().expect("fence roots");
+        let state_dir = root.path().join("state");
+        let cgroups = root.path().join("cgroups");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.clone());
+        svc.insert_test_job(
+            44,
+            TrackedJob {
+                run_attempt: 2,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+        let store = crate::stepd::StepdStore::new(&state_dir);
+        for attempt in [1, 2] {
+            let cgroup = cgroups.join(format!("job_44_{attempt}")).join("step_3");
+            std::fs::create_dir_all(&cgroup).expect("create step cgroup");
+            let descriptor = crate::stepd::StepdDescriptor::new(
+                44,
+                attempt,
+                3,
+                0,
+                0,
+                store.session_dir(44, attempt, 3).join("runtime.sock"),
+                cgroup,
+            );
+            store.publish(&descriptor).expect("publish descriptor");
+            if attempt == 2 {
+                svc.stepds
+                    .lock()
+                    .await
+                    .insert(stepd_key(&descriptor), descriptor);
+            }
+        }
+        if let Some(outcome) = recorded {
+            let obligations = store.obligations(44, 1, 3);
+            obligations
+                .append(&crate::stepd::StepdObligation::ExitObserved {
+                    exit_code: outcome.exit_code,
+                    signal: outcome.signal,
+                })
+                .expect("record step exit");
+            obligations
+                .append(&crate::stepd::StepdObligation::CompletionAcknowledged)
+                .expect("acknowledge step exit");
+        }
+        if let Some(outcome) = memo {
+            svc.step_completions.complete(44, 1, 3, outcome).await;
+        }
+        let mut waiter = svc.step_completions.register(44, 1, 3).await;
+
+        fence_older_runs(&svc.stepds, &svc.step_completions, &store, &cgroups, 44, 2)
+            .await
+            .expect("fence the old run");
+
+        assert!(!cgroups.join("job_44_1").exists());
+        assert!(cgroups.join("job_44_2/step_3").is_dir());
+        assert_eq!(svc.stepds.lock().await[&(44, 3)].run_attempt, 2);
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+                run_attempt: 1,
+            }))
+            .await
+            .expect("the old run's exit remains answerable")
+            .into_inner()
+            .exit_code;
+        (
+            response,
+            waiter.try_recv().expect("release the old run's waiter"),
+        )
+    }
+
+    #[tokio::test]
+    async fn await_step_preserves_a_memoized_exit_when_fencing_a_retained_session() {
+        for outcome in [
+            crate::step_completion::StepOutcome {
+                exit_code: 0,
+                signal: 0,
+            },
+            crate::step_completion::StepOutcome {
+                exit_code: 7,
+                signal: 0,
+            },
+        ] {
+            assert_eq!(
+                await_fenced_step(Some(outcome), None).await,
+                (outcome.exit_code, outcome)
+            );
+            assert_eq!(
+                await_fenced_step(Some(outcome), Some(outcome)).await,
+                (outcome.exit_code, outcome)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn await_step_preserves_a_durable_exit_when_fencing_after_restart() {
+        for outcome in [
+            crate::step_completion::StepOutcome {
+                exit_code: 0,
+                signal: 0,
+            },
+            crate::step_completion::StepOutcome {
+                exit_code: 7,
+                signal: 0,
+            },
+        ] {
+            assert_eq!(
+                await_fenced_step(None, Some(outcome)).await,
+                (outcome.exit_code, outcome)
+            );
+            assert_eq!(
+                await_fenced_step(
+                    Some(crate::step_completion::StepOutcome {
+                        exit_code: 0,
+                        signal: nix::sys::signal::Signal::SIGKILL as i32,
+                    }),
+                    Some(outcome)
+                )
+                .await,
+                (outcome.exit_code, outcome)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn await_step_reports_sigkill_for_a_fenced_session_without_an_exit() {
+        assert_eq!(
+            await_fenced_step(None, None).await,
+            (
+                137,
+                crate::step_completion::StepOutcome {
+                    exit_code: 0,
+                    signal: nix::sys::signal::Signal::SIGKILL as i32,
+                }
+            )
+        );
+    }
+
     #[tokio::test]
     async fn await_step_does_not_hand_a_caller_the_next_attempts_exit() {
         let state_dir = tempfile::tempdir().expect("state dir");
@@ -19441,7 +20381,7 @@ mod tests {
         );
 
         assert!(
-            reporter.held_job_ids().is_empty(),
+            reporter.held_jobs().is_empty(),
             "reporter sees no jobs before registration"
         );
 
@@ -19463,9 +20403,9 @@ mod tests {
         .expect("register");
 
         assert_eq!(
-            reporter.held_job_ids(),
-            vec![77],
-            "reporter's heartbeat must observe the agent-registered allocation-only job"
+            reporter.held_jobs(),
+            vec![(77, 9)],
+            "reporter's heartbeat must observe the agent-registered allocation-only job and its run"
         );
         assert_eq!(
             svc.running

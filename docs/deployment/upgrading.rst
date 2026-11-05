@@ -760,6 +760,39 @@ plus up to 5 seconds for the accounting flush, below ``TimeoutStopSec``. A step 
 finishes during the drain does not end it, so raising the value mostly lengthens the
 restart. A new value takes effect at the next start.
 
+.. _requeued-run-upgrade-notes:
+
+Stopping a requeued job's run on a recovered node
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a node misses heartbeats, its jobs end ``NODE_FAIL`` and a job submitted
+with ``--requeue`` goes back to the queue, but the job's nodes are not told to
+stop when they go Down. From this release, the controller stops that run when a
+node heartbeats again, even while the job is still waiting in the queue. Before,
+a node kept the run and its GPUs until the job ended or ran again, and refused
+every job placed on those GPUs in the meantime.
+
+Stopping the run on heartbeat needs both an upgraded controller and an upgraded
+agent on that node, which reports the run it holds; with either side from an
+earlier release, the old behavior stays. An upgraded agent also stops the old
+run's processes, including its ``srun`` steps, when the job is placed back on
+the same node, which an earlier agent could miss for a run without a cgroup
+(``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example
+when not running as root).
+
+Before accepting a replacement attempt, the agent fences every older attempt
+it can discover in its tracked sessions, persisted session descriptors, and
+``/sys/fs/cgroup/spur/job_<id>_<attempt>`` directories. This includes attempts
+with reused step IDs after a restart and orphan cgroups without descriptors.
+It kills old workloads and removes their complete cgroup trees, including the
+parent job cgroup. Same or newer attempts and other jobs are left alone.
+Batch launches and allocation registration are refused if an old cgroup cannot
+be removed or an old session descriptor cannot be read; the old reservation is
+not replaced. Step startup is serialized with this cleanup so an old step
+cannot recreate a cgroup during replacement.
+Completed steps keep their recorded exit status when a replacement reclaims
+their retained sessions. An unreadable exit record also refuses replacement.
+
 See Also
 --------
 
