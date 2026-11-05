@@ -59,7 +59,9 @@ limit:
   GPU jobs out of the partition.
 - A cap limits only its own partition. Caps of different partitions do not
   need to add up to the node size (see `Overlapping caps`_).
-- For a multi-node job, each node's share is checked against that node.
+- For a multi-node job, each node's share is checked against that node. A
+  ``--gpus`` total is spread over the nodes so that every node's share fits:
+  with ``"gres/gpu" = 2``, ``-N2 --gpus=4`` gets 2 GPUs on each node.
 - Lowering a cap does not stop running jobs. New jobs wait until usage drops
   below the new limit.
 
@@ -122,8 +124,9 @@ These knobs use Slurm's names and meaning (``MaxMemPerNode``,
 ``MaxMemPerCPU``, ``DefMemPerNode``, ``DefMemPerCPU``, ``DefMemPerGPU``).
 
 ``max_mem_per_node``
-   Largest memory one job may use on one node. This is a per-job limit, not a
-   partition budget. With only ``max_mem_per_node = 65536`` set, four 64 GiB
+   Largest memory one job may use on one node, checked on the node that gets
+   the most: with ``-N2 -n3 --mem-per-cpu=4G`` that is the node running two
+   tasks, 8 GiB. This is a per-job limit, not a partition budget. With only ``max_mem_per_node = 65536`` set, four 64 GiB
    jobs can still fill a 256 GiB node. For a budget shared by all of the
    partition's jobs, use the ``mem`` key of ``max_tres_per_node``.
 
@@ -133,7 +136,11 @@ These knobs use Slurm's names and meaning (``MaxMemPerNode``,
 
 ``def_mem_per_node``, ``def_mem_per_cpu``, ``def_mem_per_gpu``
    Memory a job gets in this partition when it requests none. ``def_mem_per_gpu``
-   is multiplied by the job's GPUs per node and applies only to GPU jobs.
+   applies only to GPU jobs and is multiplied by the GPUs the job gets on each
+   node. A ``--gpus`` total can land unevenly (``-N2 --gpus=4`` may get 3 GPUs
+   on one node and 1 on the other), so that job gets 3 × and 1 × the default.
+   ``scontrol show job`` then reports ``MinMemoryNode=0`` and the job's total
+   in ``ReqTRES`` ``mem=``, as Slurm does for memory per GPU.
 
 .. note::
 
@@ -180,6 +187,9 @@ The adjustment depends on how the job asked for memory:
   2048 MiB limit becomes 6 CPUs × 1707 MiB = 10242 MiB); it never shrinks.
 - ``--mem`` (per node) above ``CPUs × limit``: CPUs are raised to
   ``ceil(mem / limit)``.
+- Memory from ``def_mem_per_gpu``: handled like ``--mem`` for a node holding
+  the most GPUs when they are spread as evenly as possible. A node is then
+  never given more GPUs than its CPUs allow under the limit.
 
 With ``max_mem_per_cpu = 2048`` (2 GiB):
 

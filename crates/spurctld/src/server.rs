@@ -5039,6 +5039,7 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
         } else {
             None
         },
+        memory_per_gpu_mb: None,
         gres,
         gpus,
         gpus_per_node,
@@ -5574,7 +5575,11 @@ fn requested_tres(spec: &spur_core::job::JobSpec) -> String {
         u64::from(spec.num_tasks.max(1)).saturating_mul(u64::from(spec.cpus_per_task.max(1)));
     let mut parts = vec![format!("cpu={cpu_total}"), format!("node={nodes}")];
 
-    let mem_mb = min_memory_per_node_mb(spec).saturating_mul(nodes);
+    // Per-GPU memory differs per node, so only its job total is meaningful.
+    let mem_mb = match min_memory_per_node_mb(spec) {
+        0 => spur_core::job::effective_memory_mb(spec, nodes as u32),
+        per_node => per_node.saturating_mul(nodes),
+    };
     if mem_mb > 0 {
         parts.insert(1, format!("mem={mem_mb}M"));
     }
@@ -14223,6 +14228,22 @@ mod tests {
         };
         assert_eq!(requested_tres(&spec), "cpu=1,node=1");
         assert_eq!(min_memory_per_node_mb(&spec), 0);
+    }
+
+    #[test]
+    fn requested_tres_totals_per_gpu_memory_over_the_gpu_total() {
+        let spec = spur_core::job::JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            memory_per_gpu_mb: Some(1000),
+            gpus: Some(spur_core::gpu_request::GpuRequest {
+                count: 3,
+                gpu_type: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(requested_tres(&spec), "cpu=2,mem=3000M,node=2,gres/gpu=3");
+        assert_eq!(min_memory_requested_mb(&spec), 0);
     }
 
     #[test]

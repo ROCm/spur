@@ -683,6 +683,10 @@ pub struct JobSpec {
     pub cpus_per_task: u32,
     pub memory_per_node_mb: Option<u64>,
     pub memory_per_cpu_mb: Option<u64>,
+    /// Memory per allocated GPU (MiB). Never submitted: only a partition's
+    /// `def_mem_per_gpu` sets it, so each node's memory follows its GPU share.
+    #[serde(default)]
+    pub memory_per_gpu_mb: Option<u64>,
     pub gres: Vec<String>,
     /// GPU requests. At most one is set (see `gpu_request::resolve_gpu_demand`).
     /// `gpus` = total across the job, the others are per-node / per-task. A
@@ -828,6 +832,7 @@ impl Default for JobSpec {
             cpus_per_task: 1,
             memory_per_node_mb: None,
             memory_per_cpu_mb: None,
+            memory_per_gpu_mb: None,
             gres: Vec::new(),
             gpus: None,
             gpus_per_node: None,
@@ -906,16 +911,20 @@ impl JobSpec {
     }
 }
 
-/// Total memory (MB) a job of `num_nodes` nodes requests, derived from
-/// either an explicit per-node request or a per-CPU request applied across
-/// the job's total CPU count. Falls back to 0 (unconstrained) if neither is
-/// set.
+/// Total memory (MB) a job of `num_nodes` nodes requests, derived from an
+/// explicit per-node request, or a per-CPU or per-GPU amount applied across
+/// the job's total CPU or GPU count. Falls back to 0 (unconstrained) if none
+/// is set.
 pub fn effective_memory_mb(spec: &JobSpec, num_nodes: u32) -> u64 {
     spec.memory_per_node_mb
         .map(|mem| mem * num_nodes as u64)
         .or_else(|| {
             spec.memory_per_cpu_mb
                 .map(|mem| mem * spec.num_tasks as u64 * spec.cpus_per_task as u64)
+        })
+        .or_else(|| {
+            spec.memory_per_gpu_mb
+                .map(|mem| mem.saturating_mul(effective_gpus(spec, num_nodes)))
         })
         .unwrap_or(0)
 }
@@ -2091,6 +2100,21 @@ mod tests {
         };
         // 4 tasks * 2 cpus/task * 512 MB/cpu
         assert_eq!(effective_memory_mb(&spec, 1), 4096);
+    }
+
+    #[test]
+    fn effective_memory_mb_falls_back_to_per_gpu_over_the_gpu_total() {
+        let spec = JobSpec {
+            memory_per_gpu_mb: Some(1024),
+            num_nodes: 2,
+            num_tasks: 2,
+            gpus: Some(crate::gpu_request::GpuRequest {
+                count: 3,
+                gpu_type: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(effective_memory_mb(&spec, 2), 3072);
     }
 
     #[test]
@@ -3506,6 +3530,7 @@ mod tests {
             cpus_per_task: 6,
             memory_per_node_mb: None,
             memory_per_cpu_mb: Some(1707),
+            memory_per_gpu_mb: None,
         };
 
         job.start_in_partition(Some("a".into()), Some(adjusted));

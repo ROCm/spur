@@ -363,6 +363,7 @@ fn run_attribution_records_the_chosen_partitions_adjusted_request() {
             cpus_per_task: 4,
             memory_per_node_mb: None,
             memory_per_cpu_mb: Some(1536),
+            memory_per_gpu_mb: None,
         })
     );
     let five = RunAttribution::for_partition(&job(Some(5 * GIB), None), Some(&p), false);
@@ -443,6 +444,7 @@ async fn effective_partition_and_adjusted_request_survive_a_controller_restart()
                     cpus_per_task: 4,
                     memory_per_node_mb: None,
                     memory_per_cpu_mb: Some(1536),
+                    memory_per_gpu_mb: None,
                 }),
             },
         )

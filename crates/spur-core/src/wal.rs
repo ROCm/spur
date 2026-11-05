@@ -1253,6 +1253,7 @@ mod tests {
             cpus_per_task: 4,
             memory_per_node_mb: None,
             memory_per_cpu_mb: Some(1536),
+            memory_per_gpu_mb: None,
         };
         let op = WalOperation::JobStart {
             job_id: 9,
