@@ -19,7 +19,7 @@ use spur_core::resource::{
 use crate::node_match::NodePlacement;
 use crate::partition_cap::{
     candidate_partitions, is_capped, job_in_eligible_partitions, job_in_partition, job_typed_gpu,
-    partition_cap_ok, resolution_rank, TresCharge,
+    partition_cap_ok, planned_memory_adjustment, resolution_rank, TresCharge,
 };
 use crate::timeline::{CapCheck, NodeTimeline, PartitionCharge, UNLIMITED_JOB_DURATION};
 use crate::traits::{Assignment, ClusterState, Scheduler};
@@ -837,12 +837,15 @@ impl BackfillScheduler {
                                     .map(|node| node.name.clone())
                                     .collect()
                             });
+                        let memory_adjustment =
+                            planned_adjustment(job, partition.as_deref(), cluster.partitions);
                         best = Some((
                             Assignment {
                                 job_id: job.job_id,
                                 nodes: node_names,
                                 per_node_alloc: allocations,
                                 partition,
+                                memory_adjustment,
                             },
                             start,
                         ));
@@ -1099,6 +1102,11 @@ impl BackfillScheduler {
                     job_id: job.job_id,
                     nodes: node_names,
                     per_node_alloc: plan.per_node_alloc,
+                    memory_adjustment: planned_adjustment(
+                        job,
+                        partition.as_deref(),
+                        cluster.partitions,
+                    ),
                     partition,
                 });
             } else if job.idle_fill {
@@ -1625,6 +1633,17 @@ pub fn placement_charge(
         total.gpus.len() as u64,
         typed_gpu,
     )
+}
+
+/// The memory policy of the partition named `partition` applied to the job,
+/// from the same partition snapshot its placement was planned against.
+fn planned_adjustment(
+    job: &Job,
+    partition: Option<&str>,
+    partitions: &[Partition],
+) -> Option<spur_core::partition_limits::MemoryAdjustment> {
+    let partition = partition.and_then(|name| partitions.iter().find(|p| p.name == name));
+    planned_memory_adjustment(job, partition)
 }
 
 /// Partition an uncapped placement is attributed to: the highest-tier

@@ -827,15 +827,12 @@ pub struct RunAttribution {
 }
 
 impl RunAttribution {
-    /// Attribution for a run the scheduler placed in `partition`.
-    pub fn for_partition(job: &Job, partition: Option<&Partition>, idle_fill: bool) -> Self {
-        let original = spur_core::partition_limits::MemoryAdjustment::of(&job.spec);
+    /// Attribution for a run started from the scheduler's `assignment`.
+    pub fn for_assignment(assignment: &spur_sched::traits::Assignment, idle_fill: bool) -> Self {
         Self {
             idle_fill,
-            effective_partition: partition.map(|p| p.name.clone()),
-            memory_adjustment: partition
-                .map(|p| p.memory_adjusted(&job.spec))
-                .filter(|adjusted| *adjusted != original),
+            effective_partition: assignment.partition.clone(),
+            memory_adjustment: assignment.memory_adjustment,
         }
     }
 }

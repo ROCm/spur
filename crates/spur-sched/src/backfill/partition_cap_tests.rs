@@ -935,6 +935,11 @@ fn each_candidate_partition_plans_its_own_memory_adjusted_request() {
     assert_eq!(started(&a), [1]);
     assert_eq!(a[0].partition.as_deref(), Some("big"));
     assert_eq!(a[0].per_node_alloc["n1"].cpus, 4);
+    let planned = a[0].memory_adjustment.as_ref().unwrap();
+    assert_eq!(
+        (planned.cpus_per_task, planned.memory_per_cpu_mb),
+        (4, Some(1536))
+    );
 }
 
 #[test]

@@ -593,16 +593,11 @@ async fn process_assignment(
     let resources = compute_job_allocation(&job, &assignment.nodes, &assignment.per_node_alloc);
 
     let job_id = assignment.job_id;
-    let partitions = cluster.get_partitions();
-    let partition = assignment
-        .partition
-        .as_deref()
-        .and_then(|name| partitions.iter().find(|p| p.name == name));
-    let attribution = crate::cluster::RunAttribution::for_partition(&job, partition, borrowed);
-    // Dispatch and the prolog must see the request the partition's memory
-    // policy reshaped, the same one the placement was sized for.
+    let attribution = crate::cluster::RunAttribution::for_assignment(&assignment, borrowed);
+    // Dispatch and the prolog must see the request the placement was sized
+    // for, not one recomputed from a memory policy changed since.
     let mut spec = job.spec.clone();
-    if let Some(adjustment) = attribution.memory_adjustment {
+    if let Some(adjustment) = &attribution.memory_adjustment {
         adjustment.apply_to(&mut spec);
     }
     let all_nodes = assignment.nodes.clone();
@@ -8940,6 +8935,7 @@ mod tests {
                 nodes: nodes.iter().map(|n| n.to_string()).collect(),
                 per_node_alloc,
                 partition: None,
+                memory_adjustment: None,
             }
         }
 
@@ -8985,6 +8981,49 @@ mod tests {
                 job.idle_fill,
                 "reserve_placement/activate_job must thread `borrowed` through as idle_fill"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_starts_the_request_its_placement_was_planned_for() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            cm.create_partition(spur_core::partition::Partition {
+                name: "p".into(),
+                nodes: "ALL".into(),
+                def_mem_per_node: Some(4096),
+                ..Default::default()
+            })
+            .unwrap();
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(
+                &cm,
+                JobSpec {
+                    partition: Some("p".into()),
+                    ..batch_spec("planned-memory", 1)
+                },
+            );
+            let partitions = cm.get_partitions();
+            let mut planned = assignment(job_id, &["n1"]);
+            planned.partition = Some("p".into());
+            planned.memory_adjustment = spur_sched::partition_cap::planned_memory_adjustment(
+                &cm.get_job(job_id).unwrap(),
+                partitions.iter().find(|p| p.name == "p"),
+            );
+
+            let raise = crate::cluster::PartitionLimitsUpdate {
+                def_mem_per_node: Some(Some(8192)),
+                ..Default::default()
+            };
+            cm.update_partition(
+                "p", None, None, None, None, None, None, None, false, None, None, None, None, None,
+                None, None, None, None, None, raise,
+            )
+            .unwrap();
+            assert!(process_assignment(cm.clone(), planned, false).await);
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.spec.memory_per_node_mb, Some(4096));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
