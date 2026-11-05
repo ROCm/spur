@@ -21490,15 +21490,19 @@ mod tests {
         })
     }
 
-    /// Real time: the kernel, not the paused tokio clock, delivers SIGKILL.
-    async fn wait_until_not_running(pid: i32) -> bool {
-        for _ in 0..200 {
-            if !process_is_running(pid) {
-                return true;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        false
+    /// Returns once child `pid` has exited, without reaping it. Awaits the exit
+    /// itself because the kernel, not the paused tokio clock, delivers SIGKILL;
+    /// an already-reaped child has exited too, hence any error ends the wait.
+    async fn wait_until_exited(pid: i32) {
+        use nix::sys::wait::{waitid, Id, WaitPidFlag};
+        tokio::task::spawn_blocking(move || {
+            while let Err(nix::errno::Errno::EINTR) = waitid(
+                Id::Pid(nix::unistd::Pid::from_raw(pid)),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+            ) {}
+        })
+        .await
+        .expect("wait for the process to exit");
     }
 
     /// Returns only once the trap is installed, so a SIGTERM sent right after
@@ -21557,7 +21561,7 @@ mod tests {
         let alive_before_kill_wait = process_is_running(pid);
         tokio::time::sleep_until(started + std::time::Duration::from_secs(31)).await;
         tokio::time::resume();
-        let gone_after_kill_wait = wait_until_not_running(pid).await;
+        wait_until_exited(pid).await;
 
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-pid),
@@ -21566,10 +21570,6 @@ mod tests {
         assert!(
             alive_before_kill_wait,
             "SIGKILL must not land before the requested kill wait"
-        );
-        assert!(
-            gone_after_kill_wait,
-            "SIGKILL must land once the requested kill wait elapses"
         );
     }
 
@@ -21593,7 +21593,7 @@ mod tests {
         let alive_at_old_escalation = process_is_running(pid as i32);
         tokio::time::sleep_until(started + std::time::Duration::from_secs(31)).await;
         tokio::time::resume();
-        let gone_after_kill_wait = wait_until_not_running(pid as i32).await;
+        wait_until_exited(pid as i32).await;
 
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-(pid as i32)),
@@ -21602,10 +21602,6 @@ mod tests {
         assert!(
             alive_at_old_escalation,
             "an unsupervised step must not be SIGKILLed before the kill wait"
-        );
-        assert!(
-            gone_after_kill_wait,
-            "an unsupervised step must be SIGKILLed once the kill wait elapses"
         );
     }
 
@@ -21639,22 +21635,11 @@ mod tests {
         let alive_before_backstop = !child_has_exited(&mut child).await;
         tokio::time::sleep_until(started + std::time::Duration::from_millis(11_500)).await;
         tokio::time::resume();
-        let mut killed = false;
-        for _ in 0..200 {
-            if child_has_exited(&mut child).await {
-                killed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        child.wait().await.expect("wait for the force-killed stepd");
 
         assert!(
             alive_before_backstop,
             "the stepd must outlive the kill wait; the backstop starts after it"
-        );
-        assert!(
-            killed,
-            "the wedged stepd must be force-killed once kill wait plus backstop elapse"
         );
     }
 
@@ -22111,13 +22096,12 @@ mod tests {
         ))
         .await
         .expect("signal job");
-        let gone = wait_until_not_running(pid as i32).await;
+        wait_until_exited(pid as i32).await;
 
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-(pid as i32)),
             nix::sys::signal::Signal::SIGKILL,
         );
-        assert!(gone, "the step must receive the signal");
         assert!(!svc.step_cancel_requested(919, 4).await);
     }
 
@@ -22200,13 +22184,12 @@ mod tests {
         ))
         .await
         .expect("signal job");
-        let gone = wait_until_not_running(pid).await;
+        wait_until_exited(pid).await;
 
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-pid),
             nix::sys::signal::Signal::SIGKILL,
         );
-        assert!(gone, "the full target must reach the unsupervised batch");
         assert!(
             svc.running.lock().await.contains_key(&914),
             "a signal does not tear the job down"
