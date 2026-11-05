@@ -213,10 +213,9 @@ because the CPU count is multiplied, as in Slurm. The extra CPUs count against
 the partition's ``cpu`` cap and against association and QOS limits like any
 other CPUs.
 
-While a job that lists several partitions is pending, association and QOS
-limits are checked against the most CPUs and, separately, the most memory any
-of its partitions would give it, so neither is under-counted whichever
-partition it ends up in.
+A job that lists several partitions is checked against association and QOS
+limits once per partition, with the request that partition would give it (see
+`How caps combine with other limits`_).
 
 The adjustment is made separately for each partition a job may run in. When the
 job starts, the adjusted CPU and memory request of the partition it runs in is
@@ -232,7 +231,8 @@ each scheduling pass:
 
 1. Partitions that cannot run the job are skipped: one that is not ``UP``, one
    whose ``MaxTime``, ``MinNodes``, ``MaxNodes``, or ``max_mem_per_node`` the
-   job exceeds, and one whose cap the job would exceed even on an idle node.
+   job exceeds, one whose cap the job would exceed even on an idle node, and
+   one whose adjusted request the job's association or QOS limits refuse.
    A node that only skipped partitions hold is not used. A partition that is
    only full right now is not skipped. The same rule applies to every
    multi-partition job, capped or not.
@@ -375,9 +375,41 @@ includes ``max_cpus_per_node``, ``max_tres_per_node``, ``max_mem_per_node``,
 How caps combine with other limits
 ----------------------------------
 
-All limits apply together. A job runs only if it passes its association
-limits, its QOS limits, its partition's limits, and node capacity. A partition
-cap never loosens an association or QOS limit, and the other way round.
+Spur applies the job's QOS, its user and account association, the partition
+it runs in, and physical node capacity together. A job runs only if it passes
+all of them. A partition cap never loosens an association or QOS limit, and the
+other way round. This is not Slurm's hierarchy, where the first layer that
+defines a limit wins. Inheriting limits from parent accounts or the root, and
+partition QOS, are not supported.
+
+Partition caps (``max_tres_per_node``) are additional constraints on top of the
+association and QOS limits. A partition's memory policy can change a job's CPU
+and memory request (see `How max_mem_per_cpu adds CPUs`_), and each partition
+a job may run in is judged with its own adjusted request, the same one at every
+step:
+
+- **Submit.** A ``DenyOnLimit`` QOS, or no QOS, rejects the job only if the
+  adjusted request of every requested partition breaks a QOS or association
+  limit on its own. The job is accepted if one of them fits.
+- **Quota check while pending.** Association and QOS limits are checked with
+  each partition's adjusted request. The job may then start only in the
+  partitions whose request passes. If none passes, it pends with the reason of
+  the first requested partition's failing limit.
+- **Placement and start.** The scheduler picks among the remaining partitions
+  and the job starts with the request of the partition it picked. That request
+  is what it is charged for against association, QOS, and partition limits
+  until it ends.
+
+Example: partition ``a`` sets ``max_mem_per_cpu = 2048`` and partition ``b``
+sets ``max_mem_per_cpu = 1024``. ``-p a,b -c 2 --mem-per-cpu=3G`` needs 4 CPUs
+in ``a`` and 6 CPUs in ``b``. With an association ``GrpTRES=cpu=4`` the job
+can only run in ``a``, so it runs there; ``b`` is not considered for it. With
+``GrpTRES=cpu=3`` neither fits and the job pends with ``AssocGrpCpuLimit``.
+
+Within one scheduling pass, a job that could run in several partitions holds
+the largest of their requests against shared association and QOS limits until
+it starts, so jobs queued behind it in the same pass are never admitted past a
+limit. Once it starts, only the request of the partition it runs in is charged.
 
 Jobs started by :doc:`idle-fill-scheduling` count against partition caps like
 any other running job, and an idle-fill start must fit within the cap.

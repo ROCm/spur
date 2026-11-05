@@ -632,7 +632,10 @@ Three families behave differently:
   association limits alike, so a permissive QOS (``DenyOnLimit`` off) pends an
   association TRES breach instead of rejecting it. A job that resolves to **no
   QOS** is treated as ``DenyOnLimit`` on, so a request that can never fit is
-  rejected rather than pending forever.
+  rejected rather than pending forever. When a partition's memory policy
+  changes the job's CPU or memory request, the request it would get in each
+  requested partition is checked, and the job is rejected only if none of them
+  fits (see :doc:`partition-resource-limits`).
 - **Running-count limits** (``maxjobs``, ``maxjobsperuser``) never reject at
   submit. They count only **running** jobs, so the submit is always accepted and
   the job **pends** once the running cap is reached.
