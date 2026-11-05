@@ -10704,10 +10704,9 @@ impl AgentService {
         }
     }
 
-    /// Snapshots (key, pid, epoch) of the job's unsupervised steps with a process.
-    /// The caller signals outside the lock: signal_step_tree walks /proc, and
-    /// holding `active_steps` across it would stall every concurrent run_command.
-    /// `mark_cancelled` also flags a step with no pid yet so its launch aborts.
+    /// Snapshots (key, pid, epoch) of the job's unsupervised steps with a process,
+    /// so the caller signals outside the lock: holding `active_steps` across the
+    /// /proc walk would stall every run_command. `mark_cancelled` also flags a step with no pid.
     async fn unsupervised_step_targets(
         &self,
         job_id: u32,
