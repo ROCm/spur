@@ -54,6 +54,23 @@ fn normalize_admin_level(raw: &str) -> Result<&str, Status> {
     })
 }
 
+/// Normalize a comma-separated QOS allow-list: trim, drop empty tokens (a
+/// trailing comma is harmless), and reject any name that is not a QOS.
+async fn normalize_qos_list(pool: &PgPool, list: &str) -> Result<String, Status> {
+    let names: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let missing = db::missing_qos(pool, &names)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(name) = missing.first() {
+        return Err(Status::not_found(format!("QOS '{name}' does not exist")));
+    }
+    Ok(names.join(","))
+}
+
 /// Map an optional TRES/text proto field to a nullable-column patch: unset ->
 /// keep, empty -> clear (SQL NULL), otherwise -> set.
 fn nullable_str(field: &Option<String>) -> Option<Option<&str>> {
@@ -595,6 +612,10 @@ impl SlurmAccounting for AccountingService {
         if let Some(g) = &req.grp_tres {
             validate_tres("grptres", g)?;
         }
+        let allowed_qos_normalized = match req.allowed_qos.as_deref() {
+            None => None,
+            Some(list) => Some(normalize_qos_list(pool, list).await?),
+        };
         let update = db::AccountUpdate {
             description: req.description.as_deref(),
             organization: req.organization.as_deref(),
@@ -602,6 +623,13 @@ impl SlurmAccounting for AccountingService {
             fairshare: req.fairshare_weight.map(fairshare_to_i32).transpose()?,
             max_running_jobs: nullable_limit(req.max_running_jobs, "max_running_jobs")?,
             grp_tres: nullable_str(&req.grp_tres),
+            allowed_qos: allowed_qos_normalized.as_deref().map(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }),
         };
         let mut tx = pool.begin().await.map_err(internal)?;
         let result = db::upsert_account(&mut tx, &req.name, update)
@@ -614,6 +642,7 @@ impl SlurmAccounting for AccountingService {
             ("fairshare_weight", req.fairshare_weight.map(Into::into)),
             ("max_running_jobs", req.max_running_jobs.map(Into::into)),
             ("grp_tres", req.grp_tres.map(Into::into)),
+            ("allowed_qos", allowed_qos_normalized.map(Into::into)),
         ]);
         write_txn_in_band(
             &mut tx,
@@ -674,6 +703,7 @@ impl SlurmAccounting for AccountingService {
                 fairshare_weight: r.fairshare_weight as f64,
                 max_running_jobs: limit_to_wire(r.max_running_jobs),
                 grp_tres: r.grp_tres.unwrap_or_default(),
+                allowed_qos: r.allowed_qos.unwrap_or_default(),
             })
             .collect();
 
@@ -709,20 +739,7 @@ impl SlurmAccounting for AccountingService {
         // the stored allow-list untouched; an explicit empty clears it.
         let allowed_qos_normalized: Option<String> = match req.allowed_qos.as_deref() {
             None => None,
-            Some(list) => {
-                let names: Vec<&str> = list
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let missing = db::missing_qos(pool, &names)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                if let Some(name) = missing.first() {
-                    return Err(Status::not_found(format!("QOS '{name}' does not exist")));
-                }
-                Some(names.join(","))
-            }
+            Some(list) => Some(normalize_qos_list(pool, list).await?),
         };
         // Cross-check the default is in the allow-list only when both are
         // restated here; a preserved (unset) side can't be validated without a

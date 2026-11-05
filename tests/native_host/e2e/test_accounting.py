@@ -1976,6 +1976,40 @@ class TestShowAssociation:
             f"user=alice filter must exclude bob: {only_alice}"
         )
 
+    def test_account_qos_shows_without_users_and_users_inherit_it(self, accounting_cluster):
+        c = accounting_cluster
+        c.sacctmgr(["-i", "add", "qos", "name=amd-collectives-qos"])
+        c.sacctmgr(["-i", "add", "qos", "name=amd-burst-qos"])
+        c.sacctmgr(["-i", "add", "account", "name=amd-collectives"])
+        c.sacctmgr(
+            ["-i", "modify", "account", "name=amd-collectives", "set",
+             "qos=amd-collectives-qos,amd-burst-qos"]
+        )
+
+        # The account itself is a row, even before any user is added.
+        assoc = c.sacctmgr(["show", "association", "account=amd-collectives"])
+        assert "amd-collectives-qos,amd-burst-qos" in assoc, (
+            f"account QOS missing from show association:\n{assoc}"
+        )
+
+        c.sacctmgr(["-i", "add", "user", "name=aliceacctqos", "account=amd-collectives"])
+        shown = c.sacctmgr(["show", "user", "user=aliceacctqos"])
+        alice = next(ln for ln in shown.splitlines() if "aliceacctqos" in ln)
+        assert "amd-collectives-qos,amd-burst-qos" in alice, (
+            f"user with no qos= must show the account list:\n{shown}"
+        )
+
+        c.sacctmgr(
+            ["-i", "modify", "user", "name=aliceacctqos", "account=amd-collectives",
+             "set", "qos=amd-burst-qos"]
+        )
+        shown = c.sacctmgr(["show", "user", "user=aliceacctqos"])
+        alice = next(ln for ln in shown.splitlines() if "aliceacctqos" in ln)
+        assert "amd-burst-qos" in alice, f"user qos= must be kept:\n{shown}"
+        assert "amd-collectives-qos" not in alice, (
+            f"user qos= must replace the account list:\n{shown}"
+        )
+
 
 class TestSacctmgrHelpFields:
     """`sacctmgr --help` must name the valid key=value fields per entity instead
