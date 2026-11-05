@@ -1565,6 +1565,33 @@ mod deregistration_wal_tests {
         assert_eq!(replayed(ABSENT), None, "an absent key leaves it unchanged");
     }
 
+    // These entries are already in deployed logs, so a change to how they read
+    // changes what a replay does. Never regenerate.
+    #[test]
+    fn preempt_run_attempt_wire_format_is_frozen() {
+        const CANCEL: &str = r#"{"JobPreemptCancel":{"job_id":7,"preempted_by":42,"preempt_qos":null,"at":"2026-03-04T05:06:07Z","run_attempt":3}}"#;
+        const REQUEUE: &str = r#"{"JobPreemptRequeue":{"job_id":7,"begin_time":"2999-01-01T00:00:00Z","preempted_by":42,"preempt_qos":null,"at":null,"run_attempt":3}}"#;
+
+        match serde_json::from_str(CANCEL).expect("must deserialize") {
+            WalOperation::JobPreemptCancel { run_attempt, .. } => assert_eq!(run_attempt, Some(3)),
+            _ => panic!("wrong variant"),
+        }
+        match serde_json::from_str(REQUEUE).expect("must deserialize") {
+            WalOperation::JobPreemptRequeue { run_attempt, .. } => {
+                assert_eq!(run_attempt, Some(3))
+            }
+            _ => panic!("wrong variant"),
+        }
+        for frozen in [CANCEL, REQUEUE] {
+            let op: WalOperation = serde_json::from_str(frozen).expect("must deserialize");
+            assert_eq!(
+                serde_json::to_string(&op).expect("must serialize"),
+                frozen,
+                "the entry must keep its wire shape"
+            );
+        }
+    }
+
     // A legacy entry that carried a real action must keep it.
     #[test]
     fn partition_create_pre_optional_preserves_configured_action() {
