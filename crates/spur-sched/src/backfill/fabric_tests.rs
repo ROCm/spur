@@ -696,7 +696,7 @@ fn property_run_in(
     policy: Partition,
     nodes: &[Node],
     jobs: &[Job],
-    handoffs: &HashMap<String, JobId>,
+    handoffs: &HashMap<String, Vec<JobId>>,
 ) -> (BackfillScheduler, Vec<Assignment>) {
     let context = FabricSchedulingContext {
         view: FabricView::from_nodes("test", nodes, now(), 90),

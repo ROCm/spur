@@ -170,6 +170,39 @@ pub fn job_in_partition<'a>(job: &'a Job, partition: &Partition) -> Cow<'a, Job>
     Cow::Owned(job)
 }
 
+/// The job restricted to the requested partitions that admit it now (see
+/// [`Partition::admits`]), so placement never uses a node only an ineligible
+/// partition holds. `None` when every requested partition rules it out. An
+/// unknown name is left to node matching; the controller gates on it already.
+pub fn job_in_eligible_partitions<'a>(
+    job: &'a Job,
+    partitions: &[Partition],
+) -> Option<Cow<'a, Job>> {
+    let requested: Vec<&str> = requested_partition_names(job.spec.partition.as_deref()).collect();
+    if requested.is_empty() {
+        return Some(Cow::Borrowed(job));
+    }
+    let eligible: Vec<&str> = requested
+        .iter()
+        .copied()
+        .filter(|name| {
+            partitions
+                .iter()
+                .find(|p| p.name == *name)
+                .is_none_or(|p| p.admits(&job.spec))
+        })
+        .collect();
+    if eligible.is_empty() {
+        return None;
+    }
+    if eligible.len() == requested.len() {
+        return Some(Cow::Borrowed(job));
+    }
+    let mut job = job.clone();
+    job.spec.partition = Some(eligible.join(","));
+    Some(Cow::Owned(job))
+}
+
 /// Partitions a job may be charged to: the requested ones that exist, or the
 /// cluster default when it requested none. Request order is not meaningful.
 pub fn candidate_partitions<'a>(job: &Job, partitions: &'a [Partition]) -> Vec<&'a Partition> {

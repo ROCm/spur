@@ -1012,3 +1012,83 @@ fn array_tasks_are_charged_one_by_one_against_the_cap() {
         );
     }
 }
+
+/// `hi` (tier 5, made ineligible by `ineligible`) and `lo` share idle n1;
+/// only `lo` also has n2.
+fn ineligible_hi_fixture(ineligible: impl FnOnce(&mut Partition)) -> Fixture {
+    let mut hi = Partition {
+        priority_tier: 5,
+        def_mem_per_node: Some(1024),
+        ..partition("hi", &[])
+    };
+    ineligible(&mut hi);
+    Fixture::new(
+        vec![
+            node("n1", 64, 256_000, &["hi", "lo"]),
+            node("n2", 64, 256_000, &["lo"]),
+        ],
+        vec![hi, partition("lo", &[])],
+    )
+}
+
+#[test]
+fn a_partition_that_is_not_up_is_never_chosen() {
+    use spur_core::partition::PartitionState;
+    for state in [
+        PartitionState::Down,
+        PartitionState::Drain,
+        PartitionState::Inactive,
+    ] {
+        let fx = ineligible_hi_fixture(|p| p.state = state);
+        let mut sched = BackfillScheduler::new(100);
+        let a = fx.schedule(&mut sched, &[job(1, "hi,lo", 4, 1)]);
+        assert_eq!(started(&a), [1], "{state:?}");
+        assert_eq!(a[0].partition.as_deref(), Some("lo"), "{state:?}");
+    }
+}
+
+#[test]
+fn a_candidate_whose_max_time_or_node_bounds_the_job_violates_is_never_chosen() {
+    let over_time = ineligible_hi_fixture(|p| p.max_time_minutes = Some(30));
+    let too_few_nodes = ineligible_hi_fixture(|p| p.min_nodes = 2);
+    for fx in [over_time, too_few_nodes] {
+        let mut sched = BackfillScheduler::new(100);
+        let a = fx.schedule(&mut sched, &[job(1, "hi,lo", 4, 1)]);
+        assert_eq!(started(&a), [1]);
+        assert_eq!(a[0].partition.as_deref(), Some("lo"));
+    }
+
+    let mut fx = ineligible_hi_fixture(|p| p.max_nodes = Some(1));
+    fx.nodes[1].partitions.push("hi".into());
+    let mut wide = job(1, "hi,lo", 4, 1);
+    wide.spec.num_nodes = 2;
+    wide.spec.num_tasks = 2;
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[wide]);
+    assert_eq!(started(&a), [1]);
+    assert_eq!(a[0].partition.as_deref(), Some("lo"));
+}
+
+#[test]
+fn an_uncapped_job_never_lands_on_a_node_only_a_down_partition_holds() {
+    use spur_core::partition::PartitionState;
+    let fx = Fixture::new(
+        vec![
+            node("n1", 64, 256_000, &["down"]),
+            node("n2", 64, 256_000, &["up"]),
+        ],
+        vec![
+            Partition {
+                state: PartitionState::Down,
+                priority_tier: 5,
+                ..partition("down", &[])
+            },
+            partition("up", &[]),
+        ],
+    )
+    .running_cpus("up", "n2", 64, 2);
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[job(1, "down,up", 4, 1)]);
+    assert!(a.is_empty(), "n1 is only in the Down partition: {a:?}");
+    assert_eq!(reserved(&sched, 1), Some((vec!["n2".into()], hours(2))));
+}

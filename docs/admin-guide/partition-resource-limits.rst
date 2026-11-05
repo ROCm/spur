@@ -220,9 +220,12 @@ When a job lists several partitions (``-p cpu,wide``) and at least one of them
 has a cap or a memory policy, the scheduler picks a partition for the job on
 each scheduling pass:
 
-1. Partitions whose limits could never hold the job are skipped. This includes
-   a cap the job would exceed even on an idle node and a ``max_mem_per_node``
-   it exceeds. A partition that is only full right now is not skipped.
+1. Partitions that cannot run the job are skipped: one that is not ``UP``, one
+   whose ``MaxTime``, ``MinNodes``, ``MaxNodes``, or ``max_mem_per_node`` the
+   job exceeds, and one whose cap the job would exceed even on an idle node.
+   A node that only skipped partitions hold is not used. A partition that is
+   only full right now is not skipped. The same rule applies to every
+   multi-partition job, capped or not.
 2. The rest are tried in ``priority_tier`` order, highest first. The job starts
    in the first one where it can start now, so a lower-tier partition with
    room runs it while a higher-tier one is busy. This matches Slurm's

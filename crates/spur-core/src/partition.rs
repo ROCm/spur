@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use crate::job::{JobSpec, PendingReason};
+
 /// Partition (queue) configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Partition {
@@ -99,6 +101,42 @@ impl Partition {
             return Err(format!("{} (set at most one)", def_mem.join(", ")));
         }
         Ok(())
+    }
+
+    /// Whether a wall-time request fits `MaxTime`; no request or no limit fits.
+    pub fn time_allows(&self, time_limit: Option<&chrono::Duration>) -> bool {
+        match (self.max_time_minutes, time_limit) {
+            (Some(max_mins), Some(tl)) => tl.num_seconds() <= i64::from(max_mins) * 60,
+            _ => true,
+        }
+    }
+
+    /// The reason this partition can never run the job (static limits), or
+    /// `None` if it can. Node-count violations report `PartitionConfig`;
+    /// wall-time violations report the more specific `PartitionTimeLimit`.
+    pub fn limit_block(&self, spec: &JobSpec) -> Option<PendingReason> {
+        // A job never runs on fewer than one node, whatever it asked for.
+        let nodes = spec.num_nodes.max(1);
+        if self.max_nodes.is_some_and(|max| nodes > max) {
+            return Some(PendingReason::PartitionConfig);
+        }
+        if nodes < self.min_nodes {
+            return Some(PendingReason::PartitionConfig);
+        }
+        if !self.time_allows(spec.time_limit.as_ref()) {
+            return Some(PendingReason::PartitionTimeLimit);
+        }
+        if self.max_mem_per_node_exceeded(spec).is_some() {
+            return Some(PendingReason::PartitionConfig);
+        }
+        None
+    }
+
+    /// Whether the job may start in this partition now: it is Up and none of
+    /// its static limits rule the job out. The controller's pending-reason
+    /// gate and the scheduler's partition choice both use this rule.
+    pub fn admits(&self, spec: &JobSpec) -> bool {
+        self.state == PartitionState::Up && self.limit_block(spec).is_none()
     }
 }
 
@@ -294,6 +332,54 @@ impl Default for Partition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admits_requires_up_and_every_static_limit() {
+        let spec = JobSpec {
+            num_nodes: 2,
+            time_limit: Some(chrono::Duration::minutes(60)),
+            memory_per_node_mb: Some(2048),
+            ..Default::default()
+        };
+        assert!(Partition::default().admits(&spec));
+        let ruled_out = [
+            Partition {
+                state: PartitionState::Down,
+                ..Default::default()
+            },
+            Partition {
+                state: PartitionState::Drain,
+                ..Default::default()
+            },
+            Partition {
+                max_time_minutes: Some(59),
+                ..Default::default()
+            },
+            Partition {
+                max_nodes: Some(1),
+                ..Default::default()
+            },
+            Partition {
+                min_nodes: 3,
+                ..Default::default()
+            },
+            Partition {
+                max_mem_per_node: Some(1024),
+                ..Default::default()
+            },
+        ];
+        for partition in ruled_out {
+            assert!(!partition.admits(&spec), "{partition:?}");
+        }
+        assert_eq!(
+            Partition {
+                max_time_minutes: Some(59),
+                ..Default::default()
+            }
+            .limit_block(&spec),
+            Some(PendingReason::PartitionTimeLimit)
+        );
+    }
 
     #[test]
     fn preempt_mode_parses_unset_off_and_actions() {
