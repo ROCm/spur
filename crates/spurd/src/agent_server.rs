@@ -21559,7 +21559,8 @@ mod tests {
     }
 
     /// Returns only once the trap is installed, so a SIGTERM sent right after
-    /// can't beat it and kill the process outright.
+    /// can't beat it and kill the process outright. The child ends on its own
+    /// after 60s, so a SIGKILL that never lands fails a test instead of hanging it.
     async fn spawn_term_ignoring_process() -> tokio::process::Child {
         use std::os::unix::process::CommandExt;
         use tokio::io::AsyncBufReadExt;
@@ -21567,7 +21568,7 @@ mod tests {
         command
             .args([
                 "-c",
-                "trap '' TERM; echo ready; while true; do sleep 1; done",
+                "trap '' TERM; echo ready; sleep 60",
             ])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
