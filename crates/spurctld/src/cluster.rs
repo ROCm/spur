@@ -31204,7 +31204,8 @@ state = "UP"
         let id = run_job_on(&cm, "victim", "n1");
         cm.suspend_job(id, "testuser").unwrap();
         settle(&cm, id, JobState::Suspended);
-        // The state an older controller could leave: suspended with the grace still live.
+        // Defensive: unreachable now that JobSuspend refuses a job in its grace, but a
+        // resume must still never carry a live grace back into a running job.
         let pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
         cm.jobs.write().get_mut(&id).unwrap().preempt_pending = Some(pending);
         assert!(cm.get_job(id).unwrap().preempt_grace().is_some());
