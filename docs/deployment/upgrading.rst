@@ -945,9 +945,10 @@ behave as before: with no limit set, nothing changes, and
 .. warning::
 
    **Upgrade every controller replica before you configure any partition
-   cap.** A job blocked by a cap is stored in the Raft log with the new
-   ``PartitionTresLimit`` pending reason, which an older controller cannot
-   read. An older replica also ignores the new limit fields, so if it became
+   cap.** A job blocked by a cap carries the new ``PartitionTresLimit``
+   pending reason, which is saved in Raft snapshots; an older controller
+   cannot load such a snapshot, either on restart or when the leader sends
+   it one to catch up. An older replica also ignores the new limit fields, so if it became
    leader it would schedule without the caps. Because a cap can only be set once the new binary runs, the
    normal upgrade order is safe as long as no cap is configured until the last
    controller is upgraded.

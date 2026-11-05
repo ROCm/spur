@@ -175,7 +175,9 @@ The adjustment depends on how the job asked for memory:
 
 - ``--mem-per-cpu`` above the limit: CPUs per task are **multiplied** by
   ``ceil(mem_per_cpu / limit)``, and memory per CPU is divided by the same
-  factor (rounded up). Total memory does not change.
+  factor, rounded up to a whole MiB. Total memory stays the same or grows by
+  a few MiB from that rounding (for example ``-c 2 --mem-per-cpu=5G`` with a
+  2048 MiB limit becomes 6 CPUs × 1707 MiB = 10242 MiB); it never shrinks.
 - ``--mem`` (per node) above ``CPUs × limit``: CPUs are raised to
   ``ceil(mem / limit)``.
 
@@ -389,8 +391,10 @@ Upgrading
 .. important::
 
    Upgrade **every** controller replica before you configure any partition
-   cap. Jobs blocked by a cap get a new pending reason that is stored in the
-   Raft log, and a controller that has not been upgraded cannot read it.
+   cap. Jobs blocked by a cap get a new pending reason that is saved in Raft
+   snapshots, and a controller that has not been upgraded cannot load such a
+   snapshot (``unknown variant `PartitionTresLimit```) — whether on restart or
+   when a leader sends it one.
 
 Existing configurations are not affected: with no limit set, scheduling and
 ``enforce_part_limits`` behave as before. See :doc:`/deployment/upgrading`.
