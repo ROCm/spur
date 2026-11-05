@@ -1400,50 +1400,77 @@ fn invalid_value(key: &str, value: &str) -> anyhow::Error {
     anyhow::anyhow!("invalid value for {key}=: '{value}'")
 }
 
-/// Parse Slurm key=value pairs and call create_partition.
+/// Validated inputs for a Slurm-inline `scontrol create PartitionName=...`.
+#[derive(Debug)]
+struct PartitionCreateParams {
+    name: String,
+    nodes: String,
+    state: String,
+    is_default: bool,
+    max_time: String,
+    default_time: String,
+    max_nodes: Option<u32>,
+    min_nodes: u32,
+    allow_accounts: String,
+    allow_groups: String,
+    allow_qos: String,
+    deny_accounts: String,
+    deny_qos: String,
+    priority_tier: u32,
+    preempt_mode: String,
+    preempt_exempt_time: Option<u32>,
+    grace_time: Option<u32>,
+}
+
+/// Parse Slurm key=value pairs into the create_partition inputs, split from the
+/// network call so a rejected value is unit-testable without a controller.
 ///
 /// Slurm keys (case-insensitive): PartitionName, Nodes, State, Default,
 /// MaxTime, DefaultTime, MaxNodes, MinNodes, AllowAccounts, AllowGroups,
 /// AllowQos, DenyAccounts, DenyQos, PriorityTier, PreemptMode, PreemptExemptTime, GraceTime.
-async fn parse_and_create_partition(controller: &str, params: &[String]) -> Result<()> {
-    let mut name = String::new();
-    let mut nodes = String::new();
-    let mut state = "UP".to_string();
-    let mut is_default = false;
-    let mut max_time = String::new();
-    let mut default_time = String::new();
-    let mut max_nodes: Option<u32> = None;
-    let mut min_nodes: u32 = 1;
-    let mut allow_accounts = String::new();
-    let mut allow_groups = String::new();
-    let mut allow_qos = String::new();
-    let mut deny_accounts = String::new();
-    let mut deny_qos = String::new();
-    let mut priority_tier: u32 = 1;
-    let mut preempt_mode = String::new();
-    let mut preempt_exempt_time: Option<u32> = None;
-    let mut grace_time: Option<u32> = None;
+fn parse_partition_create_params(params: &[String]) -> Result<PartitionCreateParams> {
+    let mut parsed = PartitionCreateParams {
+        name: String::new(),
+        nodes: String::new(),
+        state: "UP".to_string(),
+        is_default: false,
+        max_time: String::new(),
+        default_time: String::new(),
+        max_nodes: None,
+        min_nodes: 1,
+        allow_accounts: String::new(),
+        allow_groups: String::new(),
+        allow_qos: String::new(),
+        deny_accounts: String::new(),
+        deny_qos: String::new(),
+        priority_tier: 1,
+        preempt_mode: String::new(),
+        preempt_exempt_time: None,
+        grace_time: None,
+    };
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
             match key.to_lowercase().as_str() {
-                "partitionname" => name = value.into(),
-                "nodes" => nodes = value.into(),
-                "state" => state = value.to_uppercase(),
-                "default" => is_default = value.eq_ignore_ascii_case("yes"),
-                "maxtime" => max_time = value.into(),
-                "defaulttime" => default_time = value.into(),
-                "maxnodes" => max_nodes = value.parse().ok(),
-                "minnodes" => min_nodes = value.parse().unwrap_or(1),
-                "allowaccounts" => allow_accounts = value.into(),
-                "allowgroups" => allow_groups = value.into(),
-                "allowqos" => allow_qos = value.into(),
-                "denyaccounts" => deny_accounts = value.into(),
-                "denyqos" => deny_qos = value.into(),
-                "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().unwrap_or(1),
-                "preemptmode" => preempt_mode = value.to_uppercase(),
+                "partitionname" => parsed.name = value.into(),
+                "nodes" => parsed.nodes = value.into(),
+                "state" => parsed.state = value.to_uppercase(),
+                "default" => parsed.is_default = value.eq_ignore_ascii_case("yes"),
+                "maxtime" => parsed.max_time = value.into(),
+                "defaulttime" => parsed.default_time = value.into(),
+                "maxnodes" => parsed.max_nodes = value.parse().ok(),
+                "minnodes" => parsed.min_nodes = value.parse().unwrap_or(1),
+                "allowaccounts" => parsed.allow_accounts = value.into(),
+                "allowgroups" => parsed.allow_groups = value.into(),
+                "allowqos" => parsed.allow_qos = value.into(),
+                "denyaccounts" => parsed.deny_accounts = value.into(),
+                "denyqos" => parsed.deny_qos = value.into(),
+                "prioritytier" | "priorityjobfactor" => {
+                    parsed.priority_tier = value.parse().unwrap_or(1)
+                }
+                "preemptmode" => parsed.preempt_mode = value.to_uppercase(),
                 "preemptexempttime" => {
-                    preempt_exempt_time = Some(
+                    parsed.preempt_exempt_time = Some(
                         value
                             .parse::<u32>()
                             .map_err(|_| invalid_value("PreemptExemptTime", value))?,
@@ -1451,7 +1478,7 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                 }
                 "exclusivetopo" => reject_exclusive_topo(value)?,
                 "gracetime" => {
-                    grace_time = Some(
+                    parsed.grace_time = Some(
                         value
                             .parse::<u32>()
                             .map_err(|_| invalid_value("GraceTime", value))?,
@@ -1467,30 +1494,34 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
         }
     }
 
-    if name.is_empty() {
+    if parsed.name.is_empty() {
         anyhow::bail!("scontrol create: PartitionName= is required");
     }
+    Ok(parsed)
+}
 
+async fn parse_and_create_partition(controller: &str, params: &[String]) -> Result<()> {
+    let p = parse_partition_create_params(params)?;
     create_partition(
         controller,
-        &name,
-        &nodes,
+        &p.name,
+        &p.nodes,
         "",
-        &state,
-        is_default,
-        &max_time,
-        &default_time,
-        max_nodes,
-        min_nodes,
-        &allow_accounts,
-        &allow_groups,
-        &deny_accounts,
-        &deny_qos,
-        &allow_qos,
-        priority_tier,
-        &preempt_mode,
-        preempt_exempt_time,
-        grace_time,
+        &p.state,
+        p.is_default,
+        &p.max_time,
+        &p.default_time,
+        p.max_nodes,
+        p.min_nodes,
+        &p.allow_accounts,
+        &p.allow_groups,
+        &p.deny_accounts,
+        &p.deny_qos,
+        &p.allow_qos,
+        p.priority_tier,
+        &p.preempt_mode,
+        p.preempt_exempt_time,
+        p.grace_time,
     )
     .await?;
 
@@ -2567,21 +2598,17 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn exclusive_topology_accepts_only_slurms_default() {
+    #[test]
+    fn exclusive_topology_accepts_only_slurms_default() {
         for params in [
             vec!["PartitionName=rack".into(), "ExclusiveTopo=yes".into()],
             vec!["ExclusiveTopo=YES".into(), "PartitionName=rack".into()],
         ] {
-            let error = parse_and_create_partition("not-a-controller", &params)
-                .await
-                .unwrap_err();
+            let error = parse_partition_create_params(&params).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("ExclusiveTopo=YES is not supported"));
-            let error = parse_and_update_partition("not-a-controller", &params)
-                .await
-                .unwrap_err();
+            let error = partition_update_request(&params).unwrap_err();
             assert!(error
                 .to_string()
                 .contains("ExclusiveTopo=YES is not supported"));
@@ -2590,16 +2617,12 @@ mod tests {
             vec!["PartitionName=rack".into(), "ExclusiveTopo=NO".into()],
             vec!["ExclusiveTopo=no".into(), "PartitionName=rack".into()],
         ] {
-            let error = parse_and_create_partition("not-a-controller", &params)
-                .await
-                .unwrap_err();
-            assert!(!error.to_string().contains("ExclusiveTopo"), "{error}");
+            parse_partition_create_params(&params).expect("NO is Slurm's default");
         }
-        let error = parse_and_create_partition(
-            "not-a-controller",
-            &["PartitionName=rack".into(), "ExclusiveTopo=maybe".into()],
-        )
-        .await
+        let error = parse_partition_create_params(&[
+            "PartitionName=rack".into(),
+            "ExclusiveTopo=maybe".into(),
+        ])
         .unwrap_err();
         assert!(error
             .to_string()
@@ -3270,16 +3293,20 @@ mod tests {
         assert_eq!(err, "scontrol update: invalid value for gracetime=: 'soon'");
     }
 
-    #[tokio::test]
-    async fn create_partition_rejects_a_malformed_grace_time_before_contacting_the_controller() {
-        let err = parse_and_create_partition(
-            "http://unreachable.invalid:6817",
-            &p(&["PartitionName=gpu", "GraceTime=soon"]),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+    #[test]
+    fn create_partition_rejects_a_malformed_grace_time() {
+        let err = parse_partition_create_params(&p(&["PartitionName=gpu", "GraceTime=soon"]))
+            .unwrap_err()
+            .to_string();
         assert_eq!(err, "invalid value for GraceTime=: 'soon'");
+    }
+
+    #[test]
+    fn create_partition_reads_a_grace_time() {
+        let parsed = parse_partition_create_params(&p(&["PartitionName=gpu", "GraceTime=45"]))
+            .expect("valid parameters");
+        assert_eq!(parsed.name, "gpu");
+        assert_eq!(parsed.grace_time, Some(45));
     }
 
     #[test]
