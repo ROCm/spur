@@ -164,6 +164,7 @@ mod tests {
                 gpus: Vec::new(),
                 generic: Default::default(),
                 generation: 0,
+                topology: None,
             },
         );
         node.partitions = vec!["default".into()];

@@ -11,6 +11,8 @@ pub mod block_file;
 pub mod burst_buffer;
 pub mod config;
 pub mod constraints;
+pub mod core_layout;
+pub mod cpu_topology;
 pub mod dependency;
 pub mod device_topology;
 pub mod end_reason;

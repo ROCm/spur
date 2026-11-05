@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -113,6 +114,15 @@ pub struct NodeReporter {
     /// Endpoint a dial/RPC most recently failed against, and until when to prefer a
     /// different one. Left stale once the cooldown lapses; never read past then.
     last_failed_endpoint: std::sync::Mutex<Option<(String, Instant)>>,
+    /// Holds the delivered core layout and applies it to the cgroup root.
+    spec: std::sync::Mutex<crate::spec::SpecEnforcer>,
+    spec_root: std::path::PathBuf,
+    /// The held layout's spec CPUs, readable without waiting on root I/O under
+    /// `spec`, since allocation reads it while holding the allocation lock.
+    spec_cpus: RwLock<Vec<u32>>,
+    /// Whether spurd's threads are currently pinned off spec cores, so the mask
+    /// is widened back to all online CPUs when the setting is removed.
+    daemons_pinned: std::sync::atomic::AtomicBool,
     timeouts: ReporterTimeouts,
 }
 
@@ -151,6 +161,14 @@ impl NodeReporter {
             allocation: std::sync::OnceLock::new(),
             k0s_status: std::sync::OnceLock::new(),
             last_failed_endpoint: std::sync::Mutex::new(None),
+            spec: std::sync::Mutex::new(crate::spec::SpecEnforcer::new(
+                std::path::PathBuf::from(crate::executor::CGROUP_ROOT),
+                None,
+                true,
+            )),
+            spec_root: std::path::PathBuf::from(crate::executor::CGROUP_ROOT),
+            spec_cpus: RwLock::new(Vec::new()),
+            daemons_pinned: std::sync::atomic::AtomicBool::new(false),
             timeouts,
         }
     }
@@ -159,6 +177,111 @@ impl NodeReporter {
     /// may change on re-registration). Empty when node identity is not in use.
     pub fn node_token(&self) -> String {
         read_recover(&self.node_token).clone()
+    }
+
+    /// Where spec enforcement writes, the marker that records spurd's own root
+    /// controls, and whether this node's `[cgroup]` is enabled.
+    pub fn with_spec_enforcement(
+        mut self,
+        root: std::path::PathBuf,
+        marker: std::path::PathBuf,
+        cgroup_enabled: bool,
+    ) -> Self {
+        self.spec = std::sync::Mutex::new(crate::spec::SpecEnforcer::new(
+            root.clone(),
+            Some(marker),
+            cgroup_enabled,
+        ));
+        self.spec_root = root;
+        self
+    }
+
+    /// Adopt a core layout the controller delivered. Returns true when the held
+    /// layout changed.
+    pub fn adopt_core_layout(
+        &self,
+        layout: Option<spur_proto::proto::CoreLayout>,
+        revision: Option<spur_proto::proto::LayoutRevision>,
+        delivery: crate::spec::Delivery,
+    ) -> bool {
+        let mut spec = lock_recover(&self.spec);
+        let changed = spec.adopt(
+            layout.map(Into::into),
+            revision.map(Into::into).unwrap_or_default(),
+            delivery,
+        );
+        if changed {
+            *write_recover(&self.spec_cpus) = spec.spec_cpus();
+        }
+        changed
+    }
+
+    /// Write the held layout to the cgroup root now if it is not in effect yet,
+    /// and report whether the node may start workloads.
+    pub async fn ensure_spec_enforced(self: &Arc<Self>) -> bool {
+        if lock_recover(&self.spec).needs_apply() {
+            let reporter = Arc::clone(self);
+            if let Err(e) = tokio::task::spawn_blocking(move || reporter.apply_spec_layout()).await
+            {
+                warn!(error = %e, "spec layout apply task failed");
+            }
+        }
+        lock_recover(&self.spec).enforcement_healthy()
+    }
+
+    pub fn spec_enforcement_error(&self) -> Option<String> {
+        lock_recover(&self.spec).enforcement_error()
+    }
+
+    pub fn holds_spec_cores(&self) -> bool {
+        !read_recover(&self.spec_cpus).is_empty()
+    }
+
+    /// CPU IDs reserved for node services, for the local ledger to exclude.
+    pub fn held_spec_cpus(&self) -> Vec<u32> {
+        read_recover(&self.spec_cpus).clone()
+    }
+
+    /// Apply the held layout to the cgroup root and pin spurd off spec cores.
+    /// Blocking: cgroup writes can reclaim synchronously.
+    fn apply_spec_layout(&self) {
+        let root = self.spec_root.as_path();
+        let live = read_live_job_cpusets(root);
+        let total = read_mem_total_mb();
+        let daemon_cpus = {
+            let mut spec = lock_recover(&self.spec);
+            match spec.apply(&live, total) {
+                Ok(crate::spec::MemReservation::Pending) => {
+                    debug!("node spec memory reservation pending: jobs still run under the root")
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    error = %e,
+                    "failed to apply node spec layout to cgroup root; node not enforcing"
+                ),
+            }
+            spec.daemon_cpuset()
+        };
+        match daemon_cpus {
+            Some(cpus) => {
+                if let Err(e) = pin_current_process_threads(&cpus) {
+                    warn!(error = %e, "failed to pin spurd off spec cores");
+                } else {
+                    self.daemons_pinned.store(true, Ordering::Relaxed);
+                }
+            }
+            None => {
+                if self.daemons_pinned.swap(false, Ordering::Relaxed) {
+                    if let Some(online) =
+                        discover_cpu_topology(Path::new("/sys")).map(|t| t.online_cpus())
+                    {
+                        if let Err(e) = pin_current_process_threads(&online) {
+                            warn!(error = %e, "failed to widen spurd back onto all CPUs");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Controller endpoints for the next dial. Skips a host that failed within the last
@@ -309,7 +432,8 @@ impl NodeReporter {
             || cur.gpus != fresh.gpus
             || cur.generic != fresh.generic
             || cur.fabric_binding_version != fresh.fabric_binding_version
-            || cur.block_file_revision != fresh.block_file_revision;
+            || cur.block_file_revision != fresh.block_file_revision
+            || cur.topology != fresh.topology;
         *cur = fresh;
         changed
     }
@@ -327,6 +451,7 @@ impl NodeReporter {
         let mut labels = self.labels.clone();
         labels.insert("spur.stepd".into(), "1".into());
 
+        let ticket = lock_recover(&self.spec).begin_registration();
         let req = RegisterAgentRequest {
             hostname: self.hostname.clone(),
             resources: Some(resource_to_proto(resources)),
@@ -336,6 +461,7 @@ impl NodeReporter {
             wg_pubkey: self.wg_pubkey(),
             labels,
             join_token: self.join_token.clone(),
+            topology: resources.topology.as_ref().map(Into::into),
         };
         let inner = self
             .with_controller(move |mut client| async move { client.register_agent(req).await })
@@ -347,6 +473,16 @@ impl NodeReporter {
             if !inner.node_token.is_empty() {
                 *write_recover(&self.node_token) = inner.node_token;
             }
+            // The registration reply is the authoritative layout source; adopt it
+            // so spec enforcement starts before the first heartbeat.
+            self.adopt_core_layout(
+                inner.core_layout,
+                inner.layout_revision,
+                crate::spec::Delivery::Registration {
+                    layout_error: !inner.layout_error.is_empty(),
+                    ticket,
+                },
+            );
             info!("registered with controller");
         } else {
             anyhow::bail!("controller rejected registration: {}", inner.message);
@@ -398,7 +534,7 @@ impl NodeReporter {
     }
 
     /// Periodic heartbeat loop.
-    pub async fn heartbeat_loop(&self) {
+    pub async fn heartbeat_loop(self: Arc<Self>) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
             spur_core::config::HEARTBEAT_INTERVAL_SECS,
         ));
@@ -411,6 +547,18 @@ impl NodeReporter {
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = read_recover(&self.node_token).clone();
             let running_jobs = build_running_jobs(self.held_jobs(), &self.held_job_gpu_ids());
+            let reporter = Arc::clone(&self);
+            if let Err(e) = tokio::task::spawn_blocking(move || reporter.apply_spec_layout()).await
+            {
+                warn!(error = %e, "spec layout apply task failed");
+            }
+            let (core_layout_fingerprint, spec_enforcement_error) = {
+                let spec = lock_recover(&self.spec);
+                (
+                    spec.held_fingerprint(),
+                    spec.enforcement_error().unwrap_or_default(),
+                )
+            };
             let req = spur_proto::proto::HeartbeatRequest {
                 hostname: self.hostname.clone(),
                 cpu_load: load,
@@ -426,10 +574,23 @@ impl NodeReporter {
                         install_duration_seconds: install_secs,
                     }
                 }),
+                core_layout_fingerprint,
+                spec_enforcement_error,
             };
 
             match self.send_heartbeat(req).await {
-                Ok(()) => debug!(load, free_mem, "heartbeat sent"),
+                Ok(resp) => {
+                    debug!(load, free_mem, "heartbeat sent");
+                    // The controller asks for re-registration when the layout it
+                    // expects differs from what this node reported enforcing, so
+                    // a changed spec policy is redelivered without a restart.
+                    if resp.reregister {
+                        info!("controller requested re-registration; re-registering");
+                        if let Err(e) = self.register().await {
+                            warn!(error = %e, "controller-requested re-registration failed");
+                        }
+                    }
+                }
                 Err(crate::controller_auth::ConnectAuthError::Status(status))
                     if should_reregister(&status) =>
                 {
@@ -454,13 +615,15 @@ impl NodeReporter {
     async fn send_heartbeat(
         &self,
         req: spur_proto::proto::HeartbeatRequest,
-    ) -> Result<(), crate::controller_auth::ConnectAuthError> {
+    ) -> Result<spur_proto::proto::HeartbeatResponse, crate::controller_auth::ConnectAuthError>
+    {
         let retry = req.clone();
-        let Err(e) = self
+        let e = match self
             .with_controller(move |mut client| async move { client.heartbeat(req).await })
             .await
-        else {
-            return Ok(());
+        {
+            Ok(resp) => return Ok(resp),
+            Err(e) => e,
         };
         let another_host = spur_client::parse_endpoints(&self.controller_addr).len() > 1
             && !self.timeouts.failover_cooldown.is_zero();
@@ -470,7 +633,6 @@ impl NodeReporter {
         warn!(error = %e, "heartbeat did not reach the controller; retrying on another controller");
         self.with_controller(move |mut client| async move { client.heartbeat(retry).await })
             .await
-            .map(|_| ())
     }
 }
 
@@ -628,6 +790,7 @@ pub fn classify(
         && old.generic == new.generic
         && old.fabric_binding_version == new.fabric_binding_version
         && old.block_file_revision == new.block_file_revision
+        && old.topology == new.topology
     {
         return InventoryDelta::Unchanged;
     }
@@ -756,6 +919,9 @@ pub fn discover_resources(registry: &DeviceRegistry) -> ResourceSet {
         generation: 0,
         fabric_binding_version: spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY,
         block_file_revision: None,
+        // Real online topology so the local allocation ledger indexes jobs by
+        // real CPU IDs, not a synthetic 0..cpus that can hand out offline CPUs.
+        topology: discover_cpu_topology(Path::new("/sys")),
     }
 }
 
@@ -859,6 +1025,116 @@ fn discover_cpus() -> u32 {
     num_cpus()
 }
 
+/// This node's online CPUs grouped by physical core, from sysfs. `None` when
+/// the online set or a CPU's `core_id` is unreadable.
+fn discover_cpu_topology(sys_root: &Path) -> Option<spur_core::cpu_topology::CpuTopology> {
+    use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+
+    let cpu_base = sys_root.join("devices/system/cpu");
+    let online = std::fs::read_to_string(cpu_base.join("online")).ok()?;
+    let cpu_ids = spur_core::cpu_topology::parse_cpu_list(online.trim()).ok()?;
+
+    let numa = numa_membership(&sys_root.join("devices/system/node"));
+    let mut records = Vec::with_capacity(cpu_ids.len());
+    for cpu in cpu_ids {
+        let topo = cpu_base.join(format!("cpu{cpu}")).join("topology");
+        let core_id = read_sysfs_u32(&topo.join("core_id"))?;
+        let socket = read_sysfs_u32(&topo.join("physical_package_id")).unwrap_or(0);
+        records.push(CpuRecord {
+            cpu,
+            socket,
+            core_id,
+            numa_node: numa.get(&cpu).copied(),
+        });
+    }
+    Some(CpuTopology::from_cpus(&records))
+}
+
+fn read_sysfs_u32(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// The `cpuset.cpus` of each live job cgroup under the spur root, for the
+/// enforcer to reconcile the root against (so a shrinking root never empties a
+/// running job's set). A job with no cpuset bound contributes nothing.
+fn read_live_job_cpusets(root: &Path) -> Vec<Vec<u32>> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(n) = name.to_str() else { continue };
+        if !n.starts_with("job_") {
+            continue;
+        }
+        if let Ok(list) = std::fs::read_to_string(entry.path().join("cpuset.cpus")) {
+            if let Ok(cpus) = spur_core::cpu_topology::parse_cpu_list(list.trim()) {
+                if !cpus.is_empty() {
+                    out.push(cpus);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pin every thread of spurd to `cpus`. Best-effort: the caller logs a failure.
+fn pin_current_process_threads(cpus: &[u32]) -> std::io::Result<()> {
+    let mut set = nix::sched::CpuSet::new();
+    for &cpu in cpus {
+        set.set(cpu as usize)
+            .map_err(|e| std::io::Error::other(format!("cpu {cpu}: {e}")))?;
+    }
+    for tid in current_process_tids() {
+        // A thread that died since we listed it is fine to skip.
+        let _ = nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(tid), &set);
+    }
+    Ok(())
+}
+
+fn current_process_tids() -> Vec<i32> {
+    let mut tids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+        for entry in entries.flatten() {
+            if let Some(tid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<i32>().ok())
+            {
+                tids.push(tid);
+            }
+        }
+    }
+    tids
+}
+
+/// Map each online CPU to its NUMA node by reading `node<N>/cpulist`.
+fn numa_membership(node_base: &Path) -> std::collections::HashMap<u32, u32> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir(node_base) else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(node) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("node"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Ok(list) = std::fs::read_to_string(entry.path().join("cpulist")) {
+            if let Ok(cpus) = spur_core::cpu_topology::parse_cpu_list(list.trim()) {
+                for cpu in cpus {
+                    map.insert(cpu, node);
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Parse "0-191" or "0-63,128-191" into a total count.
 fn parse_cpu_range(s: &str) -> Option<u32> {
     let mut count = 0u32;
@@ -884,19 +1160,17 @@ fn num_cpus() -> u32 {
 
 /// Read total memory from /proc/meminfo.
 fn discover_memory_mb() -> u64 {
-    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-        for line in meminfo.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let rest = rest.trim();
-                if let Some(kb_str) = rest.strip_suffix("kB") {
-                    if let Ok(kb) = kb_str.trim().parse::<u64>() {
-                        return kb / 1024;
-                    }
-                }
-            }
-        }
-    }
-    0
+    read_mem_total_mb().unwrap_or(0)
+}
+
+/// `MemTotal` in MB, `None` when `/proc/meminfo` cannot be read or parsed.
+fn read_mem_total_mb() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let rest = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?;
+    let kb = rest.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+    Some(kb / 1024)
 }
 
 /// Read current load average and free memory.
@@ -1439,6 +1713,61 @@ mod tests {
     use spur_devices::cdi::cache::CdiCache;
     use spur_devices::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
     use spur_devices::{DeviceRegistry, GresCache, GresEntry};
+
+    fn write_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn discover_cpu_topology_groups_real_ids_by_core_and_numa() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys = dir.path();
+        let cpu = sys.join("devices/system/cpu");
+        // Two cores, two hyperthreads each, split across two sockets/NUMA nodes.
+        write_file(&cpu.join("online"), "0-1,64-65\n");
+        for (id, core, pkg) in [(0u32, 0u32, 0u32), (1, 0, 0), (64, 0, 1), (65, 0, 1)] {
+            write_file(
+                &cpu.join(format!("cpu{id}/topology/core_id")),
+                &core.to_string(),
+            );
+            write_file(
+                &cpu.join(format!("cpu{id}/topology/physical_package_id")),
+                &pkg.to_string(),
+            );
+        }
+        let node = sys.join("devices/system/node");
+        write_file(&node.join("node0/cpulist"), "0-1");
+        write_file(&node.join("node1/cpulist"), "64-65");
+
+        let topo = discover_cpu_topology(sys).expect("topology");
+        assert_eq!(topo.online_cpus(), vec![0, 1, 64, 65]);
+        assert_eq!(topo.cores.len(), 2);
+        assert_eq!(topo.cores[0].cpus, vec![0, 1]);
+        assert_eq!(topo.cores[0].socket, 0);
+        assert_eq!(topo.cores[0].numa_node, Some(0));
+        assert_eq!(topo.cores[1].cpus, vec![64, 65]);
+        assert_eq!(topo.cores[1].socket, 1);
+        assert_eq!(topo.cores[1].numa_node, Some(1));
+    }
+
+    #[test]
+    fn discover_cpu_topology_is_none_without_online_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(discover_cpu_topology(dir.path()).is_none());
+    }
+
+    #[test]
+    fn read_live_job_cpusets_reads_each_job_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_file(&root.join("job_7_0/cpuset.cpus"), "0-2");
+        write_file(&root.join("job_9_1/cpuset.cpus"), "4,5");
+        write_file(&root.join("not_a_job/cpuset.cpus"), "8");
+        let mut sets = read_live_job_cpusets(root);
+        sets.sort();
+        assert_eq!(sets, vec![vec![0, 1, 2], vec![4, 5]]);
+    }
 
     #[test]
     fn test_gpus_from_registry_link_type() {
@@ -2082,6 +2411,37 @@ mod tests {
     }
 
     #[test]
+    fn a_topology_only_change_is_classified_and_fingerprinted() {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        let with_online = |ids: &[u32]| {
+            let records: Vec<CpuRecord> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, &cpu)| CpuRecord {
+                    cpu,
+                    socket: 0,
+                    core_id: i as u32,
+                    numa_node: None,
+                })
+                .collect();
+            ResourceSet {
+                cpus: ids.len() as u32,
+                memory_mb: 1024,
+                topology: Some(CpuTopology::from_cpus(&records)),
+                ..Default::default()
+            }
+        };
+        let old = with_online(&[0, 1, 2, 3]);
+        let new = with_online(&[0, 1, 3, 4]);
+
+        assert_eq!(
+            classify(&old, &new, &Default::default()),
+            InventoryDelta::FreeCapacityChanged
+        );
+        assert_ne!(old.schedulable_fingerprint(), new.schedulable_fingerprint());
+    }
+
+    #[test]
     fn classify_detects_free_growth_and_allocated_loss() {
         use std::collections::HashSet;
         let g = |d: u32, s: u64| GpuResource {
@@ -2101,6 +2461,7 @@ mod tests {
             gpus,
             generic: Default::default(),
             generation: 0,
+            topology: None,
         };
         let two = rs(vec![g(0, 128), g(1, 129)]);
         let three = rs(vec![g(0, 128), g(1, 129), g(2, 130)]);
@@ -2150,6 +2511,7 @@ mod tests {
             gpus,
             generic: Default::default(),
             generation,
+            topology: None,
         }
     }
 
@@ -2465,6 +2827,7 @@ mod tests {
             gpus: vec![],
             generic: Default::default(),
             generation: 1,
+            topology: None,
         };
         let reporter = test_reporter(base.clone());
         // same content, different generation -> not a change
@@ -2485,6 +2848,7 @@ mod tests {
             gpu_ids.iter().map(|&id| gpu(id as u32, id)).collect(),
             Vec::new(),
             0,
+            None,
             None,
         )
     }

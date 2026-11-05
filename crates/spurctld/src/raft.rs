@@ -888,6 +888,8 @@ pub struct RaftHandle {
     pub raft: SpurRaft,
     pub node_id: NodeId,
     pub peers: BTreeMap<NodeId, String>,
+    /// This controller's durable start counter, from [`bump_boot_epoch`].
+    pub boot_epoch: u64,
 }
 
 impl RaftHandle {
@@ -1229,6 +1231,29 @@ fn persist_or_verify_node_id(state_dir: &Path, node_id: NodeId) -> anyhow::Resul
     }
 }
 
+/// Advance and persist this controller's start counter. openraft restores a
+/// restarted leader at its old term, so the term alone cannot order what this
+/// process hands out against what its previous incarnation did.
+pub fn bump_boot_epoch(state_dir: &Path) -> anyhow::Result<u64> {
+    let raft_dir = state_dir.join("raft");
+    std::fs::create_dir_all(&raft_dir)?;
+    let path = raft_dir.join("boot_epoch");
+    let prev: u64 = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "failed to parse boot epoch {:?} at {}",
+                contents.trim(),
+                path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
+    };
+    let next = prev + 1;
+    write_atomic(&path, next.to_string().as_bytes())?;
+    Ok(next)
+}
+
 /// Build a 1-indexed peer map from the config peers list.
 pub fn build_peer_map(peers: &[String]) -> BTreeMap<NodeId, String> {
     peers
@@ -1269,6 +1294,7 @@ pub async fn start_raft_with_recovery_mode(
     let config = Arc::new(config.validate().map_err(|e| anyhow::anyhow!("{e}"))?);
 
     persist_or_verify_node_id(state_dir, node_id)?;
+    let boot_epoch = bump_boot_epoch(state_dir)?;
 
     let store = Arc::new(SpurStore::new_with_recovery_mode(
         state_dir,
@@ -1306,6 +1332,7 @@ pub async fn start_raft_with_recovery_mode(
         raft,
         node_id,
         peers: peer_map,
+        boot_epoch,
     })
 }
 
@@ -1577,6 +1604,14 @@ mod tests {
         persist_or_verify_node_id(dir.path(), 2).unwrap();
         let persisted = std::fs::read_to_string(dir.path().join("raft").join("node_id")).unwrap();
         assert_eq!(persisted.trim(), "2");
+    }
+
+    #[test]
+    fn boot_epoch_advances_on_every_start() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(bump_boot_epoch(dir.path()).unwrap(), 1);
+        assert_eq!(bump_boot_epoch(dir.path()).unwrap(), 2);
+        assert_eq!(bump_boot_epoch(dir.path()).unwrap(), 3);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use spur_core::accounting::{
 };
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
+use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
@@ -611,6 +612,11 @@ pub struct ClusterManager {
     /// node keep it marked until the last finishes. Leader-local, like the handler that sets it.
     k0s_removals: parking_lot::Mutex<HashMap<String, usize>>,
     raft: RwLock<Option<SpurRaft>>,
+    /// This controller's durable start counter; orders layout deliveries when a
+    /// restarted leader keeps its Raft term.
+    boot_epoch: AtomicU64,
+    /// When each node was last asked to re-register, and for which layout.
+    layout_reregister_asked: parking_lot::Mutex<HashMap<String, (std::time::Instant, u64)>>,
     propose_timeout: std::time::Duration,
     accounting: RwLock<Option<AccountingNotifier>>,
     billing_weights:
@@ -945,6 +951,8 @@ impl ClusterManager {
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             k0s_removals: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
+            boot_epoch: AtomicU64::new(0),
+            layout_reregister_asked: parking_lot::Mutex::new(HashMap::new()),
             propose_timeout: PROPOSE_TIMEOUT,
             accounting: RwLock::new(None),
             billing_weights: RwLock::new(None),
@@ -4161,6 +4169,69 @@ impl ClusterManager {
         self.nodes.read().get(name).cloned()
     }
 
+    /// The layout to deliver to a node and the revision that orders it against
+    /// every earlier delivery. The revision is returned even with no layout, so
+    /// the agent can tell a current clear from a stale one.
+    pub fn node_layout_delivery(&self, name: &str) -> LayoutDelivery {
+        let term = self
+            .raft
+            .read()
+            .as_ref()
+            .map(|r| r.metrics().borrow().current_term)
+            .unwrap_or(0);
+        let nodes = self.nodes.read();
+        let node = nodes.get(name);
+        let revision = spur_core::core_layout::LayoutRevision {
+            term,
+            boot: self.boot_epoch.load(Ordering::Relaxed),
+            seq: node.map_or(0, |n| n.layout_seq),
+        };
+        LayoutDelivery {
+            layout: node.and_then(|n| n.core_layout.as_ref().map(Into::into)),
+            revision: revision.into(),
+            error: node
+                .and_then(|n| n.layout_error.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Record the agent's enforcement state and decide whether it should
+    /// re-register to receive the node's current layout. Asked only when the
+    /// layouts differ — an enforcement error alone does not help, but a corrected
+    /// policy must still reach a failing node — and at most once per interval for
+    /// the same layout; a node whose layout cannot be computed is never asked.
+    pub fn record_layout_heartbeat(
+        &self,
+        name: &str,
+        held_fingerprint: u64,
+        enforcement_error: &str,
+    ) -> bool {
+        let mut nodes = self.nodes.write();
+        let Some(node) = nodes.get_mut(name) else {
+            return false;
+        };
+        node.layout_enforce_error =
+            (!enforcement_error.is_empty()).then(|| enforcement_error.to_string());
+        let expected = node.core_layout.as_ref().map_or(0, CoreLayout::fingerprint);
+        if node.layout_error.is_some() {
+            return false;
+        }
+        if held_fingerprint == expected {
+            self.layout_reregister_asked.lock().remove(name);
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let mut asked = self.layout_reregister_asked.lock();
+        let recently = asked.get(name).is_some_and(|(at, fp)| {
+            *fp == expected && now.duration_since(*at) < LAYOUT_REREGISTER_INTERVAL
+        });
+        if recently {
+            return false;
+        }
+        asked.insert(name.to_string(), (now, expected));
+        true
+    }
+
     /// Get all partitions.
     pub fn get_partitions(&self) -> Vec<Partition> {
         self.partitions.read().clone()
@@ -6046,6 +6117,19 @@ impl ClusterManager {
         // Reject a broken submit hook before it goes live, so reconfigure can't
         // silently swap in a hook that fails every subsequent submission.
         crate::hooks::validate_submit_hooks(&new_config.hooks)?;
+        // Applied live, a specialization change would differ between leader and
+        // followers until each recomputed, so isolation could change on failover.
+        let restart_only = spur_core::core_layout::restart_only_node_changes(
+            &self.config().nodes,
+            &new_config.nodes,
+        );
+        if !restart_only.is_empty() {
+            anyhow::bail!(
+                "reconfigure rejected: these [[nodes]] specialization changes require \
+                 restarting all controllers: {}",
+                restart_only.join(", ")
+            );
+        }
         let conf_partitions = new_config.build_partitions();
 
         let conf_names: std::collections::HashSet<String> =
@@ -6815,6 +6899,10 @@ impl ClusterManager {
 
     pub fn set_raft(&self, raft: SpurRaft) {
         *self.raft.write() = Some(raft);
+    }
+
+    pub fn set_boot_epoch(&self, epoch: u64) {
+        self.boot_epoch.store(epoch, Ordering::Relaxed);
     }
 
     /// False if writes were still pending at `limit`, meaning rows were lost.
@@ -8484,6 +8572,9 @@ impl ClusterManager {
                     hostname.clone()
                 };
                 node.labels = labels.clone();
+                // Establish the source before applying policy so layout
+                // derivation can skip Kubernetes-backed nodes (no topology).
+                node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
                 self.apply_node_config_policy(&mut node);
                 if !address.is_empty() {
                     node.address = Some(address.clone());
@@ -8495,7 +8586,6 @@ impl ClusterManager {
                 if !version.is_empty() {
                     node.version = Some(version.clone());
                 }
-                node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
                 node.last_heartbeat = Some(Utc::now());
                 node.state = node
                     .state
@@ -8999,6 +9089,16 @@ impl ClusterManager {
     }
 }
 
+/// What to deliver for a node's core layout.
+pub struct LayoutDelivery {
+    pub layout: Option<spur_proto::proto::CoreLayout>,
+    pub revision: spur_proto::proto::LayoutRevision,
+    /// Why the layout could not be computed; the agent keeps what it holds.
+    pub error: String,
+}
+
+const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Snapshot data for Raft serialization.
 /// Must include all durable cluster state so a follower can fully restore from it.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -9052,9 +9152,20 @@ impl ClusterManager {
         {
             node.features = nc.features.clone();
             node.weight = nc.weight;
-            node.total_resources =
-                node.detected_resources
-                    .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb);
+            // Compute the layout before clamping so spec cores are excluded from
+            // the schedulable CPU count (and CPUEfctv), not left over-advertised.
+            self.recompute_core_layout(node, Some(nc));
+            let spec_cpus = node
+                .core_layout
+                .as_ref()
+                .map(|l| l.spec_cpus.len() as u32)
+                .unwrap_or(0);
+            node.total_resources = node.detected_resources.clamped(
+                nc.cpus,
+                nc.memory_mb,
+                nc.reserved_memory_mb,
+                spec_cpus,
+            );
             // An unset memory cap prevents config validation from detecting this
             // scheduling stall until the agent reports its inventory.
             if node.total_resources.memory_mb == 0 && node.detected_resources.memory_mb > 0 {
@@ -9072,9 +9183,53 @@ impl ClusterManager {
         } else {
             node.total_resources = node.detected_resources.clone();
             node.reset_config_policy();
+            self.recompute_core_layout(node, None);
         }
         if node.state.is_up() {
             node.update_state_from_alloc();
+        }
+    }
+
+    /// Recompute the node's core layout. An unsatisfiable layout keeps the last
+    /// good one and records `layout_error`; the sequence advances on every content
+    /// change, a clear included, so deliveries stay ordered.
+    fn recompute_core_layout(&self, node: &mut Node, nc: Option<&spur_core::config::NodeConfig>) {
+        let before = node.core_layout.as_ref().map(CoreLayout::fingerprint);
+        self.derive_core_layout(node, nc);
+        if node.core_layout.as_ref().map(CoreLayout::fingerprint) != before {
+            node.layout_seq += 1;
+        }
+    }
+
+    fn derive_core_layout(&self, node: &mut Node, nc: Option<&spur_core::config::NodeConfig>) {
+        let Some(nc) = nc else {
+            node.core_layout = None;
+            node.layout_error = None;
+            node.spec_memory_mb = 0;
+            return;
+        };
+        node.spec_memory_mb = nc.reserved_memory_mb;
+        // Kubernetes-backed nodes register without CPU topology and are enforced
+        // by the kubelet, not spurd's cgroup root — skip layout derivation so a
+        // shared `names="ALL"` spec policy does not make them unschedulable.
+        if matches!(node.source, NodeSource::Kubernetes { .. }) {
+            node.core_layout = None;
+            node.layout_error = None;
+            return;
+        }
+        let settings = NodeCoreSettings::from_config(nc);
+        match CoreLayout::compute(
+            node.detected_resources.topology.as_ref(),
+            &settings,
+            node.detected_resources.memory_mb,
+        ) {
+            Ok(layout) => {
+                node.core_layout = layout;
+                node.layout_error = None;
+            }
+            // Keep the last good layout: dropping it would reach the agent as a
+            // clear and free the reserved cores under running jobs.
+            Err(e) => node.layout_error = Some(e.to_string()),
         }
     }
 
@@ -12182,6 +12337,9 @@ state = "UP"
             features: Vec::new(),
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }
     }
 
@@ -14102,6 +14260,7 @@ state = "UP"
             gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
             generic: Default::default(),
             generation: 0,
+            topology: None,
         };
         {
             let node = cm.get_node("n1").unwrap();
@@ -32667,6 +32826,167 @@ state = "UP"
         ));
     }
 
+    fn spec_node_config(count: u32) -> spur_core::config::NodeConfig {
+        spur_core::config::NodeConfig {
+            names: "n1".into(),
+            selector: HashMap::new(),
+            cpus: 0,
+            memory_mb: 0,
+            reserved_memory_mb: 0,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: None,
+            weight: 1,
+            core_spec_count: Some(count),
+            cpu_spec_list: None,
+            daemons_off_spec: true,
+        }
+    }
+
+    fn node_with_topology(cpus: u32) -> Node {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        let records: Vec<CpuRecord> = (0..cpus)
+            .map(|cpu| CpuRecord {
+                cpu,
+                socket: 0,
+                core_id: cpu,
+                numa_node: None,
+            })
+            .collect();
+        let resources = ResourceSet {
+            cpus,
+            memory_mb: 8192,
+            topology: Some(CpuTopology::from_cpus(&records)),
+            ..Default::default()
+        };
+        let mut node = Node::new("n1".into(), resources.clone());
+        node.detected_resources = resources;
+        node.state = NodeState::Idle;
+        node
+    }
+
+    fn spec_cluster(dir: &TempDir, count: u32) -> ClusterManager {
+        let mut config = test_config();
+        config.nodes = vec![spec_node_config(count)];
+        ClusterManager::new(config, dir.path()).unwrap()
+    }
+
+    #[test]
+    fn layout_seq_advances_only_when_the_layout_changes() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut node = node_with_topology(4);
+
+        cm.recompute_core_layout(&mut node, Some(&spec_node_config(1)));
+        assert_eq!(node.layout_seq, 1);
+        cm.recompute_core_layout(&mut node, Some(&spec_node_config(1)));
+        assert_eq!(node.layout_seq, 1, "an unchanged layout keeps its sequence");
+        cm.recompute_core_layout(&mut node, Some(&spec_node_config(2)));
+        assert_eq!(node.layout_seq, 2);
+        cm.recompute_core_layout(&mut node, None);
+        assert!(node.core_layout.is_none());
+        assert_eq!(node.layout_seq, 3, "a clear is a change too");
+    }
+
+    #[test]
+    fn a_layout_that_stops_computing_is_kept_and_delivered_with_its_error() {
+        let dir = TempDir::new().unwrap();
+        let cm = spec_cluster(&dir, 1);
+        let mut node = node_with_topology(4);
+        cm.apply_node_config_policy(&mut node);
+        let good = node.core_layout.clone().expect("layout");
+        let seq = node.layout_seq;
+
+        node.detected_resources.topology = None;
+        cm.apply_node_config_policy(&mut node);
+        assert_eq!(node.core_layout.as_ref(), Some(&good));
+        assert_eq!(node.layout_seq, seq, "an error is not a content change");
+        assert!(!node.is_schedulable());
+
+        cm.nodes.write().insert("n1".into(), node);
+        let delivery = cm.node_layout_delivery("n1");
+        assert!(delivery.layout.is_some());
+        assert!(delivery.error.contains("topology"), "{}", delivery.error);
+    }
+
+    #[test]
+    fn apply_node_config_policy_sets_spec_cores_aside_but_skips_kubernetes_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = spec_cluster(&dir, 1);
+
+        let mut native = node_with_topology(4);
+        cm.apply_node_config_policy(&mut native);
+        assert_eq!(native.total_resources.cpus, 3);
+        assert_eq!(native.cpu_tot(), 4);
+
+        let mut k8s = node_with_topology(4);
+        k8s.source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+        k8s.detected_resources.topology = None;
+        cm.apply_node_config_policy(&mut k8s);
+        assert!(k8s.core_layout.is_none());
+        assert!(k8s.layout_error.is_none());
+        assert_eq!(k8s.total_resources.cpus, 4);
+    }
+
+    #[test]
+    fn heartbeats_ask_for_reregistration_only_when_it_can_help() {
+        let dir = TempDir::new().unwrap();
+        let cm = spec_cluster(&dir, 1);
+        let mut node = node_with_topology(4);
+        cm.apply_node_config_policy(&mut node);
+        let expected = node.core_layout.as_ref().unwrap().fingerprint();
+        cm.nodes.write().insert("n1".into(), node);
+
+        assert!(!cm.record_layout_heartbeat("n1", expected, ""));
+        assert!(cm.record_layout_heartbeat("n1", 0, ""));
+        assert!(!cm.record_layout_heartbeat("n1", 0, ""), "rate-limited");
+
+        assert!(!cm.record_layout_heartbeat("n1", expected, "root write failed"));
+        let node = cm.get_node("n1").unwrap();
+        assert!(
+            cm.record_layout_heartbeat("n1", 12345, "root write failed"),
+            "a failing node holding a different layout still receives the current one"
+        );
+        assert!(!node.is_schedulable());
+        assert_eq!(
+            node.layout_drain_reason().as_deref(),
+            Some("core-layout: not enforced: root write failed")
+        );
+        assert!(!cm.record_layout_heartbeat("n1", expected, ""));
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_rejects_spec_changes_but_reloads_memory_only_ones() {
+        let dir = TempDir::new().unwrap();
+        let conf = |nodes: &str| format!("cluster_name = \"test\"\n{nodes}");
+        let spec = "[[nodes]]\nnames = \"n1\"\ncore_spec_count = 1\n";
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf(spec)).await;
+
+        std::fs::write(
+            &conf_path,
+            conf("[[nodes]]\nnames = \"n1\"\ncore_spec_count = 2\n"),
+        )
+        .unwrap();
+        let err = cm.reconfigure().unwrap_err().to_string();
+        assert!(err.contains("restarting all controllers"), "{err}");
+
+        let memory_only_dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(
+            &memory_only_dir,
+            &conf("[[nodes]]\nnames = \"n1\"\nreserved_memory_mb = 1024\n"),
+        )
+        .await;
+        std::fs::write(
+            &conf_path,
+            conf("[[nodes]]\nnames = \"n1\"\nreserved_memory_mb = 2048\n"),
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+    }
+
     #[test]
     fn node_config_matches_by_selector() {
         let nc = spur_core::config::NodeConfig {
@@ -32679,6 +32999,9 @@ state = "UP"
             features: Vec::new(),
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         };
         let labels = HashMap::from([("gpu".into(), "mi300x".into())]);
         assert!(super::node_config_matches(&nc, "any-host", &labels));
@@ -32860,6 +33183,9 @@ state = "UP"
             features: vec!["common".into()],
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         };
         assert!(super::node_config_matches(&nc, "any-host", &HashMap::new()));
         assert!(super::node_config_matches(
@@ -32984,6 +33310,9 @@ state = "UP"
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -33032,6 +33361,9 @@ state = "UP"
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -33071,6 +33403,9 @@ state = "UP"
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -33120,6 +33455,9 @@ state = "UP"
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -33168,6 +33506,9 @@ state = "UP"
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -33206,6 +33547,9 @@ state = "UP"
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
