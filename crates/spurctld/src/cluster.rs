@@ -3158,7 +3158,7 @@ impl ClusterManager {
         preempt_qos: Option<String>,
         earmark_freed: bool,
     ) -> anyhow::Result<PreemptOutcome> {
-        {
+        let run_attempt = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -3166,7 +3166,8 @@ impl ClusterManager {
             if job.state != JobState::Running {
                 anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
             }
-        }
+            job.run_attempt
+        };
 
         match mode {
             PreemptMode::Off => anyhow::bail!("preemption disabled for job {}", job_id),
@@ -3192,6 +3193,7 @@ impl ClusterManager {
                     preempted_by,
                     preempt_qos,
                     at: Some(Utc::now()),
+                    run_attempt: Some(run_attempt),
                 })?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (cancel)");
@@ -3227,6 +3229,7 @@ impl ClusterManager {
                     preempted_by,
                     preempt_qos,
                     at: None,
+                    run_attempt: Some(run_attempt),
                 })?;
                 // Requeue frees the node and moves the victim straight to Pending
                 // (no Completing drain), so only the earmark keeps the node for the
@@ -7593,6 +7596,12 @@ impl ClusterManager {
         job.spec.begin_time.map_or(hold, |begin| begin.max(hold))
     }
 
+    /// Whether a preemption decided for `run_attempt` still applies to `job`.
+    /// `None` (a pre-upgrade entry) matches any run.
+    fn preempt_targets_run(job: &Job, run_attempt: Option<u32>) -> bool {
+        run_attempt.is_none_or(|attempt| attempt == job.run_attempt)
+    }
+
     /// End a live run as PREEMPTED for accounting and return the job to Pending
     /// with an eligibility hold, in one step so the intermediate state never
     /// escapes the caller's lock. `None` when the state machine refuses.
@@ -8036,6 +8045,7 @@ impl ClusterManager {
                 begin_time,
                 preempted_by,
                 preempt_qos,
+                run_attempt,
                 ..
             } => {
                 // Only a running job is preempted; on replay the job is already
@@ -8049,7 +8059,9 @@ impl ClusterManager {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
-                    if job.state != JobState::Running {
+                    if job.state != JobState::Running
+                        || !Self::preempt_targets_run(job, *run_attempt)
+                    {
                         return ClientResponse::default();
                     }
                     freed_nodes = job.allocated_nodes.clone();
@@ -8199,6 +8211,7 @@ impl ClusterManager {
                 preempted_by,
                 preempt_qos,
                 at,
+                run_attempt,
             } => {
                 let at = at.unwrap_or(timestamp);
                 let freed_nodes;
@@ -8209,7 +8222,9 @@ impl ClusterManager {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
-                    if job.state != JobState::Running {
+                    if job.state != JobState::Running
+                        || !Self::preempt_targets_run(job, *run_attempt)
+                    {
                         return ClientResponse::default();
                     }
                     if let Err(e) = job.transition(JobState::Preempted) {
@@ -16406,6 +16421,7 @@ state = "UP"
             preempted_by: Some(2),
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -17537,6 +17553,7 @@ state = "UP"
             preempted_by: Some(job_id + 1),
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
 
         let last = cm.get_job(job_id).unwrap().last_requeue.unwrap();
@@ -17760,6 +17777,7 @@ state = "UP"
             preempted_by: Some(job_id + 1),
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -19653,6 +19671,7 @@ state = "UP"
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
             at: None,
+            run_attempt: None,
         });
 
         assert!(
@@ -19692,6 +19711,7 @@ state = "UP"
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
             at: None,
+            run_attempt: None,
         });
         assert!(
             replay.jobs_finalized.is_empty(),
@@ -19702,6 +19722,194 @@ state = "UP"
             0,
             "replayed preempt-cancel must not double-free"
         );
+    }
+
+    /// Job 1 running its `run_attempt`-th run on `worker1`.
+    fn seed_running_job(cm: &ClusterManager, run_attempt: u32) {
+        register_node(cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("preempt-run-gate")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt,
+            idle_fill: false,
+            at: None,
+        });
+    }
+
+    async fn cluster_with_running_job(dir: &TempDir, run_attempt: u32) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        seed_running_job(&cm, run_attempt);
+        cm
+    }
+
+    fn preempt_cancel_for_run(run_attempt: Option<u32>) -> WalOperation {
+        WalOperation::JobPreemptCancel {
+            job_id: 1,
+            preempted_by: Some(42),
+            preempt_qos: None,
+            at: None,
+            run_attempt,
+        }
+    }
+
+    fn preempt_requeue_for_run(run_attempt: Option<u32>) -> WalOperation {
+        WalOperation::JobPreemptRequeue {
+            job_id: 1,
+            begin_time: Utc::now() + chrono::Duration::seconds(5),
+            preempted_by: Some(42),
+            preempt_qos: None,
+            at: None,
+            run_attempt,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_cancel_decided_for_an_earlier_run_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+
+        let resp = cm.apply_operation(&preempt_cancel_for_run(Some(2)));
+
+        assert!(resp.jobs_finalized.is_empty());
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_cancel_decided_for_the_current_run_applies() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+
+        cm.apply_operation(&preempt_cancel_for_run(Some(3)));
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert_eq!(job.preempted_by, Some(42));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_cancel_from_a_pre_upgrade_entry_applies_to_any_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+        let legacy: WalOperation =
+            serde_json::from_str(r#"{"JobPreemptCancel":{"job_id":1,"preempted_by":42}}"#).unwrap();
+
+        cm.apply_operation(&legacy);
+
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_decided_for_an_earlier_run_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+
+        let resp = cm.apply_operation(&preempt_requeue_for_run(Some(2)));
+
+        assert!(resp.jobs_finalized.is_empty());
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.preempt_requeue_count, 0);
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_decided_for_the_current_run_applies() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+
+        let resp = cm.apply_operation(&preempt_requeue_for_run(Some(3)));
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.preempt_requeue_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_from_a_pre_upgrade_entry_applies_to_any_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+        let legacy: WalOperation = serde_json::from_str(
+            r#"{"JobPreemptRequeue":{"job_id":1,"begin_time":"2999-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+
+        cm.apply_operation(&legacy);
+
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Pending);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempting_a_running_job_stamps_the_run_it_was_decided_for() {
+        for mode in [PreemptMode::Requeue, PreemptMode::Cancel] {
+            let dir = TempDir::new().unwrap();
+            let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+            let recorder = Arc::new(RecordingApplier {
+                inner: cm.clone(),
+                ops: parking_lot::Mutex::new(Vec::new()),
+            });
+            let handle =
+                crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), recorder.clone())
+                    .await
+                    .unwrap();
+            handle
+                .raft
+                .wait(Some(std::time::Duration::from_secs(5)))
+                .metrics(|m| m.current_leader == Some(1), "leader elected")
+                .await
+                .expect("single-node raft did not self-elect within 5s");
+            cm.set_raft(handle.raft);
+            seed_running_job(&cm, 3);
+
+            cm.preempt_job_with_provenance(1, mode, Some(42), None)
+                .unwrap();
+
+            let ops = recorder.ops.lock();
+            let stamped = ops.iter().find_map(|op| match op {
+                WalOperation::JobPreemptRequeue { run_attempt, .. }
+                | WalOperation::JobPreemptCancel { run_attempt, .. } => Some(*run_attempt),
+                _ => None,
+            });
+            assert_eq!(stamped, Some(Some(3)), "{mode:?}");
+        }
+    }
+
+    /// Records every operation Raft commits before handing it to the cluster, so a
+    /// test can see what a proposer wrote and not only how it applied.
+    struct RecordingApplier {
+        inner: Arc<ClusterManager>,
+        ops: parking_lot::Mutex<Vec<WalOperation>>,
+    }
+
+    impl crate::raft::StateMachineApply for RecordingApplier {
+        fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+            self.ops.lock().push(op.clone());
+            self.inner.apply_operation(op)
+        }
+
+        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+            crate::raft::StateMachineApply::snapshot_state(self.inner.as_ref())
+        }
+
+        fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+            crate::raft::StateMachineApply::restore_from_snapshot(self.inner.as_ref(), data)
+        }
     }
 
     fn budget_qos(cap: u32) -> Qos {
@@ -20047,6 +20255,7 @@ state = "UP"
             preempted_by: None,
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
         // One op finalizes the prior run as PREEMPTED (drives accounting) ...
         assert_eq!(resp.jobs_finalized.len(), 1);
@@ -20070,6 +20279,7 @@ state = "UP"
             preempted_by: None,
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
         assert!(
             replay.jobs_finalized.is_empty(),
@@ -30651,6 +30861,7 @@ state = "UP"
             preempted_by: Some(99),
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
 
         let job = cm.get_job(id).unwrap();
@@ -30671,6 +30882,7 @@ state = "UP"
             preempted_by: Some(99),
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
 
         let job = cm.get_job(id).unwrap();
@@ -31020,6 +31232,7 @@ state = "UP"
             preempted_by: Some(99),
             preempt_qos: Some("high".into()),
             at: Some(grace_exit_at() + chrono::Duration::seconds(10)),
+            run_attempt: None,
         });
 
         assert!(resp.jobs_finalized.is_empty(), "waits for n2 to report");
@@ -31096,6 +31309,7 @@ state = "UP"
             preempted_by: Some(99),
             preempt_qos: Some("high".into()),
             at: None,
+            run_attempt: None,
         });
 
         assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);

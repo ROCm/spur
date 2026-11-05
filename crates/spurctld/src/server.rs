@@ -7779,6 +7779,7 @@ mod tests {
                 preempted_by: Some(99),
                 preempt_qos: None,
                 at: Some(Utc::now() - chrono::Duration::seconds(ago_secs)),
+                run_attempt: None,
             });
             assert_eq!(cluster.get_job(job_id).unwrap().state, JobState::Completing);
         };

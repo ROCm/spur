@@ -213,6 +213,11 @@ pub enum WalOperation {
         /// When the preempted run ended, distinct from `begin_time`'s future hold.
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Run this preemption was decided for. A NoOp on apply when set and the
+        /// job has since moved to another run. `None` (every pre-upgrade entry)
+        /// applies to whichever run is current.
+        #[serde(default)]
+        run_attempt: Option<u32>,
     },
     /// Preempt a running job with cancel. The job transitions Running →
     /// Preempted → Cancelled: Preempted is reported to accounting so the
@@ -232,6 +237,11 @@ pub enum WalOperation {
         /// deadline from one value. Absent pre-upgrade; falls back to apply time.
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Run this preemption was decided for. A NoOp on apply when set and the
+        /// job has since moved to another run. `None` (every pre-upgrade entry)
+        /// applies to whichever run is current.
+        #[serde(default)]
+        run_attempt: Option<u32>,
     },
     /// Admin requeue (`scontrol requeue` / `requeuehold`): return a job to
     /// Pending with the same spec in one atomic step. A running/suspended job is
@@ -1274,6 +1284,7 @@ mod tests {
             r#"{"JobComplete":{"job_id":7,"exit_code":0,"state":"COMPLETED"}}"#,
             r#"{"JobNodeComplete":{"job_id":7,"node_name":"n1","exit_code":0,"signal":0}}"#,
             r#"{"JobPreemptRequeue":{"job_id":7,"begin_time":"2026-01-01T00:00:00Z"}}"#,
+            r#"{"JobPreemptCancel":{"job_id":7}}"#,
             r#"{"JobUserRequeue":{"job_id":7}}"#,
             r#"{"JobEvict":{"job_id":7}}"#,
             r#"{"NodeRemove":{"name":"n1","reason":null}}"#,
@@ -1711,6 +1722,7 @@ mod suspend_wal_tests {
             preempted_by: Some(3),
             preempt_qos: Some("burst".into()),
             at: Some(stamped),
+            run_attempt: Some(4),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1720,11 +1732,13 @@ mod suspend_wal_tests {
                 preempted_by,
                 preempt_qos,
                 at,
+                run_attempt,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, Some(3));
                 assert_eq!(preempt_qos.as_deref(), Some("burst"));
                 assert_eq!(at, Some(stamped));
+                assert_eq!(run_attempt, Some(4));
             }
             _ => panic!("wrong variant"),
         }
@@ -1738,11 +1752,13 @@ mod suspend_wal_tests {
                 preempted_by,
                 preempt_qos,
                 at,
+                run_attempt,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
                 assert_eq!(at, None, "legacy entry falls back to apply time");
+                assert_eq!(run_attempt, None, "legacy entry checks no run");
             }
             _ => panic!("wrong variant"),
         }
@@ -1757,6 +1773,7 @@ mod suspend_wal_tests {
             preempted_by: Some(7),
             preempt_qos: Some("highprio".into()),
             at: None,
+            run_attempt: Some(2),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1766,12 +1783,14 @@ mod suspend_wal_tests {
                 begin_time: b,
                 preempted_by,
                 preempt_qos,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(b, begin_time);
                 assert_eq!(preempted_by, Some(7));
                 assert_eq!(preempt_qos.as_deref(), Some("highprio"));
+                assert_eq!(run_attempt, Some(2));
             }
             _ => panic!("wrong variant"),
         }
@@ -1783,10 +1802,12 @@ mod suspend_wal_tests {
             WalOperation::JobPreemptRequeue {
                 preempted_by,
                 preempt_qos,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
+                assert_eq!(run_attempt, None, "legacy entry checks no run");
             }
             _ => panic!("wrong variant"),
         }
