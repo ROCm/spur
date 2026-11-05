@@ -1252,3 +1252,69 @@ async fn a_removed_node_leaves_no_partition_usage_behind() {
     );
     assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n2".into(), 8)]));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_suspended_job_keeps_charging_the_cap_it_still_holds() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    let suspended = run_on(&cm, spec_in("cpu", 8), "n1", 8);
+    cm.suspend_job(suspended, "testuser").unwrap();
+    settle(&cm, suspended, JobState::Suspended);
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n1".into(), 8)]));
+
+    let next = submit_and_wait(&cm, spec_in("cpu", 8));
+    assert!(run_pass(&cm).is_empty());
+    assert_eq!(reason(&cm, next).0, PendingReason::PartitionTresLimit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_the_job_finished_on_no_longer_charges_the_cap() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("cpu", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    register_node(&cm, "n2", 16, 64 * GIB);
+    let id = submit_and_wait(
+        &cm,
+        JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            ..spec_in("cpu", 8)
+        },
+    );
+    let nodes = ["n1".to_string(), "n2".to_string()];
+    activate(
+        &cm,
+        id,
+        &nodes,
+        scalar_alloc(16, 2 * GIB),
+        &per_node_for(&["n1", "n2"], scalar_alloc(8, GIB)),
+        RunAttribution {
+            effective_partition: Some("cpu".into()),
+            ..Default::default()
+        },
+    );
+    cm.apply_operation(&WalOperation::JobNodeComplete {
+        job_id: id,
+        node_name: "n1".into(),
+        exit_code: 0,
+        signal: 0,
+        at: None,
+        run_attempt: cm.get_job(id).unwrap().run_attempt,
+    });
+    assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
+    assert_eq!(cap_usage(&cm, "cpu"), BTreeMap::from([("n2".into(), 8)]));
+
+    let replacement = submit_and_wait(&cm, spec_in("cpu", 8));
+    assert_eq!(run_pass(&cm), [replacement]);
+}
