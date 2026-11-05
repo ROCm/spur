@@ -732,10 +732,11 @@ impl ControllerService {
             }
             _ => return Ok(StepdFenceOutcome::Stale),
         }
-        match self
-            .cluster
-            .preempt_job(job_id, spur_core::partition::PreemptMode::Requeue)
-        {
+        match self.cluster.preempt_job(
+            job_id,
+            run_attempt,
+            spur_core::partition::PreemptMode::Requeue,
+        ) {
             Ok(crate::cluster::PreemptOutcome::Killed) => {
                 crate::scheduler_loop::send_cancel_to_agents(&self.cluster, &job, 0).await;
                 Ok(StepdFenceOutcome::Fenced)
@@ -9384,7 +9385,11 @@ mod tests {
 
         assert!(matches!(
             svc.cluster
-                .preempt_job(job_id, spur_core::partition::PreemptMode::Suspend)
+                .preempt_job(
+                    job_id,
+                    run_attempt,
+                    spur_core::partition::PreemptMode::Suspend
+                )
                 .expect("suspend the running job"),
             crate::cluster::PreemptOutcome::Suspended
         ));
@@ -10471,7 +10476,11 @@ mod tests {
             ),
         );
         svc.cluster
-            .preempt_job(job_id, spur_core::partition::PreemptMode::Suspend)
+            .preempt_job(
+                job_id,
+                run_attempt,
+                spur_core::partition::PreemptMode::Suspend,
+            )
             .expect("suspend the running job");
 
         // Pin the branch: the retain response is also what a complete cohort

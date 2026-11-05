@@ -1569,7 +1569,13 @@ async fn preempt_victim_now(
 ) -> anyhow::Result<()> {
     use crate::cluster::PreemptOutcome;
 
-    match cluster.preempt_job_with_provenance(victim.job_id, mode, Some(preemptor), preempt_qos) {
+    match cluster.preempt_job_with_provenance(
+        victim.job_id,
+        victim.run_attempt,
+        mode,
+        Some(preemptor),
+        preempt_qos,
+    ) {
         Ok(PreemptOutcome::Killed) => {
             // Signal 0 = graceful cancel (SIGTERM then SIGKILL). Nodes that
             // already reported during a grace have nothing left to stop.
@@ -1893,6 +1899,7 @@ async fn reclaim_for_unplaced(
             // lose when requeue preserves it at no cost to the reclaimer.
             match cluster.reclaim_job_with_provenance(
                 victim.job_id,
+                victim.run_attempt,
                 spur_core::partition::PreemptMode::Requeue,
                 Some(reclaimer.job_id),
                 None,
@@ -6525,7 +6532,13 @@ mod tests {
 
             let closed = gate.close();
             let err = cm
-                .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
+                .preempt_job_with_provenance(
+                    job_id,
+                    victim.run_attempt,
+                    PreemptMode::Requeue,
+                    Some(99),
+                    None,
+                )
                 .expect_err("the requeue cannot apply while the gate is closed");
             follow_late_preemption(
                 &cm,

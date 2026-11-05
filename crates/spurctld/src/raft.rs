@@ -154,6 +154,10 @@ pub struct ClientResponse {
     /// preemption grace, and left it unchanged.
     #[serde(default)]
     pub suspend_applied: bool,
+    /// False when a `JobPreemptRequeue` or `JobPreemptCancel` found the job no
+    /// longer Running at the run it was decided for, and left it unchanged.
+    #[serde(default)]
+    pub preempt_applied: bool,
     /// False when a `JobTimeLimitExpired` found the run no longer Running or
     /// Suspended at that attempt, and left it unchanged.
     #[serde(default)]

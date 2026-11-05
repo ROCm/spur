@@ -213,9 +213,9 @@ pub enum WalOperation {
         /// When the preempted run ended, distinct from `begin_time`'s future hold.
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
-        /// Run this preemption was decided for. A NoOp on apply when set and the
-        /// job has since moved to another run. `None` (every pre-upgrade entry)
-        /// applies to whichever run is current.
+        /// Run the caller decided to preempt, not whichever is current when this
+        /// is proposed. A NoOp on apply when set and the job is at another run.
+        /// `None` (every pre-upgrade entry) applies to whichever run is current.
         #[serde(default)]
         run_attempt: Option<u32>,
     },
@@ -237,9 +237,9 @@ pub enum WalOperation {
         /// deadline from one value. Absent pre-upgrade; falls back to apply time.
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
-        /// Run this preemption was decided for. A NoOp on apply when set and the
-        /// job has since moved to another run. `None` (every pre-upgrade entry)
-        /// applies to whichever run is current.
+        /// Run the caller decided to preempt, not whichever is current when this
+        /// is proposed. A NoOp on apply when set and the job is at another run.
+        /// `None` (every pre-upgrade entry) applies to whichever run is current.
         #[serde(default)]
         run_attempt: Option<u32>,
     },
