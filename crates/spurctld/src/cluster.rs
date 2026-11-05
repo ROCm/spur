@@ -5153,7 +5153,8 @@ impl ClusterManager {
         Ok((target_state, running_count))
     }
 
-    /// Whether `name` has any job holding an allocation (Running/Completing/Suspended). Shared by
+    /// Whether `name` has any job still charged to it (Running/Completing/Suspended); a node that
+    /// already reported its part of a run is free. Shared by
     /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
     /// busy node without `--force` using the same rule.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
@@ -5162,7 +5163,7 @@ impl ClusterManager {
             matches!(
                 j.state,
                 JobState::Running | JobState::Completing | JobState::Suspended
-            ) && j.allocated_nodes.iter().any(|n| n == name)
+            ) && j.is_held_on(name)
         })
     }
 
@@ -31437,6 +31438,20 @@ state = "UP"
         assert!(job.preempt_pending.is_none());
         assert_eq!(cpus_in_use(&cm, "n1"), 0);
         assert_eq!(cpus_in_use(&cm, "n2"), 0, "freed once, not twice");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_reported_during_a_grace_is_no_longer_busy() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        assert!(cm.node_has_running_jobs("n1"));
+
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(!cm.node_has_running_jobs("n1"), "n1 reported and was freed");
+        assert!(cm.node_has_running_jobs("n2"), "n2 is still running");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

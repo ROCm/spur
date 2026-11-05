@@ -305,6 +305,7 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `a_launch_failure_requeue_during_a_cancel_grace_repends_the_job_with_backoff`,
   `a_held_launch_failure_during_a_cancel_grace_holds_the_job`,
   `holding_at_the_requeue_cap_during_a_cancel_grace_holds_the_job`,
+  `a_node_that_reported_during_a_grace_is_no_longer_busy`,
   `losing_a_node_in_a_cancel_grace_earmarks_the_freed_nodes_for_the_preemptor`,
   `losing_a_node_in_a_requeue_grace_repends_the_victim_as_preempted`,
   `partition_grace_time_round_trips_through_update_and_clear`, and the `run_attempt` gate on the final
