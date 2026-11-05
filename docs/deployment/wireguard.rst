@@ -122,6 +122,12 @@ to ``spur net``. ``spurd`` reads the persisted config from that directory to
 decide what to protect, and defaults to ``/etc/wireguard``; if the two disagree,
 it finds no config and protects nothing.
 
+The same applies to a non-default interface name. Set ``wg_interface`` under
+``[network]`` in ``spur.conf`` to the ``--interface`` you pass to ``spur net``.
+``spurd`` also honors ``SPUR_WG_INTERFACE`` in its environment, which takes
+precedence over the config field; ``spurctld`` reads only the config field.
+Both default to ``spur0``.
+
 Removing a node from the mesh
 =============================
 
