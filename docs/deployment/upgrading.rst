@@ -29,7 +29,7 @@ Check whether an update is available:
 
 .. code-block:: text
 
-   update available: 0.3.0 → v0.3.1
+   update available: 0.14.0 → v0.15.0
    Run `spur self-update` to install.
 
 Install the update:
@@ -55,7 +55,7 @@ After a successful update the CLI prints:
 
 .. code-block:: text
 
-   Updated spur to v0.3.1
+   Updated spur to v0.15.0
    Note: Restart running daemons (spurctld, spurd, spurauthd) to use the new version.
 
 .. warning::
@@ -120,7 +120,7 @@ Pass ``nightly`` or a pinned ``vX.Y.Z`` to select a specific release, or set
 .. code-block:: bash
 
    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- nightly
-   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- v0.3.1
+   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- v0.15.0
 
 Like ``spur self-update``, ``install.sh`` does not manage systemd units or restart
 daemons. Restart ``spurctld`` and ``spurd`` yourself after re-installing.
@@ -138,7 +138,7 @@ unable to parse a log written by a differently-versioned peer:
 
 .. code-block:: bash
 
-   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd -p spurauthd
 
 Binaries roll out by content, not version string: Ansible compares checksums, so an
 unchanged re-run is a near no-op.
@@ -158,7 +158,7 @@ or when a short blip is acceptable:
 
 .. note::
 
-   Spur 0.3.0 has no online Raft membership change. Adding, removing, or reordering a
+   Spur has no online Raft membership change. Adding, removing, or reordering a
    **controller** fails early unless you also pass ``-e spur_wipe_state=true`` (a Raft
    reinit that wipes state). Compute agents are not Raft members, so they can be added or
    removed freely without a wipe.
@@ -335,7 +335,7 @@ Follow this order for any cluster upgrade:
    ``spurstepd`` to carry running jobs across instead (see :ref:`upgrading-in-place`).
 4. **Never wipe state during an upgrade.** Keep the default ``spur_wipe_state=false``.
    Wiping resets the Raft job-id counter and destroys accounting history.
-5. **HA membership is fixed at init** in Spur 0.3.0. You can roll new binaries onto the
+5. **HA membership is fixed at init.** You can roll new binaries onto the
    existing controller set freely, but changing *which* hosts are controllers requires
    ``deploy.yml -e spur_wipe_state=true``.
 6. **Only roll forward across an accounting schema migration.** The first upgraded

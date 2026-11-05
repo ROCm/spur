@@ -54,7 +54,7 @@ the inventory, and deploy.
    git clone https://github.com/ROCm/spur.git && cd spur
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
    sudo apt install -y protobuf-compiler build-essential
-   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd -p spurauthd
    SPUR_BUILD="$(pwd)/target/release"
    cd -
 
@@ -67,7 +67,8 @@ the inventory, and deploy.
    ansible-playbook playbooks/deploy.yml -i inventory/hosts.ini -e spur_binary_src="$SPUR_BUILD"
 
 ``spur_binary_src`` points at the build-output directory; the ``spur_install`` role
-reads ``spur``, ``spurctld``, ``spurd``, and ``spurstepd`` from it by name.
+reads ``spur``, ``spurctld``, ``spurd``, and ``spurstepd`` from it by name, plus
+``spurauthd`` when ``spur_auth_enabled=true``.
 ``spurstepd`` must land next to ``spurd`` on every compute node — the agent looks
 for it beside its own executable and does not search ``$PATH``. Omit it to install a
 published release via ``install.sh`` instead, selected by ``spur_version``
@@ -83,12 +84,12 @@ near no-op.
 
 .. note::
 
-   The toolkit does not set up native credentials (``[auth] plugin = "spur"``). It
-   never starts ``spurauthd`` or distributes the key sets, and a ``spur_binary_src``
-   deploy does not copy the binary at all (an ``install.sh`` deploy does). To use
-   native credentials on a toolkit-deployed cluster, follow :ref:`native-auth-plugin`
-   by hand on every host. A run with ``-e spur_overwrite_conf=true`` re-renders
-   ``spur.conf`` from the template and drops the ``[auth]`` section you added.
+   Native credentials (``[auth] plugin = "spur"``) are opt-in. Set
+   ``spur_auth_enabled=true`` and the ``spur_auth`` role renders the ``[auth]``
+   section, generates and distributes the key sets, and runs ``spurauthd`` on every
+   host. Roll out with the default ``spur_auth_mode=permissive`` first. See the
+   "Authentication & RBAC" section of ``ansible/README.md`` in the toolkit for the
+   variables, and :ref:`native-auth-plugin` for how the plugin works.
 
 Topologies
 ----------
@@ -114,10 +115,10 @@ Deployment shape is determined entirely by the inventory groups and the
      - encrypted mesh on ``spur0``
    * - HA — multi-controller Raft
      - Odd N ≥ 3 hosts in ``spur_controllers``; auto-enabled
-     - direct, or wireguard (multi-controller mesh via spur-toolkit#23)
+     - direct, or wireguard (multi-controller mesh)
    * - HA — separate compute
      - ``spur_controllers`` and ``spur_agents`` are disjoint sets
-     - direct, or wireguard (via spur-toolkit#23)
+     - direct, or wireguard
 
 Single-node
 ~~~~~~~~~~~
@@ -173,12 +174,10 @@ WireGuard mesh. See :ref:`ansible-wireguard`.
 
 .. note::
 
-   The Ansible WireGuard role currently supports a **single controller** — for
-   multi-controller HA today, use the ``direct`` transport. Multi-controller HA
-   *over* WireGuard is added by `spur-toolkit#23
-   <https://github.com/ROCm/spur-toolkit/pull/23>`_ (not yet merged); see
-   :doc:`wireguard` for how that mesh forms (bootstrap ``net init`` + a full-mesh
-   ``net mesh`` pass wiring controller↔controller tunnels for Raft).
+   The WireGuard role supports single- and multi-controller inventories. With more
+   than one host in ``spur_controllers``, it runs a full-mesh ``net mesh`` pass after
+   the bootstrap ``net init`` so the controllers reach each other directly for Raft.
+   See :doc:`wireguard` for how the mesh forms.
 
 HA — multi-controller Raft
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -330,15 +329,6 @@ only lasts until reboot).
    The full WireGuard mesh story — bring-up, why peer endpoints matter for
    worker↔worker connectivity, node removal, HA, and k0s over the mesh — is in
    :doc:`wireguard`.
-
-.. note::
-
-   ``spur_wg_persist`` and the ``spur_k8s_*`` variables / k0s playbooks documented
-   in this and the following section ship in `spur-toolkit#23
-   <https://github.com/ROCm/spur-toolkit/pull/23>`_, which is not yet merged. On the
-   current toolkit ``main`` these variables are unconsumed and ``k8s_up.yml`` /
-   ``k8s_add_nodes.yml`` do not exist; drive ``spur k8s up`` / ``add-nodes``
-   directly (see :doc:`wireguard`) until #23 lands.
 
 SPUR-managed k0s cluster
 ------------------------

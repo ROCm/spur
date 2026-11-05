@@ -164,11 +164,10 @@ otherwise the others keep a stale peer.
 
 .. note::
 
-   The Ansible ``remove_nodes.yml`` playbook automates all of the above — the
-   controller-side ``remove-peer`` (on all controllers) and the node-side teardown
-   — but that WireGuard cleanup ships in `spur-toolkit#23
-   <https://github.com/ROCm/spur-toolkit/pull/23>`_, which is not yet merged. Until
-   it lands, perform these steps manually.
+   The Ansible ``remove_nodes.yml`` playbook automates all of the above. With
+   ``spur_transport=wireguard`` it runs ``spur net remove-peer`` on every surviving
+   mesh member (controllers, agents, and login nodes) and tears down the interface
+   and ``/etc/wireguard/<iface>.conf`` on the removed node. See :doc:`ansible`.
 
 High availability over the mesh
 ===============================
@@ -195,10 +194,10 @@ position):
 
 Raft elects a leader automatically; clients and agents may target any controller
 and are redirected to the current leader. See :doc:`native-host` for the full
-per-node controller/agent setup. An inventory-driven, multi-controller
-WireGuard-mesh flow is added by `spur-toolkit#23
-<https://github.com/ROCm/spur-toolkit/pull/23>`_ (not yet merged — until it lands
-the Ansible role supports a single controller under WireGuard only).
+per-node controller/agent setup. The Ansible ``spur_wireguard`` role automates
+this for multi-controller inventories: list the controllers in ``spur_controllers``
+with ``spur_transport=wireguard`` and it runs the bootstrap ``net init`` and the
+full-mesh ``net mesh`` pass (see :doc:`ansible`).
 
 k0s cluster inside the mesh
 ===========================
@@ -219,8 +218,6 @@ cluster.
 
 .. note::
 
-   The Ansible ``spur_k8s_*`` variables and the ``k8s_up.yml`` /
-   ``k8s_add_nodes.yml`` playbooks referenced for this flow ship in `spur-toolkit#23
-   <https://github.com/ROCm/spur-toolkit/pull/23>`_, which is not yet merged. Until
-   it lands, drive ``spur k8s up`` / ``add-nodes`` directly (as shown above) rather
-   than via those playbooks.
+   With Ansible, set ``spur_k8s_enabled=true`` before ``deploy.yml``, then run the
+   ``k8s_up.yml`` and ``k8s_add_nodes.yml`` playbooks, which wrap ``spur k8s up``
+   and ``spur k8s add-nodes``. See :doc:`ansible` for the ``spur_k8s_*`` variables.
