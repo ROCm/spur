@@ -1357,7 +1357,7 @@ pub async fn shutdown_allocation(
 /// request here is an ack the supervisor answers at once, so nothing on this
 /// path legitimately blocks — a wedged peer that accepts but never answers must
 /// not pin a cancel, a signal, or a dispatch forever.
-const STEPD_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const STEPD_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 // Paused-time tests drive a real socket, and tokio auto-advances the virtual
 // clock to the nearest timer whenever the runtime looks idle, firing the bound

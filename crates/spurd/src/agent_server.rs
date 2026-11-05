@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -1904,7 +1904,7 @@ const WORKLOAD_DEATH_POLLS: u32 = 20;
 const WORKLOAD_DEATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// Sized like the other supervisor exchanges rather than a launch's typical
 /// latency: a loaded node can stall the fork well past a second.
-const WORKLOAD_PID_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+const WORKLOAD_PID_DEADLINE: std::time::Duration = crate::stepd::STEPD_REQUEST_TIMEOUT;
 const WORKLOAD_PID_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// A supervisor that dies before pushing completion leaves no other record, so
@@ -3179,11 +3179,26 @@ async fn supervised_step_workload_pid(
                 Ok(snapshot) if snapshot.job_pid > 0 => return Ok(snapshot.job_pid as u32),
                 Ok(_) => last = WorkloadPidProbe::NoPidYet,
                 Err(error) => {
-                    if matches!(
-                        crate::stepd::stepd_liveness(descriptor),
-                        Ok(crate::stepd::StepdLiveness::Stale)
-                    ) {
-                        return Err(WorkloadPidUnavailable::SupervisorGone(error));
+                    match crate::stepd::stepd_liveness(descriptor) {
+                        Ok(crate::stepd::StepdLiveness::Stale) => {
+                            trace!(
+                                job_id = descriptor.job_id,
+                                step_id = descriptor.step_id,
+                                %error,
+                                "workload pid query failed and the supervisor is gone"
+                            );
+                            return Err(WorkloadPidUnavailable::SupervisorGone(
+                                SupervisorExit::of(descriptor),
+                            ));
+                        }
+                        Ok(crate::stepd::StepdLiveness::Live) => {}
+                        // Treated as alive, so the deadline still bounds the wait.
+                        Err(liveness_error) => debug!(
+                            job_id = descriptor.job_id,
+                            step_id = descriptor.step_id,
+                            %liveness_error,
+                            "could not check the supervisor's liveness; still waiting"
+                        ),
                     }
                     trace!(
                         job_id = descriptor.job_id,
@@ -3220,9 +3235,44 @@ enum WorkloadPidProbe {
     Failed(std::io::Error),
 }
 
+/// Why a supervisor that stopped answering counts as gone.
+#[derive(Debug)]
+enum SupervisorExit {
+    /// Not yet published; the agent-side launcher holding it has exited.
+    LauncherGone(u32),
+    PidGone(u32),
+    PidReused(u32),
+    /// Still a zombie: exited but not yet reaped.
+    Exited(u32),
+}
+
+impl SupervisorExit {
+    fn of(descriptor: &crate::stepd::StepdDescriptor) -> Self {
+        if descriptor.is_provisional() {
+            return Self::LauncherGone(descriptor.launcher_pid);
+        }
+        match crate::stepd::process_start_ticks(descriptor.pid) {
+            Ok(ticks) if ticks != descriptor.process_start_ticks => Self::PidReused(descriptor.pid),
+            Ok(_) => Self::Exited(descriptor.pid),
+            Err(_) => Self::PidGone(descriptor.pid),
+        }
+    }
+}
+
+impl std::fmt::Display for SupervisorExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LauncherGone(pid) => write!(f, "launcher pid {pid} is gone"),
+            Self::PidGone(pid) => write!(f, "pid {pid} is gone"),
+            Self::PidReused(pid) => write!(f, "pid {pid} now belongs to another process"),
+            Self::Exited(pid) => write!(f, "pid {pid} has exited"),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum WorkloadPidUnavailable {
-    SupervisorGone(std::io::Error),
+    SupervisorGone(SupervisorExit),
     TimedOut(WorkloadPidProbe),
 }
 
@@ -3230,23 +3280,17 @@ impl std::fmt::Display for WorkloadPidUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let deadline = WORKLOAD_PID_DEADLINE.as_secs();
         match self {
-            Self::SupervisorGone(error) => {
-                write!(f, "its supervisor exited before reporting it ({error})")
+            Self::SupervisorGone(exit) => {
+                write!(f, "supervisor exited before reporting a pid ({exit})")
             }
             Self::TimedOut(WorkloadPidProbe::NeverAnswered) => {
-                write!(f, "its supervisor did not answer within {deadline}s")
+                write!(f, "supervisor did not answer within {deadline}s")
             }
             Self::TimedOut(WorkloadPidProbe::NoPidYet) => {
-                write!(
-                    f,
-                    "its supervisor still had no workload pid after {deadline}s"
-                )
+                write!(f, "supervisor still had no workload pid after {deadline}s")
             }
             Self::TimedOut(WorkloadPidProbe::Failed(error)) => {
-                write!(
-                    f,
-                    "its supervisor was unreachable for {deadline}s ({error})"
-                )
+                write!(f, "supervisor was unreachable for {deadline}s ({error})")
             }
         }
     }
@@ -8605,11 +8649,8 @@ impl SlurmAgent for AgentService {
                                 &descriptor,
                             )
                             .await;
-                            // A supervisor that never reported a pid either never
-                            // finished launching (recorded no reason) or hit a real
-                            // failure it wrote down before giving up — surface that
-                            // instead of the generic message so a real bug isn't
-                            // misread as a timeout.
+                            // A failure the supervisor recorded is the real cause;
+                            // show it rather than the generic wait error.
                             let reason = crate::stepd::StepdStore::new(&self.stepd_state_dir)
                                 .recorded_failure(init.job_id, run_attempt, step_id);
                             return Err(Status::internal(match reason {
@@ -13181,8 +13222,7 @@ mod tests {
 
         let run_descriptor = descriptor.clone();
         tokio::spawn(async move {
-            // Bind well after polling has already started failing to connect,
-            // and past the one-second budget this wait used to have.
+            // Bind well after polling has already started failing to connect.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
             let _ = crate::stepd::run_supervisor(listener, run_descriptor, session).await;
@@ -13256,6 +13296,48 @@ mod tests {
                 .contains(&format!("{}s", WORKLOAD_PID_DEADLINE.as_secs())),
             "the error must say how long it waited: {error}"
         );
+    }
+
+    // These strings end up in the user's srun error and are what diagnoses
+    // the next failure, so pin them.
+    #[test]
+    fn workload_pid_unavailable_messages() {
+        let deadline = WORKLOAD_PID_DEADLINE.as_secs();
+        let refused = || std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let cases = [
+            (
+                WorkloadPidUnavailable::SupervisorGone(SupervisorExit::PidGone(42)),
+                "supervisor exited before reporting a pid (pid 42 is gone)".to_string(),
+            ),
+            (
+                WorkloadPidUnavailable::SupervisorGone(SupervisorExit::PidReused(42)),
+                "supervisor exited before reporting a pid (pid 42 now belongs to another process)"
+                    .to_string(),
+            ),
+            (
+                WorkloadPidUnavailable::SupervisorGone(SupervisorExit::Exited(42)),
+                "supervisor exited before reporting a pid (pid 42 has exited)".to_string(),
+            ),
+            (
+                WorkloadPidUnavailable::SupervisorGone(SupervisorExit::LauncherGone(42)),
+                "supervisor exited before reporting a pid (launcher pid 42 is gone)".to_string(),
+            ),
+            (
+                WorkloadPidUnavailable::TimedOut(WorkloadPidProbe::NeverAnswered),
+                format!("supervisor did not answer within {deadline}s"),
+            ),
+            (
+                WorkloadPidUnavailable::TimedOut(WorkloadPidProbe::NoPidYet),
+                format!("supervisor still had no workload pid after {deadline}s"),
+            ),
+            (
+                WorkloadPidUnavailable::TimedOut(WorkloadPidProbe::Failed(refused())),
+                format!("supervisor was unreachable for {deadline}s ({})", refused()),
+            ),
+        ];
+        for (unavailable, expected) in cases {
+            assert_eq!(unavailable.to_string(), expected);
+        }
     }
 
     // A fresh container step's own GPU grant only ever exists in the env this
