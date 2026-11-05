@@ -21566,10 +21566,7 @@ mod tests {
         use tokio::io::AsyncBufReadExt;
         let mut command = std::process::Command::new("/bin/sh");
         command
-            .args([
-                "-c",
-                "trap '' TERM; echo ready; sleep 60",
-            ])
+            .args(["-c", "trap '' TERM; echo ready; sleep 60"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
