@@ -248,6 +248,8 @@ missing descriptors, nested orphan cgroups, and bind mounts that prevent parent
 or step removal. It checks process identity and cgroup disappearance before
 acceptance, preserves unrelated workloads, exercises both batch and allocation
 launches, and retries after removing each injected cleanup failure.
+It also checks that successful and failed steps from the old attempt retain
+their original exit codes after replacement.
 
 .. code-block:: bash
 

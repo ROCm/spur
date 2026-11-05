@@ -790,6 +790,8 @@ Batch launches and allocation registration are refused if an old cgroup cannot
 be removed or an old session descriptor cannot be read; the old reservation is
 not replaced. Step startup is serialized with this cleanup so an old step
 cannot recreate a cgroup during replacement.
+Completed steps keep their recorded exit status when a replacement reclaims
+their retained sessions. An unreadable exit record also refuses replacement.
 
 See Also
 --------

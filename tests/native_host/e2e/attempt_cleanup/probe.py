@@ -151,6 +151,7 @@ class Fixture:
         self.logs = []
         self.mounts = []
         self.old = []
+        self.completed_steps = {88: 0, 89: 23} if scenario == "completed-steps" else {}
         self.sentinels = []
         self.controller = Controller()
         self.server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
@@ -210,7 +211,7 @@ class Fixture:
         Path("/work").mkdir(mode=0o750)
         os.chown("/work", 65534, 65534)
         for attempt in (1, 2, 3):
-            shared = self.scenario in {"shared-slots", "orphaned", "nested-orphans"}
+            shared = self.scenario in {"shared-slots", "orphaned", "nested-orphans", "completed-steps"}
             steps = (BATCH, 0) if shared else (attempt * 10, attempt * 10 + 1)
             for step in steps:
                 self.start_old_step(attempt, step)
@@ -277,6 +278,25 @@ enabled = false
                     if self.scenario not in {"orphaned", "nested-orphans"} or d["run_attempt"] == 3}
         wait_for("recovery reports", lambda: expected <= self.controller.recovered)
         assert all(alive(d["workload_pid"], d["workload_start_ticks"]) for d in self.old)
+
+    def finish_old_steps(self):
+        for step, exit_code in self.completed_steps.items():
+            result = self.client.RunCommand(pb.RunCommandRequest(
+                job_id=JOB, step_id=step, uid=65534, gid=65534, work_dir="/work",
+                command=["/bin/bash", "-c", f"exit {exit_code}"], num_tasks=1, step_num_tasks=1,
+            ), timeout=30)
+            assert result.exit_code == exit_code, result
+            assert descriptor(NEW_ATTEMPT - 1, step), "the completed descriptor must remain discoverable"
+
+    def verify_completed_steps(self):
+        outcomes = {}
+        for step, exit_code in self.completed_steps.items():
+            result = self.client.AwaitStep(pb.AwaitStepRequest(
+                job_id=JOB, run_attempt=NEW_ATTEMPT - 1, step_id=step, user="nobody",
+            ), timeout=10)
+            outcomes[step] = result.exit_code
+            assert result.exit_code == exit_code, (step, exit_code, result)
+        return outcomes
 
     def bind_mount(self, path):
         subprocess.run(["mount", "--bind", str(path), str(path)], check=True)
@@ -376,7 +396,7 @@ enabled = false
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenario", choices=[
-        "distinct-slots", "shared-slots", "orphaned", "nested-orphans", "parent-busy", "leaf-busy",
+        "distinct-slots", "shared-slots", "orphaned", "nested-orphans", "parent-busy", "leaf-busy", "completed-steps",
     ], required=True)
     parser.add_argument("--mode", choices=["batch", "allocation"], required=True)
     args = parser.parse_args()
@@ -387,6 +407,8 @@ def main():
         setup_cgroup_namespace()
         fixture = Fixture(args.scenario, args.mode)
         fixture.prepare()
+        fixture.finish_old_steps()
+        report["completed_before"] = fixture.verify_completed_steps()
         report["before"] = fixture.snapshot()
         report["recovered"] = sorted(fixture.controller.recovered)
         report["tracked_before"] = [
@@ -414,6 +436,7 @@ def main():
             assert not attempt["workloads_alive"], attempt
             assert not attempt["remaining_cgroups"], attempt
         report["new"] = fixture.verify_new()
+        report["completed_after"] = fixture.verify_completed_steps()
         fixture.verify_preserved()
         wait_for("old supervisors to exit", lambda: all(
             not alive(d["pid"], d["process_start_ticks"]) for d in fixture.old

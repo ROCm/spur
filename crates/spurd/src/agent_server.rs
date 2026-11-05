@@ -810,7 +810,7 @@ async fn fence_older_runs(
     older.sort_by_key(|descriptor| !spur_core::step::owns_job_lifetime(descriptor.step_id));
     for descriptor in older {
         fence_stepd(stepds, &descriptor).await?;
-        settle_fenced_session(completions, &descriptor).await;
+        settle_fenced_session(completions, store, &descriptor).await?;
     }
     for path in cgroups {
         if !crate::cgroup_cleanup::wait_until_reaped(
@@ -858,28 +858,43 @@ fn older_run_cgroups(
     Ok(paths)
 }
 
-/// A fenced supervisor sends no completion push, so its parked caller and its
-/// session are released here instead.
+/// Fencing can stop a supervisor before its completion push reaches the agent,
+/// so pending callers still need an outcome when the workload is gone.
 async fn settle_fenced_session(
     completions: &crate::step_completion::StepCompletions,
+    store: &crate::stepd::StepdStore,
     descriptor: &crate::stepd::StepdDescriptor,
-) {
-    let outcome = crate::step_completion::StepOutcome {
-        exit_code: 0,
-        signal: nix::sys::signal::Signal::SIGKILL as i32,
-    };
-    completions
-        .complete(
-            descriptor.job_id,
-            descriptor.run_attempt,
-            descriptor.step_id,
-            outcome,
-        )
-        .await;
+) -> std::io::Result<()> {
+    match durable_runtime_exit(store, descriptor)? {
+        Some((exit_code, signal)) => {
+            completions
+                .complete(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                    crate::step_completion::StepOutcome { exit_code, signal },
+                )
+                .await;
+        }
+        None => {
+            completions
+                .complete_if_unsettled(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                    crate::step_completion::StepOutcome {
+                        exit_code: 0,
+                        signal: nix::sys::signal::Signal::SIGKILL as i32,
+                    },
+                )
+                .await;
+        }
+    }
     if let Err(error) = crate::stepd::record_resources_released(descriptor) {
         warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt,
             step_id = descriptor.step_id, %error, "failed to release a fenced session");
     }
+    Ok(())
 }
 
 /// Fences every older run of the job, owner and steps alike; a newer run holding this
@@ -16861,6 +16876,157 @@ mod tests {
             .expect("a restart must not lose a step's exit");
 
         assert_eq!(response.into_inner().exit_code, 7);
+    }
+
+    async fn await_fenced_step(
+        memo: Option<crate::step_completion::StepOutcome>,
+        recorded: Option<crate::step_completion::StepOutcome>,
+    ) -> (i32, crate::step_completion::StepOutcome) {
+        let root = tempfile::tempdir().expect("fence roots");
+        let state_dir = root.path().join("state");
+        let cgroups = root.path().join("cgroups");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.clone());
+        svc.insert_test_job(
+            44,
+            TrackedJob {
+                run_attempt: 2,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+        let store = crate::stepd::StepdStore::new(&state_dir);
+        for attempt in [1, 2] {
+            let cgroup = cgroups.join(format!("job_44_{attempt}")).join("step_3");
+            std::fs::create_dir_all(&cgroup).expect("create step cgroup");
+            let descriptor = crate::stepd::StepdDescriptor::new(
+                44,
+                attempt,
+                3,
+                0,
+                0,
+                store.session_dir(44, attempt, 3).join("runtime.sock"),
+                cgroup,
+            );
+            store.publish(&descriptor).expect("publish descriptor");
+            if attempt == 2 {
+                svc.stepds
+                    .lock()
+                    .await
+                    .insert(stepd_key(&descriptor), descriptor);
+            }
+        }
+        if let Some(outcome) = recorded {
+            let obligations = store.obligations(44, 1, 3);
+            obligations
+                .append(&crate::stepd::StepdObligation::ExitObserved {
+                    exit_code: outcome.exit_code,
+                    signal: outcome.signal,
+                })
+                .expect("record step exit");
+            obligations
+                .append(&crate::stepd::StepdObligation::CompletionAcknowledged)
+                .expect("acknowledge step exit");
+        }
+        if let Some(outcome) = memo {
+            svc.step_completions.complete(44, 1, 3, outcome).await;
+        }
+        let mut waiter = svc.step_completions.register(44, 1, 3).await;
+
+        fence_older_runs(&svc.stepds, &svc.step_completions, &store, &cgroups, 44, 2)
+            .await
+            .expect("fence the old run");
+
+        assert!(!cgroups.join("job_44_1").exists());
+        assert!(cgroups.join("job_44_2/step_3").is_dir());
+        assert_eq!(svc.stepds.lock().await[&(44, 3)].run_attempt, 2);
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+                run_attempt: 1,
+            }))
+            .await
+            .expect("the old run's exit remains answerable")
+            .into_inner()
+            .exit_code;
+        (
+            response,
+            waiter.try_recv().expect("release the old run's waiter"),
+        )
+    }
+
+    #[tokio::test]
+    async fn await_step_preserves_a_memoized_exit_when_fencing_a_retained_session() {
+        for outcome in [
+            crate::step_completion::StepOutcome {
+                exit_code: 0,
+                signal: 0,
+            },
+            crate::step_completion::StepOutcome {
+                exit_code: 7,
+                signal: 0,
+            },
+        ] {
+            assert_eq!(
+                await_fenced_step(Some(outcome), None).await,
+                (outcome.exit_code, outcome)
+            );
+            assert_eq!(
+                await_fenced_step(Some(outcome), Some(outcome)).await,
+                (outcome.exit_code, outcome)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn await_step_preserves_a_durable_exit_when_fencing_after_restart() {
+        for outcome in [
+            crate::step_completion::StepOutcome {
+                exit_code: 0,
+                signal: 0,
+            },
+            crate::step_completion::StepOutcome {
+                exit_code: 7,
+                signal: 0,
+            },
+        ] {
+            assert_eq!(
+                await_fenced_step(None, Some(outcome)).await,
+                (outcome.exit_code, outcome)
+            );
+            assert_eq!(
+                await_fenced_step(
+                    Some(crate::step_completion::StepOutcome {
+                        exit_code: 0,
+                        signal: nix::sys::signal::Signal::SIGKILL as i32,
+                    }),
+                    Some(outcome)
+                )
+                .await,
+                (outcome.exit_code, outcome)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn await_step_reports_sigkill_for_a_fenced_session_without_an_exit() {
+        assert_eq!(
+            await_fenced_step(None, None).await,
+            (
+                137,
+                crate::step_completion::StepOutcome {
+                    exit_code: 0,
+                    signal: nix::sys::signal::Signal::SIGKILL as i32,
+                }
+            )
+        );
     }
 
     #[tokio::test]

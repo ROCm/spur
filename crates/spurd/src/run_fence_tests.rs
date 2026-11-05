@@ -108,6 +108,46 @@ fn unreadable_old_sessions_are_not_silently_skipped() {
     assert!(store.older_sessions(790, 4).unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn an_unreadable_exit_refuses_the_fence_without_inventing_an_outcome() {
+    let root = tempfile::tempdir().unwrap();
+    let store = crate::stepd::StepdStore::new(root.path().join("state"));
+    let cgroups = root.path().join("cgroups");
+    let cgroup = cgroups.join("job_79_1/step_0");
+    fs::create_dir_all(&cgroup).unwrap();
+    let descriptor = crate::stepd::StepdDescriptor::new(
+        79,
+        1,
+        0,
+        0,
+        0,
+        store.session_dir(79, 1, 0).join("runtime.sock"),
+        cgroup.clone(),
+    );
+    store.publish(&descriptor).unwrap();
+    fs::write(
+        store.session_dir(79, 1, 0).join("obligations.jsonl"),
+        "broken\n",
+    )
+    .unwrap();
+    let completions = crate::step_completion::StepCompletions::new();
+
+    let error = fence_older_runs(
+        &Arc::new(Mutex::new(StepdMap::new())),
+        &completions,
+        &store,
+        &cgroups,
+        79,
+        2,
+    )
+    .await
+    .expect_err("an unreadable exit cannot be replaced with a synthetic exit");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(completions.settled(79, 1, 0).await, None);
+    assert!(!cgroup.exists());
+}
+
 #[test]
 fn cgroup_discovery_does_not_follow_symlinks() {
     let root = tempfile::tempdir().unwrap();

@@ -48,7 +48,7 @@ def attempt_cleanup_image(ssh_nodes, remote_bin_dir):
 @pytest.mark.parametrize("mode", ["batch", "allocation"])
 @pytest.mark.parametrize("scenario", [
     "distinct-slots", "shared-slots", "orphaned", "nested-orphans",
-    "parent-busy", "leaf-busy",
+    "parent-busy", "leaf-busy", "completed-steps",
 ])
 def test_old_attempt_processes_and_cgroups_are_reaped(
     attempt_cleanup_image, tmp_path, scenario, mode,
