@@ -1219,6 +1219,7 @@ pub(crate) fn running_partition_usage(cluster: &ClusterManager) -> PartitionNode
     let jobs = cluster.get_jobs(&JobFilter {
         states: &[
             spur_core::job::JobState::Running,
+            spur_core::job::JobState::Suspended,
             spur_core::job::JobState::Completing,
             spur_core::job::JobState::Pending,
         ],
@@ -1233,24 +1234,31 @@ pub(crate) fn running_partition_usage(cluster: &ClusterManager) -> PartitionNode
 }
 
 /// Pure core of [`running_partition_usage`]. Idle-fill runs are charged like
-/// any other: they hold real cores the cap exists to keep free.
+/// any other: they hold real cores the cap exists to keep free. A suspended
+/// job keeps its allocation, so it keeps its charge; a node the job already
+/// finished on was released, so it stops charging.
 fn partition_usage_from_jobs(
     jobs: &[spur_core::job::Job],
     partitions: &[spur_core::partition::Partition],
     now: DateTime<Utc>,
     waits: ReleaseWaits,
 ) -> PartitionNodeUsage {
+    use spur_core::job::JobState;
     let mut usage = PartitionNodeUsage::new();
-    let holding = jobs
-        .iter()
-        .filter(|j| j.occupies_resources() || j.state == spur_core::job::JobState::Completing);
+    let holding = jobs.iter().filter(|j| {
+        j.occupies_resources() || matches!(j.state, JobState::Suspended | JobState::Completing)
+    });
     for job in holding {
         let Some(partition) = charged_partition(job, partitions).filter(|p| is_capped(p)) else {
             continue;
         };
         let until = job_expected_end(job, now, waits);
         let by_node = usage.entry(partition.name.clone()).or_default();
-        for (node, alloc) in &job.per_node_alloc {
+        let held = job
+            .per_node_alloc
+            .iter()
+            .filter(|(node, _)| job.is_held_on(node));
+        for (node, alloc) in held {
             by_node
                 .entry(node.clone())
                 .or_default()

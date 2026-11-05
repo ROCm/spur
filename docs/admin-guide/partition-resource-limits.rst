@@ -248,7 +248,11 @@ The order of names in ``--partition`` is not used.
 
 Nothing is fixed while the job waits. If another candidate partition frees up
 first, the job starts there. The partition is recorded only when the job starts,
-and the job's usage counts against that partition until it ends.
+and the job's usage counts against that partition until it ends. A suspended
+job keeps its allocation, so it keeps counting. A job preempted with a
+:ref:`grace time <qos-preempt-grace>` keeps counting until it exits or is killed
+at the end of its grace, so its preemptor starts only once that share is freed.
+A multi-node job stops counting on each node as soon as it finishes there.
 
 ``scontrol show job`` keeps the requested list in ``Partition=`` and adds
 ``EffectivePartition=`` with the chosen one once the job has started; Slurm
