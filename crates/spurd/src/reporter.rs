@@ -391,7 +391,9 @@ impl NodeReporter {
 
     /// Periodic heartbeat loop.
     pub async fn heartbeat_loop(&self) {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            spur_core::config::HEARTBEAT_INTERVAL_SECS,
+        ));
 
         loop {
             interval.tick().await;

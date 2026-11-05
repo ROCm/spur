@@ -349,6 +349,18 @@ Enable and start it:
    The one-line installer places binaries in ``~/.local/bin`` by default. If you install
    that way, adjust ``ExecStart`` to match — this unit assumes ``/usr/local/bin``.
 
+.. important::
+
+   After ``SIGTERM``, ``spurctld`` waits at most ``[controller] shutdown_grace_secs``
+   (default 10s) for in-flight RPCs to drain, then flushes accounting for up to 5 seconds
+   and exits. An ``srun`` step holds its RPC open for the step's whole runtime, so this is
+   what keeps ``systemctl restart spurctld`` short while steps are running. Keep the grace
+   well below ``heartbeat_timeout_secs``, since the draining controller answers no
+   heartbeats, and avoid ``0``, which removes the bound. Keep ``TimeoutStopSec`` above the
+   grace plus those 5 seconds: systemd's default of 90s, which the unit above leaves
+   unchanged, covers the default grace. A ``SIGKILL`` at that timeout skips the accounting
+   flush.
+
 High Availability
 ~~~~~~~~~~~~~~~~~
 

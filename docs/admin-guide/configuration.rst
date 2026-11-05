@@ -329,6 +329,29 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        where each phase gets its own full budget. Raising this value
        toward its max therefore also raises how long a node can sit
        idle-but-charged after a failover.
+   * - ``shutdown_grace_secs``
+     - integer
+     - ``10``
+     - Restart
+     - How long ``spurctld`` waits, after ``SIGTERM`` or ``SIGINT``, for
+       in-flight RPCs to drain before forcing shutdown. An ``srun`` step holds
+       its RPC open for the step's whole runtime, so this bounds how long a
+       restart takes while steps are running. Range 0-86400; ``0`` waits
+       indefinitely, and a repeated ``SIGTERM`` or ``SIGINT`` does not end that
+       wait, only ``SIGKILL`` does.
+
+       The default suits most sites. Keep it well below
+       ``heartbeat_timeout_secs``: the draining controller answers no
+       heartbeats but still checks node health, so a grace within 35 seconds of
+       that timeout (one heartbeat interval plus the flush) lets a full drain
+       mark nodes DOWN and fail their jobs, and so can ``0``, whose drain has no
+       bound. ``spurctld`` warns at startup in either case. Also keep the grace,
+       plus up to 5 seconds for the accounting flush that follows, below your
+       service manager's stop timeout (systemd ``TimeoutStopSec``, Kubernetes
+       ``terminationGracePeriodSeconds``): a ``SIGKILL`` from that timeout skips
+       the flush. Requests still running when the grace period ends are only cut
+       off at exit, so the flush is best-effort for accounting rows they write
+       late.
 
 ``[spurd]``
 -----------
