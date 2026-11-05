@@ -1732,19 +1732,7 @@ async fn start_preemption_grace(
 /// immediate preemption would have, using the mode and provenance recorded when
 /// the victim was warned.
 async fn finalize_expired_graces(cluster: &Arc<ClusterManager>, now: DateTime<Utc>) {
-    let due: Vec<spur_core::job::Job> = cluster
-        .get_jobs(&JobFilter {
-            states: &[spur_core::job::JobState::Running],
-            ..Default::default()
-        })
-        .into_iter()
-        .filter(|job| {
-            job.preempt_grace()
-                .is_some_and(|pending| now >= pending.deadline)
-        })
-        .collect();
-
-    for job in &due {
+    for job in &cluster.jobs_past_grace_deadline(now) {
         finalize_running_grace(cluster, job).await;
     }
 }

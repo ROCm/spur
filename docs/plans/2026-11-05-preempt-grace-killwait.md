@@ -173,7 +173,8 @@ deadline if every controller is down at that moment.
    the earlier of the estimate and the deadline plus the kill wait. The time-limit and inactivity
    watchdogs skip in-grace jobs. New `srun` steps are placed only on nodes the job still holds.
 3. **Deadline.** `finalize_expired_graces` runs each pass and preempts every `Running` job past its
-   deadline at the matching attempt through the normal path (`preempt_victim_now`), using the stored
+   deadline (`ClusterManager::jobs_past_grace_deadline` filters under the read lock and clones only the
+   due jobs, so a pass with no grace running clones nothing; there is no index or persisted counter) at the matching attempt through the normal path (`preempt_victim_now`), using the stored
    mode and provenance. The kill goes to `held_nodes()` only. The final entries free and wait only
    for nodes that have not reported, so no node is freed twice.
 4. **Partial and full exit.** `JobNodeComplete` on an in-grace run records the node and frees its
@@ -292,7 +293,8 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `a_suspend_preemption_the_apply_refuses_leaves_the_victim_running`.
 - Deadline, reclaim and timers (`scheduler_loop.rs`): `grace_does_nothing_before_the_deadline`,
   `grace_preempts_at_the_deadline_with_the_stored_mode`, `grace_requeues_at_the_deadline_when_that_was_the_stored_mode`,
-  `grace_finalizer_skips_a_stale_attempt`, `warning_a_victim_already_in_grace_is_superseded_not_an_error`,
+  `grace_finalizer_skips_a_stale_attempt`, `only_running_jobs_whose_grace_deadline_has_passed_are_due`,
+  `a_grace_recorded_for_an_earlier_run_is_not_due`, `warning_a_victim_already_in_grace_is_superseded_not_an_error`,
   `a_superseded_victim_does_not_end_the_victim_set`, `a_failed_preemption_abandons_the_set_unless_the_victim_is_gone`, `a_grace_that_applies_late_still_warns_the_victim`,
   `reclaim_skips_an_in_grace_job`, `preemptor_waits_for_its_in_grace_victim`,
   `time_limit_watchdog_leaves_a_capped_grace_to_the_finalizer_until_its_kill_wait_ends`,

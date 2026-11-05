@@ -1738,6 +1738,22 @@ impl ClusterManager {
         self.karma_stats.reset();
     }
 
+    /// The Running jobs whose preemption grace ends at or before `now`. Filters
+    /// under the read lock, so a tick with no grace running clones nothing.
+    pub fn jobs_past_grace_deadline(&self, now: DateTime<Utc>) -> Vec<Job> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|job| {
+                job.state == JobState::Running
+                    && job
+                        .preempt_grace()
+                        .is_some_and(|pending| now >= pending.deadline)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Get jobs matching filters.
     pub fn get_jobs(&self, filter: &JobFilter) -> Vec<Job> {
         // Built once per call so the per-job node check is O(allocated_nodes)
@@ -31431,6 +31447,40 @@ state = "UP"
         assert!(job.preempt_pending.is_none());
         assert_eq!(cpus_in_use(&cm, "n1"), 0);
         assert_eq!(cpus_in_use(&cm, "n2"), 0, "freed once, not twice");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_running_jobs_whose_grace_deadline_has_passed_are_due() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let in_grace = run_job_on(&cm, "in-grace", "n1");
+        let _plain = run_job_on(&cm, "plain", "n1");
+        let pending = preempt_pending_for(cm.get_job(in_grace).unwrap().run_attempt, 90);
+        let deadline = pending.deadline;
+        signal_grace(&cm, in_grace, PreemptMode::Cancel);
+
+        let before = deadline - chrono::Duration::seconds(1);
+        assert!(cm.jobs_past_grace_deadline(before).is_empty());
+        let due: Vec<JobId> = cm
+            .jobs_past_grace_deadline(deadline)
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+        assert_eq!(due, [in_grace]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grace_recorded_for_an_earlier_run_is_not_due() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+        let deadline = cm.get_job(id).unwrap().preempt_pending.unwrap().deadline;
+        cm.jobs.write().get_mut(&id).unwrap().run_attempt += 1;
+
+        assert!(cm.jobs_past_grace_deadline(deadline).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
