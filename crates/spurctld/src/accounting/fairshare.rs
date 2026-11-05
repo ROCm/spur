@@ -213,6 +213,7 @@ mod tests {
             fairshare_weight: weight,
             max_running_jobs: None,
             grp_tres: None,
+            allowed_qos: None,
         }
     }
 

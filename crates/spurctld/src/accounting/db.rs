@@ -171,6 +171,9 @@ ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS flags TEXT NOT NULL DEFAULT '';
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
+-- NULL means unset, so a user with no allow-list can inherit it. An explicit
+-- clear is also NULL: the account list is the fallback, not a second "off" state.
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
@@ -1597,6 +1600,7 @@ pub struct AccountUpdate<'a> {
     pub fairshare: Option<i32>,
     pub max_running_jobs: Option<Option<i32>>,
     pub grp_tres: Option<Option<&'a str>>,
+    pub allowed_qos: Option<Option<&'a str>>,
 }
 
 /// Create or update an account, writing only the fields set in `u`. `modify`
@@ -1626,6 +1630,9 @@ pub async fn upsert_account<'a>(
     }
     if let Some(v) = u.grp_tres {
         updates.push(("grp_tres", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.allowed_qos {
+        updates.push(("allowed_qos", SqlVal::NullText(v)));
     }
     upsert_row(conn, UpsertTable::Accounts, &keys, &updates).await
 }
@@ -1688,7 +1695,7 @@ pub async fn list_coordinators(pool: &PgPool) -> anyhow::Result<Vec<(String, Str
 /// List all accounts.
 pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres FROM accounts ORDER BY name"
+        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres, allowed_qos FROM accounts ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1701,6 +1708,7 @@ pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> 
             fairshare_weight: r.get("fairshare_weight"),
             max_running_jobs: r.get("max_running_jobs"),
             grp_tres: r.get("grp_tres"),
+            allowed_qos: r.get("allowed_qos"),
         })
         .collect())
 }
@@ -1715,6 +1723,8 @@ pub struct AccountRecord {
     pub max_running_jobs: Option<i32>,
     /// Account resource allocation as a TRES string; None = unlimited.
     pub grp_tres: Option<String>,
+    /// QOS allow-list for the account. None means unset.
+    pub allowed_qos: Option<String>,
 }
 
 /// Update the partition-less association's columns, inserting the row if none
@@ -1904,9 +1914,10 @@ pub async fn remove_user(
 }
 
 /// List users, joining each one's own association row for `default_qos`/
-/// `allowed_qos`. `DISTINCT ON ... a.id DESC` picks the newest row if legacy
-/// duplicates exist (pre-dating the add_user upsert fix); it never touches
-/// the others.
+/// `allowed_qos`. A user with no allow-list inherits the account's
+/// (`COALESCE`); an explicit user list wins. `DISTINCT ON ... a.id DESC` picks
+/// the newest row if legacy duplicates exist (pre-dating the add_user upsert
+/// fix); it never touches the others.
 pub async fn list_users(
     pool: &PgPool,
     account: Option<&str>,
@@ -1926,11 +1937,13 @@ pub async fn list_users_visible(
         r#"
         SELECT DISTINCT ON (u.name, u.account)
             u.name, u.account, u.admin_level, u.default_account,
-            a.default_qos, a.allowed_qos,
+            a.default_qos,
+            COALESCE(a.allowed_qos, acct.allowed_qos) AS allowed_qos,
             a.max_running_jobs, a.max_submit_jobs, a.grp_submit_jobs,
             a.max_wall_min, a.max_tres_per_job, a.grp_tres,
             a.partition_name, a.fairshare_weight
         FROM users u
+        LEFT JOIN accounts acct ON acct.name = u.account
         LEFT JOIN associations a
             ON a.user_name = u.name AND a.account = u.account
                 AND (a.partition_name IS NULL OR a.partition_name = '')
