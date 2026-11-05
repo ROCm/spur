@@ -1337,10 +1337,10 @@ the administrative reason. An empty node enters ``DRAINED`` immediately.
 
 .. note::
 
-   Partitions are **static config**, not runtime objects. Unlike Slurm's
-   ``scontrol create partition``, Spur has no runtime partition create, delete,
-   or modify. To change a partition, edit ``[[partitions]]`` in ``spur.conf`` and
-   reload the controller. See :doc:`/deployment/partitioning` and
+   Partitions can also be created, updated, and deleted at runtime with
+   ``scontrol create/update/delete PartitionName=``. These changes persist across
+   restarts, but the next ``scontrol reconfigure`` resets partitions to
+   ``[[partitions]]`` in ``spur.conf``. See :ref:`runtime-partitions` and
    :doc:`configuration`.
 
 Auditing administrative actions
