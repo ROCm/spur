@@ -21521,19 +21521,41 @@ mod tests {
         })
     }
 
-    /// Returns once child `pid` has exited, without reaping it. Awaits the exit
-    /// itself because the kernel, not the paused tokio clock, delivers SIGKILL;
-    /// an already-reaped child has exited too, hence any error ends the wait.
-    async fn wait_until_exited(pid: i32) {
+    /// Returns how child `pid` ended, without reaping it; ECHILD (reaped by the
+    /// code under test) fails the test. Waits on the kernel, not the paused clock.
+    async fn wait_until_exited(pid: i32) -> nix::sys::wait::WaitStatus {
+        wait_until_exited_or_reaped(pid)
+            .await
+            .expect("child was reaped before the test could read how it ended")
+    }
+
+    /// Like `wait_until_exited`, but `None` for a child the code under test already
+    /// reaped (ECHILD): its exit status is gone, though it has certainly exited.
+    async fn wait_until_exited_or_reaped(pid: i32) -> Option<nix::sys::wait::WaitStatus> {
         use nix::sys::wait::{waitid, Id, WaitPidFlag};
-        tokio::task::spawn_blocking(move || {
-            while let Err(nix::errno::Errno::EINTR) = waitid(
+        tokio::task::spawn_blocking(move || loop {
+            match waitid(
                 Id::Pid(nix::unistd::Pid::from_raw(pid)),
                 WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
-            ) {}
+            ) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::ECHILD) => return None,
+                Err(errno) => panic!("waitid({pid}) failed: {errno}"),
+                Ok(status) => return Some(status),
+            }
         })
         .await
-        .expect("wait for the process to exit");
+        .expect("wait for the process to exit")
+    }
+
+    fn assert_ended_by_signal(
+        status: nix::sys::wait::WaitStatus,
+        expected: nix::sys::signal::Signal,
+    ) {
+        assert!(
+            matches!(status, nix::sys::wait::WaitStatus::Signaled(_, signal, _) if signal == expected),
+            "expected the process to be killed by {expected}, but it ended as {status:?}"
+        );
     }
 
     /// Returns only once the trap is installed, so a SIGTERM sent right after
@@ -21592,12 +21614,16 @@ mod tests {
         let alive_before_kill_wait = process_is_running(pid);
         tokio::time::sleep_until(started + std::time::Duration::from_secs(31)).await;
         tokio::time::resume();
-        wait_until_exited(pid).await;
+        // Teardown waits on a managed child, which reaps it and its status.
+        let status = wait_until_exited_or_reaped(pid).await;
 
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-pid),
             nix::sys::signal::Signal::SIGKILL,
         );
+        if let Some(status) = status {
+            assert_ended_by_signal(status, nix::sys::signal::Signal::SIGKILL);
+        }
         assert!(
             alive_before_kill_wait,
             "SIGKILL must not land before the requested kill wait"
@@ -21624,12 +21650,13 @@ mod tests {
         let alive_at_old_escalation = process_is_running(pid as i32);
         tokio::time::sleep_until(started + std::time::Duration::from_secs(31)).await;
         tokio::time::resume();
-        wait_until_exited(pid as i32).await;
+        let status = wait_until_exited(pid as i32).await;
 
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-(pid as i32)),
             nix::sys::signal::Signal::SIGKILL,
         );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGKILL);
         assert!(
             alive_at_old_escalation,
             "an unsupervised step must not be SIGKILLed before the kill wait"
@@ -22127,12 +22154,13 @@ mod tests {
         ))
         .await
         .expect("signal job");
-        wait_until_exited(pid as i32).await;
+        let status = wait_until_exited(pid as i32).await;
 
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-(pid as i32)),
             nix::sys::signal::Signal::SIGKILL,
         );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGTERM);
         assert!(!svc.step_cancel_requested(919, 4).await);
     }
 
@@ -22215,12 +22243,13 @@ mod tests {
         ))
         .await
         .expect("signal job");
-        wait_until_exited(pid).await;
+        let status = wait_until_exited(pid).await;
 
         let _ = nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(-pid),
             nix::sys::signal::Signal::SIGKILL,
         );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGTERM);
         assert!(
             svc.running.lock().await.contains_key(&914),
             "a signal does not tear the job down"
