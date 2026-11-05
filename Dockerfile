@@ -89,7 +89,10 @@ RUN echo "=== Required GLIBC versions ===" && \
 
 FROM ubuntu:24.04 AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# --only-upgrade apt: the ubuntu:24.04 base ships an apt with a fixed HIGH CVE
+# that fails the Trivy image gate until the base image is rebuilt.
+RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade apt \
+    && apt-get install -y --no-install-recommends \
     ca-certificates \
     util-linux \
     openssl \
