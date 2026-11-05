@@ -103,6 +103,42 @@ impl MemoryAdjustment {
     }
 }
 
+/// A request a job could run with, and the candidate partitions whose memory
+/// policy reshapes it into exactly that request.
+#[derive(Debug, Clone)]
+pub struct CandidateRequest<'a> {
+    pub spec: JobSpec,
+    pub partitions: Vec<&'a str>,
+}
+
+/// The distinct requests the job would run with in `candidates`, in candidate
+/// order; partitions that reshape it the same way share one entry. With no
+/// candidates the job's own request is the only one.
+pub fn candidate_requests<'a>(
+    spec: &JobSpec,
+    candidates: impl IntoIterator<Item = &'a Partition>,
+) -> Vec<CandidateRequest<'a>> {
+    let mut requests: Vec<(MemoryAdjustment, Vec<&'a str>)> = Vec::new();
+    for partition in candidates {
+        let adjusted = partition.memory_adjusted(spec);
+        match requests.iter_mut().find(|(known, _)| *known == adjusted) {
+            Some((_, names)) => names.push(&partition.name),
+            None => requests.push((adjusted, vec![&partition.name])),
+        }
+    }
+    if requests.is_empty() {
+        requests.push((MemoryAdjustment::of(spec), Vec::new()));
+    }
+    requests
+        .into_iter()
+        .map(|(adjustment, partitions)| {
+            let mut spec = spec.clone();
+            adjustment.apply_to(&mut spec);
+            CandidateRequest { spec, partitions }
+        })
+        .collect()
+}
+
 /// Tasks on the node holding the fewest of them (at least one).
 fn min_tasks_per_node(spec: &JobSpec) -> u32 {
     spec.tasks_per_node
@@ -255,6 +291,40 @@ fn raise_cpus_for_memory(spec: &JobSpec, limit: u64, adjusted: &mut MemoryAdjust
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_requests_group_partitions_that_reshape_the_job_alike() {
+        let per_cpu = |name: &str, limit| Partition {
+            name: name.into(),
+            max_mem_per_cpu: Some(limit),
+            ..Default::default()
+        };
+        let plain = Partition {
+            name: "plain".into(),
+            ..Default::default()
+        };
+        let candidates = [
+            per_cpu("a", 2 * GIB),
+            plain,
+            per_cpu("b", GIB),
+            per_cpu("a2", 2 * GIB),
+        ];
+        let job = spec(2, None, Some(3 * GIB));
+        let requests = candidate_requests(&job, &candidates);
+        let shapes: Vec<(u32, Vec<&str>)> = requests
+            .iter()
+            .map(|r| (r.spec.cpus_per_task, r.partitions.clone()))
+            .collect();
+        assert_eq!(
+            shapes,
+            [(4, vec!["a", "a2"]), (2, vec!["plain"]), (6, vec!["b"])]
+        );
+
+        let alone = candidate_requests(&job, []);
+        assert_eq!(alone.len(), 1);
+        assert_eq!(alone[0].spec.cpus_per_task, 2);
+        assert!(alone[0].partitions.is_empty());
+    }
 
     const GIB: u64 = 1024;
 

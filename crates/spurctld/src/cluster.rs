@@ -29,7 +29,7 @@ use spur_core::job::{
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
 use spur_core::partition_limits::{
-    fold_max_cpus_per_node, MemoryAdjustment, PartitionResourceLimits,
+    candidate_requests, fold_max_cpus_per_node, PartitionResourceLimits,
 };
 use spur_core::qos::{
     check_qos_limits_with_grp_node_charge, check_qos_standalone_limits, check_qos_submit_limits,
@@ -1431,7 +1431,7 @@ impl ClusterManager {
             }
             None => 1,
         };
-        self.enforce_submit_limits(&spec, incoming_tasks)?;
+        self.enforce_submit_limits(&spec, &partitions, incoming_tasks)?;
 
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
         let specs =
@@ -5796,10 +5796,6 @@ impl ClusterManager {
                     None => GateOutcome::Keep,
                 }
             });
-            // Quota is charged for what the job will actually get under its
-            // partition's memory policy; placement re-derives it per partition
-            // from the original request, so that is restored below.
-            let original_requests = apply_quota_memory_requests(&mut candidates, &partitions);
             let (idle_fill_on, borrow_factor, borrow_fraction) = {
                 let cfg = self.config.read();
                 (
@@ -5823,97 +5819,89 @@ impl ClusterManager {
                         job.allocated_nodes.len() as u64;
                 }
             }
+            // Each candidate partition reshapes the request under its memory
+            // policy, so the gates judge each shape and the job keeps only the
+            // partitions whose shape they admit.
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
-                let admitted = match account_block_with(
-                    job,
-                    &self.association_cache,
-                    &jobs,
-                    &nodes,
-                    &reserved,
-                ) {
-                    Ok(admitted) => admitted,
-                    Err(reason) => {
-                        claims_blocked |= claimed_any;
-                        return GateOutcome::Block(reason);
-                    }
-                };
+                let qos = &qos_by_job[&job.job_id];
                 let consumed_wall = job
                     .spec
                     .qos
                     .as_deref()
                     .and_then(|name| consumed_minutes(&grp_wall_usage, name));
-                let qos_charge = match qos_block_with(
-                    job,
-                    &qos_by_job[&job.job_id],
-                    &jobs,
-                    &nodes,
-                    &reserved,
-                    consumed_wall,
-                ) {
-                    Ok(charge) => charge,
-                    Err(blocked) => {
-                        claims_blocked |= claimed_any;
-                        // The ceiling is consulted here, at the moment a new borrow
-                        // would be admitted, which is what keeps it one-directional:
-                        // lowering it denies the next loan without disturbing runs
-                        // that are already borrowing.
-                        let qos_name = job.spec.qos.as_deref().unwrap_or_default();
-                        let ceiling = borrow_ceiling(
-                            qos_by_job[&job.job_id]
-                                .limits
-                                .grp_tres
-                                .as_ref()
-                                .map(|grp| grp.get(TresType::Node))
-                                .unwrap_or(0),
-                            cluster_nodes,
-                            borrow_factor,
-                            borrow_fraction,
+                let outcomes: Vec<(Job, QuotaVerdict)> = quota_probes(job, &partitions)
+                    .into_iter()
+                    .map(|mut probe| {
+                        let verdict = quota_gate(
+                            &mut probe,
+                            qos,
+                            &self.association_cache,
+                            &jobs,
+                            &nodes,
+                            &reserved,
+                            consumed_wall,
                         );
-                        let within_ceiling = !borrow_would_exceed_ceiling(
-                            ceiling,
-                            borrowed_by_qos.get(qos_name).copied().unwrap_or(0),
-                            job.spec.num_nodes as u64,
-                        );
-                        if idle_fill_on
-                            && within_ceiling
-                            && blocked.grp_node_sole_blocker
-                            && admitted.admits_without_credit
-                            && idle_fill_collectible(job)
-                        {
-                            // The hint names nodes the account already occupies; a
-                            // borrowed job must land on spare capacity instead, and
-                            // `admits_without_credit` above is what makes dropping it
-                            // sound (D4).
-                            job.preferred_nodes.clear();
-                            // D8: charge the account in full and the QOS in every
-                            // dimension but Node, so later jobs in this pass see the
-                            // cpu/mem/gpu this candidate would consume. The Node
-                            // dimension is deliberately 0 — that is the one aggregate
-                            // a borrowed job is outside of (D1).
-                            reserved.reserve(job, 0, job.spec.num_nodes as u64);
-                            *borrowed_by_qos.entry(qos_name.to_string()).or_insert(0) +=
-                                job.spec.num_nodes as u64;
-                            idle_fill_candidates.push(job.clone());
-                        }
-                        // Blocked either way: the job is over quota and that stays its
-                        // reported reason whether or not it gets lent a node (§5.4).
-                        return GateOutcome::Block(blocked.reason);
+                        (probe, verdict)
+                    })
+                    .collect();
+                let refusal = outcomes
+                    .iter()
+                    .find_map(|(_, verdict)| verdict.block_reason());
+                let claim = QuotaClaim::of_admitted(&outcomes);
+                let Some(reason) = refusal.filter(|_| claim.is_none()) else {
+                    let claim = claim.unwrap_or_default();
+                    claim.narrow(job);
+                    if !unclaimed.contains(&job.job_id) {
+                        reserved.reserve(job, &claim.tres, claim.qos_charge, claim.account_charge);
+                        claimed_any = true;
                     }
+                    return GateOutcome::Keep;
                 };
-                if !unclaimed.contains(&job.job_id) {
-                    reserved.reserve(job, qos_charge, admitted.charge);
-                    claimed_any = true;
+                claims_blocked |= claimed_any;
+                // The ceiling is consulted here, at the moment a new borrow would
+                // be admitted, which is what keeps it one-directional: lowering it
+                // denies the next loan without disturbing runs already borrowing.
+                let qos_name = job.spec.qos.as_deref().unwrap_or_default();
+                let ceiling = borrow_ceiling(
+                    qos.limits
+                        .grp_tres
+                        .as_ref()
+                        .map(|grp| grp.get(TresType::Node))
+                        .unwrap_or(0),
+                    cluster_nodes,
+                    borrow_factor,
+                    borrow_fraction,
+                );
+                let within_ceiling = !borrow_would_exceed_ceiling(
+                    ceiling,
+                    borrowed_by_qos.get(qos_name).copied().unwrap_or(0),
+                    job.spec.num_nodes as u64,
+                );
+                let lendable = outcomes.iter().find(|(_, v)| v.only_grp_node_blocked());
+                if let Some((probe, _)) = lendable
+                    .filter(|_| idle_fill_on && within_ceiling && idle_fill_collectible(job))
+                {
+                    // The hint names nodes the account already occupies; a
+                    // borrowed job must land on spare capacity instead, and
+                    // `admits_without_credit` is what makes dropping it sound (D4).
+                    let mut lent = job.clone();
+                    lent.spec.partition = probe.spec.partition.clone();
+                    lent.preferred_nodes.clear();
+                    // D8: charge the account in full and the QOS in every
+                    // dimension but Node, so later jobs in this pass see the
+                    // cpu/mem/gpu this candidate would consume. The Node dimension
+                    // is deliberately 0 — that is the one aggregate a borrowed job
+                    // is outside of (D1).
+                    reserved.reserve(&lent, &job_tres(probe), 0, job.spec.num_nodes as u64);
+                    *borrowed_by_qos.entry(qos_name.to_string()).or_insert(0) +=
+                        job.spec.num_nodes as u64;
+                    idle_fill_candidates.push(lent);
                 }
-                GateOutcome::Keep
+                // Blocked either way: the job is over quota and that stays its
+                // reported reason whether or not it gets lent a node (§5.4).
+                GateOutcome::Block(reason)
             });
 
-            // Before the capacity gate: the largest request among candidates may
-            // fit no node even though another candidate partition's would.
-            let jobs_to_restore = candidates
-                .iter_mut()
-                .map(|candidate| &mut candidate.job)
-                .chain(idle_fill_candidates.iter_mut());
-            restore_original_requests(jobs_to_restore, &original_requests);
             retain_eligible(&mut candidates, &mut reason_updates, |job| {
                 match resource_impossible_reason(job, &nodes, &reservations) {
                     Some(reason) => GateOutcome::Block(reason),
@@ -7631,8 +7619,15 @@ impl ClusterManager {
     /// Submit-time limit gate (Slurm's `acct_policy_validate`). Submit-count
     /// limits and the association per-job wall deny unconditionally; stand-alone
     /// TRES/wall breaches deny only under the governing QOS's `DenyOnLimit`
-    /// (treated as on when the job has no QOS). `incoming` is the task count added.
-    fn enforce_submit_limits(&self, spec: &JobSpec, incoming: u32) -> Result<(), SubmitError> {
+    /// (treated as on when the job has no QOS), and only when the request every
+    /// candidate partition's memory policy gives the job breaches. `incoming` is
+    /// the task count added.
+    fn enforce_submit_limits(
+        &self,
+        spec: &JobSpec,
+        partitions: &[Partition],
+        incoming: u32,
+    ) -> Result<(), SubmitError> {
         let jobs = self.jobs.read();
         let user = spec.user.as_str();
         let account = spec.account.as_deref().filter(|a| !a.is_empty());
@@ -7688,6 +7683,7 @@ impl ClusterManager {
         // A job with no QOS is treated as DenyOnLimit-on so an unsatisfiable
         // association request is rejected rather than pending forever.
         let mut deny_on_limit = true;
+        let mut governing_qos = None;
         if self.qos_cache.is_loaded() {
             if let Some(qos_name) = qos_name {
                 if let Some(qos) = self.qos_cache.get(qos_name) {
@@ -7731,26 +7727,37 @@ impl ClusterManager {
                     ) {
                         return Err(deny(reason));
                     }
-                    if deny_on_limit {
-                        if let Some(reason) = check_qos_standalone_limits(spec, &qos) {
-                            return Err(deny(reason));
-                        }
-                    }
+                    governing_qos = Some(qos);
                 }
             }
         }
 
-        // Association stand-alone TRES breach, gated the same way as QOS.
-        if deny_on_limit && assoc_loaded {
-            if let Some(account) = account {
-                let limits = self.association_cache.limits(user, account);
-                if let Some(reason) = check_account_standalone_limits(spec, &limits) {
-                    return Err(deny(reason));
+        if !deny_on_limit {
+            return Ok(());
+        }
+        let account_limits = account
+            .filter(|_| assoc_loaded)
+            .map(|account| self.association_cache.limits(user, account));
+        let breach = |request: &JobSpec| {
+            governing_qos
+                .as_ref()
+                .and_then(|qos| check_qos_standalone_limits(request, qos))
+                .or_else(|| {
+                    account_limits
+                        .as_ref()
+                        .and_then(|limits| check_account_standalone_limits(request, limits))
+                })
+        };
+        let mut first_breach = None;
+        for request in candidate_requests(spec, submit_candidates(spec, partitions)) {
+            match breach(&request.spec) {
+                None => return Ok(()),
+                Some(reason) => {
+                    first_breach.get_or_insert(reason);
                 }
             }
         }
-
-        Ok(())
+        first_breach.map_or(Ok(()), |reason| Err(deny(reason)))
     }
 
     /// Persist a mutation via Raft consensus. The apply callback
@@ -10405,71 +10412,6 @@ fn node_tres_capacity(resources: &ResourceSet, key: &str) -> u64 {
     }
 }
 
-/// The request each candidate's quota gates should see: the most CPUs and
-/// the most memory its candidate partitions' memory policies produce, so
-/// quota is never under-charged. Returns the original requests it changed.
-fn apply_quota_memory_requests(
-    candidates: &mut [PendingJobCandidate],
-    partitions: &[Partition],
-) -> HashMap<JobId, MemoryAdjustment> {
-    let mut originals = HashMap::new();
-    for candidate in candidates {
-        let job = &mut candidate.job;
-        let Some(adjusted) = quota_memory_request(job, partitions) else {
-            continue;
-        };
-        originals.insert(job.job_id, MemoryAdjustment::of(&job.spec));
-        adjusted.apply_to(&mut job.spec);
-    }
-    originals
-}
-
-/// The most CPUs per task and, separately, the most total memory any candidate
-/// partition's memory policy gives the job, or `None` when no policy changes
-/// the request. The two maxima may come from different partitions, so memory
-/// is restated per node (rounded up) to stay independent of the CPU count.
-fn quota_memory_request(job: &Job, partitions: &[Partition]) -> Option<MemoryAdjustment> {
-    let original = MemoryAdjustment::of(&job.spec);
-    let adjusted: Vec<MemoryAdjustment> =
-        spur_sched::partition_cap::candidate_partitions(job, partitions)
-            .into_iter()
-            .filter(|p| p.has_memory_policy())
-            .map(|p| p.memory_adjusted(&job.spec))
-            .filter(|adjusted| *adjusted != original)
-            .collect();
-    if adjusted.is_empty() {
-        return None;
-    }
-    let requests = || adjusted.iter().chain([&original]);
-    let cpus_per_task = requests().map(|a| a.cpus_per_task).max()?;
-    let memory_mb = requests().map(|a| quota_memory_mb(&job.spec, a)).max()?;
-    let nodes = u64::from(job.spec.num_nodes.max(1));
-    Some(MemoryAdjustment {
-        cpus_per_task,
-        memory_per_node_mb: (memory_mb > 0).then(|| memory_mb.div_ceil(nodes)),
-        memory_per_cpu_mb: None,
-        memory_per_gpu_mb: None,
-    })
-}
-
-/// Total memory (MiB) quota charges for `spec` reshaped by `adjustment`.
-fn quota_memory_mb(spec: &JobSpec, adjustment: &MemoryAdjustment) -> u64 {
-    let mut probe = spec.clone();
-    adjustment.apply_to(&mut probe);
-    effective_memory_mb(&probe, probe.num_nodes)
-}
-
-fn restore_original_requests<'a>(
-    jobs: impl Iterator<Item = &'a mut Job>,
-    originals: &HashMap<JobId, MemoryAdjustment>,
-) {
-    for job in jobs {
-        if let Some(original) = originals.get(&job.job_id) {
-            original.apply_to(&mut job.spec);
-        }
-    }
-}
-
 /// Over-limit keys that keep `partition`'s cap from ever holding the job, as
 /// if every eligible node were idle. `None` when the partition is uncapped,
 /// enough of its nodes would admit the job, or too few nodes are known yet to
@@ -10883,6 +10825,145 @@ fn account_block_with(
     }
 }
 
+/// The job as each request it could run with reshapes it, in request order,
+/// each restricted to the requested partitions that admit it and produce that
+/// request. A job that requested none keeps its own partition list.
+fn quota_probes(job: &Job, partitions: &[Partition]) -> Vec<Job> {
+    let requested =
+        spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions);
+    let admitting: Vec<&Partition> = requested
+        .into_iter()
+        .filter(|p| p.admits(&job.spec))
+        .collect();
+    let narrows = !admitting.is_empty();
+    let candidates = if narrows {
+        admitting
+    } else {
+        spur_sched::partition_cap::candidate_partitions(job, partitions)
+    };
+    candidate_requests(&job.spec, candidates)
+        .into_iter()
+        .map(|request| {
+            let mut probe = job.clone();
+            probe.spec = request.spec;
+            if narrows {
+                probe.spec.partition = Some(request.partitions.join(","));
+            }
+            probe
+        })
+        .collect()
+}
+
+/// The association and QOS gates' verdict on one request a job could run with.
+enum QuotaVerdict {
+    Admitted {
+        account: AccountAdmitted,
+        qos_charge: u64,
+    },
+    AccountBlocked(spur_core::job::PendingReason),
+    QosBlocked {
+        account: AccountAdmitted,
+        blocked: QosBlocked,
+    },
+}
+
+impl QuotaVerdict {
+    fn block_reason(&self) -> Option<spur_core::job::PendingReason> {
+        match self {
+            Self::Admitted { .. } => None,
+            Self::AccountBlocked(reason) => Some(reason.clone()),
+            Self::QosBlocked { blocked, .. } => Some(blocked.reason.clone()),
+        }
+    }
+
+    /// Over its QOS group node cap and nothing else, with no packing credit
+    /// needed from the account, so it may borrow idle capacity.
+    fn only_grp_node_blocked(&self) -> bool {
+        matches!(
+            self,
+            Self::QosBlocked { account, blocked }
+                if blocked.grp_node_sole_blocker && account.admits_without_credit
+        )
+    }
+}
+
+/// Run the association gate, then the QOS gate, on `job` as it stands.
+fn quota_gate(
+    job: &mut Job,
+    qos: &Qos,
+    assoc_cache: &AssociationCache,
+    jobs: &HashMap<JobId, Job>,
+    nodes: &HashMap<String, Node>,
+    reserved: &PassReservations,
+    consumed_wall_minutes: Option<u64>,
+) -> QuotaVerdict {
+    let account = match account_block_with(job, assoc_cache, jobs, nodes, reserved) {
+        Ok(account) => account,
+        Err(reason) => return QuotaVerdict::AccountBlocked(reason),
+    };
+    match qos_block_with(job, qos, jobs, nodes, reserved, consumed_wall_minutes) {
+        Ok(qos_charge) => QuotaVerdict::Admitted {
+            account,
+            qos_charge,
+        },
+        Err(blocked) => QuotaVerdict::QosBlocked { account, blocked },
+    }
+}
+
+/// What a job claims this pass when the gates admit some of its requests: the
+/// most of each TRES and grp-node charge among them, so the claim covers the
+/// request of whichever of their partitions placement picks.
+#[derive(Default)]
+struct QuotaClaim {
+    tres: TresRecord,
+    qos_charge: u64,
+    account_charge: u64,
+    partitions: Vec<String>,
+    preferred_nodes: HashSet<String>,
+}
+
+impl QuotaClaim {
+    /// `None` when the gates refused every request.
+    fn of_admitted(outcomes: &[(Job, QuotaVerdict)]) -> Option<Self> {
+        let mut claim: Option<Self> = None;
+        for (probe, verdict) in outcomes {
+            let QuotaVerdict::Admitted {
+                account,
+                qos_charge,
+            } = verdict
+            else {
+                continue;
+            };
+            claim
+                .get_or_insert_with(Self::default)
+                .add(probe, *qos_charge, account.charge);
+        }
+        claim
+    }
+
+    fn add(&mut self, probe: &Job, qos_charge: u64, account_charge: u64) {
+        let tres = job_tres(probe);
+        for kind in tres.types() {
+            self.tres.set(kind, self.tres.get(kind).max(tres.get(kind)));
+        }
+        self.qos_charge = self.qos_charge.max(qos_charge);
+        self.account_charge = self.account_charge.max(account_charge);
+        self.partitions
+            .extend(requested_partition_names(probe.spec.partition.as_deref()).map(str::to_string));
+        self.preferred_nodes
+            .extend(probe.preferred_nodes.iter().cloned());
+    }
+
+    /// Restrict the job to the partitions whose request was admitted, and pass
+    /// on the nodes the gates credited it with.
+    fn narrow(&self, job: &mut Job) {
+        if job.spec.partition.is_some() && !self.partitions.is_empty() {
+            job.spec.partition = Some(self.partitions.join(","));
+        }
+        job.preferred_nodes.clone_from(&self.preferred_nodes);
+    }
+}
+
 /// For a partition OR-list, returns `None` when any requested partition is Up
 /// and permits the request. When every Up alternative rejects it, returns that
 /// block reason (`PartitionTimeLimit` for a wall-time cap, else
@@ -11028,6 +11109,23 @@ fn partition_resource_violation(
     }
     let overshoots = partition_cap_never_fits(job, partition, nodes, reservations)?;
     Some(cap_never_runs_desc(job, partition, &overshoots))
+}
+
+/// Partitions whose memory policy a submitted job may run under: the requested
+/// ones its static limits fit, or every requested one when none does (the job
+/// then pends on the partition limit, not on a quota it might never meet).
+fn submit_candidates<'a>(spec: &JobSpec, partitions: &'a [Partition]) -> Vec<&'a Partition> {
+    let requested = spur_core::partition::matched_partitions(spec.partition.as_deref(), partitions);
+    let fitting: Vec<&Partition> = requested
+        .iter()
+        .copied()
+        .filter(|p| p.limit_block(spec).is_none())
+        .collect();
+    if fitting.is_empty() {
+        requested
+    } else {
+        fitting
+    }
 }
 
 /// Running-TRES accumulation with the distinct-node rule applied once at the
@@ -11380,8 +11478,13 @@ impl PassReservations {
     /// claim the same shared node's same spare capacity as long as they
     /// approached it from different dimensions, reopening the double-credit
     /// gap this whole mechanism exists to close.
-    fn reserve(&mut self, job: &Job, qos_node_charge: u64, account_node_charge: u64) {
-        let tres = job_tres(job);
+    fn reserve(
+        &mut self,
+        job: &Job,
+        tres: &TresRecord,
+        qos_node_charge: u64,
+        account_node_charge: u64,
+    ) {
         let user = job.spec.user.clone();
         if let Some(qos) = job.spec.qos.as_ref().filter(|q| !q.is_empty()) {
             let mut qos_grp_tres = tres.clone();
@@ -11391,10 +11494,7 @@ impl PassReservations {
                 .or_default()
                 .add(&qos_grp_tres);
             let key = (user.clone(), qos.clone());
-            self.qos_user_tres
-                .entry(key.clone())
-                .or_default()
-                .add(&tres);
+            self.qos_user_tres.entry(key.clone()).or_default().add(tres);
             *self.qos_user_count.entry(key).or_insert(0) += 1;
             self.qos_claimed_nodes
                 .entry(qos.clone())

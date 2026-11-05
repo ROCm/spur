@@ -247,7 +247,7 @@ async fn enforce_part_limits_adds_no_checks_without_caps() {
 }
 
 #[test]
-fn quota_gates_see_the_largest_adjusted_request_among_candidates() {
+fn quota_probes_are_each_admitting_partitions_adjusted_request() {
     let partitions = vec![
         Partition {
             max_mem_per_cpu: Some(2 * GIB),
@@ -258,63 +258,73 @@ fn quota_gates_see_the_largest_adjusted_request_among_candidates() {
             ..partition("b", &[])
         },
         partition("plain", &[]),
+        Partition {
+            state: spur_core::partition::PartitionState::Down,
+            ..partition("down", &[])
+        },
     ];
-    let mut job = Job::new(
+    let job = Job::new(
         1,
         JobSpec {
             memory_per_cpu_mb: Some(3 * GIB),
-            ..spec_in("a,b,plain", 2)
+            ..spec_in("b,down,a,plain", 2)
         },
     );
-    let largest = quota_memory_request(&job, &partitions).unwrap();
+    let probes: Vec<(String, u32)> = quota_probes(&job, &partitions)
+        .into_iter()
+        .map(|p| (p.spec.partition.unwrap_or_default(), p.spec.cpus_per_task))
+        .collect();
     assert_eq!(
-        largest.cpus_per_task, 6,
-        "b's 1G/CPU limit triples the CPUs"
+        probes,
+        [("b".into(), 6), ("a".into(), 4), ("plain".into(), 2)],
+        "request order, one probe per request, the Down partition left out"
     );
-
-    job.spec.partition = Some("a".into());
-    assert_eq!(
-        quota_memory_request(&job, &partitions)
-            .unwrap()
-            .cpus_per_task,
-        4
-    );
-    job.spec.partition = Some("plain".into());
-    assert_eq!(quota_memory_request(&job, &partitions), None);
-
-    job.spec.partition = Some("a,b".into());
-    let original = MemoryAdjustment::of(&job.spec);
-    let mut candidates = vec![PendingJobCandidate {
-        job: job.clone(),
-        scheduling_eligible: true,
-        tag_reason: true,
-    }];
-    let originals = apply_quota_memory_requests(&mut candidates, &partitions);
-    assert_eq!(candidates[0].job.spec.cpus_per_task, 6);
-    restore_original_requests(candidates.iter_mut().map(|c| &mut c.job), &originals);
-    assert_eq!(MemoryAdjustment::of(&candidates[0].job.spec), original);
 }
 
 #[test]
-fn quota_gates_charge_the_most_cpus_and_the_most_memory_independently() {
-    let partitions = vec![
-        Partition {
-            def_mem_per_cpu: Some(GIB),
-            max_mem_per_cpu: Some(GIB / 4),
-            ..partition("cpus", &[])
+fn a_claim_covers_the_most_of_each_resource_among_admitted_requests() {
+    let probe = |partition: &str, cpus: u32, mem: u64| {
+        Job::new(
+            1,
+            JobSpec {
+                memory_per_node_mb: Some(mem),
+                ..spec_in(partition, cpus)
+            },
+        )
+    };
+    let admitted = |qos_charge| QuotaVerdict::Admitted {
+        account: AccountAdmitted {
+            charge: 1,
+            admits_without_credit: true,
         },
-        Partition {
-            def_mem_per_node: Some(8 * GIB),
-            ..partition("mem", &[])
-        },
+        qos_charge,
+    };
+    let outcomes = [
+        (probe("cpus", 4, GIB), admitted(1)),
+        (
+            probe("big", 8, 8 * GIB),
+            QuotaVerdict::AccountBlocked(PendingReason::AssocGrpCpuLimit),
+        ),
+        (probe("mem", 2, 4 * GIB), admitted(0)),
     ];
-    let mut job = Job::new(1, spec_in("cpus,mem", 1));
-    let charged = quota_memory_request(&job, &partitions).unwrap();
-    charged.apply_to(&mut job.spec);
-    let cpus = job.spec.num_tasks * job.spec.cpus_per_task;
-    let mem = spur_core::job::effective_memory_mb(&job.spec, job.spec.num_nodes);
-    assert_eq!(cpus, 4, "`cpus` raises 1 CPU to 4 for its 256M/CPU limit");
-    assert_eq!(mem, 8 * GIB, "`mem` defaults to 8G, more than cpus' 1G");
+    let claim = QuotaClaim::of_admitted(&outcomes).unwrap();
+    assert_eq!(
+        (
+            claim.tres.get(TresType::Cpu),
+            claim.tres.get(TresType::Memory),
+            claim.qos_charge,
+        ),
+        (4, 4 * GIB, 1)
+    );
+    let mut job = probe("cpus,big,mem", 1, GIB);
+    claim.narrow(&mut job);
+    assert_eq!(job.spec.partition.as_deref(), Some("cpus,mem"));
+
+    let refused = [(
+        probe("big", 8, 8 * GIB),
+        QuotaVerdict::AccountBlocked(PendingReason::AssocGrpCpuLimit),
+    )];
+    assert!(QuotaClaim::of_admitted(&refused).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1317,4 +1327,148 @@ async fn a_node_the_job_finished_on_no_longer_charges_the_cap() {
 
     let replacement = submit_and_wait(&cm, spec_in("cpu", 8));
     assert_eq!(run_pass(&cm), [replacement]);
+}
+
+/// `a` allows 2 GiB per CPU and `b` 1 GiB, so `-c2 --mem-per-cpu=3G` needs 4
+/// CPUs in `a` and 6 in `b`. `b` has the higher tier, so placement prefers it.
+async fn per_cpu_limited_pair(dir: &TempDir) -> Arc<ClusterManager> {
+    let cm = cluster_with(
+        dir,
+        EnforcePartLimits::No,
+        vec![
+            Partition {
+                max_mem_per_cpu: Some(2 * GIB),
+                ..partition("a", &[])
+            },
+            Partition {
+                max_mem_per_cpu: Some(GIB),
+                priority_tier: 5,
+                ..partition("b", &[])
+            },
+        ],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    cm
+}
+
+fn three_gib_per_cpu(partitions: &str) -> JobSpec {
+    JobSpec {
+        memory_per_cpu_mb: Some(3 * GIB),
+        ..spec_in(partitions, 2)
+    }
+}
+
+fn qos_with_max_cpus_per_job(cm: &ClusterManager, cpus: u64, deny_on_limit: bool) -> JobSpec {
+    let mut per_job = TresRecord::new();
+    per_job.set(TresType::Cpu, cpus);
+    cm.qos_cache().insert(Qos {
+        name: "small".into(),
+        deny_on_limit,
+        limits: spur_core::accounting::QosLimits {
+            max_tres_per_job: Some(per_job),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    JobSpec {
+        qos: Some("small".into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_association_limit_is_checked_per_candidate_partition() {
+    let dir = TempDir::new().unwrap();
+    let cm = per_cpu_limited_pair(&dir).await;
+    limit_account_cpus(&cm, 4);
+    let id = submit_and_wait(&cm, in_account(three_gib_per_cpu("a,b"), "research"));
+
+    assert_eq!(run_pass(&cm), [id], "a's 4 CPUs fit GrpTRES=cpu=4");
+    let job = cm.get_job(id).unwrap();
+    assert_eq!(job.effective_partition.as_deref(), Some("a"));
+    assert_eq!(job.spec.cpus_per_task, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_qos_limit_is_checked_per_candidate_partition() {
+    let dir = TempDir::new().unwrap();
+    let cm = per_cpu_limited_pair(&dir).await;
+    let qos = qos_with_max_cpus_per_job(&cm, 4, false);
+    let id = submit_and_wait(
+        &cm,
+        JobSpec {
+            qos: qos.qos,
+            ..three_gib_per_cpu("a,b")
+        },
+    );
+
+    assert_eq!(run_pass(&cm), [id]);
+    assert_eq!(
+        cm.get_job(id).unwrap().effective_partition.as_deref(),
+        Some("a")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_job_no_candidate_admits_reports_the_first_failing_gate() {
+    let dir = TempDir::new().unwrap();
+    let cm = per_cpu_limited_pair(&dir).await;
+    let id = submit_and_wait(&cm, in_account(three_gib_per_cpu("a,b"), "research"));
+    limit_account_cpus(&cm, 3);
+
+    assert!(run_pass(&cm).is_empty());
+    assert_eq!(reason(&cm, id).0, PendingReason::AssocGrpCpuLimit);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deny_on_limit_sees_each_candidate_partitions_adjusted_request() {
+    let dir = TempDir::new().unwrap();
+    let cm = per_cpu_limited_pair(&dir).await;
+    let qos = qos_with_max_cpus_per_job(&cm, 4, true);
+    let in_qos = |partitions| JobSpec {
+        qos: qos.qos.clone(),
+        ..three_gib_per_cpu(partitions)
+    };
+
+    let msg = submit_err(&cm, in_qos("b"));
+    assert!(msg.contains("(QOSMaxCpuPerJobLimit)"), "{msg}");
+    assert!(cm.submit_job(in_qos("a,b")).is_ok());
+    assert!(cm.submit_job(in_qos("a")).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deny_on_limit_sees_a_partitions_default_memory() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![
+            Partition {
+                def_mem_per_node: Some(8 * GIB),
+                ..partition("big", &[])
+            },
+            partition("plain", &[]),
+        ],
+    )
+    .await;
+    let mut per_job = TresRecord::new();
+    per_job.set(TresType::Memory, 4 * GIB);
+    cm.qos_cache().insert(Qos {
+        name: "small".into(),
+        deny_on_limit: true,
+        limits: spur_core::accounting::QosLimits {
+            max_tres_per_job: Some(per_job),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let in_qos = |partitions| JobSpec {
+        qos: Some("small".into()),
+        ..spec_in(partitions, 1)
+    };
+
+    let msg = submit_err(&cm, in_qos("big"));
+    assert!(msg.contains("(QOSMaxMemoryPerJob)"), "{msg}");
+    assert!(cm.submit_job(in_qos("big,plain")).is_ok());
 }
