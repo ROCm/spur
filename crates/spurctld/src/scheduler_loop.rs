@@ -4142,7 +4142,7 @@ async fn cancel_one_agent(
 /// Deliver `signals`, in order, to every node in `node_names` without any of the
 /// agent's termination escalation. Nodes run concurrently on their own tasks and
 /// this returns immediately; each RPC is bounded by `CANCEL_RPC_TIMEOUT`.
-pub async fn send_signal_to_nodes(
+pub(crate) async fn send_signal_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
