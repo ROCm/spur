@@ -118,6 +118,15 @@ deadline if every controller is down at that moment.
   refuse a job that has moved on before proposing anything. Apply reports `preempt_applied`; a caller
   that finds the entry was skipped returns an error instead of logging a preemption or earmarking
   nodes.
+- `JobComplete` carries `controller_initiated` (`#[serde(default, skip_serializing_if = "Not::not")]`,
+  so entries from older controllers read `false` and keep their behaviour). The in-grace override
+  that turns a no-cancel `JobComplete` on a Running victim into the preemption outcome covers the
+  completions it exists for: an srun/PTY client reporting its run's end and a force-finish after
+  partial node reports. The controller's own `Failed` completions in `requeue_after_launch_failure`
+  and `hold_job_at_max_requeue` (`WalOperation::job_failed_by_controller`) set the flag, so the
+  `Failed -> Pending` backoff or hold that follows still finds the `Failed` job it expects. The
+  nodes those completions free are still earmarked for the preemptor. An older follower ignores the
+  flag, so do not trigger these paths on an in-grace victim until every controller is upgraded.
 - Every transition that ends or replaces a run clears `preempt_pending`: the final preemption
   entries, user and admin cancel, admin requeue, eviction and node failure, time-limit expiry and
   force-complete.
@@ -253,6 +262,8 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `qos_limits_with_numeric_grace_time_still_deserializes`, `preempt_run_attempt_wire_format_is_frozen`
   (`JobPreemptRequeue` and `JobPreemptCancel` with `run_attempt`), and the legacy-entry checks for
   the same two entries without it (the `*_from_a_pre_upgrade_entry_applies_to_any_run` tests below).
+- WAL (`spur-core/src/wal.rs`): `a_job_complete_written_before_controller_initiated_existed_replays_as_the_runs_own_end`,
+  `a_controller_initiated_job_complete_has_a_frozen_wire_form`.
 - Job helpers (`spur-core/src/job.rs`): `only_a_completing_run_signalled_for_a_limit_is_stopping_for_the_time_limit`,
   `preempt_grace_ignores_a_warning_recorded_for_an_earlier_run`,
   `held_nodes_leaves_out_the_nodes_that_reported`.
@@ -291,6 +302,9 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `suspend_mode_preemption_refused_at_apply_is_not_a_preemption`,
   `resuming_a_job_that_carries_a_grace_drops_the_grace`,
   `losing_a_node_still_running_ends_a_partially_exited_grace_victim`,
+  `a_launch_failure_requeue_during_a_cancel_grace_repends_the_job_with_backoff`,
+  `a_held_launch_failure_during_a_cancel_grace_holds_the_job`,
+  `holding_at_the_requeue_cap_during_a_cancel_grace_holds_the_job`,
   `losing_a_node_in_a_cancel_grace_earmarks_the_freed_nodes_for_the_preemptor`,
   `losing_a_node_in_a_requeue_grace_repends_the_victim_as_preempted`,
   `partition_grace_time_round_trips_through_update_and_clear`, and the `run_attempt` gate on the final

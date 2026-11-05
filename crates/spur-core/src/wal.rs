@@ -97,6 +97,11 @@ pub enum WalOperation {
         unreported_nodes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancel: Option<crate::end_reason::CancelProvenance>,
+        /// The controller ended the run itself (a launch failure, the requeue
+        /// cap), not the workload or its client. A preemption grace must not
+        /// turn such a completion into the preemption outcome.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        controller_initiated: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -489,6 +494,21 @@ impl WalOperation {
             state,
             unreported_nodes: Vec::new(),
             cancel: None,
+            controller_initiated: false,
+            at: None,
+        }
+    }
+
+    /// A run the controller ends as `Failed` on its own account, before it
+    /// requeues or holds the job.
+    pub fn job_failed_by_controller(job_id: JobId) -> Self {
+        Self::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Failed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: true,
             at: None,
         }
     }
@@ -500,6 +520,7 @@ impl WalOperation {
             state: JobState::Cancelled,
             unreported_nodes: Vec::new(),
             cancel: Some(cancel),
+            controller_initiated: false,
             at: None,
         }
     }
@@ -1312,6 +1333,7 @@ mod tests {
             state: JobState::Completed,
             unreported_nodes: Vec::new(),
             cancel: None,
+            controller_initiated: false,
             at: None,
         };
         op.stamp_occurred_at(at);
@@ -2052,6 +2074,40 @@ mod suspend_wal_tests {
             WalOperation::JobComplete { job_id: 5, ref unreported_nodes, .. }
                 if unreported_nodes.is_empty()
         ));
+    }
+
+    #[test]
+    fn a_job_complete_written_before_controller_initiated_existed_replays_as_the_runs_own_end() {
+        let old = r#"{"JobComplete":{"job_id":5,"exit_code":1,"state":"FAILED"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobComplete {
+                job_id: 5,
+                controller_initiated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_controller_initiated_job_complete_has_a_frozen_wire_form() {
+        let frozen = r#"{"JobComplete":{"job_id":5,"exit_code":-1,"state":"FAILED","controller_initiated":true}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobComplete {
+                job_id: 5,
+                exit_code: -1,
+                state: JobState::Failed,
+                controller_initiated: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_string(&WalOperation::job_failed_by_controller(5)).unwrap(),
+            frozen
+        );
     }
 
     #[test]

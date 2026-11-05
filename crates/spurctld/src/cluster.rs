@@ -3075,6 +3075,7 @@ impl ClusterManager {
             state,
             unreported_nodes: facts.unreported_nodes,
             cancel: facts.cancel,
+            controller_initiated: false,
             at: None,
         })?;
         self.run_all_finalized_side_effects(&resp);
@@ -3812,7 +3813,7 @@ impl ClusterManager {
 
         // transition to Failed via JobComplete so node resources,
         // licenses, and steps are properly cleaned up.
-        self.propose(WalOperation::job_complete(job_id, -1, JobState::Failed))?;
+        self.propose(WalOperation::job_failed_by_controller(job_id))?;
 
         if hold {
             self.propose(WalOperation::job_state_change_held_pending_desc(
@@ -4501,7 +4502,7 @@ impl ClusterManager {
         };
 
         if state == JobState::Running {
-            self.propose(WalOperation::job_complete(job_id, -1, JobState::Failed))?;
+            self.propose(WalOperation::job_failed_by_controller(job_id))?;
             state = JobState::Failed;
         }
 
@@ -8776,6 +8777,7 @@ impl ClusterManager {
                 state,
                 unreported_nodes,
                 cancel,
+                controller_initiated,
                 ..
             } => {
                 let freed_nodes;
@@ -8801,13 +8803,17 @@ impl ClusterManager {
                     // already reported) ends as the preemption it was warned of. A
                     // completion carrying a cancel was ended on purpose instead,
                     // and the cancel wins.
-                    let in_grace = job
+                    let warned = job
                         .preempt_grace()
                         .filter(|_| job.state == JobState::Running && cancel.is_none())
                         .cloned();
+                    // The controller failing the run (launch failure, requeue cap)
+                    // is not the checkpoint-and-exit the warning asked for, and the
+                    // requeue or hold that follows expects the Failed it records.
+                    let in_grace = warned.clone().filter(|_| !*controller_initiated);
                     // An OOM kill is not the checkpoint-and-exit the warning asked
                     // for, so it ends the run as the failure it was.
-                    let grace = in_grace.clone().filter(|_| *state != JobState::OutOfMemory);
+                    let grace = in_grace.filter(|_| *state != JobState::OutOfMemory);
                     if grace.is_some() {
                         Self::adopt_grace_provenance(job, timestamp);
                     }
@@ -8815,7 +8821,7 @@ impl ClusterManager {
                         Some(p) if p.mode == PreemptMode::Cancel => &JobState::Cancelled,
                         _ => state,
                     };
-                    freed_for_preemptor = in_grace.map(|p| p.preempted_by).or_else(|| {
+                    freed_for_preemptor = warned.map(|p| p.preempted_by).or_else(|| {
                         (job.preempt_mode.as_deref() == Some("Cancel"))
                             .then_some(job.preempted_by)
                             .flatten()
@@ -30174,6 +30180,7 @@ state = "UP"
             state: JobState::Cancelled,
             unreported_nodes: Vec::new(),
             cancel: None,
+            controller_initiated: false,
             at: None,
         });
         assert_eq!(cm.allocate_step_id(1), 0);
@@ -31529,6 +31536,7 @@ state = "UP"
             state: JobState::Failed,
             unreported_nodes: Vec::new(),
             cancel: None,
+            controller_initiated: false,
             at: None,
         });
 
@@ -31553,6 +31561,7 @@ state = "UP"
             state: JobState::Failed,
             unreported_nodes: vec!["n2".into()],
             cancel: None,
+            controller_initiated: false,
             at: None,
         });
 
@@ -31568,6 +31577,65 @@ state = "UP"
             Some(99),
             "the node that never reported is earmarked for the preemptor"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launch_failure_requeue_during_a_cancel_grace_repends_the_job_with_backoff() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+
+        cm.requeue_after_launch_failure(id, false).unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(job.requeue_count, 1);
+        assert_eq!(
+            job.preempted_by, None,
+            "the run failed, it was not preempted"
+        );
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(
+            cm.preempt_freed_nodes_raw()
+                .get("n1")
+                .map(|(owner, _)| *owner),
+            Some(99),
+            "the preemptor still gets the node the failed run released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_launch_failure_during_a_cancel_grace_holds_the_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+
+        cm.requeue_after_launch_failure(id, true).unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::Held);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holding_at_the_requeue_cap_during_a_cancel_grace_holds_the_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+
+        cm.hold_job_at_max_requeue(id, None).unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -31914,6 +31982,7 @@ state = "UP"
             state: JobState::Completed,
             unreported_nodes: Vec::new(),
             cancel: None,
+            controller_initiated: false,
             at: None,
         });
         assert_eq!(cpus_in_use(&cm, "n1"), 0);
@@ -32040,6 +32109,7 @@ state = "UP"
             state: JobState::Failed,
             unreported_nodes: vec!["n2".into()],
             cancel: None,
+            controller_initiated: false,
             at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
         });
 
@@ -32175,6 +32245,7 @@ state = "UP"
             state: JobState::Cancelled,
             unreported_nodes: Vec::new(),
             cancel: Some(CancelProvenance::system()),
+            controller_initiated: false,
             at: Some(grace_exit_at()),
         });
 
@@ -32253,6 +32324,7 @@ state = "UP"
                 state: JobState::OutOfMemory,
                 unreported_nodes: Vec::new(),
                 cancel: None,
+                controller_initiated: false,
                 at: Some(grace_exit_at()),
             });
             cm.run_all_finalized_side_effects(&resp);
@@ -32380,6 +32452,7 @@ state = "UP"
             state: JobState::Cancelled,
             unreported_nodes: vec!["n2".into()],
             cancel: None,
+            controller_initiated: false,
             at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
         });
         cm.run_all_finalized_side_effects(&resp);
