@@ -46,7 +46,7 @@ Only ``feat``, ``fix``, and ``perf`` appear in the release notes. Non-user-facin
 License Headers
 ---------------
 
-All new source files (``.rs``, ``.proto``, ``.py``, ``.sh``, and ``Dockerfile``) must include this header at the top:
+All new source files (``.rs``, ``.proto``, ``.c``, ``.h``, ``.py``, ``.sh``, and ``Dockerfile``) must include this header at the top:
 
 .. code-block:: text
 
@@ -75,7 +75,7 @@ PR Process
 ----------
 
 1. Create a feature branch from ``main`` on your fork
-2. Make your changes in logical commits following the commit style above
+2. Make your changes in logical, self-contained commits
 3. Ensure all pre-commit hook checks pass
 4. Push to your fork and open a PR against ``ROCm/spur:main``
 
@@ -90,5 +90,5 @@ Maintainers look for clear code structure, adequate test coverage, and long-term
 
 - New functionality has corresponding tests
 - Features are complete end-to-end within a single PR. Avoid partial implementations that leave unused code or require follow-up PRs to become functional
-- Commits are logically separated and follow the commit style
+- Commits are logically separated and each one is meaningful on its own
 - The PR description explains what changed and why
