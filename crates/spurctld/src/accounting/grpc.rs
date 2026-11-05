@@ -161,6 +161,7 @@ struct AccountingInner {
     assoc: parking_lot::RwLock<Option<std::sync::Arc<crate::association_cache::AssociationCache>>>,
     auth: parking_lot::RwLock<spur_core::config::AuthConfig>,
     fairshare_halflife_days: std::sync::atomic::AtomicU32,
+    billing_weights: std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>>,
 }
 
 impl Clone for AccountingService {
@@ -180,6 +181,9 @@ impl AccountingService {
                 assoc: parking_lot::RwLock::new(None),
                 auth: parking_lot::RwLock::new(spur_core::config::AuthConfig::default()),
                 fairshare_halflife_days: std::sync::atomic::AtomicU32::new(0),
+                billing_weights: std::sync::Arc::new(parking_lot::RwLock::new(
+                    spur_core::config::BillingWeights::default(),
+                )),
             }),
         }
     }
@@ -188,6 +192,20 @@ impl AccountingService {
         self.inner
             .fairshare_halflife_days
             .store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn attach_billing_weights(&self, weights: spur_core::config::BillingWeights) {
+        *self.inner.billing_weights.write() = weights;
+    }
+
+    fn billing_weights(&self) -> spur_core::config::BillingWeights {
+        *self.inner.billing_weights.read()
+    }
+
+    pub(crate) fn billing_weights_shared(
+        &self,
+    ) -> std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>> {
+        std::sync::Arc::clone(&self.inner.billing_weights)
     }
 
     fn configured_halflife_days(&self) -> u32 {
@@ -576,7 +594,13 @@ impl SlurmAccounting for AccountingService {
             })
             .collect();
 
-        Ok(Response::new(GetUsageResponse { entries }))
+        let w = self.billing_weights();
+        Ok(Response::new(GetUsageResponse {
+            entries,
+            billing_weight_cpu: w.cpu,
+            billing_weight_gpu: w.gpu,
+            has_billing_weights: true,
+        }))
     }
 
     // ============================================================
@@ -832,6 +856,100 @@ impl SlurmAccounting for AccountingService {
         Ok(Response::new(()))
     }
 
+    async fn modify_usage(
+        &self,
+        request: Request<ModifyUsageRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.require_admin(&request, "modify usage")?;
+        let audit = crate::audit::InBand::capture(&request, "ModifyUsage");
+        let pool = self.pool()?;
+        let pool = &pool;
+        let req = request.into_inner();
+        if req.user.is_empty() && req.account.is_empty() {
+            return Err(Status::invalid_argument("user or account required"));
+        }
+        if !req.user.is_empty() && req.account.is_empty() {
+            return Err(Status::invalid_argument(
+                "account= required for user-level usage modification",
+            ));
+        }
+        if req.user.is_empty() && req.raw_usage != 0 {
+            return Err(Status::invalid_argument(
+                "account-level usage adjustment only supports reset to zero",
+            ));
+        }
+        if !req.user.is_empty() {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM associations WHERE user_name = $1 AND account = $2)",
+            )
+            .bind(&req.user)
+            .bind(&req.account)
+            .fetch_one(pool)
+            .await
+            .map_err(internal)?;
+            if !exists {
+                return Err(Status::not_found(format!(
+                    "no association for user '{}' in account '{}'",
+                    req.user, req.account
+                )));
+            }
+        }
+        let halflife_days = self.configured_halflife_days();
+        let weights = self.billing_weights();
+        let mut tx = pool.begin().await.map_err(internal)?;
+
+        let (prev, entity_name) = if req.user.is_empty() {
+            let descendants = db::get_account_descendants(pool, &req.account)
+                .await
+                .map_err(internal)?;
+            let mut total_prev = 0i64;
+            for acct in &descendants {
+                let p = db::modify_usage(&mut tx, "", acct, 0, halflife_days, &weights)
+                    .await
+                    .map_err(internal)?;
+                total_prev += p;
+            }
+            (total_prev, req.account.clone())
+        } else {
+            let p = db::modify_usage(
+                &mut tx,
+                &req.user,
+                &req.account,
+                req.raw_usage,
+                halflife_days,
+                &weights,
+            )
+            .await
+            .map_err(internal)?;
+            let name = format!("{}@{}", req.user, req.account);
+            (p, name)
+        };
+
+        let new_total = if req.raw_usage == 0 {
+            0
+        } else if req.raw_usage < 0 {
+            (prev + req.raw_usage).max(0)
+        } else {
+            req.raw_usage
+        };
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(
+                &entity_name,
+                serde_json::json!({
+                    "previous_usage": prev,
+                    "requested_value": req.raw_usage,
+                    "resulting_usage": new_total,
+                }),
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        Ok(Response::new(()))
+    }
+
     async fn list_users(
         &self,
         request: Request<ListUsersRequest>,
@@ -1064,7 +1182,8 @@ impl SlurmAccounting for AccountingService {
             req.halflife_days
         };
 
-        let raw_factors = super::fairshare_factors(&pool, halflife)
+        let weights = self.billing_weights();
+        let raw_factors = super::fairshare_factors(&pool, halflife, &weights)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

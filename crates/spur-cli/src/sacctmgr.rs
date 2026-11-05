@@ -247,6 +247,7 @@ const USER_KEYS: &[&str] = &[
     "grptres",
     "maxwall",
     "maxwallduration",
+    "rawusage",
 ];
 
 /// Input keys the `add`/`modify account` handlers read (names + aliases). Gates
@@ -262,6 +263,7 @@ const ACCOUNT_KEYS: &[&str] = &[
     "maxrunningjobs",
     "maxjobs",
     "grptres",
+    "rawusage",
 ];
 
 /// Selectors `delete account` / `delete qos` accept: the entity name only.
@@ -497,6 +499,9 @@ fn list_user_filters(p: &std::collections::HashMap<String, String>) -> (String, 
 
 async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
     let p = parse_params(params);
+    if p.contains_key("rawusage") {
+        bail!("rawusage cannot be set during add; use 'sacctmgr modify' instead");
+    }
 
     match entity.to_lowercase().as_str() {
         "account" => {
@@ -917,6 +922,11 @@ fn build_modify_user_request(
 async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
     let p = parse_params(params);
 
+    // rawusage= is a separate RPC, not part of the normal upsert.
+    if let Some(raw) = p.get("rawusage") {
+        return modify_raw_usage(entity, &p, raw, addr).await;
+    }
+
     match entity.to_lowercase().as_str() {
         "account" => {
             let req = build_modify_account_request(&p)?;
@@ -953,6 +963,65 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
         }
         other => bail!("sacctmgr: unknown entity type '{}'", other),
     }
+}
+
+async fn modify_raw_usage(
+    entity: &str,
+    p: &std::collections::HashMap<String, String>,
+    raw_str: &str,
+    addr: &str,
+) -> Result<()> {
+    let raw_usage: i64 = raw_str
+        .parse()
+        .with_context(|| format!("rawusage must be an integer, got '{raw_str}'"))?;
+
+    let (user, acct_name) = match entity.to_lowercase().as_str() {
+        "user" => {
+            let name = p
+                .get("name")
+                .or_else(|| p.get("user"))
+                .ok_or_else(|| anyhow::anyhow!("name= required"))?
+                .clone();
+            let acct = p
+                .get("account")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("account= required for user-level rawusage modification")
+                })?
+                .clone();
+            (name, acct)
+        }
+        "account" => {
+            let acct = p
+                .get("name")
+                .or_else(|| p.get("account"))
+                .ok_or_else(|| anyhow::anyhow!("name= required"))?
+                .clone();
+            (String::new(), acct)
+        }
+        other => bail!("rawusage is not supported for entity type '{other}'"),
+    };
+
+    let mut client = connect(addr).await?;
+    let mut request = tonic::Request::new(spur_proto::proto::ModifyUsageRequest {
+        user: user.clone(),
+        account: acct_name.clone(),
+        raw_usage,
+    });
+    request.set_timeout(SACCTMGR_RPC_TIMEOUT);
+    client
+        .modify_usage(request)
+        .await
+        .context("ModifyUsage RPC failed")?;
+
+    let target = if user.is_empty() {
+        format!("account '{acct_name}'")
+    } else if acct_name.is_empty() {
+        format!("user '{user}'")
+    } else {
+        format!("user '{user}' in account '{acct_name}'")
+    };
+    println!(" Modified {target}: RawUsage set to {raw_usage}.");
+    Ok(())
 }
 
 /// Entities `show` prints as hardcoded fixed-width tables, with no field-spec table behind

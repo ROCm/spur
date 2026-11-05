@@ -613,6 +613,8 @@ pub struct ClusterManager {
     raft: RwLock<Option<SpurRaft>>,
     propose_timeout: std::time::Duration,
     accounting: RwLock<Option<AccountingNotifier>>,
+    billing_weights:
+        RwLock<Option<std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>>>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
     grp_wall_cache: Arc<GrpWallCache>,
@@ -945,6 +947,7 @@ impl ClusterManager {
             raft: RwLock::new(None),
             propose_timeout: PROPOSE_TIMEOUT,
             accounting: RwLock::new(None),
+            billing_weights: RwLock::new(None),
             fairshare_cache,
             qos_cache,
             grp_wall_cache,
@@ -6127,7 +6130,11 @@ impl ClusterManager {
         // Swap the live config last, after partition WAL ops have been accepted,
         // so a mid-reconfigure failure leaves the previous config in place.
         // Readers pick up the new sections on their next `config()` snapshot.
+        let new_weights = new_config.scheduler.billing_weights();
         *self.config.write() = Arc::new(new_config);
+        if let Some(ref handle) = *self.billing_weights.read() {
+            *handle.write() = new_weights;
+        }
         // Agent channels are built per call, so new tunables apply to the next RPC. Unlike the
         // jwt key, these carry no security posture, so adopting them live is safe.
         crate::agent_client::set_channel_tuning(&self.config.read().controller);
@@ -6822,6 +6829,13 @@ impl ClusterManager {
 
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
         *self.accounting.write() = Some(notifier);
+    }
+
+    pub fn set_billing_weights_handle(
+        &self,
+        handle: std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>>,
+    ) {
+        *self.billing_weights.write() = Some(handle);
     }
 
     pub fn set_sched_stats(&self, stats: Arc<SchedStatsCollector>) {

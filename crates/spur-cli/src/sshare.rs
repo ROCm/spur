@@ -134,23 +134,37 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     };
 
     // Build lookup maps from entries (server guarantees one entry per user+account)
+    let (w_cpu, w_gpu) = if usage.has_billing_weights {
+        (usage.billing_weight_cpu, usage.billing_weight_gpu)
+    } else {
+        (1.0, 1.0)
+    };
+
     let mut account_cpu_secs: HashMap<&str, f64> = HashMap::new();
     let mut account_gpu_secs: HashMap<&str, f64> = HashMap::new();
+    let mut account_billing: HashMap<&str, f64> = HashMap::new();
     let mut user_account_cpu_secs: HashMap<(&str, &str), f64> = HashMap::new();
     let mut user_account_gpu_secs: HashMap<(&str, &str), f64> = HashMap::new();
+    let mut user_account_billing: HashMap<(&str, &str), f64> = HashMap::new();
     for entry in &usage.entries {
         *account_cpu_secs.entry(&entry.account).or_default() += entry.cpu_seconds;
         *account_gpu_secs.entry(&entry.account).or_default() += entry.gpu_seconds;
+        let bill = w_cpu * entry.cpu_seconds + w_gpu * entry.gpu_seconds;
+        *account_billing.entry(&entry.account).or_default() += bill;
         user_account_cpu_secs.insert((&entry.user, &entry.account), entry.cpu_seconds);
         user_account_gpu_secs.insert((&entry.user, &entry.account), entry.gpu_seconds);
+        user_account_billing.insert(
+            (&entry.user, &entry.account),
+            w_cpu * entry.cpu_seconds + w_gpu * entry.gpu_seconds,
+        );
     }
 
-    // Compute total usage for normalization
-    let total_cpu_usage: f64 = account_cpu_secs.values().sum();
-    let total_cpu_usage = if total_cpu_usage <= 0.0 {
+    // Compute total usage for normalization (weighted billing)
+    let cluster_usage: f64 = account_billing.values().sum();
+    let cluster_usage = if cluster_usage <= 0.0 {
         1.0
     } else {
-        total_cpu_usage
+        cluster_usage
     };
 
     if args.long {
@@ -187,11 +201,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
         let raw_shares = account.fairshare_weight;
         let norm_shares = raw_shares / total_shares;
-        let raw_usage = account_cpu_secs
+        let raw_usage = account_billing
             .get(account.name.as_str())
             .copied()
             .unwrap_or(0.0);
-        let norm_usage = raw_usage / total_cpu_usage;
+        let norm_usage = raw_usage / cluster_usage;
         let fair_share = account_fairshare
             .get(account.name.as_str())
             .copied()
@@ -243,11 +257,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 }
             }
 
-            let user_usage = user_account_cpu_secs
+            let user_usage = user_account_billing
                 .get(&(user.name.as_str(), account.name.as_str()))
                 .copied()
                 .unwrap_or(0.0);
-            let user_norm_usage = user_usage / total_cpu_usage;
+            let user_norm_usage = user_usage / cluster_usage;
             // Each user within an account gets an equal sub-share
             let user_count = account_users.len().max(1) as f64;
             let user_norm_shares = norm_shares / user_count;

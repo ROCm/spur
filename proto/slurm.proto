@@ -710,6 +710,9 @@ service SlurmAccounting {
   rpc DeleteQos(DeleteQosRequest) returns (google.protobuf.Empty);
   rpc ListQos(ListQosRequest) returns (ListQosResponse);
 
+  // Usage management (sacctmgr modify user/account set rawusage=N)
+  rpc ModifyUsage(ModifyUsageRequest) returns (google.protobuf.Empty);
+
   // Fairshare
   rpc GetFairshareFactors(GetFairshareFactorsRequest) returns (GetFairshareFactorsResponse);
 
@@ -879,6 +882,8 @@ message PingResponse {
   // InactiveLimit in effect on the controller, in seconds (0 = reaping off).
   // Unset from a node agent or a controller predating the field.
   optional uint32 inactive_limit_secs = 8;
+  string tres_billing_weights = 9;
+  string usage_reset_period = 10;
 }
 
 message JobStateCount {
@@ -1705,6 +1710,20 @@ message UsageEntry {
 
 message GetUsageResponse {
   repeated UsageEntry entries = 1;
+  // Billing weights so sshare/sprio can display weighted RawUsage.
+  double billing_weight_cpu = 2;
+  double billing_weight_gpu = 3;
+  // True when the controller has billing weights configured; false (proto
+  // default) means a pre-feature controller — sshare should fall back to 1:1.
+  bool has_billing_weights = 4;
+}
+
+message ModifyUsageRequest {
+  string user = 1;
+  string account = 2;
+  // The new raw usage value. 0 = reset to zero (Slurm parity).
+  // Positive = set to this value. Negative = subtract from current (clamp at 0).
+  int64 raw_usage = 3;
 }
 
 message GetFairshareFactorsRequest {
