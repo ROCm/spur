@@ -539,7 +539,7 @@ QOS keys
      - Seconds a job in this QOS is given to wind down (checkpoint, flush
        output) between the preemption warning and the kill, when it is
        preempted in ``cancel`` or ``requeue`` mode. The *victim's* QOS value
-       applies, not the preemptor's. It is capped at the victim's remaining
+       applies, not that of the preemptor. It is capped at the victim's remaining
        time limit. Unset inherits the partition's ``GraceTime``, and ``0``
        means no grace period. To revert to unset:
        ``sacctmgr modify qos name=<name> set cleargracetime=1``. See
@@ -904,10 +904,10 @@ choose ``cancel`` or ``requeue`` when the pending job needs capacity freed.
 ``GraceTime`` is a per-QOS value in seconds, set with
 ``sacctmgr modify qos name=<name> set GraceTime=600`` (keys are
 case-insensitive) and shown by ``sacctmgr show qos --long`` or
-``format=GraceTime``. The victim's QOS value applies, not the preemptor's. A
+``format=GraceTime``. The victim's QOS value applies, not that of the preemptor. A
 partition can carry one too (``grace_time`` under ``[[partitions]]``,
-``scontrol create PartitionName=<name> GraceTime=600``, or ``scontrol update
-PartitionName=<name> GraceTime=600`` at runtime). Resolution order, as for
+``scontrol create PartitionName=<name> GraceTime=600``, or
+``scontrol update PartitionName=<name> GraceTime=600`` at runtime). Resolution order, as for
 ``preempt_exempt_time``:
 
 #. The victim's QOS ``GraceTime``, if set. ``GraceTime=0`` is a set value: it
@@ -940,7 +940,10 @@ When a pending job selects a victim that has a grace:
    signals go to the job's ``srun`` steps only, **not to the batch script**,
    as in Slurm. A process the batch script starts directly, without ``srun``,
    gets no warning and sees nothing until the final kill, so users who want
-   to checkpoint on preemption must launch their work with ``srun``.
+   to checkpoint on preemption must launch their work with ``srun``. The
+   warning is not re-sent: if it is lost (the node's agent is unreachable, or
+   the controller leader changes at that moment), the job still runs out the
+   grace and is preempted at the deadline, only without having been warned.
 #. The victim stays ``RUNNING`` (``R`` in ``squeue``) and keeps its nodes for
    the whole grace, until the deadline or until every node has reported the
    job finished. ``scontrol show job`` shows ``PreemptTime=`` (when the
