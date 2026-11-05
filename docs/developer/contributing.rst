@@ -33,40 +33,43 @@ PRs are squash-merged, so the PR title becomes the commit message on ``main``. U
 
 **description** — imperative mood, lowercase, no trailing period. Summarize the user-visible change, not the implementation detail.
 
+Append ``!`` after the type or scope (e.g. ``fix(spur-core)!: ...``) to mark a breaking change.
+
 Example:
 
 .. code-block:: text
 
    feat(spur-k8s): add support for GPU resource limits in SpurJob spec
 
+Only ``feat``, ``fix``, and ``perf`` appear in the release notes. Non-user-facing work (CI, tooling, infra, tests) must use a type that stays out of them, such as ``ci``, ``build``, ``test``, or ``chore``. CI rejects titles that pair ``feat``, ``fix``, or ``perf`` with any of these scopes: ``ci``, ``cd``, ``build``, ``release``, ``infra``, ``e2e``, ``docs``, ``test``, ``tests``, ``style``, ``chore``, ``revert``. For example, use ``ci(e2e): fix flaky test`` instead of ``fix(e2e): fix flaky test``.
+
 License Headers
 ---------------
 
-All new source files (``.rs``, ``.proto``, ``.py``, ``.sh``) must include this header at the top:
+All new source files (``.rs``, ``.proto``, ``.py``, ``.sh``, and ``Dockerfile``) must include this header at the top:
 
 .. code-block:: text
 
    // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
    // SPDX-License-Identifier: Apache-2.0
 
-Use ``#`` instead of ``//`` for Python and shell scripts.
+Use ``#`` instead of ``//`` for Python, shell scripts, and ``Dockerfile``. The header must appear within the first five lines, so a shebang line before it is fine.
 
-Pre-Commit Hooks
-----------------
+Pre-Commit Hook
+---------------
 
-The repo includes pre-commit and commit-msg hooks that check formatting, license headers, and commit message format. Opt in by pointing git to the hooks directory:
+The repo includes a pre-commit hook in ``.githooks/``. Opt in by pointing git to the hooks directory:
 
 .. code-block:: bash
 
    git config core.hooksPath .githooks
 
-This enforces:
+The hook runs two checks:
 
-- ``cargo fmt --check --all`` — code formatting
-- SPDX license headers on staged source files
-- Commit message matches conventional commit format (see above)
+- ``cargo fmt --all --check`` (code formatting)
+- ``scripts/check-license-headers.sh`` on staged source files (SPDX license headers)
 
-If formatting fails, run ``cargo fmt --all`` and amend your commit. You can bypass hooks with ``git commit --no-verify``, but CI will still enforce these checks.
+If the hook fails, the commit is aborted. Fix the issue (for formatting, run ``cargo fmt --all``), stage the changes, and commit again. You can bypass the hook with ``git commit --no-verify``, but CI still enforces both checks.
 
 PR Process
 ----------
