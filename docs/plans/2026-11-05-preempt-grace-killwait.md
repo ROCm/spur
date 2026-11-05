@@ -144,8 +144,10 @@ deadline if every controller is down at that moment.
    this change, for a zero or time-capped grace, suspend mode, any Kubernetes-operator node, or any node
    lacking `signal-job` (`grace_eligible`). Otherwise `start_preemption_grace` commits
    `JobPreemptSignaled` and then `send_preemption_warning` signals the steps. A propose timeout
-   warns later through `follow_late_preemption`; if the entry did not apply (the run changed) no
-   warning is sent.
+   warns later through `follow_late_preemption`; if the entry did not apply (the run changed, or it
+   is already in a grace) no warning is sent and `start_preemption_grace` returns
+   `PreemptStart::Superseded`, which `victim_step` treats like an already-gone victim: the rest of the
+   victim set is still preempted. Only a failure with the victim still running abandons the set.
 2. **During the grace.** In-grace jobs are not preemption or reclaim candidates. The preemptor waits
    for them and stays at the front of the queue, earmarks refresh, and backfill frees their nodes at
    the earlier of the estimate and the deadline plus the kill wait. The time-limit and inactivity
@@ -263,7 +265,8 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `a_suspend_preemption_the_apply_refuses_leaves_the_victim_running`.
 - Deadline, reclaim and timers (`scheduler_loop.rs`): `grace_does_nothing_before_the_deadline`,
   `grace_preempts_at_the_deadline_with_the_stored_mode`, `grace_requeues_at_the_deadline_when_that_was_the_stored_mode`,
-  `grace_finalizer_skips_a_stale_attempt`, `a_grace_that_applies_late_still_warns_the_victim`,
+  `grace_finalizer_skips_a_stale_attempt`, `warning_a_victim_already_in_grace_is_superseded_not_an_error`,
+  `a_superseded_victim_does_not_end_the_victim_set`, `a_failed_preemption_abandons_the_set_unless_the_victim_is_gone`, `a_grace_that_applies_late_still_warns_the_victim`,
   `reclaim_skips_an_in_grace_job`, `preemptor_waits_for_its_in_grace_victim`,
   `time_limit_watchdog_leaves_a_capped_grace_to_the_finalizer_until_its_kill_wait_ends`,
   `time_limit_watchdog_expires_a_capped_grace_the_finalizer_never_ended`,

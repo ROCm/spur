@@ -1462,34 +1462,21 @@ pub(crate) async fn try_preempt(
                     preempt_qos.clone(),
                 )
                 .await
+                .map(|()| PreemptStart::Started)
             };
-            match outcome {
-                Ok(()) => {
+            match victim_step(cluster, candidate.job_id, outcome) {
+                VictimStep::Preempted => {
                     preempted = true;
                     evicted_so_far.push(candidate.job_id);
                 }
-                Err(e) => {
-                    // A victim gone since the snapshot already released its node, so
-                    // the set still holds. Any other failure leaves it held, with
-                    // `evicted_so_far` already gone and the rest of the set abandoned.
-                    let gone = cluster
-                        .get_job(candidate.job_id)
-                        .is_none_or(|j| j.state != JobState::Running);
-                    if gone {
-                        warn!(
-                            job_id = candidate.job_id,
-                            error = %e,
-                            "failed to preempt job already gone"
-                        );
-                    } else {
-                        error!(
-                            job_id = candidate.job_id,
-                            error = %e,
-                            already_evicted = ?evicted_so_far,
-                            "failed to preempt job, abandoning the rest of its victim set"
-                        );
-                        break;
-                    }
+                VictimStep::Skip => {}
+                VictimStep::Abandon => {
+                    error!(
+                        job_id = candidate.job_id,
+                        already_evicted = ?evicted_so_far,
+                        "failed to preempt job, abandoning the rest of its victim set"
+                    );
+                    break;
                 }
             }
         }
@@ -1497,6 +1484,51 @@ pub(crate) async fn try_preempt(
             // `occupants` is now stale, so a second pending job could otherwise
             // prove placement on nodes already promised away.
             break;
+        }
+    }
+}
+
+/// How the victim loop proceeds after one victim's preemption attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum VictimStep {
+    Preempted,
+    /// The victim needs nothing from this pass; the rest of the set still applies.
+    Skip,
+    Abandon,
+}
+
+/// Whether a victim was preempted, or its run had already ended or been replaced.
+#[derive(Debug, PartialEq, Eq)]
+enum PreemptStart {
+    Started,
+    Superseded,
+}
+
+fn victim_step(
+    cluster: &ClusterManager,
+    victim_id: spur_core::job::JobId,
+    outcome: anyhow::Result<PreemptStart>,
+) -> VictimStep {
+    match outcome {
+        Ok(PreemptStart::Started) => VictimStep::Preempted,
+        Ok(PreemptStart::Superseded) => {
+            warn!(
+                job_id = victim_id,
+                "victim's run was replaced or already warned — skipping it"
+            );
+            VictimStep::Skip
+        }
+        Err(e) => {
+            // A victim gone since the snapshot already released its node, so
+            // the set still holds. Any other failure leaves it held.
+            let gone = cluster
+                .get_job(victim_id)
+                .is_none_or(|j| j.state != spur_core::job::JobState::Running);
+            if !gone {
+                return VictimStep::Abandon;
+            }
+            warn!(job_id = victim_id, error = %e, "failed to preempt job already gone");
+            VictimStep::Skip
         }
     }
 }
@@ -1625,7 +1657,7 @@ async fn start_preemption_grace(
     cluster: &Arc<ClusterManager>,
     victim: &spur_core::job::Job,
     grace: PreemptionGrace,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PreemptStart> {
     let deadline = grace.now + chrono::Duration::seconds(i64::from(grace.secs));
     let pending = spur_core::job::PreemptPending {
         signaled_at: grace.now,
@@ -1654,10 +1686,7 @@ async fn start_preemption_grace(
     // The run ended or was replaced since the snapshot: warning it now would
     // signal a different run than the one chosen as victim.
     if !applied {
-        anyhow::bail!(
-            "job {} can no longer be given a preemption grace",
-            victim.job_id
-        );
+        return Ok(PreemptStart::Superseded);
     }
     info!(
         preempted_job = victim.job_id,
@@ -1673,7 +1702,7 @@ async fn start_preemption_grace(
         &victim.allocated_nodes,
     )
     .await;
-    Ok(())
+    Ok(PreemptStart::Started)
 }
 
 /// Ends the preemption of every job whose grace period is over, exactly as an
@@ -9863,6 +9892,50 @@ mod tests {
                     signals,
                     _dir: dir,
                 }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn warning_a_victim_already_in_grace_is_superseded_not_an_error() {
+                let f = victim_in_grace(PreemptMode::Cancel, None).await;
+                let grace = PreemptionGrace {
+                    preemptor: f.hunter.job_id,
+                    preempt_qos: None,
+                    mode: PreemptMode::Cancel,
+                    secs: 30,
+                    now: f.signaled_at,
+                };
+
+                let outcome = start_preemption_grace(&f.cm, &f.victim, grace).await;
+
+                assert_eq!(outcome.unwrap(), PreemptStart::Superseded);
+                assert!(f.signals.lock().unwrap().is_empty(), "no second warning");
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn a_superseded_victim_does_not_end_the_victim_set() {
+                let f = victim_in_grace(PreemptMode::Cancel, None).await;
+                let victim = f.victim.job_id;
+
+                assert_eq!(
+                    victim_step(&f.cm, victim, Ok(PreemptStart::Superseded)),
+                    VictimStep::Skip
+                );
+                assert_eq!(
+                    victim_step(&f.cm, victim, Ok(PreemptStart::Started)),
+                    VictimStep::Preempted
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn a_failed_preemption_abandons_the_set_unless_the_victim_is_gone() {
+                let f = victim_in_grace(PreemptMode::Cancel, None).await;
+                let failed = || Err(anyhow::anyhow!("propose failed"));
+
+                assert_eq!(
+                    victim_step(&f.cm, f.victim.job_id, failed()),
+                    VictimStep::Abandon
+                );
+                assert_eq!(victim_step(&f.cm, 987_654, failed()), VictimStep::Skip);
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
