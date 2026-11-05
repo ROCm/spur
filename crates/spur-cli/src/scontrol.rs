@@ -595,9 +595,16 @@ fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> St
         "ClusterName={}\nSlurmctldAddr={}\nVersion={}\n",
         ping.cluster_name, controller, ping.version
     );
-    // Omitted rather than shown as 0 when an older controller does not report it.
-    if let Some(secs) = ping.inactive_limit_secs {
-        out.push_str(&format!("InactiveLimit={secs}\n"));
+    // Omitted rather than shown as 0 when an older controller does not report them.
+    let optional_secs = [
+        ("InactiveLimit", ping.inactive_limit_secs),
+        ("KillWait", ping.kill_wait_secs),
+        ("TimeoutKillWait", ping.timeout_kill_wait_secs),
+    ];
+    for (key, secs) in optional_secs {
+        if let Some(secs) = secs {
+            out.push_str(&format!("{key}={secs}\n"));
+        }
     }
     if !ping.tres_billing_weights.is_empty() {
         out.push_str(&format!(
@@ -2871,6 +2878,27 @@ mod tests {
         // An older controller does not report it; say nothing rather than 0.
         let legacy = format_config("http://ctld:6817", &ping(None));
         assert!(!legacy.contains("InactiveLimit"), "{legacy}");
+    }
+
+    #[test]
+    fn config_reports_the_controllers_kill_waits() {
+        let ping = spur_proto::proto::PingResponse {
+            kill_wait_secs: Some(5),
+            timeout_kill_wait_secs: Some(30),
+            ..Default::default()
+        };
+        let out = format_config("http://ctld:6817", &ping);
+        assert!(out.contains("KillWait=5\n"), "{out}");
+        assert!(out.contains("TimeoutKillWait=30\n"), "{out}");
+    }
+
+    #[test]
+    fn config_omits_kill_waits_an_older_controller_does_not_report() {
+        let legacy = format_config(
+            "http://ctld:6817",
+            &spur_proto::proto::PingResponse::default(),
+        );
+        assert!(!legacy.contains("KillWait"), "{legacy}");
     }
 
     #[test]

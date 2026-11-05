@@ -595,6 +595,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        seconds (5 with the defaults); that term follows ``kill_wait_secs`` live.
        Mirrors Slurm's ``KillWait`` for these stops, but does not yet reach
        ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+       ``scontrol show config`` prints the value in effect, floor applied, as
+       ``KillWait``.
    * - ``timeout_kill_wait_secs``
      - integer
      - ``30``
@@ -607,7 +609,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
        (this or ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``. In
        Slurm, ``KillWait`` also covers time limits; here that part is this
        setting. Does not yet reach ``srun`` steps
-       (:ref:`kill wait note <kill-wait-steps-caveat>`).
+       (:ref:`kill wait note <kill-wait-steps-caveat>`). ``scontrol show config``
+       prints the value in effect, floor applied, as ``TimeoutKillWait``.
    * - ``max_user_priority``
      - integer
      - ``1000``

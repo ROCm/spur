@@ -6037,6 +6037,8 @@ impl SlurmAgent for AgentService {
             inactive_limit_secs: None,
             tres_billing_weights: String::new(),
             usage_reset_period: String::new(),
+            kill_wait_secs: None,
+            timeout_kill_wait_secs: None,
         }))
     }
 

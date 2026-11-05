@@ -806,6 +806,9 @@ graceful stops. ``scheduler.timeout_kill_wait_secs``
 (default ``30``) covers the stops that end ``TIMEOUT``: the time limit and the
 inactivity limit. Both changes apply to a ``spur.conf`` that is not edited, and
 with the defaults most waits are the ones a job had before.
+``scontrol show config`` prints both values in effect as ``KillWait`` and
+``TimeoutKillWait`` (in seconds, floor applied); against a controller older than
+this release it omits them rather than showing a misleading ``0``.
 
 .. list-table::
    :header-rows: 1

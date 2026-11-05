@@ -2452,7 +2452,9 @@ impl SlurmController for ControllerService {
             cluster_name: config.cluster_name.clone(),
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
-            inactive_limit_secs: Some(self.cluster.config().scheduler.inactive_limit_secs),
+            inactive_limit_secs: Some(config.scheduler.inactive_limit_secs),
+            kill_wait_secs: Some(config.scheduler.effective_kill_wait_secs()),
+            timeout_kill_wait_secs: Some(config.scheduler.effective_timeout_kill_wait_secs()),
             tres_billing_weights: config.scheduler.tres_billing_weights.clone(),
             usage_reset_period: config.scheduler.usage_reset_period.as_str().to_owned(),
         }))
@@ -8213,6 +8215,21 @@ mod tests {
             resp.auth_audience.is_empty(),
             "jwt-plugin tests advertise no native audience"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ping_reports_the_effective_kill_waits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.scheduler.kill_wait_secs = 2;
+        config.scheduler.timeout_kill_wait_secs = 45;
+        let svc = test_service_with(&dir, config).await;
+        let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
+        assert_eq!(
+            resp.kill_wait_secs,
+            Some(spur_core::config::MIN_EFFECTIVE_KILL_WAIT_SECS)
+        );
+        assert_eq!(resp.timeout_kill_wait_secs, Some(45));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

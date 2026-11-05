@@ -934,6 +934,12 @@ message PingResponse {
   optional uint32 inactive_limit_secs = 8;
   string tres_billing_weights = 9;
   string usage_reset_period = 10;
+  // SIGTERM-to-SIGKILL waits in effect on the controller, in seconds, with the
+  // floor applied: `kill_wait_secs` for ordinary stops, `timeout_kill_wait_secs`
+  // for stops at a time or inactivity limit. Unset from a node agent or a
+  // controller predating the fields.
+  optional uint32 kill_wait_secs = 11;
+  optional uint32 timeout_kill_wait_secs = 12;
 }
 
 message JobStateCount {
