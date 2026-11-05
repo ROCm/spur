@@ -780,6 +780,17 @@ the same node, which an earlier agent could miss for a run without a cgroup
 (``[cgroup] enabled = false``, or ``spurd`` cannot create cgroups, for example
 when not running as root).
 
+Before accepting a replacement attempt, the agent fences every older attempt
+it can discover in its tracked sessions, persisted session descriptors, and
+``/sys/fs/cgroup/spur/job_<id>_<attempt>`` directories. This includes attempts
+with reused step IDs after a restart and orphan cgroups without descriptors.
+It kills old workloads and removes their complete cgroup trees, including the
+parent job cgroup. Same or newer attempts and other jobs are left alone.
+Batch launches and allocation registration are refused if an old cgroup cannot
+be removed or an old session descriptor cannot be read; the old reservation is
+not replaced. Step startup is serialized with this cleanup so an old step
+cannot recreate a cgroup during replacement.
+
 See Also
 --------
 

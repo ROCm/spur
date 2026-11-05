@@ -233,6 +233,32 @@ Running the Tests
 
 Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
 
+Old-attempt cgroup cleanup
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``test_old_attempt_cgroup_cleanup.py`` requires Docker access and cgroup v2 on
+the first configured native-host node. Each case runs real ``spurd`` and
+``spurstepd`` binaries inside a disposable privileged container with a private
+cgroup namespace and no network connectivity. No host cgroup mount is shared.
+A loopback controller fixture keeps recovery unavailable so the test checks
+cleanup at the agent's launch boundary independently of controller cancellation.
+
+The pytest matrix covers three old attempts with distinct or reused step IDs,
+missing descriptors, nested orphan cgroups, and bind mounts that prevent parent
+or step removal. It checks process identity and cgroup disappearance before
+acceptance, preserves unrelated workloads, exercises both batch and allocation
+launches, and retries after removing each injected cleanup failure.
+
+.. code-block:: bash
+
+   pytest tests/native_host/e2e/test_old_attempt_cgroup_cleanup.py -v
+
+The image defaults to ``ubuntu:22.04``; ``SPUR_TEST_CGROUP_BASE_IMAGE`` can select
+a locally available compatible base. The test builds its Python gRPC bindings
+from the checkout's proto and uses the configured test binaries. Containers,
+the temporary image, and remote build files are removed at teardown; pytest's
+temporary directory retains the result and agent log for each case.
+
 End-to-End Tests (Kubernetes)
 -----------------------------
 

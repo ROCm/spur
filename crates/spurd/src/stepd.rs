@@ -2902,6 +2902,41 @@ impl StepdStore {
         })
     }
 
+    pub(crate) fn older_sessions(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> io::Result<Vec<StepdDescriptor>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let mut fields = name.split('.');
+            if fields.next().and_then(|v| v.parse::<u32>().ok()) != Some(job_id)
+                || fields
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .is_none_or(|v| v >= run_attempt)
+                || fields.next().and_then(|v| v.parse::<u32>().ok()).is_none()
+                || fields.next().is_some()
+            {
+                continue;
+            }
+            if !entry.file_type()?.is_dir() {
+                return Err(io::Error::other("runtime session is not a directory"));
+            }
+            // A damaged old descriptor cannot establish which supervisor must stop.
+            sessions.push(self.load_descriptor(&entry.path())?);
+        }
+        Ok(sessions)
+    }
+
     pub fn discover_unacknowledged_completions(&self) -> io::Result<Vec<PendingStepdCompletion>> {
         let mut completions = Vec::new();
         for session_dir in self.session_dirs()? {
