@@ -142,6 +142,12 @@ deadline if every controller is down at that moment.
 - Capability: agents advertise `"signal-job"` (`spur_core::node::CAP_SIGNAL_JOB`) in
   `RegisterAgentRequest.capabilities`, stored as `Node.capabilities`. A victim on any node without it
   gets no grace and a warning is logged naming the node.
+- `SignalJob` for a job the agent holds nothing of (`signal_scope`, `holds_job`) returns `NOT_FOUND`, and
+  the controller logs it apart from a delivery (`signal_outcome`), so a lost warning is visible. An
+  unscoped request (`run_attempt` 0) resolves to the current run through `resolve_cancel_attempt`, as
+  `send_explicit_signal` and `graceful_cancel` do, so a superseded run's lingering supervisor is not
+  signalled. The controller skips an agent without `signal-job` for every target; there is no
+  `CancelJob` fallback. `SignalTarget::Full` stays in the protocol and the agent.
 - Wait selection: `graceful_kill_wait_secs` (`spurctld/src/scheduler_loop.rs`) returns the timeout
   wait for a run with `time_limit_signaled_at` set and the kill wait otherwise. Every graceful
   `CancelJob`, including the heartbeat re-cancel, uses it, so a re-sent cancel carries the same wait.
@@ -324,7 +330,11 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
 - RPC layer (`spurctld/src/server.rs`): `a_partial_exit_in_grace_does_not_signal_the_other_nodes`,
   `the_batch_scripts_node_reporting_in_grace_sends_the_graceful_cancel`,
   `job_to_proto_reports_grace_preempt_time_and_end_time`, `ping_reports_the_effective_kill_waits`.
-- Agent (`spurd/src/agent_server.rs`): the `signal_job_*` tests (target filtering, never escalates,
+- Agent (`spurd/src/agent_server.rs`): `signal_job_for_a_job_this_node_does_not_hold_is_not_found`,
+  `a_signal_for_no_particular_attempt_is_scoped_to_the_current_run`,
+  `a_signal_for_a_superseded_attempt_has_no_scope`, `a_signal_for_an_orphaned_step_keeps_the_wildcard_scope`,
+  and the controller-side `signals_reach_each_node_in_order_and_skip_agents_without_signal_job` and
+  `a_not_found_signal_reply_is_reported_apart_from_a_delivery_and_a_failure`. Also the `signal_job_*` tests (target filtering, never escalates,
   stale attempt dropped, unspecified and batch targets rejected, non-controller callers rejected) and
   the graceful-cancel tests that assert the request's wait is honoured. `spur-k8s` has
   `virtual_agent_signal_job_is_unimplemented`.

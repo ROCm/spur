@@ -4131,14 +4131,9 @@ async fn cancel_one_agent(
     }
 }
 
-/// Deliver `signals`, in order, to every node in `node_names` without any of
-/// the agent's termination escalation. Nodes run concurrently on their own
-/// tasks and this returns immediately; each RPC is bounded by
-/// `CANCEL_RPC_TIMEOUT`.
-///
-/// A node whose agent predates `SignalJob` gets the signals through
-/// `CancelJob` instead, which only a `Full` target can stand in for; any other
-/// target skips the node, so callers gate on the capability before choosing one.
+/// Deliver `signals`, in order, to every node in `node_names` without any of the
+/// agent's termination escalation. Nodes run concurrently on their own tasks and
+/// this returns immediately; each RPC is bounded by `CANCEL_RPC_TIMEOUT`.
 pub async fn send_signal_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
@@ -4148,41 +4143,39 @@ pub async fn send_signal_to_nodes(
     target: SignalTarget,
 ) {
     for (agent_addr, node) in resolve_agents(cluster, job_id, node_names) {
-        if node.supports(spur_core::node::CAP_SIGNAL_JOB) {
-            tokio::spawn(signal_one_agent(
-                agent_addr,
-                job_id,
-                run_attempt,
-                signals.to_vec(),
-                target,
-            ));
-        } else if target == SignalTarget::Full {
-            tokio::spawn(cancel_with_signals(
-                agent_addr,
-                job_id,
-                run_attempt,
-                signals.to_vec(),
-            ));
-        } else {
+        if !node.supports(spur_core::node::CAP_SIGNAL_JOB) {
             warn!(
                 job_id,
                 node = %node.name,
                 ?target,
                 "agent does not support SignalJob — skipping signal"
             );
+            continue;
         }
+        tokio::spawn(signal_one_agent(
+            agent_addr,
+            job_id,
+            run_attempt,
+            signals.to_vec(),
+            target,
+        ));
     }
 }
 
-/// Legacy delivery: one signal-carrying `CancelJob` per signal, in order.
-async fn cancel_with_signals(
-    agent_addr: String,
-    job_id: spur_core::job::JobId,
-    run_attempt: u32,
-    signals: Vec<i32>,
-) {
-    for signal in signals {
-        cancel_one_agent(agent_addr.clone(), job_id, run_attempt, signal, 0).await;
+/// What a `SignalJob` reply means for the run it was meant to warn.
+#[derive(Debug, PartialEq, Eq)]
+enum SignalOutcome {
+    Delivered,
+    /// The agent holds nothing of the job, so nobody was warned.
+    NoSuchJob,
+    Failed(String),
+}
+
+fn signal_outcome<T>(result: Result<T, tonic::Status>) -> SignalOutcome {
+    match result {
+        Ok(_) => SignalOutcome::Delivered,
+        Err(status) if status.code() == tonic::Code::NotFound => SignalOutcome::NoSuchJob,
+        Err(status) => SignalOutcome::Failed(status.to_string()),
     }
 }
 
@@ -4216,9 +4209,17 @@ async fn signal_one_agent(
                 signal,
                 target: target as i32,
             };
-            match client.signal_job(request).await {
-                Ok(_) => info!(job_id, signal, ?target, agent = %agent_addr, "sent SignalJob"),
-                Err(e) => warn!(
+            match signal_outcome(client.signal_job(request).await) {
+                SignalOutcome::Delivered => {
+                    info!(job_id, signal, ?target, agent = %agent_addr, "sent SignalJob")
+                }
+                SignalOutcome::NoSuchJob => warn!(
+                    job_id,
+                    signal,
+                    agent = %agent_addr,
+                    "agent has no such job — SignalJob delivered nothing"
+                ),
+                SignalOutcome::Failed(e) => warn!(
                     job_id,
                     signal,
                     agent = %agent_addr,
@@ -6952,7 +6953,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn signals_reach_each_node_in_order_and_skip_legacy_nodes_for_partial_targets() {
+        async fn signals_reach_each_node_in_order_and_skip_agents_without_signal_job() {
             use spur_proto::proto::SignalTarget;
             let dir = TempDir::new().unwrap();
             let cm = crate::cluster::gated::cluster(&dir, test_config()).await.0;
@@ -6987,17 +6988,27 @@ mod tests {
             assert!(new_cancels.lock().unwrap().is_empty());
 
             send_signal_to_nodes(&cm, 7, 3, &nodes, &[18, 15], SignalTarget::Full).await;
-            wait_for("both signals reach the legacy node", || {
-                old_cancels.lock().unwrap().len() == 2
+            wait_for("both signals reach the capable node again", || {
+                new_signals.lock().unwrap().len() == 4
             });
-            let legacy: Vec<(i32, u32)> = old_cancels
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| (r.signal, r.run_attempt))
-                .collect();
-            assert_eq!(legacy, [(18, 3), (15, 3)]);
+            assert!(
+                old_cancels.lock().unwrap().is_empty(),
+                "an agent without SignalJob is skipped for every target"
+            );
             assert!(old_signals.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_not_found_signal_reply_is_reported_apart_from_a_delivery_and_a_failure() {
+            assert_eq!(signal_outcome(Ok(())), SignalOutcome::Delivered);
+            assert_eq!(
+                signal_outcome::<()>(Err(tonic::Status::not_found("no such job"))),
+                SignalOutcome::NoSuchJob
+            );
+            assert!(matches!(
+                signal_outcome::<()>(Err(tonic::Status::unavailable("down"))),
+                SignalOutcome::Failed(_)
+            ));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
