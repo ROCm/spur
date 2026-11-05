@@ -100,7 +100,8 @@ Note: clearpreemptexempttime=1 clears a QOS preempt-exempt override back to NULL
 (inherit from partition/global); a bare clearpreemptexempttime does nothing.
 This differs from preemptexempttime=0, which sets an explicit zero exemption.
 cleargracetime=1 likewise resets a QOS GraceTime to unset (inherit the
-partition's), unlike gracetime=0, which means no grace.";
+partition's), unlike gracetime=0, which means no grace. It takes a boolean
+value (1/yes/true or 0/no/false) and cannot be combined with gracetime=.";
 
 /// `key=value` selectors `delete` accepts, per entity. Distinct from the write
 /// fields: delete only *selects* what to remove, and advertising a write field
@@ -731,6 +732,26 @@ fn build_modify_account_request(
     })
 }
 
+/// Read `gracetime=` and `cleargracetime=`. A value together with a clear is
+/// ambiguous, so it is refused rather than letting one intent silently win.
+fn parse_grace_time_params(
+    p: &std::collections::HashMap<String, String>,
+) -> Result<(Option<u32>, bool)> {
+    let grace_time = p
+        .get("gracetime")
+        .map(|v| parse_u32("gracetime", v))
+        .transpose()?;
+    let clear = p
+        .get("cleargracetime")
+        .map(|v| parse_bool("cleargracetime", v))
+        .transpose()?
+        .unwrap_or(false);
+    if clear && grace_time.is_some() {
+        bail!("gracetime= cannot be combined with cleargracetime=1");
+    }
+    Ok((grace_time, clear))
+}
+
 /// Build the full `CreateQosRequest` for `add qos`: unset limits default to the
 /// `INFINITE` sentinel, while `grace_time` stays absent unless given.
 fn build_add_qos_request(
@@ -743,6 +764,7 @@ fn build_add_qos_request(
         .ok_or_else(|| anyhow::anyhow!("name= required"))?
         .clone();
     let no_limit = spur_core::accounting::INFINITE;
+    let (grace_time, clear_grace_time) = parse_grace_time_params(p)?;
     Ok(CreateQosRequest {
         name,
         description: Some(p.get("description").cloned().unwrap_or_default()),
@@ -786,11 +808,8 @@ fn build_add_qos_request(
             .map(|v| parse_u32("preemptexempttime", v))
             .transpose()?,
         clear_preempt_exempt_time: false,
-        clear_grace_time: false,
-        grace_time: p
-            .get("gracetime")
-            .map(|v| parse_u32("gracetime", v))
-            .transpose()?,
+        clear_grace_time,
+        grace_time,
         idle_fill_preemptable: p
             .get("idlefillpreemptable")
             .map(|v| parse_bool("idlefillpreemptable", v))
@@ -825,6 +844,7 @@ fn build_modify_qos_request(
         .or_else(|| p.get("qos"))
         .ok_or_else(|| anyhow::anyhow!("name= required"))?
         .clone();
+    let (grace_time, clear_grace_time) = parse_grace_time_params(p)?;
     Ok(CreateQosRequest {
         name,
         description: p.get("description").cloned(),
@@ -864,14 +884,8 @@ fn build_modify_qos_request(
             .get("clearpreemptexempttime")
             .map(|v| is_truthy(v))
             .unwrap_or(false),
-        clear_grace_time: p
-            .get("cleargracetime")
-            .map(|v| is_truthy(v))
-            .unwrap_or(false),
-        grace_time: p
-            .get("gracetime")
-            .map(|v| parse_u32("gracetime", v))
-            .transpose()?,
+        clear_grace_time,
+        grace_time,
         idle_fill_preemptable: p
             .get("idlefillpreemptable")
             .map(|v| parse_bool("idlefillpreemptable", v))
@@ -3111,21 +3125,67 @@ mod tests {
         assert_eq!(row.trim(), "0");
     }
 
-    #[test]
-    fn cleargracetime_requires_truthy_value() {
-        let params = |value: &str| -> std::collections::HashMap<String, String> {
-            [
-                ("name".into(), "q".into()),
-                ("cleargracetime".into(), value.into()),
-            ]
-            .into_iter()
+    fn qos_params(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .chain([("name".to_string(), "q".to_string())])
             .collect()
-        };
-        let bare = build_modify_qos_request(&params("")).unwrap();
-        assert!(!bare.clear_grace_time, "bare key must not clear");
-        let cleared = build_modify_qos_request(&params("1")).unwrap();
-        assert!(cleared.clear_grace_time);
-        assert_eq!(cleared.grace_time, None);
+    }
+
+    #[test]
+    fn cleargracetime_reads_a_boolean_value() {
+        for (value, clears) in [
+            ("1", true),
+            ("yes", true),
+            ("TRUE", true),
+            ("0", false),
+            ("no", false),
+        ] {
+            let req = build_modify_qos_request(&qos_params(&[("cleargracetime", value)])).unwrap();
+            assert_eq!(req.clear_grace_time, clears, "{value}");
+            assert_eq!(req.grace_time, None);
+        }
+    }
+
+    #[test]
+    fn cleargracetime_rejects_an_unrecognised_value() {
+        for value in ["", "maybe", "2", "y"] {
+            let p = qos_params(&[("cleargracetime", value)]);
+            for (verb, err) in [
+                ("add", build_add_qos_request(&p).unwrap_err()),
+                ("modify", build_modify_qos_request(&p).unwrap_err()),
+            ] {
+                let msg = err.to_string();
+                assert!(msg.contains("cleargracetime"), "{verb} {value:?}: {msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn gracetime_with_a_true_cleargracetime_is_rejected() {
+        let p = qos_params(&[("gracetime", "600"), ("cleargracetime", "1")]);
+        for err in [
+            build_add_qos_request(&p).unwrap_err(),
+            build_modify_qos_request(&p).unwrap_err(),
+        ] {
+            assert_eq!(
+                err.to_string(),
+                "gracetime= cannot be combined with cleargracetime=1"
+            );
+        }
+    }
+
+    #[test]
+    fn gracetime_with_a_false_cleargracetime_sets_the_value() {
+        let p = qos_params(&[("gracetime", "600"), ("cleargracetime", "0")]);
+        for req in [
+            build_add_qos_request(&p).unwrap(),
+            build_modify_qos_request(&p).unwrap(),
+        ] {
+            assert_eq!(req.grace_time, Some(600));
+            assert!(!req.clear_grace_time);
+        }
     }
 
     #[test]

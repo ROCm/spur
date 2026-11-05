@@ -2029,7 +2029,8 @@ message CreateQosRequest {
   // cancelled. 0 = no grace. Absent = no change on update.
   optional uint32 grace_time = 20;
   // Set to true to clear grace_time back to NULL (inherit the partition's
-  // GraceTime). Takes precedence over grace_time.
+  // GraceTime). Setting it together with grace_time is rejected as
+  // INVALID_ARGUMENT.
   bool clear_grace_time = 21;
 }
 

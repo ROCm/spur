@@ -77,9 +77,15 @@ fn nullable_limit(field: Option<u32>, what: &str) -> Result<Option<Option<i32>>,
 
 /// Map the `grace_time` proto fields to a column patch: `clear` -> NULL
 /// (inherit the partition's), unset -> keep, n -> store n (0 means no grace).
-/// Errors if `n` overflows i32.
+/// A value together with a clear is ambiguous, so it is refused; so is an `n`
+/// that overflows i32.
 fn grace_time_patch(field: Option<u32>, clear: bool) -> Result<Option<Option<i32>>, Status> {
     if clear {
+        if field.is_some() {
+            return Err(Status::invalid_argument(
+                "grace_time and clear_grace_time cannot both be set",
+            ));
+        }
         return Ok(Some(None));
     }
     field
@@ -1774,9 +1780,20 @@ mod tests {
     }
 
     #[test]
-    fn grace_time_patch_clear_writes_null_and_wins_over_a_value() {
+    fn grace_time_patch_clear_writes_null() {
         assert_eq!(grace_time_patch(None, true).unwrap(), Some(None));
-        assert_eq!(grace_time_patch(Some(600), true).unwrap(), Some(None));
+    }
+
+    #[test]
+    fn grace_time_patch_rejects_a_value_together_with_a_clear() {
+        for value in [0, 600] {
+            let err = grace_time_patch(Some(value), true).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert_eq!(
+                err.message(),
+                "grace_time and clear_grace_time cannot both be set"
+            );
+        }
     }
 
     #[test]
@@ -1793,15 +1810,6 @@ mod tests {
             grace_time_audit(grace_time_patch(None, true).unwrap()),
             Some(serde_json::Value::Null)
         );
-    }
-
-    #[test]
-    fn grace_time_audit_records_what_was_stored_when_a_value_and_a_clear_are_both_given() {
-        let details = txn::requested(&[(
-            "grace_time",
-            grace_time_audit(grace_time_patch(Some(600), true).unwrap()),
-        )]);
-        assert_eq!(details, serde_json::json!({ "grace_time": null }));
     }
 
     #[test]
