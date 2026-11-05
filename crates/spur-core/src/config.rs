@@ -677,10 +677,8 @@ pub struct SchedulerConfig {
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
-    /// Seconds between SIGTERM and SIGKILL when Spur stops a job for any reason
-    /// other than a time or inactivity limit (scancel, requeue, preemption,
-    /// reclaim, reservation end). Values below [`MIN_EFFECTIVE_KILL_WAIT_SECS`]
-    /// act as that minimum.
+    /// Seconds between SIGTERM and SIGKILL for every stop except a time or
+    /// inactivity limit. Values below [`MIN_EFFECTIVE_KILL_WAIT_SECS`] act as that.
     #[serde(default = "default_kill_wait")]
     pub kill_wait_secs: u32,
     /// The same wait for a job stopped by its time limit or the inactivity

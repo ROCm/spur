@@ -1536,8 +1536,8 @@ fn victim_step(
 /// SIGCONT first so a stopped step can run its handler, then SIGTERM as the warning.
 const PREEMPT_WARNING_SIGNALS: [i32; 2] = [Signal::SIGCONT as i32, Signal::SIGTERM as i32];
 
-/// The grace a victim is allowed: its QOS `GraceTime`, capped so it never
-/// outlives the time limit the watchdog enforces. No time limit means no cap.
+/// The grace a victim is allowed: its resolved `GraceTime` (QOS, else partition),
+/// capped so it never outlives the time limit. No time limit means no cap.
 fn effective_grace_secs(grace_time: u32, job: &spur_core::job::Job, now: DateTime<Utc>) -> u32 {
     let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
         return grace_time;
@@ -3311,11 +3311,9 @@ async fn confirm_dispatch_on_nodes(
 
 /// Watchdog: terminate running jobs that exceed their time limit.
 ///
-/// A job past its deadline is recorded as timed out and moved to COMPLETING in
-/// one replicated step, then sent the ordinary graceful cancel. The agent keeps
-/// the SIGTERM-to-SIGKILL clock and each node reports back, so the controller
-/// holds no timer of its own; a job stuck in COMPLETING is the completing
-/// timeout's to force-finish.
+/// A job past its deadline moves to COMPLETING in one replicated step, then gets
+/// the graceful cancel. The agent keeps the kill-wait clock, so the controller
+/// holds no timer; a job stuck in COMPLETING is the completing timeout's.
 ///
 /// Runs every 10 seconds.
 async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
@@ -3875,10 +3873,9 @@ pub async fn send_cancel_to_nodes(
     }
 }
 
-/// The kill wait a cancel carries: only a graceful cancel (`signal == 0`) has
-/// a SIGTERM-to-SIGKILL window; an explicit signal is delivered as given. The
-/// job is read at send time, so a run that has since been marked timed out
-/// gets the timeout wait.
+/// The kill wait a cancel carries: only a graceful cancel (`signal == 0`) has a
+/// window. The job is read at send time, so a run since marked timed out gets
+/// the timeout wait.
 fn cancel_kill_wait_secs(
     cluster: &ClusterManager,
     job_id: spur_core::job::JobId,

@@ -3098,10 +3098,9 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Record that a running job has been warned of preemption and may keep
-    /// its nodes until `pending.deadline`. `true` if the entry applied; `false`
-    /// means the run ended, was replaced, or already has a grace, and the
-    /// caller must not warn it.
+    /// Record that a running job was warned of preemption and may keep its nodes
+    /// until `pending.deadline`. `false`: the run ended, was replaced, or is
+    /// already in a grace, so the caller must not warn it.
     pub fn signal_preemption(
         &self,
         pending: PreemptPending,
@@ -3119,11 +3118,9 @@ impl ClusterManager {
         )
     }
 
-    /// Record that a run exhausted its time limit and move it to Completing in
-    /// one entry, so the caller's graceful cancel finds the verdict already
-    /// durable. `true` if this expiry moved the run to Completing; `false` means
-    /// it holds no nodes (or already ended or is draining) and the caller must
-    /// finalize it itself.
+    /// Record that a run exhausted its time limit and move it to Completing in one
+    /// entry, so the graceful cancel finds the verdict durable. `false`: the run
+    /// holds no nodes (or already ended) and the caller must finalize it itself.
     pub fn expire_time_limit(
         &self,
         job_id: JobId,
@@ -3159,10 +3156,9 @@ impl ClusterManager {
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
     ///
-    /// `expected_run_attempt` is the run the caller decided to preempt. No other
-    /// run is touched: the call is refused up front when the job has moved on,
-    /// and the Raft entry carries the attempt so a run that starts between the
-    /// proposal and its apply is left alone too.
+    /// `expected_run_attempt` is the run the caller decided to preempt; a job that
+    /// has moved on is refused, and the Raft entry carries it so apply skips a
+    /// replacement run too.
     ///
     /// `preempted_by` is the job that triggered the preemption (recorded for
     /// provenance), or `None` when there isn't one. `preempt_qos` is the
@@ -7667,10 +7663,9 @@ impl ClusterManager {
         job.preempt_qos = preempt_qos;
     }
 
-    /// Move a run whose node just reported toward its end. A victim in its
-    /// grace stays Running, with nothing sent to the nodes still working, until
-    /// every node has reported; then it ends as the preemption it was warned of.
-    /// `None` while nodes are outstanding or when the state machine refuses.
+    /// Move a run whose node just reported toward its end. A victim in its grace
+    /// stays Running until every node has reported, then ends as the preemption it
+    /// was warned of. `None` while nodes are outstanding or the state machine refuses.
     fn advance_after_node_report(
         job: &mut Job,
         grace: Option<&PreemptPending>,
@@ -8799,11 +8794,9 @@ impl ClusterManager {
                     {
                         return ClientResponse::default();
                     }
-                    // A victim that ends during its grace (an srun/PTY run whose
-                    // client reports its exit, or a force-finish after some nodes
-                    // already reported) ends as the preemption it was warned of. A
-                    // completion carrying a cancel was ended on purpose instead,
-                    // and the cancel wins.
+                    // A victim ending in its grace (an srun/PTY client reporting its
+                    // exit, or a force-finish after partial reports) ends as the
+                    // preemption it was warned of. A completion with a cancel wins.
                     let warned = job
                         .preempt_grace()
                         .filter(|_| job.state == JobState::Running && cancel.is_none())

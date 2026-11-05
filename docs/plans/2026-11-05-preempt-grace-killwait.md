@@ -27,7 +27,8 @@ This work adds:
 - Resolution: the victim's QOS value if set, else the highest value among the victim's matched
   partitions, else 0. An explicit QOS `0` means no grace even when the partition has one.
 - The effective grace is capped at the seconds left before the victim's own time limit. A victim with
-  no time limit is not capped.
+  no time limit is not capped. A Requeue-mode victim with less time remaining than its grace therefore
+  always requeues at the capped deadline and never ends `TIMEOUT`.
 - Applies to `cancel` and `requeue` preemption only. Suspend preemption never gets a grace.
 - The warning is SIGCONT then SIGTERM, delivered to `srun` steps only. The batch script is not
   signalled, matching Slurm; a script that does not use `srun` is warned of nothing and only sees the

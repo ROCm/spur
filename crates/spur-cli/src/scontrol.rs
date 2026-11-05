@@ -2519,7 +2519,8 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
 }
 
 /// Shown for a preempted job, and for one still inside its preemption grace,
-/// where only the deadline is known: nothing has been preempted yet.
+/// where only the signal time is known: `PreemptTime` is when the warning went
+/// out, and `EndTime` carries the deadline.
 fn preemption_line(job: &spur_proto::proto::JobInfo) -> Option<String> {
     let preempt_time = job
         .preempt_time

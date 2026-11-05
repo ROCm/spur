@@ -2,22 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Black-box end-to-end tests for the preemption grace (QOS GraceTime) and KillWait.
+Black-box end-to-end tests for the preemption grace (GraceTime) and the kill waits.
 
-A victim whose QOS (or, with the QOS unset, partition) sets GraceTime is not evicted at
-once. Its srun steps get SIGCONT then SIGTERM, the batch script gets nothing, and the victim stays RUNNING on its nodes
-until the grace deadline. At the deadline the ordinary preemption runs: a graceful
-terminate that waits up to kill_wait_secs before SIGKILL, then the partition's
-preempt_mode decides whether the victim is cancelled or requeued.
-
-The victim's batch script launches an srun step that traps SIGTERM, appends to a
-marker file and keeps sleeping; the batch script itself traps SIGTERM into a second
-marker, so a warning that leaks to the batch script is visible. Time limits have their
-own wait: a job that ignores SIGTERM sits in COMPLETING for the whole of
-timeout_kill_wait_secs before it ends TIMEOUT.
-
-Requires Postgres on node 0 for the preemption tests (accounting_cluster fixture,
-skips when Docker is absent); the time-limit test needs only the plain cluster.
+A victim with a grace is warned (SIGCONT, SIGTERM to its srun steps only) and stays RUNNING
+until the deadline, then the partition's preempt_mode cancels or requeues it. Needs Postgres
+on node 0 for the preemption tests (accounting_cluster fixture); the time-limit test needs
+only the plain cluster.
 """
 
 import re

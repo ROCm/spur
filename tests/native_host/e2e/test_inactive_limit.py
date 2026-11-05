@@ -8,9 +8,8 @@ native auth plugin every restart changes the credential epoch, so a client that
 kept its submit-time credential would fail every later keepalive and have its
 attended allocation reaped one limit later.
 
-A client that goes silent is reaped like a time-limited job: the srun step gets
-SIGTERM, the job sits in COMPLETING for up to timeout_kill_wait_secs, and it ends TIMEOUT.
-The SIGTERM is final, so a client that pings again afterwards does not save it.
+A silent client is reaped like a time-limited job: SIGTERM, up to
+timeout_kill_wait_secs in COMPLETING, then TIMEOUT; a later ping does not save it.
 """
 
 import shlex

@@ -17,10 +17,9 @@ fn default_port() -> u16 {
     6818
 }
 
-/// Deserializer for a patch field typed `Option<Option<T>>`: an absent key is
-/// "no change" (via `#[serde(default)]`), `null` clears, a value sets. Pair it
-/// with `skip_serializing_if = "Option::is_none"` so a clear is not written as
-/// the same `null` that plain serde reads back as "no change".
+/// Deserializer for `Option<Option<T>>` patch fields: absent is no change (via
+/// `#[serde(default)]`), `null` clears, a value sets. Pair with
+/// `skip_serializing_if = "Option::is_none"` so a clear is not read back as absent.
 fn clear_or_set<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,

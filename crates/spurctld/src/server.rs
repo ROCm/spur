@@ -6046,10 +6046,9 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
     Status::new(code, message)
 }
 
-/// The nodes to stop after a node report took `job` to `result`. A job that is
-/// completing stops them whichever node reported; one still in its grace only
-/// when the batch script's node did, because a rank exiting elsewhere is a step
-/// event, not the end of the job.
+/// The nodes to stop after a node report took `job` to `result`. A job in its
+/// grace stops them only when the batch script's node reported; a rank exiting
+/// elsewhere is a step event.
 fn stragglers_after_report(
     job: &spur_core::job::Job,
     result: &crate::cluster::NodeCompleteResult,
@@ -6064,10 +6063,8 @@ fn stragglers_after_report(
     }
 }
 
-/// The stop for a job's remaining nodes, as a graceful cancel so the per-job
-/// kill wait applies. The job and its run are read now, so a requeue before the
-/// returned future runs cannot aim the cancel at the next run. `None` when no
-/// node needs stopping.
+/// The stop for a job's remaining nodes, as a graceful cancel. The run is read
+/// now, so a requeue before the future runs cannot aim it at the next run.
 fn remaining_nodes_stop(
     cluster: &Arc<ClusterManager>,
     job_id: u32,
@@ -6087,10 +6084,8 @@ fn remaining_nodes_stop(
 }
 
 /// Nodes to stop once one of a job's nodes has reported, for a batch script that
-/// launches its ranks with `srun`. With `primary_only` set, only a report from
-/// the batch script's node (the first allocated) counts: the other nodes run a
-/// hold script that never reports by itself, so a rank exiting there is a step
-/// event, not the end of the job.
+/// launches ranks with `srun`. With `primary_only`, only the batch script's node
+/// (the first allocated) counts: the others run a hold script that never reports.
 fn step_launch_stragglers(job: &spur_core::job::Job, primary_only: Option<&str>) -> Vec<String> {
     let launches_steps = job
         .spec
