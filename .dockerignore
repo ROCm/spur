@@ -21,8 +21,11 @@ docs/
 **/.pytest_cache/
 **/*.egg-info/
 
-.env
-.env.*
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.conf
 
 CLAUDE.md
 README.md
