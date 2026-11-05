@@ -377,7 +377,11 @@ the same key and their caps add up to more than the node's capacity,
 
    partition caps on this node add up to more than it has; those partitions can contend for it
 
-The check runs when the scheduler starts and when a node registers.
+The check runs when the scheduler starts, when a node registers or reports
+new resources, after ``scontrol reconfigure`` (for every node), and after
+``scontrol create partition`` or ``scontrol update partition`` (for the nodes
+in that partition). It is not repeated on scheduling passes, so an
+overcommit is logged again only at the next of these events.
 
 Upgrading
 ---------

@@ -690,6 +690,70 @@ async fn reconfigure_changes_caps_on_an_existing_partition() {
     assert_eq!(p.max_mem_per_cpu, None);
 }
 
+fn cpu_overcommit(total: u64, partitions: &[&str]) -> (String, CapOvercommit) {
+    (
+        "n1".into(),
+        CapOvercommit {
+            key: "cpu".into(),
+            total,
+            capacity: 16,
+            partitions: partitions.iter().map(|p| p.to_string()).collect(),
+        },
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partition_create_and_update_can_overcommit_a_node() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("a", &[("cpu", 8)])],
+    )
+    .await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    assert!(cm.node_cap_overcommits(|_| true).is_empty());
+
+    cm.create_partition(partition("b", &[("cpu", 8)])).unwrap();
+    assert!(cm.node_cap_overcommits(|_| true).is_empty());
+
+    update_limits(
+        &cm,
+        "a",
+        PartitionLimitsUpdate {
+            max_cpus_per_node: Some(Some(12)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        cm.node_cap_overcommits(|_| true),
+        vec![cpu_overcommit(20, &["a", "b"])]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconfigure_can_overcommit_a_node() {
+    let dir = TempDir::new().unwrap();
+    let conf = |b_cpus: u64| {
+        format!(
+            "cluster_name = \"test\"\n\n\
+             [[partitions]]\nname = \"a\"\nnodes = \"ALL\"\nmax_cpus_per_node = 8\n\n\
+             [[partitions]]\nname = \"b\"\nnodes = \"ALL\"\nmax_cpus_per_node = {b_cpus}\n"
+        )
+    };
+    let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf(8)).await;
+    register_node(&cm, "n1", 16, 64 * GIB);
+    assert!(cm.node_cap_overcommits(|_| true).is_empty());
+
+    std::fs::write(&conf_path, conf(10)).unwrap();
+    cm.reconfigure().unwrap();
+    assert_eq!(
+        cm.node_cap_overcommits(|_| true),
+        vec![cpu_overcommit(18, &["a", "b"])]
+    );
+}
+
 #[test]
 fn partition_limit_block_reports_a_max_mem_per_node_violation() {
     let p = Partition {

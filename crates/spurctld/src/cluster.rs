@@ -4246,16 +4246,34 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Overcommitted partition caps on the nodes `on_node` selects, as
+    /// `(node, overcommit)` sorted by node name.
+    pub(crate) fn node_cap_overcommits(
+        &self,
+        on_node: impl Fn(&Node) -> bool,
+    ) -> Vec<(String, CapOvercommit)> {
+        let partitions = self.partitions.read().clone();
+        let mut overcommits: Vec<(String, CapOvercommit)> = self
+            .nodes
+            .read()
+            .values()
+            .filter(|node| on_node(node))
+            .flat_map(|node| {
+                partition_cap_overcommits(node, &partitions)
+                    .into_iter()
+                    .map(|overcommit| (node.name.clone(), overcommit))
+            })
+            .collect();
+        overcommits.sort_by(|a, b| a.0.cmp(&b.0));
+        overcommits
+    }
+
     /// Warn when the caps of the partitions sharing a node add up to more
     /// than the node has. Valid by design, but they then contend for it.
-    pub fn warn_partition_cap_overcommit(&self, node_name: &str) {
-        let Some(node) = self.get_node(node_name) else {
-            return;
-        };
-        let partitions = self.partitions.read().clone();
-        for overcommit in partition_cap_overcommits(&node, &partitions) {
+    fn warn_node_cap_overcommits(&self, on_node: impl Fn(&Node) -> bool) {
+        for (node, overcommit) in self.node_cap_overcommits(on_node) {
             warn!(
-                node = %node.name,
+                node = %node,
                 resource = %overcommit.key,
                 total = overcommit.total,
                 capacity = overcommit.capacity,
@@ -4265,12 +4283,16 @@ impl ClusterManager {
         }
     }
 
-    /// [`Self::warn_partition_cap_overcommit`] for every known node.
+    pub fn warn_partition_cap_overcommit(&self, node_name: &str) {
+        self.warn_node_cap_overcommits(|node| node.name == node_name);
+    }
+
     pub fn warn_partition_cap_overcommits(&self) {
-        let names: Vec<String> = self.nodes.read().keys().cloned().collect();
-        for name in names {
-            self.warn_partition_cap_overcommit(&name);
-        }
+        self.warn_node_cap_overcommits(|_| true);
+    }
+
+    fn warn_partition_cap_overcommits_in(&self, partition: &str) {
+        self.warn_node_cap_overcommits(|node| node.partitions.iter().any(|p| p == partition));
     }
 
     /// Syncs node labels if they differ, rejecting the diff from an unprivileged caller instead of
@@ -6338,6 +6360,7 @@ impl ClusterManager {
                 partition.name
             )));
         }
+        let name = partition.name.clone();
         let resp = self
             .propose(WalOperation::PartitionCreate { partition })
             .map_err(|e| PartitionError::raft(e.to_string()))?;
@@ -6346,6 +6369,7 @@ impl ClusterManager {
                 "partition already exists".to_string(),
             ));
         }
+        self.warn_partition_cap_overcommits_in(&name);
         Ok(())
     }
 
@@ -6441,6 +6465,7 @@ impl ClusterManager {
             resource_limits,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
+        self.warn_partition_cap_overcommits_in(name);
         Ok(())
     }
 
@@ -6660,6 +6685,7 @@ impl ClusterManager {
             let mut nodes = self.nodes.write();
             self.reconcile_partitions(&mut nodes);
         }
+        self.warn_partition_cap_overcommits();
 
         info!("reconfigure: applied spur.conf on the leader (followers converge on restart; see docs/admin-guide/configuration.rst, \"Applying configuration changes\", for per-field reload scope)");
         Ok(())
