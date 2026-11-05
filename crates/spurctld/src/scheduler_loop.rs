@@ -3329,6 +3329,20 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
     }
 }
 
+/// Whether the grace finalizer still owns `job`: a second kill sequence from a
+/// watchdog would race it. Once the deadline and the final kill wait have both
+/// passed the finalizer has failed, and the watchdogs take over as the backstop.
+fn inside_preemption_grace(
+    sched: &spur_core::config::SchedulerConfig,
+    job: &spur_core::job::Job,
+    now: DateTime<Utc>,
+) -> bool {
+    job.preempt_grace().is_some_and(|pending| {
+        let wait = chrono::Duration::seconds(i64::from(graceful_kill_wait_secs(sched, job)));
+        now < pending.deadline + wait
+    })
+}
+
 /// Terminate `job` if it has outlived its time limit as of `now`. A job holding
 /// no nodes will never report, so it is finalized here instead of waiting.
 async fn expire_job_if_overdue(
@@ -3336,9 +3350,7 @@ async fn expire_job_if_overdue(
     job: &spur_core::job::Job,
     now: DateTime<Utc>,
 ) {
-    // The grace deadline is capped at the time limit, so the preemption path
-    // ends this run; a second kill sequence here would race it.
-    if job.preempt_grace().is_some() {
+    if inside_preemption_grace(&cluster.config().scheduler, job, now) {
         return;
     }
     let (Some(time_limit), Some(start_time)) = (job.spec.time_limit, job.start_time) else {
@@ -3461,7 +3473,7 @@ async fn reap_inactive_job(
     limit_secs: u32,
     now: DateTime<Utc>,
 ) {
-    if job.preempt_grace().is_some() {
+    if inside_preemption_grace(&cluster.config().scheduler, job, now) {
         return;
     }
     info!(
@@ -9298,6 +9310,7 @@ mod tests {
                 let mut config = test_config();
                 config.partitions[0].preempt_mode = mode.into();
                 config.scheduler.preempt_type = PreemptType::QosPriority;
+                config.scheduler.kill_wait_secs = 5;
                 config
             }
 
@@ -9783,6 +9796,7 @@ mod tests {
                 victim: Job,
                 hunter: Job,
                 signaled_at: DateTime<Utc>,
+                grace_deadline: DateTime<Utc>,
                 cancels: Cancels,
                 signals: Signals,
                 _dir: TempDir,
@@ -9790,7 +9804,7 @@ mod tests {
 
             impl GraceFixture {
                 fn deadline(&self) -> DateTime<Utc> {
-                    self.signaled_at + chrono::Duration::seconds(600)
+                    self.grace_deadline
                 }
 
                 fn cancel_summary(&self) -> Vec<(i32, u32, u32)> {
@@ -9809,6 +9823,18 @@ mod tests {
                 mode: PreemptMode,
                 time_limit: Option<chrono::Duration>,
             ) -> GraceFixture {
+                victim_in_grace_ending(mode, time_limit, |_, signaled_at| {
+                    signaled_at + chrono::Duration::seconds(600)
+                })
+                .await
+            }
+
+            /// Like `victim_in_grace`, with the grace ending at `deadline_of(victim, signaled_at)`.
+            async fn victim_in_grace_ending(
+                mode: PreemptMode,
+                time_limit: Option<chrono::Duration>,
+                deadline_of: fn(&Job, DateTime<Utc>) -> DateTime<Utc>,
+            ) -> GraceFixture {
                 let dir = TempDir::new().unwrap();
                 let cm = test_cluster_with_config(&dir, preempting_config("cancel")).await;
                 let (addr, cancels, signals) = spawn_mock_agent_recording_requests().await;
@@ -9822,7 +9848,9 @@ mod tests {
                 let victim = run_victim(&cm, "victim", "n1", time_limit);
                 let hunter = submit_preemptor(&cm);
                 let signaled_at = Utc::now();
-                let pending = pending_due(&victim, &hunter, mode, signaled_at);
+                let mut pending = pending_due(&victim, &hunter, mode, signaled_at);
+                pending.deadline = deadline_of(&victim, signaled_at);
+                let grace_deadline = pending.deadline;
                 assert!(cm.signal_preemption(pending, victim.job_id).unwrap());
                 let victim = cm.get_job(victim.job_id).unwrap();
                 GraceFixture {
@@ -9830,6 +9858,7 @@ mod tests {
                     victim,
                     hunter,
                     signaled_at,
+                    grace_deadline,
                     cancels,
                     signals,
                     _dir: dir,
@@ -10090,13 +10119,27 @@ mod tests {
                 assert_eq!(f.cpus_in_use("n2"), 0);
             }
 
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn time_limit_watchdog_skips_an_in_grace_job() {
-                let f =
-                    victim_in_grace(PreemptMode::Cancel, Some(chrono::Duration::minutes(1))).await;
-                let start = f.victim.start_time.expect("a running job has a start time");
+            /// A victim warned for the whole remainder of its 1 minute limit, so the
+            /// grace ends at the limit itself, as the cap makes it.
+            async fn victim_in_a_capped_grace(mode: PreemptMode) -> GraceFixture {
+                victim_in_grace_ending(mode, Some(chrono::Duration::minutes(1)), |victim, _| {
+                    victim.start_time.expect("a running job has a start time")
+                        + chrono::Duration::minutes(1)
+                })
+                .await
+            }
 
-                expire_job_if_overdue(&f.cm, &f.victim, start + chrono::Duration::minutes(2)).await;
+            fn after_the_final_kill_wait(f: &GraceFixture) -> DateTime<Utc> {
+                f.deadline() + chrono::Duration::seconds(5)
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn time_limit_watchdog_leaves_a_capped_grace_to_the_finalizer_until_its_kill_wait_ends(
+            ) {
+                let f = victim_in_a_capped_grace(PreemptMode::Cancel).await;
+                let still_inside = after_the_final_kill_wait(&f) - chrono::Duration::seconds(1);
+
+                expire_job_if_overdue(&f.cm, &f.victim, still_inside).await;
 
                 let job = f.cm.get_job(f.victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Running);
@@ -10105,15 +10148,58 @@ mod tests {
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn inactive_watchdog_skips_an_in_grace_job() {
-                let f = victim_in_grace(PreemptMode::Cancel, None).await;
+            async fn time_limit_watchdog_expires_a_capped_grace_the_finalizer_never_ended() {
+                let f = victim_in_a_capped_grace(PreemptMode::Cancel).await;
 
-                reap_inactive_job(&f.cm, &f.victim, 300, Utc::now()).await;
+                expire_job_if_overdue(&f.cm, &f.victim, after_the_final_kill_wait(&f)).await;
+
+                wait_for("graceful cancel delivered", || {
+                    !f.cancels.lock().unwrap().is_empty()
+                });
+                let job = f.cm.get_job(f.victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Completing);
+                assert!(job.time_limit_signaled_at.is_some());
+                assert!(job.preempt_pending.is_none());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn time_limit_watchdog_expires_a_grace_whose_time_limit_was_lowered_after_it_started(
+            ) {
+                let f =
+                    victim_in_grace(PreemptMode::Cancel, Some(chrono::Duration::hours(1))).await;
+                let mut lowered = f.victim.clone();
+                lowered.spec.time_limit = Some(chrono::Duration::minutes(1));
+
+                expire_job_if_overdue(&f.cm, &lowered, f.deadline() + chrono::Duration::seconds(5))
+                    .await;
+
+                let job = f.cm.get_job(f.victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Completing);
+                assert!(job.time_limit_signaled_at.is_some());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn inactive_watchdog_skips_an_in_grace_job_until_its_kill_wait_ends() {
+                let f = victim_in_grace(PreemptMode::Cancel, None).await;
+                let still_inside = after_the_final_kill_wait(&f) - chrono::Duration::seconds(1);
+
+                reap_inactive_job(&f.cm, &f.victim, 300, still_inside).await;
 
                 let job = f.cm.get_job(f.victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Running);
                 assert!(job.preempt_pending.is_some());
                 assert!(f.cancels.lock().unwrap().is_empty());
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn inactive_watchdog_expires_a_grace_the_finalizer_never_ended() {
+                let f = victim_in_grace(PreemptMode::Cancel, None).await;
+
+                reap_inactive_job(&f.cm, &f.victim, 300, after_the_final_kill_wait(&f)).await;
+
+                let job = f.cm.get_job(f.victim.job_id).unwrap();
+                assert_eq!(job.state, JobState::Completing);
+                assert!(job.time_limit_signaled_at.is_some());
             }
         }
     }

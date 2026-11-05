@@ -981,7 +981,11 @@ Rules that follow from this:
   victim's nodes, no second preemptor selects the same victim, and idle-fill
   reclaim (:doc:`idle-fill-scheduling`) waits for the grace too.
 * **A grace shortened by the time limit** still ends as a preemption, not a
-  time limit.
+  time limit. The deadline is fixed when the warning is sent, so lowering the
+  job's ``TimeLimit`` during the grace does not shorten it. As a backstop, if
+  the job is still running once its deadline and the final kill wait have both
+  passed (for example because the preemption keeps failing), the time limit and
+  inactivity watchdogs stop it as they would any other job.
 
 Where no grace is given, the victim is preempted at once and the controller
 continues as if ``GraceTime`` were ``0``:

@@ -172,6 +172,13 @@ job got. Backfill estimates for running jobs add `timeout_kill_wait_secs`. The r
 warning at load and reconfigure when it does not (`complete_wait_too_short`) but never rejects the config, so deployed
 configurations keep loading.
 
+### Watchdog backstop
+
+The time-limit and inactivity watchdogs leave a job in its grace to `finalize_expired_graces`, so a
+second kill sequence does not race it, but only while `now < deadline + kill wait`
+(`inside_preemption_grace`). After that the finalizer has failed, or the limit was lowered mid-grace
+(the cap is applied only when the warning is sent), and the watchdogs expire the job normally.
+
 ### Suspend refusal
 
 `scontrol suspend` on a job in its grace is refused after the ownership check, so a non-owner learns
@@ -258,7 +265,11 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `grace_preempts_at_the_deadline_with_the_stored_mode`, `grace_requeues_at_the_deadline_when_that_was_the_stored_mode`,
   `grace_finalizer_skips_a_stale_attempt`, `a_grace_that_applies_late_still_warns_the_victim`,
   `reclaim_skips_an_in_grace_job`, `preemptor_waits_for_its_in_grace_victim`,
-  `time_limit_watchdog_skips_an_in_grace_job`, `busy_until_uses_the_grace_deadline`,
+  `time_limit_watchdog_leaves_a_capped_grace_to_the_finalizer_until_its_kill_wait_ends`,
+  `time_limit_watchdog_expires_a_capped_grace_the_finalizer_never_ended`,
+  `time_limit_watchdog_expires_a_grace_whose_time_limit_was_lowered_after_it_started`,
+  `inactive_watchdog_skips_an_in_grace_job_until_its_kill_wait_ends`,
+  `inactive_watchdog_expires_a_grace_the_finalizer_never_ended`, `busy_until_uses_the_grace_deadline`,
   `graceful_wait_is_timeout_wait_for_a_timed_out_run`, `graceful_wait_is_kill_wait_otherwise`,
   `an_expired_time_limit_sends_one_graceful_cancel_and_no_sigkill`.
 - Dependencies (`spur-core/src/dependency.rs`): `singleton_waits_for_a_predecessor_still_inside_its_time_limit_kill_wait`,
