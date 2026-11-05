@@ -338,6 +338,12 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   stale attempt dropped, unspecified and batch targets rejected, non-controller callers rejected) and
   the graceful-cancel tests that assert the request's wait is honoured. `spur-k8s` has
   `virtual_agent_signal_job_is_unimplemented`.
+- Partition `GraceTime` update: `update_partition_clear_grace_time_accepts_only_boolean_values`,
+  `update_partition_rejects_a_grace_time_together_with_a_clear` and
+  `update_partition_flags_reject_a_grace_time_together_with_a_clear` (through the real inline and clap
+  parsers), and `update_partition_rejects_a_grace_time_together_with_a_clear` in `spurctld/src/server.rs`
+  (the handler, via `partition_grace_time_update`). `ClearGraceTime=` shares `boolean::parse_bool` with
+  `sacctmgr`.
 - CLI (`spur-cli`): `sacctmgr` tests for `gracetime` and `cleargracetime` parsing and the `GraceTime`
   column, `scontrol` tests for `create partition` (`create_partition_reads_a_grace_time`,
   `create_partition_rejects_a_malformed_grace_time`), `update partition` (`GraceTime`,

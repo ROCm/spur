@@ -4,6 +4,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::boolean::{is_truthy, parse_bool};
 use crate::format_engine;
 use crate::timearg::{datetime_to_proto, parse_time_arg};
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
@@ -355,23 +356,6 @@ fn parse_i32(key: &str, val: &str) -> Result<i32> {
 fn parse_u32(key: &str, val: &str) -> Result<u32> {
     val.parse()
         .map_err(|_| anyhow::anyhow!("invalid value for {key}=: '{val}'"))
-}
-
-/// Parse an explicit on/off parameter. Unrecognised values are rejected rather
-/// than treated as off, so a typo cannot silently clear the setting.
-fn parse_bool(key: &str, val: &str) -> Result<bool> {
-    match val.to_lowercase().as_str() {
-        "1" | "yes" | "true" => Ok(true),
-        "0" | "no" | "false" => Ok(false),
-        _ => Err(anyhow::anyhow!("invalid value for {key}=: '{val}'")),
-    }
-}
-
-/// Return true when a key=value pair explicitly opts in to a boolean action
-/// (value is "1", "yes", or "true", case-insensitive). Bare keys (no `=value`)
-/// never match because `parse_params` maps them to an empty string.
-fn is_truthy(val: &str) -> bool {
-    matches!(val.to_lowercase().as_str(), "1" | "yes" | "true")
 }
 
 /// Look up a field by its accepted aliases in priority order, returning the key

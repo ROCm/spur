@@ -919,13 +919,16 @@ Both layers are honored together. Slurm instead reads one value, the QOS's under
 ``preempt/qos`` or the partition's under ``preempt/partition_prio``.
 
 ``sacctmgr modify qos name=<name> set cleargracetime=1`` returns a QOS to unset,
-so it inherits the partition's; ``scontrol update PartitionName=<name>
-ClearGraceTime=yes`` does the same for a partition. ``show qos`` leaves the column
-blank for unset and prints ``0`` for an explicit zero, and ``scontrol show
-partition`` prints ``GraceTime=`` only when one is set.
+so it inherits the partition's;
+``scontrol update PartitionName=<name> ClearGraceTime=yes`` does the same for a
+partition. ``ClearGraceTime`` takes ``yes``/``1``/``true`` or ``no``/``0``/``false``;
+any other value is rejected, and so is a ``GraceTime`` given together with a
+clear. ``show qos`` leaves the column blank for unset and prints ``0`` for an
+explicit zero, and ``scontrol show partition`` prints ``GraceTime=`` only when one is set.
 
-The grace a victim gets is ``min(GraceTime, time left before the victim's own
-time limit)``; a victim with no time limit is not capped. It applies to
+The grace a victim gets is
+``min(GraceTime, time left before the victim's own time limit)``; a victim with
+no time limit is not capped. It applies to
 ``cancel`` and ``requeue`` preemption. ``suspend`` has no grace.
 
 When a pending job selects a victim that has a grace:

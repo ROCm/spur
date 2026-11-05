@@ -3361,6 +3361,7 @@ impl SlurmController for ControllerService {
 
         let audit = crate::audit::slot(&request);
         let req = request.into_inner();
+        let grace_time = partition_grace_time_update(req.grace_time, req.clear_grace_time)?;
         annotate(
             &audit,
             Annotation::new(
@@ -3454,11 +3455,7 @@ impl SlurmController for ControllerService {
                 } else {
                     req.preempt_exempt_time.map(Some)
                 },
-                if req.clear_grace_time {
-                    Some(None)
-                } else {
-                    req.grace_time.map(Some)
-                },
+                grace_time,
             )
             .map_err(partition_rpc_status)?;
 
@@ -5985,6 +5982,22 @@ fn resolve_max_nodes_update(max_nodes_value: Option<u32>, clear_flag: bool) -> (
     let clear = clear_flag || max_nodes_value == Some(0);
     let max_nodes = if clear { None } else { max_nodes_value };
     (max_nodes, clear)
+}
+
+/// The partition `grace_time` patch an update asks for: outer `None` leaves it
+/// alone, `Some(None)` clears it. A value together with a clear is ambiguous, so
+/// it is refused rather than letting one intent silently win.
+fn partition_grace_time_update(
+    grace_time: Option<u32>,
+    clear: bool,
+) -> Result<Option<Option<u32>>, Status> {
+    match (grace_time, clear) {
+        (Some(_), true) => Err(Status::invalid_argument(
+            "grace_time and clear_grace_time cannot both be set",
+        )),
+        (_, true) => Ok(Some(None)),
+        (value, false) => Ok(value.map(Some)),
+    }
 }
 
 fn update_job_err_to_status(err: anyhow::Error) -> Status {
@@ -14543,6 +14556,25 @@ mod tests {
             .into_inner()
             .reservations;
         assert!(none.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_partition_rejects_a_grace_time_together_with_a_clear() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let err = svc
+            .update_partition(Request::new(UpdatePartitionRequest {
+                name: "default".into(),
+                grace_time: Some(600),
+                clear_grace_time: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the two intents contradict each other");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("clear_grace_time"), "{err}");
     }
 
     // --- control-plane mutation authorization ---

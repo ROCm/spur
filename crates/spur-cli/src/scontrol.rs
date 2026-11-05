@@ -249,7 +249,7 @@ pub enum ScontrolCommand {
         #[arg(long)]
         grace_time: Option<u32>,
         /// Clear the partition's grace_time, leaving it unset.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "grace_time")]
         clear_grace_time: bool,
     },
     /// Delete a partition
@@ -1905,9 +1905,7 @@ fn partition_update_request(
             "exclusivetopo" => reject_exclusive_topo(value)?,
             "gracetime" => grace_time = Some(value.parse().map_err(|_| invalid())?),
             "cleargracetime" => {
-                clear_grace_time = value.eq_ignore_ascii_case("yes")
-                    || value == "1"
-                    || value.eq_ignore_ascii_case("true");
+                clear_grace_time = crate::boolean::parse_bool(key, value).map_err(|_| invalid())?
             }
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
@@ -1920,6 +1918,9 @@ fn partition_update_request(
 
     if name.is_empty() {
         anyhow::bail!("scontrol update: PartitionName= is required");
+    }
+    if grace_time.is_some() && clear_grace_time {
+        bail!("scontrol update: GraceTime= cannot be combined with ClearGraceTime=yes");
     }
 
     // An ACL is applied only when its key appeared; an empty value clears it.
@@ -3283,6 +3284,77 @@ mod tests {
 
         let no = partition_update_request(&p(&["PartitionName=gpu", "ClearGraceTime=no"])).unwrap();
         assert!(!no.clear_grace_time);
+    }
+
+    #[test]
+    fn update_partition_clear_grace_time_accepts_only_boolean_values() {
+        for yes in ["yes", "YES", "1", "true", "True"] {
+            let param = format!("ClearGraceTime={yes}");
+            let req = partition_update_request(&p(&["PartitionName=gpu", &param])).unwrap();
+            assert!(req.clear_grace_time, "{yes}");
+        }
+        for no in ["no", "0", "false"] {
+            let param = format!("ClearGraceTime={no}");
+            let req = partition_update_request(&p(&["PartitionName=gpu", &param])).unwrap();
+            assert!(!req.clear_grace_time, "{no}");
+        }
+        for typo in ["on", "2", "maybe", ""] {
+            let param = format!("ClearGraceTime={typo}");
+            let err = partition_update_request(&p(&["PartitionName=gpu", &param]))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!("scontrol update: invalid value for ClearGraceTime=: '{typo}'")
+            );
+        }
+    }
+
+    #[test]
+    fn update_partition_rejects_a_grace_time_together_with_a_clear() {
+        let err = partition_update_request(&p(&[
+            "PartitionName=gpu",
+            "GraceTime=600",
+            "ClearGraceTime=yes",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "scontrol update: GraceTime= cannot be combined with ClearGraceTime=yes"
+        );
+
+        let kept = partition_update_request(&p(&[
+            "PartitionName=gpu",
+            "ClearGraceTime=no",
+            "GraceTime=600",
+        ]))
+        .unwrap();
+        assert_eq!(kept.grace_time, Some(600));
+        assert!(!kept.clear_grace_time);
+    }
+
+    #[test]
+    fn update_partition_flags_reject_a_grace_time_together_with_a_clear() {
+        let both = ScontrolArgs::try_parse_from([
+            "scontrol",
+            "update-partition",
+            "--name",
+            "gpu",
+            "--grace-time",
+            "600",
+            "--clear-grace-time",
+        ]);
+        assert!(both.is_err());
+
+        let clear_only = ScontrolArgs::try_parse_from([
+            "scontrol",
+            "update-partition",
+            "--name",
+            "gpu",
+            "--clear-grace-time",
+        ]);
+        assert!(clear_only.is_ok());
     }
 
     #[test]
