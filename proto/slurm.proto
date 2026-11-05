@@ -1289,14 +1289,14 @@ message AgentCancelJobRequest {
   // release against a concurrent redispatch under the same job_id.
   uint32 run_attempt = 3;
   // Seconds to wait after the first signal before escalating to SIGKILL.
-  // 0 means the agent default (5 s).
+  // 0 means the agent default (5 s); any value below 5 is raised to 5.
   uint32 kill_wait_secs = 4;
 }
 
 enum SignalTarget {
   SIGNAL_TARGET_UNSPECIFIED = 0;
   SIGNAL_TARGET_STEPS = 1;   // every step except the batch script
-  SIGNAL_TARGET_BATCH = 2;   // the batch script only
+  SIGNAL_TARGET_BATCH = 2;   // the batch script only; not yet supported (agents return UNIMPLEMENTED)
   SIGNAL_TARGET_FULL = 3;    // everything in the run
 }
 

@@ -1373,8 +1373,8 @@ const EXPLICIT_SIGNAL_STEP_ESCALATION: std::time::Duration = std::time::Duration
 /// request names none.
 const MIN_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Gap between a graceful cancel's immediate signal and its SIGKILL
-/// escalation, for both the legacy and stepd-supervised paths.
+/// Raised to the floor because a shorter gap would SIGKILL a step before its
+/// SIGTERM handler could run.
 fn kill_wait_from_request(kill_wait_secs: u32) -> std::time::Duration {
     std::time::Duration::from_secs(u64::from(kill_wait_secs)).max(MIN_KILL_WAIT)
 }
@@ -10497,10 +10497,9 @@ impl AgentService {
         }
     }
 
-    /// The attempt a signal is for: `NotFound` when this node holds nothing of
-    /// the job, `None` when it runs a different attempt. An unscoped request
-    /// resolves to the current run, or stays the wildcard when only an orphaned
-    /// unsupervised step is left.
+    /// The attempt a signal is for: `NotFound` when this node holds nothing of the
+    /// job, `None` when it runs another attempt. An unscoped request resolves to
+    /// the current run, or stays the wildcard for an orphaned unsupervised step.
     async fn signal_scope(&self, job_id: u32, run_attempt: u32) -> Result<Option<u32>, Status> {
         if !self.holds_job(job_id).await {
             return Err(Status::not_found(format!(
@@ -10705,13 +10704,10 @@ impl AgentService {
         }
     }
 
-    /// Snapshots (key, pid, epoch) of the job's steps that have no supervisor
-    /// and a process to signal; the caller signals *outside* the lock, since
-    /// signal_step_tree walks /proc and holding active_steps across it would
-    /// block every concurrent run_command (and the ActiveStepGuard's try_lock
-    /// cleanup, which silently skips on contention). `mark_cancelled` also
-    /// flags every in-scope step, including one with no pid yet, so a launch
-    /// still in flight aborts.
+    /// Snapshots (key, pid, epoch) of the job's unsupervised steps with a process.
+    /// The caller signals outside the lock: signal_step_tree walks /proc, and
+    /// holding `active_steps` across it would stall every concurrent run_command.
+    /// `mark_cancelled` also flags a step with no pid yet so its launch aborts.
     async fn unsupervised_step_targets(
         &self,
         job_id: u32,
