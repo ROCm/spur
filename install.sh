@@ -189,7 +189,7 @@ if [ -f "${EXTRACTED}/lib/spur/${MPI_PLUGIN}" ]; then
 fi
 
 # --- Verify ---
-"${INSTALL_DIR}/spur" --version >/dev/null 2>&1 || err "Installation verification failed"
+"${INSTALL_DIR}/spur" --version >/dev/null || err "Installation verification failed"
 
 # --- PATH hint ---
 log "Installed to ${INSTALL_DIR}/"

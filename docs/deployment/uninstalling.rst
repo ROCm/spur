@@ -61,7 +61,7 @@ Remove binaries and symlinks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 If Spur was installed via ``install.sh``, its built-in uninstaller removes the core
-binaries and its own symlink set:
+binaries, its own symlink set, and the MPI plugin:
 
 .. code-block:: bash
 
