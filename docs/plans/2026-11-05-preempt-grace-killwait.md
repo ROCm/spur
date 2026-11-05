@@ -126,7 +126,7 @@ deadline if every controller is down at that moment.
 - `JobComplete` carries `controller_initiated` (`#[serde(default, skip_serializing_if = "Not::not")]`,
   so entries from older controllers read `false` and keep their behaviour). The in-grace override
   that turns a no-cancel `JobComplete` on a Running victim into the preemption outcome covers the
-  completions it exists for: an srun/PTY client reporting its run's end and a force-finish after
+  completions it exists for: an srun or `--pty` client reporting its run's end and a force-finish after
   partial node reports. The controller's own `Failed` completions in `requeue_after_launch_failure`
   and `hold_job_at_max_requeue` (`WalOperation::job_failed_by_controller`) set the flag, so the
   `Failed -> Pending` backoff or hold that follows still finds the `Failed` job it expects. The
@@ -148,8 +148,8 @@ deadline if every controller is down at that moment.
   `RegisterAgentRequest.capabilities`, stored as `Node.capabilities`. A victim on any node without it
   gets no grace and a warning is logged naming the node.
 - `SignalJob` for a job the agent holds nothing of (`signal_scope`, `holds_job`) returns `NOT_FOUND`, and
-  the controller logs it apart from a delivery (`signal_outcome`), so a lost warning is visible. An
-  unscoped request (`run_attempt` 0) resolves to the current run through `resolve_cancel_attempt`, as
+  the controller logs it apart from a delivery (`signal_outcome`), so a lost warning is visible. A
+  request with no attempt (`run_attempt` 0) resolves to the current run through `resolve_cancel_attempt`, as
   `send_explicit_signal` and `graceful_cancel` do, so a superseded run's lingering supervisor is not
   signalled. The controller skips an agent without `signal-job` for every target; there is no
   `CancelJob` fallback. `SignalTarget::Full` stays in the protocol and the agent.
@@ -199,7 +199,7 @@ configurations keep loading.
 
 The time-limit and inactivity watchdogs leave a job in its grace to `finalize_expired_graces`, so a
 second kill sequence does not race it, but only while `now < deadline + kill wait`
-(`inside_preemption_grace`). After that the finalizer has failed, or the limit was lowered mid-grace
+(`inside_preemption_grace`). After that the grace-end pass has failed, or the limit was lowered mid-grace
 (the cap is applied only when the warning is sent), and the watchdogs expire the job normally.
 
 ### Suspend refusal
@@ -353,7 +353,7 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
 - Partition `GraceTime` update: `update_partition_clear_grace_time_accepts_only_boolean_values`,
   `update_partition_rejects_a_grace_time_together_with_a_clear` and
   `update_partition_flags_reject_a_grace_time_together_with_a_clear` (through the real inline and clap
-  parsers), and `update_partition_rejects_a_grace_time_together_with_a_clear` in `spurctld/src/server.rs`
+  parsing), and `update_partition_rejects_a_grace_time_together_with_a_clear` in `spurctld/src/server.rs`
   (the handler, via `partition_grace_time_update`). `ClearGraceTime=` shares `boolean::parse_bool` with
   `sacctmgr`.
 - CLI (`spur-cli`): `sacctmgr` tests for `gracetime` and `cleargracetime` parsing and the `GraceTime`
