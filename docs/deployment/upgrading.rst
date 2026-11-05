@@ -896,8 +896,8 @@ Preemption grace time (``GraceTime``)
 
 This release makes the per-QOS ``GraceTime`` take effect and adds a per-partition
 ``GraceTime`` (see :ref:`preemption grace time <qos-preempt-grace>`). A victim's
-grace is its QOS value if set, else the highest value among its partitions, else
-``0``. Nothing is set by default, so nothing changes until an administrator sets
+grace is its QOS value if set, else the highest value among the partitions it runs
+in, else ``0``. Nothing is set by default, so nothing changes until an administrator sets
 one.
 
 **Upgrade every controller before setting a partition ``GraceTime``.** The

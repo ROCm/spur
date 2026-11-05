@@ -2188,8 +2188,8 @@ message UpdatePartitionRequest {
   // Seconds a preempted job gets to wind down before it is killed. 0 is a valid
   // value meaning no grace. Absent = no change.
   optional uint32 grace_time = 26;
-  // Set to true to clear grace_time back to unset. Takes precedence over
-  // grace_time.
+  // Set to true to clear grace_time back to unset. Setting it together with
+  // grace_time is rejected as INVALID_ARGUMENT.
   bool clear_grace_time = 27;
 }
 

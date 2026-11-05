@@ -813,8 +813,8 @@ How a job learns it is being preempted
 
 If the QOS your job runs under, or the partition it runs in, has a ``GraceTime``
 (ask your administrator; see :ref:`preemption grace time <qos-preempt-grace>`;
-the QOS value wins if it is set, otherwise the highest value among the job's
-partitions applies), a job selected for preemption in ``cancel`` or
+the QOS value wins if it is set, otherwise the highest value among the
+partitions the job runs in applies), a job selected for preemption in ``cancel`` or
 ``requeue`` mode is not killed at once. It gets SIGCONT then SIGTERM, one time,
 as a warning, stays ``RUNNING`` and keeps its nodes, and is preempted at the
 deadline shown as ``EndTime`` (``PreemptTime`` shows when the warning was sent).

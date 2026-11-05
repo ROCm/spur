@@ -24,8 +24,12 @@ This work adds:
 
 - Set per QOS (`sacctmgr ... set GraceTime=<secs>`, `cleargracetime=1` to unset) and per partition
   (`grace_time` under `[[partitions]]`, `scontrol update partition GraceTime=` / `ClearGraceTime=1`).
-- Resolution: the victim's QOS value if set, else the highest value among the victim's matched
-  partitions, else 0. An explicit QOS `0` means no grace even when the partition has one.
+- Resolution: the victim's QOS value if set, else the highest value among the partitions it runs in
+  (`partitions_running`), else 0. An explicit QOS `0` means no grace even when the partition has one.
+  Placement is per node, so a `--partition=a,b` job records no single partition. "Runs in" is the
+  requested partitions whose membership (`Node.partitions`) covers at least one allocated node; a
+  node in both counts for both, and a job whose nodes are in none of its requested partitions gets no
+  partition grace. A single requested partition needs no lookup.
 - The effective grace is capped at the seconds left before the victim's own time limit. A victim with
   no time limit is not capped. A Requeue-mode victim with less time remaining than its grace therefore
   always requeues at the capped deadline and never ends `TIMEOUT`.
@@ -275,7 +279,12 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `preempt_grace_ignores_a_warning_recorded_for_an_earlier_run`,
   `held_nodes_leaves_out_the_nodes_that_reported`.
 - Grace resolution and eligibility (`spurctld/src/scheduler_loop.rs`): `grace_time_prefers_the_qos_value`,
-  `grace_time_falls_back_to_the_highest_partition`, `qos_zero_overrides_a_partition_grace`,
+  `grace_time_comes_from_the_partition_the_job_runs_in`,
+  `grace_time_takes_the_highest_among_the_partitions_hosting_the_job`,
+  `grace_time_is_zero_when_no_requested_partition_hosts_the_job`,
+  `a_single_requested_partition_needs_no_node_lookup`,
+  `a_multi_partition_victim_gets_the_grace_of_the_partition_it_runs_in`,
+  `qos_zero_overrides_a_partition_grace`,
   `grace_time_defaults_to_zero`, the `effective_grace_*` cap tests,
   `grace_is_never_eligible_for_suspend`, `grace_is_not_eligible_on_a_kubernetes_node`,
   `grace_needs_every_allocated_node_to_support_signal_job`, `grace_capped_to_zero_preempts_immediately`,

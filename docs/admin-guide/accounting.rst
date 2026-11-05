@@ -912,7 +912,10 @@ PartitionName=<name> GraceTime=600`` at runtime). Resolution order, as for
 
 #. The victim's QOS ``GraceTime``, if set. ``GraceTime=0`` is a set value: it
    explicitly means no grace and overrides a partition's.
-#. Otherwise the highest ``GraceTime`` among the partitions the victim requested.
+#. Otherwise the highest ``GraceTime`` among the partitions the victim runs in: the
+   ones it requested that contain its allocated nodes. A job submitted with
+   ``--partition=a,b`` that is running on ``a``'s nodes gets ``a``'s value, not ``b``'s.
+   A job whose nodes belong to none of its requested partitions gets none.
 #. Otherwise ``0``: the victim is preempted at once, as in earlier releases.
 
 Both layers are honored together. Slurm instead reads one value, the QOS's under

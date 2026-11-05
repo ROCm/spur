@@ -1640,8 +1640,9 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
      - Seconds a job preempted from this partition is given to wind down between
        the preemption warning and the kill. It applies only when the victim's QOS
        leaves ``GraceTime`` unset, and the QOS value wins otherwise, including an
-       explicit ``0``. A job in several partitions takes the highest value among
-       them. ``0`` means no grace; unset contributes none. Applies to ``cancel`` and
+       explicit ``0``. A job requested in several partitions takes the highest value
+       among the ones its nodes belong to, so ``--partition=a,b`` running on
+       ``a`` gets ``a``'s value only. ``0`` means no grace; unset contributes none. Applies to ``cancel`` and
        ``requeue`` preemption and is capped at the victim's remaining time limit. A value in
        ``spur.conf`` is applied on startup and ``scontrol reconfigure``; omitting
        it later does not clear a value already set at runtime. Set it at runtime with

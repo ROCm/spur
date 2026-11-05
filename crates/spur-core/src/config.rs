@@ -1208,8 +1208,8 @@ pub struct PartitionConfig {
     #[serde(default)]
     pub preempt_exempt_time: Option<u32>,
     /// Seconds a preempted job gets to wind down before it is killed. Used when
-    /// the victim's QOS leaves its grace time unset; the highest value among a
-    /// job's partitions applies. `None` means unset.
+    /// the victim's QOS leaves its grace time unset; the highest value among the
+    /// partitions the job runs in applies. `None` means unset.
     #[serde(default)]
     pub grace_time: Option<u32>,
 }

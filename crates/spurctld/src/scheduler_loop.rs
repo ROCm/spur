@@ -1208,19 +1208,42 @@ fn effective_exempt_secs(
         .unwrap_or(sched.preempt_exempt_time)
 }
 
+/// The requested partitions that host the job's allocated nodes, i.e. the ones it
+/// runs in. Placement is per node, so a `--partition=a,b` job records no single
+/// partition; one named partition needs no lookup.
+fn partitions_running<'a>(
+    job: &spur_core::job::Job,
+    partitions: &'a [spur_core::partition::Partition],
+    nodes: &[Node],
+) -> Vec<&'a spur_core::partition::Partition> {
+    let requested =
+        spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions);
+    if requested.len() <= 1 {
+        return requested;
+    }
+    let hosts = |partition: &spur_core::partition::Partition| {
+        job.allocated_nodes.iter().any(|name| {
+            nodes
+                .iter()
+                .any(|n| &n.name == name && n.partitions.contains(&partition.name))
+        })
+    };
+    requested.into_iter().filter(|p| hosts(p)).collect()
+}
+
 /// Configured preemption grace for a running job: the QOS value if set (so an
 /// explicit 0 disables a partition's grace), else the highest value among the
-/// job's partitions, else 0. Like `effective_exempt_secs`, the maximum wins when
-/// the job spans partitions.
+/// partitions it runs in, else 0.
 fn effective_grace_time(
     job: &spur_core::job::Job,
     partitions: &[spur_core::partition::Partition],
+    nodes: &[Node],
     qos: &spur_core::accounting::Qos,
 ) -> u32 {
     if let Some(t) = qos.limits.grace_time {
         return t;
     }
-    spur_core::partition::matched_partitions(job.spec.partition.as_deref(), partitions)
+    partitions_running(job, partitions, nodes)
         .into_iter()
         .filter_map(|p| p.grace_time)
         .max()
@@ -1440,7 +1463,7 @@ pub(crate) async fn try_preempt(
             let grace_secs = victim_grace_secs(
                 candidate,
                 *mode,
-                effective_grace_time(candidate, partitions, candidate_qos),
+                effective_grace_time(candidate, partitions, cluster_nodes, candidate_qos),
                 cluster_nodes,
                 now,
             );
@@ -5136,29 +5159,107 @@ mod tests {
         assert_eq!(effective_exempt_secs(&job, &parts, &qos, &sched), 10);
     }
 
+    fn node_in(name: &str, partitions: &[&str]) -> Node {
+        let mut node = Node::new(name.into(), spur_core::resource::ResourceSet::default());
+        node.partitions = partitions.iter().map(|p| p.to_string()).collect();
+        node
+    }
+
+    fn job_running_on(partition: &str, nodes: &[&str]) -> Job {
+        let mut job = job_in_partitions(partition);
+        job.allocated_nodes = nodes.iter().map(|n| n.to_string()).collect();
+        job
+    }
+
     #[test]
     fn grace_time_prefers_the_qos_value() {
         let job = job_in_partitions("gpu");
         let parts = vec![partition_with_grace("gpu", 600)];
-        assert_eq!(effective_grace_time(&job, &parts, &qos_with_grace(30)), 30);
+        assert_eq!(
+            effective_grace_time(&job, &parts, &[], &qos_with_grace(30)),
+            30
+        );
     }
 
     #[test]
-    fn grace_time_falls_back_to_the_highest_partition() {
-        let job = job_in_partitions("gpu,cpu");
+    fn grace_time_comes_from_the_partition_the_job_runs_in() {
+        let job = job_running_on("a,b", &["n1"]);
         let parts = vec![
-            partition_with_grace("gpu", 120),
-            partition_with_grace("cpu", 600),
+            partition_with_grace("a", 120),
+            partition_with_grace("b", 600),
+        ];
+        let nodes = vec![node_in("n1", &["a"]), node_in("n2", &["b"])];
+        assert_eq!(
+            effective_grace_time(&job, &parts, &nodes, &no_qos_override()),
+            120
+        );
+
+        let on_b = job_running_on("a,b", &["n2"]);
+        assert_eq!(
+            effective_grace_time(&on_b, &parts, &nodes, &no_qos_override()),
+            600
+        );
+    }
+
+    #[test]
+    fn grace_time_takes_the_highest_among_the_partitions_hosting_the_job() {
+        let parts = vec![
+            partition_with_grace("a", 120),
+            partition_with_grace("b", 600),
             partition_with_grace("other", 9000),
         ];
-        assert_eq!(effective_grace_time(&job, &parts, &no_qos_override()), 600);
+        let nodes = vec![node_in("n1", &["a", "b", "other"]), node_in("n2", &["a"])];
+
+        let in_both = job_running_on("a,b", &["n1"]);
+        assert_eq!(
+            effective_grace_time(&in_both, &parts, &nodes, &no_qos_override()),
+            600,
+            "a node in both partitions hosts the job in both; an unrequested one never counts"
+        );
+
+        let spanning = job_running_on("a,b", &["n2", "n1"]);
+        assert_eq!(
+            effective_grace_time(&spanning, &parts, &nodes, &no_qos_override()),
+            600
+        );
+    }
+
+    #[test]
+    fn grace_time_is_zero_when_no_requested_partition_hosts_the_job() {
+        let job = job_running_on("a,b", &["n1"]);
+        let parts = vec![
+            partition_with_grace("a", 120),
+            partition_with_grace("b", 600),
+        ];
+        let moved = vec![node_in("n1", &["elsewhere"])];
+        assert_eq!(
+            effective_grace_time(&job, &parts, &moved, &no_qos_override()),
+            0
+        );
+        assert_eq!(
+            effective_grace_time(&job, &parts, &[], &no_qos_override()),
+            0
+        );
+    }
+
+    #[test]
+    fn a_single_requested_partition_needs_no_node_lookup() {
+        let job = job_in_partitions("gpu");
+        let parts = vec![partition_with_grace("gpu", 600)];
+        assert_eq!(
+            effective_grace_time(&job, &parts, &[], &no_qos_override()),
+            600
+        );
     }
 
     #[test]
     fn qos_zero_overrides_a_partition_grace() {
         let job = job_in_partitions("gpu");
         let parts = vec![partition_with_grace("gpu", 600)];
-        assert_eq!(effective_grace_time(&job, &parts, &qos_with_grace(0)), 0);
+        assert_eq!(
+            effective_grace_time(&job, &parts, &[], &qos_with_grace(0)),
+            0
+        );
     }
 
     #[test]
@@ -5168,8 +5269,11 @@ mod tests {
             "gpu",
             spur_core::partition::PreemptMode::Cancel,
         )];
-        assert_eq!(effective_grace_time(&job, &unset, &no_qos_override()), 0);
-        assert_eq!(effective_grace_time(&job, &[], &no_qos_override()), 0);
+        assert_eq!(
+            effective_grace_time(&job, &unset, &[], &no_qos_override()),
+            0
+        );
+        assert_eq!(effective_grace_time(&job, &[], &[], &no_qos_override()), 0);
     }
 
     #[test]
@@ -9557,6 +9661,59 @@ mod tests {
                 let job = cm.get_job(victim.job_id).unwrap();
                 assert_eq!(job.state, JobState::Running);
                 assert!(job.preempt_pending.is_some(), "the partition grace applies");
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn a_multi_partition_victim_gets_the_grace_of_the_partition_it_runs_in() {
+                let dir = TempDir::new().unwrap();
+                let mut config = preempting_config("cancel");
+                config.partitions[0].name = "a".into();
+                config.partitions[0].nodes = "n1".into();
+                config.partitions[0].grace_time = Some(120);
+                let mut b = config.partitions[0].clone();
+                b.name = "b".into();
+                b.default = false;
+                b.nodes = "n2".into();
+                b.grace_time = Some(600);
+                config.partitions.push(b);
+                let cm = test_cluster_with_config(&dir, config).await;
+                let (addr, _cancels, signals) = spawn_mock_agent_recording_requests().await;
+                for node in ["n1", "n2"] {
+                    register_node_with_capabilities(
+                        &cm,
+                        node,
+                        addr,
+                        vec![SIGNAL_JOB_CAPABILITY.into()],
+                    );
+                }
+                insert_qos_pair_with_grace(&cm, None);
+                let spec = JobSpec {
+                    name: "victim".into(),
+                    user: "testuser".into(),
+                    work_dir: "/tmp".into(),
+                    qos: Some("low".into()),
+                    partition: Some("a,b".into()),
+                    ..Default::default()
+                };
+                let victim_id = submit_and_wait(&cm, spec);
+                start_on(&cm, victim_id, "n1");
+                let hunter = submit_preemptor(&cm);
+
+                preempt_for(&cm, &hunter).await;
+
+                wait_for("both warning signals delivered", || {
+                    signals.lock().unwrap().len() == 2
+                });
+                let pending = cm
+                    .get_job(victim_id)
+                    .unwrap()
+                    .preempt_pending
+                    .expect("the victim is in a grace");
+                assert_eq!(
+                    pending.deadline - pending.signaled_at,
+                    chrono::Duration::seconds(120),
+                    "partition a hosts the victim; b's larger grace does not apply"
+                );
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
