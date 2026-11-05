@@ -344,10 +344,10 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        ``heartbeat_timeout_secs``: the draining controller answers no
        heartbeats but still checks node health, so a grace within 35 seconds of
        that timeout (one heartbeat interval plus the flush) lets a full drain
-       mark nodes DOWN and fail their jobs. ``spurctld`` warns at startup when
-       the grace is that close, or ``0``. Also keep the grace, plus up to 5
-       seconds for the accounting flush that follows, below your service
-       manager's stop timeout (systemd ``TimeoutStopSec``, Kubernetes
+       mark nodes DOWN and fail their jobs, and so can ``0``, whose drain has no
+       bound. ``spurctld`` warns at startup in either case. Also keep the grace,
+       plus up to 5 seconds for the accounting flush that follows, below your
+       service manager's stop timeout (systemd ``TimeoutStopSec``, Kubernetes
        ``terminationGracePeriodSeconds``): a ``SIGKILL`` from that timeout skips
        the flush. Requests still running when the grace period ends are only cut
        off at exit, so the flush is best-effort for accounting rows they write

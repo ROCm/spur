@@ -745,18 +745,20 @@ step's whole runtime, so restarting a controller while a step ran (for example d
 accounting flush.
 
 A step still running when the grace period ends keeps running on its node. A buffered
-``srun`` re-attaches to it if the restarted controller answers within the client's retry
-window (see :ref:`srun-controller-restart`); ``srun --pty`` is not covered. Accounting for
-requests still in flight at that point is best-effort: anything they write after the flush
-is lost.
+``srun`` re-attaches to it if it reconnects to the restarted controller within its retry
+window, and otherwise exits with an error while the step runs on; see
+:ref:`srun-controller-restart`. ``srun --pty`` follows a different path and is not covered.
+Accounting for requests still in flight at that point is best-effort: anything they write
+after the flush is lost.
 
 The default suits most sites. Keep it well below ``heartbeat_timeout_secs``: the controller
 answers no heartbeats while it drains, so a grace within about 35 seconds of that timeout
-lets a full drain mark nodes DOWN and fail their jobs, and ``spurctld`` warns at startup.
-A step that finishes during the drain does not end it, so raising the value mostly
-lengthens the restart. A new value takes effect at the next start. ``0`` restores the
-unbounded wait, which a repeated ``SIGTERM`` or ``SIGINT`` does not end; only ``SIGKILL``
-does.
+lets a full drain mark nodes DOWN and fail their jobs. ``0`` restores the unbounded wait,
+which can run past that timeout too, and which a repeated ``SIGTERM`` or ``SIGINT`` does not
+end; only ``SIGKILL`` does. ``spurctld`` warns at startup in either case. Keep the grace,
+plus up to 5 seconds for the accounting flush, below ``TimeoutStopSec``. A step that
+finishes during the drain does not end it, so raising the value mostly lengthens the
+restart. A new value takes effect at the next start.
 
 See Also
 --------

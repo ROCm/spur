@@ -356,9 +356,10 @@ Enable and start it:
    and exits. An ``srun`` step holds its RPC open for the step's whole runtime, so this is
    what keeps ``systemctl restart spurctld`` short while steps are running. Keep the grace
    well below ``heartbeat_timeout_secs``, since the draining controller answers no
-   heartbeats, and keep ``TimeoutStopSec`` above the grace plus those 5 seconds: systemd's
-   default of 90s, which the unit above leaves unchanged, covers the default grace. A
-   ``SIGKILL`` at that timeout skips the accounting flush.
+   heartbeats, and avoid ``0``, which removes the bound. Keep ``TimeoutStopSec`` above the
+   grace plus those 5 seconds: systemd's default of 90s, which the unit above leaves
+   unchanged, covers the default grace. A ``SIGKILL`` at that timeout skips the accounting
+   flush.
 
 High Availability
 ~~~~~~~~~~~~~~~~~
