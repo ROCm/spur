@@ -12,4 +12,5 @@ COPY slurm.proto probe.py /validation/
 RUN python3 -m grpc_tools.protoc -I/validation --python_out=/validation \
     --grpc_python_out=/validation /validation/slurm.proto
 ENV SPUR_STEPD_STATE_DIR=/state
+USER 65534:65534
 ENTRYPOINT ["python3", "/validation/probe.py"]

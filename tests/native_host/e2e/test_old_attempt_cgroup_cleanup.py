@@ -57,7 +57,7 @@ def test_old_attempt_processes_and_cgroups_are_reaped(
     name = f"spur-attempt-cleanup-{token}-{scenario}-{mode}"
     try:
         code, output = node.exec_with_exit(
-            f"docker run --name {name} --init --privileged --cgroupns=private "
+            f"docker run --name {name} --init --user 0:0 --privileged --cgroupns=private "
             f"--network=none --hostname=attempt-node {image} "
             f"--scenario {scenario} --mode {mode}"
         )
