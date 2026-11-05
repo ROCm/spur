@@ -1713,9 +1713,13 @@ WireGuard mesh networking and the agent port.
    * - ``wg_interface``
      - string
      - ``"spur0"``
-     - Not implemented
-     - Superseded by the ``SPUR_WG_INTERFACE`` environment variable read by
-       ``spurd``, which defaults to ``spur0``.
+     - Restart, Agent restart
+     - WireGuard mesh interface name. ``spurd`` uses it to detect its mesh
+       address, report its mesh public key, and apply pushed mesh membership
+       to the live interface. The ``SPUR_WG_INTERFACE`` environment variable
+       overrides it for ``spurd``. With ``[cluster]`` and ``wg_enabled`` on,
+       ``spurctld`` reads peer endpoints from it. ``spur net`` takes
+       ``--interface`` instead and does not read this field.
    * - ``wg_port``
      - integer
      - ``51820``
