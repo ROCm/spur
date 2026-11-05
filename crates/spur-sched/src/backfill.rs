@@ -17,8 +17,8 @@ use spur_core::resource::{
 
 use crate::node_match::NodePlacement;
 use crate::partition_cap::{
-    candidate_partitions, is_capped, job_in_partition, job_typed_gpu, partition_cap_ok,
-    resolution_rank, TresCharge,
+    candidate_partitions, is_capped, job_in_eligible_partitions, job_in_partition, job_typed_gpu,
+    partition_cap_ok, resolution_rank, TresCharge,
 };
 use crate::timeline::{CapCheck, NodeTimeline, PartitionCharge, UNLIMITED_JOB_DURATION};
 use crate::traits::{Assignment, ClusterState, Scheduler};
@@ -877,8 +877,11 @@ impl BackfillScheduler {
                 continue; // Single-component "het" job, treat normally
             }
             let all_have_nodes = indices.iter().all(|&idx| {
-                let job = &pending[idx];
-                let suitable = self.find_suitable_nodes(job, cluster, &handoffs, now);
+                let Some(job) = job_in_eligible_partitions(&pending[idx], cluster.partitions)
+                else {
+                    return false;
+                };
+                let suitable = self.find_suitable_nodes(&job, cluster, &handoffs, now);
                 suitable.len() >= job.spec.num_nodes as usize
             });
             if !all_have_nodes {
@@ -911,6 +914,11 @@ impl BackfillScheduler {
                 note(UnplacedKind::HetGroupIncomplete, 0, None);
                 continue;
             }
+            let Some(job) = job_in_eligible_partitions(job, cluster.partitions) else {
+                note(UnplacedKind::NoSuitableNodes, 0, None);
+                continue;
+            };
+            let job = &*job;
             if spur_core::constraints::validate(&job.spec).is_err()
                 || (spur_core::constraints::requires_gpu_properties(&job.spec)
                     && cluster.fabric.is_none())
@@ -1104,11 +1112,6 @@ impl BackfillScheduler {
         let mut best: Option<(PlacementPlan, &Partition)> = None;
         let mut errors = Vec::new();
         for &partition in candidates {
-            // A per-job memory limit the job exceeds rules the partition out.
-            if partition.max_mem_per_node_exceeded(&job.spec).is_some() {
-                errors.push((UnplacedKind::NoSuitableNodes, 0));
-                continue;
-            }
             let scope = PartitionScope {
                 partition,
                 typed_gpu,

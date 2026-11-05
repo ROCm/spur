@@ -755,17 +755,17 @@ async fn reconfigure_can_overcommit_a_node() {
 }
 
 #[test]
-fn partition_limit_block_reports_a_max_mem_per_node_violation() {
+fn limit_block_reports_a_max_mem_per_node_violation() {
     let p = Partition {
         max_mem_per_node: Some(GIB),
         ..partition("m", &[])
     };
     let mut job = Job::new(1, spec_in("m", 1));
     job.spec.memory_per_node_mb = Some(GIB);
-    assert_eq!(partition_limit_block(&job, &p), None);
+    assert_eq!(p.limit_block(&job.spec), None);
     job.spec.memory_per_node_mb = Some(GIB + 1);
     assert_eq!(
-        partition_limit_block(&job, &p),
+        p.limit_block(&job.spec),
         Some(PendingReason::PartitionConfig)
     );
 }

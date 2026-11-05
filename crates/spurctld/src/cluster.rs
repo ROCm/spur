@@ -10916,7 +10916,7 @@ fn partition_block(job: &Job, partitions: &[Partition]) -> Option<spur_core::job
             continue;
         }
         has_up_partition = true;
-        match partition_limit_block(job, part) {
+        match part.limit_block(&job.spec) {
             None => return None,
             Some(reason) => {
                 block_reason.get_or_insert(reason);
@@ -10955,7 +10955,7 @@ fn validate_partition_time_limit(
         return Ok(());
     }
 
-    let allows = |part: &&Partition| partition_time_allows(part, Some(time_limit));
+    let allows = |part: &&Partition| part.time_allows(Some(time_limit));
     let satisfied = if mode == EnforcePartLimits::All {
         requested.iter().all(allows)
     } else {
@@ -11030,38 +11030,6 @@ fn partition_resource_violation(
     }
     let overshoots = partition_cap_never_fits(job, partition, nodes, reservations)?;
     Some(cap_never_runs_desc(job, partition, &overshoots))
-}
-
-/// True when a job's wall-time fits the partition's `MaxTime`. `None` `MaxTime`
-/// (UNLIMITED) or `None` time limit always fits. Compared at second precision so
-/// a request just over the cap is not truncated down to an allowed minute.
-fn partition_time_allows(part: &Partition, time_limit: Option<&chrono::Duration>) -> bool {
-    match (part.max_time_minutes, time_limit) {
-        (Some(max_mins), Some(tl)) => tl.num_seconds() <= i64::from(max_mins) * 60,
-        _ => true,
-    }
-}
-
-/// The reason a partition cannot ever schedule this job (static limits), or
-/// `None` if it can. Node-count violations report `PartitionConfig`; wall-time
-/// violations report the more specific `PartitionTimeLimit` (Slurm parity).
-fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::PendingReason> {
-    use spur_core::job::PendingReason;
-    if let Some(max) = part.max_nodes {
-        if job.spec.num_nodes > max {
-            return Some(PendingReason::PartitionConfig);
-        }
-    }
-    if part.min_nodes > 0 && job.spec.num_nodes < part.min_nodes {
-        return Some(PendingReason::PartitionConfig);
-    }
-    if !partition_time_allows(part, job.spec.time_limit.as_ref()) {
-        return Some(PendingReason::PartitionTimeLimit);
-    }
-    if part.max_mem_per_node_exceeded(&job.spec).is_some() {
-        return Some(PendingReason::PartitionConfig);
-    }
-    None
 }
 
 /// Running-TRES accumulation with the distinct-node rule applied once at the
