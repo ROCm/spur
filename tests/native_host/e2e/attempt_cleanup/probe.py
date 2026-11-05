@@ -126,11 +126,15 @@ def enable_children(path):
 def setup_cgroup_namespace():
     assert Path("/.dockerenv").exists(), "this probe must run inside Docker"
     assert os.getuid() == 0
-    subprocess.run(["mount", "-t", "cgroup2", "none", "/sys/fs/cgroup"], check=True)
+    assert Path("/proc/self/cgroup").read_text().strip() == "0::/"
     root = CGROUP.parent
-    assert subprocess.check_output(["stat", "-f", "-c", "%T", str(root)], text=True).strip() == "cgroup2fs"
+    filesystem = subprocess.check_output(["stat", "-f", "-c", "%T", str(root)], text=True).strip()
+    if filesystem != "cgroup2fs":
+        subprocess.run(["mount", "-t", "cgroup2", "none", str(root)], check=True)
     pids = (root / "cgroup.procs").read_text().split()
     assert str(os.getpid()) in pids, "the cgroup namespace must be rooted at this container"
+    if os.statvfs(root).f_flag & os.ST_RDONLY:
+        subprocess.run(["mount", "-o", "remount,bind,rw", str(root)], check=True)
     daemon = root / "daemon"
     daemon.mkdir()
     for pid in pids:
