@@ -925,7 +925,7 @@ Both layers are honored together. Slurm instead reads one value, the QOS's under
 so it inherits the partition's;
 ``scontrol update PartitionName=<name> ClearGraceTime=yes`` does the same for a
 partition. ``cleargracetime`` and ``ClearGraceTime`` take ``yes``/``1``/``true`` or
-``no``/``0``/``false``; any other value is rejected (a bare ``cleargracetime`` too).
+``no``/``0``/``false``; any other value is rejected (an empty ``cleargracetime=`` too).
 A ``gracetime`` or ``GraceTime`` given together with a true clear is rejected as well,
 by ``sacctmgr add qos``, ``sacctmgr modify qos`` and ``scontrol update``, and by the
 controller for any client. ``show qos`` leaves the column blank for unset and prints ``0`` for an
