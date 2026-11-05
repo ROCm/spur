@@ -7866,7 +7866,50 @@ impl ClusterManager {
         });
     }
 
-    /// Evict a single job by ID: transition to NodeFail, then free its
+    /// Re-pend a Requeue-mode victim whose run ended inside its grace because a
+    /// node was lost, freeing the nodes that had not reported and earmarking them
+    /// for the preemptor. `None` when the state machine refuses.
+    fn repend_evicted_victim(
+        job: &mut Job,
+        nodes: &mut HashMap<String, Node>,
+        pending: &PreemptPending,
+        at: DateTime<Utc>,
+        freed_for_preemptor: &mut Vec<(JobId, Vec<String>)>,
+    ) -> Option<JobFinalized> {
+        let job_id = job.job_id;
+        let held = job.allocated_nodes.clone();
+        let allocated_resources = job.allocated_resources.clone();
+        let per_node_alloc = job.per_node_alloc.clone();
+        let reported: Vec<String> = job.node_completions.keys().cloned().collect();
+
+        let begin = Self::preempt_hold_until(job, at, pending.requeue_hold_secs);
+        let finalized = Self::repend_after_preemption(
+            job,
+            begin,
+            Some(pending.preempted_by),
+            pending.preempt_qos.clone(),
+            at,
+        )?;
+        Self::deallocate_job_slices(
+            nodes,
+            &held,
+            allocated_resources.as_ref(),
+            &per_node_alloc,
+            &reported,
+            job_id,
+        );
+        let newly_freed: Vec<String> = held
+            .into_iter()
+            .filter(|node| !reported.contains(node))
+            .collect();
+        if !newly_freed.is_empty() {
+            freed_for_preemptor.push((pending.preempted_by, newly_freed));
+        }
+        Some(finalized)
+    }
+
+    /// Evict a single job by ID: transition to NodeFail (or end it as its
+    /// preemption when inside a grace), then free its
     /// allocations on every node it spans. Transition is validated first
     /// so allocations are never freed for a job that can't be evicted.
     /// Nodes that already reported completion via `JobNodeComplete` (which
@@ -7882,6 +7925,27 @@ impl ClusterManager {
         freed_for_preemptor: &mut Vec<(JobId, Vec<String>)>,
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
+
+        // A victim that loses a node inside its grace ends as the preemption it
+        // was warned of, not as a node failure that would charge its requeue
+        // budget or lose a Requeue-mode victim without --requeue.
+        let grace = job
+            .preempt_grace()
+            .filter(|_| job.state == JobState::Running && job.cancel_signaled_at.is_none())
+            .cloned();
+        match grace {
+            Some(pending) if pending.mode == PreemptMode::Requeue => {
+                return Self::repend_evicted_victim(
+                    job,
+                    nodes,
+                    &pending,
+                    timestamp,
+                    freed_for_preemptor,
+                );
+            }
+            Some(_) => Self::adopt_grace_provenance(job, timestamp),
+            None => {}
+        }
 
         job.end_suspension(timestamp);
         // A run already signalled for cancellation keeps that verdict: reporting
@@ -30962,19 +31026,40 @@ state = "UP"
 
     /// A job on n1 and n2 that is warned of preemption and still RUNNING.
     fn run_two_node_job_in_grace(cm: &ClusterManager, mode: PreemptMode) -> JobId {
-        register_node(cm, "n1", 4, 8000);
-        register_node(cm, "n2", 4, 8000);
+        run_job_in_grace_across(cm, &["n1", "n2"], mode)
+    }
+
+    /// A one-CPU-per-node job on `nodes` that is warned of preemption and still RUNNING.
+    fn run_job_in_grace_across(cm: &ClusterManager, nodes: &[&str], mode: PreemptMode) -> JobId {
+        for node in nodes {
+            register_node(cm, node, 4, 8000);
+        }
         let id = submit_and_wait(cm, basic_spec("victim"));
+        let count = nodes.len() as u32;
         cm.start_job(
             id,
-            vec!["n1".into(), "n2".into()],
-            scalar_alloc(2, 2000),
-            per_node_for(&["n1", "n2"], scalar_alloc(1, 1000)),
+            nodes.iter().map(|n| n.to_string()).collect(),
+            scalar_alloc(count, u64::from(count) * 1000),
+            per_node_for(nodes, scalar_alloc(1, 1000)),
         )
         .unwrap();
         settle(cm, id, JobState::Running);
         signal_grace(cm, id, mode);
         id
+    }
+
+    fn lose_node(cm: &ClusterManager, name: &str) {
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: name.into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("lost".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+        cm.run_all_finalized_side_effects(&resp);
     }
 
     fn report_node(
@@ -31288,7 +31373,7 @@ state = "UP"
         });
 
         let job = cm.get_job(id).unwrap();
-        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(job.state, JobState::Pending);
         assert!(job.preempt_pending.is_none());
     }
 
@@ -31299,19 +31384,10 @@ state = "UP"
         register_node(&cm, "n1", 8, 16000);
         let id = run_job_in_grace(&cm, "victim", "n1");
 
-        cm.apply_operation(&WalOperation::NodeStateChange {
-            name: "n1".into(),
-            old_state: NodeState::Allocated,
-            new_state: NodeState::Down,
-            reason: Some("lost".into()),
-            admin_locked: false,
-            reason_uid: None,
-            reason_time: None,
-            at: None,
-        });
+        lose_node(&cm, "n1");
 
         let job = cm.get_job(id).unwrap();
-        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(job.state, JobState::Pending);
         assert!(job.preempt_pending.is_none());
     }
 
@@ -31346,22 +31422,57 @@ state = "UP"
         let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
         report_node(&cm, id, "n1", grace_exit_at());
 
-        cm.apply_operation(&WalOperation::NodeStateChange {
-            name: "n2".into(),
-            old_state: NodeState::Allocated,
-            new_state: NodeState::Down,
-            reason: Some("lost".into()),
-            admin_locked: false,
-            reason_uid: None,
-            reason_time: None,
-            at: None,
-        });
+        lose_node(&cm, "n2");
 
         let job = cm.get_job(id).unwrap();
-        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
         assert!(job.preempt_pending.is_none());
         assert_eq!(cpus_in_use(&cm, "n1"), 0);
         assert_eq!(cpus_in_use(&cm, "n2"), 0, "freed once, not twice");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_in_a_cancel_grace_earmarks_the_freed_nodes_for_the_preemptor() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_job_in_grace_across(&cm, &["n1", "n2", "n3"], PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        lose_node(&cm, "n2");
+
+        let earmarks = cm.preempt_freed_nodes_raw();
+        assert_eq!(earmarks.get("n3").map(|(owner, _)| *owner), Some(99));
+        assert_eq!(cpus_in_use(&cm, "n3"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_in_a_requeue_grace_repends_the_victim_as_preempted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_job_in_grace_across(&cm, &["n1", "n2", "n3"], PreemptMode::Requeue);
+        assert!(!cm.get_job(id).unwrap().spec.requeue);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        lose_node(&cm, "n2");
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Requeue"));
+        assert_eq!(job.preempt_requeue_count, 1);
+        assert_eq!(job.requeue_count, 0, "a preemption is not a failure");
+        assert!(job.preempt_pending.is_none());
+        assert!(job.spec.begin_time.is_some());
+        for node in ["n1", "n2", "n3"] {
+            assert_eq!(cpus_in_use(&cm, node), 0, "{node} freed exactly once");
+        }
+        assert_eq!(
+            cm.preempt_freed_nodes_raw()
+                .get("n3")
+                .map(|(owner, _)| *owner),
+            Some(99)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

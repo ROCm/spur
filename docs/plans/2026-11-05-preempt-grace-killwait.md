@@ -42,8 +42,13 @@ This work adds:
   first. When the batch script's own node reports, the job has ended and the remaining nodes are
   stopped.
 - Overrides: a user `scancel` during a grace wins and the run ends as that cancel; so do `scontrol requeue`,
-  node failure, reservation end and an out-of-memory kill. `scontrol suspend` of a job in
-  its grace is refused.
+  reservation end and an out-of-memory kill. `scontrol suspend` of a job in its grace is refused.
+- Losing a node during a grace ends the run as the preemption it was warned of (`evict_job_locked`):
+  Cancel mode adopts the grace provenance and ends Cancelled; Requeue mode re-pends through
+  `repend_after_preemption`, as the `JobComplete` path does. The warning already committed the run to
+  ending as a preemption, so the node loss only brings the end forward. Routing it through the node-failure
+  requeue would charge `requeue_count` and lose a Requeue-mode victim that has no `--requeue`. The nodes
+  that had not reported are earmarked for the preemptor in both modes.
 
 ### Kill waits
 
@@ -272,6 +277,8 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `suspend_mode_preemption_refused_at_apply_is_not_a_preemption`,
   `resuming_a_job_that_carries_a_grace_drops_the_grace`,
   `losing_a_node_still_running_ends_a_partially_exited_grace_victim`,
+  `losing_a_node_in_a_cancel_grace_earmarks_the_freed_nodes_for_the_preemptor`,
+  `losing_a_node_in_a_requeue_grace_repends_the_victim_as_preempted`,
   `partition_grace_time_round_trips_through_update_and_clear`, and the `run_attempt` gate on the final
   preemption: the apply side (`preempt_cancel_decided_for_an_earlier_run_is_a_noop`,
   `preempt_requeue_decided_for_an_earlier_run_is_a_noop`,
