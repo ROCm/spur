@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{Duration, Utc};
 use tracing::{debug, info};
@@ -16,7 +16,7 @@ use spur_core::resource::{
 
 use crate::node_match::NodePlacement;
 use crate::timeline::{NodeTimeline, UNLIMITED_JOB_DURATION};
-use crate::traits::{Assignment, ClusterState, Scheduler};
+use crate::traits::{AdmitAll, Assignment, ClusterState, JobStart, Scheduler, StartAdmission};
 
 /// Backfill scheduler.
 ///
@@ -59,6 +59,8 @@ enum UnplacedKind {
     NoCapacityAtStart,
     /// Placeable, but only in a future slot, which is now held for the job.
     FutureSlotReserved,
+    /// Placeable now, but the caller's admission refused the start.
+    RefusedAtStart,
 }
 
 impl UnplacedKind {
@@ -71,6 +73,7 @@ impl UnplacedKind {
             Self::TooFewCandidates => "too_few_candidates",
             Self::NoCapacityAtStart => "no_capacity_at_start",
             Self::FutureSlotReserved => "future_slot_reserved",
+            Self::RefusedAtStart => "refused_at_start",
         }
     }
 }
@@ -515,11 +518,13 @@ impl BackfillScheduler {
                             }
                         }
                     }
+                    // A probe on a throwaway scheduler: it must never charge the caller.
                     let immediate = trial.schedule_jobs(
                         std::slice::from_ref(&block_job),
                         &projected,
                         floor,
                         false,
+                        &mut AdmitAll,
                     );
                     let mut start = None;
                     let mut allocations = HashMap::new();
@@ -664,12 +669,77 @@ impl BackfillScheduler {
 }
 
 impl BackfillScheduler {
+    /// [`Scheduler::schedule`] at the caller's `now`, asking `admission` before every
+    /// start so the caller can charge or refuse it. Reservation matching and
+    /// [`Self::planned_job_starts`] still read `Utc::now()`.
+    pub fn schedule_with(
+        &mut self,
+        pending: &[Job],
+        cluster: &ClusterState,
+        now: chrono::DateTime<Utc>,
+        admission: &mut dyn StartAdmission,
+    ) -> Vec<Assignment> {
+        self.schedule_jobs(pending, cluster, now, true, admission)
+    }
+
+    /// Asks `admission` to start a heterogeneous job's start-now `components`, each
+    /// with its end, as one. If refused, none of them starts and the slots reserved
+    /// for them are released.
+    fn admit_het_components(
+        &mut self,
+        components: &[(&Job, chrono::DateTime<Utc>)],
+        now: chrono::DateTime<Utc>,
+        admission: &mut dyn StartAdmission,
+        assignments: &mut Vec<Assignment>,
+        unplaced: &mut HashMap<JobId, Unplaced>,
+    ) {
+        let is_component = |id: JobId| components.iter().any(|(job, _)| job.job_id == id);
+        let starts: Vec<JobStart> = assignments
+            .iter()
+            .filter_map(|assignment| {
+                let (job, end) = components
+                    .iter()
+                    .find(|(job, _)| job.job_id == assignment.job_id)?;
+                Some(JobStart {
+                    job,
+                    nodes: &assignment.nodes,
+                    start: now,
+                    end: *end,
+                })
+            })
+            .collect();
+        if admission.admit(&starts) {
+            for start in &starts {
+                debug!(job_id = start.job.job_id, nodes = ?start.nodes, "scheduling job");
+            }
+            return;
+        }
+        for start in &starts {
+            unplaced.insert(
+                start.job.job_id,
+                Unplaced {
+                    kind: UnplacedKind::RefusedAtStart,
+                    needed_nodes: start.job.spec.num_nodes.max(1),
+                    candidates: start.nodes.len() as u32,
+                    planned_start: None,
+                },
+            );
+        }
+        assignments.retain(|assignment| !is_component(assignment.job_id));
+        for timeline in &mut self.timelines {
+            timeline
+                .intervals
+                .retain(|interval| interval.job_id.is_none_or(|id| !is_component(id)));
+        }
+    }
+
     fn schedule_jobs(
         &mut self,
         pending: &[Job],
         cluster: &ClusterState,
         now: chrono::DateTime<Utc>,
         initialize: bool,
+        admission: &mut dyn StartAdmission,
     ) -> Vec<Assignment> {
         if initialize {
             self.init_timelines(cluster.nodes);
@@ -738,7 +808,30 @@ impl BackfillScheduler {
         let mut unplaced: HashMap<JobId, Unplaced> = HashMap::new();
         let limit = pending.len().min(self.max_jobs);
 
+        // A heterogeneous job's components that can start now are reserved as they are
+        // placed, then admitted together once its last component is placed (or the
+        // pass ends first), keyed by that last component's index.
+        let het_last: HashMap<usize, usize> = het_groups
+            .values()
+            .filter(|components| components.len() > 1)
+            .filter_map(|components| components.iter().max().map(|&last| (components, last)))
+            .flat_map(|(components, last)| components.iter().map(move |&i| (i, last)))
+            .collect();
+        let mut het_starts: BTreeMap<usize, Vec<(&Job, chrono::DateTime<Utc>)>> = BTreeMap::new();
+
         'jobs: for (job_idx, job) in pending.iter().enumerate().take(limit) {
+            while let Some(entry) = het_starts
+                .first_entry()
+                .filter(|entry| *entry.key() < job_idx)
+            {
+                self.admit_het_components(
+                    &entry.remove(),
+                    now,
+                    admission,
+                    &mut assignments,
+                    &mut unplaced,
+                );
+            }
             let mut note = |kind: UnplacedKind, candidates: usize, planned_start| {
                 unplaced.insert(
                     job.job_id,
@@ -770,6 +863,17 @@ impl BackfillScheduler {
                 match self.plan_gpu_job(job, cluster, context, now) {
                     Some((assignment, start)) => {
                         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
+                        if start <= now
+                            && !admission.admit(&[JobStart {
+                                job,
+                                nodes: &assignment.nodes,
+                                start: now,
+                                end: now + duration,
+                            }])
+                        {
+                            note(UnplacedKind::RefusedAtStart, assignment.nodes.len(), None);
+                            continue;
+                        }
                         for (node, allocation) in &assignment.per_node_alloc {
                             if let Some(index) = cluster.nodes.iter().position(|n| n.name == *node)
                             {
@@ -1039,24 +1143,32 @@ impl BackfillScheduler {
                     .map(|(ni, _)| cluster.nodes[*ni].name.clone())
                     .collect();
 
+                let end = now + duration;
+                if let Some(&last) = het_last.get(&job_idx) {
+                    het_starts.entry(last).or_default().push((job, end));
+                } else if admission.admit(&[JobStart {
+                    job,
+                    nodes: &node_names,
+                    start: now,
+                    end,
+                }]) {
+                    debug!(
+                        job_id = job.job_id,
+                        nodes = ?node_names,
+                        "scheduling job"
+                    );
+                } else {
+                    note(UnplacedKind::RefusedAtStart, assigned_nodes.len(), None);
+                    continue;
+                }
+
                 for (ni, _) in &assigned_nodes {
                     let node_alloc = per_node_alloc
                         .get(&cluster.nodes[*ni].name)
                         .cloned()
                         .unwrap_or_default();
-                    self.timelines[*ni].reserve_for_job(
-                        now,
-                        now + duration,
-                        node_alloc,
-                        Some(job.job_id),
-                    );
+                    self.timelines[*ni].reserve_for_job(now, end, node_alloc, Some(job.job_id));
                 }
-
-                debug!(
-                    job_id = job.job_id,
-                    nodes = ?node_names,
-                    "scheduling job"
-                );
 
                 assignments.push(Assignment {
                     job_id: job.job_id,
@@ -1090,6 +1202,9 @@ impl BackfillScheduler {
                 );
             }
         }
+        for components in het_starts.into_values() {
+            self.admit_het_components(&components, now, admission, &mut assignments, &mut unplaced);
+        }
 
         if initialize {
             self.log_unplaced(unplaced);
@@ -1100,7 +1215,7 @@ impl BackfillScheduler {
 
 impl Scheduler for BackfillScheduler {
     fn schedule(&mut self, pending: &[Job], cluster: &ClusterState) -> Vec<Assignment> {
-        self.schedule_jobs(pending, cluster, Utc::now(), true)
+        self.schedule_with(pending, cluster, Utc::now(), &mut AdmitAll)
     }
 
     fn name(&self) -> &str {
@@ -3280,6 +3395,405 @@ mod tests {
             0,
             "neither het component should schedule if one can't"
         );
+    }
+
+    #[derive(Debug, PartialEq)]
+    pub(super) struct Asked {
+        pub(super) job_id: JobId,
+        pub(super) nodes: Vec<String>,
+        pub(super) start: chrono::DateTime<Utc>,
+        pub(super) end: chrono::DateTime<Utc>,
+    }
+
+    /// Records every batch of starts it is asked about and refuses any batch that
+    /// holds one of `refused`.
+    #[derive(Default)]
+    pub(super) struct Recorder {
+        pub(super) refused: HashSet<JobId>,
+        pub(super) asked: Vec<Vec<Asked>>,
+    }
+
+    impl Recorder {
+        pub(super) fn refusing(job_id: JobId) -> Self {
+            Self {
+                refused: HashSet::from([job_id]),
+                ..Default::default()
+            }
+        }
+
+        fn batches(&self) -> Vec<Vec<JobId>> {
+            self.asked
+                .iter()
+                .map(|batch| batch.iter().map(|asked| asked.job_id).collect())
+                .collect()
+        }
+    }
+
+    impl StartAdmission for Recorder {
+        fn admit(&mut self, starts: &[JobStart<'_>]) -> bool {
+            self.asked.push(
+                starts
+                    .iter()
+                    .map(|s| Asked {
+                        job_id: s.job.job_id,
+                        nodes: s.nodes.to_vec(),
+                        start: s.start,
+                        end: s.end,
+                    })
+                    .collect(),
+            );
+            starts.iter().all(|s| !self.refused.contains(&s.job.job_id))
+        }
+    }
+
+    pub(super) fn holds_a_slot(sched: &BackfillScheduler, job_id: JobId) -> bool {
+        sched
+            .timelines
+            .iter()
+            .flat_map(|timeline| &timeline.intervals)
+            .any(|interval| interval.job_id == Some(job_id))
+    }
+
+    /// `job` as component `group` of the heterogeneous job whose first component is
+    /// `anchor`.
+    fn het_component(mut job: Job, group: u32, anchor: JobId) -> Job {
+        job.het_group = Some(group);
+        job.het_job_id = (group > 0).then_some(anchor);
+        job
+    }
+
+    /// One pass over `pending` on `nodes`, all in the default partition.
+    fn schedule_admitting(
+        sched: &mut BackfillScheduler,
+        nodes: &[Node],
+        busy_until: &HashMap<String, chrono::DateTime<Utc>>,
+        pending: &[Job],
+        now: chrono::DateTime<Utc>,
+        admission: &mut dyn StartAdmission,
+    ) -> Vec<Assignment> {
+        let partitions = [Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let cluster = ClusterState {
+            fabric: None,
+            busy_until,
+            nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+        sched.schedule_with(pending, &cluster, now, admission)
+    }
+
+    fn started(assignments: &[Assignment]) -> Vec<(JobId, Vec<&str>)> {
+        assignments
+            .iter()
+            .map(|a| (a.job_id, a.nodes.iter().map(String::as_str).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn admit_all_places_a_mixed_workload_as_main_does() {
+        let mut nodes = make_nodes(3);
+        nodes[0].state = NodeState::Allocated;
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        nodes.push(make_named_gpu_node("gpu-node1", 8));
+        let busy_until =
+            HashMap::from([("node001".to_string(), Utc::now() + Duration::minutes(30))]);
+        let mut exclusive = make_job(6, 1, 1);
+        exclusive.spec.exclusive = true;
+        let pending = [
+            make_job(1, 2, 32),
+            make_gpu_job(2, 4),
+            make_job_with_nodelist(3, 1, Some("node001"), None),
+            het_component(make_job(4, 1, 16), 0, 4),
+            het_component(make_job(5, 2, 16), 1, 4),
+            exclusive,
+            make_job(7, 4, 64),
+            make_job_with_nodelist(8, 1, Some("nosuchnode"), None),
+            make_job(9, 5, 1),
+        ];
+
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = schedule_admitting(
+            &mut sched,
+            &nodes,
+            &busy_until,
+            &pending,
+            Utc::now(),
+            &mut AdmitAll,
+        );
+
+        assert_eq!(
+            started(&assignments),
+            [
+                (1, vec!["node002", "node003"]),
+                (2, vec!["gpu-node1"]),
+                (4, vec!["gpu-node1"]),
+                (5, vec!["gpu-node1", "node002"]),
+            ]
+        );
+        let mut outcomes: Vec<_> = sched
+            .last_outcome
+            .iter()
+            .map(|(id, outcome)| (*id, outcome.kind))
+            .collect();
+        outcomes.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            outcomes,
+            [
+                (3, UnplacedKind::FutureSlotReserved),
+                (6, UnplacedKind::FutureSlotReserved),
+                (7, UnplacedKind::FutureSlotReserved),
+                (8, UnplacedKind::NoSuitableNodes),
+                (9, UnplacedKind::TooFewCandidates),
+            ]
+        );
+        let planned_by_job = sched.planned_job_starts();
+        let mut planned: Vec<(JobId, Vec<&str>)> = planned_by_job
+            .iter()
+            .map(|(id, (nodes, _))| {
+                let mut nodes: Vec<_> = nodes.iter().map(String::as_str).collect();
+                nodes.sort();
+                (*id, nodes)
+            })
+            .collect();
+        planned.sort();
+        assert_eq!(
+            planned,
+            [
+                (3, vec!["node001"]),
+                (6, vec!["node002"]),
+                (7, vec!["gpu-node1", "node001", "node002", "node003"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_job_reserves_nothing_and_leaves_its_nodes_to_later_jobs() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::refusing(1);
+
+        let pending = [make_job(1, 1, 64), make_job(2, 1, 64)];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(1),
+            &HashMap::new(),
+            &pending,
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(started(&assignments), [(2, vec!["node001"])]);
+        assert_eq!(sched.last_outcome[&1].kind, UnplacedKind::RefusedAtStart);
+        assert!(!holds_a_slot(&sched, 1));
+        assert!(!sched.planned_job_starts().contains_key(&1));
+    }
+
+    #[test]
+    fn admission_is_asked_in_priority_order_only_for_jobs_starting_now() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::default();
+        let now = Utc::now();
+        let end = now + Duration::hours(1);
+
+        // Job 2 needs both nodes, so it waits for job 1; job 3 fits before it.
+        let pending = [make_job(1, 1, 64), make_job(2, 2, 64), make_job(3, 1, 64)];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(2),
+            &HashMap::new(),
+            &pending,
+            now,
+            &mut admission,
+        );
+
+        assert_eq!(
+            started(&assignments),
+            [(1, vec!["node001"]), (3, vec!["node002"])]
+        );
+        assert_eq!(
+            sched.last_outcome[&2].kind,
+            UnplacedKind::FutureSlotReserved
+        );
+        assert_eq!(
+            admission.asked,
+            [
+                vec![Asked {
+                    job_id: 1,
+                    nodes: vec!["node001".into()],
+                    start: now,
+                    end,
+                }],
+                vec![Asked {
+                    job_id: 3,
+                    nodes: vec!["node002".into()],
+                    start: now,
+                    end,
+                }],
+            ]
+        );
+    }
+
+    #[test]
+    fn het_job_with_a_refused_component_starts_none_and_frees_their_nodes() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::refusing(3);
+
+        let pending = [
+            het_component(make_job(1, 1, 64), 0, 1),
+            make_job(2, 1, 64),
+            het_component(make_job(3, 1, 64), 1, 1),
+            make_job(4, 2, 64),
+        ];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(3),
+            &HashMap::new(),
+            &pending,
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(admission.batches(), [vec![2], vec![1, 3], vec![4]]);
+        assert_eq!(
+            started(&assignments),
+            [(2, vec!["node002"]), (4, vec!["node001", "node003"])]
+        );
+        for component in [1, 3] {
+            assert_eq!(
+                sched.last_outcome[&component].kind,
+                UnplacedKind::RefusedAtStart
+            );
+            assert!(!holds_a_slot(&sched, component));
+        }
+    }
+
+    #[test]
+    fn a_refused_het_job_at_the_end_of_the_queue_starts_no_component() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::refusing(3);
+
+        let pending = [
+            make_job(1, 1, 64),
+            het_component(make_job(2, 1, 64), 0, 2),
+            het_component(make_job(3, 1, 64), 1, 2),
+        ];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(3),
+            &HashMap::new(),
+            &pending,
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(admission.batches(), [vec![1], vec![2, 3]]);
+        assert_eq!(started(&assignments), [(1, vec!["node001"])]);
+        for component in [2, 3] {
+            assert_eq!(
+                sched.last_outcome[&component].kind,
+                UnplacedKind::RefusedAtStart
+            );
+            assert!(!holds_a_slot(&sched, component));
+        }
+    }
+
+    #[test]
+    fn two_het_jobs_in_one_pass_are_admitted_separately() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut admission = Recorder::refusing(4);
+
+        let pending = [
+            het_component(make_job(1, 1, 64), 0, 1),
+            het_component(make_job(2, 1, 64), 0, 2),
+            het_component(make_job(3, 1, 64), 1, 1),
+            het_component(make_job(4, 1, 64), 1, 2),
+        ];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(4),
+            &HashMap::new(),
+            &pending,
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(admission.batches(), [vec![1, 3], vec![2, 4]]);
+        assert_eq!(
+            started(&assignments),
+            [(1, vec!["node001"]), (3, vec!["node003"])]
+        );
+        for component in [2, 4] {
+            assert_eq!(
+                sched.last_outcome[&component].kind,
+                UnplacedKind::RefusedAtStart
+            );
+            assert!(!holds_a_slot(&sched, component));
+        }
+    }
+
+    #[test]
+    fn het_jobs_cut_by_the_depth_limit_are_admitted_separately() {
+        let mut sched = BackfillScheduler::new(2);
+        let mut admission = Recorder::refusing(2);
+
+        let pending = [
+            het_component(make_job(1, 1, 64), 0, 1),
+            het_component(make_job(2, 1, 64), 0, 2),
+            het_component(make_job(3, 1, 64), 1, 1),
+            het_component(make_job(4, 1, 64), 1, 2),
+        ];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &make_nodes(4),
+            &HashMap::new(),
+            &pending,
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert_eq!(admission.batches(), [vec![1], vec![2]]);
+        assert_eq!(started(&assignments), [(1, vec!["node001"])]);
+        assert_eq!(sched.last_outcome[&2].kind, UnplacedKind::RefusedAtStart);
+        assert!(!holds_a_slot(&sched, 2));
+    }
+
+    #[test]
+    fn refusing_a_het_job_releases_only_its_components_starting_now() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        nodes[0].state = NodeState::Allocated;
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let busy_until =
+            HashMap::from([("node001".to_string(), Utc::now() + Duration::minutes(30))]);
+        let mut admission = Recorder::refusing(1);
+
+        // Component 2 needs both nodes, so it waits for the busy one.
+        let pending = [
+            het_component(make_job(1, 1, 32), 0, 1),
+            het_component(make_job(2, 2, 32), 1, 1),
+        ];
+        let assignments = schedule_admitting(
+            &mut sched,
+            &nodes,
+            &busy_until,
+            &pending,
+            Utc::now(),
+            &mut admission,
+        );
+
+        assert!(assignments.is_empty());
+        assert_eq!(admission.batches(), [vec![1]]);
+        assert_eq!(sched.last_outcome[&1].kind, UnplacedKind::RefusedAtStart);
+        assert!(!holds_a_slot(&sched, 1));
+        assert_eq!(
+            sched.last_outcome[&2].kind,
+            UnplacedKind::FutureSlotReserved
+        );
+        assert!(holds_a_slot(&sched, 2));
+        assert!(sched.planned_job_starts().contains_key(&2));
     }
 
     #[test]

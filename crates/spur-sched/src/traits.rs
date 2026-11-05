@@ -33,6 +33,38 @@ pub struct ClusterState<'a> {
     pub busy_until: &'a HashMap<String, DateTime<Utc>>,
 }
 
+/// A job backfill is about to start on `nodes`, running from `start` to `end`.
+#[derive(Debug, Clone, Copy)]
+pub struct JobStart<'a> {
+    pub job: &'a Job,
+    pub nodes: &'a [String],
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// Lets the caller admit or refuse each start before backfill commits it, so limits
+/// are charged on the nodes a job actually gets.
+///
+/// Jobs are asked in placement order, each at most once per pass, and the pass
+/// returns exactly the admitted starts. A heterogeneous job is asked once, after its
+/// last component is placed, or when the pass ends if the depth limit cuts it.
+pub trait StartAdmission {
+    /// Whether all of `starts` may start: one job, or the components of a
+    /// heterogeneous job starting in this pass, which start together or not at all.
+    /// Admitting is a commitment: later jobs must see the room these take.
+    fn admit(&mut self, starts: &[JobStart<'_>]) -> bool;
+}
+
+/// Admission without limits: every placed job starts.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AdmitAll;
+
+impl StartAdmission for AdmitAll {
+    fn admit(&mut self, _starts: &[JobStart<'_>]) -> bool {
+        true
+    }
+}
+
 /// Trait for pluggable scheduler implementations.
 pub trait Scheduler: Send + Sync {
     /// Given pending jobs and current cluster state, produce assignments.
