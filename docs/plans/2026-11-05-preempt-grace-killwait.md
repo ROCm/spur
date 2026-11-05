@@ -64,6 +64,9 @@ time limit).
 
 At a time or inactivity limit the job moves to `COMPLETING` (`CG`) straight away, holds its nodes
 for the wait, and then ends `TIMEOUT` with reason `TimeLimit`. `--requeue` on timeout still works.
+`Job::is_stopping_for_time_limit` (`Completing` with `time_limit_signaled_at` set) keeps such a job
+counting as running for the singleton dependency and the array `%N` throttle (`running_array_counts`);
+other `COMPLETING` jobs (`scancel`, preemption) do not count, as before.
 
 ## Design
 
@@ -236,7 +239,8 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `qos_limits_with_numeric_grace_time_still_deserializes`, `preempt_run_attempt_wire_format_is_frozen`
   (`JobPreemptRequeue` and `JobPreemptCancel` with `run_attempt`), and the legacy-entry checks for
   the same two entries without it (the `*_from_a_pre_upgrade_entry_applies_to_any_run` tests below).
-- Job helpers (`spur-core/src/job.rs`): `preempt_grace_ignores_a_warning_recorded_for_an_earlier_run`,
+- Job helpers (`spur-core/src/job.rs`): `only_a_completing_run_signalled_for_a_limit_is_stopping_for_the_time_limit`,
+  `preempt_grace_ignores_a_warning_recorded_for_an_earlier_run`,
   `held_nodes_leaves_out_the_nodes_that_reported`.
 - Grace resolution and eligibility (`spurctld/src/scheduler_loop.rs`): `grace_time_prefers_the_qos_value`,
   `grace_time_falls_back_to_the_highest_partition`, `qos_zero_overrides_a_partition_grace`,
@@ -252,7 +256,9 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `time_limit_watchdog_skips_an_in_grace_job`, `busy_until_uses_the_grace_deadline`,
   `graceful_wait_is_timeout_wait_for_a_timed_out_run`, `graceful_wait_is_kill_wait_otherwise`,
   `an_expired_time_limit_sends_one_graceful_cancel_and_no_sigkill`.
-- State machine (`spurctld/src/cluster.rs`): `signal_preemption_records_the_grace_and_reports_it_applied`,
+- Dependencies (`spur-core/src/dependency.rs`): `singleton_waits_for_a_predecessor_still_inside_its_time_limit_kill_wait`,
+  `singleton_ignores_a_cancelled_completing_predecessor`, `singleton_waits_for_a_running_predecessor`.
+- State machine (`spurctld/src/cluster.rs`): `array_throttle_counts_a_task_stopped_by_its_time_limit_but_not_a_cancelled_one`, `signal_preemption_records_the_grace_and_reports_it_applied`,
   `a_grace_for_an_earlier_run_does_not_preempt_the_current_one`,
   `a_partial_exit_in_grace_keeps_the_job_running`, `a_replayed_partial_exit_in_grace_frees_nothing_twice`,
   `all_nodes_exiting_in_grace_ends_preempted`, `cancel_mode_exit_during_grace_ends_cancelled_and_preempted`,

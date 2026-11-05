@@ -1285,6 +1285,13 @@ impl Job {
             || (self.state == JobState::Pending && self.holds_a_placement())
     }
 
+    /// A run the controller stopped for a time or inactivity limit that is still
+    /// inside its kill wait. It still holds its allocation, so a singleton or an
+    /// array throttle must keep treating it as running.
+    pub fn is_stopping_for_time_limit(&self) -> bool {
+        self.state == JobState::Completing && self.time_limit_signaled_at.is_some()
+    }
+
     /// Earliest time the job may start: `--begin` when it falls after submit.
     pub fn eligible_time(&self) -> DateTime<Utc> {
         match self.spec.begin_time {
@@ -2162,6 +2169,18 @@ mod tests {
         assert_eq!(state, JobState::Failed);
         assert_eq!(code, 5);
         assert_eq!(signal, 11);
+    }
+
+    #[test]
+    fn only_a_completing_run_signalled_for_a_limit_is_stopping_for_the_time_limit() {
+        let mut job = timed_out_job();
+        job.state = JobState::Running;
+        assert!(!job.is_stopping_for_time_limit());
+        job.state = JobState::Completing;
+        assert!(job.is_stopping_for_time_limit());
+        job.time_limit_signaled_at = None;
+        job.cancel_signaled_at = Some(Utc::now());
+        assert!(!job.is_stopping_for_time_limit());
     }
 
     /// A job whose run the watchdog signalled for exhausting its time limit.

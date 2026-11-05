@@ -10519,7 +10519,9 @@ impl<'a> RunningTresAccumulator<'a> {
 /// (§7, D1).
 fn running_array_counts(jobs: &HashMap<JobId, Job>) -> HashMap<JobId, u32> {
     jobs.values()
-        .filter(|job| job.state == JobState::Running && !job.idle_fill)
+        .filter(|job| {
+            (job.state == JobState::Running || job.is_stopping_for_time_limit()) && !job.idle_fill
+        })
         .filter_map(|job| job.spec.array_job_id)
         .fold(HashMap::new(), |mut counts, array_id| {
             *counts.entry(array_id).or_insert(0) += 1;
@@ -38639,6 +38641,21 @@ mod idle_fill_aggregate_tests {
             Some(1),
             "only the unstamped task counts toward array_max_concurrent"
         );
+    }
+
+    #[test]
+    fn array_throttle_counts_a_task_stopped_by_its_time_limit_but_not_a_cancelled_one() {
+        let mut stopping = running_in_qos(1, "alice", "team", &["n1"], false);
+        stopping.spec.array_job_id = Some(100);
+        stopping.state = JobState::Completing;
+        stopping.time_limit_signaled_at = Some(Utc::now());
+        let mut cancelled = running_in_qos(2, "alice", "team", &["n2"], false);
+        cancelled.spec.array_job_id = Some(100);
+        cancelled.state = JobState::Completing;
+        cancelled.cancel_signaled_at = Some(Utc::now());
+        let jobs = HashMap::from([(1, stopping), (2, cancelled)]);
+
+        assert_eq!(running_array_counts(&jobs).get(&100).copied(), Some(1));
     }
 
     #[test]

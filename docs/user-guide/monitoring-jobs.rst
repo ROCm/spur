@@ -1268,7 +1268,9 @@ stays ``COMPLETING`` for up to the time-limit kill wait
 wait ends early once the job's own process (its batch script) has exited, and
 the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits: a clean
 exit on SIGTERM does not make it ``COMPLETED``. ``--requeue`` still requeues it
-on timeout. The SIGTERM is final, so a batch script can use the wait to
+on timeout. While it waits, the job still counts as running for
+``--dependency=singleton`` and for an array's ``%N`` throttle, so a successor
+or the next array task does not start until the job has ended. The SIGTERM is final, so a batch script can use the wait to
 checkpoint and exit. An idle interactive allocation reaped for inactivity
 (:ref:`inactive-limit`) normally ends ``TIMEOUT`` within a moment of the
 SIGTERM, without spending the wait in ``COMPLETING``: its work runs in ``srun``
