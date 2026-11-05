@@ -7,7 +7,7 @@ file and function name; search for the name, line numbers drift.
 
 ## Problem
 
-On `main` a preempted job received SIGTERM and, 5 seconds later, SIGKILL. The 5 seconds was fixed in
+Before this change a preempted job received SIGTERM and, 5 seconds later, SIGKILL. The 5 seconds was fixed in
 `spurd`, so neither the admin nor the workload could change it, and it is too short for a training job
 to write a checkpoint to shared storage. Time limits and the inactivity limit were a second, separate
 path with their own fixed waits.
@@ -56,7 +56,8 @@ floor of 5 seconds. A job that exits on SIGTERM is gone as soon as it exits; the
 | `timeout_kill_wait_secs` | 30 | stops that end `TIMEOUT`: the time limit and the inactivity limit |
 
 Slurm's single `KillWait` covers both; to get that, set both to the same value. A cluster that sets
-nothing keeps `main`'s timings (5 seconds for `scancel` and preemption, 30 at a time limit).
+nothing keeps the timings from before this change (5 seconds for `scancel` and preemption, 30 at a
+time limit).
 `scontrol show config` prints both effective values as `KillWait` and `TimeoutKillWait`.
 
 ### COMPLETING at time and inactivity limits
@@ -103,7 +104,12 @@ deadline if every controller is down at that moment.
   reason. Proposer: `ClusterManager::expire_time_limit`. The older `JobTimeLimitSignaled` stays for
   replay.
 - `JobPreemptRequeue` and `JobPreemptCancel` carry an optional `run_attempt`; apply does nothing when it
-  is set and differs from the job's. `None` (entries from older controllers) applies to any run.
+  is set and differs from the job's. `None` (entries from older controllers) applies to any run. The
+  stamp is the run the caller decided to preempt: `preempt_job`, `preempt_job_with_provenance` and
+  `reclaim_job_with_provenance` take it as `expected_run_attempt` (from the scheduler's snapshot) and
+  refuse a job that has moved on before proposing anything. Apply reports `preempt_applied`; a caller
+  that finds the entry was skipped returns an error instead of logging a preemption or earmarking
+  nodes.
 - Every transition that ends or replaces a run clears `preempt_pending`: the final preemption
   entries, user and admin cancel, admin requeue, eviction and node failure, time-limit expiry and
   force-complete.
@@ -126,8 +132,8 @@ deadline if every controller is down at that moment.
 
 ### Scheduler flow
 
-1. **Start.** `try_preempt` picks victims. `victim_grace_secs` returns 0, meaning preempt now as on
-   `main`, for a zero or time-capped grace, suspend mode, any Kubernetes-operator node, or any node
+1. **Start.** `try_preempt` picks victims. `victim_grace_secs` returns 0, meaning preempt now as before
+   this change, for a zero or time-capped grace, suspend mode, any Kubernetes-operator node, or any node
    lacking `signal-job` (`grace_eligible`). Otherwise `start_preemption_grace` commits
    `JobPreemptSignaled` and then `send_preemption_warning` signals the steps. A propose timeout
    warns later through `follow_late_preemption`; if the entry did not apply (the run changed) no
@@ -183,8 +189,8 @@ that still needs its nodes starts a fresh grace.
   `clear_grace_time` on the QOS and partition messages, `preempt_time` on the job message, and the
   optional `kill_wait_secs` and `timeout_kill_wait_secs` on `PingResponse`. `QosInfo.grace_time` was
   made `optional` at its existing tag, which is wire-compatible for a scalar.
-- Defaults reproduce `main` (no grace, 5 seconds for `scancel` and preemption, 30 at a time limit),
-  except that time and inactivity limited jobs now show `COMPLETING` instead of `RUNNING` for up to
+- Defaults reproduce the behaviour before this change (no grace, 5 seconds for `scancel` and
+  preemption, 30 at a time limit), except that time and inactivity limited jobs now show `COMPLETING` instead of `RUNNING` for up to
   the timeout wait, and unsupervised `srun` steps get the full wait instead of 2 seconds.
 - New controller with an old `spurd`: no `signal-job` capability so no grace, and `kill_wait_secs` is
   ignored so the old fixed 5 seconds applies, including at a time limit.
@@ -227,8 +233,9 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   frozen-JSON tests `partition_update_without_grace_time_replays`,
   `partition_update_grace_time_wire_format_is_frozen`, `job_time_limit_expired_has_a_frozen_wire_form`,
   `partition_snapshot_without_grace_time_loads`, `qos_limits_without_grace_time_deserializes`,
-  `qos_limits_with_numeric_grace_time_still_deserializes`, and the legacy-entry checks for
-  `JobPreemptRequeue` and `JobPreemptCancel` without `run_attempt`.
+  `qos_limits_with_numeric_grace_time_still_deserializes`, `preempt_run_attempt_wire_format_is_frozen`
+  (`JobPreemptRequeue` and `JobPreemptCancel` with `run_attempt`), and the legacy-entry checks for
+  the same two entries without it (the `*_from_a_pre_upgrade_entry_applies_to_any_run` tests below).
 - Job helpers (`spur-core/src/job.rs`): `preempt_grace_ignores_a_warning_recorded_for_an_earlier_run`,
   `held_nodes_leaves_out_the_nodes_that_reported`.
 - Grace resolution and eligibility (`spurctld/src/scheduler_loop.rs`): `grace_time_prefers_the_qos_value`,
@@ -236,7 +243,8 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `grace_time_defaults_to_zero`, the `effective_grace_*` cap tests,
   `grace_is_never_eligible_for_suspend`, `grace_is_not_eligible_on_a_kubernetes_node`,
   `grace_needs_every_allocated_node_to_support_signal_job`, `grace_capped_to_zero_preempts_immediately`,
-  `try_preempt_with_grace_signals_instead_of_killing`, `try_preempt_uses_partition_grace_when_qos_unset`.
+  `try_preempt_with_grace_signals_instead_of_killing`, `try_preempt_uses_partition_grace_when_qos_unset`,
+  `a_suspend_preemption_the_apply_refuses_leaves_the_victim_running`.
 - Deadline, reclaim and timers (`scheduler_loop.rs`): `grace_does_nothing_before_the_deadline`,
   `grace_preempts_at_the_deadline_with_the_stored_mode`, `grace_requeues_at_the_deadline_when_that_was_the_stored_mode`,
   `grace_finalizer_skips_a_stale_attempt`, `a_grace_that_applies_late_still_warns_the_victim`,
@@ -253,14 +261,24 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `a_reservation_ending_cancels_a_job_in_a_cancel_grace`, `suspend_refuses_a_job_in_preemption_grace`,
   `an_operator_suspend_applied_during_a_grace_leaves_the_job_running`,
   `a_preemption_suspend_applied_during_a_grace_leaves_the_job_running`,
+  `a_suspend_applied_outside_a_grace_reports_it_applied`,
   `suspend_reports_a_grace_that_lands_after_its_check`,
   `suspend_mode_preemption_refused_at_apply_is_not_a_preemption`,
   `resuming_a_job_that_carries_a_grace_drops_the_grace`,
   `losing_a_node_still_running_ends_a_partially_exited_grace_victim`,
   `partition_grace_time_round_trips_through_update_and_clear`, and the `run_attempt` gate on the final
-  preemption (`preempt_cancel_decided_for_an_earlier_run_is_a_noop`,
+  preemption: the apply side (`preempt_cancel_decided_for_an_earlier_run_is_a_noop`,
   `preempt_requeue_decided_for_an_earlier_run_is_a_noop`,
-  `preempting_a_running_job_stamps_the_run_it_was_decided_for`).
+  `preempt_cancel_decided_for_the_current_run_applies`,
+  `preempt_requeue_decided_for_the_current_run_applies`,
+  `preempt_cancel_from_a_pre_upgrade_entry_applies_to_any_run`,
+  `preempt_requeue_from_a_pre_upgrade_entry_applies_to_any_run`), the proposer
+  (`preempting_a_running_job_stamps_the_run_it_was_decided_for`,
+  `preempting_a_run_the_job_has_moved_past_proposes_nothing`,
+  `reclaiming_a_run_the_job_has_moved_past_proposes_nothing`) and the applied report
+  (`a_final_preemption_that_applies_reports_it_applied`,
+  `a_final_preemption_for_another_run_does_not_report_it_applied`,
+  `a_final_preemption_the_apply_skips_is_not_reported_as_preempted`).
 - RPC layer (`spurctld/src/server.rs`): `a_partial_exit_in_grace_does_not_signal_the_other_nodes`,
   `the_batch_scripts_node_reporting_in_grace_sends_the_graceful_cancel`,
   `job_to_proto_reports_grace_preempt_time_and_end_time`, `ping_reports_the_effective_kill_waits`.
@@ -269,7 +287,9 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   the graceful-cancel tests that assert the request's wait is honoured. `spur-k8s` has
   `virtual_agent_signal_job_is_unimplemented`.
 - CLI (`spur-cli`): `sacctmgr` tests for `gracetime` and `cleargracetime` parsing and the `GraceTime`
-  column, `scontrol` tests for `update partition` (`GraceTime`, `ClearGraceTime`, malformed value),
+  column, `scontrol` tests for `create partition` (`create_partition_reads_a_grace_time`,
+  `create_partition_rejects_a_malformed_grace_time`), `update partition` (`GraceTime`,
+  `ClearGraceTime`, malformed value),
   `show partition`, `show job` (`PreemptTime`) and `show config` (`KillWait`, `TimeoutKillWait`, absent
   against an older controller).
 
