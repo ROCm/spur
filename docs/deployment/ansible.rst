@@ -491,10 +491,13 @@ For upgrading a live cluster, see :doc:`upgrading`. For tearing a cluster down, 
 .. note::
 
    To change partitions durably, edit ``[[partitions]]`` in the controller
-   ``spur.conf`` template, re-run ``deploy.yml``, then run ``scontrol reconfigure``.
-   The restart alone does not reliably apply partition edits, because the
-   controller restores partitions from its persisted Raft state. Runtime partition
-   changes made with ``scontrol create/update/delete`` are reset by the next
+   ``spur.conf`` template, re-run ``deploy.yml`` with ``-e spur_overwrite_conf=true``
+   (without it, an existing ``spur.conf`` is left untouched), then run
+   ``scontrol reconfigure``. Overwriting re-renders the whole file from the
+   template, so hand edits to ``spur.conf`` are lost. The restart alone is not
+   enough: once the controller has taken a Raft snapshot, it restores partitions
+   from that snapshot and ignores ``[[partitions]]``. Runtime partition changes
+   made with ``scontrol create/update/delete`` are reset by the next
    ``reconfigure``; see :ref:`runtime-partitions`.
 
 See Also

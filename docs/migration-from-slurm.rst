@@ -54,7 +54,7 @@ noted as "accepted for compatibility" parse without error but have no effect yet
    * - Area
      - Difference
    * - Partitions
-     - ``scontrol create/update/delete PartitionName=`` work at runtime and persist across restarts, but ``spur.conf`` is never rewritten: the next ``scontrol reconfigure`` resets partitions to the file, deleting runtime-only ones. See :ref:`runtime-partitions`.
+     - ``scontrol create/update/delete PartitionName=`` work at runtime and persist across restarts, but ``spur.conf`` is never rewritten: the next ``scontrol reconfigure`` resets partitions to the file, deleting runtime-only ones that have no active jobs. See :ref:`runtime-partitions`.
    * - ``--noconvert``
      - Accepted for compatibility on ``squeue``, ``sinfo``, ``sacct``, ``sstat``, ``sshare``, and ``sreport``. Spur already reports raw values where applicable (``sinfo``'s memory columns are MB integers; ``squeue`` has no memory column yet), so there is nothing to suppress. ``sstat`` still prints ``MemAlloc`` with an ``M`` suffix whether or not the flag is passed.
    * - ``sacct`` ``ReqMem``

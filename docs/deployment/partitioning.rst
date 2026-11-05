@@ -112,8 +112,12 @@ running, completing, or suspended jobs.
 
 Runtime changes are written to the controller's Raft log, so they replicate to
 follower controllers and survive a restart. A partition deleted at runtime stays
-deleted after a restart even if ``spur.conf`` still defines it. On restart, the
-persisted partition state takes precedence over ``[[partitions]]`` in the file.
+deleted after a restart even if ``spur.conf`` still defines it. A restart does
+not reliably apply ``[[partitions]]`` edits. Once the controller has taken a
+Raft snapshot, a restart restores the partition table from that snapshot and
+ignores ``[[partitions]]`` entirely, including partitions newly added to the
+file. Before the first snapshot, runtime changes in the log are replayed on top
+of the file. Use ``scontrol reconfigure`` to apply file edits.
 
 ``spur.conf`` is not rewritten. The next ``scontrol reconfigure`` makes the file
 authoritative again: it overwrites runtime edits to partitions the file defines
