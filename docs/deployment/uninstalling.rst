@@ -71,11 +71,14 @@ To uninstall from a custom directory, set ``INSTALL_DIR``:
 
 .. code-block:: bash
 
-   INSTALL_DIR=/opt/spur/bin curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash -s -- uninstall
+   curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | INSTALL_DIR=/opt/spur/bin bash -s -- uninstall
 
 The ``install.sh`` uninstaller removes only the binaries
 ``spur spurctld spurd spurstepd spurauthd`` and the symlinks
-``sbatch srun squeue scancel sinfo sacct scontrol``. It does **not** remove the
+``sbatch srun squeue scancel sinfo sacct scontrol`` from ``INSTALL_DIR``, plus the
+MPI plugin ``spur_mpi_pmix.so`` from the sibling ``lib/spur`` directory (for example
+``/opt/spur/lib/spur`` when ``INSTALL_DIR=/opt/spur/bin``). It removes that
+``lib/spur`` directory too, but only if it is then empty. It does **not** remove the
 extra symlinks the Ansible installer adds. If Ansible installed Spur, remove the full set
 by hand:
 
