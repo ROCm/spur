@@ -194,10 +194,11 @@ position):
 
 Raft elects a leader automatically; clients and agents may target any controller
 and are redirected to the current leader. See :doc:`native-host` for the full
-per-node controller/agent setup. The Ansible ``spur_wireguard`` role automates
-this for multi-controller inventories: list the controllers in ``spur_controllers``
-with ``spur_transport=wireguard`` and it runs the bootstrap ``net init`` and the
-full-mesh ``net mesh`` pass (see :doc:`ansible`).
+per-node controller/agent setup. Ansible automates this for multi-controller
+inventories: with the controllers in ``spur_controllers`` and
+``spur_transport=wireguard``, the ``spur_wireguard`` role runs the bootstrap
+``net init`` and the full-mesh ``net mesh`` pass, and the ``spur_controller`` role
+renders ``hosts``/``peers`` with the mesh IPs (see :doc:`ansible`).
 
 k0s cluster inside the mesh
 ===========================

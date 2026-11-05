@@ -84,12 +84,16 @@ near no-op.
 
 .. note::
 
-   Native credentials (``[auth] plugin = "spur"``) are opt-in. Set
-   ``spur_auth_enabled=true`` and the ``spur_auth`` role renders the ``[auth]``
-   section, generates and distributes the key sets, and runs ``spurauthd`` on every
-   host. Roll out with the default ``spur_auth_mode=permissive`` first. See the
-   "Authentication & RBAC" section of ``ansible/README.md`` in the toolkit for the
-   variables, and :ref:`native-auth-plugin` for how the plugin works.
+   Native credentials (``[auth] plugin = "spur"``) are opt-in. Pass
+   ``-e spur_auth_enabled=true -e spur_overwrite_conf=true`` to ``deploy.yml``: the
+   ``spur_auth`` role generates and distributes the key sets and runs ``spurauthd``
+   on every host, and the controller and agent roles render ``[auth]`` into each
+   daemon's ``spur.conf``. Without ``spur_overwrite_conf=true`` an existing
+   ``spur.conf`` is left alone and keeps its old ``[auth]`` settings. First-time
+   enablement goes through ``deploy.yml``, not ``rolling_upgrade.yml``. Roll out with
+   the default ``spur_auth_mode=permissive`` first. See the "Authentication & RBAC"
+   section of ``ansible/README.md`` in the toolkit for the variables, and
+   :ref:`native-auth-plugin` for how the plugin works.
 
 Topologies
 ----------
@@ -305,7 +309,9 @@ WireGuard mesh
 
 Set ``spur_transport=wireguard`` in the inventory to run all node-to-node traffic over
 an encrypted WireGuard mesh. The ``spur_wireguard`` role installs ``wireguard-tools``,
-initializes the mesh on the controller, and joins every agent and login node to it.
+initializes the mesh on the first controller, and joins every other controller, agent,
+and login node to it. With more than one controller it then runs a full-mesh
+``net mesh`` pass.
 
 .. code-block:: ini
 
@@ -320,9 +326,10 @@ The mesh defaults are ``spur_wg_cidr=10.44.0.0/16``, ``spur_wg_port=51820``, and
 
 The mesh interface is enabled as a ``wg-quick@<iface>`` systemd unit
 (``spur_wg_persist=true``, the default) so it is recreated on boot from
-``/etc/wireguard/<iface>.conf``; the controller's reconcile then re-pushes peer
-membership. Set ``spur_wg_persist=false`` to skip boot enablement (the interface then
-only lasts until reboot).
+``/etc/wireguard/<iface>.conf``. The role saves the live peer set into that file with
+``wg-quick save`` after the mesh forms, so the full mesh comes back on boot. Set
+``spur_wg_persist=false`` to skip boot enablement (the interface then only lasts until
+reboot).
 
 .. note::
 
