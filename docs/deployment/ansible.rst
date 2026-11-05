@@ -490,9 +490,12 @@ For upgrading a live cluster, see :doc:`upgrading`. For tearing a cluster down, 
 
 .. note::
 
-   Spur has no runtime partition CLI (unlike Slurm's ``scontrol create/update/delete
-   partition``). To change partitions, edit ``[[partitions]]`` in the controller
-   ``spur.conf`` template and re-run ``deploy.yml`` (a brief controller restart).
+   To change partitions durably, edit ``[[partitions]]`` in the controller
+   ``spur.conf`` template, re-run ``deploy.yml``, then run ``scontrol reconfigure``.
+   The restart alone does not reliably apply partition edits, because the
+   controller restores partitions from its persisted Raft state. Runtime partition
+   changes made with ``scontrol create/update/delete`` are reset by the next
+   ``reconfigure``; see :ref:`runtime-partitions`.
 
 See Also
 --------

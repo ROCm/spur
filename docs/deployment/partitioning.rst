@@ -82,6 +82,46 @@ The same dual-path matching applies to ``[[nodes]]`` config blocks (which set
 features and weight; see :doc:`native-host`), keyed by ``names`` (hostlist) or
 ``selector`` (labels).
 
+.. _runtime-partitions:
+
+Managing Partitions at Runtime
+------------------------------
+
+``scontrol`` creates, updates, and deletes partitions on a running controller
+with Slurm's inline syntax:
+
+.. code-block:: bash
+
+   scontrol create PartitionName=gpu Nodes=gpu-node-[1-4] MaxTime=24:00:00 State=UP
+   scontrol update PartitionName=gpu MaxTime=48:00:00 State=DRAIN
+   scontrol delete PartitionName=gpu
+
+The inline syntax sets hostlist membership only. For label-based membership use
+the long-form subcommands, which take ``--selector`` as comma-separated
+``key=value`` pairs:
+
+.. code-block:: bash
+
+   scontrol create-partition --name gpu --selector pool=gpu
+   scontrol update-partition --name gpu --selector pool=gpu,rack=a
+   scontrol delete-partition --name gpu
+
+All three require the **Administrator** role (see
+:ref:`privileged-operations`). ``delete`` refuses a partition that still has
+running, completing, or suspended jobs.
+
+Runtime changes are written to the controller's Raft log, so they replicate to
+follower controllers and survive a restart. A partition deleted at runtime stays
+deleted after a restart even if ``spur.conf`` still defines it. On restart, the
+persisted partition state takes precedence over ``[[partitions]]`` in the file.
+
+``spur.conf`` is not rewritten. The next ``scontrol reconfigure`` makes the file
+authoritative again: it overwrites runtime edits to partitions the file defines
+(except a runtime ``PreemptExemptTime`` the file leaves unset), recreates file
+partitions deleted at runtime, and deletes runtime-created partitions the file
+does not define unless they still have active jobs. Copy any runtime change you
+want to keep into ``spur.conf`` before running ``scontrol reconfigure``.
+
 Applying Config Changes
 -----------------------
 
