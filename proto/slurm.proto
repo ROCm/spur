@@ -694,6 +694,7 @@ service SlurmAgent {
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   // Deliver a signal without tearing the run down (e.g. a preemption grace
   // warning). Agents that implement it advertise the `signal-job` capability.
+  // NOT_FOUND means the agent holds nothing of the job, so nothing was signalled.
   rpc SignalJob(AgentSignalJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);

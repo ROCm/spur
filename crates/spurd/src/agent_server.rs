@@ -10497,6 +10497,42 @@ impl AgentService {
         }
     }
 
+    /// The attempt a signal is for: `NotFound` when this node holds nothing of
+    /// the job, `None` when it runs a different attempt. An unscoped request
+    /// resolves to the current run, or stays the wildcard when only an orphaned
+    /// unsupervised step is left.
+    async fn signal_scope(&self, job_id: u32, run_attempt: u32) -> Result<Option<u32>, Status> {
+        if !self.holds_job(job_id).await {
+            return Err(Status::not_found(format!(
+                "job {job_id} is not held by this node"
+            )));
+        }
+        if !self.runs_attempt(job_id, run_attempt).await {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.resolve_cancel_attempt(job_id, run_attempt)
+                .await
+                .unwrap_or(0),
+        ))
+    }
+
+    /// Whether this node tracks any part of the job: a supervisor, the job
+    /// itself, or a step.
+    async fn holds_job(&self, job_id: u32) -> bool {
+        if !stepds_for_job(&*self.stepds.lock().await, job_id).is_empty() {
+            return true;
+        }
+        if self.running.lock().await.contains_key(&job_id) {
+            return true;
+        }
+        self.active_steps
+            .lock()
+            .await
+            .keys()
+            .any(|(tracked, _)| *tracked == job_id)
+    }
+
     /// Deliver a signal and nothing else: no launch fencing, release wait,
     /// teardown or escalation, so a warning leaves the run alive to react to it.
     async fn deliver_signal(
@@ -10520,13 +10556,13 @@ impl AgentService {
         };
         let sig = nix::sys::signal::Signal::try_from(signal)
             .map_err(|_| Status::invalid_argument(format!("invalid signal {signal}")))?;
-        if !self.runs_attempt(job_id, run_attempt).await {
+        let Some(run_attempt) = self.signal_scope(job_id, run_attempt).await? else {
             warn!(
                 job_id,
                 run_attempt, signal, "dropping a signal for a superseded run"
             );
             return Ok(());
-        }
+        };
 
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
         for descriptor in runtimes
@@ -22194,6 +22230,57 @@ mod tests {
             svc.running.lock().await.contains_key(&914),
             "a signal does not tear the job down"
         );
+    }
+
+    #[tokio::test]
+    async fn signal_job_for_a_job_this_node_does_not_hold_is_not_found() {
+        let svc = test_agent();
+
+        for run_attempt in [0, 3] {
+            let status = svc
+                .signal_job(signal_job_request(
+                    930,
+                    run_attempt,
+                    nix::sys::signal::Signal::SIGTERM,
+                    SignalTarget::Steps,
+                ))
+                .await
+                .expect_err("nothing was signalled");
+            assert_eq!(
+                status.code(),
+                tonic::Code::NotFound,
+                "attempt {run_attempt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_no_particular_attempt_is_scoped_to_the_current_run() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(931, tracked).await;
+
+        assert_eq!(svc.signal_scope(931, 0).await.expect("known job"), Some(2));
+        assert_eq!(svc.signal_scope(931, 2).await.expect("known job"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_a_superseded_attempt_has_no_scope() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(932, tracked).await;
+
+        assert_eq!(svc.signal_scope(932, 1).await.expect("known job"), None);
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_an_orphaned_step_keeps_the_wildcard_scope() {
+        let svc = test_agent();
+        svc.register_test_step(933, 4, None).await;
+
+        assert_eq!(svc.signal_scope(933, 0).await.expect("known job"), Some(0));
     }
 
     #[tokio::test]
