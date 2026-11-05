@@ -172,7 +172,8 @@ deadline if every controller is down at that moment.
 2. **During the grace.** In-grace jobs are not preemption or reclaim candidates. The preemptor waits
    for them and stays at the front of the queue, earmarks refresh, and backfill frees their nodes at
    the earlier of the estimate and the deadline plus the kill wait. The time-limit and inactivity
-   watchdogs skip in-grace jobs. New `srun` steps are placed only on nodes the job still holds.
+   watchdogs leave in-grace jobs to the finalizer until the kill wait after the deadline has passed
+   (see "Watchdog backstop"). New `srun` steps are placed only on nodes the job still holds.
 3. **Deadline.** `finalize_expired_graces` runs each pass and preempts every `Running` job past its
    deadline (`ClusterManager::jobs_past_grace_deadline` filters under the read lock and clones only the
    due jobs, so a pass with no grace running clones nothing; there is no index or persisted counter) at the matching attempt through the normal path (`preempt_victim_now`), using the stored
