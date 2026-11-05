@@ -2326,32 +2326,64 @@ impl ClusterManager {
         actor: Actor,
         operates_jobs: bool,
     ) -> anyhow::Result<()> {
-        let user = actor.user.as_str();
-        {
-            let jobs = self.jobs.read();
-            let job = jobs
-                .get(&job_id)
-                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            if job.state != JobState::Running {
-                anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
-            }
-            Self::check_job_owner_for(user, &job.spec.user, "suspend", operates_jobs)?;
-            // The preemption that ends the grace only applies to a Running job.
-            if job.preempt_grace().is_some() {
-                anyhow::bail!(
-                    "job {job_id} is in its preemption grace period and cannot be suspended"
-                );
-            }
+        self.check_suspendable(job_id, &actor.user, operates_jobs)?;
+        self.propose_suspend(job_id, actor)
+    }
+
+    fn check_suspendable(
+        &self,
+        job_id: JobId,
+        user: &str,
+        operates_jobs: bool,
+    ) -> anyhow::Result<()> {
+        let jobs = self.jobs.read();
+        let job = jobs
+            .get(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        if job.state != JobState::Running {
+            anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
         }
-        self.propose(WalOperation::JobSuspend {
+        Self::check_job_owner_for(user, &job.spec.user, "suspend", operates_jobs)?;
+        // The preemption that ends the grace only applies to a Running job.
+        if job.preempt_grace().is_some() {
+            return Err(Self::in_grace_error(job_id));
+        }
+        Ok(())
+    }
+
+    fn propose_suspend(&self, job_id: JobId, actor: Actor) -> anyhow::Result<()> {
+        let resp = self.propose(WalOperation::JobSuspend {
             job_id,
             at: chrono::Utc::now(),
             preempted_by: None,
             preempt_qos: None,
             by: (!actor.user.is_empty()).then(|| actor.clone()),
         })?;
+        if !resp.suspend_applied {
+            return Err(self.suspend_refusal(job_id));
+        }
         info!(job_id, "job suspended");
         Ok(())
+    }
+
+    fn in_grace_error(job_id: JobId) -> anyhow::Error {
+        anyhow::anyhow!("job {job_id} is in its preemption grace period and cannot be suspended")
+    }
+
+    /// Why a `JobSuspend` that was checked before it was proposed still did not
+    /// apply: the run changed in between.
+    fn suspend_refusal(&self, job_id: JobId) -> anyhow::Error {
+        let jobs = self.jobs.read();
+        let Some(job) = jobs.get(&job_id) else {
+            return anyhow::anyhow!("job {job_id} not found");
+        };
+        if job.preempt_grace().is_some() {
+            return Self::in_grace_error(job_id);
+        }
+        anyhow::anyhow!(
+            "job {job_id} could not be suspended (state {:?})",
+            job.state
+        )
     }
 
     /// Resume a suspended job: validate state, record through Raft, fold suspended time.
@@ -3183,6 +3215,9 @@ impl ClusterManager {
                     preempt_qos: preempt_qos.clone(),
                     by: None,
                 })?;
+                if !resp.suspend_applied {
+                    return Err(self.suspend_refusal(job_id));
+                }
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (suspend)");
                 Ok(PreemptOutcome::Suspended)
@@ -7500,6 +7535,42 @@ impl ClusterManager {
         }
     }
 
+    /// Suspend a run, unless it is inside its preemption grace: the deadline
+    /// is only enforced on a Running job, so a suspended one would keep the
+    /// grace forever. Returns whether the job is now suspended by this entry.
+    fn apply_suspend(
+        job: &mut Job,
+        at: DateTime<Utc>,
+        preempted_by: Option<JobId>,
+        preempt_qos: Option<&str>,
+        by: Option<&Actor>,
+    ) -> bool {
+        if job.preempt_grace().is_some() {
+            warn!(
+                job_id = job.job_id,
+                "suspend refused: the job is in its preemption grace period"
+            );
+            return false;
+        }
+        match job.apply_transition(JobState::Suspended) {
+            Ok(TransitionOutcome::Applied) => {}
+            Ok(TransitionOutcome::NoOp) => return false,
+            Err(e) => {
+                warn!(job_id = job.job_id, error = %e, "invalid suspend transition in WAL apply");
+                return false;
+            }
+        }
+        job.suspended_at = Some(at);
+        if preempted_by.is_some() {
+            job.preempted_by = preempted_by;
+            job.preempt_mode = Some("Suspend".to_string());
+            job.preempt_qos = preempt_qos.map(str::to_string);
+        } else {
+            job.suspended_by = by.cloned();
+        }
+        true
+    }
+
     /// Move a live run to Completing, where it holds its nodes until each
     /// reports. Returns whether it now waits for them: a run holding no nodes
     /// never will, so it must not wait, and the caller finalizes it instead.
@@ -8299,22 +8370,13 @@ impl ClusterManager {
                 by,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    match job.apply_transition(JobState::Suspended) {
-                        Ok(TransitionOutcome::Applied) => {
-                            job.suspended_at = Some(*at);
-                            if preempted_by.is_some() {
-                                job.preempted_by = *preempted_by;
-                                job.preempt_mode = Some("Suspend".to_string());
-                                job.preempt_qos = preempt_qos.clone();
-                            } else {
-                                job.suspended_by = by.clone();
-                            }
-                        }
-                        Ok(TransitionOutcome::NoOp) => {}
-                        Err(e) => {
-                            warn!(job_id = *job_id, error = %e, "invalid suspend transition in WAL apply")
-                        }
-                    }
+                    response.suspend_applied = Self::apply_suspend(
+                        job,
+                        *at,
+                        *preempted_by,
+                        preempt_qos.as_deref(),
+                        by.as_ref(),
+                    );
                 }
             }
             WalOperation::JobResume { job_id, at } => {
@@ -8328,6 +8390,9 @@ impl ClusterManager {
                             job.preempted_by = None;
                             job.preempt_mode = None;
                             job.preempt_qos = None;
+                            // A grace outliving the suspension would end the
+                            // resumed run at once, with no warning.
+                            job.preempt_pending = None;
                         }
                         Ok(TransitionOutcome::NoOp) => {}
                         Err(e) => {
@@ -30709,6 +30774,143 @@ state = "UP"
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.state, JobState::Running);
         assert!(job.preempt_pending.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_suspend_applied_during_a_grace_leaves_the_job_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        let resp = cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: id,
+            at: Utc::now(),
+            preempted_by: None,
+            preempt_qos: None,
+            by: Some(Actor {
+                user: "operator".to_string(),
+                uid: None,
+            }),
+        });
+
+        assert!(!resp.suspend_applied);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_grace().is_some());
+        assert!(job.suspended_at.is_none());
+        assert!(job.suspended_by.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemption_suspend_applied_during_a_grace_leaves_the_job_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        let resp = cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: id,
+            at: Utc::now(),
+            preempted_by: Some(7),
+            preempt_qos: Some("other".into()),
+            by: None,
+        });
+
+        assert!(!resp.suspend_applied);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_grace().is_some());
+        assert!(job.suspended_at.is_none());
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(job.preempt_mode, None);
+        assert_eq!(job.preempt_qos, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspend_applied_outside_a_grace_reports_it_applied() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "plain", "n1");
+
+        let resp = cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: id,
+            at: Utc::now(),
+            preempted_by: None,
+            preempt_qos: None,
+            by: None,
+        });
+
+        assert!(resp.suspend_applied);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_mode_preemption_refused_at_apply_is_not_a_preemption() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        let err = cm
+            .preempt_job_with_provenance(id, PreemptMode::Suspend, Some(7), None)
+            .expect_err("a victim in its grace cannot be suspended");
+
+        assert!(err.to_string().contains("preemption grace period"), "{err}");
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_grace().is_some());
+        assert_eq!(job.preempted_by, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_reports_a_grace_that_lands_after_its_check() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let actor = Actor {
+            user: "testuser".to_string(),
+            uid: None,
+        };
+
+        cm.check_suspendable(id, &actor.user, true)
+            .expect("no grace yet, so the early check passes");
+        signal_grace(&cm, id, PreemptMode::Requeue);
+        let err = cm
+            .propose_suspend(id, actor)
+            .expect_err("the suspend must not report success");
+
+        assert!(err.to_string().contains("preemption grace period"), "{err}");
+        assert_eq!(
+            crate::server::cluster_err_to_precondition_status(err).code(),
+            tonic::Code::FailedPrecondition
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_grace().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resuming_a_job_that_carries_a_grace_drops_the_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        cm.suspend_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Suspended);
+        // The state an older controller could leave: suspended with the grace still live.
+        let pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
+        cm.jobs.write().get_mut(&id).unwrap().preempt_pending = Some(pending);
+        assert!(cm.get_job(id).unwrap().preempt_grace().is_some());
+
+        cm.resume_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Running);
+
+        let job = cm.get_job(id).unwrap();
+        assert!(job.preempt_pending.is_none());
+        assert!(job.preempt_grace().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

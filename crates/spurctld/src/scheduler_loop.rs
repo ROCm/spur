@@ -3706,7 +3706,11 @@ fn follow_late_preemption(
                 run_attempt,
                 nodes,
             } => cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, 0).await,
-            VictimFollowUp::Suspend(job) => send_suspend_to_agents(&cluster, &job, false).await,
+            VictimFollowUp::Suspend(job) => {
+                if resp.suspend_applied {
+                    send_suspend_to_agents(&cluster, &job, false).await;
+                }
+            }
             VictimFollowUp::Warn {
                 job_id,
                 run_attempt,
@@ -6982,6 +6986,39 @@ mod tests {
                 suspend_calls.load(Ordering::SeqCst) == 1
             });
             settle(&cm, job.job_id, JobState::Suspended);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_suspend_preemption_the_apply_refuses_leaves_the_victim_running() {
+            use spur_core::job::{JobState, PreemptPending};
+            use spur_core::partition::PreemptMode;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _, suspend_calls) = spawn_mock_agent_recording().await;
+            register_node_at(&cm, "n1", addr);
+            let victim = run_on(&cm, "victim", "n1");
+            let signaled_at = Utc::now();
+            let pending = PreemptPending {
+                signaled_at,
+                deadline: signaled_at + chrono::Duration::seconds(90),
+                preempted_by: 99,
+                preempt_qos: None,
+                mode: PreemptMode::Requeue,
+                run_attempt: victim.run_attempt,
+                requeue_hold_secs: 0,
+            };
+            assert!(cm.signal_preemption(pending, victim.job_id).unwrap());
+
+            let err = preempt_victim_now(&cm, &victim, PreemptMode::Suspend, 7, None)
+                .await
+                .expect_err("a victim in its grace is not suspended");
+
+            assert!(err.to_string().contains("preemption grace period"), "{err}");
+            let after = cm.get_job(victim.job_id).unwrap();
+            assert_eq!(after.state, JobState::Running);
+            assert!(after.preempt_grace().is_some());
+            assert_eq!(suspend_calls.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

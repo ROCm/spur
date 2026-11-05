@@ -163,6 +163,14 @@ configurations keep loading.
 `scontrol suspend` on a job in its grace is refused after the ownership check, so a non-owner learns
 nothing about the job's state.
 
+The refusal is repeated when the `JobSuspend` entry applies, for operator and preemption suspends
+alike: a grace can be committed between the early check and the apply, and a Suspended job would
+never reach its deadline (the deadline scan covers Running jobs only). The apply reports whether it
+suspended the job (`ClientResponse.suspend_applied`); a caller that finds it did not returns the same
+grace error, and suspend-mode preemption reports the victim as not preempted without signalling its
+agents. `JobResume` clears `preempt_pending`, so a resumed run is plainly Running and a preemptor
+that still needs its nodes starts a fresh grace.
+
 ## Compatibility and upgrade notes
 
 - New Raft entries `JobTimeLimitExpired` (every time or inactivity limit) and `JobPreemptSignaled`
@@ -243,6 +251,11 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `requeue_mode_exit_during_grace_repends_with_hold`, `exit_during_grace_is_counted_once_when_requeued`,
   `a_user_cancel_after_a_partial_exit_in_grace_wins`, `an_oom_kill_reported_in_a_grace_ends_out_of_memory`,
   `a_reservation_ending_cancels_a_job_in_a_cancel_grace`, `suspend_refuses_a_job_in_preemption_grace`,
+  `an_operator_suspend_applied_during_a_grace_leaves_the_job_running`,
+  `a_preemption_suspend_applied_during_a_grace_leaves_the_job_running`,
+  `suspend_reports_a_grace_that_lands_after_its_check`,
+  `suspend_mode_preemption_refused_at_apply_is_not_a_preemption`,
+  `resuming_a_job_that_carries_a_grace_drops_the_grace`,
   `losing_a_node_still_running_ends_a_partially_exited_grace_victim`,
   `partition_grace_time_round_trips_through_update_and_clear`, and the `run_attempt` gate on the final
   preemption (`preempt_cancel_decided_for_an_earlier_run_is_a_noop`,

@@ -150,6 +150,10 @@ pub struct ClientResponse {
     /// run, or already warned, and left it unchanged.
     #[serde(default)]
     pub preempt_signal_applied: bool,
+    /// False when a `JobSuspend` found the run no longer Running, or inside its
+    /// preemption grace, and left it unchanged.
+    #[serde(default)]
+    pub suspend_applied: bool,
     /// False when a `JobTimeLimitExpired` found the run no longer Running or
     /// Suspended at that attempt, and left it unchanged.
     #[serde(default)]
