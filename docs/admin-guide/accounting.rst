@@ -571,7 +571,10 @@ QOS keys
        busy node, keeps its place in the queue but does not hold the rest of the
        cap from lower-priority jobs that can start now. A pass re-checks up to
        eight times, so a longer chain of such waiting jobs can still hold the
-       cap. The same applies to an account's ``grptres``.
+       cap. A job that preempted others keeps its share of the cap while the node
+       its preemption frees is held for it (see the preemption note in
+       :doc:`configuration`), so another job under the same cap can't take that
+       room. The same applies to an account's ``grptres``.
    * - ``grpwall``
      - unset (no limit)
      - Aggregate wall-clock budget across all jobs under this QOS. A bare integer
