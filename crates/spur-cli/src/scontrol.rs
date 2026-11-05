@@ -1395,6 +1395,11 @@ async fn parse_and_create(controller: &str, params: &[String]) -> Result<()> {
     }
 }
 
+/// The error for a `Key=value` parameter whose value does not parse.
+fn invalid_value(key: &str, value: &str) -> anyhow::Error {
+    anyhow::anyhow!("invalid value for {key}=: '{value}'")
+}
+
 /// Parse Slurm key=value pairs and call create_partition.
 ///
 /// Slurm keys (case-insensitive): PartitionName, Nodes, State, Default,
@@ -1438,16 +1443,19 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
                 "prioritytier" | "priorityjobfactor" => priority_tier = value.parse().unwrap_or(1),
                 "preemptmode" => preempt_mode = value.to_uppercase(),
                 "preemptexempttime" => {
-                    preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
-                        anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
-                    })?);
+                    preempt_exempt_time = Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| invalid_value("PreemptExemptTime", value))?,
+                    );
                 }
                 "exclusivetopo" => reject_exclusive_topo(value)?,
                 "gracetime" => {
-                    grace_time =
-                        Some(value.parse::<u32>().map_err(|_| {
-                            anyhow::anyhow!("invalid value for GraceTime=: '{value}'")
-                        })?);
+                    grace_time = Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| invalid_value("GraceTime", value))?,
+                    );
                 }
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
@@ -1638,7 +1646,7 @@ fn parse_update(params: &[String]) -> Result<UpdateTarget> {
         let Some((key, value)) = param.split_once('=') else {
             bail!("scontrol update: invalid input: '{param}'");
         };
-        let invalid = || anyhow::anyhow!("scontrol update: invalid value for {key}=: '{value}'");
+        let invalid = || anyhow::anyhow!("scontrol update: {}", invalid_value(key, value));
         let key_lower = key.to_lowercase();
         match key_lower.as_str() {
             "state" | "reason" => first_node_only_param = first_node_only_param.or(Some(param)),
@@ -1823,7 +1831,7 @@ fn partition_update_request(
         let Some((key, value)) = param.split_once('=') else {
             bail!("scontrol update: invalid input: '{param}'");
         };
-        let invalid = || anyhow::anyhow!("scontrol update: invalid value for {key}=: '{value}'");
+        let invalid = || anyhow::anyhow!("scontrol update: {}", invalid_value(key, value));
         match key.to_lowercase().as_str() {
             "partitionname" => name = value.into(),
             "nodes" => nodes = Some(value.into()),
@@ -1852,9 +1860,11 @@ fn partition_update_request(
             }
             "preemptmode" => preempt_mode = Some(value.to_uppercase()),
             "preemptexempttime" => {
-                preempt_exempt_time = Some(value.parse::<u32>().map_err(|_| {
-                    anyhow::anyhow!("invalid value for PreemptExemptTime=: '{value}'")
-                })?);
+                preempt_exempt_time = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| invalid_value("PreemptExemptTime", value))?,
+                );
             }
             "clearpreemptexempttime" => {
                 clear_preempt_exempt_time = value.eq_ignore_ascii_case("yes")
@@ -3254,10 +3264,22 @@ mod tests {
 
     #[test]
     fn update_partition_rejects_a_malformed_grace_time() {
-        let err = partition_update_request(&p(&["PartitionName=gpu", "GraceTime=soon"]))
+        let err = partition_update_request(&p(&["PartitionName=gpu", "gracetime=soon"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("invalid value for GraceTime="), "{err}");
+        assert_eq!(err, "scontrol update: invalid value for gracetime=: 'soon'");
+    }
+
+    #[tokio::test]
+    async fn create_partition_rejects_a_malformed_grace_time_before_contacting_the_controller() {
+        let err = parse_and_create_partition(
+            "http://unreachable.invalid:6817",
+            &p(&["PartitionName=gpu", "GraceTime=soon"]),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(err, "invalid value for GraceTime=: 'soon'");
     }
 
     #[test]
