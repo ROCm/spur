@@ -31390,6 +31390,54 @@ state = "UP"
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_running_jobs_whose_grace_deadline_has_passed_are_due() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let in_grace = run_job_on(&cm, "in-grace", "n1");
+        let _plain = run_job_on(&cm, "plain", "n1");
+        let pending = preempt_pending_for(cm.get_job(in_grace).unwrap().run_attempt, 90);
+        let deadline = pending.deadline;
+        signal_grace(&cm, in_grace, PreemptMode::Cancel);
+
+        let before = deadline - chrono::Duration::seconds(1);
+        assert!(cm.jobs_past_grace_deadline(before).is_empty());
+        let due: Vec<JobId> = cm
+            .jobs_past_grace_deadline(deadline)
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+        assert_eq!(due, [in_grace]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grace_recorded_for_an_earlier_run_is_not_due() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+        let deadline = cm.get_job(id).unwrap().preempt_pending.unwrap().deadline;
+        cm.jobs.write().get_mut(&id).unwrap().run_attempt += 1;
+
+        assert!(cm.jobs_past_grace_deadline(deadline).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_reported_during_a_grace_is_no_longer_busy() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        assert!(cm.node_has_running_jobs("n1"));
+
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(!cm.node_has_running_jobs("n1"), "n1 reported and was freed");
+        assert!(cm.node_has_running_jobs("n2"), "n2 is still running");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn losing_a_node_in_a_grace_is_a_node_failure_not_a_preemption() {
         for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
             let dir = TempDir::new().unwrap();
