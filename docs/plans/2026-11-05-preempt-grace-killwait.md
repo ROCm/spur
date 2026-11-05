@@ -47,13 +47,14 @@ This work adds:
   first. When the batch script's own node reports, the job has ended and the remaining nodes are
   stopped.
 - Overrides: a user `scancel` during a grace wins and the run ends as that cancel; so do `scontrol requeue`,
-  reservation end and an out-of-memory kill. `scontrol suspend` of a job in its grace is refused.
-- Losing a node during a grace ends the run as the preemption it was warned of (`evict_job_locked`):
-  Cancel mode adopts the grace provenance and ends Cancelled; Requeue mode re-pends through
-  `repend_after_preemption`, as the `JobComplete` path does. The warning already committed the run to
-  ending as a preemption, so the node loss only brings the end forward. Routing it through the node-failure
-  requeue would charge `requeue_count` and lose a Requeue-mode victim that has no `--requeue`. The nodes
-  that had not reported are earmarked for the preemptor in both modes.
+  node failure, reservation end and an out-of-memory kill. `scontrol suspend` of a job in its grace is refused.
+- Losing a node during a grace is an ordinary node failure, as in Slurm (`evict_job_locked`, shared by
+  node down, node removal and `JobEvict`): the run ends `NODE_FAIL`, the grace is cleared, the job gets
+  no preemption provenance (`preempted_by`, `preempt_mode` and `preempt_qos` stay unset) and it is not
+  recorded `PREEMPTED`. A requeue follows the normal `--requeue` rules through `maybe_requeue` and charges
+  `requeue_count`. The one grace-specific step is the earmark: the eviction reads the preemptor from the
+  grace before clearing it and earmarks the healthy nodes it frees (the ones that had not reported) for it,
+  in addition to the existing `preempt_mode == "Cancel"` path.
 
 ### Kill waits
 
@@ -324,8 +325,12 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
   `a_held_launch_failure_during_a_cancel_grace_holds_the_job`,
   `holding_at_the_requeue_cap_during_a_cancel_grace_holds_the_job`,
   `a_node_that_reported_during_a_grace_is_no_longer_busy`,
-  `losing_a_node_in_a_cancel_grace_earmarks_the_freed_nodes_for_the_preemptor`,
-  `losing_a_node_in_a_requeue_grace_repends_the_victim_as_preempted`,
+  `losing_a_node_in_a_grace_is_a_node_failure_not_a_preemption`,
+  `losing_a_node_in_a_grace_requeues_only_a_job_submitted_with_requeue`,
+  `losing_a_node_in_a_grace_without_requeue_leaves_the_victim_failed`,
+  `losing_a_node_in_a_grace_earmarks_the_freed_nodes_for_the_preemptor`,
+  `evicting_a_job_in_a_grace_earmarks_its_nodes_without_a_preemption_outcome`,
+  `evict_job_in_a_grace_earmarks_only_the_nodes_not_yet_reported`,
   `partition_grace_time_round_trips_through_update_and_clear`, and the `run_attempt` gate on the final
   preemption: the apply side (`preempt_cancel_decided_for_an_earlier_run_is_a_noop`,
   `preempt_requeue_decided_for_an_earlier_run_is_a_noop`,

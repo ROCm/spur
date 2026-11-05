@@ -975,11 +975,10 @@ Rules that follow from this:
   recorded ``PREEMPTED`` (or re-queued), or at the deadline, whichever comes
   first. At the deadline, only the nodes that have not yet finished are
   stopped.
-* **A node lost during the grace** ends the job as the preemption it was
-  warned of, not as a node failure: ``cancel`` mode records ``PREEMPTED``,
-  ``requeue`` mode re-queues the job even without ``--requeue`` and without
-  charging its requeue limit. The nodes that were still running are freed for
-  the preemptor.
+* **A node lost during the grace** is an ordinary node failure, as in Slurm:
+  the job ends ``NODE_FAIL`` (and is re-queued only if submitted with
+  ``--requeue``, charging its requeue limit), not ``PREEMPTED``. The nodes
+  that were still running are freed for the preemptor.
 * **A user cancel during the grace wins.** After ``scancel`` the job ends as the
   user's cancel, not as preempted.
 * **Suspending is refused.** ``scontrol suspend`` on a job in its grace fails.
