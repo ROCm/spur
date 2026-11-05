@@ -3695,6 +3695,18 @@ enum VictimFollowUp {
     },
 }
 
+impl VictimFollowUp {
+    /// Whether the entry's apply took effect: one that was refused (the run
+    /// moved on, or an admin suspend won the race) leaves nothing to follow up.
+    fn owed(&self, resp: &crate::raft::ClientResponse) -> bool {
+        match self {
+            Self::Cancel { .. } => resp.preempt_applied,
+            Self::Suspend(_) => resp.suspend_applied,
+            Self::Warn { .. } => resp.preempt_signal_applied,
+        }
+    }
+}
+
 /// Carries out a preemption whose write applied only after `propose` gave up waiting.
 fn follow_late_preemption(
     cluster: &Arc<ClusterManager>,
@@ -3707,26 +3719,21 @@ fn follow_late_preemption(
     let cluster = cluster.clone();
     late.on_late_apply(move |resp| async move {
         cluster.run_all_finalized_side_effects(&resp);
+        if !then.owed(&resp) {
+            return;
+        }
         match then {
             VictimFollowUp::Cancel {
                 job_id,
                 run_attempt,
                 nodes,
             } => cancel_job_on_nodes(&cluster, job_id, run_attempt, &nodes, 0).await,
-            VictimFollowUp::Suspend(job) => {
-                if resp.suspend_applied {
-                    send_suspend_to_agents(&cluster, &job, false).await;
-                }
-            }
+            VictimFollowUp::Suspend(job) => send_suspend_to_agents(&cluster, &job, false).await,
             VictimFollowUp::Warn {
                 job_id,
                 run_attempt,
                 nodes,
-            } => {
-                if resp.preempt_signal_applied {
-                    send_preemption_warning(&cluster, job_id, run_attempt, &nodes).await;
-                }
-            }
+            } => send_preemption_warning(&cluster, job_id, run_attempt, &nodes).await,
         }
     });
 }
@@ -6505,6 +6512,38 @@ mod tests {
             wait_for(&format!("job {job_id} -> {expected:?}"), || {
                 cm.get_job(job_id).is_some_and(|j| j.state == expected)
             });
+        }
+
+        #[test]
+        fn a_late_follow_up_is_owed_only_if_its_entry_applied() {
+            use crate::raft::ClientResponse;
+
+            let with = |set: fn(&mut ClientResponse)| {
+                let mut resp = ClientResponse::default();
+                set(&mut resp);
+                resp
+            };
+            let cancel = VictimFollowUp::Cancel {
+                job_id: 1,
+                run_attempt: 2,
+                nodes: vec!["n1".into()],
+            };
+            let suspend =
+                VictimFollowUp::Suspend(Box::new(spur_core::job::Job::new(1, JobSpec::default())));
+            let warn = VictimFollowUp::Warn {
+                job_id: 1,
+                run_attempt: 2,
+                nodes: vec!["n1".into()],
+            };
+            let skipped = ClientResponse::default();
+
+            assert!(cancel.owed(&with(|r| r.preempt_applied = true)));
+            assert!(!cancel.owed(&skipped));
+            assert!(!cancel.owed(&with(|r| r.suspend_applied = true)));
+            assert!(suspend.owed(&with(|r| r.suspend_applied = true)));
+            assert!(!suspend.owed(&skipped));
+            assert!(warn.owed(&with(|r| r.preempt_signal_applied = true)));
+            assert!(!warn.owed(&skipped));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

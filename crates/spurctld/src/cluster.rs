@@ -20124,7 +20124,10 @@ state = "UP"
                 .preempt_job_with_provenance(1, 3, mode, Some(42), None)
                 .expect_err("a preemption decided for run 3 must not reach run 4");
 
-            assert!(err.to_string().contains("run"), "{mode:?}: {err}");
+            assert!(
+                err.to_string().contains("is at run 4, not the run 3"),
+                "{mode:?}: {err}"
+            );
             assert!(proposed_preemption_ops(&recorder).is_empty(), "{mode:?}");
             let job = cm.get_job(1).unwrap();
             assert_eq!(job.state, JobState::Running, "{mode:?}");
@@ -20157,7 +20160,10 @@ state = "UP"
                 .preempt_job_with_provenance(1, 3, mode, Some(42), None)
                 .expect_err("the entry applied as a NoOp, so nothing was preempted");
 
-            assert!(err.to_string().contains("run"), "{mode:?}: {err}");
+            assert!(
+                err.to_string().contains("no longer running as run 3"),
+                "{mode:?}: {err}"
+            );
             let job = cm.get_job(1).unwrap();
             assert_eq!(job.state, JobState::Running, "{mode:?}");
             assert_eq!(job.run_attempt, 4, "{mode:?}");
