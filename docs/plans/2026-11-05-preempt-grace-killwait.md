@@ -106,7 +106,7 @@ deadline if every controller is down at that moment.
 - `JobPreemptRequeue` and `JobPreemptCancel` carry an optional `run_attempt`; apply does nothing when it
   is set and differs from the job's. `None` (entries from older controllers) applies to any run. The
   stamp is the run the caller decided to preempt: `preempt_job`, `preempt_job_with_provenance` and
-  `reclaim_job_with_provenance` take it as `expected_run_attempt` (from the scheduler's snapshot) and
+  `reclaim_job_with_provenance` take it as `expected_run_attempt` (from the snapshot the scheduler decided on) and
   refuse a job that has moved on before proposing anything. Apply reports `preempt_applied`; a caller
   that finds the entry was skipped returns an error instead of logging a preemption or earmarking
   nodes.
