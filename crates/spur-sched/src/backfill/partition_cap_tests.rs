@@ -1092,3 +1092,89 @@ fn an_uncapped_job_never_lands_on_a_node_only_a_down_partition_holds() {
     assert!(a.is_empty(), "n1 is only in the Down partition: {a:?}");
     assert_eq!(reserved(&sched, 1), Some((vec!["n2".into()], hours(2))));
 }
+
+fn total_gpu_job(id: u32, partition: &str, nodes: u32, gpus: u32, ty: Option<&str>) -> Job {
+    let mut j = job(id, partition, 1, 1);
+    j.spec.num_nodes = nodes;
+    j.spec.num_tasks = nodes;
+    j.spec.gpus = Some(spur_core::gpu_request::GpuRequest {
+        count: gpus,
+        gpu_type: ty.map(str::to_string),
+    });
+    j
+}
+
+fn gpu_counts(assignment: &Assignment) -> Vec<u64> {
+    let mut nodes: Vec<_> = assignment.per_node_alloc.keys().collect();
+    nodes.sort();
+    nodes
+        .into_iter()
+        .map(|n| assignment.per_node_alloc[n].total_device_count("gpu"))
+        .collect()
+}
+
+#[test]
+fn a_gpu_total_is_spread_within_the_per_node_gpu_cap() {
+    let fx = Fixture::new(
+        vec![gpu_node("n1", &["gpu"]), gpu_node("n2", &["gpu"])],
+        vec![partition("gpu", &[("gres/gpu", 2)])],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[total_gpu_job(1, "gpu", 2, 4, None)]);
+    assert_eq!(started(&a), [1], "[2,2] fits the cap");
+    assert_eq!(gpu_counts(&a[0]), [2, 2]);
+}
+
+#[test]
+fn a_gpu_total_is_spread_within_a_typed_caps_running_headroom() {
+    let fx = Fixture::new(
+        vec![gpu_node("n1", &["gpu"]), gpu_node("n2", &["gpu"])],
+        vec![partition("gpu", &[("gres/gpu:a100", 3)])],
+    )
+    .running(
+        "gpu",
+        "n1",
+        ResourceAllocations::default(),
+        TresCharge::new(0, 0, 2, Some("a100")),
+        hours(4),
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[total_gpu_job(1, "gpu", 2, 4, Some("a100"))]);
+    assert_eq!(started(&a), [1], "[1,3] fits the typed headroom");
+    assert_eq!(gpu_counts(&a[0]), [1, 3]);
+}
+
+#[test]
+fn default_memory_per_gpu_follows_each_nodes_gpu_share() {
+    let mut small = gpu_node("n2", &["gpu"]);
+    small.total_resources.gpus.truncate(1);
+    let fx = Fixture::new(
+        vec![gpu_node("n1", &["gpu"]), small],
+        vec![Partition {
+            def_mem_per_gpu: Some(8192),
+            ..partition("gpu", &[])
+        }],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[total_gpu_job(1, "gpu", 2, 4, None)]);
+    assert_eq!(started(&a), [1]);
+    assert_eq!(gpu_counts(&a[0]), [3, 1]);
+    assert_eq!(a[0].per_node_alloc["n1"].memory_mb, 3 * 8192);
+    assert_eq!(a[0].per_node_alloc["n2"].memory_mb, 8192);
+}
+
+#[test]
+fn a_gpu_total_is_spread_within_max_mem_per_node_at_the_per_gpu_default() {
+    let fx = Fixture::new(
+        vec![gpu_node("n1", &["gpu"]), gpu_node("n2", &["gpu"])],
+        vec![Partition {
+            def_mem_per_gpu: Some(8192),
+            max_mem_per_node: Some(2 * 8192),
+            ..partition("gpu", &[])
+        }],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[total_gpu_job(1, "gpu", 2, 4, None)]);
+    assert_eq!(started(&a), [1]);
+    assert_eq!(gpu_counts(&a[0]), [2, 2]);
+}

@@ -10,6 +10,7 @@ use spur_core::gpu_request::{distribute_total, resolve_gpu_demand, GpuDemand};
 use spur_core::job::{Job, JobId, PartitionTresOvershoot};
 use spur_core::node::Node;
 use spur_core::partition::Partition;
+use spur_core::partition_limits::{node_cpu_counts, node_memory_mb};
 use spur_core::reservation::{self, Reservation};
 use spur_core::resource::{
     build_exclusive_allocation, build_node_allocation, ResourceAllocations, ResourceSet,
@@ -442,79 +443,117 @@ impl BackfillScheduler {
             .len() as u32
     }
 
-    /// Resolve concrete per-node CPU and GPU allocations for non-uniform demand.
-    /// CPU counts are positional (aligned to task launch order); a GPU total is
-    /// packed greedily onto the most-available nodes. `None` if it cannot fit at `at_time`.
+    /// Resolve concrete per-node CPU, GPU, and memory allocations for
+    /// non-uniform demand. CPU counts are positional (aligned to task launch
+    /// order); a GPU total is packed greedily onto the nodes with the most room
+    /// for it, bounded by free devices and by `scope`'s cap headroom and
+    /// per-job memory limits. `None` if it cannot fit at `at_time`.
     fn plan_per_node_alloc(
         &self,
         job: &Job,
         demand: &GpuDemand,
         assigned_nodes: &[(usize, chrono::DateTime<Utc>)],
         nodes: &[Node],
-        at_time: chrono::DateTime<Utc>,
+        window: (chrono::DateTime<Utc>, chrono::Duration),
+        scope: Option<PartitionScope<'_>>,
     ) -> Option<HashMap<String, ResourceAllocations>> {
+        let (at_time, duration) = window;
         let base = base_node_request(job);
-        let cpu_counts = cpu_per_node_counts(job);
+        let cpu_counts = node_cpu_counts(&job.spec);
         let gpu_type = demand.gpu_type();
+        let request = |idx: usize, gpus: u32| {
+            let mut req = base.clone();
+            req.cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
+            req.memory_mb = node_memory_mb(&job.spec, u64::from(req.cpus), u64::from(gpus));
+            req.gpus = placeholder_gpus(gpus, gpu_type);
+            req
+        };
+        let fits = |ni: usize, req: &ResourceSet| {
+            let current = self.timelines[ni].accumulated_at(at_time);
+            nodes[ni]
+                .total_resources
+                .can_satisfy_with_allocated(&current, req)
+                && self.scope_admits(ni, req, scope, at_time, duration)
+        };
 
-        // Per-node GPU target keyed by node index.
-        let gpu_targets: HashMap<usize, u32> = match demand {
-            GpuDemand::None => HashMap::new(),
+        let gpu_targets: Vec<u32> = match demand {
+            GpuDemand::None => vec![0; assigned_nodes.len()],
             GpuDemand::PerNode { counts, .. } => {
                 if counts.len() != assigned_nodes.len() {
                     return None;
                 }
-                assigned_nodes
-                    .iter()
-                    .zip(counts.iter())
-                    .map(|((ni, _), &c)| (*ni, c))
-                    .collect()
+                counts.clone()
             }
             GpuDemand::Total { count, .. } => {
-                // Capacity-sorted greedy: pack GPUs onto most-available nodes.
-                let mut caps: Vec<(usize, u32)> = assigned_nodes
+                // A node's room is the most GPUs its whole share still fits
+                // with, so the greedy split never picks one a limit rejects.
+                let rooms: Vec<u32> = assigned_nodes
                     .iter()
-                    .map(|(ni, _)| (*ni, self.free_gpus_at(*ni, &nodes[*ni], gpu_type, at_time)))
+                    .enumerate()
+                    .map(|(idx, (ni, _))| {
+                        let free = self.free_gpus_at(*ni, &nodes[*ni], gpu_type, at_time);
+                        (1..=free)
+                            .rev()
+                            .find(|&gpus| fits(*ni, &request(idx, gpus)))
+                            .unwrap_or(0)
+                    })
                     .collect();
-                caps.sort_by_key(|(_, cap)| std::cmp::Reverse(*cap));
-                let cap_values: Vec<u32> = caps.iter().map(|(_, c)| *c).collect();
-                let targets = distribute_total(*count, &cap_values)?;
-                caps.iter()
-                    .zip(targets)
-                    .map(|((ni, _), give)| (*ni, give))
-                    .collect()
+                let mut order: Vec<usize> = (0..assigned_nodes.len()).collect();
+                order.sort_by_key(|&idx| std::cmp::Reverse(rooms[idx]));
+                let caps: Vec<u32> = order.iter().map(|&idx| rooms[idx]).collect();
+                let mut targets = vec![0; assigned_nodes.len()];
+                for (idx, give) in order.into_iter().zip(distribute_total(*count, &caps)?) {
+                    targets[idx] = give;
+                }
+                targets
             }
         };
 
         let mut per_node_alloc = HashMap::new();
-        for (idx, (ni, _)) in assigned_nodes.iter().enumerate() {
-            let node = &nodes[*ni];
-            let current = self.timelines[*ni].accumulated_at(at_time);
-
-            let mut req = base.clone();
-            let cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
-            req.cpus = cpus;
-            // A per-CPU memory request scales with this node's CPU share.
-            if let Some(mem_per_cpu) = job.spec.memory_per_cpu_mb {
-                req.memory_mb = mem_per_cpu * cpus as u64;
-            }
-            req.gpus = placeholder_gpus(gpu_targets.get(ni).copied().unwrap_or(0), gpu_type);
-
-            // Exact per-node feasibility against current free capacity; if a node
-            // cannot hold its share the whole placement is deferred.
-            if !node
-                .total_resources
-                .can_satisfy_with_allocated(&current, &req)
-            {
+        for (idx, ((ni, _), gpus)) in assigned_nodes.iter().zip(gpu_targets).enumerate() {
+            let req = request(idx, gpus);
+            // If a node cannot hold its exact share the whole placement is deferred.
+            if !fits(*ni, &req) {
                 return None;
             }
-
+            let node = &nodes[*ni];
+            let current = self.timelines[*ni].accumulated_at(at_time);
             per_node_alloc.insert(
                 node.name.clone(),
                 build_node_allocation(&node.total_resources, &current, &req),
             );
         }
         Some(per_node_alloc)
+    }
+
+    /// Whether one node's share stays within `scope`'s per-job memory limits
+    /// and, when its cap is enforced, within the cap for the whole run.
+    fn scope_admits(
+        &self,
+        ni: usize,
+        req: &ResourceSet,
+        scope: Option<PartitionScope<'_>>,
+        start: chrono::DateTime<Utc>,
+        duration: chrono::Duration,
+    ) -> bool {
+        let Some(scope) = scope else {
+            return true;
+        };
+        if !scope
+            .partition
+            .node_memory_allowed(u64::from(req.cpus), req.memory_mb)
+        {
+            return false;
+        }
+        if !scope.enforce_cap || !is_capped(scope.partition) {
+            return true;
+        }
+        let charge = TresCharge::from_request(req, scope.typed_gpu);
+        let cap = CapCheck {
+            partition: scope.partition,
+            charge: &charge,
+        };
+        self.timelines[ni].cap_admits(cap, start, duration)
     }
 }
 
@@ -1485,19 +1524,14 @@ impl BackfillScheduler {
             if !heterogeneous {
                 break;
             }
-            if let Some(allocations) = self
-                .plan_per_node_alloc(job, &demand, &assigned_nodes, cluster.nodes, earliest)
-                .filter(|allocations| {
-                    self.cap_admits_allocations(
-                        cluster,
-                        capped_scope,
-                        &assigned_nodes,
-                        allocations,
-                        earliest,
-                        duration,
-                    )
-                })
-            {
+            if let Some(allocations) = self.plan_per_node_alloc(
+                job,
+                &demand,
+                &assigned_nodes,
+                cluster.nodes,
+                (earliest, duration),
+                scope,
+            ) {
                 per_node_alloc = allocations;
                 break;
             }
@@ -1533,34 +1567,6 @@ impl BackfillScheduler {
             nodes: assigned_nodes.into_iter().map(|(ni, _)| ni).collect(),
             start: earliest,
             per_node_alloc,
-        })
-    }
-
-    /// Whether every node's actual share of a heterogeneous job stays within
-    /// the scope's cap for the whole run. Timing used the per-node minimum
-    /// share, so the real (possibly larger) share is checked here.
-    fn cap_admits_allocations(
-        &self,
-        cluster: &ClusterState,
-        scope: Option<PartitionScope<'_>>,
-        assigned_nodes: &[(usize, chrono::DateTime<Utc>)],
-        allocations: &HashMap<String, ResourceAllocations>,
-        start: chrono::DateTime<Utc>,
-        duration: chrono::Duration,
-    ) -> bool {
-        let Some(scope) = scope else {
-            return true;
-        };
-        assigned_nodes.iter().all(|&(ni, _)| {
-            let Some(alloc) = allocations.get(&cluster.nodes[ni].name) else {
-                return true;
-            };
-            let charge = TresCharge::from_allocation(alloc, scope.typed_gpu);
-            let cap = CapCheck {
-                partition: scope.partition,
-                charge: &charge,
-            };
-            self.timelines[ni].cap_admits(cap, start, duration)
         })
     }
 }
@@ -1625,11 +1631,7 @@ pub fn base_node_request(job: &Job) -> ResourceSet {
     }
     .max(1);
 
-    let memory = job
-        .spec
-        .memory_per_node_mb
-        .or_else(|| job.spec.memory_per_cpu_mb.map(|m| m * cpus as u64))
-        .unwrap_or(0);
+    let memory = node_memory_mb(&job.spec, u64::from(cpus), 0);
 
     let mut generic = HashMap::new();
     for gres in &job.spec.gres {
@@ -1695,24 +1697,13 @@ fn homogeneous_per_node(demand: &GpuDemand) -> Option<u32> {
     }
 }
 
-/// Per-node CPU counts honoring the task distribution (e.g. `-N2 -n7` ->
-/// `[4, 3]`), positionally aligned to the assigned nodes. Floors each node at
-/// one CPU.
-pub fn cpu_per_node_counts(job: &Job) -> Vec<u32> {
-    let cpt = job.spec.cpus_per_task.max(1);
-    spur_core::gpu_request::tasks_per_node_counts(&job.spec, job.spec.num_nodes.max(1))
-        .into_iter()
-        .map(|tasks| (tasks * cpt).max(1))
-        .collect()
-}
-
 /// Whether a job's per-node CPU demand is non-uniform, so it must take the
 /// heterogeneous allocation path rather than the uniform fast path.
 fn cpu_is_heterogeneous(job: &Job) -> bool {
     if job.spec.exclusive {
         return false;
     }
-    let counts = cpu_per_node_counts(job);
+    let counts = node_cpu_counts(&job.spec);
     counts.iter().min() != counts.iter().max()
 }
 
@@ -1727,6 +1718,7 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
     // homogeneous demand carries its exact per-node count.
     let per_node = homogeneous_per_node(&demand).unwrap_or(1);
     rs.gpus = placeholder_gpus(per_node, demand.gpu_type());
+    rs.memory_mb = node_memory_mb(&job.spec, u64::from(rs.cpus), u64::from(per_node));
     rs
 }
 
@@ -4628,7 +4620,7 @@ mod tests {
     fn base_node_request_uneven_uses_lightest_share() {
         // 3 tasks over 2 nodes -> [2,1] tasks; the base is the lightest node's
         // share (1 task * 2 cpus = 2). The exact per-node counts come from
-        // cpu_per_node_counts; feasibility must not exclude the lighter node.
+        // node_cpu_counts; feasibility must not exclude the lighter node.
         assert_eq!(cpu_request(2, 3, 2), 2);
         // 7 tasks over 2 nodes -> [4,3]; lightest share is 3.
         assert_eq!(cpu_request(2, 7, 1), 3);
@@ -4641,7 +4633,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_per_node_counts_splits_uneven_tasks() {
+    fn node_cpu_counts_splits_uneven_tasks() {
         let job = Job::new(
             1,
             JobSpec {
@@ -4652,12 +4644,12 @@ mod tests {
             },
         );
         // Block distribution: 4 tasks on node 0, 3 on node 1.
-        assert_eq!(cpu_per_node_counts(&job), vec![4, 3]);
+        assert_eq!(node_cpu_counts(&job.spec), vec![4, 3]);
         assert!(cpu_is_heterogeneous(&job));
     }
 
     #[test]
-    fn cpu_per_node_counts_scales_cpus_per_task_and_sums_to_total() {
+    fn node_cpu_counts_scales_cpus_per_task_and_sums_to_total() {
         let job = Job::new(
             1,
             JobSpec {
@@ -4668,13 +4660,13 @@ mod tests {
             },
         );
         // [4,3] tasks * 2 cpus/task = [8,6], summing to num_tasks*cpus = 14.
-        let counts = cpu_per_node_counts(&job);
+        let counts = node_cpu_counts(&job.spec);
         assert_eq!(counts, vec![8, 6]);
         assert_eq!(counts.iter().sum::<u32>(), 7 * 2);
     }
 
     #[test]
-    fn cpu_per_node_counts_uniform_is_homogeneous() {
+    fn node_cpu_counts_uniform_is_homogeneous() {
         let job = Job::new(
             1,
             JobSpec {
@@ -4684,7 +4676,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(cpu_per_node_counts(&job), vec![6, 6]);
+        assert_eq!(node_cpu_counts(&job.spec), vec![6, 6]);
         assert!(!cpu_is_heterogeneous(&job));
     }
 

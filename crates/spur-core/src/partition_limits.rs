@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::gpu_request::{resolve_gpu_demand, GpuDemand};
+use crate::gpu_request::{resolve_gpu_demand, tasks_per_node_counts, GpuDemand};
 use crate::job::JobSpec;
 use crate::partition::{Partition, TRES_CPU};
 
@@ -81,6 +81,8 @@ pub struct MemoryAdjustment {
     pub memory_per_node_mb: Option<u64>,
     #[serde(default)]
     pub memory_per_cpu_mb: Option<u64>,
+    #[serde(default)]
+    pub memory_per_gpu_mb: Option<u64>,
 }
 
 impl MemoryAdjustment {
@@ -89,6 +91,7 @@ impl MemoryAdjustment {
             cpus_per_task: spec.cpus_per_task,
             memory_per_node_mb: spec.memory_per_node_mb,
             memory_per_cpu_mb: spec.memory_per_cpu_mb,
+            memory_per_gpu_mb: spec.memory_per_gpu_mb,
         }
     }
 
@@ -96,30 +99,44 @@ impl MemoryAdjustment {
         spec.cpus_per_task = self.cpus_per_task;
         spec.memory_per_node_mb = self.memory_per_node_mb;
         spec.memory_per_cpu_mb = self.memory_per_cpu_mb;
+        spec.memory_per_gpu_mb = self.memory_per_gpu_mb;
     }
 }
 
-/// Tasks per node as the scheduler sizes a node's share (at least one).
-fn tasks_per_node(spec: &JobSpec) -> u32 {
+/// Tasks on the node holding the fewest of them (at least one).
+fn min_tasks_per_node(spec: &JobSpec) -> u32 {
     spec.tasks_per_node
         .unwrap_or(spec.num_tasks / spec.num_nodes.max(1))
         .max(1)
 }
 
-/// CPUs the job asks for on one node, floored at one like the scheduler does.
-pub fn node_cpus(spec: &JobSpec) -> u64 {
-    (u64::from(tasks_per_node(spec)) * u64::from(spec.cpus_per_task)).max(1)
+/// CPUs on the node holding the smallest share, floored at one.
+fn min_node_cpus(spec: &JobSpec) -> u64 {
+    (u64::from(min_tasks_per_node(spec)) * u64::from(spec.cpus_per_task)).max(1)
 }
 
-/// Memory (MiB) the job asks for on one node holding `cpus` of its CPUs.
-pub fn node_memory_mb(spec: &JobSpec, cpus: u64) -> u64 {
+/// CPUs the job uses on each node, in task-layout order (e.g. `-N2 -n7` ->
+/// `[4, 3]`), each floored at one.
+pub fn node_cpu_counts(spec: &JobSpec) -> Vec<u32> {
+    let cpus_per_task = spec.cpus_per_task.max(1);
+    tasks_per_node_counts(spec, spec.num_nodes.max(1))
+        .into_iter()
+        .map(|tasks| tasks.saturating_mul(cpus_per_task).max(1))
+        .collect()
+}
+
+/// Memory (MiB) the job asks for on one node holding `cpus` of its CPUs and
+/// `gpus` of its GPUs.
+pub fn node_memory_mb(spec: &JobSpec, cpus: u64, gpus: u64) -> u64 {
     spec.memory_per_node_mb
         .or_else(|| spec.memory_per_cpu_mb.map(|m| m.saturating_mul(cpus)))
+        .or_else(|| spec.memory_per_gpu_mb.map(|m| m.saturating_mul(gpus)))
         .unwrap_or(0)
 }
 
-/// Largest GPU count the job asks for on any one node.
-fn gpus_per_node(spec: &JobSpec) -> u64 {
+/// Largest GPU count on any one node when a GPU total is spread as evenly as
+/// possible. A total may land unevenly, but this spread always exists.
+fn even_node_gpus(spec: &JobSpec) -> u64 {
     match resolve_gpu_demand(spec) {
         Ok(GpuDemand::PerNode { counts, .. }) => u64::from(counts.into_iter().max().unwrap_or(0)),
         Ok(GpuDemand::Total { count, .. }) => {
@@ -127,6 +144,13 @@ fn gpus_per_node(spec: &JobSpec) -> u64 {
         }
         Ok(GpuDemand::None) | Err(_) => 0,
     }
+}
+
+/// Memory (MiB) on the node needing the most, with CPUs at their actual
+/// per-node shares and GPUs at their most even spread.
+fn peak_node_memory_mb(spec: &JobSpec) -> u64 {
+    let cpus = node_cpu_counts(spec).into_iter().max().unwrap_or(1);
+    node_memory_mb(spec, u64::from(cpus), even_node_gpus(spec))
 }
 
 impl Partition {
@@ -148,7 +172,13 @@ impl Partition {
         // memory request", so the policy must too.
         adjusted.memory_per_node_mb = adjusted.memory_per_node_mb.filter(|m| *m > 0);
         adjusted.memory_per_cpu_mb = adjusted.memory_per_cpu_mb.filter(|m| *m > 0);
-        if adjusted.memory_per_node_mb.is_none() && adjusted.memory_per_cpu_mb.is_none() {
+        adjusted.memory_per_gpu_mb = adjusted.memory_per_gpu_mb.filter(|m| *m > 0);
+        let named = [
+            adjusted.memory_per_node_mb,
+            adjusted.memory_per_cpu_mb,
+            adjusted.memory_per_gpu_mb,
+        ];
+        if named.iter().all(Option::is_none) {
             self.apply_default_memory(spec, &mut adjusted);
         }
         if let Some(limit) = self.max_mem_per_cpu.filter(|l| *l > 0) {
@@ -163,9 +193,8 @@ impl Partition {
         } else if let Some(per_cpu) = self.def_mem_per_cpu {
             adjusted.memory_per_cpu_mb = Some(per_cpu);
         } else if let Some(per_gpu) = self.def_mem_per_gpu {
-            let gpus = gpus_per_node(spec);
-            if gpus > 0 {
-                adjusted.memory_per_node_mb = Some(per_gpu.saturating_mul(gpus));
+            if even_node_gpus(spec) > 0 {
+                adjusted.memory_per_gpu_mb = Some(per_gpu);
             }
         }
     }
@@ -176,23 +205,41 @@ impl Partition {
         let limit = self.max_mem_per_node?;
         let mut adjusted = spec.clone();
         self.memory_adjusted(spec).apply_to(&mut adjusted);
-        let requested = node_memory_mb(&adjusted, node_cpus(&adjusted));
+        let requested = peak_node_memory_mb(&adjusted);
         (requested > limit).then_some((requested, limit))
+    }
+
+    /// Whether one node's share of a job, `memory_mb` with `cpus` CPUs, stays
+    /// within this partition's per-job memory limits. Binds only where the
+    /// share differs per node, as GPUs spread unevenly do.
+    pub fn node_memory_allowed(&self, cpus: u64, memory_mb: u64) -> bool {
+        let per_node_ok = self.max_mem_per_node.is_none_or(|limit| memory_mb <= limit);
+        let per_cpu_ok = self
+            .max_mem_per_cpu
+            .filter(|limit| *limit > 0)
+            .is_none_or(|limit| memory_mb <= limit.saturating_mul(cpus));
+        per_node_ok && per_cpu_ok
     }
 }
 
 /// Slurm `_valid_pn_min_mem`: `--mem-per-cpu` over the limit multiplies the
 /// CPUs per task by `ceil(mem / limit)` and divides memory per CPU by the same
 /// factor; `--mem` over `cpus × limit` raises the CPUs to `ceil(mem / limit)`.
+/// Per-GPU memory is raised for like `--mem` at its most even GPU spread.
 fn raise_cpus_for_memory(spec: &JobSpec, limit: u64, adjusted: &mut MemoryAdjustment) {
-    if let Some(per_node) = adjusted.memory_per_node_mb.filter(|m| *m > 0) {
-        let mut probe = spec.clone();
-        adjusted.apply_to(&mut probe);
+    let mut probe = spec.clone();
+    adjusted.apply_to(&mut probe);
+    let per_node = adjusted.memory_per_node_mb.or_else(|| {
+        adjusted
+            .memory_per_gpu_mb
+            .map(|m| m.saturating_mul(even_node_gpus(&probe)))
+    });
+    if let Some(per_node) = per_node.filter(|m| *m > 0) {
         let needed = per_node.div_ceil(limit);
-        if needed <= node_cpus(&probe) {
+        if needed <= min_node_cpus(&probe) {
             return;
         }
-        let per_task = needed.div_ceil(u64::from(tasks_per_node(&probe)));
+        let per_task = needed.div_ceil(u64::from(min_tasks_per_node(&probe)));
         adjusted.cpus_per_task = u32::try_from(per_task).unwrap_or(u32::MAX);
         return;
     }
@@ -319,12 +366,59 @@ mod tests {
             gres: vec!["gpu:2".into()],
             ..spec(1, None, None)
         };
+        let adjusted = p.memory_adjusted(&gpu_job);
         assert_eq!(
-            p.memory_adjusted(&gpu_job).memory_per_node_mb,
-            Some(16 * GIB)
+            (adjusted.memory_per_node_mb, adjusted.memory_per_gpu_mb),
+            (None, Some(8 * GIB))
         );
+        let mut applied = gpu_job.clone();
+        adjusted.apply_to(&mut applied);
+        assert_eq!(node_memory_mb(&applied, 1, 3), 24 * GIB);
+        assert_eq!(node_memory_mb(&applied, 1, 1), 8 * GIB);
         let cpu_job = spec(1, None, None);
         assert_eq!(p.memory_adjusted(&cpu_job), MemoryAdjustment::of(&cpu_job));
+    }
+
+    #[test]
+    fn max_mem_per_node_checks_a_gpu_total_at_its_most_even_spread() {
+        let p = Partition {
+            def_mem_per_gpu: Some(8 * GIB),
+            max_mem_per_node: Some(16 * GIB),
+            ..Default::default()
+        };
+        let total = |gpus| JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            gpus: Some(crate::gpu_request::GpuRequest {
+                count: gpus,
+                gpu_type: None,
+            }),
+            ..spec(1, None, None)
+        };
+        assert_eq!(p.max_mem_per_node_exceeded(&total(4)), None);
+        assert_eq!(
+            p.max_mem_per_node_exceeded(&total(5)),
+            Some((24 * GIB, 16 * GIB))
+        );
+        assert!(p.node_memory_allowed(1, 16 * GIB));
+        assert!(!p.node_memory_allowed(1, 24 * GIB));
+    }
+
+    #[test]
+    fn per_gpu_memory_is_raised_for_at_its_most_even_spread() {
+        let p = Partition {
+            def_mem_per_gpu: Some(4 * GIB),
+            max_mem_per_cpu: Some(2 * GIB),
+            ..Default::default()
+        };
+        let job = JobSpec {
+            gres: vec!["gpu:2".into()],
+            ..spec(1, None, None)
+        };
+        let adjusted = p.memory_adjusted(&job);
+        assert_eq!(adjusted.cpus_per_task, 4);
+        assert!(p.node_memory_allowed(4, 8 * GIB));
+        assert!(!p.node_memory_allowed(4, 12 * GIB));
     }
 
     #[test]
@@ -365,6 +459,23 @@ mod tests {
         assert!(defaulted
             .max_mem_per_node_exceeded(&spec(1, None, None))
             .is_some());
+    }
+
+    #[test]
+    fn max_mem_per_node_checks_the_largest_uneven_cpu_share() {
+        let p = Partition {
+            max_mem_per_node: Some(4 * GIB),
+            ..Default::default()
+        };
+        let uneven = JobSpec {
+            num_nodes: 2,
+            num_tasks: 3,
+            ..spec(1, None, Some(4 * GIB))
+        };
+        assert_eq!(
+            p.max_mem_per_node_exceeded(&uneven),
+            Some((8 * GIB, 4 * GIB))
+        );
     }
 
     #[test]

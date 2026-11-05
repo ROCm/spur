@@ -10451,6 +10451,7 @@ fn quota_memory_request(job: &Job, partitions: &[Partition]) -> Option<MemoryAdj
         cpus_per_task,
         memory_per_node_mb: (memory_mb > 0).then(|| memory_mb.div_ceil(nodes)),
         memory_per_cpu_mb: None,
+        memory_per_gpu_mb: None,
     })
 }
 
