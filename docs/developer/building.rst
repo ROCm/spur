@@ -234,7 +234,7 @@ Running the Tests
 Tests that require more nodes than provided, or missing GPU/container prerequisites, are automatically skipped.
 
 Old-attempt cgroup cleanup
-~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``test_old_attempt_cgroup_cleanup.py`` requires Docker access and cgroup v2 on
 the first configured native-host node. Each case runs real ``spurd`` and
@@ -255,9 +255,9 @@ launches, and retries after removing each injected cleanup failure.
 
 The image defaults to ``ubuntu:22.04``; ``SPUR_TEST_CGROUP_BASE_IMAGE`` can select
 a locally available compatible base. The test builds its Python gRPC bindings
-from the checkout's proto and uses the configured test binaries. Containers,
-the temporary image, and remote build files are removed at teardown; pytest's
-temporary directory retains the result and agent log for each case.
+from the checkout's protocol definition and uses the configured test binaries.
+Containers, the temporary image, and remote build files are removed at teardown.
+The pytest temporary directory retains the result and agent log for each case.
 
 End-to-End Tests (Kubernetes)
 -----------------------------
