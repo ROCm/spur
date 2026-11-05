@@ -91,6 +91,12 @@ fn grace_time_patch(field: Option<u32>, clear: bool) -> Result<Option<Option<i32
         .transpose()
 }
 
+/// What the audit record shows for a grace patch: the stored seconds, or JSON
+/// null when the value was cleared, so a clear is recorded like any other change.
+fn grace_time_audit(patch: Option<Option<i32>>) -> Option<serde_json::Value> {
+    patch.map(|stored| stored.map_or(serde_json::Value::Null, Into::into))
+}
+
 fn qos_info_from_record(r: db::QosRecord) -> QosInfo {
     QosInfo {
         idle_fill_preemptable: r.idle_fill_preemptable,
@@ -1092,6 +1098,7 @@ impl SlurmAccounting for AccountingService {
                     .map_err(Status::invalid_argument)
             })
             .transpose()?;
+        let grace_time = grace_time_patch(req.grace_time, req.clear_grace_time)?;
         let update = db::QosUpdate {
             idle_fill_preemptable: req.idle_fill_preemptable,
             description: req.description.as_deref(),
@@ -1119,7 +1126,7 @@ impl SlurmAccounting for AccountingService {
             } else {
                 req.preempt_exempt_time.map(|v| Some(v as i32))
             },
-            grace_time: grace_time_patch(req.grace_time, req.clear_grace_time)?,
+            grace_time,
             flags: flags.as_deref(),
         };
         let mut tx = pool.begin().await.map_err(internal)?;
@@ -1137,7 +1144,7 @@ impl SlurmAccounting for AccountingService {
             ("grp_wall_minutes", req.grp_wall_minutes.map(Into::into)),
             ("max_tres_per_job", req.max_tres_per_job.map(Into::into)),
             ("grp_tres", req.grp_tres.map(Into::into)),
-            ("grace_time", req.grace_time.map(Into::into)),
+            ("grace_time", grace_time_audit(grace_time)),
             ("flags", flags.map(Into::into)),
         ]);
         write_txn_in_band(
@@ -1770,6 +1777,31 @@ mod tests {
     fn grace_time_patch_clear_writes_null_and_wins_over_a_value() {
         assert_eq!(grace_time_patch(None, true).unwrap(), Some(None));
         assert_eq!(grace_time_patch(Some(600), true).unwrap(), Some(None));
+    }
+
+    #[test]
+    fn grace_time_audit_records_a_value_a_clear_and_nothing() {
+        assert_eq!(
+            grace_time_audit(grace_time_patch(None, false).unwrap()),
+            None
+        );
+        assert_eq!(
+            grace_time_audit(grace_time_patch(Some(600), false).unwrap()),
+            Some(serde_json::json!(600))
+        );
+        assert_eq!(
+            grace_time_audit(grace_time_patch(None, true).unwrap()),
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn grace_time_audit_records_what_was_stored_when_a_value_and_a_clear_are_both_given() {
+        let details = txn::requested(&[(
+            "grace_time",
+            grace_time_audit(grace_time_patch(Some(600), true).unwrap()),
+        )]);
+        assert_eq!(details, serde_json::json!({ "grace_time": null }));
     }
 
     #[test]

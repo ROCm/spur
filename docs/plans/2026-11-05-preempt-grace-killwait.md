@@ -350,7 +350,9 @@ Unit tests call real code, use explicit fixtures and have no timeouts.
 `#[ignore]`d unless `DATABASE_URL` points at PostgreSQL: `qos_grace_time_unset_vs_zero_round_trips`
 (`spurctld/src/accounting/db.rs`) checks unset is NULL, an explicit `0` is kept, and `cleargracetime`
 returns to NULL. The gRPC patch logic is covered without a database by the `grace_time_patch_*` tests
-in `accounting/grpc.rs`.
+in `accounting/grpc.rs`, and the audit record by `grace_time_audit_records_a_value_a_clear_and_nothing` and
+`grace_time_audit_records_what_was_stored_when_a_value_and_a_clear_are_both_given`: the record carries the
+stored seconds, or null for a clear, and a clear given together with a value records the null that was stored.
 
 ### End-to-end tests (`tests/native_host/e2e/`)
 
