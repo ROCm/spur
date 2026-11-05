@@ -339,7 +339,8 @@ async fn an_oversized_default_in_one_candidate_does_not_strand_the_job() {
 }
 
 #[test]
-fn run_attribution_records_the_chosen_partitions_adjusted_request() {
+fn a_placement_is_planned_with_the_chosen_partitions_adjusted_request() {
+    use spur_sched::partition_cap::planned_memory_adjustment;
     let p = Partition {
         max_mem_per_cpu: Some(2 * GIB),
         ..partition("cpu", &[])
@@ -354,11 +355,14 @@ fn run_attribution_records_the_chosen_partitions_adjusted_request() {
             },
         )
     };
+    let cpus = |job: &Job| {
+        planned_memory_adjustment(job, Some(&p))
+            .unwrap()
+            .cpus_per_task
+    };
 
-    let three = RunAttribution::for_partition(&job(Some(3 * GIB), None), Some(&p), false);
-    assert_eq!(three.effective_partition.as_deref(), Some("cpu"));
     assert_eq!(
-        three.memory_adjustment,
+        planned_memory_adjustment(&job(Some(3 * GIB), None), Some(&p)),
         Some(MemoryAdjustment {
             cpus_per_task: 4,
             memory_per_node_mb: None,
@@ -366,18 +370,13 @@ fn run_attribution_records_the_chosen_partitions_adjusted_request() {
             memory_per_gpu_mb: None,
         })
     );
-    let five = RunAttribution::for_partition(&job(Some(5 * GIB), None), Some(&p), false);
-    assert_eq!(five.memory_adjustment.unwrap().cpus_per_task, 6);
-    let per_node = RunAttribution::for_partition(&job(None, Some(8 * GIB)), Some(&p), true);
-    assert_eq!(per_node.memory_adjustment.unwrap().cpus_per_task, 4);
-    assert!(per_node.idle_fill);
-
-    let within = RunAttribution::for_partition(&job(Some(GIB), None), Some(&p), false);
-    assert_eq!(within.memory_adjustment, None);
+    assert_eq!(cpus(&job(Some(5 * GIB), None)), 6);
+    assert_eq!(cpus(&job(None, Some(8 * GIB))), 4);
     assert_eq!(
-        RunAttribution::for_partition(&job(None, None), None, false),
-        RunAttribution::default()
+        planned_memory_adjustment(&job(Some(GIB), None), Some(&p)),
+        None
     );
+    assert_eq!(planned_memory_adjustment(&job(None, None), None), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -397,7 +396,11 @@ async fn default_memory_is_applied_at_start_when_the_job_names_none() {
     let job = cm.get_job(id).unwrap();
     let partitions = cm.get_partitions();
     let d = partitions.iter().find(|p| p.name == "d");
-    let attribution = RunAttribution::for_partition(&job, d, false);
+    let attribution = RunAttribution {
+        effective_partition: Some("d".into()),
+        memory_adjustment: spur_sched::partition_cap::planned_memory_adjustment(&job, d),
+        ..Default::default()
+    };
     let res = scalar_alloc(2, GIB);
     cm.reserve_attributed_placement(
         id,
@@ -810,11 +813,7 @@ fn run_pass(cm: &ClusterManager) -> Vec<JobId> {
     cm.annotate_partition_cap_pending(&unscheduled, scheduler.partition_cap_blocks());
     for a in &assignments {
         let job = cm.get_job(a.job_id).unwrap();
-        let partition = a
-            .partition
-            .as_deref()
-            .and_then(|name| partitions.iter().find(|p| p.name == name));
-        let attribution = RunAttribution::for_partition(&job, partition, false);
+        let attribution = RunAttribution::for_assignment(a, false);
         let resources =
             crate::scheduler_loop::compute_job_allocation(&job, &a.nodes, &a.per_node_alloc);
         activate(

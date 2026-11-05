@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use spur_core::job::{Job, JobId};
 use spur_core::node::Node;
 use spur_core::partition::Partition;
+use spur_core::partition_limits::MemoryAdjustment;
 use spur_core::reservation::Reservation;
 use spur_core::resource::ResourceAllocations;
 use spur_core::topology::TopologyTree;
@@ -23,6 +24,10 @@ pub struct Assignment {
     /// Partition the run is charged to, chosen among the job's candidates.
     /// `None` when no requested partition contains the assigned nodes.
     pub partition: Option<String>,
+    /// The request as `partition`'s memory policy reshaped it when this
+    /// placement was sized, so the run starts with what it was planned for.
+    /// `None` when the policy changes nothing.
+    pub memory_adjustment: Option<MemoryAdjustment>,
 }
 
 /// Cluster state visible to the scheduler.

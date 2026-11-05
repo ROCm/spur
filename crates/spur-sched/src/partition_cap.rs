@@ -170,6 +170,16 @@ pub fn job_in_partition<'a>(job: &'a Job, partition: &Partition) -> Cow<'a, Job>
     Cow::Owned(job)
 }
 
+/// The request `partition`'s memory policy gives the job, or `None` when it
+/// changes nothing or no partition is charged.
+pub fn planned_memory_adjustment(
+    job: &Job,
+    partition: Option<&Partition>,
+) -> Option<MemoryAdjustment> {
+    let adjusted = partition?.memory_adjusted(&job.spec);
+    (adjusted != MemoryAdjustment::of(&job.spec)).then_some(adjusted)
+}
+
 /// The job restricted to the requested partitions that admit it now (see
 /// [`Partition::admits`]), so placement never uses a node only an ineligible
 /// partition holds. `None` when every requested partition rules it out. An
