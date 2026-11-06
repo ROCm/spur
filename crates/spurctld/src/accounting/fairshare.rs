@@ -105,12 +105,18 @@ pub(super) fn compute_fairshare(
 
     let mut factors = HashMap::new();
     for (key, user_share) in &user_shares {
+        let user_cap = if *user_share > 0.0 {
+            (*user_share * FAIRSHARE_CAP).max(1.0)
+        } else {
+            0.0
+        };
+
         let usage_val = user_usage.get(key).copied().unwrap_or(0.0);
         let factor = if usage_val < epsilon {
-            (*user_share / epsilon).min(FAIRSHARE_CAP)
+            user_cap
         } else {
             let actual_share = usage_val / total_usage.max(epsilon);
-            (user_share / actual_share).min(FAIRSHARE_CAP)
+            (user_share / actual_share).min(user_cap)
         };
         factors.insert(key.clone(), factor);
     }
@@ -259,10 +265,23 @@ mod tests {
             &HashMap::new(),
         );
 
-        let alice_factor = factors.get(&("alice".into(), "research".into())).unwrap();
-        let bob_factor = factors.get(&("bob".into(), "engineering".into())).unwrap();
-        assert!(*bob_factor > 1.0);
-        assert!(*alice_factor < 1.0);
+        let alice_factor = *factors.get(&("alice".into(), "research".into())).unwrap();
+        let bob_factor = *factors.get(&("bob".into(), "engineering".into())).unwrap();
+
+        // Each account has share 0.5 → per-user cap = 5.0.
+        // Both records share the same period_start, so decay cancels.
+        // alice: 150k, bob: 10k, total = 160k.
+        // alice actual_share = 150k/160k = 0.9375 → factor = 0.5/0.9375 = 0.5333...
+        // bob   actual_share =  10k/160k = 0.0625 → factor = 0.5/0.0625 = 8.0 → capped at 5.0.
+        assert!(
+            (bob_factor - 5.0).abs() < 1e-9,
+            "bob should be exactly 5.0 (capped), got {bob_factor}"
+        );
+        let expected_alice = 0.5 / 0.9375;
+        assert!(
+            (alice_factor - expected_alice).abs() < 1e-9,
+            "alice should be {expected_alice}, got {alice_factor}"
+        );
         assert!(bob_factor > alice_factor);
     }
 
@@ -718,6 +737,217 @@ mod tests {
         assert!(
             f_with > f_no,
             "partial offset should improve alice's fairshare factor; no_offset={f_no}, with_offset={f_with}"
+        );
+    }
+
+    #[test]
+    fn test_zero_usage_proportional_to_share() {
+        let now = Utc::now();
+        let accounts = vec![make_account("big", None, 3), make_account("small", None, 1)];
+        let user_weights: HashMap<(String, String), i32> = vec![
+            (("u_big".into(), "big".into()), 1),
+            (("u_small".into(), "small".into()), 1),
+        ]
+        .into_iter()
+        .collect();
+
+        let factors = compute_fairshare(
+            &[],
+            &accounts,
+            &user_weights,
+            14,
+            now,
+            &BillingWeights::default(),
+            &HashMap::new(),
+        );
+        let big = factors[&("u_big".to_string(), "big".to_string())];
+        let small = factors[&("u_small".to_string(), "small".to_string())];
+        assert!(
+            big > small,
+            "idle user with bigger share must get higher factor: big={big}, small={small}"
+        );
+        let expected_big = (0.75_f64 * 10.0).max(1.0);
+        let expected_small = (0.25_f64 * 10.0).max(1.0);
+        assert!(
+            (big - expected_big).abs() < 1e-9,
+            "big share idle factor should be {expected_big}, got {big}"
+        );
+        assert!(
+            (small - expected_small).abs() < 1e-9,
+            "small share idle factor should be {expected_small}, got {small}"
+        );
+    }
+
+    #[test]
+    fn test_sole_user_gets_full_cap() {
+        let now = Utc::now();
+        let accounts = vec![make_account("funded", None, 1)];
+
+        let user_weights: HashMap<(String, String), i32> =
+            vec![(("u1".into(), "funded".into()), 1)]
+                .into_iter()
+                .collect();
+
+        let factors = compute_fairshare(
+            &[],
+            &accounts,
+            &user_weights,
+            14,
+            now,
+            &BillingWeights::default(),
+            &HashMap::new(),
+        );
+        let u1 = factors[&("u1".to_string(), "funded".to_string())];
+        assert_eq!(u1, 10.0, "sole user (share=1.0) idle factor must be 10.0");
+    }
+
+    #[test]
+    fn test_unfunded_account_stays_zero() {
+        let now = Utc::now();
+        let accounts = vec![
+            make_account("funded", None, 1),
+            make_account("unfunded", None, 0),
+        ];
+
+        let user_weights: HashMap<(String, String), i32> = vec![
+            (("u1".into(), "funded".into()), 1),
+            (("u2".into(), "unfunded".into()), 1),
+        ]
+        .into_iter()
+        .collect();
+
+        let factors = compute_fairshare(
+            &[],
+            &accounts,
+            &user_weights,
+            14,
+            now,
+            &BillingWeights::default(),
+            &HashMap::new(),
+        );
+        let u2 = factors[&("u2".to_string(), "unfunded".to_string())];
+        assert_eq!(u2, 0.0, "zero-share zero-usage user must stay at 0");
+    }
+
+    #[test]
+    fn test_twenty_users_low_share() {
+        let now = Utc::now();
+        let accounts = vec![make_account("team", None, 1)];
+        let mut user_weights = HashMap::new();
+        for i in 0..20 {
+            user_weights.insert((format!("u{i}"), "team".to_string()), 1);
+        }
+        // Each user share = 1.0/20 = 0.05 → user_cap = max(0.05*10, 1.0) = 1.0
+        // total_usage = 100_000
+        // u0: idle       → factor = user_cap = 1.0
+        // u1: 1% (1000)  → actual_share = 1000/100000 = 0.01,  factor = 0.05/0.01 = 5.0 → cap 1.0
+        // u2: 4% (4000)  → actual_share = 4000/100000 = 0.04,  factor = 0.05/0.04 = 1.25 → cap 1.0
+        // u3: 5% (5000)  → actual_share = 5000/100000 = 0.05,  factor = 0.05/0.05 = 1.0
+        // u4: 10% (10000)→ actual_share = 10000/100000 = 0.1,   factor = 0.05/0.1 = 0.5
+        // u5: 80% (80000)→ actual_share = 80000/100000 = 0.8,   factor = 0.05/0.8 = 0.0625
+        let record = |user: &str, secs: i64| UsageRecord {
+            user_name: user.into(),
+            account: "team".into(),
+            cpu_seconds: secs,
+            gpu_seconds: 0,
+            job_count: 1,
+            period_start: now,
+        };
+        let usage = vec![
+            record("u1", 1_000),
+            record("u2", 4_000),
+            record("u3", 5_000),
+            record("u4", 10_000),
+            record("u5", 80_000),
+        ];
+
+        let factors = compute_fairshare(
+            &usage,
+            &accounts,
+            &user_weights,
+            14,
+            now,
+            &BillingWeights::default(),
+            &HashMap::new(),
+        );
+        let f = |u: &str| factors[&(u.to_string(), "team".to_string())];
+
+        assert!(
+            (f("u0") - 1.0).abs() < 1e-9,
+            "idle user (share 0.05) must get 1.0, got {}",
+            f("u0")
+        );
+        assert!(
+            (f("u1") - 1.0).abs() < 1e-9,
+            "1% user must be capped at 1.0, got {}",
+            f("u1")
+        );
+        assert!(
+            (f("u2") - 1.0).abs() < 1e-9,
+            "4% user must be capped at 1.0, got {}",
+            f("u2")
+        );
+        assert!(
+            (f("u3") - 1.0).abs() < 1e-9,
+            "5% user (at share) must get 1.0, got {}",
+            f("u3")
+        );
+        assert!(
+            (f("u4") - 0.5).abs() < 1e-9,
+            "10% user must get 0.5, got {}",
+            f("u4")
+        );
+        assert!(
+            (f("u5") - 0.0625).abs() < 1e-9,
+            "80% user must get 0.0625, got {}",
+            f("u5")
+        );
+    }
+
+    #[test]
+    fn test_tiny_share_idle_equals_near_zero_usage() {
+        let now = Utc::now();
+        let mut accounts = vec![make_account("team", None, 1)];
+        for i in 0..19 {
+            accounts.push(make_account(&format!("other{i}"), None, 1));
+        }
+        // 20 accounts × 100 users in "team" = share 0.05/100 = 0.0005
+        let mut user_weights = HashMap::new();
+        for i in 0..100 {
+            user_weights.insert((format!("u{i}"), "team".to_string()), 1);
+        }
+        let record = |user: &str, account: &str, secs: i64| UsageRecord {
+            user_name: user.into(),
+            account: account.into(),
+            cpu_seconds: secs,
+            gpu_seconds: 0,
+            job_count: 1,
+            period_start: now - Duration::hours(1),
+        };
+        let usage = vec![
+            record("heavy", "other0", 1_000_000_000),
+            record("u1", "team", 1),
+        ];
+
+        let factors = compute_fairshare(
+            &usage,
+            &accounts,
+            &user_weights,
+            14,
+            now,
+            &BillingWeights::default(),
+            &HashMap::new(),
+        );
+        let idle_user = factors[&("u0".to_string(), "team".to_string())];
+        let one_sec = factors[&("u1".to_string(), "team".to_string())];
+        // share = 0.0005, cap = max(0.0005*10, 1.0) = 1.0
+        assert_eq!(
+            idle_user, 1.0,
+            "tiny-share idle user must get floor cap 1.0, got {idle_user}"
+        );
+        assert_eq!(
+            idle_user, one_sec,
+            "idle and 1-second user must rank equally at the cap: idle={idle_user}, one_sec={one_sec}"
         );
     }
 }
