@@ -183,6 +183,7 @@ jobs:
           build-args: |
             SPUR_GIT_SHA=${{ needs.build.outputs.short_sha }}
             SPUR_GIT_DIRTY=false
+          no-cache-filters: runtime
           cache-from: type=gha,scope=nightly-docker
           cache-to: type=gha,scope=nightly-docker,mode=max
 
