@@ -366,13 +366,7 @@ fn resolve_node_field(
         'N' | 'n' => node.name.clone(),
         'P' | 'R' => partition_name.to_string(),
         't' | 'T' => effective_state_str(node),
-        'c' => {
-            if let Some(ref r) = node.total_resources {
-                r.cpus.to_string()
-            } else {
-                "0".into()
-            }
-        }
+        'c' => spur_core::node::reported_cpu_tot(node).to_string(),
         'm' => {
             if let Some(ref r) = node.total_resources {
                 r.memory_mb.to_string()
@@ -423,8 +417,12 @@ fn resolve_node_field(
 /// group.
 fn resolve_node_group_field(nodes: &[&spur_proto::proto::NodeInfo], spec: char) -> Option<String> {
     match spec {
-        'c' => Some(per_node_size(nodes, |r| u64::from(r.cpus))),
-        'm' => Some(per_node_size(nodes, |r| r.memory_mb)),
+        'c' => Some(per_node_size(nodes, |n| {
+            u64::from(spur_core::node::reported_cpu_tot(n))
+        })),
+        'm' => Some(per_node_size(nodes, |n| {
+            n.total_resources.as_ref().map_or(0, |r| r.memory_mb)
+        })),
         't' | 'T' => Some(if nodes.is_empty() {
             "n/a".into()
         } else {
@@ -458,11 +456,9 @@ fn resolve_node_group_field(nodes: &[&spur_proto::proto::NodeInfo], spec: char) 
 /// the smallest one with a `+` suffix when the row mixes sizes.
 fn per_node_size(
     nodes: &[&spur_proto::proto::NodeInfo],
-    size: impl Fn(&spur_proto::proto::ResourceSet) -> u64,
+    size: impl Fn(&spur_proto::proto::NodeInfo) -> u64,
 ) -> String {
-    let mut sizes = nodes
-        .iter()
-        .map(|n| n.total_resources.as_ref().map_or(0, &size));
+    let mut sizes = nodes.iter().map(|n| size(n));
     let Some(first) = sizes.next() else {
         return "0".into();
     };
@@ -1111,6 +1107,26 @@ mod tests {
         let fields = format_engine::parse_format("%P|%c|%m", &format_engine::sinfo_header);
         let lines = render_sinfo_output(&fields, &[make_partition("empty", false)], &[], false);
         assert_eq!(lines, ["empty|0|0"]);
+    }
+
+    #[test]
+    fn test_cpus_report_cputot_including_spec_cores_in_both_views() {
+        let fields = format_engine::parse_format("%P|%c", &format_engine::sinfo_header);
+        let partitions = [make_partition("batch", true)];
+        let spec = NodeInfo {
+            cpu_tot: 8,
+            ..sized_node("n1", 6, 1000)
+        };
+        let plain = NodeInfo {
+            cpu_tot: 8,
+            ..sized_node("n2", 8, 1000)
+        };
+        let nodes = [spec, plain];
+
+        let partition_view = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(partition_view, ["batch*|8"]);
+        let node_view = render_sinfo_output(&fields, &partitions, &nodes, true);
+        assert_eq!(node_view, ["batch|8", "batch|8"]);
     }
 
     #[test]

@@ -753,7 +753,7 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 }
                 println!(
                     "   CPUTot={} CPUAlloc={} RealMemory={} FreeMem={}",
-                    cpu_tot(&node),
+                    spur_core::node::reported_cpu_tot(&node),
                     alloc.map(|r| r.cpus).unwrap_or(0),
                     total.map(|r| r.memory_mb).unwrap_or(0),
                     node.free_memory_mb,
@@ -1267,15 +1267,6 @@ fn node_state_name(state: i32) -> &'static str {
     spur_core::node::NodeState::from_proto_i32(state)
         .map(|s| s.display_upper())
         .unwrap_or("UNKNOWN")
-}
-
-/// `CPUTot`: CPUs before spec cores are set aside; a controller that predates
-/// the field reports 0, so fall back to the schedulable count.
-fn cpu_tot(node: &spur_proto::proto::NodeInfo) -> u32 {
-    if node.cpu_tot > 0 {
-        return node.cpu_tot;
-    }
-    node.total_resources.as_ref().map_or(0, |r| r.cpus)
 }
 
 /// `State=` value for `scontrol show node`, composited the way real Slurm

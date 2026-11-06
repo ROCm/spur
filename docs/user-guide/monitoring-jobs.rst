@@ -332,9 +332,10 @@ Default columns (partition view): ``PARTITION AVAIL TIMELIMIT NODES STATE
 NODELIST``; ``-l`` adds CPUS and MEMORY. Node view (``-N``): ``NODELIST NODES
 PARTITION STATE CPUS MEMORY GRES``.
 
-In the partition view, CPUS and MEMORY (``%c`` and ``%m``) are per-node sizes,
-as in Slurm. When a row's nodes differ, the smallest size is shown with a ``+``
-suffix, for example ``64+``.
+CPUS and MEMORY (``%c`` and ``%m``) are per-node sizes, as in Slurm: CPUS is
+the node's ``CPUTot``, specialized cores included, and MEMORY its
+``RealMemory``. In the partition view, when a row's nodes differ, the smallest
+size is shown with a ``+`` suffix, for example ``64+``.
 
 .. code-block:: bash
 
