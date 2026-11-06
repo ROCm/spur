@@ -100,6 +100,8 @@ pub struct StepdLaunchSpec {
     pub cred_digest: String,
     #[serde(default)]
     pub pty_step_id: Option<spur_core::step::StepId>,
+    #[serde(default)]
+    pub task_launch: Option<crate::task_launcher::TaskPlan>,
 }
 
 /// Everything the supervisor needs to host its own PMIx server. The agent builds
@@ -240,6 +242,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             cred_kid: String::new(),
             cred_digest: String::new(),
             pty_step_id: None,
+            task_launch: config.task_launch.clone(),
         })
     }
 }
@@ -282,7 +285,22 @@ impl StepdLaunchSpec {
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
             allocation_holder: self.allocation_holder,
+            task_launch: self.task_launch,
         }
+    }
+}
+
+/// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
+/// fallback resolves via `execv` (CWD-relative only, no $PATH search). Inside
+/// `spurstepd` itself this resolves to its own binary, which is also the task
+/// launcher.
+pub(crate) fn resolve_stepd_executable() -> PathBuf {
+    let co_located = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("spurstepd")));
+    match co_located {
+        Some(path) if path.exists() => path,
+        _ => PathBuf::from("spurstepd"),
     }
 }
 
@@ -3552,6 +3570,14 @@ mod launch_spec_compat {
         assert!(spec.array_task_id.is_none());
     }
 
+    #[test]
+    fn an_older_launch_spec_starts_no_task_launcher_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(spec.task_launch.is_none());
+    }
+
     /// Captured from the build that first shipped `pmix` in launch.json, before
     /// `wrapper_path` existed. A supervisor started by an older agent mid-upgrade
     /// reads exactly this, so it has to keep decoding.
@@ -3978,10 +4004,30 @@ mod tests {
         session_dir
     }
 
+    #[test]
+    fn a_task_plan_survives_the_hand_off_to_the_supervisor() {
+        let plan = crate::task_launcher::TaskPlan {
+            tasks_on_node: 4,
+            task_offset: 8,
+            user_script: "/tmp/cmd_0_1.sh".into(),
+            label: true,
+            cpu_bind: spur_core::step::CpuBind::Rank,
+        };
+        let mut config = launch_spec().into_launch_config();
+        config.task_launch = Some(plan.clone());
+
+        let spec = StepdLaunchSpec::try_from(&config).expect("launch spec");
+        let decoded: StepdLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode")).expect("decode");
+
+        assert_eq!(decoded.into_launch_config().task_launch, Some(plan));
+    }
+
     fn launch_spec() -> StepdLaunchSpec {
         StepdLaunchSpec {
             joins_parent_namespaces: false,
             allocation_holder: false,
+            task_launch: None,
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
