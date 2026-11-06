@@ -7480,6 +7480,208 @@ mod tests {
         );
     }
 
+    /// A job held at max requeue has freed its node, so the run the node still
+    /// holds is reclaimed by the attempt it names.
+    #[tokio::test]
+    async fn stale_reported_jobs_reclaims_a_held_job_the_node_still_runs() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::PendingReason;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        place(&cluster, 50, &["n1"], 1);
+        fail_and_requeue(&cluster, 50);
+        cluster.apply_operation(&WalOperation::JobPriorityChange {
+            job_id: 50,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::JobHoldMaxRequeue),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: None,
+        });
+        assert!(cluster
+            .get_job(50)
+            .unwrap()
+            .pending_reason
+            .is_scheduling_hold());
+
+        assert_eq!(
+            stale_reported_jobs(&cluster, "n1", &[report_run(50, 1)])
+                .iter()
+                .map(|r| (r.job_id, r.run_attempt))
+                .collect::<Vec<_>>(),
+            vec![(50, 1)],
+            "the cancel names the run the node reported"
+        );
+        assert!(
+            !is_reclaimable(&cluster, "n1", &report_run(50, 0)),
+            "an old agent names no run, so it could be a launch after a release"
+        );
+    }
+
+    /// A hold naming an older run leaves the newer run's reservation in place,
+    /// so the node being launched on must not be told to release it.
+    #[tokio::test]
+    async fn stale_reported_jobs_spares_a_held_job_still_reserved_on_the_node() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState, PendingReason};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 52,
+            spec: Box::new(JobSpec {
+                name: "relaunching".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
+        let mut per_node = std::collections::HashMap::new();
+        per_node.insert("n1".to_string(), res.clone());
+        apply(&WalOperation::JobStart {
+            job_id: 52,
+            nodes: vec!["n1".into()],
+            resources: res,
+            per_node_alloc: per_node,
+            srun_step_dispatch: false,
+            run_attempt: 2,
+            idle_fill: false,
+            at: None,
+        });
+        apply(&WalOperation::JobPriorityChange {
+            job_id: 52,
+            old_priority: 0,
+            new_priority: 0,
+            pending_reason: Some(PendingReason::JobHoldMaxRequeue),
+            pending_reason_desc: None,
+            reset_requeue_count: false,
+            clear_reservation: false,
+            run_attempt: Some(1),
+        });
+        let job = cluster.get_job(52).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.pending_reason.is_scheduling_hold());
+        assert!(
+            job.is_held_on("n1"),
+            "a hold for an older run keeps this reservation"
+        );
+
+        assert!(
+            !is_reclaimable(&cluster, "n1", &report_run(52, 1)),
+            "run 1 on the node is left to the run 2 launch placed there"
+        );
+    }
+
+    /// `requeuehold` frees the node, so its old run is reclaimed, before and
+    /// after a release; the run the scheduler then places on the node is spared.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_reclaimable_follows_a_requeuehold_through_its_release() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster =
+            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft);
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            );
+        };
+        let start_on_n1 = |run_attempt: u32| {
+            let res = spur_core::resource::ResourceAllocations::with_scalar(1, 0);
+            let per_node_alloc = std::collections::HashMap::from([("n1".to_string(), res.clone())]);
+            apply(&WalOperation::JobStart {
+                job_id: 60,
+                nodes: vec!["n1".into()],
+                resources: res,
+                per_node_alloc,
+                srun_step_dispatch: false,
+                run_attempt,
+                idle_fill: false,
+                at: None,
+            });
+            apply(&WalOperation::job_state_change(
+                60,
+                JobState::Pending,
+                JobState::Running,
+            ));
+        };
+
+        apply(&WalOperation::JobSubmit {
+            job_id: 60,
+            spec: Box::new(JobSpec {
+                name: "requeueheld".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        start_on_n1(1);
+        apply(&WalOperation::JobUserRequeue {
+            job_id: 60,
+            hold: true,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+        let job = cluster.get_job(60).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.pending_reason.is_scheduling_hold());
+        assert!(
+            is_reclaimable(&cluster, "n1", &report_run(60, 1)),
+            "the held job's old run is reclaimed"
+        );
+
+        cluster.release_job(60).unwrap();
+        assert!(
+            is_reclaimable(&cluster, "n1", &report_run(60, 1)),
+            "a release queues the job again, and its old run is still stale"
+        );
+        assert!(
+            !is_reclaimable(&cluster, "n1", &report_run(60, 0)),
+            "an attempt-0 cancel could hit the launch the release leads to"
+        );
+
+        start_on_n1(2);
+        assert!(
+            !is_reclaimable(&cluster, "n1", &report_run(60, 2)),
+            "the new run on this node is spared"
+        );
+    }
+
     /// A node evicted mid-run keeps the job and its devices; the controller
     /// restarts it elsewhere and must let the old node release.
     #[tokio::test]

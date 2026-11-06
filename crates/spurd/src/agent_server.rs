@@ -10265,8 +10265,12 @@ impl AgentService {
                 ) {
                     Ok(result) => result,
                     Err(_) => {
+                        // `job_id` is the dispatch being refused; the operator
+                        // needs the jobs that still own the devices.
+                        let gpu_owners = alloc.gpu_owners(&controller_gpu_ids);
                         warn!(
                             job_id,
+                            ?gpu_owners,
                             requested = ?controller_gpu_ids,
                             already_allocated = ?alloc.allocated_gpu_ids(),
                             "rejecting dispatch: controller-allocated GPUs already in use in the \

@@ -1311,6 +1311,17 @@ time limit, where earlier releases gave it 2 seconds.
 Suspending a job that is in its preemption grace period is refused, because the
 preemption that ends the grace only applies to a running job.
 
+.. _held-job-still-running:
+
+A running job that is held, by ``scontrol requeuehold`` (``JobHeldUser``) or
+on reaching ``max_batch_requeue`` (``JobHoldMaxRequeue``), gives up its nodes
+at once. If the stop sent at that moment does not reach a node, the process
+keeps running there while ``sinfo`` already shows the node's resources as free,
+and a new job sent to the same GPUs is refused. An administrator can find the
+job still holding them in that node's spurd log (``gpu_owners=[...]``). On the
+node's next heartbeat the controller tells it to stop the held job's process,
+so the resources become usable within about 40 seconds.
+
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
 ``Account=``, ``Comment=``, ``QOS=``, and ``ExcNodeList=`` (also spelled

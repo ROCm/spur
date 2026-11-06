@@ -369,14 +369,24 @@ impl NodeAllocation {
             .collect()
     }
 
-    /// Job ids owning any of `device_ids`, excluding mid-launch owners (a launch
-    /// in flight is a real duplicate, not a reclaimable stale owner).
-    pub fn conflicting_owners(&self, device_ids: &[u64]) -> Vec<u32> {
-        self.owners
+    /// Job ids owning any of `device_ids`, mid-launch owners included, sorted.
+    pub fn gpu_owners(&self, device_ids: &[u64]) -> Vec<u32> {
+        let mut owners: Vec<u32> = self
+            .owners
             .iter()
-            .filter(|(id, _)| !self.launching.contains_key(id))
             .filter(|(_, owned)| owned.result.gpu_ids.iter().any(|g| device_ids.contains(g)))
             .map(|(id, _)| *id)
+            .collect();
+        owners.sort_unstable();
+        owners
+    }
+
+    /// [`Self::gpu_owners`] excluding mid-launch owners (a launch in flight is a
+    /// real duplicate, not a reclaimable stale owner).
+    pub fn conflicting_owners(&self, device_ids: &[u64]) -> Vec<u32> {
+        self.gpu_owners(device_ids)
+            .into_iter()
+            .filter(|id| !self.launching.contains_key(id))
             .collect()
     }
 
@@ -959,6 +969,9 @@ mod tests {
         // A dispatch spanning a committed and a launching device reports only the
         // committed owner.
         assert_eq!(node.conflicting_owners(&[1, 2]), vec![1]);
+        // Every owner, the launching one included, is named.
+        assert_eq!(node.gpu_owners(&[1, 2]), vec![1, 2]);
+        assert!(node.gpu_owners(&[3]).is_empty());
     }
 
     #[test]
