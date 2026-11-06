@@ -1,9 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Keeps a Spur-written `/etc/cdi/amd.json` in sync with live GPU discovery.
-//! A spec not carrying Spur's `auto-detected` annotation is never rewritten,
-//! only warned about, since something else owns it.
+//! Keeps a Spur-written `/etc/cdi/amd.json` in sync with live GPU discovery;
+//! a spec without Spur's `auto-detected` annotation is someone else's.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

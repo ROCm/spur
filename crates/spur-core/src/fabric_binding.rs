@@ -61,10 +61,8 @@ impl FabricBinding {
         })
     }
 
-    /// Placement and dispatch check: the node must still report the exact inventory
-    /// generation, block file revision, and vPod endpoint set the binding was made under.
     /// Move the bound ids to a new encoding of the same silicon. A declared
-    /// endpoint is named after its stable_id, so this node's move with it.
+    /// endpoint is named after its stable_id, so this node's endpoints move with it.
     pub fn rename_gpus(&mut self, renamed: &std::collections::HashMap<u64, u64>) {
         let endpoints: std::collections::HashMap<String, String> = match self.file_revision {
             Some(_) => renamed
@@ -92,6 +90,8 @@ impl FabricBinding {
         self.active_endpoints.iter_mut().for_each(rename_endpoint);
     }
 
+    /// Placement and dispatch check: the node must still report the exact inventory
+    /// generation, block file revision, and vPod endpoint set the binding was made under.
     pub fn validate(
         &self,
         namespace: &str,

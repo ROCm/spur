@@ -1111,8 +1111,9 @@ fn spawn_inventory_refresh(
                 warn!(
                     anchor = format_args!("{anchor:#x}"),
                     pinned = ?pinned.get(&anchor),
-                    "a repartitioned gpu has been withheld for over an hour; \
-                     a job may be leaking its pre-change partition"
+                    after = ?reporter::FENCE_WARN_AFTER,
+                    "a repartitioned gpu has been withheld past the fence warning \
+                     threshold; a job may be leaking its pre-change partition"
                 );
             }
 

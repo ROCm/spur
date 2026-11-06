@@ -866,9 +866,8 @@ fn bdf_anchor(stable_id: u64) -> u64 {
     spur_core::gpu_identity::anchor(stable_id)
 }
 
-/// Held ids moved to the current encoding, so a re-encoded id is the same
-/// device, not a loss. `baseline` renames only held entries: fully renamed it
-/// would equal `fresh` and hide the rename from the controller.
+/// Held ids moved to the current encoding. `baseline` renames only held
+/// entries: fully renamed it would equal `fresh` and hide the rename.
 pub struct RefreshPlan {
     pub renamed: HashMap<u64, u64>,
     pub baseline: ResourceSet,
@@ -922,9 +921,8 @@ pub fn save_baseline(dir: &std::path::Path, set: &ResourceSet) {
 
 pub const FENCES_FILE: &str = "inventory-fences.json";
 
-/// GPUs repartitioned under running jobs, keyed by BDF anchor. Each keeps only
-/// the entries its pre-change holders still hold and offers nothing else until
-/// they exit: any id of the new layout may name silicon they still use.
+/// GPUs repartitioned under running jobs, by BDF anchor: each offers only what
+/// its pre-change holders still hold until they exit.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Fences {
     #[serde(default)]
@@ -1054,9 +1052,8 @@ pub struct TickPlan {
 }
 
 impl TickPlan {
-    /// Ids in `ledger_ids` the ledger must refuse this tick: every old id of
-    /// a GPU repartitioned under a holder, from its first sighting, before
-    /// any debounce or commit lets the inventory drop them.
+    /// Ids in `ledger_ids` to refuse this tick: every old id of a GPU
+    /// repartitioned under a holder, from its first sighting.
     pub fn ledger_fenced(&self, committed: &Fences, ledger_ids: &[u64]) -> HashSet<u64> {
         let anchors: HashSet<u64> = committed
             .anchors
@@ -1132,10 +1129,8 @@ pub fn plan_tick(
     }
 }
 
-/// Install `reported` on the ledger. Once installed, the gate follows the
-/// fences it was built from: a GPU they no longer fence has no pre-change
-/// holder left, and gating it until the next tick would refuse dispatches
-/// onto the layout just offered. A deferral keeps the wider gate.
+/// Install `reported` on the ledger, gated by the fences it was built from so
+/// the layout just offered is dispatchable; a deferral keeps the wider gate.
 pub fn apply_to_ledger(
     ledger: &mut NodeAllocation,
     tick: &TickPlan,
@@ -1188,8 +1183,7 @@ pub fn refresh_delta(old: &ResourceSet, fresh: &ResourceSet, plan: &RefreshPlan)
 }
 
 /// What to report at startup while adopted jobs hold `held`, and how their
-/// recorded ids map onto `fresh`. Reuses the refresh path against the saved
-/// baseline; without one only the legacy id rule and anchor pinning apply.
+/// recorded ids map onto `fresh`, via the refresh path against the baseline.
 pub fn startup_inventory(
     fresh: &ResourceSet,
     baseline: Option<&ResourceSet>,
@@ -1197,7 +1191,7 @@ pub fn startup_inventory(
     fences: &Fences,
 ) -> StartupInventory {
     let Some(baseline) = baseline else {
-        return startup_inventory_without_baseline(fresh, held);
+        return startup_inventory_without_baseline(fresh, held, fences);
     };
     let tick = plan_tick(baseline, fresh, held, fences);
     StartupInventory {
@@ -1212,7 +1206,10 @@ pub fn startup_inventory(
 fn startup_inventory_without_baseline(
     fresh: &ResourceSet,
     held: &HashSet<u64>,
+    fences: &Fences,
 ) -> StartupInventory {
+    let fences = fences.pruned(held);
+    let fresh = &fences.apply(fresh);
     let fresh_ids: HashSet<u64> = fresh.gpus.iter().map(|g| g.stable_id).collect();
     let renamed: HashMap<u64, u64> = held
         .iter()
@@ -1244,7 +1241,7 @@ fn startup_inventory_without_baseline(
         return StartupInventory {
             reported: fresh.clone(),
             renamed,
-            fences: Fences::default(),
+            fences,
         };
     }
     let pinned_anchors: HashSet<u64> = pinned.iter().map(|g| bdf_anchor(g.stable_id)).collect();
@@ -1259,7 +1256,7 @@ fn startup_inventory_without_baseline(
     StartupInventory {
         reported: reconcile_free_pool(fresh, &synthetic, &fenced),
         renamed,
-        fences: Fences::default(),
+        fences,
     }
 }
 
@@ -4088,6 +4085,36 @@ mod tests {
             fresh.gpus.iter().map(|g| g.stable_id).collect::<Vec<_>>()
         );
         assert!(out.renamed.is_empty());
+    }
+
+    #[test]
+    fn startup_without_a_baseline_keeps_a_persisted_fence() {
+        use std::collections::HashSet;
+        let fresh = layout_node(8);
+        let held_id = sid(0x11, 0);
+        let mut fences = Fences::default();
+        fences.pin(bdf_anchor(held_id), &gpu(0, held_id));
+        let held: HashSet<u64> = [held_id].into();
+        let out = startup_inventory(&fresh, None, &held, &fences);
+        let on_gpu: Vec<u64> = out
+            .reported
+            .gpus
+            .iter()
+            .map(|g| g.stable_id)
+            .filter(|id| id >> 16 == 0x11)
+            .collect();
+        assert_eq!(on_gpu, vec![held_id]);
+        assert_eq!(out.fences, fences);
+    }
+
+    #[test]
+    fn startup_without_a_baseline_drops_a_fence_with_no_live_holder() {
+        let fresh = layout_node(8);
+        let mut fences = Fences::default();
+        fences.pin(bdf_anchor(sid(0x11, 0)), &gpu(0, sid(0x11, 0)));
+        let out = startup_inventory(&fresh, None, &Default::default(), &fences);
+        assert_eq!(out.reported.gpus, fresh.gpus);
+        assert_eq!(out.fences, Fences::default());
     }
 
     #[test]

@@ -15165,6 +15165,134 @@ state = "UP"
         assert_eq!(job_gpu_ids(&replayed, 1, "n1"), vec![gpu_sid(0x11, 0, 1)]);
     }
 
+    fn bind_held_gpus(ops: &mut [WalOperation]) {
+        for op in ops.iter_mut() {
+            let WalOperation::JobStart { per_node_alloc, .. } = op else {
+                continue;
+            };
+            for (node, slice) in per_node_alloc.iter_mut() {
+                let gpus = slice
+                    .device_ids("gpu")
+                    .into_iter()
+                    .map(|stable_id| spur_core::gpu_binding::BoundGpu {
+                        stable_id,
+                        gpu_type: "mi300x".into(),
+                        topology: None,
+                    })
+                    .collect();
+                slice.gpu_binding = Some(spur_core::gpu_binding::GpuBinding {
+                    node: node.clone(),
+                    generation: 1,
+                    gpus,
+                });
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_update_re_encoding_moves_a_recorded_gpu_binding() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let other = gpu_sid(0x12, 0, 0);
+        let old = [legacy_cpx_ids(0x11), vec![other]].concat();
+        let new = [partition_ids(0x11, 8), vec![other]].concat();
+        let mut ops = gpu_id_change_ops(&old, &[gpu_sid(0x11, 1, 0)], &new);
+        bind_held_gpus(&mut ops);
+
+        for op in &ops {
+            cm.apply_operation(op);
+        }
+
+        let renamed = gpu_sid(0x11, 0, 1);
+        let job = cm.get_job(1).unwrap();
+        let slice = job.per_node_alloc.get("n1").unwrap();
+        assert_eq!(slice.device_ids("gpu"), vec![renamed]);
+        let binding = slice.gpu_binding.as_ref().expect("binding kept");
+        assert_eq!(binding.gpus[0].stable_id, renamed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snapshot_on_either_side_of_a_remapping_update_restores_the_same_ids() {
+        let other = gpu_sid(0x12, 0, 0);
+        let old = [legacy_cpx_ids(0x11), vec![other]].concat();
+        let new = [partition_ids(0x11, 8), vec![other]].concat();
+        let ops = gpu_id_change_ops(&old, &[gpu_sid(0x11, 1, 0)], &new);
+        let (setup, update) = ops.split_at(ops.len() - 1);
+
+        let dir = TempDir::new().unwrap();
+        let live = test_cluster(&dir).await;
+        for op in setup {
+            live.apply_operation(op);
+        }
+        let before = live.snapshot_state().unwrap();
+        live.apply_operation(&update[0]);
+        let after = live.snapshot_state().unwrap();
+
+        let dir_before = TempDir::new().unwrap();
+        let from_before = test_cluster(&dir_before).await;
+        from_before.restore_from_snapshot(&before).unwrap();
+        from_before.apply_operation(&update[0]);
+        let dir_after = TempDir::new().unwrap();
+        let from_after = test_cluster(&dir_after).await;
+        from_after.restore_from_snapshot(&after).unwrap();
+
+        let renamed = vec![gpu_sid(0x11, 0, 1)];
+        for cm in [&live, &from_before, &from_after] {
+            assert_eq!(job_gpu_ids(cm, 1, "n1"), renamed);
+            assert_eq!(
+                cm.get_node("n1").unwrap().alloc_resources.device_ids("gpu"),
+                renamed
+            );
+            let mut free = free_gpu_ids(cm, "n1");
+            free.sort_unstable();
+            let mut want = free_gpu_ids(&live, "n1");
+            want.sort_unstable();
+            assert_eq!(free, want);
+        }
+    }
+
+    // The placement fails closed: the stale id is not in the inventory, so the
+    // node withholds its GPUs instead of offering the silicon twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_job_start_on_ids_from_before_a_re_encoding_withholds_the_node_gpus() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let other = gpu_sid(0x12, 0, 0);
+        let stale = gpu_sid(0x11, 1, 0);
+        let old = [legacy_cpx_ids(0x11), vec![other]].concat();
+        let new = [partition_ids(0x11, 8), vec![other]].concat();
+        let mut ops = gpu_id_change_ops(&old, &[stale], &new);
+        let update = ops.pop().unwrap();
+        let start = ops.pop().unwrap();
+        for op in ops.iter().chain([&update, &start]) {
+            cm.apply_operation(op);
+        }
+
+        assert_eq!(job_gpu_ids(&cm, 1, "n1"), vec![stale]);
+        let free = free_gpu_ids(&cm, "n1");
+        assert!(free.is_empty(), "gpus offered under a stale id: {free:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repartition_that_keeps_the_held_id_leaves_it_allocated() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let other = gpu_sid(0x12, 0, 0);
+        let held = gpu_sid(0x11, 0, 0);
+        let old = [partition_ids(0x11, 8), vec![other]].concat();
+        let new = [partition_ids(0x11, 2), vec![other]].concat();
+        for op in gpu_id_change_ops(&old, &[held], &new) {
+            cm.apply_operation(&op);
+        }
+
+        assert_eq!(job_gpu_ids(&cm, 1, "n1"), vec![held]);
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.device_ids("gpu"),
+            vec![held]
+        );
+        assert!(!free_gpu_ids(&cm, "n1").contains(&held));
+    }
+
     // An empty reported set (old agent, or a job with no GPUs) leaves the node's
     // used-view untouched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2312,6 +2312,36 @@ silicon identity. Perform it only on a node with no GPU jobs running.
   until every job that held the GPU before the change ends. This holds across
   a ``spurd`` restart. The jobs themselves are not failed or requeued.
 
+**What an operator sees.** A fenced GPU shows up as fewer GPU GRES in
+``scontrol show node`` than the hardware has, and ``spurd`` logs
+``allocated device changed; pinning held gpus, converging free pool only``.
+If a fence outlasts the warning threshold (one hour), ``spurd`` also warns
+that a job may be leaking its pre-change partition.
+
+**State on disk.** ``spurd`` keeps two files under ``<state_dir>/runtime/``
+(``state_dir`` defaults to ``/var/spool/spur``):
+
+* ``inventory-baseline.json``: the last inventory the controller acknowledged.
+  A restart compares the fresh discovery against it to tell a re-encoding of
+  the same partitions from a partition change.
+* ``inventory-fences.json``: the fenced GPUs and the partitions their
+  pre-change jobs still hold.
+
+Neither file needs editing. If the baseline is missing, ``spurd`` falls back
+to the legacy id rule and still honours the fence file.
+
+**How a fence clears.** It lifts on its own when the last job that held the
+GPU before the change exits; the next refresh then advertises the new
+partitions. A ``spurd`` restart with no such job still running also drops it.
+To clear one held by a leaked job, cancel that job.
+
+**Known limits.**
+
+* A new ``srun`` step into a job whose GPU stayed fenced across a ``spurd``
+  restart is refused; the job's existing steps keep running.
+* A job already queued when the last holder of a fenced GPU exits can be
+  refused once on the released partition; it runs after the next refresh.
+
 ``[isolation]``
 ---------------
 

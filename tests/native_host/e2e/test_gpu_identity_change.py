@@ -1,29 +1,8 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for GPU stable_id changes under running jobs.
-
-Builds on the static-CDI harness of test_inventory_convergence.py: spurd runs
-with `auto_detect = false` and a test-controlled CDI spec, so its inventory is
-exactly what the spec declares, and `SPUR_INVENTORY_REFRESH_SECS` makes the
-refresh loop pick up a rewrite within seconds. Unlike the GPU-less tests there,
-every fake partition points at a REAL `/dev/dri/renderD<minor>` from the bed so
-jobs actually launch. The GPU layout is expressed only through the
-`spur.amd.com/stable-id` annotation; the specs carry no
-`spur.amd.com/auto-detected` marker, so spurd never rewrites them itself.
-
-Two kinds of change are driven:
-  - re-encoding: older builds put a partition's rank in the PCI function bits
-    (`(bus<<16)|(f<<8)`); the current encoding uses the rank bits
-    (`(bus<<16)|f`). Same silicon, new ids: a running job must keep its device
-    under the new name, with nothing fenced and nothing double-booked.
-  - repartition: a GPU's partition set changes. While a job holds the GPU its
-    device stays pinned and none of the GPU's fresh partitions are offered;
-    with nothing held the fresh layout is adopted.
-
-What spurd last reported (and the controller acknowledged) is read from its
-persisted inventory baseline, which pins down the advertised ids even when the
-GPU count does not move.
+"""E2E tests for GPU stable_id changes (re-encoding and repartition) under
+running jobs, on the static-CDI harness of test_inventory_convergence.py.
 """
 
 import json

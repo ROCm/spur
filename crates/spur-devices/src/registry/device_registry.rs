@@ -92,9 +92,8 @@ impl DeviceRegistry {
         Ok((host, container))
     }
 
-    /// The registry to inject from while `pinned` ids still name the silicon
-    /// their jobs were given: those keep `previous`'s device even where the new
-    /// layout reuses the id, and a `gres_name` device not `reported` is dropped.
+    /// The registry to inject from: `pinned` ids keep `previous`'s device even
+    /// where the new layout reuses the id; unreported `gres_name` ones drop.
     pub fn with_pinned(
         mut self,
         previous: &DeviceRegistry,

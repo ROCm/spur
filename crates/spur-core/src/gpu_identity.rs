@@ -32,10 +32,8 @@ fn is_bdf_anchor(anchor: u64) -> bool {
     anchor != 0
 }
 
-/// Older builds put a partition's rank in the PCI function bits. Such an id is
-/// read as rank `f` of function 0 only when nothing sits on its own anchor and
-/// function 0 of the same device is present, so a real multi-function device
-/// keeps its id.
+/// An older build's id with the rank in the function bits, read as rank `f` of
+/// function 0 only when that cannot be a real multi-function device.
 fn legacy_normalized(old: u64, anchors: &HashSet<u64>) -> Option<u64> {
     let f = function(old);
     let base = device_anchor(old);

@@ -122,7 +122,7 @@ impl std::fmt::Display for ReleaseGround {
 /// exhaustion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllocError {
-    /// A controller-allocated GPU is already in use on this node.
+    /// A controller-allocated GPU is already in use, or fenced, on this node.
     GpusUnavailable,
     /// A GPU id is not in this node's current inventory.
     GpusUnknown,

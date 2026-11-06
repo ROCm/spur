@@ -781,9 +781,8 @@ pub async fn rename_tracked_gpu_ids(running: &RunningJobs, renamed: &HashMap<u64
     }
 }
 
-/// Commit a launch's reservation. A refresh may rename the ledger between the
-/// reserve and the commit, so return the renames its published and tracked ids
-/// must follow; `None` when the reservation is no longer this attempt's.
+/// Commit a launch's reservation, returning the renames a refresh made since
+/// the reserve; `None` when the reservation is no longer this attempt's.
 fn commit_reservation(
     allocation: &mut NodeAllocation,
     job_id: u32,
