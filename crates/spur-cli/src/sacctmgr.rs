@@ -3,6 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 
 use crate::boolean::{is_truthy, parse_bool};
 use crate::format_engine;
@@ -191,6 +192,10 @@ fn parse_params(params: &[String]) -> std::collections::HashMap<String, String> 
     while let Some(param) = iter.next() {
         if let Some((key, value)) = param.split_once('=') {
             map.insert(key.to_lowercase(), value.to_string());
+        } else if param.eq_ignore_ascii_case("withcoord") {
+            // A flag, not a key/value pair. Taking the next token would swallow
+            // `name=alice` in `show user withcoord name=alice`.
+            map.insert("withcoord".to_string(), String::new());
         } else if param.starts_with("where") || param.starts_with("set") {
             // Skip Slurm-style "where" and "set" keywords
             continue;
@@ -281,9 +286,22 @@ const DELETE_NAME_ONLY_KEYS: &[&str] = &["name", "account", "qos"];
 /// rejected rather than advertised.
 const DELETE_USER_KEYS: &[&str] = &["name", "user", "account"];
 
+/// `add`/`delete`/`show coordinator` accept an account and a user list.
+/// `names`, `name`, and `user` are the same list.
+const COORDINATOR_KEYS: &[&str] = &["account", "names", "name", "user"];
+
 /// Reject keys the command does not understand, so a mistyped or unsupported
 /// field errors loudly instead of being silently dropped (a dropped limit
 /// reads as "set" but never enforces).
+fn coordinator_names(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn reject_unknown_keys(
     p: &std::collections::HashMap<String, String>,
     allowed: &[&str],
@@ -625,8 +643,46 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             println!(" QOS added.");
             Ok(())
         }
+        "coordinator" | "coordinators" => {
+            reject_unknown_keys(&p, COORDINATOR_KEYS)?;
+            let account = p
+                .get("account")
+                .ok_or_else(|| anyhow::anyhow!("account= required"))?;
+            let users = coordinator_names(
+                p.get("names")
+                    .or_else(|| p.get("name"))
+                    .or_else(|| p.get("user"))
+                    .map(String::as_str),
+            );
+            if users.is_empty() {
+                bail!("names= required");
+            }
+            let mut client = connect(addr).await?;
+            match client
+                .add_coordinator(AddCoordinatorRequest {
+                    account: account.clone(),
+                    users: users.clone(),
+                })
+                .await
+            {
+                Ok(_) => {
+                    println!(
+                        " Adding coordinator(s) {} to account {}",
+                        users.join(","),
+                        account
+                    );
+                    println!(" Done.");
+                    Ok(())
+                }
+                Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                    println!(" The assignment is already there.");
+                    Ok(())
+                }
+                Err(status) => Err(anyhow::Error::new(status).context("AddCoordinator RPC failed")),
+            }
+        }
         other => bail!(
-            "sacctmgr: unknown entity type '{}'. Use: account, user, qos",
+            "sacctmgr: unknown entity type '{}'. Use: account, user, qos, coordinator",
             other
         ),
     }
@@ -681,6 +737,42 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     Ok(())
                 }
                 Err(status) => Err(anyhow::Error::new(status).context("RemoveUser RPC failed")),
+            }
+        }
+        "coordinator" | "coordinators" => {
+            reject_unknown_keys(&p, COORDINATOR_KEYS)?;
+            let account = p
+                .get("account")
+                .ok_or_else(|| anyhow::anyhow!("account= required"))?;
+            let users = coordinator_names(
+                p.get("names")
+                    .or_else(|| p.get("name"))
+                    .or_else(|| p.get("user"))
+                    .map(String::as_str),
+            );
+            if users.is_empty() {
+                bail!("names= required");
+            }
+            let mut client = connect(addr).await?;
+            match client
+                .remove_coordinator(RemoveCoordinatorRequest {
+                    account: account.clone(),
+                    users,
+                })
+                .await
+            {
+                Ok(_) => {
+                    println!(" Deleting coordinator(s) from account {}", account);
+                    println!(" Done.");
+                    Ok(())
+                }
+                Err(status) if status.code() == tonic::Code::NotFound => {
+                    println!(" Nothing deleted.");
+                    Ok(())
+                }
+                Err(status) => {
+                    Err(anyhow::Error::new(status).context("RemoveCoordinator RPC failed"))
+                }
             }
         }
         "qos" => {
@@ -1095,22 +1187,34 @@ async fn show(
 
     match entity.as_str() {
         "account" | "accounts" => {
-            let fields = account_format_fields(long_aware_format(&p, long))?;
+            let mut fields = account_format_fields(long_aware_format(&p, long))?;
+            if p.contains_key("withcoord") {
+                append_coords_column(&mut fields);
+            }
+            let show_coords = fields.iter().any(|token| {
+                matches!(token, format_engine::FormatToken::Field(field) if field.spec == 'C')
+            });
 
             let mut client = connect(addr).await?;
             let resp = client
-                .list_accounts(ListAccountsRequest {})
+                .list_accounts(ListAccountsRequest { shares: false })
                 .await
                 .context("ListAccounts RPC failed")?;
 
             let accounts = resp.into_inner().accounts;
+            let coords = if show_coords {
+                load_coordinator_columns(&mut client).await?.1
+            } else {
+                HashMap::new()
+            };
 
             style.print_header(&fields);
 
             for a in &accounts {
+                let cell = coords.get(&a.name).map(String::as_str).unwrap_or("");
                 println!(
                     "{}",
-                    style.row(&fields, &|spec| resolve_account_field(a, spec))
+                    style.row(&fields, &|spec| resolve_account_field(a, spec, cell))
                 );
             }
             Ok(())
@@ -1123,19 +1227,35 @@ async fn show(
                 .list_users(ListUsersRequest {
                     account: account_filter,
                     user: user_filter,
+                    associations: false,
                 })
                 .await
                 .context("ListUsers RPC failed")?;
 
             let users = resp.into_inner().users;
+            let withcoord = p.contains_key("withcoord");
+            let coords = if withcoord {
+                load_coordinator_columns(&mut client).await?.0
+            } else {
+                HashMap::new()
+            };
+            let mut header = user_header_row();
+            if withcoord {
+                header.push_str(&format!(" {:<20}", "Coords"));
+            }
 
             if style.shows_header() {
-                println!("{}", user_header_row());
-                println!("{}", "-".repeat(180));
+                println!("{header}");
+                println!("{}", "-".repeat(header.len()));
             }
 
             for u in &users {
-                println!("{}", format_user_row(u));
+                let mut row = format_user_row(u);
+                if withcoord {
+                    let cell = coords.get(&u.name).map(String::as_str).unwrap_or("");
+                    row.push_str(&format!(" {cell:<20}"));
+                }
+                println!("{row}");
             }
             Ok(())
         }
@@ -1194,6 +1314,7 @@ async fn show(
             let mut request = tonic::Request::new(ListUsersRequest {
                 account: account_filter,
                 user: user_filter,
+                associations: true,
             });
             request.set_timeout(SACCTMGR_RPC_TIMEOUT);
             let resp = client
@@ -1256,8 +1377,39 @@ async fn show(
             }
             Ok(())
         }
+        "coordinator" | "coordinators" => {
+            reject_unknown_keys(&p, COORDINATOR_KEYS)?;
+            let account = p.get("account").cloned().unwrap_or_default();
+            let wanted = coordinator_names(
+                p.get("names")
+                    .or_else(|| p.get("name"))
+                    .or_else(|| p.get("user"))
+                    .map(String::as_str),
+            );
+            let mut client = connect(addr).await?;
+            let mut rows = client
+                .list_coordinators(ListCoordinatorsRequest {
+                    account,
+                    user: String::new(),
+                })
+                .await
+                .context("ListCoordinators RPC failed")?
+                .into_inner()
+                .coordinators;
+            if !wanted.is_empty() {
+                rows.retain(|row| wanted.iter().any(|name| name == &row.user));
+            }
+            if style.shows_header() {
+                println!("{:<15} {:<20}", "User", "Account");
+                println!("{}", "-".repeat(36));
+            }
+            for row in &rows {
+                println!("{:<15} {:<20}", row.user, row.account);
+            }
+            Ok(())
+        }
         other => bail!(
-            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres, txn",
+            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, coordinator, tres, txn",
             other
         ),
     }
@@ -1403,6 +1555,7 @@ fn account_header(spec: char) -> &'static str {
         'S' => "Share",
         'G' => "GrpTRES",
         'J' => "MaxJobs",
+        'C' => "Coords",
         _ => "?",
     }
 }
@@ -1416,6 +1569,7 @@ fn account_field_spec(name: &str) -> Option<char> {
         "share" | "fairshare" | "fairshareweight" => Some('S'),
         "grptres" => Some('G'),
         "maxjobs" | "maxrunningjobs" => Some('J'),
+        "coords" | "coordinators" | "coord" => Some('C'),
         _ => None,
     }
 }
@@ -1431,8 +1585,78 @@ fn account_format_fields(
         ACCOUNT_ALL_FORMAT,
         &account_field_spec,
         &account_header,
-        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs",
+        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs, Coords",
     )
+}
+
+/// `withcoord` adds the column when the caller's format did not already ask for it.
+fn append_coords_column(fields: &mut Vec<format_engine::FormatToken>) {
+    if fields
+        .iter()
+        .any(|token| matches!(token, format_engine::FormatToken::Field(field) if field.spec == 'C'))
+    {
+        return;
+    }
+    fields.push(format_engine::FormatToken::Literal(" ".to_string()));
+    fields.push(format_engine::FormatToken::Field(
+        format_engine::FormatField {
+            spec: 'C',
+            width: 20,
+            right_align: false,
+            truncate: None,
+            header: "Coords".to_string(),
+        },
+    ));
+}
+
+/// `(accounts by user, users by account)`, names joined and sorted. A caller
+/// who is denied the coordinator list gets empty columns rather than a failed
+/// `show user`; they coordinate nothing, and other assignments stay hidden.
+async fn load_coordinator_columns(
+    client: &mut SlurmAccountingClient<crate::authclient::AuthChannel>,
+) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
+    match client
+        .list_coordinators(ListCoordinatorsRequest {
+            account: String::new(),
+            user: String::new(),
+        })
+        .await
+    {
+        Ok(resp) => Ok(coordinator_columns(&resp.into_inner().coordinators)),
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            Ok((HashMap::new(), HashMap::new()))
+        }
+        Err(status) => Err(status).context("ListCoordinators RPC failed"),
+    }
+}
+
+fn coordinator_columns(
+    rows: &[CoordinatorInfo],
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut by_user: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut by_account: HashMap<String, Vec<&str>> = HashMap::new();
+    for row in rows {
+        by_user
+            .entry(row.user.clone())
+            .or_default()
+            .push(row.account.as_str());
+        by_account
+            .entry(row.account.clone())
+            .or_default()
+            .push(row.user.as_str());
+    }
+    (join_names(by_user), join_names(by_account))
+}
+
+fn join_names(groups: HashMap<String, Vec<&str>>) -> HashMap<String, String> {
+    groups
+        .into_iter()
+        .map(|(key, mut names)| {
+            names.sort_unstable();
+            names.dedup();
+            (key, names.join(","))
+        })
+        .collect()
 }
 
 /// Render a numeric limit, blank when unset/unlimited (the INFINITE sentinel);
@@ -1509,7 +1733,7 @@ fn format_association_row(
     format!("{user:<15} {account:<20} {partition:<15} {share:<10} {default_qos:<10}",)
 }
 
-fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
+fn resolve_account_field(a: &AccountInfo, spec: char, coords: &str) -> String {
     match spec {
         'N' => a.name.clone(),
         'D' => a.description.clone(),
@@ -1518,6 +1742,7 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
         'S' => (a.fairshare_weight as u32).to_string(),
         'G' => a.grp_tres.clone(),
         'J' => blank_if_unset(a.max_running_jobs),
+        'C' => coords.to_string(),
         _ => "?".into(),
     }
 }
@@ -1859,6 +2084,62 @@ mod tests {
     fn delete_user_accepts_name_and_account_selectors() {
         let p = parse_params(&["name=alice".into(), "account=physics".into()]);
         assert!(reject_unknown_keys(&p, DELETE_USER_KEYS).is_ok());
+    }
+
+    #[test]
+    fn coordinator_names_split_a_comma_list() {
+        assert_eq!(
+            coordinator_names(Some("alice, bob")),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        assert!(coordinator_names(None).is_empty());
+    }
+
+    #[test]
+    fn coordinator_rejects_a_field_it_does_not_apply() {
+        let p = parse_params(&["account=ml".into(), "fairshare=10".into()]);
+        let err = reject_unknown_keys(&p, COORDINATOR_KEYS).unwrap_err();
+        assert!(err.to_string().contains("unknown field 'fairshare'"));
+    }
+
+    #[test]
+    fn withcoord_is_a_flag_and_does_not_swallow_the_next_field() {
+        let p = parse_params(&["withcoord".into(), "name=alice".into()]);
+        assert!(p.contains_key("withcoord"));
+        assert_eq!(p.get("name").map(String::as_str), Some("alice"));
+
+        let p = parse_params(&["WithCoord".into()]);
+        assert!(p.contains_key("withcoord"));
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn coordinator_columns_group_users_and_accounts() {
+        let rows = vec![
+            CoordinatorInfo {
+                user: "bob".into(),
+                account: "physics".into(),
+            },
+            CoordinatorInfo {
+                user: "alice".into(),
+                account: "gpu".into(),
+            },
+            CoordinatorInfo {
+                user: "alice".into(),
+                account: "physics".into(),
+            },
+        ];
+        let (by_user, by_account) = coordinator_columns(&rows);
+        assert_eq!(
+            by_user.get("alice").map(String::as_str),
+            Some("gpu,physics")
+        );
+        assert_eq!(by_user.get("bob").map(String::as_str), Some("physics"));
+        assert_eq!(
+            by_account.get("physics").map(String::as_str),
+            Some("alice,bob")
+        );
+        assert_eq!(by_account.get("gpu").map(String::as_str), Some("alice"));
     }
 
     #[test]
@@ -2822,7 +3103,7 @@ mod tests {
         assert_eq!(specs, vec!['N', 'G']);
 
         let a = stub_account();
-        let row = format_engine::format_row(&fields, &|spec| resolve_account_field(&a, spec));
+        let row = format_engine::format_row(&fields, &|spec| resolve_account_field(&a, spec, ""));
         assert!(row.contains("physics"), "Account missing: {row}");
         assert!(row.contains("node=4,cpu=256"), "GrpTRES missing: {row}");
         assert!(
@@ -2891,13 +3172,13 @@ mod tests {
             max_running_jobs: spur_core::accounting::INFINITE,
             ..stub_account()
         };
-        assert_eq!(resolve_account_field(&unset, 'J'), "");
+        assert_eq!(resolve_account_field(&unset, 'J', ""), "");
 
         let blocking = AccountInfo {
             max_running_jobs: 0,
             ..stub_account()
         };
-        assert_eq!(resolve_account_field(&blocking, 'J'), "0");
+        assert_eq!(resolve_account_field(&blocking, 'J', ""), "0");
     }
 
     #[test]
@@ -2906,13 +3187,13 @@ mod tests {
             max_running_jobs: 10,
             ..stub_account()
         };
-        assert_eq!(resolve_account_field(&a, 'J'), "10");
+        assert_eq!(resolve_account_field(&a, 'J', ""), "10");
     }
 
     #[test]
     fn account_resolve_unknown_spec_is_visible_marker() {
         // A header spec missing a resolver renders "?" (not a silently blank column).
-        assert_eq!(resolve_account_field(&stub_account(), 'Z'), "?");
+        assert_eq!(resolve_account_field(&stub_account(), 'Z', ""), "?");
     }
 
     #[test]

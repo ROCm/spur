@@ -115,6 +115,9 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         "DeleteAccount" => targeted(Delete, TxnEntity::Account, Local),
         "AddUser" => targeted(Create, TxnEntity::User, Local),
         "RemoveUser" => targeted(Delete, TxnEntity::User, Local),
+        // A coordinator assignment names an account, which is the target.
+        "AddCoordinator" => targeted(Create, TxnEntity::Account, Local),
+        "RemoveCoordinator" => targeted(Delete, TxnEntity::Account, Local),
         "CreateQos" => targeted(Create, TxnEntity::Qos, Local),
         "DeleteQos" => targeted(Delete, TxnEntity::Qos, Local),
         "ModifyUsage" => targeted(Update, TxnEntity::User, Local),
@@ -141,6 +144,7 @@ pub(crate) fn classify(method: &str) -> Option<RpcClass> {
         | "GetUsage"
         | "ListAccounts"
         | "ListUsers"
+        | "ListCoordinators"
         | "ListQos"
         | "GetFairshareFactors"
         | "GetTransactions" => RpcClass::ReadOnly,

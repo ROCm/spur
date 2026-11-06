@@ -2127,7 +2127,7 @@ impl SlurmController for ControllerService {
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read(meta, forward.then(|| req.clone()), identity, path)
+            .forward_read(meta, forward.then(|| req.clone()), identity.clone(), path)
             .await
         {
             return Ok(resp);
@@ -2152,7 +2152,12 @@ impl SlurmController for ControllerService {
             .collect();
 
         let reservations = self.cluster.get_reservations();
-        annotate_nodes_with_reservations(&mut proto_nodes, &reservations, Utc::now());
+        annotate_nodes_with_reservations(
+            &mut proto_nodes,
+            &reservations,
+            Utc::now(),
+            reservation_visibility(&self.cluster, identity.as_ref()),
+        );
         annotate_nodes_with_planned_reservations(&mut proto_nodes, &self.cluster);
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
     }
@@ -2214,7 +2219,7 @@ impl SlurmController for ControllerService {
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read(meta, forward.then(|| req.clone()), identity, path)
+            .forward_read(meta, forward.then(|| req.clone()), identity.clone(), path)
             .await
         {
             return Ok(resp);
@@ -2231,6 +2236,7 @@ impl SlurmController for ControllerService {
             std::slice::from_mut(&mut proto_node),
             &reservations,
             Utc::now(),
+            reservation_visibility(&self.cluster, identity.as_ref()),
         );
         annotate_nodes_with_planned_reservations(
             std::slice::from_mut(&mut proto_node),
@@ -3614,17 +3620,18 @@ impl SlurmController for ControllerService {
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read(meta, forward.then(|| req.clone()), identity, path)
+            .forward_read(meta, forward.then(|| req.clone()), identity.clone(), path)
             .await
         {
             return Ok(resp);
         }
         let name = req.name.trim();
+        let visible = reservation_visibility(&self.cluster, identity.as_ref());
         let reservations = self.cluster.get_reservations();
         let now = Utc::now();
         let infos: Vec<ReservationInfo> = reservations
             .iter()
-            .filter(|r| name.is_empty() || r.name == name)
+            .filter(|r| (name.is_empty() || r.name == name) && visible(r))
             .map(|r| ReservationInfo {
                 name: r.name.clone(),
                 start_time: r.start_time.to_rfc3339(),
@@ -5247,18 +5254,11 @@ pub(crate) fn identity_role(
     let id = identity?;
     let auth = &cluster.config().auth;
     let cache = cluster.association_cache();
-    let groups = if auth.admin_groups.is_empty() && auth.operator_groups.is_empty() {
-        Vec::new()
-    } else {
-        spur_core::privilege::named_user_groups(&id.user).unwrap_or_default()
-    };
-    Some(spur_core::rbac::resolve_role(
+    Some(spur_core::rbac::resolve_caller_role(
         id,
         auth,
         cache.admin_level(&id.user).as_deref(),
         cache.is_loaded(),
-        &groups,
-        false,
     ))
 }
 
@@ -5299,12 +5299,48 @@ fn usage_read_scope(
     )
 }
 
+/// The read scope for `scontrol show reservation`, gated by
+/// `[auth] private_data = ["reservations"]`.
+fn reservation_read_scope(
+    cluster: &crate::cluster::ClusterManager,
+    identity: Option<&spur_core::auth::Identity>,
+) -> spur_core::rbac::ReadScope {
+    spur_core::rbac::read_scope(
+        identity,
+        identity_role(cluster, identity),
+        cluster.config().auth.reservations_private(),
+    )
+}
+
+/// Which reservations `identity` may see by name.
+fn reservation_visibility(
+    cluster: &crate::cluster::ClusterManager,
+    identity: Option<&spur_core::auth::Identity>,
+) -> impl Fn(&Reservation) -> bool {
+    let scope = reservation_read_scope(cluster, identity);
+    let accounts = match &scope {
+        spur_core::rbac::ReadScope::Caller(user)
+        | spur_core::rbac::ReadScope::Coordinated { user, .. } => {
+            cluster.association_cache().accounts_for(user)
+        }
+        spur_core::rbac::ReadScope::All => None,
+    };
+    move |res| match &scope {
+        spur_core::rbac::ReadScope::All => true,
+        spur_core::rbac::ReadScope::Caller(user)
+        | spur_core::rbac::ReadScope::Coordinated { user, .. } => {
+            res.visible_to(user, accounts.as_deref())
+        }
+    }
+}
+
 /// The assoc-mgr `users=` filter: an unrestricted caller keeps the selector
 /// (empty means every user), a scoped caller is pinned to their own user.
 fn assoc_mgr_user_filter(scope: &spur_core::rbac::ReadScope, requested: &str) -> Option<String> {
     match scope {
         spur_core::rbac::ReadScope::All => (!requested.is_empty()).then(|| requested.to_string()),
-        spur_core::rbac::ReadScope::Caller(user) => Some(user.clone()),
+        spur_core::rbac::ReadScope::Caller(user)
+        | spur_core::rbac::ReadScope::Coordinated { user, .. } => Some(user.clone()),
     }
 }
 
@@ -5729,6 +5765,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         active_reservation: String::new(),
         labels: node.labels.clone(),
         reservation_maint: false,
+        in_reservation: false,
         features: node.features.clone(),
         planned_job_id: 0,
         planned_start: None,
@@ -5878,17 +5915,22 @@ fn node_matches_filter(
     tokens.any(|req| node.partitions.iter().any(|p| p == req))
 }
 
+/// `named` says which reservations the caller may see by name. A hidden one
+/// still marks the node reserved, so `sinfo` keeps showing `resv`/`maint`.
 fn annotate_nodes_with_reservations(
     nodes: &mut [NodeInfo],
     reservations: &[Reservation],
     now: DateTime<Utc>,
+    named: impl Fn(&Reservation) -> bool,
 ) {
     for node_info in nodes.iter_mut() {
         node_info.reservation_maint = false;
+        node_info.in_reservation = false;
         node_info.active_reservation.clear();
         for res in reservations {
             if res.is_active(now) && res.covers_node(&node_info.name) {
-                if node_info.active_reservation.is_empty() {
+                node_info.in_reservation = true;
+                if node_info.active_reservation.is_empty() && named(res) {
                     node_info.active_reservation = res.name.clone();
                 }
                 if res.flags.maint {
@@ -6728,6 +6770,15 @@ mod tests {
             .auth
             .private_data
             .insert(spur_core::config::PrivateData::Jobs);
+        config
+    }
+
+    fn reservations_private_config() -> spur_core::config::SlurmConfig {
+        let mut config = step_test_config();
+        config
+            .auth
+            .private_data
+            .insert(spur_core::config::PrivateData::Reservations);
         config
     }
 
@@ -14114,7 +14165,7 @@ mod tests {
     #[test]
     fn test_annotate_no_reservations() {
         let mut nodes = vec![make_node_info("n1"), make_node_info("n2")];
-        annotate_nodes_with_reservations(&mut nodes, &[], Utc::now());
+        annotate_nodes_with_reservations(&mut nodes, &[], Utc::now(), |_| true);
         assert!(nodes[0].active_reservation.is_empty());
         assert!(nodes[1].active_reservation.is_empty());
     }
@@ -14123,7 +14174,7 @@ mod tests {
     fn test_annotate_active_reservation() {
         let mut nodes = vec![make_node_info("n1"), make_node_info("n2")];
         let reservations = vec![make_reservation("maint", &["n1"], -1, 1)];
-        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |_| true);
         assert_eq!(nodes[0].active_reservation, "maint");
         assert!(nodes[1].active_reservation.is_empty());
     }
@@ -14132,7 +14183,7 @@ mod tests {
     fn test_annotate_expired_reservation() {
         let mut nodes = vec![make_node_info("n1")];
         let reservations = vec![make_reservation("old", &["n1"], -3, -1)];
-        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |_| true);
         assert!(nodes[0].active_reservation.is_empty());
     }
 
@@ -14140,7 +14191,7 @@ mod tests {
     fn test_annotate_future_reservation() {
         let mut nodes = vec![make_node_info("n1")];
         let reservations = vec![make_reservation("future", &["n1"], 1, 3)];
-        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |_| true);
         assert!(nodes[0].active_reservation.is_empty());
     }
 
@@ -14152,7 +14203,7 @@ mod tests {
             make_node_info("n3"),
         ];
         let reservations = vec![make_reservation("gpu-resv", &["n1", "n3"], -1, 1)];
-        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |_| true);
         assert_eq!(nodes[0].active_reservation, "gpu-resv");
         assert!(nodes[1].active_reservation.is_empty());
         assert_eq!(nodes[2].active_reservation, "gpu-resv");
@@ -14165,8 +14216,25 @@ mod tests {
             make_reservation("first", &["n1"], -1, 1),
             make_reservation("second", &["n1"], -1, 1),
         ];
-        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |_| true);
         assert_eq!(nodes[0].active_reservation, "first");
+        assert!(nodes[0].in_reservation);
+    }
+
+    #[test]
+    fn test_annotate_hides_the_name_but_keeps_the_node_reserved() {
+        let mut nodes = vec![make_node_info("n1"), make_node_info("n2")];
+        let reservations = vec![
+            make_reservation("hidden", &["n1", "n2"], -1, 1),
+            make_reservation("mine", &["n2"], -1, 1),
+        ];
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |r| {
+            r.name == "mine"
+        });
+        assert!(nodes[0].active_reservation.is_empty());
+        assert!(nodes[0].in_reservation);
+        assert_eq!(nodes[1].active_reservation, "mine");
+        assert!(nodes[1].in_reservation);
     }
 
     #[test]
@@ -14201,7 +14269,7 @@ mod tests {
             owner: String::new(),
         };
         let reservations = vec![plain, maint];
-        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now());
+        annotate_nodes_with_reservations(&mut nodes, &reservations, Utc::now(), |_| true);
         assert_eq!(nodes[0].active_reservation, "plain");
         assert!(nodes[0].reservation_maint);
     }
@@ -14551,6 +14619,137 @@ mod tests {
             .into_inner()
             .reservations;
         assert!(none.is_empty());
+
+        assert!(matches!(
+            reservation_read_scope(&svc.cluster, Some(&viewer("alice", false))),
+            spur_core::rbac::ReadScope::All
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_reservations_hides_unusable_ones_when_reservations_are_private() {
+        use spur_core::resource::ResourceSet;
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, reservations_private_config()).await;
+        assert!(matches!(
+            reservation_read_scope(&svc.cluster, Some(&viewer("alice", false))),
+            spur_core::rbac::ReadScope::Caller(user) if user == "alice"
+        ));
+
+        for n in ["n1", "n2", "n3", "n4"] {
+            svc.cluster
+                .register_node(
+                    n.into(),
+                    n.into(),
+                    ResourceSet {
+                        cpus: 4,
+                        memory_mb: 8000,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".into(),
+                    6818,
+                    String::new(),
+                    String::new(),
+                    spur_core::node::NodeSource::NativeHost,
+                    std::collections::HashMap::new(),
+                    Vec::new(),
+                    true,
+                )
+                .unwrap();
+        }
+        for _ in 0..200 {
+            if ["n1", "n2", "n3", "n4"]
+                .iter()
+                .all(|n| svc.cluster.get_node(n).is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let specs = [
+            ("open", "n1", Vec::new(), Vec::new()),
+            ("alice_res", "n2", vec!["alice".into()], Vec::new()),
+            ("bob_res", "n3", vec!["bob".into()], Vec::new()),
+            ("physics_res", "n4", Vec::new(), vec!["physics".into()]),
+        ];
+        for (name, node, users, accounts) in specs {
+            svc.create_reservation(admin_request(CreateReservationRequest {
+                name: name.into(),
+                start_time: "now".into(),
+                duration_minutes: 60,
+                nodes: vec![node.into()],
+                accounts,
+                users,
+                flags: Vec::new(),
+                user: String::new(),
+            }))
+            .await
+            .unwrap();
+        }
+
+        let listed = async |user: Option<(&str, bool)>, name: &str| {
+            let mut req = Request::new(ListReservationsRequest { name: name.into() });
+            if let Some((user, admin)) = user {
+                req.extensions_mut().insert(viewer(user, admin));
+            }
+            let mut names: Vec<String> = svc
+                .list_reservations(req)
+                .await
+                .unwrap()
+                .into_inner()
+                .reservations
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            listed(Some(("alice", false)), "").await,
+            ["alice_res", "open"]
+        );
+        svc.cluster
+            .association_cache()
+            .insert_association("alice", "physics");
+        assert_eq!(
+            listed(Some(("alice", false)), "").await,
+            ["alice_res", "open", "physics_res"]
+        );
+        assert!(listed(Some(("alice", false)), "bob_res").await.is_empty());
+
+        let mut req = Request::new(GetNodesRequest::default());
+        req.extensions_mut().insert(viewer("alice", false));
+        let nodes = svc.get_nodes(req).await.unwrap().into_inner().nodes;
+        let node = |name: &str| nodes.iter().find(|n| n.name == name).unwrap();
+        assert_eq!(node("n2").active_reservation, "alice_res");
+        assert!(node("n3").in_reservation);
+        assert!(
+            node("n3").active_reservation.is_empty(),
+            "bob_res must not leak through the node record"
+        );
+        let mut req = Request::new(GetNodeRequest { name: "n3".into() });
+        req.extensions_mut().insert(viewer("alice", false));
+        let n3 = svc.get_node(req).await.unwrap().into_inner();
+        assert!(n3.in_reservation && n3.active_reservation.is_empty());
+        assert_eq!(listed(Some(("bob", false)), "").await, ["bob_res", "open"]);
+        assert_eq!(
+            listed(Some(("carol", true)), "").await,
+            ["alice_res", "bob_res", "open", "physics_res"]
+        );
+        assert_eq!(
+            listed(None, "").await,
+            ["alice_res", "bob_res", "open", "physics_res"]
+        );
+
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("op", "Operator");
+        assert_eq!(
+            listed(Some(("op", false)), "").await,
+            ["alice_res", "bob_res", "open", "physics_res"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -101,14 +101,23 @@ Accounting entities map directly from Slurm:
 - The ``default_qos`` setting is the equivalent of Slurm's fallback QOS.
 - The ``[auth] private_data`` setting is the equivalent of the ``slurm.conf``
   side of Slurm's ``PrivateData`` (see :ref:`private-data`). Like Slurm, it is
-  unset by default, so every user sees every job. ``"jobs"`` and ``"usage"`` are
-  supported, written as a TOML list (``private_data = ["jobs", "usage"]``), not a
-  comma-separated string. ``sacct``, ``sshare``, and ``sreport``, which Slurm
-  restricts through ``slurmdbd.conf``, are not restricted yet. Unlike Slurm, root
-  has no implicit exemption: grant it a role (``cluster_admins``,
-  ``admin_groups``, an accounting admin level, or
-  ``allow_uid_zero_administrator``). Account coordinators are not exempt from
-  ``"jobs"``.
+  unset by default, so every user sees every job. ``"jobs"``, ``"usage"``,
+  ``"users"``, ``"accounts"``, and ``"reservations"`` are supported, written as
+  a TOML list (``private_data = ["jobs", "usage"]``), not a comma-separated
+  string. ``sacct`` and ``sreport job`` sizes follow ``"jobs"``. ``sshare`` and
+  ``sreport`` utilization follow ``"usage"``. ``sprio`` follows ``"jobs"``.
+  User and account listings follow ``"users"`` and ``"accounts"``. ``sshare``
+  is not filtered by ``"accounts"``. A coordinator sees the accounts they
+  coordinate, including sub-accounts, and the ``sacct`` history,
+  ``sreport job`` sizes, usage, and associations in those accounts.
+  ``sacctmgr show user`` stays the caller. ``show user withcoord`` and
+  ``show account withcoord`` list coordinator assignments, and
+  ``show coordinator`` is the same listing. ``squeue`` and ``sprio`` stay the
+  caller's own jobs. Unlike Slurm,
+  root has no implicit exemption: grant it a role
+  (``cluster_admins``, ``admin_groups``, an accounting admin level, or
+  ``allow_uid_zero_administrator``). Coordinators do not gain Slurm's write
+  powers (add users, change limits, cancel jobs).
 
 See :doc:`/admin-guide/accounting` for the accounting concept guide.
 

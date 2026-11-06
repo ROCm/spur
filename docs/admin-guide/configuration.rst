@@ -1324,9 +1324,10 @@ admin signal apply.
 Job and usage visibility (``private_data``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-By default every caller sees every job and every ``scontrol show assoc_mgr``
-scope, as a stock ``slurm.conf`` does. That includes each job's ``command``, the
-first non-comment line of its batch script, so a credential written there is
+By default every caller sees every job, every user and account, every
+reservation, and every ``scontrol show assoc_mgr`` scope, as a stock
+``slurm.conf`` does. That includes each job's ``command``, the first
+non-comment line of its batch script, so a credential written there is
 readable by every user. ``private_data`` under ``[auth]`` is the equivalent of
 Slurm's ``PrivateData`` and narrows what a User sees.
 
@@ -1354,20 +1355,60 @@ Slurm's ``PrivateData`` and narrows what a User sees.
      - Hides from a User
    * - ``"jobs"``
      - Other users' jobs and steps: ``squeue``/``spur queue``, ``sprio``,
-       ``sstat``, ``scontrol show job``/``step``, the jobs that ``scancel -p``,
-       ``-A``, or ``-n`` selects, and REST ``/jobs`` and ``/job/{id}``.
-       ``squeue -u other``, ``squeue -j``, and ``scontrol show job`` print
-       nothing for another user's job; ``sstat``, ``scontrol show step``, and
-       REST ``/job/{id}`` report it as not found.
+       ``sstat``, ``sacct``/``spur history``, ``scontrol show job``/``step``,
+       the jobs that ``scancel -p``, ``-A``, or ``-n`` selects, and REST
+       ``/jobs`` and ``/job/{id}``. ``sreport job`` sizes follow the same rule
+       and total the jobs the caller can see. A coordinator also sees jobs in
+       ``sacct`` and those reports for the accounts they coordinate. ``squeue``
+       stays the caller's own jobs. ``squeue -u other``, ``squeue -j``,
+       ``sacct -u other``, ``sacct -j`` for another user's job, and
+       ``scontrol show job`` print nothing; ``sstat``, ``scontrol show step``,
+       and REST ``/job/{id}`` report it as not found.
    * - ``"usage"``
      - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
        part in, and only their own ``User=`` lines. A ``users=`` selector is
        replaced with their own name. ``Grp*`` totals still include every user's
-       jobs.
+       jobs. ``sshare`` omits other users' rows. Account rows stay, and their
+       raw usage, account and cluster totals, ``NormUsage``, and ``% of Tot``
+       are left blank rather than computed from the User's rows alone.
+       ``sreport`` utilization leaves those same cells blank.
+       A coordinator also sees usage for the accounts they coordinate; those
+       rows are filled in, and cluster totals stay blank.
+       ``sprio`` and ``sreport job`` sizes follow ``"jobs"``, not ``"usage"``.
+       ``"users"`` also drops other users from ``sshare``.
+   * - ``"users"``
+     - ``sacctmgr show user`` lists only the caller, including for a coordinator.
+       ``show association`` lists the caller's rows, and a coordinator also sees
+       every association in the accounts they coordinate. ``user=`` for someone
+       else prints nothing unless that user is in a coordinated account.
+       ``sshare`` leaves the per-user ``NormShares`` blank when the list is not
+       the whole cluster.
+   * - ``"accounts"``
+     - ``sacctmgr show account`` lists only accounts the caller coordinates,
+       including sub-accounts of those accounts. A user who coordinates nothing
+       is denied. Until the association cache has loaded, the call returns
+       unavailable. ``sshare`` is not filtered by this category: it keeps the
+       full share tree, as in Slurm. Add a coordinator with
+       ``sacctmgr add coordinator account=<name> names=<user>``. The user must
+       already exist. ``show user withcoord`` and ``show account withcoord``
+       add a ``Coords`` column; ``show coordinator`` lists the same assignments.
+   * - ``"reservations"``
+     - ``scontrol show reservation`` lists reservations the caller is named on,
+       or whose accounts include one of the caller's. A reservation with no
+       users and no accounts stays visible. An account-only reservation is
+       hidden until the association cache has loaded. ``scontrol show node``
+       omits ``ActiveReservation`` for a hidden reservation, but ``sinfo`` and
+       ``smd`` still show the node as ``resv`` or ``maint``.
 
-``sacct``, ``sshare``, and ``sreport`` are not restricted by either category yet.
-Set both categories for the visibility closest to what Spur v0.13 and v0.14
-enforced:
+``sacct`` and ``sreport job`` sizes follow ``"jobs"``. ``sshare`` and
+``sreport`` utilization follow ``"usage"``. ``sprio`` follows ``"jobs"``.
+The user rows ``sshare`` and ``sreport`` list follow ``"users"``. ``sreport``
+account rows follow ``"accounts"``. ``sshare`` account rows are the share
+tree and stay when ``"accounts"`` is set. QOS definitions
+(``sacctmgr show qos``) stay visible. A coordinator is not an operator: the
+extra rows are the accounts they coordinate, including sub-accounts. Set
+``"jobs"`` and ``"usage"`` for the visibility closest to what Spur v0.13 and
+v0.14 enforced:
 
 .. code-block:: toml
 
@@ -1378,7 +1419,9 @@ enforced:
 
 Operators and Administrators are exempt. Root is exempt only through a role
 (``cluster_admins``, ``admin_groups``, an accounting admin level, or
-``allow_uid_zero_administrator``), and account coordinators are not exempt.
+``allow_uid_zero_administrator``). An account coordinator is not exempt from a
+category; they see the accounts they coordinate and the accounts under those,
+as in Slurm. ``sshare`` still shows the full share tree.
 
 .. warning::
 
@@ -1390,9 +1433,18 @@ Operators and Administrators are exempt. Root is exempt only through a role
    agents from registering; on a JWT cluster ``private_data`` only hides data
    from users who keep their token set.
 
-``scontrol reconfigure`` applies a change on the leader, which serves every gRPC
-read. Followers keep their startup value for REST and for any read they serve
-while the leader is unreachable, so restart every controller after changing it.
+``scontrol reconfigure`` applies a change on the leader only, and every read the
+leader serves uses the new value immediately. Controller reads (``squeue``,
+``scontrol show job``/``node``/``reservation``/``assoc_mgr``) forward to the
+leader. Accounting reads (``sacct``, ``sacctmgr show user`` and
+``show account``, ``sshare``, ``sreport``, and ``sprio`` fairshare) are not
+forwarded, so a follower answers them with the ``private_data`` it loaded at
+startup. It does the same for REST, and for controller reads while the leader
+is unreachable. Restart every follower after changing ``private_data``.
+Upgrade ``sshare`` together with ``spurctld`` before enabling ``"users"`` or
+``"accounts"``. An older controller does not set ``scoped_to_user`` on those
+lists, so this ``sshare`` would divide by the filtered weights and print
+``NormShares`` as if they were the cluster total.
 ``spurctld`` refuses to start, or to reconfigure, on a category it does not
 support; agents and the CLI ignore unknown category names.
 
@@ -1444,7 +1496,10 @@ operator must be resolvable *on the controller*, not only on the login node.
 
 Ownership is not part of this decision. The creator is recorded as ``Owner`` for
 attribution and shown by ``scontrol show reservation``, but any operator may
-update or delete any reservation, matching Slurm's operator semantics.
+update or delete any reservation, matching Slurm's operator semantics. Listing
+is separate: with ``private_data = ["reservations"]``, a User's
+``scontrol show reservation`` returns only reservations they can use (see
+:ref:`private-data`).
 
 .. warning::
 

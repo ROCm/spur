@@ -240,7 +240,8 @@ pub fn node_overlay(node: &spur_proto::proto::NodeInfo) -> Option<NodeOverlay> {
     if node.state != spur_proto::proto::NodeState::NodeIdle as i32 {
         return None;
     }
-    if !node.active_reservation.is_empty() {
+    // An older controller sends only the name.
+    if node.in_reservation || !node.active_reservation.is_empty() {
         return Some(NodeOverlay::Reserved {
             maint: node.reservation_maint,
         });
@@ -906,6 +907,17 @@ mod tests {
         assert_eq!(
             node_overlay(&node),
             Some(NodeOverlay::Reserved { maint: false })
+        );
+    }
+
+    #[test]
+    fn node_overlay_reserved_when_the_name_is_hidden() {
+        let mut node = idle_node_info();
+        node.in_reservation = true;
+        node.reservation_maint = true;
+        assert_eq!(
+            node_overlay(&node),
+            Some(NodeOverlay::Reserved { maint: true })
         );
     }
 

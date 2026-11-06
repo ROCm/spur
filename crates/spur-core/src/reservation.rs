@@ -115,6 +115,21 @@ impl Reservation {
         }
         false
     }
+
+    /// Whether `user` may see this reservation when `reservations` is private.
+    ///
+    /// `accounts` is `None` while the association cache has not loaded. A
+    /// reservation that names only accounts stays hidden then, instead of
+    /// being shown to every caller.
+    pub fn visible_to(&self, user: &str, accounts: Option<&[String]>) -> bool {
+        if self.allows_user(user, None) {
+            return true;
+        }
+        accounts.is_some_and(|mine| {
+            mine.iter()
+                .any(|account| self.allows_user(user, Some(account)))
+        })
+    }
 }
 
 /// Whether two reservations share a node and overlap in time.
@@ -306,6 +321,25 @@ mod tests {
         assert!(res.is_active(Utc::now()));
         assert!(!res.is_active(res.end_time + Duration::seconds(1)));
         assert!(!res.is_active(res.start_time - Duration::seconds(1)));
+    }
+
+    #[test]
+    fn visible_to_names_the_user_or_one_of_their_accounts() {
+        let named = make_reservation();
+        assert!(named.visible_to("alice", None));
+        assert!(!named.visible_to("bob", None));
+        assert!(named.visible_to("bob", Some(&["research".into()])));
+        assert!(!named.visible_to("bob", Some(&[])));
+
+        let mut account_only = make_reservation();
+        account_only.users.clear();
+        assert!(!account_only.visible_to("bob", None));
+        assert!(account_only.visible_to("bob", Some(&["research".into()])));
+
+        let mut open = make_reservation();
+        open.users.clear();
+        open.accounts.clear();
+        assert!(open.visible_to("bob", None));
     }
 
     #[test]

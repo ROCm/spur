@@ -989,11 +989,19 @@ impl AuthMode {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum PrivateData {
-    /// Hide other users' jobs and job steps from `squeue`, `scontrol show job`,
-    /// `scontrol show step`, and the REST job surface.
+    /// Hide other users' jobs from the live queue and from `sacct`.
     Jobs,
-    /// Pin `scontrol show assoc_mgr` to the scopes the caller takes part in.
+    /// Pin usage reads (`assoc_mgr`, `sshare`, `sreport` utilization) to the caller,
+    /// widened to the accounts a coordinator runs.
     Usage,
+    /// Pin `sacctmgr show user` to the caller. `show association` widens to the
+    /// accounts a coordinator runs.
+    Users,
+    /// List `sacctmgr show account` only to coordinators, and only the accounts they
+    /// coordinate.
+    Accounts,
+    /// Pin `scontrol show reservation` to reservations the caller can use.
+    Reservations,
     Unsupported(String),
 }
 
@@ -1002,6 +1010,9 @@ impl From<String> for PrivateData {
         match name.as_str() {
             "jobs" => PrivateData::Jobs,
             "usage" => PrivateData::Usage,
+            "users" => PrivateData::Users,
+            "accounts" => PrivateData::Accounts,
+            "reservations" => PrivateData::Reservations,
             _ => PrivateData::Unsupported(name),
         }
     }
@@ -1012,6 +1023,9 @@ impl From<PrivateData> for String {
         match category {
             PrivateData::Jobs => "jobs".into(),
             PrivateData::Usage => "usage".into(),
+            PrivateData::Users => "users".into(),
+            PrivateData::Accounts => "accounts".into(),
+            PrivateData::Reservations => "reservations".into(),
             PrivateData::Unsupported(name) => name,
         }
     }
@@ -1087,6 +1101,21 @@ impl AuthConfig {
         self.private_data.contains(&PrivateData::Usage)
     }
 
+    /// Whether other users' accounting rows are hidden from an ordinary caller.
+    pub fn users_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Users)
+    }
+
+    /// Whether accounts the caller does not belong to are hidden.
+    pub fn accounts_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Accounts)
+    }
+
+    /// Whether reservations the caller cannot use are hidden.
+    pub fn reservations_private(&self) -> bool {
+        self.private_data.contains(&PrivateData::Reservations)
+    }
+
     /// A warning when `private_data` is set but a caller can bypass it by sending no credential.
     pub fn private_data_warning(&self) -> Option<&'static str> {
         if self.private_data.is_empty() || self.mode == AuthMode::Required {
@@ -1094,7 +1123,8 @@ impl AuthConfig {
         }
         Some(
             "[auth] private_data restricts only callers that present a credential; without \
-             mode = \"required\", a caller that sends none still sees every job and scope",
+             mode = \"required\", a caller that sends none still sees every job, user, \
+             account, reservation, and usage scope",
         )
     }
 
@@ -1108,7 +1138,10 @@ impl AuthConfig {
         match unsupported {
             Some(name) => Err(ConfigError::InvalidValue {
                 field: "auth.private_data".into(),
-                value: format!("{name:?} (supported: \"jobs\", \"usage\")"),
+                value: format!(
+                    "{name:?} (supported: \"jobs\", \"usage\", \"users\", \"accounts\", \
+                     \"reservations\")"
+                ),
             }),
             None => Ok(()),
         }
@@ -5059,6 +5092,24 @@ mode = "permissive"
         .unwrap();
         assert!(config.auth.jobs_private());
         assert!(config.auth.usage_private());
+        assert!(!config.auth.users_private());
+        assert!(!config.auth.accounts_private());
+        assert!(!config.auth.reservations_private());
+    }
+
+    #[test]
+    fn private_data_parses_users_accounts_and_reservations() {
+        let config = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\n\
+             private_data = [\"users\", \"accounts\", \"reservations\"]\n",
+        )
+        .unwrap();
+        assert!(config.auth.users_private());
+        assert!(config.auth.accounts_private());
+        assert!(config.auth.reservations_private());
+        assert!(!config.auth.jobs_private());
+        assert!(!config.auth.usage_private());
+        config.auth.check_private_data().unwrap();
     }
 
     #[test]
@@ -5080,7 +5131,8 @@ mode = "permissive"
     #[test]
     fn private_data_check_accepts_supported_categories() {
         let config = SlurmConfig::load_from_str(
-            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\nprivate_data = [\"jobs\", \"usage\"]\n",
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\n\
+             private_data = [\"jobs\", \"usage\", \"users\", \"accounts\", \"reservations\"]\n",
         )
         .unwrap();
         config.auth.check_private_data().unwrap();

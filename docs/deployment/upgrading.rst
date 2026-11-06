@@ -571,6 +571,12 @@ Without ``private_data``, ``scancel -p``, ``-A``, or ``-n`` also selects other
 users' jobs. Each one the caller does not own is refused and reported on
 ``stderr``.
 
+A cluster that already sets ``"jobs"`` now also hides other users' ``sacct``
+history and ``sreport job`` sizes. A cluster that already sets ``"usage"`` now
+also hides other users' ``sshare`` and ``sreport`` utilization figures. ``sprio``
+stays with ``"jobs"``. Set the categories only where that narrower view is what
+you want, and upgrade ``spur-cli`` together with ``spurctld``.
+
 ``scontrol reconfigure`` applies ``private_data`` on the leader only; restart every
 controller after changing it. During a rolling upgrade, visibility depends on which
 controller serves the request, but it is never wider than the new configuration

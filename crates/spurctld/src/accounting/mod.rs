@@ -51,7 +51,8 @@ pub(crate) fn start(
 
     let service = AccountingService::unavailable("connecting to accounting database");
     service.attach_association_cache(cluster.association_cache().clone());
-    service.attach_auth(config.auth.clone());
+    let live = cluster.clone();
+    service.attach_auth_source(move || live.config().auth.clone());
     service.attach_fairshare_halflife(config.scheduler.fairshare_halflife_days);
     service.attach_billing_weights(config.scheduler.billing_weights());
     let bringup = service.clone();
@@ -374,6 +375,7 @@ pub async fn association_maps(
     HashMap<(String, String), AccountLimits>,
     HashMap<(String, String), HashSet<String>>,
     HashMap<String, String>,
+    HashSet<(String, String)>,
 )> {
     let users = db::list_users(pool, None, None).await?;
 
@@ -414,6 +416,20 @@ pub async fn association_maps(
         })
         .collect();
 
+    let parent_of: HashMap<String, String> = db::list_accounts(pool)
+        .await?
+        .into_iter()
+        .filter_map(|account| {
+            account
+                .parent
+                .filter(|parent| !parent.is_empty())
+                .map(|parent| (account.name, parent))
+        })
+        .collect();
+    // Stored expanded, so every read sees sub-accounts without walking the tree.
+    let coordinators =
+        crate::association_cache::with_sub_accounts(db::list_coordinators(pool).await?, &parent_of);
+
     Ok((
         default_qos,
         default_account,
@@ -421,6 +437,7 @@ pub async fn association_maps(
         limits,
         allowed_qos,
         admin_level,
+        coordinators,
     ))
 }
 

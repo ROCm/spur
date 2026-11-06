@@ -379,7 +379,8 @@ Accounting History — ``sacct``
 -------------------------------
 
 ``spur history`` (Slurm ``sacct``) reports finished and running jobs from the
-accounting service.
+accounting service. With ``private_data = ["jobs"]`` it lists only your own
+jobs, and ``-u`` for someone else prints nothing (see :ref:`private-data`).
 
 .. code-block:: bash
 
@@ -999,7 +1000,11 @@ By default every caller sees every scope and may pass ``users=<name>`` to
 inspect one user. When an administrator sets ``private_data = ["usage"]`` under
 ``[auth]`` (see :ref:`private-data`), an unprivileged caller sees only the QOS
 and accounts they take part in, and only their own ``User=`` lines; a ``users=``
-selector is replaced with their own name. ``Grp*`` totals on the scope line
+selector is replaced with their own name. ``sshare`` omits other users'
+rows and leaves account totals and shares of the total blank. ``sreport``
+utilization fills in only your own usage and fairshare and leaves the other
+cells blank. ``sprio`` and ``sreport job`` sizes follow
+``"jobs"`` instead. ``Grp*`` totals on the scope line
 still include every user's jobs. Operators and Administrators are exempt.
 
 Cluster Metrics — ``/metrics``
