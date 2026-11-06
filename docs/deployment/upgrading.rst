@@ -737,8 +737,9 @@ change them while that file exists.
    controller remaps the job's allocation to the new ids. Upgrade the
    controllers before the agents: an older controller does not remap
    allocations when a node re-registers, and an upgraded agent then rejects
-   dispatches with ``controller-allocated GPUs are not in this node's gpu
-   inventory``. With the controllers upgraded first, jobs keep running, no
+   dispatches with
+   ``controller-allocated GPUs are not in this node's gpu inventory``.
+   With the controllers upgraded first, jobs keep running, no
    dispatch rejection or ``JobHoldMaxRequeue`` hold results, and draining
    nodes is no longer required for the GPU id change. See
    :ref:`gpu-partition-mode-change` for the separate, still-destructive case
