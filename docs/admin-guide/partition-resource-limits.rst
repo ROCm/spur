@@ -255,9 +255,12 @@ on those nodes, whatever their partition's tier.
 Nothing is fixed while the job waits. If another candidate partition frees up
 first, the job starts there. The partition is recorded only when the job starts,
 and the job's usage counts against that partition until it ends. A suspended
-job keeps its allocation, so it keeps counting. A job preempted with a
-:ref:`grace time <qos-preempt-grace>` keeps counting until it exits or is killed
-at the end of its grace, so its preemptor starts only once that share is freed.
+job keeps its allocation, so it keeps counting. A job preempted in ``cancel``
+mode with a :ref:`grace time <qos-preempt-grace>` keeps counting until it exits
+or is killed at the end of its grace, so its preemptor starts only once that
+share is freed. A job preempted in ``requeue`` mode returns to ``PENDING`` and
+stops counting at once, before its processes have exited, so while they shut
+down (up to ``kill_wait_secs``) the node can briefly hold more than the cap.
 A multi-node job stops counting on each node as soon as it finishes there.
 
 ``scontrol show job`` keeps the requested list in ``Partition=`` and adds
