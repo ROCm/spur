@@ -2887,19 +2887,23 @@ mod tests {
             qos: "normal".into(),
             ..Default::default()
         };
+        // Messages name the expected line rather than echoing the whole job
+        // detail, which carries job identity fields.
         let pending = format_job_detail(&job);
+        let requested_only = "   Partition=cpu,wide QOS=normal\n";
         assert!(
-            pending.contains("   Partition=cpu,wide QOS=normal\n"),
-            "{pending}"
+            pending.contains(requested_only),
+            "missing {requested_only:?}"
         );
-        assert!(!pending.contains("EffectivePartition"), "{pending}");
+        assert!(
+            !pending.contains("EffectivePartition"),
+            "EffectivePartition shown before a partition was chosen"
+        );
 
         job.effective_partition = "wide".into();
         let running = format_job_detail(&job);
-        assert!(
-            running.contains("   Partition=cpu,wide QOS=normal EffectivePartition=wide\n"),
-            "{running}"
-        );
+        let chosen = "   Partition=cpu,wide QOS=normal EffectivePartition=wide\n";
+        assert!(running.contains(chosen), "missing {chosen:?}");
     }
 
     #[test]
@@ -3050,10 +3054,8 @@ mod tests {
         job.min_memory_node_mb = 0;
         job.mem_per_tres = "gpu:8192".into();
         let out = format_job_detail(&job);
-        assert!(
-            out.contains("MinMemoryNode=0\n   MemPerTres=gpu:8192\n"),
-            "{out}"
-        );
+        let per_gpu = "MinMemoryNode=0\n   MemPerTres=gpu:8192\n";
+        assert!(out.contains(per_gpu), "missing {per_gpu:?}");
         assert!(!format_job_detail(&pending_pinned_job()).contains("MemPerTres"));
     }
 
