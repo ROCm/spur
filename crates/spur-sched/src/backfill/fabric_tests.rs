@@ -927,7 +927,45 @@ fn property_co_owner_places_beside_an_unplanned_owner() {
     other.spec.num_nodes = 3;
     other.spec.num_tasks = 3;
     let jobs = [other, property_job_on(2, "n0")];
-    let (_, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].job_id, 2);
+    assert!(scheduler.released_handoffs().is_empty());
+}
+
+#[test]
+fn property_owner_releases_its_unused_handed_off_node() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n0".to_string(), vec![1]), ("n1".to_string(), vec![1])]);
+    let jobs = [property_job_on(1, "n0"), handoff_owner(2, "n1")];
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    let ids: Vec<_> = assignments.iter().map(|a| a.job_id).collect();
+    assert_eq!(ids, [1, 2]);
+    assert_eq!(scheduler.released_handoffs(), [("n1".to_string(), 1)]);
+}
+
+#[test]
+fn property_job_needs_every_owner_of_a_node_planned() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n1".to_string(), vec![1, 2])]);
+    let mut stuck = handoff_owner(2, "n1");
+    stuck.spec.num_nodes = 3;
+    stuck.spec.num_tasks = 3;
+    let jobs = [handoff_owner(1, "n0"), stuck, property_job_on(3, "n1")];
+    let (_, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    assert_eq!(
+        assignments.iter().map(|a| a.job_id).collect::<Vec<_>>(),
+        [1]
+    );
+
+    let jobs = [
+        handoff_owner(1, "n0"),
+        handoff_owner(2, "n0"),
+        property_job_on(3, "n1"),
+    ];
+    let (_, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    assert_eq!(
+        assignments.iter().map(|a| a.job_id).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
 }
