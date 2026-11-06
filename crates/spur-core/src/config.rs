@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::partition::{Partition, PartitionState, PreemptType};
+use crate::partition::{Partition, PartitionState, PreemptType, TRES_CPU};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -623,8 +623,11 @@ impl Default for AccountingConfig {
     }
 }
 
-/// Submit-time enforcement of partition wall-time (Slurm `EnforcePartLimits`):
-/// `No` admits over-limit jobs to pend, `All` needs all fit, `Any` needs one.
+/// Submit-time enforcement of partition limits (Slurm `EnforcePartLimits`):
+/// wall time, per-job memory limits, and requests a partition's per-node
+/// resource cap could never hold. `No` admits over-limit jobs to pend, `All`
+/// needs all requested partitions to fit, `Any` needs one. A job over a cap
+/// only because of current load always pends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum EnforcePartLimits {
@@ -1245,6 +1248,51 @@ pub struct PartitionConfig {
     /// partitions the job runs in applies. `None` means unset.
     #[serde(default)]
     pub grace_time: Option<u32>,
+    /// Cumulative per-node cap on this partition's jobs, keyed by TRES
+    /// (`cpu`, `mem` in MiB, `gres/gpu`, `gres/gpu:<type>`).
+    #[serde(default)]
+    pub max_tres_per_node: BTreeMap<String, u64>,
+    /// Slurm `MaxCPUsPerNode`: shorthand for `max_tres_per_node.cpu`.
+    #[serde(default)]
+    pub max_cpus_per_node: Option<u32>,
+    /// Per-job memory policy (MiB), Slurm `MaxMemPerNode`/`MaxMemPerCPU`/
+    /// `DefMemPer*`. At most one `max_mem_*` and one `def_mem_*` may be set.
+    #[serde(default)]
+    pub max_mem_per_node: Option<u64>,
+    #[serde(default)]
+    pub max_mem_per_cpu: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_node: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_cpu: Option<u64>,
+    #[serde(default)]
+    pub def_mem_per_gpu: Option<u64>,
+}
+
+impl PartitionConfig {
+    /// The per-node cap map with the `max_cpus_per_node` alias folded into
+    /// the `cpu` key. [`SlurmConfig::validate`] rejects setting both.
+    pub fn effective_max_tres_per_node(&self) -> BTreeMap<String, u64> {
+        let mut caps = self.max_tres_per_node.clone();
+        if let Some(cpus) = self.max_cpus_per_node {
+            caps.entry(TRES_CPU.to_string()).or_insert(u64::from(cpus));
+        }
+        caps
+    }
+
+    fn validate_cpu_cap_alias(&self) -> Result<(), ConfigError> {
+        // Two spellings of one cap would leave the effective value to a
+        // precedence rule an operator cannot see, so require exactly one.
+        let (Some(alias), Some(cpu)) =
+            (self.max_cpus_per_node, self.max_tres_per_node.get(TRES_CPU))
+        else {
+            return Ok(());
+        };
+        Err(ConfigError::InvalidValue {
+            field: format!("partitions.{}.max_cpus_per_node", self.name),
+            value: format!("{alias} conflicts with max_tres_per_node.cpu = {cpu} (set only one)"),
+        })
+    }
 }
 
 fn default_partition_state() -> String {
@@ -2473,6 +2521,15 @@ impl SlurmConfig {
                     value,
                 }
             })?;
+            pc.validate_cpu_cap_alias()?;
+        }
+        for partition in self.build_partitions() {
+            partition
+                .validate_resource_limits()
+                .map_err(|value| ConfigError::InvalidValue {
+                    field: format!("partitions.{}", partition.name),
+                    value,
+                })?;
         }
         // Keepalive detection is interval + timeout, so an hour-long interval silently disables
         // the liveness this exists to provide.
@@ -2971,6 +3028,12 @@ impl SlurmConfig {
                     .unwrap_or(None),
                 preempt_exempt_time: pc.preempt_exempt_time,
                 grace_time: pc.grace_time,
+                max_tres_per_node: pc.effective_max_tres_per_node(),
+                max_mem_per_node: pc.max_mem_per_node,
+                max_mem_per_cpu: pc.max_mem_per_cpu,
+                def_mem_per_node: pc.def_mem_per_node,
+                def_mem_per_cpu: pc.def_mem_per_cpu,
+                def_mem_per_gpu: pc.def_mem_per_gpu,
                 ..Default::default()
             })
             .collect()
@@ -5905,5 +5968,154 @@ cluster_name = "test"
 usage_reset_period = "biweekly"
 "#;
         assert!(SlurmConfig::load_from_str(toml).is_err());
+    }
+
+    fn load_partition(body: &str) -> Result<SlurmConfig, ConfigError> {
+        SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n\n[[partitions]]\nname = \"cpu\"\nnodes = \"n1\"\n{body}"
+        ))
+    }
+
+    fn rejected(body: &str) -> String {
+        match load_partition(body) {
+            Ok(_) => panic!("expected config load to fail for:\n{body}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn partition_resource_caps_default_to_unlimited() {
+        let parts = load_partition("").unwrap().build_partitions();
+        let p = &parts[0];
+        assert!(p.max_tres_per_node.is_empty());
+        assert_eq!(p.max_mem_per_node, None);
+        assert_eq!(p.max_mem_per_cpu, None);
+        assert_eq!(p.def_mem_per_node, None);
+        assert_eq!(p.def_mem_per_cpu, None);
+        assert_eq!(p.def_mem_per_gpu, None);
+    }
+
+    #[test]
+    fn scalar_alias_alone_folds_into_cpu_tres_key() {
+        let parts = load_partition("max_cpus_per_node = 16\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(
+            parts[0].max_tres_per_node,
+            BTreeMap::from([("cpu".to_string(), 16)])
+        );
+
+        let direct = load_partition("[partitions.max_tres_per_node]\ncpu = 16\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(parts[0].max_tres_per_node, direct[0].max_tres_per_node);
+    }
+
+    #[test]
+    fn scalar_alias_merges_with_other_tres_keys() {
+        let parts = load_partition(
+            "max_cpus_per_node = 8\n[partitions.max_tres_per_node]\nmem = 131072\n\"gres/gpu:a100\" = 2\n\"gres/gpu\" = 0\n",
+        )
+        .unwrap()
+        .build_partitions();
+        assert_eq!(
+            parts[0].max_tres_per_node,
+            BTreeMap::from([
+                ("cpu".to_string(), 8),
+                ("gres/gpu".to_string(), 0),
+                ("gres/gpu:a100".to_string(), 2),
+                ("mem".to_string(), 131072),
+            ])
+        );
+    }
+
+    #[test]
+    fn partition_memory_knobs_are_carried_to_the_runtime_partition() {
+        let parts = load_partition("max_mem_per_cpu = 2048\ndef_mem_per_gpu = 8192\n")
+            .unwrap()
+            .build_partitions();
+        assert_eq!(parts[0].max_mem_per_cpu, Some(2048));
+        assert_eq!(parts[0].def_mem_per_gpu, Some(8192));
+        assert_eq!(parts[0].max_mem_per_node, None);
+    }
+
+    #[test]
+    fn build_partitions_rejects_max_mem_per_node_and_max_mem_per_cpu_both_set() {
+        let err = rejected("max_mem_per_node = 65536\nmax_mem_per_cpu = 2048\n");
+        for needle in ["partitions.cpu", "max_mem_per_node", "max_mem_per_cpu"] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+
+        let per_node = load_partition("max_mem_per_node = 65536\n").unwrap();
+        assert_eq!(per_node.build_partitions()[0].max_mem_per_node, Some(65536));
+        let per_cpu = load_partition("max_mem_per_cpu = 2048\n").unwrap();
+        assert_eq!(per_cpu.build_partitions()[0].max_mem_per_cpu, Some(2048));
+    }
+
+    #[test]
+    fn build_partitions_rejects_conflicting_max_cpus_per_node_and_tres_cpu() {
+        let err = rejected("max_cpus_per_node = 64\n[partitions.max_tres_per_node]\ncpu = 32\n");
+        for needle in ["partitions.cpu", "max_cpus_per_node", "64", "cpu = 32"] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+
+        // Both spellings of the same cap are rejected even when they agree.
+        let err = rejected("max_cpus_per_node = 64\n[partitions.max_tres_per_node]\ncpu = 64\n");
+        assert!(err.contains("max_cpus_per_node"), "{err}");
+    }
+
+    #[test]
+    fn build_partitions_rejects_multiple_def_mem_set() {
+        let knobs = ["def_mem_per_node", "def_mem_per_cpu", "def_mem_per_gpu"];
+        for (i, a) in knobs.iter().enumerate() {
+            for b in &knobs[i + 1..] {
+                let err = rejected(&format!("{a} = 4096\n{b} = 1024\n"));
+                for needle in ["partitions.cpu", a, b] {
+                    assert!(err.contains(needle), "missing {needle:?} in: {err}");
+                }
+            }
+        }
+        let err = rejected("def_mem_per_node = 1\ndef_mem_per_cpu = 2\ndef_mem_per_gpu = 3\n");
+        assert!(err.contains("def_mem_per_gpu = 3"), "{err}");
+
+        for knob in knobs {
+            assert!(
+                load_partition(&format!("{knob} = 1024\n")).is_ok(),
+                "{knob} alone must load"
+            );
+        }
+    }
+
+    #[test]
+    fn build_partitions_rejects_malformed_max_tres_per_node_key() {
+        for key in ["cpus", "gres", "gres/gpu:", "disk", "CPU", "gres/gpu:a 100"] {
+            let err = rejected(&format!("[partitions.max_tres_per_node]\n\"{key}\" = 32\n"));
+            assert!(err.contains("partitions.cpu"), "{err}");
+            assert!(err.contains(&format!("{key:?}")), "missing key in: {err}");
+        }
+        for key in ["cpu", "mem", "gres/gpu", "gres/gpu:a100"] {
+            assert!(
+                load_partition(&format!("[partitions.max_tres_per_node]\n\"{key}\" = 32\n"))
+                    .is_ok(),
+                "{key} must load"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_partition_cap_fails_to_parse() {
+        let err = rejected("max_cpus_per_node = -1\n");
+        assert!(err.contains("max_cpus_per_node"), "{err}");
+        let err = rejected("[partitions.max_tres_per_node]\ncpu = -1\n");
+        assert!(err.to_lowercase().contains("invalid value"), "{err}");
+    }
+
+    #[test]
+    fn enforce_part_limits_keeps_its_meaning_with_caps_configured() {
+        let cfg = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[scheduler]\nenforce_part_limits = \"any\"\n\n[[partitions]]\nname = \"cpu\"\nmax_cpus_per_node = 8\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.scheduler.enforce_part_limits, EnforcePartLimits::Any);
     }
 }

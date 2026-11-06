@@ -934,6 +934,25 @@ The ``grace_time`` column is added to the QOS table automatically with
 ``ADD COLUMN IF NOT EXISTS``, and a controller that predates this release
 ignores it.
 
+Partition resource limits
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This release adds per-partition resource caps and memory limits (see
+:doc:`/admin-guide/partition-resource-limits`). Existing ``spur.conf`` files
+behave as before: with no limit set, nothing changes, and
+``enforce_part_limits`` keeps its meaning for wall time.
+
+.. warning::
+
+   **Upgrade every controller replica before you configure any partition
+   cap.** A job blocked by a cap carries the new ``PartitionTresLimit``
+   pending reason, which is saved in Raft snapshots; an older controller
+   cannot load such a snapshot, either on restart or when the leader sends
+   it one to catch up. An older replica also ignores the new limit fields, so if it became
+   leader it would schedule without the caps. Because a cap can only be set once the new binary runs, the
+   normal upgrade order is safe as long as no cap is configured until the last
+   controller is upgraded.
+
 See Also
 --------
 

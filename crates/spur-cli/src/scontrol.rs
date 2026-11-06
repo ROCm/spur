@@ -451,6 +451,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 &preempt_mode,
                 preempt_exempt_time,
                 grace_time,
+                PartitionLimitArgs::default(),
             )
             .await
         }
@@ -515,6 +516,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 clear_preempt_exempt_time,
                 grace_time,
                 clear_grace_time,
+                ..Default::default()
             };
             update_partition(&args.controller, req).await
         }
@@ -1420,6 +1422,7 @@ struct PartitionCreateParams {
     preempt_mode: String,
     preempt_exempt_time: Option<u32>,
     grace_time: Option<u32>,
+    limits: PartitionLimitArgs,
 }
 
 /// Parse Slurm key=value pairs into the create_partition inputs, split from the
@@ -1447,6 +1450,7 @@ fn parse_partition_create_params(params: &[String]) -> Result<PartitionCreatePar
         preempt_mode: String::new(),
         preempt_exempt_time: None,
         grace_time: None,
+        limits: PartitionLimitArgs::default(),
     };
 
     for param in params {
@@ -1487,9 +1491,12 @@ fn parse_partition_create_params(params: &[String]) -> Result<PartitionCreatePar
                 // silently ignore Slurm-only keys that don't map to spur fields
                 "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
                 | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln"
-                | "maxcpuspernode" | "maxcpuspersocket" | "jobdefaults" | "defmempernode"
-                | "maxmempernode" | "qos" | "tres" => {}
-                other => eprintln!("scontrol create partition: unknown key '{}'", other),
+                | "maxcpuspersocket" | "jobdefaults" | "qos" | "tres" => {}
+                other => {
+                    if !parsed.limits.parse_key(other, value)? {
+                        eprintln!("scontrol create partition: unknown key '{}'", other)
+                    }
+                }
             }
         }
     }
@@ -1522,6 +1529,7 @@ async fn parse_and_create_partition(controller: &str, params: &[String]) -> Resu
         &p.preempt_mode,
         p.preempt_exempt_time,
         p.grace_time,
+        p.limits,
     )
     .await?;
 
@@ -1857,6 +1865,7 @@ fn partition_update_request(
     let mut clear_preempt_exempt_time = false;
     let mut grace_time: Option<u32> = None;
     let mut clear_grace_time = false;
+    let mut limits = PartitionLimitArgs::default();
 
     for param in params {
         let Some((key, value)) = param.split_once('=') else {
@@ -1909,10 +1918,13 @@ fn partition_update_request(
             }
             // silently ignore Slurm-only keys
             "allocnodes" | "hidden" | "rootonly" | "reqresv" | "oversubscribe"
-            | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln" | "maxcpuspernode"
-            | "maxcpuspersocket" | "jobdefaults" | "defmempernode" | "maxmempernode" | "qos"
-            | "tres" => {}
-            _ => bail!("scontrol update: update of this parameter is not supported: '{param}'"),
+            | "overtimelimit" | "disablerootjobs" | "exclusiveuser" | "lln"
+            | "maxcpuspersocket" | "jobdefaults" | "qos" | "tres" => {}
+            other => {
+                if !limits.parse_key(other, value)? {
+                    bail!("scontrol update: update of this parameter is not supported: '{param}'")
+                }
+            }
         }
     }
 
@@ -1952,7 +1964,119 @@ fn partition_update_request(
         clear_preempt_exempt_time,
         grace_time,
         clear_grace_time,
+        set_max_tres_per_node: limits.max_tres_per_node.is_some(),
+        max_tres_per_node: limits.max_tres_per_node.unwrap_or_default(),
+        max_cpus_per_node: limits.max_cpus_per_node,
+        max_mem_per_node: limits.max_mem_per_node,
+        max_mem_per_cpu: limits.max_mem_per_cpu,
+        def_mem_per_node: limits.def_mem_per_node,
+        def_mem_per_cpu: limits.def_mem_per_cpu,
+        def_mem_per_gpu: limits.def_mem_per_gpu,
     })
+}
+
+/// `scontrol show partition` lines for resource caps and memory policy, in
+/// Slurm's spelling: `MaxCPUsPerNode=64 MaxTRESPerNode=cpu=64,mem=131072` and
+/// `DefMemPerCPU=1024 MaxMemPerNode=UNLIMITED`.
+fn partition_limit_lines(part: &spur_proto::proto::PartitionInfo) -> [String; 2] {
+    let unlimited = |v: Option<String>| v.unwrap_or_else(|| "UNLIMITED".into());
+    let mut caps: Vec<_> = part.max_tres_per_node.iter().collect();
+    caps.sort();
+    let caps = caps
+        .iter()
+        .map(|(key, limit)| format!("{key}={limit}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let caps_line = format!(
+        "MaxCPUsPerNode={} MaxTRESPerNode={}",
+        unlimited(part.max_cpus_per_node.map(|v| v.to_string())),
+        if caps.is_empty() {
+            "UNLIMITED".into()
+        } else {
+            caps
+        },
+    );
+    let def_mem = [
+        ("DefMemPerNode", part.def_mem_per_node),
+        ("DefMemPerCPU", part.def_mem_per_cpu),
+        ("DefMemPerGPU", part.def_mem_per_gpu),
+    ]
+    .into_iter()
+    .find_map(|(name, v)| v.map(|v| format!("{name}={v}")))
+    .unwrap_or_else(|| "DefMemPerNode=UNLIMITED".into());
+    let max_mem = match (part.max_mem_per_cpu, part.max_mem_per_node) {
+        (Some(v), _) => format!("MaxMemPerCPU={v}"),
+        (None, v) => format!("MaxMemPerNode={}", unlimited(v.map(|v| v.to_string()))),
+    };
+    [caps_line, format!("{def_mem} {max_mem}")]
+}
+
+/// Partition resource caps and memory policy given as Slurm-inline keys:
+/// `MaxCPUsPerNode`, `MaxTRESPerNode=cpu=64,mem=131072,gres/gpu=0`,
+/// `MaxMemPerNode`, `MaxMemPerCPU`, `DefMemPerNode`, `DefMemPerCPU`,
+/// `DefMemPerGPU` (memory in MiB). On update, `UNLIMITED` or 0 clears a knob
+/// and an empty `MaxTRESPerNode=` clears every cap.
+#[derive(Debug, Default, PartialEq)]
+struct PartitionLimitArgs {
+    max_cpus_per_node: Option<u32>,
+    max_tres_per_node: Option<HashMap<String, u64>>,
+    max_mem_per_node: Option<u64>,
+    max_mem_per_cpu: Option<u64>,
+    def_mem_per_node: Option<u64>,
+    def_mem_per_cpu: Option<u64>,
+    def_mem_per_gpu: Option<u64>,
+}
+
+impl PartitionLimitArgs {
+    /// Record `key=value` if `key` (lowercased) is a limit key; `Ok(false)`
+    /// when it is not one.
+    fn parse_key(&mut self, key: &str, value: &str) -> Result<bool> {
+        let invalid = || anyhow::anyhow!("invalid value for {key}=: '{value}'");
+        let count = |value: &str| -> Result<u64> {
+            if value.eq_ignore_ascii_case("UNLIMITED") {
+                return Ok(0);
+            }
+            value.trim().parse().map_err(|_| invalid())
+        };
+        let field = match key {
+            "maxcpuspernode" => {
+                let cpus = u32::try_from(count(value)?).map_err(|_| invalid())?;
+                self.max_cpus_per_node = Some(cpus);
+                return Ok(true);
+            }
+            "maxtrespernode" => {
+                self.max_tres_per_node = Some(parse_tres_caps(value).map_err(|_| invalid())?);
+                return Ok(true);
+            }
+            "maxmempernode" => &mut self.max_mem_per_node,
+            "maxmempercpu" => &mut self.max_mem_per_cpu,
+            "defmempernode" => &mut self.def_mem_per_node,
+            "defmempercpu" => &mut self.def_mem_per_cpu,
+            "defmempergpu" => &mut self.def_mem_per_gpu,
+            _ => return Ok(false),
+        };
+        *field = Some(count(value)?);
+        Ok(true)
+    }
+}
+
+/// `cpu=64,mem=131072,gres/gpu:a100=2` into a cap map; empty means no caps.
+fn parse_tres_caps(value: &str) -> Result<HashMap<String, u64>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (key, limit) = entry
+                .rsplit_once('=')
+                .with_context(|| format!("'{entry}' is not KEY=LIMIT"))?;
+            let limit = limit
+                .trim()
+                .parse()
+                .with_context(|| format!("'{entry}' has a non-numeric limit"))?;
+            Ok((key.trim().to_string(), limit))
+        })
+        .collect()
 }
 
 /// Update a node's state via the controller.
@@ -2039,6 +2163,7 @@ async fn create_partition(
     preempt_mode: &str,
     preempt_exempt_time: Option<u32>,
     grace_time: Option<u32>,
+    limits: PartitionLimitArgs,
 ) -> Result<()> {
     let channel = crate::authclient::connect(controller)
         .await
@@ -2065,6 +2190,13 @@ async fn create_partition(
             preempt_mode: preempt_mode.to_string(),
             preempt_exempt_time,
             grace_time,
+            max_cpus_per_node: limits.max_cpus_per_node,
+            max_tres_per_node: limits.max_tres_per_node.unwrap_or_default(),
+            max_mem_per_node: limits.max_mem_per_node.filter(|v| *v != 0),
+            max_mem_per_cpu: limits.max_mem_per_cpu.filter(|v| *v != 0),
+            def_mem_per_node: limits.def_mem_per_node.filter(|v| *v != 0),
+            def_mem_per_cpu: limits.def_mem_per_cpu.filter(|v| *v != 0),
+            def_mem_per_gpu: limits.def_mem_per_gpu.filter(|v| *v != 0),
         })
         .await
         .context("failed to create partition")?;
@@ -2340,6 +2472,9 @@ fn format_partition_detail(part: &spur_proto::proto::PartitionInfo) -> String {
         let _ = write!(out, " GraceTime={t}");
     }
     let _ = writeln!(out);
+    for line in partition_limit_lines(part) {
+        let _ = writeln!(out, "   {line}");
+    }
     let _ = writeln!(out);
     out
 }
@@ -2389,7 +2524,11 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         }
     }
     let _ = writeln!(out, "   UserId={} Account={}", job.user, job.account);
-    let _ = writeln!(out, "   Partition={} QOS={}", job.partition, job.qos);
+    let _ = write!(out, "   Partition={} QOS={}", job.partition, job.qos);
+    if !job.effective_partition.is_empty() {
+        let _ = write!(out, " EffectivePartition={}", job.effective_partition);
+    }
+    out.push('\n');
     let _ = writeln!(
         out,
         "   JobState={} Reason={} Dependency={}",
@@ -2481,6 +2620,9 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         "   MinCPUsNode={} {mem_label}={}",
         job.min_cpus_node, min_mem
     );
+    if !job.mem_per_tres.is_empty() {
+        let _ = writeln!(out, "   MemPerTres={}", job.mem_per_tres);
+    }
     let _ = writeln!(out, "   Features={}", or_null(&job.features));
     if !job.reservation.is_empty() {
         let _ = writeln!(out, "   Reservation={}", job.reservation);
@@ -2739,6 +2881,32 @@ mod tests {
     }
 
     #[test]
+    fn job_detail_shows_the_effective_partition_only_once_chosen() {
+        let mut job = spur_proto::proto::JobInfo {
+            partition: "cpu,wide".into(),
+            qos: "normal".into(),
+            ..Default::default()
+        };
+        // Messages name the expected line rather than echoing the whole job
+        // detail, which carries job identity fields.
+        let pending = format_job_detail(&job);
+        let requested_only = "   Partition=cpu,wide QOS=normal\n";
+        assert!(
+            pending.contains(requested_only),
+            "missing {requested_only:?}"
+        );
+        assert!(
+            !pending.contains("EffectivePartition"),
+            "EffectivePartition shown before a partition was chosen"
+        );
+
+        job.effective_partition = "wide".into();
+        let running = format_job_detail(&job);
+        let chosen = "   Partition=cpu,wide QOS=normal EffectivePartition=wide\n";
+        assert!(running.contains(chosen), "missing {chosen:?}");
+    }
+
+    #[test]
     fn job_detail_shows_the_binding_version_for_native_and_file_bindings() {
         use spur_proto::proto::{FabricBinding, FabricBlockKey};
         let mut job = spur_proto::proto::JobInfo::default();
@@ -2878,6 +3046,17 @@ mod tests {
         let out = format_job_detail(&job);
         assert!(out.contains("MinMemoryCPU=1000M"), "{out}");
         assert!(!out.contains("MinMemoryNode"), "{out}");
+    }
+
+    #[test]
+    fn job_detail_shows_memory_per_gpu_as_mem_per_tres() {
+        let mut job = pending_pinned_job();
+        job.min_memory_node_mb = 0;
+        job.mem_per_tres = "gpu:8192".into();
+        let out = format_job_detail(&job);
+        let per_gpu = "MinMemoryNode=0\n   MemPerTres=gpu:8192\n";
+        assert!(out.contains(per_gpu), "missing {per_gpu:?}");
+        assert!(!format_job_detail(&pending_pinned_job()).contains("MemPerTres"));
     }
 
     #[test]
@@ -3924,5 +4103,71 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn partition_limit_keys_parse_slurm_inline_values() {
+        let mut limits = PartitionLimitArgs::default();
+        for (key, value) in [
+            ("maxcpuspernode", "64"),
+            ("maxtrespernode", "cpu=64, mem=131072,gres/gpu:a100=2"),
+            ("maxmempernode", "65536"),
+            ("defmempercpu", "UNLIMITED"),
+        ] {
+            assert!(limits.parse_key(key, value).unwrap(), "{key}");
+        }
+        assert_eq!(
+            limits,
+            PartitionLimitArgs {
+                max_cpus_per_node: Some(64),
+                max_tres_per_node: Some(HashMap::from([
+                    ("cpu".to_string(), 64),
+                    ("mem".to_string(), 131_072),
+                    ("gres/gpu:a100".to_string(), 2),
+                ])),
+                max_mem_per_node: Some(65_536),
+                def_mem_per_cpu: Some(0),
+                ..Default::default()
+            }
+        );
+
+        assert!(!limits.parse_key("maxnodes", "4").unwrap());
+        assert!(limits.parse_key("maxmempercpu", "lots").is_err());
+        assert!(limits.parse_key("maxtrespernode", "cpu").is_err());
+        assert!(limits.parse_key("maxtrespernode", "cpu=x").is_err());
+
+        let mut clear = PartitionLimitArgs::default();
+        assert!(clear.parse_key("maxtrespernode", "").unwrap());
+        assert_eq!(clear.max_tres_per_node, Some(HashMap::new()));
+    }
+
+    #[test]
+    fn show_partition_prints_limits_in_slurm_spelling() {
+        let plain = spur_proto::proto::PartitionInfo::default();
+        assert_eq!(
+            partition_limit_lines(&plain),
+            [
+                "MaxCPUsPerNode=UNLIMITED MaxTRESPerNode=UNLIMITED".to_string(),
+                "DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED".to_string(),
+            ]
+        );
+
+        let capped = spur_proto::proto::PartitionInfo {
+            max_cpus_per_node: Some(64),
+            max_tres_per_node: HashMap::from([
+                ("mem".to_string(), 131_072),
+                ("cpu".to_string(), 64),
+            ]),
+            def_mem_per_cpu: Some(1024),
+            max_mem_per_cpu: Some(2048),
+            ..Default::default()
+        };
+        assert_eq!(
+            partition_limit_lines(&capped),
+            [
+                "MaxCPUsPerNode=64 MaxTRESPerNode=cpu=64,mem=131072".to_string(),
+                "DefMemPerCPU=1024 MaxMemPerCPU=2048".to_string(),
+            ]
+        );
     }
 }
