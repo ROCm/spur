@@ -383,7 +383,7 @@ pub fn unsupported_cpu_bind(source: &HashMap<String, String>) -> Option<String> 
     }
 }
 
-fn parse_cpu_bind(source: &HashMap<String, String>) -> CpuBind {
+pub fn parse_cpu_bind(source: &HashMap<String, String>) -> CpuBind {
     source
         .get("SPUR_CPU_BIND")
         .or_else(|| source.get("SLURM_CPU_BIND"))
