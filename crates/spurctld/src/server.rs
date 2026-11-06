@@ -5209,12 +5209,18 @@ fn reservation_visibility(
 ) -> impl Fn(&Reservation) -> bool {
     let scope = reservation_read_scope(cluster, identity);
     let accounts = match &scope {
-        spur_core::rbac::ReadScope::Caller(user) => cluster.association_cache().accounts_for(user),
+        spur_core::rbac::ReadScope::Caller(user)
+        | spur_core::rbac::ReadScope::Coordinated { user, .. } => {
+            cluster.association_cache().accounts_for(user)
+        }
         spur_core::rbac::ReadScope::All => None,
     };
     move |res| match &scope {
         spur_core::rbac::ReadScope::All => true,
-        spur_core::rbac::ReadScope::Caller(user) => res.visible_to(user, accounts.as_deref()),
+        spur_core::rbac::ReadScope::Caller(user)
+        | spur_core::rbac::ReadScope::Coordinated { user, .. } => {
+            res.visible_to(user, accounts.as_deref())
+        }
     }
 }
 
@@ -5223,7 +5229,8 @@ fn reservation_visibility(
 fn assoc_mgr_user_filter(scope: &spur_core::rbac::ReadScope, requested: &str) -> Option<String> {
     match scope {
         spur_core::rbac::ReadScope::All => (!requested.is_empty()).then(|| requested.to_string()),
-        spur_core::rbac::ReadScope::Caller(user) => Some(user.clone()),
+        spur_core::rbac::ReadScope::Caller(user)
+        | spur_core::rbac::ReadScope::Coordinated { user, .. } => Some(user.clone()),
     }
 }
 

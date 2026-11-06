@@ -30,16 +30,54 @@ fn scoped_fairshare(
 ) -> Vec<FairshareEntry> {
     entries
         .into_iter()
-        .filter(|entry| scope.permits(&entry.user))
+        .filter(|entry| scope.permits_row(&entry.user, &entry.account))
         .collect()
 }
 
-/// Tells the client its reply was pinned, so it does not present the
-/// remaining rows as account or cluster totals.
+/// Tells the client its reply was pinned to one user, so it does not present
+/// the remaining rows as account or cluster totals. A coordinator's subset
+/// leaves this unset and sets `partial` instead.
 fn scoped_to_user(scope: &spur_core::rbac::ReadScope) -> Option<String> {
     match scope {
-        spur_core::rbac::ReadScope::All => None,
+        spur_core::rbac::ReadScope::All | spur_core::rbac::ReadScope::Coordinated { .. } => None,
         spur_core::rbac::ReadScope::Caller(user) => Some(user.clone()),
+    }
+}
+
+/// The user predicate a private read hands to SQL.
+#[derive(Debug)]
+enum ScopedUser {
+    /// The request names someone this caller cannot see.
+    None,
+    /// `None` is every user. A coordinator is not one SQL user, so the handler
+    /// fetches this set and keeps the rows `permits_row` allows.
+    Query(Option<String>),
+}
+
+fn coordinated_filter(scope: &spur_core::rbac::ReadScope) -> Option<(&str, &[String])> {
+    match scope {
+        spur_core::rbac::ReadScope::Coordinated { user, accounts } => {
+            Some((user.as_str(), accounts.as_slice()))
+        }
+        _ => None,
+    }
+}
+
+fn is_foreign_key_violation(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Database(db)) => db.code().as_deref() == Some("23503"),
+        _ => false,
+    }
+}
+
+fn scoped_sql_user(scope: &spur_core::rbac::ReadScope, requested: &str) -> ScopedUser {
+    let requested = (!requested.is_empty()).then(|| requested.to_owned());
+    match scope {
+        spur_core::rbac::ReadScope::Coordinated { .. } => ScopedUser::Query(requested),
+        _ => match scope.job_user_filter(requested.as_deref()) {
+            Some(user) => ScopedUser::Query(user),
+            None => ScopedUser::None,
+        },
     }
 }
 
@@ -132,40 +170,6 @@ fn fairshare_to_i32(v: f64) -> Result<i32, Status> {
     Ok(v as i32)
 }
 
-/// Rejects an identified caller below Operator from an account/user/QOS mutation.
-/// Anonymous is allowed, matching the controller's gate.
-fn require_admin_identity(
-    identity: Option<&spur_core::auth::Identity>,
-    auth: &spur_core::config::AuthConfig,
-    cache: Option<&crate::association_cache::AssociationCache>,
-    op: &str,
-) -> Result<(), Status> {
-    if identity_operates_jobs(identity, auth, cache) {
-        return Ok(());
-    }
-    spur_core::native_metrics::inc_role_deny();
-    Err(Status::permission_denied(format!(
-        "{op} requires cluster operator or administrator"
-    )))
-}
-
-/// The role check behind `require_admin_identity`, with no deny metric, for
-/// callers that only trim what they return. Anonymous passes.
-fn identity_operates_jobs(
-    identity: Option<&spur_core::auth::Identity>,
-    auth: &spur_core::config::AuthConfig,
-    cache: Option<&crate::association_cache::AssociationCache>,
-) -> bool {
-    let Some(id) = identity else {
-        return true;
-    };
-    let (level, loaded) = match cache {
-        Some(cache) => (cache.admin_level(&id.user), cache.is_loaded()),
-        None => (None, false),
-    };
-    spur_core::rbac::resolve_caller_role(id, auth, level.as_deref(), loaded).operates_jobs()
-}
-
 /// The accounting gRPC service. The pool is held behind a shared, swappable
 /// slot so a controller that boots while the database is unreachable can
 /// install the pool later, once the background bring-up connects — the same
@@ -180,17 +184,11 @@ struct AccountingInner {
     pool: parking_lot::RwLock<Option<PgPool>>,
     reason: parking_lot::RwLock<&'static str>,
     assoc: parking_lot::RwLock<Option<std::sync::Arc<crate::association_cache::AssociationCache>>>,
-    auth: parking_lot::RwLock<spur_core::config::AuthConfig>,
-    /// Live `[auth]` when set. `reconfigure` swaps the cluster config; the
-    /// startup snapshot in `auth` would leave role checks and `private_data` stale.
+    /// Live `[auth]`. `reconfigure` swaps the cluster config this reads.
     auth_source: parking_lot::RwLock<
         Option<std::sync::Arc<dyn Fn() -> spur_core::config::AuthConfig + Send + Sync>>,
     >,
     fairshare_halflife_days: std::sync::atomic::AtomicU32,
-    /// User filter the last read was about to hand to the database. Set only in
-    /// tests, before the pool check, so a missing database still records it.
-    #[cfg(test)]
-    queried_user: parking_lot::Mutex<Option<Option<String>>>,
 }
 
 impl Clone for AccountingService {
@@ -208,11 +206,8 @@ impl AccountingService {
                 pool: parking_lot::RwLock::new(None),
                 reason: parking_lot::RwLock::new(reason),
                 assoc: parking_lot::RwLock::new(None),
-                auth: parking_lot::RwLock::new(spur_core::config::AuthConfig::default()),
                 auth_source: parking_lot::RwLock::new(None),
                 fairshare_halflife_days: std::sync::atomic::AtomicU32::new(0),
-                #[cfg(test)]
-                queried_user: parking_lot::Mutex::new(None),
             }),
         }
     }
@@ -249,13 +244,8 @@ impl AccountingService {
         *self.inner.assoc.write() = Some(cache);
     }
 
-    pub(crate) fn attach_auth(&self, auth: spur_core::config::AuthConfig) {
-        *self.inner.auth.write() = auth;
-    }
-
     /// Read `[auth]` from the running cluster so `scontrol reconfigure` applies
-    /// without a restart. With no source, [`Self::current_auth`] uses the
-    /// snapshot from [`Self::attach_auth`].
+    /// without a restart. With no source, `[auth]` is the default.
     pub(crate) fn attach_auth_source(
         &self,
         source: impl Fn() -> spur_core::config::AuthConfig + Send + Sync + 'static,
@@ -264,22 +254,85 @@ impl AccountingService {
     }
 
     fn current_auth(&self) -> spur_core::config::AuthConfig {
-        let source = self.inner.auth_source.read().clone();
-        if let Some(source) = source {
-            return source();
-        }
-        self.inner.auth.read().clone()
+        self.inner
+            .auth_source
+            .read()
+            .as_ref()
+            .map(|source| source())
+            .unwrap_or_default()
+    }
+
+    /// One `[auth]` read and one association-cache lookup for this request.
+    fn auth_role<T>(
+        &self,
+        request: &Request<T>,
+    ) -> (spur_core::config::AuthConfig, Option<spur_core::rbac::Role>) {
+        let auth = self.current_auth();
+        let role = request
+            .extensions()
+            .get::<spur_core::auth::Identity>()
+            .map(|id| self.resolved_role(id, &auth));
+        (auth, role)
     }
 
     fn caller_read_scope<T>(
         &self,
         request: &Request<T>,
+        private: impl Fn(&spur_core::config::AuthConfig) -> bool,
+    ) -> spur_core::rbac::ReadScope {
+        self.caller_read_scope_with(request, private, false)
+    }
+
+    /// `widen` adds the accounts this caller coordinates. The live queue does
+    /// not, so `squeue` stays the caller's own jobs.
+    fn caller_read_scope_with<T>(
+        &self,
+        request: &Request<T>,
+        private: impl Fn(&spur_core::config::AuthConfig) -> bool,
+        widen: bool,
+    ) -> spur_core::rbac::ReadScope {
+        let (auth, role) = self.auth_role(request);
+        self.scope_from(request, role, private(&auth), widen)
+    }
+
+    fn scope_from<T>(
+        &self,
+        request: &Request<T>,
+        role: Option<spur_core::rbac::Role>,
         private: bool,
+        widen: bool,
     ) -> spur_core::rbac::ReadScope {
         let identity = request.extensions().get::<spur_core::auth::Identity>();
-        let auth = self.current_auth();
-        let role = identity.map(|id| self.resolved_role(id, &auth));
-        spur_core::rbac::read_scope(identity, role, private)
+        let scope = spur_core::rbac::read_scope(identity, role, private);
+        if !widen {
+            return scope;
+        }
+        let spur_core::rbac::ReadScope::Caller(user) = &scope else {
+            return scope;
+        };
+        match self.coordinated_loaded(user) {
+            Some(accounts) => scope.widen_to(accounts),
+            None => scope,
+        }
+    }
+
+    /// `None` when no cache is installed or it has not loaded.
+    fn coordinated_loaded(&self, user: &str) -> Option<Vec<String>> {
+        self.inner.assoc.read().as_ref()?.coordinated_accounts(user)
+    }
+
+    async fn directory_partial(
+        &self,
+        scope: &spur_core::rbac::ReadScope,
+        pool: &PgPool,
+    ) -> Result<bool, Status> {
+        let Some(mine) = scope.coordinated_accounts() else {
+            return Ok(false);
+        };
+        let all = db::list_accounts(pool).await.map_err(internal)?;
+        Ok(all
+            .iter()
+            .any(|account| !mine.iter().any(|c| c == &account.name)))
     }
 
     fn resolved_role(
@@ -295,41 +348,24 @@ impl AccountingService {
         spur_core::rbac::resolve_caller_role(id, auth, level.as_deref(), loaded)
     }
 
-    fn accounts_for(&self, user: &str) -> Option<Vec<String>> {
-        self.inner.assoc.read().as_ref()?.accounts_for(user)
-    }
-
+    /// Anonymous is allowed, matching the controller's gate. An identified
+    /// caller below Operator is denied.
     fn require_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
-        let auth = self.current_auth();
-        let cache = self.inner.assoc.read().clone();
-        require_admin_identity(
-            request.extensions().get::<spur_core::auth::Identity>(),
-            &auth,
-            cache.as_deref(),
-            op,
-        )
+        if self.may_see_actors(request) {
+            return Ok(());
+        }
+        spur_core::native_metrics::inc_role_deny();
+        Err(Status::permission_denied(format!(
+            "{op} requires cluster operator or administrator"
+        )))
     }
 
     /// Whether this caller may see who acted on a job, the same audience as
-    /// `get_transactions`.
+    /// `get_transactions`. No deny metric: this only trims what a read returns.
     fn may_see_actors<T>(&self, request: &Request<T>) -> bool {
-        let auth = self.current_auth();
-        let cache = self.inner.assoc.read().clone();
-        identity_operates_jobs(
-            request.extensions().get::<spur_core::auth::Identity>(),
-            &auth,
-            cache.as_deref(),
-        )
-    }
-
-    #[cfg(test)]
-    fn note_queried_user(&self, user: Option<&str>) {
-        *self.inner.queried_user.lock() = Some(user.map(str::to_string));
-    }
-
-    #[cfg(test)]
-    fn queried_user(&self) -> Option<Option<String>> {
-        self.inner.queried_user.lock().clone()
+        self.auth_role(request)
+            .1
+            .is_none_or(spur_core::rbac::Role::operates_jobs)
     }
 
     fn kick_assoc(&self) {
@@ -482,16 +518,17 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetJobHistoryRequest>,
     ) -> Result<Response<GetJobHistoryResponse>, Status> {
-        let show_actors = self.may_see_actors(&request);
-        let scope = self.caller_read_scope(&request, self.current_auth().jobs_private());
+        let (auth, role) = self.auth_role(&request);
+        let show_actors = role.is_none_or(spur_core::rbac::Role::operates_jobs);
+        let scope = self.scope_from(&request, role, auth.jobs_private(), true);
         let req = request.into_inner();
-        let requested = (!req.user.is_empty()).then_some(req.user.as_str());
-        let Some(scoped_user) = scope.job_user_filter(requested) else {
-            return Ok(Response::new(GetJobHistoryResponse { jobs: Vec::new() }));
+        let sql_user = match scoped_sql_user(&scope, &req.user) {
+            ScopedUser::None => {
+                return Ok(Response::new(GetJobHistoryResponse { jobs: Vec::new() }));
+            }
+            ScopedUser::Query(user) => user,
         };
-        let user = scoped_user.as_deref();
-        #[cfg(test)]
-        self.note_queried_user(user);
+        let user = sql_user.as_deref();
 
         let pool = self.pool()?;
         let pool = &pool;
@@ -510,7 +547,7 @@ impl SlurmAccounting for AccountingService {
             Some(req.account.as_str())
         };
 
-        let records = db::get_job_history(
+        let mut records = db::get_job_history(
             pool,
             &db::JobHistoryQuery {
                 user,
@@ -520,10 +557,16 @@ impl SlurmAccounting for AccountingService {
                 states: &states,
                 job_ids: &req.job_ids,
                 limit: req.limit,
+                coordinated: coordinated_filter(&scope),
             },
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
+        if matches!(scope, spur_core::rbac::ReadScope::Coordinated { .. }) {
+            records.retain(|r| {
+                scope.permits_row(&r.user_name, &r.account) && user.is_none_or(|u| r.user_name == u)
+            });
+        }
 
         let jobs = records
             .iter()
@@ -622,19 +665,31 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetUsageRequest>,
     ) -> Result<Response<GetUsageResponse>, Status> {
-        let scope = self.caller_read_scope(&request, self.current_auth().usage_private());
+        let job_scoped = request.get_ref().job_scoped;
+        let scope = self.caller_read_scope_with(
+            &request,
+            |auth| {
+                if job_scoped {
+                    auth.jobs_private()
+                } else {
+                    auth.usage_private()
+                }
+            },
+            true,
+        );
         let req = request.into_inner();
-        let requested = (!req.user.is_empty()).then_some(req.user.as_str());
-        let scoped_to_user = scoped_to_user(&scope);
-        let Some(scoped_user) = scope.job_user_filter(requested) else {
-            return Ok(Response::new(GetUsageResponse {
-                entries: Vec::new(),
-                scoped_to_user,
-            }));
+        let scoped_to = scoped_to_user(&scope);
+        let sql_user = match scoped_sql_user(&scope, &req.user) {
+            ScopedUser::None => {
+                return Ok(Response::new(GetUsageResponse {
+                    entries: Vec::new(),
+                    scoped_to_user: scoped_to,
+                    partial: false,
+                }));
+            }
+            ScopedUser::Query(user) => user,
         };
-        let user = scoped_user.as_deref();
-        #[cfg(test)]
-        self.note_queried_user(user);
+        let user = sql_user.as_deref();
         let pool = self.pool()?;
         let pool = &pool;
 
@@ -648,13 +703,22 @@ impl SlurmAccounting for AccountingService {
             Some(req.account.as_str())
         };
 
-        let records = db::get_usage(pool, user, account, since)
+        let records = db::get_usage_visible(pool, user, account, since, coordinated_filter(&scope))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        let partial = self.directory_partial(&scope, pool).await?;
 
         let mut agg: std::collections::HashMap<(String, String), (f64, f64, u64)> =
             std::collections::HashMap::new();
         for r in &records {
+            if !scope.permits_row(&r.user_name, &r.account) {
+                continue;
+            }
+            if let Some(want) = user {
+                if r.user_name != want {
+                    continue;
+                }
+            }
             let e = agg
                 .entry((r.user_name.clone(), r.account.clone()))
                 .or_default();
@@ -676,7 +740,8 @@ impl SlurmAccounting for AccountingService {
 
         Ok(Response::new(GetUsageResponse {
             entries,
-            scoped_to_user,
+            scoped_to_user: scoped_to,
+            partial,
         }))
     }
 
@@ -759,27 +824,34 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<ListAccountsRequest>,
     ) -> Result<Response<ListAccountsResponse>, Status> {
-        let scope = self.caller_read_scope(&request, self.current_auth().accounts_private());
-        let pinned = scoped_to_user(&scope);
-        // `None` lists every account. `Some` is the caller's associations, and an
-        // empty vec shows nothing — including while the cache has not loaded.
+        let scope =
+            self.caller_read_scope(&request, spur_core::config::AuthConfig::accounts_private);
+        // Operators and an unrestricted caller see every account. Everyone else
+        // sees only accounts they coordinate. Membership is not enough: Slurm
+        // denies a user who coordinates nothing.
         let allowed = match &scope {
             spur_core::rbac::ReadScope::All => None,
-            spur_core::rbac::ReadScope::Caller(user) => {
-                Some(self.accounts_for(user).unwrap_or_default())
+            spur_core::rbac::ReadScope::Caller(user)
+            | spur_core::rbac::ReadScope::Coordinated { user, .. } => {
+                let Some(accounts) = self.coordinated_loaded(user) else {
+                    return Err(Status::unavailable("association cache is still loading"));
+                };
+                if accounts.is_empty() {
+                    return Err(Status::permission_denied(
+                        "account definitions are visible to their coordinators",
+                    ));
+                }
+                Some(accounts)
             }
         };
-        if allowed.as_ref().is_some_and(|names| names.is_empty()) {
-            return Ok(Response::new(ListAccountsResponse {
-                accounts: Vec::new(),
-                scoped_to_user: pinned,
-            }));
-        }
         let pool = self.pool()?;
         let pool = &pool;
         let records = db::list_accounts(pool)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        let partial = allowed
+            .as_ref()
+            .is_some_and(|names| records.iter().any(|r| !names.iter().any(|n| n == &r.name)));
 
         let accounts = records
             .into_iter()
@@ -795,10 +867,7 @@ impl SlurmAccounting for AccountingService {
             })
             .collect();
 
-        Ok(Response::new(ListAccountsResponse {
-            accounts,
-            scoped_to_user: pinned,
-        }))
+        Ok(Response::new(ListAccountsResponse { accounts, partial }))
     }
 
     async fn add_user(&self, request: Request<AddUserRequest>) -> Result<Response<()>, Status> {
@@ -957,19 +1026,25 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<ListUsersRequest>,
     ) -> Result<Response<ListUsersResponse>, Status> {
-        let scope = self.caller_read_scope(&request, self.current_auth().users_private());
+        let associations = request.get_ref().associations;
+        let scope = self.caller_read_scope_with(
+            &request,
+            spur_core::config::AuthConfig::users_private,
+            associations,
+        );
         let pinned = scoped_to_user(&scope);
         let req = request.into_inner();
-        let requested = (!req.user.is_empty()).then_some(req.user.as_str());
-        let Some(scoped_user) = scope.job_user_filter(requested) else {
-            return Ok(Response::new(ListUsersResponse {
-                users: Vec::new(),
-                scoped_to_user: pinned,
-            }));
+        let sql_user = match scoped_sql_user(&scope, &req.user) {
+            ScopedUser::None => {
+                return Ok(Response::new(ListUsersResponse {
+                    users: Vec::new(),
+                    scoped_to_user: pinned,
+                    partial: false,
+                }));
+            }
+            ScopedUser::Query(user) => user,
         };
-        let user = scoped_user.as_deref();
-        #[cfg(test)]
-        self.note_queried_user(user);
+        let user = sql_user.as_deref();
         let pool = self.pool()?;
         let pool = &pool;
         let account = if req.account.is_empty() {
@@ -977,9 +1052,15 @@ impl SlurmAccounting for AccountingService {
         } else {
             Some(req.account.as_str())
         };
-        let records = db::list_users(pool, account, user)
+        let mut records = db::list_users_visible(pool, account, user, coordinated_filter(&scope))
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        if matches!(scope, spur_core::rbac::ReadScope::Coordinated { .. }) {
+            records.retain(|r| {
+                scope.permits_row(&r.name, &r.account) && user.is_none_or(|u| r.name == u)
+            });
+        }
+        let partial = self.directory_partial(&scope, pool).await?;
 
         let users = records
             .into_iter()
@@ -1007,7 +1088,129 @@ impl SlurmAccounting for AccountingService {
         Ok(Response::new(ListUsersResponse {
             users,
             scoped_to_user: pinned,
+            partial,
         }))
+    }
+
+    async fn add_coordinator(
+        &self,
+        request: Request<AddCoordinatorRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.require_admin(&request, "add coordinator")?;
+        let audit = crate::audit::InBand::capture(&request, "AddCoordinator");
+        let pool = self.pool()?;
+        let pool = &pool;
+        let req = request.into_inner();
+        if req.account.is_empty() || req.users.is_empty() {
+            return Err(Status::invalid_argument("account and users are required"));
+        }
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let mut added = 0;
+        for user in &req.users {
+            added += db::add_coordinator(&mut tx, user, &req.account)
+                .await
+                .map_err(|e| {
+                    if is_foreign_key_violation(&e) {
+                        Status::not_found(format!("account '{}' does not exist", req.account))
+                    } else {
+                        internal(e)
+                    }
+                })?;
+        }
+        if added == 0 {
+            return Err(Status::already_exists(format!(
+                "coordinator assignment already exists for account '{}'",
+                req.account
+            )));
+        }
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(
+                &req.account,
+                txn::requested(&[("users", Some(serde_json::json!(req.users)))]),
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        self.kick_assoc();
+        Ok(Response::new(()))
+    }
+
+    async fn remove_coordinator(
+        &self,
+        request: Request<RemoveCoordinatorRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.require_admin(&request, "remove coordinator")?;
+        let audit = crate::audit::InBand::capture(&request, "RemoveCoordinator");
+        let pool = self.pool()?;
+        let pool = &pool;
+        let req = request.into_inner();
+        if req.account.is_empty() || req.users.is_empty() {
+            return Err(Status::invalid_argument("account and users are required"));
+        }
+        let mut tx = pool.begin().await.map_err(internal)?;
+        let mut deleted = 0;
+        for user in &req.users {
+            deleted += db::remove_coordinator(&mut tx, user, &req.account)
+                .await
+                .map_err(internal)?;
+        }
+        if deleted == 0 {
+            return Err(Status::not_found(format!(
+                "no coordinator matched account '{}'",
+                req.account
+            )));
+        }
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(&req.account, txn::delete_details(None)),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        self.kick_assoc();
+        Ok(Response::new(()))
+    }
+
+    async fn list_coordinators(
+        &self,
+        request: Request<ListCoordinatorsRequest>,
+    ) -> Result<Response<ListCoordinatorsResponse>, Status> {
+        let scope =
+            self.caller_read_scope(&request, spur_core::config::AuthConfig::accounts_private);
+        let allowed = match &scope {
+            spur_core::rbac::ReadScope::All => None,
+            spur_core::rbac::ReadScope::Caller(user)
+            | spur_core::rbac::ReadScope::Coordinated { user, .. } => {
+                let Some(accounts) = self.coordinated_loaded(user) else {
+                    return Err(Status::unavailable("association cache is still loading"));
+                };
+                if accounts.is_empty() {
+                    return Err(Status::permission_denied(
+                        "account definitions are visible to their coordinators",
+                    ));
+                }
+                Some(accounts)
+            }
+        };
+        let req = request.into_inner();
+        let pool = self.pool()?;
+        let rows = db::list_coordinators(&pool).await.map_err(internal)?;
+        let coordinators = rows
+            .into_iter()
+            .filter(|(user, account)| {
+                allowed
+                    .as_ref()
+                    .is_none_or(|names| names.iter().any(|n| n == account))
+                    && (req.account.is_empty() || req.account == *account)
+                    && (req.user.is_empty() || req.user == *user)
+            })
+            .map(|(user, account)| CoordinatorInfo { user, account })
+            .collect();
+        Ok(Response::new(ListCoordinatorsResponse { coordinators }))
     }
 
     async fn create_qos(&self, request: Request<CreateQosRequest>) -> Result<Response<()>, Status> {
@@ -1184,7 +1387,20 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<GetFairshareFactorsRequest>,
     ) -> Result<Response<GetFairshareFactorsResponse>, Status> {
-        let scope = self.caller_read_scope(&request, self.current_auth().usage_private());
+        let job_scoped = request.get_ref().job_scoped;
+        // `sprio` asks for the jobs rule and does not widen: its job list is
+        // the caller's own jobs. `sshare` widens to coordinated accounts.
+        let scope = self.caller_read_scope_with(
+            &request,
+            |auth| {
+                if job_scoped {
+                    auth.jobs_private()
+                } else {
+                    auth.usage_private()
+                }
+            },
+            !job_scoped,
+        );
         let req = request.into_inner();
 
         // When the client sends 0, use the cluster's configured half-life
@@ -1206,6 +1422,7 @@ impl SlurmAccounting for AccountingService {
                 entries: Vec::new(),
                 effective_halflife_days: effective,
                 scoped_to_user: scoped_to_user(&scope),
+                partial: false,
             }));
         }
 
@@ -1225,10 +1442,12 @@ impl SlurmAccounting for AccountingService {
                 }),
         );
 
+        let partial = self.directory_partial(&scope, &pool).await?;
         Ok(Response::new(GetFairshareFactorsResponse {
             entries,
             effective_halflife_days: effective,
             scoped_to_user: scoped_to_user(&scope),
+            partial,
         }))
     }
 
@@ -1563,10 +1782,6 @@ mod tests {
     #[test]
     fn require_admin_follows_a_reconfigure_that_drops_the_operator() {
         let service = AccountingService::unavailable("no DB needed for this test");
-        let mut startup = spur_core::config::AuthConfig::default();
-        startup.cluster_admins.push("op".into());
-        service.attach_auth(startup);
-
         let still_admin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let flag = still_admin.clone();
         service.attach_auth_source(move || {
@@ -1610,10 +1825,13 @@ mod tests {
     #[test]
     fn cluster_admins_and_accounting_operator_pass_without_jwt_admin_claim() {
         let service = AccountingService::unavailable("no DB needed for this test");
-        service.attach_auth(spur_core::config::AuthConfig {
-            cluster_admins: vec!["erin".into()],
-            ..Default::default()
-        });
+        fix_auth(
+            &service,
+            spur_core::config::AuthConfig {
+                cluster_admins: vec!["erin".into()],
+                ..Default::default()
+            },
+        );
         let mut named = Request::new(AddUserRequest::default());
         named.extensions_mut().insert(identity("erin", false));
         assert!(service.require_admin(&named, "add user").is_ok());
@@ -1686,12 +1904,42 @@ mod tests {
         }
     }
 
+    fn fix_auth(service: &AccountingService, auth: spur_core::config::AuthConfig) {
+        service.attach_auth_source(move || auth.clone());
+    }
+
     fn auth_hiding(categories: &[&str]) -> spur_core::config::AuthConfig {
         let mut auth = spur_core::config::AuthConfig::default();
         for category in categories {
             auth.private_data.insert((*category).to_string().into());
         }
         auth
+    }
+
+    #[test]
+    fn scoped_sql_user_pins_the_caller_and_skips_someone_else() {
+        let scope = spur_core::rbac::ReadScope::Caller("alice".into());
+        assert!(matches!(scoped_sql_user(&scope, "bob"), ScopedUser::None));
+        match scoped_sql_user(&scope, "") {
+            ScopedUser::Query(Some(user)) => assert_eq!(user, "alice"),
+            other => panic!("own history must query the caller, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_sql_user_keeps_a_coordinators_requested_user() {
+        let scope = spur_core::rbac::ReadScope::Coordinated {
+            user: "alice".into(),
+            accounts: vec!["physics".into()],
+        };
+        assert!(matches!(
+            scoped_sql_user(&scope, ""),
+            ScopedUser::Query(None)
+        ));
+        match scoped_sql_user(&scope, "bob") {
+            ScopedUser::Query(Some(user)) => assert_eq!(user, "bob"),
+            other => panic!("a coordinator query keeps the requested user, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1701,6 +1949,7 @@ mod tests {
         let mut asking = Request::new(ListUsersRequest {
             user: "bob".into(),
             account: String::new(),
+            associations: false,
         });
         asking.extensions_mut().insert(identity("alice", false));
         let err = service
@@ -1709,11 +1958,12 @@ mod tests {
             .expect_err("without private_data the query still runs");
         assert_eq!(err.code(), tonic::Code::Unavailable);
 
-        service.attach_auth(auth_hiding(&["users"]));
+        fix_auth(&service, auth_hiding(&["users"]));
 
         let mut other = Request::new(ListUsersRequest {
             user: "bob".into(),
             account: String::new(),
+            associations: false,
         });
         other.extensions_mut().insert(identity("alice", false));
         let listed = service.list_users(other).await.unwrap().into_inner();
@@ -1727,7 +1977,6 @@ mod tests {
             .await
             .expect_err("the caller's own rows still come from the database");
         assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert_eq!(service.queried_user(), Some(Some("alice".to_string())));
 
         let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
         cache.insert_admin_level("op", "Operator");
@@ -1736,6 +1985,7 @@ mod tests {
             let mut req = Request::new(ListUsersRequest {
                 user: "bob".into(),
                 account: String::new(),
+                associations: false,
             });
             req.extensions_mut().insert(identity(user, admin));
             let err = service.list_users(req).await.expect_err("exempt caller");
@@ -1751,7 +2001,6 @@ mod tests {
     #[tokio::test]
     async fn list_users_follows_a_reconfigure_of_private_data() {
         let service = AccountingService::unavailable("no DB needed for this test");
-        service.attach_auth(spur_core::config::AuthConfig::default());
         let users_private = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = users_private.clone();
         service.attach_auth_source(move || {
@@ -1767,6 +2016,7 @@ mod tests {
             let mut req = Request::new(ListUsersRequest {
                 user: "bob".into(),
                 account: String::new(),
+                associations: false,
             });
             req.extensions_mut().insert(identity("alice", false));
             req
@@ -1787,26 +2037,36 @@ mod tests {
     #[tokio::test]
     async fn list_accounts_pins_an_ordinary_caller_when_accounts_are_private() {
         let service = AccountingService::unavailable("no DB needed for this test");
-        service.attach_auth(auth_hiding(&["accounts"]));
+        fix_auth(&service, auth_hiding(&["accounts"]));
 
         let mut alice = Request::new(ListAccountsRequest {});
         alice.extensions_mut().insert(identity("alice", false));
-        let listed = service.list_accounts(alice).await.unwrap().into_inner();
-        assert!(
-            listed.accounts.is_empty(),
-            "a cold association cache shows no accounts"
+        let err = service.list_accounts(alice).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "a cold association cache cannot tell a coordinator from anyone else"
         );
-        assert_eq!(listed.scoped_to_user.as_deref(), Some("alice"));
 
         let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
         cache.insert_association("alice", "physics");
-        service.attach_association_cache(cache);
+        service.attach_association_cache(cache.clone());
+        let mut alice = Request::new(ListAccountsRequest {});
+        alice.extensions_mut().insert(identity("alice", false));
+        let err = service.list_accounts(alice).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::PermissionDenied,
+            "membership is not coordination"
+        );
+
+        cache.insert_coordinator("alice", "physics");
         let mut alice = Request::new(ListAccountsRequest {});
         alice.extensions_mut().insert(identity("alice", false));
         let err = service
             .list_accounts(alice)
             .await
-            .expect_err("a membership still has to be read from the database");
+            .expect_err("a coordinated account still has to be read from the database");
         assert_eq!(err.code(), tonic::Code::Unavailable);
 
         assert!(!account_allowed(Some(&["physics".into()]), "ml"));
@@ -1846,7 +2106,7 @@ mod tests {
             .expect_err("without private_data the query still runs");
         assert_eq!(err.code(), tonic::Code::Unavailable);
 
-        service.attach_auth(auth_hiding(&["jobs"]));
+        fix_auth(&service, auth_hiding(&["jobs"]));
         let jobs = service
             .get_job_history(history_for("bob"))
             .await
@@ -1860,17 +2120,16 @@ mod tests {
             .await
             .expect_err("the caller's own history still comes from the database");
         assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert_eq!(service.queried_user(), Some(Some("alice".to_string())));
 
         // `usage` does not hide job history.
-        service.attach_auth(auth_hiding(&["usage"]));
+        fix_auth(&service, auth_hiding(&["usage"]));
         let err = service
             .get_job_history(history_for("bob"))
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
 
-        service.attach_auth(auth_hiding(&["jobs"]));
+        fix_auth(&service, auth_hiding(&["jobs"]));
         let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
         cache.insert_admin_level("op", "Operator");
         service.attach_association_cache(cache);
@@ -1897,7 +2156,7 @@ mod tests {
             .expect_err("without private_data the query still runs");
         assert_eq!(err.code(), tonic::Code::Unavailable);
 
-        service.attach_auth(auth_hiding(&["usage"]));
+        fix_auth(&service, auth_hiding(&["usage"]));
         let usage = service
             .get_usage(usage_for("bob"))
             .await
@@ -1911,7 +2170,6 @@ mod tests {
             .await
             .expect_err("the caller's own usage still comes from the database");
         assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert_eq!(service.queried_user(), Some(Some("alice".to_string())));
 
         let err = service
             .get_fairshare_factors(Request::new(GetFairshareFactorsRequest::default()))
@@ -1919,7 +2177,10 @@ mod tests {
             .expect_err("anonymous fairshare still comes from the database");
         assert_eq!(err.code(), tonic::Code::Unavailable);
 
-        let mut unnamed = Request::new(GetFairshareFactorsRequest { halflife_days: 7 });
+        let mut unnamed = Request::new(GetFairshareFactorsRequest {
+            halflife_days: 7,
+            job_scoped: false,
+        });
         unnamed.extensions_mut().insert(identity("", false));
         let factors = service
             .get_fairshare_factors(unnamed)
@@ -2224,6 +2485,7 @@ mod tests {
                 user: user.clone(),
                 account: acct.clone(),
                 since: None,
+                job_scoped: false,
             }))
             .await
             .expect("get_usage");

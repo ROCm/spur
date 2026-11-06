@@ -708,6 +708,9 @@ service SlurmAccounting {
   rpc AddUser(AddUserRequest) returns (google.protobuf.Empty);
   rpc RemoveUser(RemoveUserRequest) returns (google.protobuf.Empty);
   rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+  rpc AddCoordinator(AddCoordinatorRequest) returns (google.protobuf.Empty);
+  rpc RemoveCoordinator(RemoveCoordinatorRequest) returns (google.protobuf.Empty);
+  rpc ListCoordinators(ListCoordinatorsRequest) returns (ListCoordinatorsResponse);
 
   // QOS management (sacctmgr)
   rpc CreateQos(CreateQosRequest) returns (google.protobuf.Empty);
@@ -1697,6 +1700,9 @@ message GetUsageRequest {
   string user = 1;
   string account = 2;
   google.protobuf.Timestamp since = 3;
+  // Follow `private_data = ["jobs"]` instead of `"usage"`. Job-size reports
+  // set this; `sshare` and utilization reports leave it unset.
+  bool job_scoped = 4;
 }
 
 message UsageEntry {
@@ -1709,13 +1715,19 @@ message UsageEntry {
 
 message GetUsageResponse {
   repeated UsageEntry entries = 1;
-  // Set when `[auth] private_data = ["usage"]` pinned the reply to this user.
-  // Entries then omit everyone else, so they do not sum to account totals.
+  // Set when the reply is pinned to this one user. Entries then omit everyone
+  // else, so they do not sum to account totals.
   optional string scoped_to_user = 2;
+  // Set when entries are a coordinator's accounts and not the whole cluster.
+  // Every returned row is real; sums of them are not cluster totals.
+  bool partial = 3;
 }
 
 message GetFairshareFactorsRequest {
   uint32 halflife_days = 1;
+  // Follow `private_data = ["jobs"]` instead of `"usage"`. `sprio` sets this
+  // so a visible job keeps its factor when usage is private.
+  bool job_scoped = 2;
 }
 
 message FairshareEntry {
@@ -1729,8 +1741,10 @@ message GetFairshareFactorsResponse {
   // The half-life the server actually used (may differ from the request
   // when the request sent 0, meaning "use the configured default").
   uint32 effective_halflife_days = 2;
-  // Set when `[auth] private_data = ["usage"]` pinned the reply to this user.
+  // Set when the reply is pinned to this one user.
   optional string scoped_to_user = 3;
+  // Set when entries are a coordinator's accounts and not the whole cluster.
+  bool partial = 4;
 }
 
 // -- K8s Operator --
@@ -1798,9 +1812,9 @@ message ListAccountsRequest { }
 
 message ListAccountsResponse {
   repeated AccountInfo accounts = 1;
-  // Set when `[auth] private_data = ["accounts"]` pinned the reply to this
-  // user. The weights then omit other accounts, so they are not a cluster total.
-  optional string scoped_to_user = 2;
+  // Set when the list is the accounts one coordinator covers, not every account.
+  // The weights are then not the cluster share total.
+  bool partial = 2;
 }
 
 message AccountInfo {
@@ -1851,6 +1865,10 @@ message RemoveUserRequest {
 message ListUsersRequest {
   string account = 1;
   string user = 2;
+  // `sacctmgr show association` and `sshare`. A coordinator then also sees
+  // associations in the accounts they coordinate. `show user` leaves this unset,
+  // which stays pinned to the caller.
+  bool associations = 3;
 }
 
 message ListUsersResponse {
@@ -1858,6 +1876,32 @@ message ListUsersResponse {
   // Set when `[auth] private_data = ["users"]` pinned the reply to this user.
   // A per-account headcount from `users` is then only the caller.
   optional string scoped_to_user = 2;
+  // Set when the list is a coordinator's associations and not every user.
+  bool partial = 3;
+}
+
+message AddCoordinatorRequest {
+  string account = 1;
+  repeated string users = 2;
+}
+
+message RemoveCoordinatorRequest {
+  string account = 1;
+  repeated string users = 2;
+}
+
+message ListCoordinatorsRequest {
+  string account = 1;
+  string user = 2;
+}
+
+message CoordinatorInfo {
+  string user = 1;
+  string account = 2;
+}
+
+message ListCoordinatorsResponse {
+  repeated CoordinatorInfo coordinators = 1;
 }
 
 message UserInfo {

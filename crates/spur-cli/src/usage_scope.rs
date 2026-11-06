@@ -9,22 +9,46 @@
 /// caller's own figures as an account or cluster total, and dividing by it
 /// would make the caller's share look like 100%.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct UsageScope(Option<String>);
+pub(crate) struct UsageScope {
+    pinned: Option<String>,
+    /// A coordinator's accounts: every returned row is real, and sums are not
+    /// the cluster.
+    partial: bool,
+}
 
 impl UsageScope {
     /// Pinned if any reply says so: a caller pinned on one RPC is pinned on all.
     pub(crate) fn from_replies<'a>(scoped: impl IntoIterator<Item = Option<&'a str>>) -> Self {
-        Self(scoped.into_iter().flatten().next().map(str::to_string))
+        Self {
+            pinned: scoped.into_iter().flatten().next().map(str::to_string),
+            partial: false,
+        }
     }
 
-    /// Sums, shares of a total, and averages across users are real.
+    pub(crate) fn with_partial(mut self, partial: impl IntoIterator<Item = bool>) -> Self {
+        self.partial = partial.into_iter().any(|flag| flag);
+        self
+    }
+
+    /// Sums and shares of the cluster are real.
     pub(crate) fn totals_visible(&self) -> bool {
-        self.0.is_none()
+        self.pinned.is_none() && !self.partial
+    }
+
+    /// Account rows cover every user of that account, so their raw usage is real.
+    /// A single-user pin does not.
+    pub(crate) fn account_rows_visible(&self) -> bool {
+        self.pinned.is_none()
+    }
+
+    /// The reply was pinned to one user.
+    pub(crate) fn is_single_user(&self) -> bool {
+        self.pinned.is_some()
     }
 
     /// `user`'s own figures are in the reply, so a missing row is a real zero.
     pub(crate) fn user_visible(&self, user: &str) -> bool {
-        self.0.as_deref().is_none_or(|me| me == user)
+        self.pinned.as_deref().is_none_or(|me| me == user)
     }
 }
 
@@ -62,6 +86,15 @@ mod tests {
         let scope = UsageScope::from_replies([Some("")]);
         assert!(!scope.totals_visible());
         assert!(!scope.user_visible("alice"));
+    }
+
+    #[test]
+    fn a_partial_reply_shows_every_returned_row_and_no_cluster_total() {
+        let scope = UsageScope::from_replies([None]).with_partial([true]);
+        assert!(!scope.totals_visible());
+        assert!(scope.account_rows_visible());
+        assert!(!scope.is_single_user());
+        assert!(scope.user_visible("bob"));
     }
 
     #[test]

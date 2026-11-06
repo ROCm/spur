@@ -69,13 +69,16 @@ in, or stream a job.
 By default every caller sees every job, every user and account, every
 reservation, and every ``scontrol show assoc_mgr`` scope, as a stock
 ``slurm.conf`` does. ``[auth] private_data`` narrows this, matching Slurm's
-``PrivateData``: ``"jobs"`` pins a User's job reads, including ``sacct``, to
-their own jobs, ``"usage"`` pins ``scontrol show assoc_mgr`` and the usage and
-fairshare figures in ``sshare``, ``sreport``, and ``sprio`` (the user and account rows of
-those commands follow ``"users"`` and ``"accounts"``; see :ref:`private-data`),
-``"users"`` and ``"accounts"`` pin ``sacctmgr show user`` and ``show account``,
-and ``"reservations"`` pins ``scontrol show reservation``. Operators and
-Administrators are exempt. A caller with no verified identity is not restricted
+``PrivateData``: ``"jobs"`` pins a User's job reads, including ``sacct``,
+``sprio``, and ``sreport job`` sizes, to their own jobs, ``"usage"`` pins
+``scontrol show assoc_mgr`` and the usage and fairshare figures in ``sshare``
+and ``sreport`` utilization (the user and account rows of those commands follow
+``"users"`` and ``"accounts"``; see :ref:`private-data`), ``"users"`` pins
+``sacctmgr show user`` to the caller, ``"accounts"`` shows a coordinator only
+the accounts they coordinate, and ``"reservations"`` pins ``scontrol show
+reservation``. A coordinator also sees jobs, usage, and associations in those
+accounts. Operators and Administrators are exempt. A caller with no verified
+identity is not restricted
 either, so ``private_data`` is enforceable only under ``plugin = "spur"`` with
 ``mode = "required"``. See :ref:`private-data` for the full list of affected
 commands.

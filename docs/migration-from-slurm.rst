@@ -96,12 +96,16 @@ Accounting entities map directly from Slurm:
   unset by default, so every user sees every job. ``"jobs"``, ``"usage"``,
   ``"users"``, ``"accounts"``, and ``"reservations"`` are supported, written as
   a TOML list (``private_data = ["jobs", "usage"]``), not a comma-separated
-  string. ``sacct`` follows ``"jobs"``. ``sshare`` and ``sreport`` usage follows
-  ``"usage"``; their user and account listings follow ``"users"`` and
-  ``"accounts"``. Unlike Slurm, root has no implicit exemption: grant it a role
+  string. ``sacct`` and ``sreport job`` sizes follow ``"jobs"``. ``sshare`` and
+  ``sreport`` utilization follow ``"usage"``. ``sprio`` follows ``"jobs"``.
+  User and account listings follow ``"users"`` and ``"accounts"``. A coordinator
+  sees the accounts they coordinate, and the ``sacct`` history, ``sreport job``
+  sizes, usage, and associations in those accounts. ``sacctmgr show user`` stays
+  the caller. ``squeue`` and ``sprio`` stay the caller's own jobs. Unlike Slurm,
+  root has no implicit exemption: grant it a role
   (``cluster_admins``, ``admin_groups``, an accounting admin level, or
-  ``allow_uid_zero_administrator``). Account coordinators are not exempt from
-  ``"jobs"``.
+  ``allow_uid_zero_administrator``). Coordinators do not gain Slurm's write
+  powers (add users, change limits, cancel jobs).
 
 See :doc:`/admin-guide/accounting` for the accounting concept guide.
 

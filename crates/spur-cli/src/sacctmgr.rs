@@ -273,9 +273,22 @@ const DELETE_NAME_ONLY_KEYS: &[&str] = &["name", "account", "qos"];
 /// rejected rather than advertised.
 const DELETE_USER_KEYS: &[&str] = &["name", "user", "account"];
 
+/// `add`/`delete`/`show coordinator` accept an account and a user list.
+/// `names`, `name`, and `user` are the same list.
+const COORDINATOR_KEYS: &[&str] = &["account", "names", "name", "user"];
+
 /// Reject keys the command does not understand, so a mistyped or unsupported
 /// field errors loudly instead of being silently dropped (a dropped limit
 /// reads as "set" but never enforces).
+fn coordinator_names(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn reject_unknown_keys(
     p: &std::collections::HashMap<String, String>,
     allowed: &[&str],
@@ -692,8 +705,46 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
             println!(" QOS added.");
             Ok(())
         }
+        "coordinator" | "coordinators" => {
+            reject_unknown_keys(&p, COORDINATOR_KEYS)?;
+            let account = p
+                .get("account")
+                .ok_or_else(|| anyhow::anyhow!("account= required"))?;
+            let users = coordinator_names(
+                p.get("names")
+                    .or_else(|| p.get("name"))
+                    .or_else(|| p.get("user"))
+                    .map(String::as_str),
+            );
+            if users.is_empty() {
+                bail!("names= required");
+            }
+            let mut client = connect(addr).await?;
+            match client
+                .add_coordinator(AddCoordinatorRequest {
+                    account: account.clone(),
+                    users: users.clone(),
+                })
+                .await
+            {
+                Ok(_) => {
+                    println!(
+                        " Adding coordinator(s) {} to account {}",
+                        users.join(","),
+                        account
+                    );
+                    println!(" Done.");
+                    Ok(())
+                }
+                Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                    println!(" The assignment is already there.");
+                    Ok(())
+                }
+                Err(status) => Err(anyhow::Error::new(status).context("AddCoordinator RPC failed")),
+            }
+        }
         other => bail!(
-            "sacctmgr: unknown entity type '{}'. Use: account, user, qos",
+            "sacctmgr: unknown entity type '{}'. Use: account, user, qos, coordinator",
             other
         ),
     }
@@ -748,6 +799,42 @@ async fn delete(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     Ok(())
                 }
                 Err(status) => Err(anyhow::Error::new(status).context("RemoveUser RPC failed")),
+            }
+        }
+        "coordinator" | "coordinators" => {
+            reject_unknown_keys(&p, COORDINATOR_KEYS)?;
+            let account = p
+                .get("account")
+                .ok_or_else(|| anyhow::anyhow!("account= required"))?;
+            let users = coordinator_names(
+                p.get("names")
+                    .or_else(|| p.get("name"))
+                    .or_else(|| p.get("user"))
+                    .map(String::as_str),
+            );
+            if users.is_empty() {
+                bail!("names= required");
+            }
+            let mut client = connect(addr).await?;
+            match client
+                .remove_coordinator(RemoveCoordinatorRequest {
+                    account: account.clone(),
+                    users,
+                })
+                .await
+            {
+                Ok(_) => {
+                    println!(" Deleting coordinator(s) from account {}", account);
+                    println!(" Done.");
+                    Ok(())
+                }
+                Err(status) if status.code() == tonic::Code::NotFound => {
+                    println!(" Nothing deleted.");
+                    Ok(())
+                }
+                Err(status) => {
+                    Err(anyhow::Error::new(status).context("RemoveCoordinator RPC failed"))
+                }
             }
         }
         "qos" => {
@@ -1022,6 +1109,7 @@ async fn show(
                 .list_users(ListUsersRequest {
                     account: account_filter,
                     user: user_filter,
+                    associations: false,
                 })
                 .await
                 .context("ListUsers RPC failed")?;
@@ -1093,6 +1181,7 @@ async fn show(
             let mut request = tonic::Request::new(ListUsersRequest {
                 account: account_filter,
                 user: user_filter,
+                associations: true,
             });
             request.set_timeout(SACCTMGR_RPC_TIMEOUT);
             let resp = client
@@ -1155,8 +1244,39 @@ async fn show(
             }
             Ok(())
         }
+        "coordinator" | "coordinators" => {
+            reject_unknown_keys(&p, COORDINATOR_KEYS)?;
+            let account = p.get("account").cloned().unwrap_or_default();
+            let wanted = coordinator_names(
+                p.get("names")
+                    .or_else(|| p.get("name"))
+                    .or_else(|| p.get("user"))
+                    .map(String::as_str),
+            );
+            let mut client = connect(addr).await?;
+            let mut rows = client
+                .list_coordinators(ListCoordinatorsRequest {
+                    account,
+                    user: String::new(),
+                })
+                .await
+                .context("ListCoordinators RPC failed")?
+                .into_inner()
+                .coordinators;
+            if !wanted.is_empty() {
+                rows.retain(|row| wanted.iter().any(|name| name == &row.user));
+            }
+            if style.shows_header() {
+                println!("{:<15} {:<20}", "User", "Account");
+                println!("{}", "-".repeat(36));
+            }
+            for row in &rows {
+                println!("{:<15} {:<20}", row.user, row.account);
+            }
+            Ok(())
+        }
         other => bail!(
-            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, tres, txn",
+            "sacctmgr: unknown entity '{}'. Use: account, user, qos, association, coordinator, tres, txn",
             other
         ),
     }
@@ -1755,6 +1875,22 @@ mod tests {
     fn delete_user_accepts_name_and_account_selectors() {
         let p = parse_params(&["name=alice".into(), "account=physics".into()]);
         assert!(reject_unknown_keys(&p, DELETE_USER_KEYS).is_ok());
+    }
+
+    #[test]
+    fn coordinator_names_split_a_comma_list() {
+        assert_eq!(
+            coordinator_names(Some("alice, bob")),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        assert!(coordinator_names(None).is_empty());
+    }
+
+    #[test]
+    fn coordinator_rejects_a_field_it_does_not_apply() {
+        let p = parse_params(&["account=ml".into(), "fairshare=10".into()]);
+        let err = reject_unknown_keys(&p, COORDINATOR_KEYS).unwrap_err();
+        assert!(err.to_string().contains("unknown field 'fairshare'"));
     }
 
     #[test]

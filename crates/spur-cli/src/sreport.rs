@@ -112,21 +112,28 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
 type AcctClient = SlurmAccountingClient<crate::authclient::AuthChannel>;
 
+/// Account definitions. A non-coordinator is denied when `accounts` is private;
+/// the caller then builds rows from the usage it is allowed to see.
+async fn account_directory(client: &mut AcctClient) -> Result<Vec<spur_proto::proto::AccountInfo>> {
+    match client.list_accounts(ListAccountsRequest {}).await {
+        Ok(resp) => Ok(resp.into_inner().accounts),
+        Err(status) if status.code() == tonic::Code::PermissionDenied => Ok(Vec::new()),
+        Err(status) => Err(status).context("failed to list accounts"),
+    }
+}
+
 async fn report_account_utilization_by_user(
     client: &mut AcctClient,
     since: Option<prost_types::Timestamp>,
     args: &SreportArgs,
 ) -> Result<()> {
-    let accounts_resp = client
-        .list_accounts(ListAccountsRequest {})
-        .await
-        .context("failed to list accounts")?;
-    let accounts = accounts_resp.into_inner().accounts;
+    let mut accounts = account_directory(client).await?;
 
     let users_resp = client
         .list_users(ListUsersRequest {
             account: String::new(),
             user: String::new(),
+            associations: true,
         })
         .await
         .context("failed to list users")?;
@@ -137,10 +144,23 @@ async fn report_account_utilization_by_user(
             user: String::new(),
             account: String::new(),
             since,
+            job_scoped: false,
         })
         .await
         .context("failed to get usage")?;
     let usage = usage_resp.into_inner();
+    if accounts.is_empty() {
+        let mut names: Vec<String> = usage.entries.iter().map(|e| e.account.clone()).collect();
+        names.sort();
+        names.dedup();
+        accounts = names
+            .into_iter()
+            .map(|name| spur_proto::proto::AccountInfo {
+                name,
+                ..Default::default()
+            })
+            .collect();
+    }
 
     let delimiter = if args.parsable { "|" } else { "  " };
 
@@ -179,12 +199,13 @@ async fn report_account_utilization_by_user(
         );
     }
 
-    let scope = UsageScope::from_replies([usage.scoped_to_user.as_deref()]);
+    let scope =
+        UsageScope::from_replies([usage.scoped_to_user.as_deref()]).with_partial([usage.partial]);
     for account in &accounts {
         let &(acct_cpu, acct_gpu, acct_jobs) = acct_agg
             .get(account.name.as_str())
             .unwrap_or(&(0.0, 0.0, 0));
-        let totals = scope.totals_visible();
+        let account_usage = scope.account_rows_visible();
 
         println!(
             "{:<20}{}{:<15}{}{}{}{}{}{}",
@@ -192,11 +213,11 @@ async fn report_account_utilization_by_user(
             delimiter,
             "",
             delimiter,
-            cell(totals, 12, || format!("{acct_cpu:>12.0}")),
+            cell(account_usage, 12, || format!("{acct_cpu:>12.0}")),
             delimiter,
-            cell(totals, 12, || format!("{acct_gpu:>12.0}")),
+            cell(account_usage, 12, || format!("{acct_gpu:>12.0}")),
             delimiter,
-            cell(totals, 10, || format!("{acct_jobs:>10}")),
+            cell(account_usage, 10, || format!("{acct_jobs:>10}")),
         );
 
         let account_users: Vec<_> = users.iter().filter(|u| u.account == account.name).collect();
@@ -233,6 +254,7 @@ async fn report_user_utilization_by_account(
         .list_users(ListUsersRequest {
             account: String::new(),
             user: String::new(),
+            associations: true,
         })
         .await
         .context("failed to list users")?;
@@ -243,6 +265,7 @@ async fn report_user_utilization_by_account(
             user: String::new(),
             account: String::new(),
             since,
+            job_scoped: false,
         })
         .await
         .context("failed to get usage")?;
@@ -277,7 +300,8 @@ async fn report_user_utilization_by_account(
         );
     }
 
-    let scope = UsageScope::from_replies([usage.scoped_to_user.as_deref()]);
+    let scope =
+        UsageScope::from_replies([usage.scoped_to_user.as_deref()]).with_partial([usage.partial]);
     for user in &users {
         let &(cpu, gpu, jobs) = user_agg
             .get(&(user.name.as_str(), user.account.as_str()))
@@ -306,17 +330,14 @@ async fn report_job_sizes_by_account(
     since: Option<prost_types::Timestamp>,
     args: &SreportArgs,
 ) -> Result<()> {
-    let accounts_resp = client
-        .list_accounts(ListAccountsRequest {})
-        .await
-        .context("failed to list accounts")?;
-    let accounts = accounts_resp.into_inner().accounts;
+    let accounts = account_directory(client).await?;
 
     let usage_resp = client
         .get_usage(GetUsageRequest {
             user: String::new(),
             account: String::new(),
             since,
+            job_scoped: true,
         })
         .await
         .context("failed to get usage")?;
@@ -344,9 +365,25 @@ async fn report_job_sizes_by_account(
         }
     }
 
-    let totals = UsageScope::from_replies([usage.scoped_to_user.as_deref()]).totals_visible();
-    for account in &accounts {
-        let &(cpu, jobs) = acct_agg.get(account.name.as_str()).unwrap_or(&(0.0, 0));
+    let restricted = usage.scoped_to_user.is_some() || usage.partial || accounts.is_empty();
+    let mut names: Vec<String> = if restricted {
+        acct_agg.keys().map(|name| (*name).to_string()).collect()
+    } else {
+        accounts
+            .iter()
+            .map(|account| account.name.clone())
+            .collect()
+    };
+    if !restricted {
+        for name in acct_agg.keys() {
+            if !names.iter().any(|have| have == *name) {
+                names.push((*name).to_string());
+            }
+        }
+    }
+    names.sort();
+    for name in &names {
+        let &(cpu, jobs) = acct_agg.get(name.as_str()).unwrap_or(&(0.0, 0));
         let pct = if total_cpu > 0.0 {
             (cpu / total_cpu) * 100.0
         } else {
@@ -354,28 +391,17 @@ async fn report_job_sizes_by_account(
         };
 
         println!(
-            "{:<20}{}{}{}{}{}{}",
-            account.name,
-            delimiter,
-            cell(totals, 10, || format!("{jobs:>10}")),
-            delimiter,
-            cell(totals, 12, || format!("{cpu:>12.0}")),
-            delimiter,
-            cell(totals, 8, || format!("{pct:>7.1}%")),
+            "{:<20}{}{jobs:>10}{}{cpu:>12.0}{}{pct:>7.1}%",
+            name, delimiter, delimiter, delimiter,
         );
     }
 
     if !args.parsable {
         println!("{}", "-".repeat(56));
+        let tot_pct = if total_cpu > 0.0 { 100.0 } else { 0.0 };
         println!(
-            "{:<20}{}{}{}{}{}{}",
-            "TOTAL",
-            delimiter,
-            cell(totals, 10, || format!("{total_jobs:>10}")),
-            delimiter,
-            cell(totals, 12, || format!("{total_cpu:>12.0}")),
-            delimiter,
-            cell(totals, 8, || format!("{:>7.1}%", 100.0)),
+            "{:<20}{}{total_jobs:>10}{}{total_cpu:>12.0}{}{tot_pct:>7.1}%",
+            "TOTAL", delimiter, delimiter, delimiter,
         );
     }
 
@@ -391,6 +417,7 @@ async fn report_job_sizes_by_user(
         .list_users(ListUsersRequest {
             account: String::new(),
             user: String::new(),
+            associations: true,
         })
         .await
         .context("failed to list users")?;
@@ -401,6 +428,7 @@ async fn report_job_sizes_by_user(
             user: String::new(),
             account: String::new(),
             since,
+            job_scoped: true,
         })
         .await
         .context("failed to get usage")?;
@@ -436,46 +464,52 @@ async fn report_job_sizes_by_user(
         }
     }
 
-    let scope = UsageScope::from_replies([usage.scoped_to_user.as_deref()]);
-    let totals = scope.totals_visible();
-    for user in &users {
-        let &(cpu, jobs) = user_agg
-            .get(&(user.name.as_str(), user.account.as_str()))
-            .unwrap_or(&(0.0, 0));
+    let restricted = usage.scoped_to_user.is_some() || usage.partial || users.is_empty();
+    let mut rows: Vec<(String, String, u64, f64)> = if restricted {
+        user_agg
+            .iter()
+            .map(|((user, account), (cpu, jobs))| {
+                ((*user).to_string(), (*account).to_string(), *jobs, *cpu)
+            })
+            .collect()
+    } else {
+        users
+            .iter()
+            .map(|user| {
+                let (cpu, jobs) = user_agg
+                    .get(&(user.name.as_str(), user.account.as_str()))
+                    .copied()
+                    .unwrap_or((0.0, 0));
+                (user.name.clone(), user.account.clone(), jobs, cpu)
+            })
+            .collect()
+    };
+    if !restricted {
+        for ((user, account), (cpu, jobs)) in &user_agg {
+            if !rows.iter().any(|row| row.0 == *user && row.1 == *account) {
+                rows.push(((*user).to_string(), (*account).to_string(), *jobs, *cpu));
+            }
+        }
+    }
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    for (user, account, jobs, cpu) in &rows {
         let pct = if total_cpu > 0.0 {
             (cpu / total_cpu) * 100.0
         } else {
             0.0
         };
-        let mine = scope.user_visible(&user.name);
-
         println!(
-            "{:<15}{}{:<20}{}{}{}{}{}{}",
-            user.name,
-            delimiter,
-            user.account,
-            delimiter,
-            cell(mine, 10, || format!("{jobs:>10}")),
-            delimiter,
-            cell(mine, 12, || format!("{cpu:>12.0}")),
-            delimiter,
-            cell(mine && totals, 8, || format!("{pct:>7.1}%")),
+            "{:<15}{}{:<20}{}{jobs:>10}{}{cpu:>12.0}{}{pct:>7.1}%",
+            user, delimiter, account, delimiter, delimiter, delimiter,
         );
     }
 
     if !args.parsable {
         println!("{}", "-".repeat(71));
+        let tot_pct = if total_cpu > 0.0 { 100.0 } else { 0.0 };
         println!(
-            "{:<15}{}{:<20}{}{}{}{}{}{}",
-            "TOTAL",
-            delimiter,
-            "",
-            delimiter,
-            cell(totals, 10, || format!("{total_jobs:>10}")),
-            delimiter,
-            cell(totals, 12, || format!("{total_cpu:>12.0}")),
-            delimiter,
-            cell(totals, 8, || format!("{:>7.1}%", 100.0)),
+            "{:<15}{}{:<20}{}{total_jobs:>10}{}{total_cpu:>12.0}{}{tot_pct:>7.1}%",
+            "TOTAL", delimiter, "", delimiter, delimiter, delimiter,
         );
     }
 

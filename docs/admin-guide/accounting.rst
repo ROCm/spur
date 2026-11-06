@@ -184,8 +184,19 @@ Show accounts
 
    sacctmgr show account
 
-With ``private_data = ["accounts"]``, a User sees only accounts they belong to
+With ``private_data = ["accounts"]``, a User sees an account only when they
+coordinate it. A user who coordinates nothing is denied once the association
+cache has loaded. While the cache is still loading, the call is unavailable
 (see :ref:`private-data`).
+
+.. code-block:: bash
+
+   sacctmgr add coordinator account=ml names=alice
+
+``names=`` takes one user or a comma-separated list. ``delete coordinator``
+uses the same keys. ``show coordinator`` lists the assignments, and accepts
+``account=`` and ``user=`` filters. Adding or removing a coordinator requires
+Administrator.
 
 .. code-block:: text
 
@@ -301,7 +312,8 @@ Show users
 ~~~~~~~~~~~
 
 Filter by ``account=`` or ``name=``. With ``private_data = ["users"]``, a User
-sees only their own rows (see :ref:`private-data`).
+sees only their own rows. ``show association`` also includes associations in
+accounts the caller coordinates (see :ref:`private-data`).
 
 .. code-block:: bash
 
@@ -1109,6 +1121,9 @@ consumed more is penalized. The score is computed from three inputs:
 - **Account hierarchy** — accounts form a tree, and each account's effective
   share is its weight divided by the sum of its sibling weights, scaled by its
   parent's share. ``sshare`` displays the resulting per-user factors.
+  ``sshare -u`` and ``sshare -A`` only choose which rows to print. ``NormUsage``
+  stays that row's share of the usage the caller can see, and an account row
+  keeps the account's full raw usage.
 - **Usage decay** — older usage fades exponentially with a half-life set by
   ``scheduler.fairshare_halflife_days`` (default 14).
 - **CPU + GPU billing** — a job's billable usage is the sum of its CPU-seconds

@@ -102,6 +102,11 @@ pub fn resolve_caller_role(
 pub enum ReadScope {
     All,
     Caller(String),
+    /// The caller's own rows, plus every row in `accounts`.
+    Coordinated {
+        user: String,
+        accounts: Vec<String>,
+    },
 }
 
 impl ReadScope {
@@ -109,7 +114,39 @@ impl ReadScope {
     pub fn permits(&self, owner: &str) -> bool {
         match self {
             ReadScope::All => true,
+            ReadScope::Caller(user) | ReadScope::Coordinated { user, .. } => {
+                !user.is_empty() && user == owner
+            }
+        }
+    }
+
+    /// A usage or job row. A coordinator also sees every row in their accounts.
+    pub fn permits_row(&self, owner: &str, account: &str) -> bool {
+        match self {
+            ReadScope::All => true,
             ReadScope::Caller(user) => !user.is_empty() && user == owner,
+            ReadScope::Coordinated { user, accounts } => {
+                (!user.is_empty() && user == owner) || accounts.iter().any(|a| a == account)
+            }
+        }
+    }
+
+    /// Accounts a coordinator may see beyond their own rows.
+    pub fn coordinated_accounts(&self) -> Option<&[String]> {
+        match self {
+            ReadScope::Coordinated { accounts, .. } => Some(accounts),
+            _ => None,
+        }
+    }
+
+    /// Widen a caller pin to the accounts they coordinate. An empty list, or any
+    /// other scope, stays as it is.
+    pub fn widen_to(self, accounts: Vec<String>) -> Self {
+        match self {
+            Self::Caller(user) if !user.is_empty() && !accounts.is_empty() => {
+                Self::Coordinated { user, accounts }
+            }
+            other => other,
         }
     }
 
@@ -122,8 +159,13 @@ impl ReadScope {
             ReadScope::All => Some(requested.map(str::to_string)),
             // An empty user filter means "every user" downstream, so a scoped
             // caller with no name must see nothing rather than everything.
-            ReadScope::Caller(user) if user.is_empty() => None,
-            ReadScope::Caller(user) => match requested {
+            ReadScope::Caller(user) | ReadScope::Coordinated { user, .. } if user.is_empty() => {
+                None
+            }
+            // A coordinated view is not one user. Callers that need the extra
+            // accounts match on `Coordinated` before this and use `permits_row`.
+            // Falling through shows only the caller, never every user.
+            ReadScope::Caller(user) | ReadScope::Coordinated { user, .. } => match requested {
                 None => Some(Some(user.clone())),
                 Some(r) if r == user => Some(Some(user.clone())),
                 Some(_) => None,
@@ -376,6 +418,19 @@ mod tests {
     #[test]
     fn permits_nothing_for_a_nameless_caller() {
         assert!(!ReadScope::Caller(String::new()).permits(""));
+    }
+
+    #[test]
+    fn a_coordinator_sees_their_own_rows_and_their_accounts() {
+        let scope = ReadScope::Caller("alice".into()).widen_to(vec!["physics".into()]);
+        assert!(scope.permits_row("alice", "ml"));
+        assert!(scope.permits_row("bob", "physics"));
+        assert!(!scope.permits_row("bob", "ml"));
+        assert!(!scope.permits("bob"));
+        assert_eq!(
+            ReadScope::Caller("alice".into()).widen_to(vec![]),
+            ReadScope::Caller("alice".into())
+        );
     }
 
     #[test]

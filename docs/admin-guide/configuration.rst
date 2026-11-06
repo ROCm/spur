@@ -1277,7 +1277,10 @@ Slurm's ``PrivateData`` and narrows what a User sees.
      - Other users' jobs and steps: ``squeue``/``spur queue``, ``sprio``,
        ``sstat``, ``sacct``/``spur history``, ``scontrol show job``/``step``,
        the jobs that ``scancel -p``, ``-A``, or ``-n`` selects, and REST
-       ``/jobs`` and ``/job/{id}``. ``squeue -u other``, ``squeue -j``,
+       ``/jobs`` and ``/job/{id}``. ``sreport job`` sizes follow the same rule
+       and total the jobs the caller can see. A coordinator also sees jobs in
+       ``sacct`` and those reports for the accounts they coordinate. ``squeue``
+       stays the caller's own jobs. ``squeue -u other``, ``squeue -j``,
        ``sacct -u other``, ``sacct -j`` for another user's job, and
        ``scontrol show job`` print nothing; ``sstat``, ``scontrol show step``,
        and REST ``/job/{id}`` report it as not found.
@@ -1285,20 +1288,28 @@ Slurm's ``PrivateData`` and narrows what a User sees.
      - ``scontrol show assoc_mgr`` lists only the QOS and accounts the User takes
        part in, and only their own ``User=`` lines. A ``users=`` selector is
        replaced with their own name. ``Grp*`` totals still include every user's
-       jobs. ``sshare``, ``sreport``, and ``sprio`` show only the User's own
-       usage and fairshare. Other users' figures, account and cluster totals,
-       ``NormUsage``, and ``% of Tot`` are left blank rather than computed from
-       the User's rows alone. The account and user rows themselves stay unless
-       ``"accounts"`` or ``"users"`` is also set.
+       jobs. ``sshare`` omits other users' rows. Account rows stay, and their
+       raw usage, account and cluster totals, ``NormUsage``, and ``% of Tot``
+       are left blank rather than computed from the User's rows alone.
+       ``sreport`` utilization leaves those same cells blank.
+       A coordinator also sees usage for the accounts they coordinate; those
+       rows are filled in, and cluster totals stay blank.
+       ``sprio`` and ``sreport job`` sizes follow ``"jobs"``, not ``"usage"``.
+       Account rows stay unless ``"accounts"`` is also set. ``"users"`` also
+       drops other users from ``sshare``.
    * - ``"users"``
-     - ``sacctmgr show user`` and ``show association`` list only the caller's
-       rows. ``user=`` for someone else prints nothing. ``sshare`` leaves the
-       per-user ``NormShares`` blank, because that split counts only the caller.
+     - ``sacctmgr show user`` lists only the caller, including for a coordinator.
+       ``show association`` lists the caller's rows, and a coordinator also sees
+       every association in the accounts they coordinate. ``user=`` for someone
+       else prints nothing unless that user is in a coordinated account.
+       ``sshare`` leaves the per-user ``NormShares`` blank when the list is not
+       the whole cluster.
    * - ``"accounts"``
-     - ``sacctmgr show account`` lists only accounts the caller is associated
-       with. Until the association cache has loaded, that list is empty.
-       ``sshare`` leaves account and per-user ``NormShares`` blank, because
-       the weights it received are not the cluster total.
+     - ``sacctmgr show account`` lists only accounts the caller coordinates.
+       A user who coordinates nothing is denied. Until the association cache
+       has loaded, the call returns unavailable. ``sshare`` leaves account and
+       per-user ``NormShares`` blank when the weights are not the cluster total.
+       Add a coordinator with ``sacctmgr add coordinator account=<name> names=<user>``.
    * - ``"reservations"``
      - ``scontrol show reservation`` lists reservations the caller is named on,
        or whose accounts include one of the caller's. A reservation with no
@@ -1307,11 +1318,13 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        omits ``ActiveReservation`` for a hidden reservation, but ``sinfo`` and
        ``smd`` still show the node as ``resv`` or ``maint``.
 
-``sacct`` follows ``"jobs"``. ``sshare`` and ``sreport`` usage and fairshare
-follow ``"usage"``; the user and account rows those commands also list follow
+``sacct`` and ``sreport job`` sizes follow ``"jobs"``. ``sshare`` and
+``sreport`` utilization follow ``"usage"``. ``sprio`` follows ``"jobs"``.
+The user and account rows ``sshare`` and ``sreport`` also list follow
 ``"users"`` and ``"accounts"``. QOS definitions (``sacctmgr show qos``) stay
-visible. Set ``"jobs"`` and ``"usage"`` for the visibility closest to what Spur
-v0.13 and v0.14 enforced:
+visible. A coordinator is not an operator: the extra rows are the accounts
+they coordinate. Set ``"jobs"`` and ``"usage"`` for the visibility closest to
+what Spur v0.13 and v0.14 enforced:
 
 .. code-block:: toml
 
@@ -1322,7 +1335,8 @@ v0.13 and v0.14 enforced:
 
 Operators and Administrators are exempt. Root is exempt only through a role
 (``cluster_admins``, ``admin_groups``, an accounting admin level, or
-``allow_uid_zero_administrator``), and account coordinators are not exempt.
+``allow_uid_zero_administrator``). An account coordinator is not exempt from a
+category; they see only the accounts they coordinate, as in Slurm.
 
 .. warning::
 

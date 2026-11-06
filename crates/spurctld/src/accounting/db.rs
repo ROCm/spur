@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS account_coordinators (
+    user_name       TEXT NOT NULL,
+    account         TEXT NOT NULL REFERENCES accounts(name),
+    PRIMARY KEY (user_name, account)
+);
+
 CREATE TABLE IF NOT EXISTS users (
     name            TEXT NOT NULL,
     account         TEXT NOT NULL REFERENCES accounts(name),
@@ -705,13 +711,43 @@ pub struct JobHistoryQuery<'a> {
     pub states: &'a [String],
     pub job_ids: &'a [JobId],
     pub limit: u32,
+    /// Caller and the accounts they coordinate. Applied before `LIMIT`, so the
+    /// page is their visible jobs rather than the cluster's newest rows.
+    pub coordinated: Option<(&'a str, &'a [String])>,
 }
 
-/// Query job history.
-pub async fn get_job_history(
-    pool: &PgPool,
-    query: &JobHistoryQuery<'_>,
-) -> anyhow::Result<Vec<JobRecord>> {
+fn coordinated_bind<'a>(
+    coordinated: Option<(&'a str, &'a [String])>,
+) -> (Option<&'a str>, Vec<String>) {
+    match coordinated {
+        Some((caller, accounts)) => (Some(caller), accounts.to_vec()),
+        None => (None, Vec::new()),
+    }
+}
+
+fn push_coordinated(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    user_col: &str,
+    account_col: &str,
+    coordinated: Option<(&str, &[String])>,
+) {
+    let Some((caller, accounts)) = coordinated else {
+        return;
+    };
+    qb.push(" AND (")
+        .push(user_col)
+        .push(" = ")
+        .push_bind(caller)
+        .push(" OR ")
+        .push(account_col)
+        .push(" = ANY(")
+        .push_bind(accounts.to_vec())
+        .push("))");
+}
+
+/// The statement [`get_job_history`] runs, including the coordinator predicate
+/// and the row limit. Split out so a test can check that order without a database.
+fn job_history_query(query: &JobHistoryQuery<'_>) -> QueryBuilder<sqlx::Postgres> {
     let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
@@ -749,11 +785,19 @@ pub async fn get_job_history(
         }
         sep.push_unseparated(")");
     }
+    push_coordinated(&mut qb, "user_name", "account", query.coordinated);
 
     qb.push(" ORDER BY submit_time DESC LIMIT ")
         .push_bind(effective_query_limit(query.limit));
+    qb
+}
 
-    let rows = qb.build().fetch_all(pool).await?;
+/// Query job history.
+pub async fn get_job_history(
+    pool: &PgPool,
+    query: &JobHistoryQuery<'_>,
+) -> anyhow::Result<Vec<JobRecord>> {
+    let rows = job_history_query(query).build().fetch_all(pool).await?;
 
     let records = rows
         .iter()
@@ -959,6 +1003,17 @@ pub async fn get_usage(
     account: Option<&str>,
     since: DateTime<Utc>,
 ) -> anyhow::Result<Vec<UsageRecord>> {
+    get_usage_visible(pool, user, account, since, None).await
+}
+
+pub async fn get_usage_visible(
+    pool: &PgPool,
+    user: Option<&str>,
+    account: Option<&str>,
+    since: DateTime<Utc>,
+    coordinated: Option<(&str, &[String])>,
+) -> anyhow::Result<Vec<UsageRecord>> {
+    let (caller, accounts) = coordinated_bind(coordinated);
     let rows = sqlx::query(
         r#"
         SELECT user_name, account,
@@ -970,6 +1025,7 @@ pub async fn get_usage(
         WHERE period_start >= $1
           AND ($2::text IS NULL OR user_name = $2)
           AND ($3::text IS NULL OR account = $3)
+          AND ($4::text IS NULL OR user_name = $4 OR account = ANY($5))
         GROUP BY user_name, account, period_start
         ORDER BY period_start
         "#,
@@ -977,6 +1033,8 @@ pub async fn get_usage(
     .bind(since)
     .bind(user)
     .bind(account)
+    .bind(caller)
+    .bind(accounts)
     .fetch_all(pool)
     .await?;
 
@@ -993,6 +1051,32 @@ pub async fn get_usage(
         .collect();
 
     Ok(records)
+}
+
+#[cfg(test)]
+mod history_query_tests {
+    use super::*;
+
+    #[test]
+    fn a_coordinator_filter_is_applied_before_the_row_limit() {
+        let accounts = vec!["physics".to_string()];
+        let query = JobHistoryQuery {
+            coordinated: Some(("alice", &accounts)),
+            limit: 10,
+            ..Default::default()
+        };
+        let sql = job_history_query(&query).sql();
+        let sql = sql.as_str();
+        // The select list names user_name, so the predicate is the comparison.
+        let pred = sql.find("user_name = ").expect("visible-row predicate");
+        let limit = sql.find("ORDER BY submit_time DESC LIMIT").expect("limit");
+        assert!(
+            sql.contains("FROM jobs WHERE 1=1"),
+            "this is the history statement, not a stand-in: {sql}"
+        );
+        assert!(pred < limit, "{sql}");
+        assert!(sql.contains("account = ANY"), "{sql}");
+    }
 }
 
 // A macro rather than a `const` so the EXPLAIN test can build its statement with
@@ -1302,11 +1386,57 @@ pub async fn upsert_account<'a>(
 
 /// Delete an account.
 pub async fn delete_account(conn: &mut PgConnection, name: &str) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM account_coordinators WHERE account = $1")
+        .bind(name)
+        .execute(&mut *conn)
+        .await?;
     sqlx::query("DELETE FROM accounts WHERE name = $1")
         .bind(name)
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+/// Rows inserted. Zero means this user already coordinates the account.
+pub async fn add_coordinator(
+    conn: &mut PgConnection,
+    user: &str,
+    account: &str,
+) -> anyhow::Result<u64> {
+    let res = sqlx::query(
+        "INSERT INTO account_coordinators (user_name, account) VALUES ($1, $2) \
+         ON CONFLICT (user_name, account) DO NOTHING",
+    )
+    .bind(user)
+    .bind(account)
+    .execute(&mut *conn)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn remove_coordinator(
+    conn: &mut PgConnection,
+    user: &str,
+    account: &str,
+) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM account_coordinators WHERE user_name = $1 AND account = $2")
+        .bind(user)
+        .bind(account)
+        .execute(&mut *conn)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn list_coordinators(pool: &PgPool) -> anyhow::Result<Vec<(String, String)>> {
+    let rows = sqlx::query(
+        "SELECT user_name, account FROM account_coordinators ORDER BY account, user_name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get("user_name"), r.get("account")))
+        .collect())
 }
 
 /// List all accounts.
@@ -1527,6 +1657,16 @@ pub async fn list_users(
     account: Option<&str>,
     user: Option<&str>,
 ) -> anyhow::Result<Vec<UserRecord>> {
+    list_users_visible(pool, account, user, None).await
+}
+
+pub async fn list_users_visible(
+    pool: &PgPool,
+    account: Option<&str>,
+    user: Option<&str>,
+    coordinated: Option<(&str, &[String])>,
+) -> anyhow::Result<Vec<UserRecord>> {
+    let (caller, accounts) = coordinated_bind(coordinated);
     let rows = sqlx::query(
         r#"
         SELECT DISTINCT ON (u.name, u.account)
@@ -1541,11 +1681,14 @@ pub async fn list_users(
                 AND (a.partition_name IS NULL OR a.partition_name = '')
         WHERE ($1::TEXT IS NULL OR u.account = $1)
             AND ($2::TEXT IS NULL OR u.name = $2)
+            AND ($3::TEXT IS NULL OR u.name = $3 OR u.account = ANY($4))
         ORDER BY u.name, u.account, a.id DESC NULLS LAST
         "#,
     )
     .bind(account)
     .bind(user)
+    .bind(caller)
+    .bind(accounts)
     .fetch_all(pool)
     .await?;
 
@@ -2401,6 +2544,7 @@ mod job_history_tests {
                     states: &[],
                     job_ids: &[id],
                     limit: 10,
+                    coordinated: None,
                 },
             )
             .await

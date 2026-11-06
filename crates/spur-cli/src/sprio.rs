@@ -100,7 +100,12 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let (fairshare_map, scope): (HashMap<(String, String), f64>, UsageScope) = {
         let mut acct_client = spur_proto::accounting_client(channel);
         match acct_client
-            .get_fairshare_factors(GetFairshareFactorsRequest { halflife_days: 0 })
+            .get_fairshare_factors(GetFairshareFactorsRequest {
+                halflife_days: 0,
+                // Factors follow the job list, which `jobs` already scopes.
+                // `usage` must not blank FAIRSHARE on a job this command shows.
+                job_scoped: true,
+            })
             .await
         {
             Ok(resp) => {

@@ -79,6 +79,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .list_users(ListUsersRequest {
             account: args.account.clone().unwrap_or_default(),
             user: String::new(),
+            associations: true,
         })
         .await
         .context("failed to list users")?;
@@ -88,9 +89,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Get usage data
     let usage_resp = client
         .get_usage(GetUsageRequest {
-            user: args.user.clone().unwrap_or_default(),
-            account: args.account.clone().unwrap_or_default(),
+            user: String::new(),
+            account: String::new(),
             since: None,
+            job_scoped: false,
         })
         .await
         .context("failed to get usage")?;
@@ -99,51 +101,67 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     // Share ratios divide by the accounts and users the controller returned.
     // A pinned directory is not the cluster, so those ratios stay blank.
     let (accounts_open, shares_open) = share_ratios_visible(
-        accounts_reply.scoped_to_user.as_deref(),
+        accounts_reply.partial,
         users_reply.scoped_to_user.as_deref(),
+        users_reply.partial,
     );
 
-    let (fairshare_map, factors_scoped_to): (HashMap<(String, String), f64>, Option<String>) =
-        match client
-            .get_fairshare_factors(GetFairshareFactorsRequest { halflife_days: 0 })
-            .await
-        {
-            Ok(resp) => {
-                let resp = resp.into_inner();
-                (
-                    resp.entries
-                        .into_iter()
-                        .map(|e| ((e.user, e.account), e.factor))
-                        .collect(),
-                    resp.scoped_to_user,
-                )
-            }
-            Err(e) => {
-                // The account-row fallback is the only approximation this warning
-                // can be about. Usage pin and account pin blank it for different reasons.
-                let usage_open = usage.scoped_to_user.is_none();
-                if account_fair_shown(false, usage_open, accounts_open) {
-                    eprintln!(
-                        "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
+    let (fairshare_map, factors_scoped_to, factors_partial): (
+        HashMap<(String, String), f64>,
+        Option<String>,
+        bool,
+    ) = match client
+        .get_fairshare_factors(GetFairshareFactorsRequest {
+            halflife_days: 0,
+            job_scoped: false,
+        })
+        .await
+    {
+        Ok(resp) => {
+            let resp = resp.into_inner();
+            (
+                resp.entries
+                    .into_iter()
+                    .map(|e| ((e.user, e.account), e.factor))
+                    .collect(),
+                resp.scoped_to_user,
+                resp.partial,
+            )
+        }
+        Err(e) => {
+            // The account-row fallback is the only approximation this warning
+            // can be about. A single-user pin and a partial directory blank it
+            // for different reasons.
+            let usage_open = usage.scoped_to_user.is_none() && !usage.partial;
+            let single_user = usage.scoped_to_user.is_some();
+            if account_fair_shown(false, usage_open, accounts_open, single_user) {
+                eprintln!(
+                    "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
                          Values shown are local approximations and may differ from the scheduler."
-                    );
-                } else if !usage_open {
-                    eprintln!(
-                        "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
+                );
+            } else if single_user {
+                eprintln!(
+                    "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
                          FairShare is blank; the usage reply is only this caller."
-                    );
-                } else {
-                    eprintln!(
-                        "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
+                );
+            } else {
+                eprintln!(
+                    "sshare: warning: could not fetch fair-share factors from controller: {e}\n\
                          FairShare is blank; the account list is not the cluster share total."
-                    );
-                }
-                (HashMap::new(), None)
+                );
             }
-        };
+            (HashMap::new(), None, false)
+        }
+    };
     let scope = UsageScope::from_replies([
         usage.scoped_to_user.as_deref(),
         factors_scoped_to.as_deref(),
+    ])
+    .with_partial([
+        usage.partial,
+        factors_partial,
+        accounts_reply.partial,
+        users_reply.partial,
     ]);
 
     let account_fairshare: HashMap<&str, f64> = {
@@ -235,7 +253,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         };
         let fair_share = account_factor.unwrap_or(fair_fallback);
         let totals = scope.totals_visible();
-        let fair_shown = account_fair_shown(account_factor.is_some(), totals, accounts_open);
+        let account_usage = scope.account_rows_visible();
+        let fair_shown = account_fair_shown(
+            account_factor.is_some(),
+            totals,
+            accounts_open,
+            scope.is_single_user(),
+        );
 
         let cpu_raw = account_cpu_secs
             .get(account.name.as_str())
@@ -246,13 +270,13 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             .copied()
             .unwrap_or(0.0);
 
-        let raw_long = cell(totals, 12, || format!("{raw_usage:>12.1}"));
-        let raw_short = cell(totals, 12, || format!("{raw_usage:>12.0}"));
+        let raw_long = cell(account_usage, 12, || format!("{raw_usage:>12.1}"));
+        let raw_short = cell(account_usage, 12, || format!("{raw_usage:>12.0}"));
         let norm_shares_cell = cell(accounts_open, 12, || format!("{norm_shares:>12.6}"));
         let norm = cell(totals, 12, || format!("{norm_usage:>12.6}"));
         let fair = cell(fair_shown, 12, || format!("{fair_share:>12.6}"));
-        let cpu = cell(totals, 12, || format!("{cpu_raw:>12.1}"));
-        let gpu = cell(totals, 12, || format!("{gpu_raw:>12.1}"));
+        let cpu = cell(account_usage, 12, || format!("{cpu_raw:>12.1}"));
+        let gpu = cell(account_usage, 12, || format!("{gpu_raw:>12.1}"));
 
         // Account-level row
         if args.long {
@@ -283,6 +307,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                 if &user.name != filter_user {
                     continue;
                 }
+            }
+            // Hidden users stay in `members`, so a visible user's NormShares is
+            // still their fraction of the account. Slurm omits the hidden rows.
+            if !scope.user_visible(&user.name) {
+                continue;
             }
 
             let user_usage = user_account_cpu_secs
@@ -344,17 +373,27 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 /// A pinned account list is not the cluster total, so both ratios are wrong.
 /// A pinned user list still has that total, but the per-user split counts
 /// only the caller.
-fn share_ratios_visible(accounts_scoped: Option<&str>, users_scoped: Option<&str>) -> (bool, bool) {
-    let account_shares = UsageScope::from_replies([accounts_scoped]).totals_visible();
-    let user_shares = account_shares && UsageScope::from_replies([users_scoped]).totals_visible();
-    (account_shares, user_shares)
+fn share_ratios_visible(
+    accounts_partial: bool,
+    users_scoped: Option<&str>,
+    users_partial: bool,
+) -> (bool, bool) {
+    let account_shares = !accounts_partial;
+    let users_complete =
+        UsageScope::from_replies([users_scoped]).totals_visible() && !users_partial;
+    (account_shares, account_shares && users_complete)
 }
 
-/// A controller factor averages the factor reply. The local fallback divides
-/// by NormShares, which a pinned account list inflates.
-fn account_fair_shown(has_factor: bool, usage_open: bool, account_shares: bool) -> bool {
+/// A controller factor is the account's when the reply is not a single user.
+/// The local fallback divides by NormShares, which a partial account list inflates.
+fn account_fair_shown(
+    has_factor: bool,
+    usage_open: bool,
+    account_shares: bool,
+    single_user: bool,
+) -> bool {
     if has_factor {
-        usage_open
+        !single_user
     } else {
         usage_open && account_shares
     }
@@ -385,18 +424,22 @@ mod tests {
 
     #[test]
     fn pinned_directories_hide_the_share_ratios_they_inflate() {
-        assert_eq!(share_ratios_visible(None, None), (true, true));
-        assert_eq!(share_ratios_visible(Some("alice"), None), (false, false));
-        assert_eq!(share_ratios_visible(None, Some("alice")), (true, false));
-        assert_eq!(share_ratios_visible(Some(""), Some("")), (false, false));
+        assert_eq!(share_ratios_visible(false, None, false), (true, true));
+        assert_eq!(share_ratios_visible(true, None, false), (false, false));
+        assert_eq!(
+            share_ratios_visible(false, Some("alice"), false),
+            (true, false)
+        );
+        assert_eq!(share_ratios_visible(true, Some(""), true), (false, false));
     }
 
     #[test]
     fn local_fairshare_is_hidden_when_its_share_ratio_is() {
-        assert!(account_fair_shown(true, true, false));
-        assert!(!account_fair_shown(true, false, true));
-        assert!(!account_fair_shown(false, true, false));
-        assert!(account_fair_shown(false, true, true));
+        assert!(account_fair_shown(true, true, false, false));
+        assert!(!account_fair_shown(true, false, true, true));
+        assert!(account_fair_shown(true, false, false, false));
+        assert!(!account_fair_shown(false, true, false, false));
+        assert!(account_fair_shown(false, true, true, false));
 
         assert!(user_fair_shown(true, true, false, false));
         assert!(!user_fair_shown(true, false, true, false));

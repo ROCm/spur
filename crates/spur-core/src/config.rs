@@ -777,11 +777,14 @@ impl AuthMode {
 pub enum PrivateData {
     /// Hide other users' jobs from the live queue and from `sacct`.
     Jobs,
-    /// Pin usage reads (`assoc_mgr`, `sshare`, `sreport`) to the caller.
+    /// Pin usage reads (`assoc_mgr`, `sshare`, `sreport` utilization) to the caller,
+    /// widened to the accounts a coordinator runs.
     Usage,
-    /// Pin `sacctmgr show user` and `show association` to the caller's own rows.
+    /// Pin `sacctmgr show user` to the caller. `show association` widens to the
+    /// accounts a coordinator runs.
     Users,
-    /// Pin `sacctmgr show account` to accounts the caller belongs to.
+    /// List `sacctmgr show account` only to coordinators, and only the accounts they
+    /// coordinate.
     Accounts,
     /// Pin `scontrol show reservation` to reservations the caller can use.
     Reservations,

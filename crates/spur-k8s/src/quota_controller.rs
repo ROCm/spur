@@ -71,6 +71,7 @@ async fn reconcile_once(
         .list_users(ListUsersRequest {
             account: String::new(),
             user: String::new(),
+            associations: false,
         })
         .await
         .context("ListUsers RPC")?

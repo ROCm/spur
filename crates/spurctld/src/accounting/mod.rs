@@ -51,7 +51,6 @@ pub(crate) fn start(
 
     let service = AccountingService::unavailable("connecting to accounting database");
     service.attach_association_cache(cluster.association_cache().clone());
-    service.attach_auth(config.auth.clone());
     let live = cluster.clone();
     service.attach_auth_source(move || live.config().auth.clone());
     service.attach_fairshare_halflife(config.scheduler.fairshare_halflife_days);
@@ -270,6 +269,7 @@ pub async fn association_maps(
     HashMap<(String, String), AccountLimits>,
     HashMap<(String, String), HashSet<String>>,
     HashMap<String, String>,
+    HashSet<(String, String)>,
 )> {
     let users = db::list_users(pool, None, None).await?;
 
@@ -310,6 +310,8 @@ pub async fn association_maps(
         })
         .collect();
 
+    let coordinators = db::list_coordinators(pool).await?.into_iter().collect();
+
     Ok((
         default_qos,
         default_account,
@@ -317,6 +319,7 @@ pub async fn association_maps(
         limits,
         allowed_qos,
         admin_level,
+        coordinators,
     ))
 }
 
