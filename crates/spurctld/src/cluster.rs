@@ -781,6 +781,22 @@ fn gpu_ids_match(a: &[u64], b: &[u64]) -> bool {
     sa == sb
 }
 
+/// Per-node memory (MiB) a controller hook reports: the job's per-node request,
+/// or, when its memory is sized per CPU or per GPU and so differs per node, the
+/// most any one node was allocated.
+pub(crate) fn hook_memory_mb(
+    spec: &JobSpec,
+    per_node_alloc: &HashMap<String, ResourceAllocations>,
+) -> u64 {
+    spec.memory_per_node_mb.unwrap_or_else(|| {
+        per_node_alloc
+            .values()
+            .map(|alloc| alloc.memory_mb)
+            .max()
+            .unwrap_or(0)
+    })
+}
+
 /// What a run is charged to, recorded with its placement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunAttribution {
@@ -3788,7 +3804,7 @@ impl ClusterManager {
             cpus: job.as_ref().map(|j| j.spec.cpus_per_task).unwrap_or(1),
             memory_mb: job
                 .as_ref()
-                .and_then(|j| j.spec.memory_per_node_mb)
+                .map(|j| hook_memory_mb(&j.spec, &j.per_node_alloc))
                 .unwrap_or(0),
         };
         tokio::spawn(async move {

@@ -5454,6 +5454,11 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         min_memory_node_mb: min_memory_requested_mb(&job.spec),
         min_memory_is_per_cpu: job.spec.memory_per_node_mb.is_none()
             && job.spec.memory_per_cpu_mb.is_some(),
+        mem_per_tres: job
+            .spec
+            .memory_per_gpu_mb
+            .map(|mb| format!("gpu:{mb}"))
+            .unwrap_or_default(),
         idle_fill: job.idle_fill,
         end_reason: String::new(),
         end_reason_detail: String::new(),
@@ -14162,6 +14167,18 @@ mod tests {
         let info = job_to_proto(&job);
         assert_eq!(info.partition, "cpu,wide");
         assert_eq!(info.effective_partition, "wide");
+    }
+
+    #[test]
+    fn job_to_proto_reports_per_gpu_memory_as_mem_per_tres() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(7, JobSpec::default());
+        assert_eq!(job_to_proto(&job).mem_per_tres, "");
+        job.spec.memory_per_gpu_mb = Some(8192);
+        let info = job_to_proto(&job);
+        assert_eq!(info.mem_per_tres, "gpu:8192");
+        assert_eq!(info.min_memory_node_mb, 0);
     }
 
     #[test]
