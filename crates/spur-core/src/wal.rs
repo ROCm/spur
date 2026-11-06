@@ -223,7 +223,7 @@ pub enum WalOperation {
         #[serde(default)]
         run_attempt: Option<u32>,
         /// Hand the freed nodes to `preempted_by`; false for reclaim and pre-handoff entries.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         handoff: bool,
     },
     /// Preempt a running job with cancel. The job transitions Running →

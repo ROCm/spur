@@ -741,8 +741,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
 
    Cancel and requeue preemption hand the freed nodes to the job that
    triggered the eviction; suspend preemption frees nothing and hands nothing
-   off. While the victims drain, and for at least two scheduling passes after
-   the last one releases its resources, other pending jobs, including competing
+   off. While the victims run out their preemption grace or drain, and for at
+   least two scheduling passes after the last one releases its resources,
+   other pending jobs, including competing
    preemptors, cannot be placed on those nodes. A pass runs every
    ``interval_secs``, or sooner when a job is submitted, so the post-release
    window can be well under ``interval_secs``. This protects a multi-node
@@ -760,10 +761,11 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    node in an active reservation is handed off only to a preemptor allowed to
    use that reservation, and idle-fill reclaim creates no handoff.
 
-   A handoff whose victims are still draining survives a controller restart.
+   A handoff whose victims are still in grace or draining survives a controller
+   restart.
    Post-release handoffs are kept in controller memory, so a restart or leader
    change can drop one, or renew it for two more passes (longer if the
-   preemptor still has other victims draining).
+   preemptor still has other victims in grace or draining).
 
    Eviction eligibility uses the QOS allow-list and priority. Fair-share and
    age only order the queue; they never make a job eligible to preempt.

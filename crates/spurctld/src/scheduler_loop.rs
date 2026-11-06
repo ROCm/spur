@@ -1318,7 +1318,6 @@ async fn try_preempt_with_handoffs(
     unscheduled: &[&spur_core::job::Job],
     sched: &spur_core::config::SchedulerConfig,
 ) {
-    use crate::cluster::PreemptOutcome;
     use spur_core::job::JobState;
     use spur_core::partition::{Partition, PreemptMode, PreemptType};
     use spur_core::reservation::job_runs_in_active_reservation;
@@ -2154,7 +2153,7 @@ pub(crate) fn preemptor_awaiting_release(
     use spur_core::job::JobState;
 
     match job.state {
-        JobState::Completing => job.preempted_by,
+        JobState::Completing if job.is_draining_cancel_victim() => job.preempted_by,
         JobState::Running => job.preempt_grace().map(|p| p.preempted_by),
         _ => None,
     }
@@ -9957,6 +9956,7 @@ mod tests {
                     topology: None,
                     fabric: None,
                     busy_until: &busy_until,
+                    preemption_handoffs: &HashMap::new(),
                 };
 
                 let (freed, freed_for) =

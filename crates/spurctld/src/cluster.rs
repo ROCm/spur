@@ -1079,7 +1079,7 @@ impl ClusterManager {
     /// the node for no one's benefit.
     ///
     /// The bounded post-drain budget only starts once the preemptor has its full
-    /// allocation: while any cancel-mode victim it preempted is still draining,
+    /// allocation: while any victim is in grace or draining after cancel preemption,
     /// the earmark is refreshed rather than aged. A multi-node preemptor whose
     /// victims' nodes free at different times would otherwise spend the whole
     /// budget on an early-freeing node while still waiting — unplaceable — for a
@@ -1163,8 +1163,8 @@ impl ClusterManager {
         for (node, (owner, _)) in earmarks.iter() {
             by_owner.entry(*owner).or_default().insert(node);
         }
-        for victim in jobs.values().filter(|j| j.is_draining_cancel_victim()) {
-            if let Some(owner) = victim.preempted_by {
+        for victim in jobs.values() {
+            if let Some(owner) = crate::scheduler_loop::preemptor_awaiting_release(victim) {
                 by_owner
                     .entry(owner)
                     .or_default()
@@ -8234,7 +8234,11 @@ impl ClusterManager {
                     *job_id,
                 );
                 if let Some(preemptor) = preempted_by.filter(|_| *handoff) {
-                    self.record_preempt_freed_nodes(&jobs, &freed_nodes, preemptor);
+                    let newly_freed: Vec<String> = freed_nodes
+                        .into_iter()
+                        .filter(|node| !already_deallocated.contains(node))
+                        .collect();
+                    self.record_preempt_freed_nodes(&jobs, &newly_freed, preemptor);
                 }
                 drop(jobs);
                 drop(nodes);
@@ -19984,6 +19988,7 @@ state = "UP"
 
     fn preempt_requeue_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptRequeue {
+            handoff: false,
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
             preempted_by: Some(42),
@@ -23031,6 +23036,7 @@ state = "UP"
         let err = cm
             .preempt_job_with_provenance(
                 victim_id,
+                cm.get_job(victim_id).unwrap().run_attempt,
                 PreemptMode::Requeue,
                 Some(hunter_id),
                 Some("high".into()),
@@ -23123,6 +23129,7 @@ state = "UP"
         let victim = run_job_on(cm, "victim", "n1");
         let owner = submit_and_wait(cm, basic_spec("owner"));
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
             begin_time: Utc::now() + chrono::Duration::hours(1),
             preempted_by: Some(owner),
@@ -23176,6 +23183,7 @@ state = "UP"
         let victim = run_job_on(&cm, "victim", "n1");
         let owner = run_job_on(&cm, "owner", "n2");
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
             begin_time: Utc::now() + chrono::Duration::hours(1),
             preempted_by: Some(owner),
@@ -23238,8 +23246,14 @@ state = "UP"
         owner.qos = Some("high".into());
         owner.exclusive = true;
         let owner = submit_and_wait(&cm, owner);
-        cm.preempt_job_with_provenance(wide_victim, PreemptMode::Cancel, Some(owner), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            wide_victim,
+            cm.get_job(wide_victim).unwrap().run_attempt,
+            PreemptMode::Cancel,
+            Some(owner),
+            None,
+        )
+        .unwrap();
         settle(&cm, wide_victim, JobState::Completing);
         report_nodes_released(&cm, wide_victim);
         settle(&cm, wide_victim, JobState::Cancelled);
@@ -23632,6 +23646,12 @@ state = "UP"
             hunter_pos < bystander_pos,
             "while the victim is in its grace, the preemptor must stay hoisted"
         );
+        assert_eq!(
+            cm.preemption_handoffs(&pending, &cm.get_nodes(), &cm.get_reservations())
+                .get("n1"),
+            Some(&hunter_id),
+            "a victim in grace must protect its preemptor's handoff"
+        );
     }
 
     /// An earmark is held at full budget while any victim of its owner is still
@@ -23646,7 +23666,7 @@ state = "UP"
         insert_preempting_qos_pair(&cm, "low", "high");
 
         let (_victim_id, hunter_id) = preempt_into_grace(&cm, "n1", "low", "high");
-        cm.record_preempt_freed_nodes(&["n2".to_string()], hunter_id);
+        cm.record_preempt_freed_nodes(&cm.jobs.read(), &["n2".to_string()], hunter_id);
 
         for _ in 0..=ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
             cm.tick_preempt_freed_earmarks();
@@ -31748,6 +31768,12 @@ state = "UP"
 
     /// Warn a RUNNING job that it is being preempted by job 99, ending as `mode`.
     fn signal_grace(cm: &ClusterManager, id: JobId, mode: PreemptMode) {
+        if cm.get_job(99).is_none() {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id: 99,
+                spec: Box::new(basic_spec("preemptor")),
+            });
+        }
         let mut pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
         pending.mode = mode;
         let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
@@ -32355,6 +32381,7 @@ state = "UP"
         let id = run_job_in_grace(&cm, "victim", "n1");
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            handoff: false,
             job_id: id,
             begin_time: Utc::now(),
             preempted_by: Some(99),
@@ -32841,9 +32868,13 @@ state = "UP"
         let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
         report_node(&cm, id, "n1", grace_exit_at());
         take_over_node(&cm, "n1");
+        cm.restore_from_snapshot(&cm.snapshot_state().unwrap())
+            .unwrap();
+        assert!(cm.preempt_freed_nodes_raw().is_empty());
         let begin_time = grace_exit_at() + chrono::Duration::seconds(40);
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            handoff: true,
             job_id: id,
             begin_time,
             preempted_by: Some(99),
@@ -32861,6 +32892,12 @@ state = "UP"
         assert!(job.preempt_pending.is_none());
         assert_eq!(cpus_in_use(&cm, "n1"), 1, "n1 is not subtracted again");
         assert_eq!(cpus_in_use(&cm, "n2"), 0);
+        assert_eq!(
+            earmark_owner(&cm, "n1"),
+            None,
+            "n1 was released before the snapshot"
+        );
+        assert_eq!(earmark_owner(&cm, "n2"), Some(99));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
