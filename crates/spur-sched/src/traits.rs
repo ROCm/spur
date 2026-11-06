@@ -31,8 +31,8 @@ pub struct ClusterState<'a> {
     /// Node name -> real time its last currently-running job is expected to
     /// end. Absent entries fall back to a conservative placeholder.
     pub busy_until: &'a HashMap<String, DateTime<Utc>>,
-    /// Node name -> pending preemptor its victims' released capacity is held for.
-    pub preemption_handoffs: &'a HashMap<String, JobId>,
+    /// Node name -> pending preemptors whose victims freed or are freeing it.
+    pub preemption_handoffs: &'a HashMap<String, Vec<JobId>>,
 }
 
 impl ClusterState<'_> {
@@ -40,7 +40,7 @@ impl ClusterState<'_> {
     pub fn handoff_allows(&self, job: &Job, node: &str) -> bool {
         self.preemption_handoffs
             .get(node)
-            .is_none_or(|owner| *owner == job.job_id)
+            .is_none_or(|owners| owners.contains(&job.job_id))
     }
 
     /// An additive `--nodelist` needs every listed node, so one handed-off node blocks the job.

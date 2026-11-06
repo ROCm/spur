@@ -257,3 +257,43 @@ def test_wide_preemptor_uses_the_node_an_owner_left_unused(wide_handoff_cluster)
     assert len(evicted) == 1, f"wide job evicted {evicted} of {low}"
     show = _state(c, wide, "RUNNING")
     assert "NumNodes=2" in show, show
+
+
+def test_preemptor_counts_the_node_a_completing_job_already_released(handoff_cluster):
+    c = handoff_cluster
+    n1, n2, n3 = c.node_names
+    done = _submit(c, "done", "plain", f"{n1},{n3}", 2)
+    low = _submit(c, "low", "victim-b", n2)
+    for jid in (done, low):
+        wait_job_state(c, jid, "R", timeout=60)
+    _gate(c, done, [2], True)
+    c.cli(["scancel", str(done)])
+    _wait_epilog(c, done, [2])
+    deadline = time.monotonic() + 60
+    while not re.search(r"\bCPUAlloc=0\b", c.scontrol("show", "node", n1)):
+        assert time.monotonic() < deadline, "the completing job never released its first node"
+        time.sleep(0.2)
+    hunter = _submit(c, "hunter", "hunter-b", count=2)
+    wait_job_state(c, hunter, "R", timeout=60)
+    _state(c, done, "COMPLETING")
+    assert _preempted_by(c, low) == hunter
+
+
+def test_preemptor_does_not_evict_for_a_node_assigned_in_the_same_pass(handoff_cluster):
+    c = handoff_cluster
+    n1, n2, n3 = c.node_names
+    low = _submit(c, "low", "victim-b", n2)
+    other = _submit(c, "other", "plain", n3)
+    for jid in (low, other):
+        wait_job_state(c, jid, "R", timeout=60)
+    # A shared begin time makes both eligible in one pass; the hunter sorts first by priority.
+    begin = f"--begin={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 8))}"
+    hunter = _submit(c, "hunter", "hunter-b", f"{n1},{n2}", 2, extra=[begin])
+    short = _submit(c, "short", "plain", n1, limit="1:00", sleep=20, extra=[begin])
+    wait_job_state(c, short, "R", timeout=60)
+    _assert_pending_for_passes(c, [hunter])
+    assert _preempted_by(c, low) is None
+    _state(c, low, "RUNNING")
+    wait_job(c, short, timeout=60)
+    wait_job_state(c, hunter, "R", timeout=60)
+    assert _preempted_by(c, low) == hunter
