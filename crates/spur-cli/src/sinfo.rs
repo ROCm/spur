@@ -418,10 +418,13 @@ fn resolve_node_field(
 }
 
 /// Fields resolvable from a group of nodes alone (no partition context):
-/// the group's shared display state and its nodelist rendering. Returns `None`
-/// for specs that need more than the node group.
+/// the group's shared display state, its nodelist rendering, and its per-node
+/// CPU and memory sizes. Returns `None` for specs that need more than the node
+/// group.
 fn resolve_node_group_field(nodes: &[&spur_proto::proto::NodeInfo], spec: char) -> Option<String> {
     match spec {
+        'c' => Some(per_node_size(nodes, |r| u64::from(r.cpus))),
+        'm' => Some(per_node_size(nodes, |r| r.memory_mb)),
         't' | 'T' => Some(if nodes.is_empty() {
             "n/a".into()
         } else {
@@ -451,6 +454,26 @@ fn resolve_node_group_field(nodes: &[&spur_proto::proto::NodeInfo], spec: char) 
     }
 }
 
+/// A per-node size as Slurm's sinfo prints it for a row of nodes: the size, or
+/// the smallest one with a `+` suffix when the row mixes sizes.
+fn per_node_size(
+    nodes: &[&spur_proto::proto::NodeInfo],
+    size: impl Fn(&spur_proto::proto::ResourceSet) -> u64,
+) -> String {
+    let mut sizes = nodes
+        .iter()
+        .map(|n| n.total_resources.as_ref().map_or(0, &size));
+    let Some(first) = sizes.next() else {
+        return "0".into();
+    };
+    let (min, max) = sizes.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s)));
+    if min == max {
+        min.to_string()
+    } else {
+        format!("{min}+")
+    }
+}
+
 fn resolve_partition_field(
     part: &spur_proto::proto::PartitionInfo,
     nodes: &[&spur_proto::proto::NodeInfo],
@@ -476,7 +499,6 @@ fn resolve_partition_field(
             }
         }
         'D' => nodes.len().to_string(),
-        'c' => part.total_cpus.to_string(),
         _ => "?".into(),
     }
 }
@@ -1047,6 +1069,48 @@ mod tests {
 
         let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
         assert_eq!(lines, ["empty|0|n/a|"]);
+    }
+
+    fn sized_node(name: &str, cpus: u32, memory_mb: u64) -> NodeInfo {
+        NodeInfo {
+            total_resources: Some(ResourceSet {
+                cpus,
+                memory_mb,
+                ..Default::default()
+            }),
+            ..make_node(name, NodeState::NodeIdle, "batch")
+        }
+    }
+
+    #[test]
+    fn test_partition_view_reports_per_node_cpus_and_memory() {
+        let fields = format_engine::parse_format("%P|%D|%c|%m", &format_engine::sinfo_header);
+        let mut batch = make_partition("batch", true);
+        batch.total_cpus = 128;
+        let nodes = [sized_node("n1", 64, 256_000), sized_node("n2", 64, 256_000)];
+
+        let lines = render_sinfo_output(&fields, &[batch], &nodes, false);
+        assert_eq!(lines, ["batch*|2|64|256000"]);
+    }
+
+    #[test]
+    fn test_partition_view_marks_mixed_node_sizes_with_plus() {
+        let fields = format_engine::parse_format("%P|%D|%c|%m", &format_engine::sinfo_header);
+        let partitions = [make_partition("batch", true)];
+        let nodes = [
+            sized_node("n1", 128, 512_000),
+            sized_node("n2", 64, 256_000),
+        ];
+
+        let lines = render_sinfo_output(&fields, &partitions, &nodes, false);
+        assert_eq!(lines, ["batch*|2|64+|256000+"]);
+    }
+
+    #[test]
+    fn test_empty_partition_reports_zero_per_node_sizes() {
+        let fields = format_engine::parse_format("%P|%c|%m", &format_engine::sinfo_header);
+        let lines = render_sinfo_output(&fields, &[make_partition("empty", false)], &[], false);
+        assert_eq!(lines, ["empty|0|0"]);
     }
 
     #[test]
