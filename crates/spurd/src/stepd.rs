@@ -100,6 +100,8 @@ pub struct StepdLaunchSpec {
     pub cred_digest: String,
     #[serde(default)]
     pub pty_step_id: Option<spur_core::step::StepId>,
+    #[serde(default)]
+    pub task_launch: Option<crate::task_launcher::TaskPlan>,
 }
 
 /// Everything the supervisor needs to host its own PMIx server. The agent builds
@@ -240,6 +242,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             cred_kid: String::new(),
             cred_digest: String::new(),
             pty_step_id: None,
+            task_launch: config.task_launch.clone(),
         })
     }
 }
@@ -282,7 +285,22 @@ impl StepdLaunchSpec {
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
             allocation_holder: self.allocation_holder,
+            task_launch: self.task_launch,
         }
+    }
+}
+
+/// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
+/// fallback resolves via `execv` (CWD-relative only, no $PATH search). Inside
+/// `spurstepd` itself this resolves to its own binary, which is also the task
+/// launcher.
+pub(crate) fn resolve_stepd_executable() -> PathBuf {
+    let co_located = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("spurstepd")));
+    match co_located {
+        Some(path) if path.exists() => path,
+        _ => PathBuf::from("spurstepd"),
     }
 }
 
@@ -2054,13 +2072,20 @@ fn start_supervised_pmix(spec: &mut StepdLaunchSpec) -> anyhow::Result<Option<Su
         );
     }
     let ranks = pmix.plan.local_procs.len() as u32;
+    // The task launcher takes each rank's environment in its plan; only the
+    // shell wrapper needs a script and wrapper path from the agent.
+    let wraps = spec.task_launch.is_none();
     // Checked before the server starts so a missing input cannot leave one running.
-    if ranks > 1 && pmix.user_script_path.is_empty() {
+    if wraps && ranks > 1 && pmix.user_script_path.is_empty() {
         anyhow::bail!("a multi-rank PMIx launch needs the user script path from the agent");
     }
     // A step's script runs a wrapper file by path. Without that path this would
     // fall through to replacing the script, running one rank instead of all.
-    if ranks > 1 && spur_core::step::is_user_step(spec.step_id) && pmix.wrapper_path.is_empty() {
+    if wraps
+        && ranks > 1
+        && spur_core::step::is_user_step(spec.step_id)
+        && pmix.wrapper_path.is_empty()
+    {
         anyhow::bail!("a multi-rank PMIx step needs the wrapper path from the agent");
     }
     let host = Arc::new(crate::mpi_plugin::MpiPluginHost::new(pmix.config.clone()));
@@ -2102,6 +2127,10 @@ fn apply_multi_rank_pmix(
         ranks,
     )
     .map_err(|error| anyhow::anyhow!("failed to build the PMIx rank environment: {error}"))?;
+    if let Some(plan) = spec.task_launch.as_mut() {
+        plan.rank_env = per_rank_env;
+        return Ok(());
+    }
     let wrapper = spur_core::task_launch::build_multi_task_pmix_wrapper(
         &pmix.user_script_path,
         ranks,
@@ -3552,6 +3581,14 @@ mod launch_spec_compat {
         assert!(spec.array_task_id.is_none());
     }
 
+    #[test]
+    fn an_older_launch_spec_starts_no_task_launcher_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(spec.task_launch.is_none());
+    }
+
     /// Captured from the build that first shipped `pmix` in launch.json, before
     /// `wrapper_path` existed. A supervisor started by an older agent mid-upgrade
     /// reads exactly this, so it has to keep decoding.
@@ -3978,10 +4015,32 @@ mod tests {
         session_dir
     }
 
+    #[test]
+    fn a_task_plan_survives_the_hand_off_to_the_supervisor() {
+        let plan = crate::task_launcher::TaskPlan {
+            tasks_on_node: 4,
+            task_offset: 8,
+            user_script: "/tmp/cmd_0_1.sh".into(),
+            label: true,
+            cpu_bind: spur_core::step::CpuBind::Rank,
+            mpi: true,
+            rank_env: vec![HashMap::from([("PMIX_RANK".to_string(), "8".to_string())])],
+        };
+        let mut config = launch_spec().into_launch_config();
+        config.task_launch = Some(plan.clone());
+
+        let spec = StepdLaunchSpec::try_from(&config).expect("launch spec");
+        let decoded: StepdLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode")).expect("decode");
+
+        assert_eq!(decoded.into_launch_config().task_launch, Some(plan));
+    }
+
     fn launch_spec() -> StepdLaunchSpec {
         StepdLaunchSpec {
             joins_parent_namespaces: false,
             allocation_holder: false,
+            task_launch: None,
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
@@ -4162,6 +4221,35 @@ mod tests {
         assert!(
             error.to_string().contains("wrapper path"),
             "a missing input must be caught before the server starts: {error}"
+        );
+    }
+
+    // The task launcher receives each rank's environment in its plan, so the
+    // agent writes no wrapper and stages no separate script for the supervisor.
+    #[test]
+    fn a_launcher_pmix_step_needs_neither_a_wrapper_path_nor_a_script_path() {
+        let mut spec = launch_spec();
+        spec.job_id = 42;
+        spec.step_id = 3;
+        let mut pmix = pmix_spec(3, 2, "/nonexistent/spur/plugin.so");
+        pmix.wrapper_path.clear();
+        pmix.user_script_path.clear();
+        spec.pmix = Some(pmix);
+        spec.task_launch = Some(crate::task_launcher::TaskPlan {
+            tasks_on_node: 2,
+            mpi: true,
+            ..Default::default()
+        });
+
+        let error = start_supervised_pmix(&mut spec)
+            .err()
+            .expect("no plugin exists at that path");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to start the PMIx server"),
+            "the launcher's inputs must not be demanded: {error}"
         );
     }
 
