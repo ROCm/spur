@@ -5560,16 +5560,6 @@ fn min_memory_requested_mb(spec: &spur_core::job::JobSpec) -> u64 {
         .unwrap_or(0)
 }
 
-/// Total per-node memory the job implies, for the TRES roll-up.
-fn min_memory_per_node_mb(spec: &spur_core::job::JobSpec) -> u64 {
-    if let Some(mb) = spec.memory_per_node_mb {
-        return mb;
-    }
-    spec.memory_per_cpu_mb
-        .map(|per_cpu| per_cpu.saturating_mul(min_cpus_per_node(spec)))
-        .unwrap_or(0)
-}
-
 /// Slurm-style requested TRES summary. `billing` is omitted: Spur has no TRES
 /// billing weights, and emitting a made-up value would misreport usage.
 fn requested_tres(spec: &spur_core::job::JobSpec) -> String {
@@ -5580,10 +5570,12 @@ fn requested_tres(spec: &spur_core::job::JobSpec) -> String {
         u64::from(spec.num_tasks.max(1)).saturating_mul(u64::from(spec.cpus_per_task.max(1)));
     let mut parts = vec![format!("cpu={cpu_total}"), format!("node={nodes}")];
 
-    // Per-GPU memory differs per node, so only its job total is meaningful.
-    let mem_mb = match min_memory_per_node_mb(spec) {
-        0 => spur_core::job::effective_memory_mb(spec, nodes as u32),
-        per_node => per_node.saturating_mul(nodes),
+    // Memory totals the real ask too: per-CPU memory over the CPU total, and
+    // per-GPU memory (which differs per node) over the GPU total.
+    let mem_mb = match (spec.memory_per_node_mb, spec.memory_per_cpu_mb) {
+        (Some(per_node), _) => per_node.saturating_mul(nodes),
+        (None, Some(per_cpu)) => per_cpu.saturating_mul(cpu_total),
+        (None, None) => spur_core::job::effective_memory_mb(spec, nodes as u32),
     };
     if mem_mb > 0 {
         parts.insert(1, format!("mem={mem_mb}M"));
@@ -14195,7 +14187,6 @@ mod tests {
         };
         assert_eq!(requested_tres(&spec), "cpu=16,mem=32000M,node=2,gres/gpu=8");
         assert_eq!(min_cpus_per_node(&spec), 8);
-        assert_eq!(min_memory_per_node_mb(&spec), 16000);
     }
 
     #[test]
@@ -14215,6 +14206,22 @@ mod tests {
     }
 
     #[test]
+    fn requested_tres_memory_per_cpu_totals_the_real_cpu_ask() {
+        use spur_core::job::JobSpec;
+
+        // -N2 -n3 --mem-per-cpu=4096: the busier node needs 8192, but the job
+        // asks for 3 CPUs x 4096, not 8192 on both nodes.
+        let spec = JobSpec {
+            num_nodes: 2,
+            num_tasks: 3,
+            cpus_per_task: 1,
+            memory_per_cpu_mb: Some(4096),
+            ..Default::default()
+        };
+        assert_eq!(requested_tres(&spec), "cpu=3,mem=12288M,node=2");
+    }
+
+    #[test]
     fn requested_tres_saturates_instead_of_overflowing() {
         use spur_core::job::JobSpec;
 
@@ -14230,7 +14237,6 @@ mod tests {
             requested_tres(&spec),
             format!("cpu=18446744065119617025,mem={}M,node=1", u64::MAX)
         );
-        assert_eq!(min_memory_per_node_mb(&spec), u64::MAX);
     }
 
     #[test]
@@ -14244,7 +14250,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(requested_tres(&spec), "cpu=1,node=1");
-        assert_eq!(min_memory_per_node_mb(&spec), 0);
     }
 
     #[test]
@@ -14308,7 +14313,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(min_cpus_per_node(&spec), 8);
-        assert_eq!(min_memory_per_node_mb(&spec), 8000);
     }
 
     #[test]
