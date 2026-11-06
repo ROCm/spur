@@ -33,6 +33,25 @@ capped at 256 bytes, so a longer command line is truncated on a character
 boundary and ends in ``...`` where ``scontrol show step`` prints it. The step
 still runs the full command — only the displayed name is shortened.
 
+Step exit status
+~~~~~~~~~~~~~~~~
+
+``srun`` exits non-zero when any of the step's tasks fails, as in Slurm:
+
+- If a task is killed by a signal, ``srun`` exits with 128 plus the highest
+  such signal number, even when other tasks exited with an error code.
+- Otherwise it exits with the highest exit code among the tasks.
+
+This applies to every task on every node, including with ``--label``. A
+signal sent to the step, for example with ``scancel --signal=INT``, reaches
+every task.
+
+.. note::
+
+   Steps that run with ``--container-image`` or inside a containerized job do
+   not follow these rules yet. When such a step runs several tasks on one node,
+   or runs with ``--label``, it can report success even though a task failed.
+
 Common options:
 
 .. list-table::

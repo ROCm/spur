@@ -383,7 +383,7 @@ pub fn unsupported_cpu_bind(source: &HashMap<String, String>) -> Option<String> 
     }
 }
 
-fn parse_cpu_bind(source: &HashMap<String, String>) -> CpuBind {
+pub fn parse_cpu_bind(source: &HashMap<String, String>) -> CpuBind {
     source
         .get("SPUR_CPU_BIND")
         .or_else(|| source.get("SLURM_CPU_BIND"))
@@ -635,6 +635,84 @@ fn bash_export_block(env: &HashMap<String, String>, indent: &str) -> String {
     keys.into_iter()
         .map(|key| format!("{indent}export {key}={}\n", bash_single_quote(&env[key])))
         .collect()
+}
+
+/// The `bash -c` program one PMIx rank runs before exec'ing its script, which
+/// bash receives as `$0`: the MPI preamble, then the rank's own environment,
+/// then `after`. That is the order the per-rank wrapper applied them, so a
+/// site's `env.sh` cannot override either.
+pub fn mpi_rank_program(rank_env: &HashMap<String, String>, after: &[(String, String)]) -> String {
+    let mut program = mpi_direct_task_preamble("");
+    program.push_str(&bash_export_block(rank_env, ""));
+    for (key, value) in after {
+        program.push_str(&format!("export {key}={}\n", bash_single_quote(value)));
+    }
+    program.push_str("exec bash \"$0\"\n");
+    program
+}
+
+#[cfg(test)]
+mod mpi_rank_program_tests {
+    use super::*;
+
+    fn run(program: &str, home: &std::path::Path, script: &str) -> String {
+        let script_path = home.join("task.sh");
+        std::fs::write(&script_path, script).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(program)
+            .arg(&script_path)
+            .env("HOME", home)
+            .env("PMIX_SERVER_URI", "tcp://server")
+            .env("PMI_RANK", "stale")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn a_rank_gets_the_mpi_preamble_and_runs_its_script() {
+        let home = tempfile::tempdir().unwrap();
+        let program = mpi_rank_program(&HashMap::new(), &[]);
+        let out = run(
+            &program,
+            home.path(),
+            "echo \"${PMI_RANK:-unset} $OMPI_MCA_ess $PMIX_SERVER_URI4 $SLURM_STEP_ID\"\n",
+        );
+        assert_eq!(out, "unset ^singleton,^slurm,^srun tcp://server 0\n");
+    }
+
+    #[test]
+    fn the_rank_environment_and_later_exports_override_env_sh() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("spur/mpi")).unwrap();
+        std::fs::write(
+            home.path().join("spur/mpi/env.sh"),
+            "export FROM_ENV_SH=yes\nexport PMIX_RANK=from-env-sh\nexport ROCR_VISIBLE_DEVICES=all\n",
+        )
+        .unwrap();
+        let rank_env = HashMap::from([("PMIX_RANK".to_string(), "3".to_string())]);
+        let after = [("ROCR_VISIBLE_DEVICES".to_string(), "2,3".to_string())];
+        let program = mpi_rank_program(&rank_env, &after);
+        let out = run(
+            &program,
+            home.path(),
+            "echo \"$FROM_ENV_SH $PMIX_RANK $ROCR_VISIBLE_DEVICES\"\n",
+        );
+        assert_eq!(out, "yes 3 2,3\n");
+    }
+
+    #[test]
+    fn values_are_quoted_for_the_shell() {
+        let home = tempfile::tempdir().unwrap();
+        let rank_env = HashMap::from([("ODD".to_string(), "it's $(not run)".to_string())]);
+        let program = mpi_rank_program(&rank_env, &[]);
+        assert_eq!(
+            run(&program, home.path(), "echo \"$ODD\"\n"),
+            "it's $(not run)\n"
+        );
+    }
 }
 
 /// Bash that narrows one task's GPU visibility to its slice of `SPUR_JOB_GPUS`.
