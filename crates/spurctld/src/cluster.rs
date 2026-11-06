@@ -27,7 +27,9 @@ use spur_core::job::{
     PendingReason, PreemptPending, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
-use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
+use spur_core::partition::{
+    partition_totals, requested_partition_names, Partition, PartitionTotals, PreemptMode,
+};
 use spur_core::qos::{
     check_qos_limits_with_grp_node_charge, check_qos_standalone_limits, check_qos_submit_limits,
     QosCheckResult,
@@ -4442,6 +4444,11 @@ impl ClusterManager {
     /// Get all partitions.
     pub fn get_partitions(&self) -> Vec<Partition> {
         self.partitions.read().clone()
+    }
+
+    /// Node and CPU totals per partition, keyed by partition name.
+    pub fn partition_totals(&self) -> HashMap<String, PartitionTotals> {
+        partition_totals(self.nodes.read().values())
     }
 
     /// Hold a job (prevent scheduling).
@@ -9056,22 +9063,8 @@ impl ClusterManager {
                     .transition(&NodeEvent::Register, false)
                     .unwrap_or(NodeState::Idle);
 
-                // Assign partitions: match by hostlist OR label selector (union)
                 drop(nodes);
-                let partitions = self.partitions.read();
-                for part in partitions.iter() {
-                    if partition_matches_node(part, name, labels) {
-                        node.partitions.push(part.name.clone());
-                    }
-                }
-                if node.partitions.is_empty() {
-                    if let Some(dp) = partitions.iter().find(|p| p.is_default) {
-                        node.partitions.push(dp.name.clone());
-                    } else if let Some(first) = partitions.first() {
-                        node.partitions.push(first.name.clone());
-                    }
-                }
-                drop(partitions);
+                node.partitions = resolve_node_partitions(&self.partitions.read(), name, labels);
 
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
@@ -9173,21 +9166,8 @@ impl ClusterManager {
                         node.labels.remove(k);
                     }
                     // Re-evaluate partition membership after label change
-                    let partitions = self.partitions.read();
-                    let mut matched = Vec::new();
-                    for part in partitions.iter() {
-                        if partition_matches_node(part, &node.name, &node.labels) {
-                            matched.push(part.name.clone());
-                        }
-                    }
-                    if matched.is_empty() {
-                        if let Some(dp) = partitions.iter().find(|p| p.is_default) {
-                            matched.push(dp.name.clone());
-                        } else if let Some(first) = partitions.first() {
-                            matched.push(first.name.clone());
-                        }
-                    }
-                    node.partitions = matched;
+                    node.partitions =
+                        resolve_node_partitions(&self.partitions.read(), &node.name, &node.labels);
 
                     self.apply_node_config_policy(node);
                 }
@@ -9709,20 +9689,7 @@ impl ClusterManager {
     fn reconcile_partitions(&self, nodes: &mut HashMap<String, Node>) {
         let partitions = self.partitions.read();
         for node in nodes.values_mut() {
-            let mut matched = Vec::new();
-            for part in partitions.iter() {
-                if partition_matches_node(part, &node.name, &node.labels) {
-                    matched.push(part.name.clone());
-                }
-            }
-            if matched.is_empty() {
-                if let Some(dp) = partitions.iter().find(|p| p.is_default) {
-                    matched.push(dp.name.clone());
-                } else if let Some(first) = partitions.first() {
-                    matched.push(first.name.clone());
-                }
-            }
-            node.partitions = matched;
+            node.partitions = resolve_node_partitions(&partitions, &node.name, &node.labels);
 
             self.apply_node_config_policy(node);
         }
@@ -10993,6 +10960,29 @@ pub(crate) fn partition_matches_node(
     };
 
     matches_selector || matches_hostlist
+}
+
+/// Names of the partitions a node joins: every partition it matches, or the
+/// default partition (else the first one) when it matches none.
+pub(crate) fn resolve_node_partitions(
+    partitions: &[spur_core::partition::Partition],
+    node_name: &str,
+    labels: &HashMap<String, String>,
+) -> Vec<String> {
+    let matched: Vec<String> = partitions
+        .iter()
+        .filter(|p| partition_matches_node(p, node_name, labels))
+        .map(|p| p.name.clone())
+        .collect();
+    if !matched.is_empty() {
+        return matched;
+    }
+    partitions
+        .iter()
+        .find(|p| p.is_default)
+        .or_else(|| partitions.first())
+        .map(|p| vec![p.name.clone()])
+        .unwrap_or_default()
 }
 
 /// Returns true if a NodeConfig entry applies to a node (by hostname pattern OR
@@ -36744,6 +36734,57 @@ state = "UP"
             "other-host",
             &HashMap::new()
         ));
+    }
+
+    #[test]
+    fn resolve_node_partitions_returns_every_match_in_config_order() {
+        let partitions = vec![
+            Partition {
+                name: "batch".into(),
+                nodes: "node[1-4]".into(),
+                ..Default::default()
+            },
+            Partition {
+                name: "other".into(),
+                nodes: "node9".into(),
+                ..Default::default()
+            },
+            Partition {
+                name: "train".into(),
+                selector: HashMap::from([("pool".into(), "train".into())]),
+                ..Default::default()
+            },
+        ];
+        let labels = HashMap::from([("pool".into(), "train".into())]);
+        assert_eq!(
+            super::resolve_node_partitions(&partitions, "node2", &labels),
+            vec!["batch".to_string(), "train".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_node_partitions_falls_back_to_default_then_first() {
+        let first = Partition {
+            name: "first".into(),
+            nodes: "node1".into(),
+            ..Default::default()
+        };
+        let default = Partition {
+            name: "dflt".into(),
+            nodes: "node2".into(),
+            is_default: true,
+            ..Default::default()
+        };
+        let no_labels = HashMap::new();
+        assert_eq!(
+            super::resolve_node_partitions(&[first.clone(), default], "stray", &no_labels),
+            vec!["dflt".to_string()]
+        );
+        assert_eq!(
+            super::resolve_node_partitions(&[first], "stray", &no_labels),
+            vec!["first".to_string()]
+        );
+        assert!(super::resolve_node_partitions(&[], "stray", &no_labels).is_empty());
     }
 
     fn spec_node_config(count: u32) -> spur_core::config::NodeConfig {
