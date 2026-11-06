@@ -27,7 +27,9 @@ use spur_core::job::{
     PendingReason, PreemptPending, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
-use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
+use spur_core::partition::{
+    partition_totals, requested_partition_names, Partition, PartitionTotals, PreemptMode,
+};
 use spur_core::qos::{
     check_qos_limits_with_grp_node_charge, check_qos_standalone_limits, check_qos_submit_limits,
     QosCheckResult,
@@ -4423,6 +4425,11 @@ impl ClusterManager {
     /// Get all partitions.
     pub fn get_partitions(&self) -> Vec<Partition> {
         self.partitions.read().clone()
+    }
+
+    /// Node and CPU totals per partition, keyed by partition name.
+    pub fn partition_totals(&self) -> HashMap<String, PartitionTotals> {
+        partition_totals(self.nodes.read().values())
     }
 
     /// Hold a job (prevent scheduling).

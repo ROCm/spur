@@ -2426,7 +2426,11 @@ impl SlurmController for ControllerService {
         }
 
         let partitions = self.cluster.get_partitions();
-        let proto: Vec<PartitionInfo> = partitions.iter().map(partition_to_proto).collect();
+        let totals = self.cluster.partition_totals();
+        let proto: Vec<PartitionInfo> = partitions
+            .iter()
+            .map(|p| partition_to_proto(p, totals.get(&p.name).copied().unwrap_or_default()))
+            .collect();
         Ok(Response::new(GetPartitionsResponse { partitions: proto }))
     }
 
@@ -5742,13 +5746,16 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     }
 }
 
-fn partition_to_proto(part: &spur_core::partition::Partition) -> PartitionInfo {
+fn partition_to_proto(
+    part: &spur_core::partition::Partition,
+    totals: spur_core::partition::PartitionTotals,
+) -> PartitionInfo {
     PartitionInfo {
         name: part.name.clone(),
         state: part.state.display().to_string(),
         is_default: part.is_default,
-        total_nodes: 0,
-        total_cpus: 0,
+        total_nodes: totals.nodes,
+        total_cpus: totals.cpus,
         nodes: part.nodes.clone(),
         max_time: part.max_time_minutes.map(|m| prost_types::Duration {
             seconds: m as i64 * 60,
@@ -14047,6 +14054,36 @@ mod tests {
         let info = node_to_proto(&node);
         assert_eq!(info.cpu_tot, 8);
         assert_eq!(info.spec_cpus, "6-7");
+    }
+
+    // A partition whose hostlist matches no registered node reports zero
+    // rather than borrowing totals from the partition its nodes did join.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_partitions_reports_member_node_and_cpu_totals() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\n\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n\
+             [[partitions]]\nname = \"spare\"\nnodes = \"ghost[1-2]\"\n",
+        )
+        .unwrap();
+        let svc = test_service_with(&dir, config).await;
+        register_plain_node(&svc, "node-a", 6820).await;
+        register_plain_node(&svc, "node-b", 6821).await;
+
+        let partitions = svc
+            .get_partitions(Request::new(GetPartitionsRequest::default()))
+            .await
+            .unwrap()
+            .into_inner()
+            .partitions;
+        let totals = |name: &str| {
+            let part = partitions.iter().find(|p| p.name == name).unwrap();
+            (part.total_nodes, part.total_cpus)
+        };
+        assert_eq!(totals("default"), (2, 8));
+        assert_eq!(totals("spare"), (0, 0));
     }
 
     #[test]

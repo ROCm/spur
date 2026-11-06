@@ -329,7 +329,11 @@ pub async fn get_partitions(
     State(state): State<Arc<RestState>>,
 ) -> Result<Json<ApiResponse<PartitionsData>>, RestError> {
     let partitions = state.cluster.get_partitions();
-    let json_parts: Vec<serde_json::Value> = partitions.iter().map(partition_to_json).collect();
+    let totals = state.cluster.partition_totals();
+    let json_parts: Vec<serde_json::Value> = partitions
+        .iter()
+        .map(|p| partition_to_json(p, totals.get(&p.name).copied().unwrap_or_default()))
+        .collect();
 
     Ok(ApiResponse::ok(PartitionsData {
         partitions: json_parts,
@@ -574,5 +578,63 @@ mod tests {
             "an unauthenticated caller is unrestricted on the permissive path"
         );
         assert!(job_is_visible(&state, None).await);
+    }
+
+    #[tokio::test]
+    async fn rest_partitions_report_totals_of_registered_members() {
+        use crate::raft::StateMachineApply;
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\
+             [[partitions]]\nname = \"batch\"\ndefault = true\nnodes = \"n[1-2]\"\n\
+             [[partitions]]\nname = \"spare\"\nnodes = \"ghost1\"\n",
+        )
+        .unwrap();
+        let cluster = Arc::new(
+            crate::cluster::ClusterManager::new(cfg, dir.path()).expect("cluster manager"),
+        );
+        for name in ["n1", "n2"] {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                &WalOperation::NodeRegister {
+                    name: name.into(),
+                    hostname: name.into(),
+                    resources: spur_core::resource::ResourceSet {
+                        cpus: 16,
+                        ..Default::default()
+                    },
+                    address: "10.0.0.1".into(),
+                    port: 6818,
+                    wg_pubkey: String::new(),
+                    version: String::new(),
+                    labels: std::collections::HashMap::new(),
+                    source: spur_core::node::NodeSource::NativeHost,
+                    capabilities: Vec::new(),
+                },
+            );
+        }
+        let state = no_leader_rest_state(cluster, dir.path()).await;
+
+        let partitions = get_partitions(State(state))
+            .await
+            .ok()
+            .expect("get_partitions returned an error")
+            .0
+            .data
+            .partitions;
+        let totals = |name: &str| {
+            let part = partitions.iter().find(|p| p["name"] == name).unwrap();
+            (part["total_nodes"].clone(), part["total_cpus"].clone())
+        };
+        assert_eq!(
+            totals("batch"),
+            (serde_json::json!(2), serde_json::json!(32))
+        );
+        assert_eq!(
+            totals("spare"),
+            (serde_json::json!(0), serde_json::json!(0))
+        );
     }
 }
