@@ -918,3 +918,14 @@ fn property_owner_places_on_its_own_handed_off_node() {
     assert_eq!(assignments.len(), 1);
     assert_eq!(assignments[0].nodes, ["n0"]);
 }
+
+#[test]
+fn property_owner_releases_its_unused_handed_off_node() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n0".to_string(), 1), ("n1".to_string(), 1)]);
+    let jobs = [property_job_on(1, "n0"), handoff_owner(2, "n1")];
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    let ids: Vec<_> = assignments.iter().map(|a| a.job_id).collect();
+    assert_eq!(ids, [1, 2]);
+    assert_eq!(scheduler.released_handoffs(), ["n1"]);
+}
