@@ -274,7 +274,10 @@ Jobs that can never run as configured
 Some requests break a partition's limits even on an idle node. Examples: an
 ``--exclusive`` job on nodes with more CPUs than the ``cpu`` cap, a job that
 asks for more of a resource per node than the cap allows, or a job that asks for
-more memory per node than ``max_mem_per_node``.
+more memory per node than ``max_mem_per_node``. A ``--gpus`` total counts as
+spread as evenly as possible over the job's nodes: ``-N2 --gpus=4`` puts at
+least 2 GPUs on one node however it is split, so a ``gres/gpu`` cap of 1 can
+never run it.
 
 ``scheduler.enforce_part_limits`` decides what happens to these jobs at submit:
 

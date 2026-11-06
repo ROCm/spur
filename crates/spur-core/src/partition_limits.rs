@@ -171,8 +171,9 @@ pub fn node_memory_mb(spec: &JobSpec, cpus: u64, gpus: u64) -> u64 {
 }
 
 /// Largest GPU count on any one node when a GPU total is spread as evenly as
-/// possible. A total may land unevenly, but this spread always exists.
-fn even_node_gpus(spec: &JobSpec) -> u64 {
+/// possible. A total may land unevenly, but this spread always exists, and no
+/// split puts fewer on its fullest node.
+pub fn even_node_gpus(spec: &JobSpec) -> u64 {
     match resolve_gpu_demand(spec) {
         Ok(GpuDemand::PerNode { counts, .. }) => u64::from(counts.into_iter().max().unwrap_or(0)),
         Ok(GpuDemand::Total { count, .. }) => {

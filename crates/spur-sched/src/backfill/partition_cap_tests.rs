@@ -1131,6 +1131,23 @@ fn a_gpu_total_is_spread_within_the_per_node_gpu_cap() {
 }
 
 #[test]
+fn a_gpu_total_the_cap_can_never_spread_over_its_nodes_never_fits() {
+    let fx = Fixture::new(
+        vec![gpu_node("n1", &["gpu"]), gpu_node("n2", &["gpu"])],
+        vec![partition("gpu", &[("gres/gpu", 1)])],
+    );
+    let mut sched = BackfillScheduler::new(100);
+    let a = fx.schedule(&mut sched, &[total_gpu_job(1, "gpu", 2, 4, None)]);
+    assert!(a.is_empty());
+    assert_eq!(
+        outcome(&sched, 1),
+        Some(UnplacedKind::PartitionCapNeverFits),
+        "every split of 4 GPUs over 2 nodes puts at least 2 on one"
+    );
+    assert_eq!(overshoot(&sched, 1).map(|o| o.requested), Some(2));
+}
+
+#[test]
 fn a_gpu_total_is_spread_within_a_typed_caps_running_headroom() {
     let fx = Fixture::new(
         vec![gpu_node("n1", &["gpu"]), gpu_node("n2", &["gpu"])],
