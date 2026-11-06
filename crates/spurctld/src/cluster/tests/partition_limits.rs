@@ -154,6 +154,47 @@ async fn never_runnable_per_node_request_pends_under_no() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_total_the_cap_can_never_spread_pends_as_never_runnable() {
+    let dir = TempDir::new().unwrap();
+    let cm = cluster_with(
+        &dir,
+        EnforcePartLimits::No,
+        vec![partition("gpu", &[("gres/gpu", 1)])],
+    )
+    .await;
+    for name in ["n1", "n2"] {
+        register_gpu_node(
+            &cm,
+            name,
+            (0..4).map(|i| gpu_resource(i, i.into())).collect(),
+        );
+    }
+    let id = submit_and_wait(
+        &cm,
+        JobSpec {
+            num_nodes: 2,
+            num_tasks: 2,
+            gpus: Some(spur_core::gpu_request::GpuRequest {
+                count: 4,
+                gpu_type: None,
+            }),
+            ..spec_in("gpu", 1)
+        },
+    );
+
+    assert!(!schedulable(&cm, id));
+    let job = cm.get_job(id).unwrap();
+    assert_eq!(job.pending_reason, PendingReason::PartitionTresLimit);
+    assert!(
+        job.state_reason_display().ends_with(
+            "job needs 2 gres/gpu, max_tres_per_node.gres/gpu is 1 on every eligible node"
+        ),
+        "{}",
+        job.state_reason_display()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enforce_part_limits_any_and_all_weigh_every_requested_partition() {
     let parts = || vec![partition("cpu", &[("cpu", 4)]), partition("wide", &[])];
 

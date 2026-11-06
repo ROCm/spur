@@ -10,7 +10,7 @@ use spur_core::gpu_request::{distribute_total, resolve_gpu_demand, GpuDemand};
 use spur_core::job::{Job, JobId, PartitionTresOvershoot};
 use spur_core::node::Node;
 use spur_core::partition::Partition;
-use spur_core::partition_limits::{node_cpu_counts, node_memory_mb};
+use spur_core::partition_limits::{even_node_gpus, node_cpu_counts, node_memory_mb};
 use spur_core::reservation::{self, Reservation};
 use spur_core::resource::{
     build_exclusive_allocation, build_node_allocation, ResourceAllocations, ResourceSet,
@@ -1282,7 +1282,7 @@ impl BackfillScheduler {
             .filter(|ni| in_partition(&cluster.nodes[*ni], partition))
             .filter_map(|ni| {
                 let node = &cluster.nodes[ni];
-                let charge = placement_charge(job, &required, node, typed_gpu);
+                let charge = least_fullest_node_charge(job, &required, node, typed_gpu);
                 let used = self.timelines[ni].charged_at(&partition.name, now);
                 partition_cap_ok(partition, &node.name, &used, &charge).err()
             })
@@ -1353,8 +1353,9 @@ impl BackfillScheduler {
             suitable.retain(|&ni| {
                 let node = &cluster.nodes[ni];
                 let charge = placement_charge(job, &required, node, scope.typed_gpu);
+                let least = least_fullest_node_charge(job, &required, node, scope.typed_gpu);
                 let ever_fits =
-                    partition_cap_ok(scope.partition, &node.name, &TresCharge::default(), &charge)
+                    partition_cap_ok(scope.partition, &node.name, &TresCharge::default(), &least)
                         .is_ok();
                 if ever_fits {
                     cap_charges.insert(ni, charge);
@@ -1644,6 +1645,23 @@ fn planned_adjustment(
 ) -> Option<spur_core::partition_limits::MemoryAdjustment> {
     let partition = partition.and_then(|name| partitions.iter().find(|p| p.name == name));
     planned_memory_adjustment(job, partition)
+}
+
+/// The least `job` charges a partition cap on the fullest node it could be
+/// given: like [`placement_charge`], but GPUs at their most even spread, so a
+/// cap that cannot hold this can never hold the job on any split.
+pub fn least_fullest_node_charge(
+    job: &Job,
+    required: &ResourceSet,
+    node: &Node,
+    typed_gpu: Option<&str>,
+) -> TresCharge {
+    if job.spec.exclusive {
+        return placement_charge(job, required, node, typed_gpu);
+    }
+    let cpus = u64::from(required.cpus);
+    let gpus = even_node_gpus(&job.spec);
+    TresCharge::new(cpus, node_memory_mb(&job.spec, cpus, gpus), gpus, typed_gpu)
 }
 
 /// Partition an uncapped placement is attributed to: the highest-tier

@@ -10527,8 +10527,12 @@ fn partition_cap_never_fits(
     let overshoots: Vec<_> = eligible
         .iter()
         .filter_map(|node| {
-            let charge =
-                spur_sched::backfill::placement_charge(&job, &required, node, typed_gpu.as_deref());
+            let charge = spur_sched::backfill::least_fullest_node_charge(
+                &job,
+                &required,
+                node,
+                typed_gpu.as_deref(),
+            );
             partition_cap_ok(partition, &node.name, &TresCharge::default(), &charge).err()
         })
         .collect();
