@@ -5441,10 +5441,13 @@ impl ClusterManager {
                 {
                     return None;
                 }
+                // The stored flag describes the previous run; requeue leaves it set.
+                let mut job = job.clone();
+                job.idle_fill = false;
                 Some(PendingJobCandidate {
-                    job: job.clone(),
-                    scheduling_eligible: !before_begin_time,
                     tag_reason: job.pending_reason != PendingReason::DeadLine,
+                    job,
+                    scheduling_eligible: !before_begin_time,
                 })
             })
             .collect();
@@ -22873,10 +22876,11 @@ state = "UP"
             assert!(outcome.killed[0].idle_fill);
             cm.release_job(pinned_id).unwrap();
             let classification = cm.classify_pending_jobs_with(&HashSet::new());
+            assert!(cm.get_job(pinned_id).unwrap().idle_fill);
             assert!(classification
                 .jobs
                 .iter()
-                .any(|j| j.job_id == pinned_id && j.idle_fill));
+                .any(|j| j.job_id == pinned_id && !j.idle_fill));
             assert!(classification.idle_fill_candidates.is_empty());
         }
 

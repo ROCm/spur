@@ -1166,7 +1166,11 @@ impl BackfillScheduler {
                     .iter()
                     .any(|(ni, _)| cluster.nodes[*ni].name == node)
             };
-            handoffs.owner_planned(job.job_id, picked, earliest, now);
+            // A borrower that cannot start now reserves no future slot, so it must not
+            // release or hold nodes on the strength of one.
+            if earliest <= now || !job.idle_fill {
+                handoffs.owner_planned(job.job_id, picked, earliest, now);
+            }
 
             if earliest <= now {
                 let node_names: Vec<String> = assigned_nodes
@@ -1660,6 +1664,55 @@ mod tests {
         assert_eq!(placed(&assignments), vec![(2, vec!["node001".into()])]);
         assert!(plan_of(&sched, 1).is_some_and(|(_, at)| (295..=300).contains(&at)));
         assert!(plan_of(&sched, 3).is_some_and(|(_, at)| at >= 3590));
+    }
+
+    #[test]
+    fn borrowed_owner_without_a_future_slot_keeps_its_handoff() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut nodes = make_nodes(3);
+        nodes[0].alloc_resources = ResourceAllocations::with_scalar(32, 4_000);
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 4_000);
+        let handoffs = owned(&[("node001", 1), ("node002", 1)]);
+        let busy_until = HashMap::from([
+            ("node001".to_string(), now + Duration::minutes(10)),
+            ("node002".to_string(), now + Duration::minutes(5)),
+        ]);
+        let mut owner = job_for(1, 2, Duration::minutes(1));
+        owner.idle_fill = true;
+        owner.spec.exclusive = true;
+        let mut half = make_job(2, 1, 32);
+        half.spec.nodelist = Some("node001".into());
+        half.spec.time_limit = Some(Duration::hours(1));
+        let mut whole = job_for(3, 1, Duration::hours(1));
+        whole.spec.nodelist = Some("node003".into());
+        let mut sched = BackfillScheduler::new(100);
+        let first = sched.schedule_jobs(
+            &[owner.clone(), half, whole],
+            &handoff_state(&nodes, &busy_until, &handoffs),
+            now,
+            true,
+        );
+        assert!(!sched.planned_job_starts().contains_key(&owner.job_id));
+
+        let mut after_release = make_nodes(3);
+        let mut later_busy = HashMap::new();
+        for assignment in &first {
+            for node in &mut after_release {
+                if let Some(allocation) = assignment.per_node_alloc.get(&node.name) {
+                    node.alloc_resources.add(allocation);
+                    later_busy.insert(node.name.clone(), now + Duration::hours(1));
+                }
+            }
+        }
+        let second = sched.schedule_jobs(
+            &[owner],
+            &handoff_state(&after_release, &later_busy, &handoffs),
+            now + Duration::minutes(10),
+            true,
+        );
+        assert_eq!(second.iter().map(|a| a.job_id).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
