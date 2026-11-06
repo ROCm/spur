@@ -121,6 +121,7 @@ mod tests {
             labels: std::collections::HashMap::new(),
             join_token: String::new(),
             topology: None,
+            capabilities: vec![],
         }
     }
 

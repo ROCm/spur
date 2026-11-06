@@ -524,8 +524,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - ``1``
      - Restart
      - How often (seconds) the scheduler runs. The loop cadence and the
-       preemption requeue hold are fixed at startup; the launch-backoff base
-       does re-read this value live.
+       interval term of the requeue hold (``2 x interval_secs + 3``) are fixed at
+       startup; the launch-backoff base does re-read this value live.
    * - ``max_jobs_per_cycle``
      - integer
      - ``10000``
@@ -567,7 +567,50 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Maximum seconds a job may sit in COMPLETING before it is force-finished.
        Nodes that have not confirmed completion are drained before their
        resources are released. If that drain cannot be committed, the job
-       retains its allocation and the controller retries.
+       retains its allocation and the controller retries. A node reports only
+       after the job is killed and its cgroup cleanup finishes, so this should
+       exceed the larger kill wait (``kill_wait_secs`` or
+       ``timeout_kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``; the
+       controller logs a warning when it does not.
+   * - ``kill_wait_secs``
+     - integer
+     - ``5``
+     - Live
+     - Seconds between SIGTERM and SIGKILL when Spur stops a job for any reason
+       other than a time or inactivity limit: ``scancel``, ``scontrol requeue``,
+       preemption, idle-fill reclaim, reservation end, stopping the other nodes
+       of a job whose batch script has exited, and other graceful stops.
+       Ends early once the job's processes exit. Valid ``0``-``65533``; values
+       below 5 act as 5. ``complete_wait_secs`` should exceed the larger kill
+       wait (this or ``timeout_kill_wait_secs``) plus
+       ``[cgroup] cleanup_timeout_secs``, or a healthy node still being killed
+       or cleaned up is drained when the job is force-finished; the controller
+       logs a warning when it does not. Known issue: a requeued job
+       (requeue-mode preemption, ``scontrol requeue``)
+       frees its nodes at once, while the old run is still in its kill wait, so
+       another job can be dispatched onto them during that window. The window
+       can last up to ``kill_wait_secs``, so keep it low if that matters with
+       requeue-mode preemption. A requeued job itself is held out of the queue
+       for the larger of ``2 x interval_secs + 3`` and ``kill_wait_secs``
+       seconds (5 with the defaults); that term follows ``kill_wait_secs`` live.
+       Mirrors Slurm's ``KillWait`` for these stops, but does not yet reach
+       ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+       ``scontrol show config`` prints the value in effect, floor applied, as
+       ``KillWait``.
+   * - ``timeout_kill_wait_secs``
+     - integer
+     - ``30``
+     - Live
+     - The same wait for a job stopped by its time limit or the inactivity limit
+       (``inactive_limit_secs``), the stops that end ``TIMEOUT``. A
+       time-limited batch job moves to COMPLETING straight away and spends this
+       wait there before ending ``TIMEOUT``. Valid ``0``-``65533``; values below
+       5 act as 5. ``complete_wait_secs`` should exceed the larger kill wait
+       (this or ``kill_wait_secs``) plus ``[cgroup] cleanup_timeout_secs``. In
+       Slurm, ``KillWait`` also covers time limits; here that part is this
+       setting. Does not yet reach ``srun`` steps
+       (:ref:`kill wait note <kill-wait-steps-caveat>`). ``scontrol show config``
+       prints the value in effect, floor applied, as ``TimeoutKillWait``.
    * - ``max_user_priority``
      - integer
      - ``1000``
@@ -589,8 +632,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
      - Live
      - Reap an interactive allocation (``salloc``, or a standalone ``srun`` with
        or without ``--pty``) whose client has sent no keepalive for this many
-       seconds, freeing the nodes. The reaper sends SIGTERM, waits a 30 second
-       grace, then SIGKILLs; the job ends ``TIMEOUT``. ``0`` disables reaping.
+       seconds, freeing the nodes. The reaper sends SIGTERM, then SIGKILLs after
+       up to ``timeout_kill_wait_secs``; the job ends ``TIMEOUT``, normally at
+       once (:ref:`kill wait note <kill-wait-steps-caveat>`). ``0`` disables reaping.
        Mirrors Slurm's ``InactiveLimit``; the value in effect is shown by
        ``scontrol show config``. Must be at least twice the client keepalive
        interval (60 seconds); smaller non-zero values are rejected at startup so a
@@ -728,12 +772,16 @@ Reaping abandoned interactive allocations (``inactive_limit_secs``)
 ``salloc`` and standalone ``srun`` (with or without ``--pty``) ping the
 controller every 30 seconds for as long as the client is running. When the pings
 stop for ``inactive_limit_secs`` (default ``300``; ``0`` disables reaping), the
-allocation is reaped: SIGTERM, a 30 second grace, then SIGKILL. The SIGTERM is
-final: a client that reconnects during the grace does not save the allocation,
-and the job ends ``TIMEOUT`` however its processes exit. With the default, an
-abandoned allocation is signalled 270 to 310 seconds after its client is lost
-(the last ping can be up to 30 seconds old) and is finished within about 40
-seconds of the signal.
+allocation is reaped: SIGTERM, then SIGKILL after up to
+``timeout_kill_wait_secs`` (default 30 seconds). An allocation's own process
+exits on SIGTERM and its work runs in ``srun`` steps, which the wait does not
+yet reach (:ref:`kill wait note <kill-wait-steps-caveat>`), so an allocation
+normally ends ``TIMEOUT`` within a moment of the SIGTERM, without spending the
+wait in ``COMPLETING`` (``CG``). The SIGTERM is final: a client that
+reconnects after it does not save the allocation, and the job ends ``TIMEOUT``
+however its processes exit. With the defaults, an abandoned allocation is
+signalled 270 to 310 seconds after its client is lost (the last ping can be up
+to 30 seconds old).
 
 The limit measures the client, not the job. A busy job whose client is gone is
 reaped, and so is one whose client is only stopped, such as a foreground
@@ -1586,6 +1634,21 @@ two minutes, and ``2-0:0:90`` is two days and two minutes.
        ``scontrol update PartitionName=<name> PreemptExemptTime=<secs>``;
        use ``scontrol update PartitionName=<name> ClearPreemptExemptTime=yes``
        to revert to the global default.
+   * - ``grace_time``
+     - integer or null
+     - ``null`` (unset)
+     - Seconds a job preempted from this partition is given to wind down between
+       the preemption warning and the kill. It applies only when the victim's QOS
+       leaves ``GraceTime`` unset, and the QOS value wins otherwise, including an
+       explicit ``0``. A job requested in several partitions takes the highest value
+       among the ones its nodes belong to, so ``--partition=a,b`` running on
+       ``a`` gets ``a``'s value only. ``0`` means no grace; unset contributes none. Applies to ``cancel`` and
+       ``requeue`` preemption and is capped at the victim's remaining time limit. A value in
+       ``spur.conf`` is applied on startup and ``scontrol reconfigure``; omitting
+       it later does not clear a value already set at runtime. Set it at runtime with
+       ``scontrol update PartitionName=<name> GraceTime=<secs>`` and revert it with
+       ``scontrol update PartitionName=<name> ClearGraceTime=yes``. See
+       :ref:`preemption grace time <qos-preempt-grace>`.
 
 ``[[nodes]]``
 -------------
@@ -2288,8 +2351,13 @@ cgroups.
        ``0`` requests a drain immediately if cleanup is incomplete. Cleanup
        continues after the deadline; it does not authorize resource reuse.
        Raise it on nodes where teardown is slow (large-memory jobs, GPU reset,
-       network filesystem unmounts), but keep it below ``[scheduler]
-       complete_wait_secs`` so the agent, not a force-finish, drains the node.
+       network filesystem unmounts), but keep ``[scheduler] complete_wait_secs``
+       above the larger kill wait plus this value so the agent, not a
+       force-finish, drains the node. The controller's warning checks its own
+       ``[cgroup] cleanup_timeout_secs``, while each agent uses the value in its
+       node's ``spur.conf`` (read at agent start, so ``scontrol reconfigure``
+       does not reach it). Set the controller's value to the largest any node
+       uses.
    * - ``oom_kill_job``
      - bool
      - ``true``

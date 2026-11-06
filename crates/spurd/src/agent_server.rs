@@ -1366,9 +1366,18 @@ async fn wait_for_exit_and_teardown(
     }
 }
 
-/// Grace between an immediate signal and its SIGKILL escalation, for both the
-/// legacy and stepd-supervised graceful-cancel paths.
-const GRACEFUL_CANCEL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+/// SIGKILL delay for unsupervised steps after an explicit `scancel --signal`.
+const EXPLICIT_SIGNAL_STEP_ESCALATION: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Floor for the SIGTERM-to-SIGKILL gap, and the gap used when a cancel
+/// request names none.
+const MIN_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Raised to the floor because a shorter gap would SIGKILL a step before its
+/// SIGTERM handler could run.
+fn kill_wait_from_request(kill_wait_secs: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(kill_wait_secs)).max(MIN_KILL_WAIT)
+}
 
 /// Polls until the job's `running` entry clears — via the supervisor's own
 /// completion push, this poll fencing a stepd stuck before `Start`, or (on
@@ -1377,6 +1386,7 @@ async fn wait_for_stepd_release(
     job_id: u32,
     run_attempt: u32,
     deadline: tokio::time::Instant,
+    kill_wait: std::time::Duration,
     context: &CompletionListenerContext,
 ) {
     loop {
@@ -1412,7 +1422,13 @@ async fn wait_for_stepd_release(
             // observed to be gone yet by anything gated on stepd_liveness.
             // Escalate on a wall clock instead of waiting on that oracle.
             if any_live {
-                spawn_wedged_stepd_force_reclaim(job_id, run_attempt, deadline, context.clone());
+                spawn_wedged_stepd_force_reclaim(
+                    job_id,
+                    run_attempt,
+                    deadline,
+                    kill_wait,
+                    context.clone(),
+                );
             }
             return;
         }
@@ -1424,8 +1440,8 @@ async fn wait_for_stepd_release(
 /// stuck in a hung hook) rather than exited — `stepd_liveness` reads a
 /// wedged process identically to a healthy one, so nothing gated on it ever
 /// fires here. Comfortably above the existing escalation stack (this
-/// function's own 3s bound, the 5s graceful-cancel grace period, the 10s
-/// stepd-request timeout), so it never fires during ordinary resolution.
+/// function's own 3s bound, the cancel's kill wait, the 10s stepd-request
+/// timeout), so it never fires during ordinary resolution.
 const STEPD_FORCE_RECLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One poll window between kill retries; the ledger only releases once one
@@ -1492,16 +1508,19 @@ fn force_kill_stepd(descriptor: &crate::stepd::StepdDescriptor) {
 
 /// Spawned once `wait_for_stepd_release`'s own bound elapses with a still-
 /// live descriptor. Waits out the wall-clock force window (from the
-/// original cancel, not from this spawn), then kills and fences
+/// original cancel, not from this spawn) after the kill wait has had its
+/// chance to end the supervisor gracefully, then kills and fences
 /// unconditionally — attempt-scoped the same way the active-fence loop is,
 /// so a redispatch that already superseded this attempt is never touched.
 fn spawn_wedged_stepd_force_reclaim(
     job_id: u32,
     run_attempt: u32,
     active_fence_deadline: tokio::time::Instant,
+    kill_wait: std::time::Duration,
     context: CompletionListenerContext,
 ) {
-    let force_deadline = active_fence_deadline - CANCEL_REAP_TIMEOUT + force_reclaim_timeout();
+    let force_deadline =
+        active_fence_deadline - CANCEL_REAP_TIMEOUT + kill_wait + force_reclaim_timeout();
     tokio::spawn(async move {
         tokio::time::sleep_until(force_deadline).await;
         // `running` and `stepds` are locked in separate statements, never
@@ -4930,13 +4949,14 @@ impl AgentService {
         &self,
         job_id: u32,
         run_attempt: u32,
+        kill_wait: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         let context = self.completion_listener_context();
         tokio::spawn(async move {
             // The caller already validated run_attempt via runs_attempt; a
             // fresh running read here could pick up a newer attempt instead.
             let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
-            wait_for_stepd_release(job_id, run_attempt, deadline, &context).await;
+            wait_for_stepd_release(job_id, run_attempt, deadline, kill_wait, &context).await;
         })
     }
 
@@ -6017,6 +6037,8 @@ impl SlurmAgent for AgentService {
             inactive_limit_secs: None,
             tres_billing_weights: String::new(),
             usage_reset_period: String::new(),
+            kill_wait_secs: None,
+            timeout_kill_wait_secs: None,
         }))
     }
 
@@ -7096,6 +7118,18 @@ impl SlurmAgent for AgentService {
         Ok(Response::new(()))
     }
 
+    async fn signal_job(
+        &self,
+        request: Request<AgentSignalJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let target = SignalTarget::try_from(req.target).unwrap_or(SignalTarget::Unspecified);
+        self.deliver_signal(req.job_id, req.run_attempt, req.signal, target)
+            .await?;
+        Ok(Response::new(()))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,
@@ -7140,7 +7174,12 @@ impl SlurmAgent for AgentService {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
                 .await;
         } else {
-            self.graceful_cancel(job_id, req.run_attempt).await;
+            self.graceful_cancel(
+                job_id,
+                req.run_attempt,
+                kill_wait_from_request(req.kill_wait_secs),
+            )
+            .await;
         }
 
         // The signal paths only act on a running job; release a still-launching
@@ -10359,7 +10398,8 @@ impl AgentService {
             // Neither stepds nor running names an attempt to scope to, but an
             // orphaned unsupervised step can still outlive both maps — reach
             // it via the wildcard rather than stranding it.
-            self.cancel_active_steps_for_job(job_id, 0, signal).await;
+            self.cancel_active_steps_for_job(job_id, 0, signal, EXPLICIT_SIGNAL_STEP_ESCALATION)
+                .await;
             return;
         };
         // A signal reaches every step the job holds; one failing must not
@@ -10374,8 +10414,8 @@ impl AgentService {
         );
         // Spawned before the signal loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
-        let release_wait =
-            (supervised && lethal).then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
+        let release_wait = (supervised && lethal)
+            .then(|| self.spawn_stepd_release_wait(job_id, run_attempt, std::time::Duration::ZERO));
         for descriptor in &runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
                 descriptor,
@@ -10403,8 +10443,13 @@ impl AgentService {
         }
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
-        self.cancel_active_steps_for_job(job_id, run_attempt, signal)
-            .await;
+        self.cancel_active_steps_for_job(
+            job_id,
+            run_attempt,
+            signal,
+            EXPLICIT_SIGNAL_STEP_ESCALATION,
+        )
+        .await;
         if supervised {
             // A stepd already confirmed dead has no teardown coming; fence it
             // now instead of waiting out the release-wait bound below.
@@ -10450,6 +10495,110 @@ impl AgentService {
             )
             .await;
         }
+    }
+
+    /// The attempt a signal is for: `NotFound` when this node holds nothing of the
+    /// job, `None` when it runs another attempt. An unscoped request resolves to
+    /// the current run, or stays the wildcard for an orphaned unsupervised step.
+    async fn signal_scope(&self, job_id: u32, run_attempt: u32) -> Result<Option<u32>, Status> {
+        if !self.holds_job(job_id).await {
+            return Err(Status::not_found(format!(
+                "job {job_id} is not held by this node"
+            )));
+        }
+        if !self.runs_attempt(job_id, run_attempt).await {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.resolve_cancel_attempt(job_id, run_attempt)
+                .await
+                .unwrap_or(0),
+        ))
+    }
+
+    /// Whether this node tracks any part of the job: a supervisor, the job
+    /// itself, or a step.
+    async fn holds_job(&self, job_id: u32) -> bool {
+        if !stepds_for_job(&*self.stepds.lock().await, job_id).is_empty() {
+            return true;
+        }
+        if self.running.lock().await.contains_key(&job_id) {
+            return true;
+        }
+        self.active_steps
+            .lock()
+            .await
+            .keys()
+            .any(|(tracked, _)| *tracked == job_id)
+    }
+
+    /// Deliver a signal and nothing else: no launch fencing, release wait,
+    /// teardown or escalation, so a warning leaves the run alive to react to it.
+    async fn deliver_signal(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        signal: i32,
+        target: SignalTarget,
+    ) -> Result<(), Status> {
+        let include_batch = match target {
+            SignalTarget::Steps => false,
+            SignalTarget::Full => true,
+            SignalTarget::Batch => {
+                return Err(Status::unimplemented(
+                    "signalling only the batch script is not supported",
+                ))
+            }
+            SignalTarget::Unspecified => {
+                return Err(Status::invalid_argument("a signal target is required"))
+            }
+        };
+        let sig = nix::sys::signal::Signal::try_from(signal)
+            .map_err(|_| Status::invalid_argument(format!("invalid signal {signal}")))?;
+        let Some(run_attempt) = self.signal_scope(job_id, run_attempt).await? else {
+            warn!(
+                job_id,
+                run_attempt, signal, "dropping a signal for a superseded run"
+            );
+            return Ok(());
+        };
+
+        let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
+        for descriptor in runtimes
+            .iter()
+            .filter(|descriptor| include_batch || descriptor.step_id != spur_core::step::STEP_BATCH)
+        {
+            if let Err(error) = crate::stepd::signal_allocation(
+                descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                signal,
+            )
+            .await
+            {
+                warn!(job_id, step_id = descriptor.step_id, %error,
+                    "runtime signal request failed");
+            }
+        }
+        self.signal_active_steps_for_job(job_id, run_attempt, signal)
+            .await;
+
+        // A batch supervisor owns the job's processes, so the agent has no
+        // handle of its own to signal.
+        if !include_batch || owns_job_processes(&runtimes) {
+            return Ok(());
+        }
+        let jobs = self.running.lock().await;
+        let Some(tracked) = jobs.get(&job_id).filter(|tracked| {
+            !tracked.job.is_allocation_only()
+                && (run_attempt == 0 || tracked.run_attempt == run_attempt)
+        }) else {
+            return Ok(());
+        };
+        info!(job_id, signal, "signalling the unsupervised job");
+        if let Err(error) = tracked.job.kill_signal(sig) {
+            warn!(job_id, signal, %error, "failed to signal the unsupervised job");
+        }
+        Ok(())
     }
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
@@ -10506,32 +10655,17 @@ impl AgentService {
     /// `run_attempt == 0` is a wildcard (`stepds_for_attempt`'s own
     /// convention), reached only when nothing named a concrete attempt —
     /// so an orphaned unsupervised step stays reachable, not stranded.
-    async fn cancel_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
-        let supervised: Vec<spur_core::step::StepId> =
-            stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
-                .iter()
-                .map(|descriptor| descriptor.step_id)
-                .collect();
-        // Snapshot (key, pid, epoch) under the lock, then signal *outside* it:
-        // signal_step_tree walks /proc, so holding active_steps across it would
-        // block every concurrent run_command (and the ActiveStepGuard's try_lock
-        // cleanup, which silently skips on contention).
-        let targets: Vec<((u32, u32), u32, u64)> = {
-            let mut steps = self.active_steps.lock().await;
-            let mut targets = Vec::new();
-            for (key, step) in steps.iter_mut() {
-                if key.0 == job_id
-                    && (run_attempt == 0 || step.run_attempt == run_attempt)
-                    && !supervised.contains(&key.1)
-                {
-                    step.cancel_requested = true;
-                    if let Some(pid) = step.pid {
-                        targets.push((*key, pid, step.epoch));
-                    }
-                }
-            }
-            targets
-        };
+    /// `escalate_after` is the SIGKILL delay.
+    async fn cancel_active_steps_for_job(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        signal: i32,
+        escalate_after: std::time::Duration,
+    ) {
+        let targets = self
+            .unsupervised_step_targets(job_id, run_attempt, true)
+            .await;
         if targets.is_empty() {
             return;
         }
@@ -10543,7 +10677,7 @@ impl AgentService {
         // with a recycled pid is never signalled.
         let active_steps = self.active_steps.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(escalate_after).await;
             let still: Vec<u32> = {
                 let steps = active_steps.lock().await;
                 targets
@@ -10558,7 +10692,50 @@ impl AgentService {
         });
     }
 
-    async fn graceful_cancel(&self, job_id: u32, run_attempt: u32) {
+    /// Delivers one signal to the job's unsupervised steps and nothing more:
+    /// the steps are not marked cancelled, so a step still launching is not
+    /// aborted, and nothing escalates to SIGKILL.
+    async fn signal_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
+        for (_key, pid, _epoch) in self
+            .unsupervised_step_targets(job_id, run_attempt, false)
+            .await
+        {
+            signal_step_tree(pid, signal);
+        }
+    }
+
+    /// Snapshots (key, pid, epoch) of the job's unsupervised steps with a process,
+    /// so the caller signals outside the lock: holding `active_steps` across the
+    /// /proc walk would stall every run_command. `mark_cancelled` also flags a step with no pid.
+    async fn unsupervised_step_targets(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        mark_cancelled: bool,
+    ) -> Vec<((u32, u32), u32, u64)> {
+        let supervised: Vec<spur_core::step::StepId> =
+            stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
+                .iter()
+                .map(|descriptor| descriptor.step_id)
+                .collect();
+        let mut steps = self.active_steps.lock().await;
+        let mut targets = Vec::new();
+        for (key, step) in steps.iter_mut() {
+            let in_scope = key.0 == job_id
+                && (run_attempt == 0 || step.run_attempt == run_attempt)
+                && !supervised.contains(&key.1);
+            if !in_scope {
+                continue;
+            }
+            step.cancel_requested |= mark_cancelled;
+            if let Some(pid) = step.pid {
+                targets.push((*key, pid, step.epoch));
+            }
+        }
+        targets
+    }
+
+    async fn graceful_cancel(&self, job_id: u32, run_attempt: u32, kill_wait: std::time::Duration) {
         // A cancel naming an epoch this node no longer runs belongs to a superseded
         // run, and the processes here are the redispatch that replaced it.
         if !self.runs_attempt(job_id, run_attempt).await {
@@ -10572,8 +10749,13 @@ impl AgentService {
             // Neither stepds nor running names an attempt to scope to, but an
             // orphaned unsupervised step can still outlive both maps — reach
             // it via the wildcard rather than stranding it.
-            self.cancel_active_steps_for_job(job_id, 0, nix::sys::signal::Signal::SIGTERM as i32)
-                .await;
+            self.cancel_active_steps_for_job(
+                job_id,
+                0,
+                nix::sys::signal::Signal::SIGTERM as i32,
+                kill_wait,
+            )
+            .await;
             return;
         };
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
@@ -10583,22 +10765,20 @@ impl AgentService {
         let supervised = !runtimes.is_empty();
         // Spawned before the shutdown_allocation loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
-        let release_wait = supervised.then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
+        let release_wait =
+            supervised.then(|| self.spawn_stepd_release_wait(job_id, run_attempt, kill_wait));
         for descriptor in &runtimes {
             match crate::stepd::shutdown_allocation(descriptor, uuid::Uuid::new_v4().to_string())
                 .await
             {
                 Ok(()) => {
                     // Timed from the signal, not after the job-level wait below, so a
-                    // slow (or bounded-out) wait can't push escalation past ~5s.
+                    // slow (or bounded-out) wait can't push escalation past the kill wait.
                     let signaled_at = tokio::time::Instant::now();
                     let context = self.completion_listener_context();
                     let descriptor = descriptor.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(
-                            GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()),
-                        )
-                        .await;
+                        tokio::time::sleep(kill_wait.saturating_sub(signaled_at.elapsed())).await;
                         let still_current = context
                             .stepds
                             .lock()
@@ -10627,8 +10807,14 @@ impl AgentService {
                         // This descriptor's own attempt, not whatever `running`
                         // shows now — a redispatch may already have moved it on.
                         let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
-                        wait_for_stepd_release(job_id, descriptor.run_attempt, deadline, &context)
-                            .await;
+                        wait_for_stepd_release(
+                            job_id,
+                            descriptor.run_attempt,
+                            deadline,
+                            kill_wait,
+                            &context,
+                        )
+                        .await;
                     });
                 }
                 Err(error) => {
@@ -10643,6 +10829,7 @@ impl AgentService {
             job_id,
             run_attempt,
             nix::sys::signal::Signal::SIGTERM as i32,
+            kill_wait,
         )
         .await;
         if supervised {
@@ -10671,7 +10858,11 @@ impl AgentService {
             let Some(tracked) = tracked_run(&jobs, job_id, run_attempt) else {
                 return;
             };
-            info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
+            info!(
+                job_id,
+                kill_wait_secs = kill_wait.as_secs(),
+                "graceful cancel: SIGTERM, then SIGKILL after the kill wait"
+            );
             let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
             (tracked.run_attempt, tokio::time::Instant::now())
         };
@@ -10699,9 +10890,8 @@ impl AgentService {
         let reporter = self.reporter.clone();
         tokio::spawn(async move {
             // Timed from the signal, not from after the immediate wait above,
-            // so a slow (or bounded-out) wait can't push escalation past ~5s.
-            tokio::time::sleep(GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()))
-                .await;
+            // so a slow (or bounded-out) wait can't push escalation past the kill wait.
+            tokio::time::sleep(kill_wait.saturating_sub(signaled_at.elapsed())).await;
             let sigkilled = {
                 let jobs = running.lock().await;
                 match jobs.get(&job_id) {
@@ -17510,6 +17700,7 @@ mod tests {
             job_id: 48,
             signal: 9,
             run_attempt: 0,
+            kill_wait_secs: 0,
         });
         req.extensions_mut().insert(user_identity("attacker"));
         let err = svc
@@ -18141,7 +18332,7 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         svc.register_test_step(77, 0, Some(child.id())).await;
 
-        svc.graceful_cancel(77, 0).await;
+        svc.graceful_cancel(77, 0, kill_wait_from_request(0)).await;
 
         // The step must be marked cancelled and its process signaled dead.
         {
@@ -18215,8 +18406,13 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         svc.register_test_step(79, 4, Some(child.id())).await;
 
-        svc.cancel_active_steps_for_job(79, 0, nix::sys::signal::Signal::SIGTERM as i32)
-            .await;
+        svc.cancel_active_steps_for_job(
+            79,
+            0,
+            nix::sys::signal::Signal::SIGTERM as i32,
+            EXPLICIT_SIGNAL_STEP_ESCALATION,
+        )
+        .await;
 
         assert!(
             !svc.step_cancel_requested(79, 4).await,
@@ -18294,7 +18490,7 @@ mod tests {
         track_test_stepds(&svc, 80, 1, &[spur_core::step::STEP_BATCH], state.path()).await;
         svc.register_test_step(80, 6, None).await;
 
-        svc.graceful_cancel(80, 1).await;
+        svc.graceful_cancel(80, 1, kill_wait_from_request(0)).await;
 
         assert!(
             svc.step_cancel_requested(80, 6).await,
@@ -18338,7 +18534,7 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         svc.register_test_step(78, 2, Some(child.id())).await;
 
-        svc.graceful_cancel(78, 1).await;
+        svc.graceful_cancel(78, 1, kill_wait_from_request(0)).await;
 
         assert!(
             svc.step_cancel_requested(78, 2).await,
@@ -20484,6 +20680,7 @@ mod tests {
             job_id: 7,
             signal: 9,
             run_attempt: 1,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -20517,6 +20714,7 @@ mod tests {
             job_id: 7,
             signal: 9,
             run_attempt: 1,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -20555,6 +20753,7 @@ mod tests {
             job_id,
             signal: 9,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -21238,7 +21437,8 @@ mod tests {
         let job_id = 900;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             wait_job_reaped(&svc, job_id, 5_000).await,
@@ -21293,12 +21493,209 @@ mod tests {
         };
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         // 5s grace + up to 2s monitor tick + buffer
         assert!(
             wait_job_reaped(&svc, job_id, 10_000).await,
             "monitor should reap job after SIGKILL escalation"
+        );
+    }
+
+    #[test]
+    fn kill_wait_from_request_defaults_and_floors() {
+        use std::time::Duration;
+        assert_eq!(kill_wait_from_request(0), Duration::from_secs(5));
+        assert_eq!(kill_wait_from_request(3), Duration::from_secs(5));
+        assert_eq!(kill_wait_from_request(30), Duration::from_secs(30));
+        assert_eq!(kill_wait_from_request(65533), Duration::from_secs(65533));
+    }
+
+    fn process_is_running(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                .is_some_and(|state| state != "Z")
+        })
+    }
+
+    /// Returns how child `pid` ended, without reaping it; ECHILD (reaped by the
+    /// code under test) fails the test. Waits on the kernel, not the paused clock.
+    async fn wait_until_exited(pid: i32) -> nix::sys::wait::WaitStatus {
+        wait_until_exited_or_reaped(pid)
+            .await
+            .expect("child was reaped before the test could read how it ended")
+    }
+
+    /// Like `wait_until_exited`, but `None` for a child the code under test already
+    /// reaped (ECHILD): its exit status is gone, though it has certainly exited.
+    async fn wait_until_exited_or_reaped(pid: i32) -> Option<nix::sys::wait::WaitStatus> {
+        use nix::sys::wait::{waitid, Id, WaitPidFlag};
+        tokio::task::spawn_blocking(move || loop {
+            match waitid(
+                Id::Pid(nix::unistd::Pid::from_raw(pid)),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+            ) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::ECHILD) => return None,
+                Err(errno) => panic!("waitid({pid}) failed: {errno}"),
+                Ok(status) => return Some(status),
+            }
+        })
+        .await
+        .expect("wait for the process to exit")
+    }
+
+    fn assert_ended_by_signal(
+        status: nix::sys::wait::WaitStatus,
+        expected: nix::sys::signal::Signal,
+    ) {
+        assert!(
+            matches!(status, nix::sys::wait::WaitStatus::Signaled(_, signal, _) if signal == expected),
+            "expected the process to be killed by {expected}, but it ended as {status:?}"
+        );
+    }
+
+    /// Returns only once the trap is installed, so a SIGTERM sent right after
+    /// can't beat it and kill the process outright. The child ends on its own
+    /// after 60s, so a SIGKILL that never lands fails a test instead of hanging it.
+    async fn spawn_term_ignoring_process() -> tokio::process::Child {
+        use std::os::unix::process::CommandExt;
+        use tokio::io::AsyncBufReadExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap '' TERM; echo ready; sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn SIGTERM-ignoring process");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut line = String::new();
+        tokio::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .await
+            .expect("read readiness line");
+        child
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_cancel_waits_the_requested_kill_wait_before_sigkill() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let child = spawn_term_ignoring_process().await;
+        let pid = child.id().expect("pid") as i32;
+        let job_id = 906;
+        svc.insert_test_job(
+            job_id,
+            TrackedJob {
+                job: executor::RunningJob::Managed { child },
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+
+        let started = tokio::time::Instant::now();
+        svc.graceful_cancel(job_id, 0, std::time::Duration::from_secs(30))
+            .await;
+
+        tokio::time::sleep_until(started + std::time::Duration::from_secs(29)).await;
+        let alive_before_kill_wait = process_is_running(pid);
+        tokio::time::sleep_until(started + std::time::Duration::from_secs(31)).await;
+        tokio::time::resume();
+        // Teardown waits on a managed child, which reaps it and its status.
+        let status = wait_until_exited_or_reaped(pid).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        if let Some(status) = status {
+            assert_ended_by_signal(status, nix::sys::signal::Signal::SIGKILL);
+        }
+        assert!(
+            alive_before_kill_wait,
+            "SIGKILL must not land before the requested kill wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupervised_step_escalation_follows_kill_wait() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let child = spawn_term_ignoring_process().await;
+        let pid = child.id().expect("pid");
+        svc.register_test_step(907, 4, Some(pid)).await;
+
+        let started = tokio::time::Instant::now();
+        svc.graceful_cancel(907, 0, std::time::Duration::from_secs(30))
+            .await;
+
+        tokio::time::sleep_until(started + std::time::Duration::from_secs(10)).await;
+        let alive_at_old_escalation = process_is_running(pid as i32);
+        tokio::time::sleep_until(started + std::time::Duration::from_secs(31)).await;
+        tokio::time::resume();
+        let status = wait_until_exited(pid as i32).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGKILL);
+        assert!(
+            alive_at_old_escalation,
+            "an unsupervised step must not be SIGKILLed before the kill wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn force_reclaim_fires_after_kill_wait_plus_backstop() {
+        let _shortened = ShortenedForceReclaim::new(std::time::Duration::from_secs(1));
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(908, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        let started = tokio::time::Instant::now();
+        let release_wait = svc.spawn_stepd_release_wait(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            std::time::Duration::from_secs(10),
+        );
+        release_wait.await.expect("release wait");
+
+        tokio::time::sleep_until(started + std::time::Duration::from_millis(10_500)).await;
+        let alive_before_backstop = !child_has_exited(&mut child).await;
+        tokio::time::sleep_until(started + std::time::Duration::from_millis(11_500)).await;
+        tokio::time::resume();
+        child.wait().await.expect("wait for the force-killed stepd");
+
+        assert!(
+            alive_before_backstop,
+            "the stepd must outlive the kill wait; the backstop starts after it"
         );
     }
 
@@ -21367,7 +21764,8 @@ mod tests {
             requests
         });
 
-        svc.graceful_cancel(descriptor.job_id, 0).await;
+        svc.graceful_cancel(descriptor.job_id, 0, kill_wait_from_request(0))
+            .await;
         tokio::time::advance(tokio::time::Duration::from_secs(6)).await;
         tokio::task::yield_now().await;
 
@@ -21466,6 +21864,515 @@ mod tests {
             "send_explicit_signal must not return before the job's running entry clears"
         );
         server.await.expect("runtime control server");
+    }
+
+    /// Serves a stepd's control socket, acknowledging every request, until it
+    /// is asked to shut down; the shutdown ends the loop so the test learns
+    /// exactly which requests arrived before it, without a timeout.
+    fn serve_recording_stepd(
+        listener: tokio::net::UnixListener,
+        descriptor: crate::stepd::StepdDescriptor,
+    ) -> tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        tokio::spawn(async move {
+            let mut received = Vec::new();
+            loop {
+                let (stream, _) =
+                    crate::stepd::accept_hello(&listener, &descriptor, &descriptor.capability)
+                        .await
+                        .expect("accept runtime hello");
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut line)
+                    .await
+                    .expect("read runtime request");
+                let request: crate::stepd::StepdRequest =
+                    serde_json::from_str(&line).expect("decode runtime request");
+                let acknowledgement =
+                    serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
+                        .expect("encode acknowledgement");
+                writer
+                    .write_all(format!("{acknowledgement}\n").as_bytes())
+                    .await
+                    .expect("acknowledge runtime request");
+                let stop = request == crate::stepd::StepdRequest::Shutdown;
+                received.push(request);
+                if stop {
+                    return received;
+                }
+            }
+        })
+    }
+
+    /// Binds a recording stepd for one step of a job and registers it with `svc`.
+    async fn register_recording_stepd(
+        svc: &AgentService,
+        dir: &std::path::Path,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> (
+        crate::stepd::StepdDescriptor,
+        tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>>,
+    ) {
+        let socket_path = dir.join(format!("step-{step_id}.sock"));
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "signal-job-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let server = serve_recording_stepd(listener, descriptor.clone());
+        (descriptor, server)
+    }
+
+    /// Everything the stepd was asked before this call, minus the shutdown
+    /// that ends the recording.
+    async fn finish_recording_stepd(
+        descriptor: &crate::stepd::StepdDescriptor,
+        server: tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>>,
+    ) -> Vec<crate::stepd::StepdRequest> {
+        crate::stepd::shutdown_allocation(descriptor, uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("stop the recording stepd");
+        let mut received = server.await.expect("recording stepd");
+        assert_eq!(
+            received.pop(),
+            Some(crate::stepd::StepdRequest::Shutdown),
+            "the recording ends on the test's own shutdown"
+        );
+        received
+    }
+
+    fn signal_job_request(
+        job_id: u32,
+        run_attempt: u32,
+        signal: nix::sys::signal::Signal,
+        target: SignalTarget,
+    ) -> Request<AgentSignalJobRequest> {
+        let mut req = Request::new(AgentSignalJobRequest {
+            job_id,
+            run_attempt,
+            signal: signal as i32,
+            target: target as i32,
+        });
+        req.extensions_mut().insert(controller_identity());
+        req
+    }
+
+    fn sigterm_request() -> crate::stepd::StepdRequest {
+        crate::stepd::StepdRequest::SignalAllocation {
+            signal: nix::sys::signal::Signal::SIGTERM as i32,
+        }
+    }
+
+    fn test_agent() -> AgentService {
+        AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    #[tokio::test]
+    async fn signal_job_steps_target_skips_the_batch_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 910, 1, spur_core::step::STEP_BATCH).await;
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 910, 1, 0).await;
+
+        svc.signal_job(signal_job_request(
+            910,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+
+        assert_eq!(
+            finish_recording_stepd(&step, step_server).await,
+            vec![sigterm_request()]
+        );
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_full_target_reaches_every_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 911, 1, spur_core::step::STEP_BATCH).await;
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 911, 1, 0).await;
+
+        svc.signal_job(signal_job_request(
+            911,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("signal job");
+
+        assert_eq!(
+            finish_recording_stepd(&step, step_server).await,
+            vec![sigterm_request()]
+        );
+        assert_eq!(
+            finish_recording_stepd(&batch, batch_server).await,
+            vec![sigterm_request()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signal_job_never_escalates() {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential};
+
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 912, 1, spur_core::step::STEP_BATCH).await;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(912, tracked).await;
+        let child = spawn_term_ignoring_process().await;
+        let pid = child.id().expect("pid");
+        svc.register_test_step(912, 4, Some(pid)).await;
+        let credential = ExecutionCredential {
+            kind: CredentialKind::Job,
+            cluster_id: "cluster-a".into(),
+            key_id: String::new(),
+            job_id: 912,
+            step_id: spur_core::step::STEP_BATCH,
+            run_attempt: 1,
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![],
+            account: "research".into(),
+            partition: "gpu".into(),
+            qos: String::new(),
+            resources_by_node: vec![],
+            command_digest: [1u8; spur_core::native_cred::DIGEST_LEN],
+            container_digest: None,
+            issued_at: 0,
+            not_before: 0,
+            expires_at: 0,
+            credential_id: [2u8; spur_core::native_cred::CREDENTIAL_ID_LEN],
+        };
+        assert_eq!(svc.launch_acceptance.accept(&credential), Ok(true));
+
+        svc.signal_job(signal_job_request(
+            912,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        // Let any task the signal spawned register its timer before the clock
+        // moves, or it would sleep from the advanced instant instead.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+
+        // A SIGKILL sent by the advanced clock lands in the kernel a moment
+        // later, so give it a short real-time window to show up.
+        let mut still_running = true;
+        for _ in 0..20 {
+            still_running = process_is_running(pid as i32);
+            if !still_running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            still_running,
+            "a signal-only request must never escalate to SIGKILL"
+        );
+        assert!(
+            !svc.step_cancel_requested(912, 4).await,
+            "a warning must not mark the step cancelled"
+        );
+        assert!(svc.running.lock().await.contains_key(&912));
+        assert!(svc
+            .stepds
+            .lock()
+            .await
+            .contains_key(&(912, spur_core::step::STEP_BATCH)));
+        assert_eq!(
+            svc.launch_acceptance.accept(&credential),
+            Ok(false),
+            "the attempt must stay accepted, not be cancelled"
+        );
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_signals_an_unsupervised_step_without_cancelling_it() {
+        let svc = test_agent();
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        svc.register_test_step(919, 4, Some(pid)).await;
+
+        svc.signal_job(signal_job_request(
+            919,
+            0,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        let status = wait_until_exited(pid as i32).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGTERM);
+        assert!(!svc.step_cancel_requested(919, 4).await);
+    }
+
+    #[tokio::test]
+    async fn signal_job_does_not_mark_a_launching_step_cancelled() {
+        let svc = test_agent();
+        svc.register_test_step(920, 4, None).await;
+
+        svc.signal_job(signal_job_request(
+            920,
+            0,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+
+        assert!(
+            !svc.step_cancel_requested(920, 4).await,
+            "a step with no pid yet must not be aborted by a warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_job_with_no_steps_succeeds() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 913, 1, spur_core::step::STEP_BATCH).await;
+
+        svc.signal_job(signal_job_request(
+            913,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("a batch-only job has no step to warn, which is not an error");
+
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_full_target_signals_a_legacy_unsupervised_job() {
+        let svc = test_agent();
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid") as i32;
+        let mut tracked = TrackedJob {
+            job: executor::RunningJob::Managed { child },
+            ..TrackedJob::allocation_only(None)
+        };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(914, tracked).await;
+
+        svc.signal_job(signal_job_request(
+            914,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        assert!(
+            process_is_running(pid),
+            "the steps target must leave the batch script alone"
+        );
+
+        svc.signal_job(signal_job_request(
+            914,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("signal job");
+        let status = wait_until_exited(pid).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGTERM);
+        assert!(
+            svc.running.lock().await.contains_key(&914),
+            "a signal does not tear the job down"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_job_for_a_job_this_node_does_not_hold_is_not_found() {
+        let svc = test_agent();
+
+        for run_attempt in [0, 3] {
+            let status = svc
+                .signal_job(signal_job_request(
+                    930,
+                    run_attempt,
+                    nix::sys::signal::Signal::SIGTERM,
+                    SignalTarget::Steps,
+                ))
+                .await
+                .expect_err("nothing was signalled");
+            assert_eq!(
+                status.code(),
+                tonic::Code::NotFound,
+                "attempt {run_attempt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_no_particular_attempt_is_scoped_to_the_current_run() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(931, tracked).await;
+
+        assert_eq!(svc.signal_scope(931, 0).await.expect("known job"), Some(2));
+        assert_eq!(svc.signal_scope(931, 2).await.expect("known job"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_a_superseded_attempt_has_no_scope() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(932, tracked).await;
+
+        assert_eq!(svc.signal_scope(932, 1).await.expect("known job"), None);
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_an_orphaned_step_keeps_the_wildcard_scope() {
+        let svc = test_agent();
+        svc.register_test_step(933, 4, None).await;
+
+        assert_eq!(svc.signal_scope(933, 0).await.expect("known job"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn signal_job_drops_a_stale_run_attempt() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 915, 2, 0).await;
+
+        svc.signal_job(signal_job_request(
+            915,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("a signal for a superseded run is dropped, not an error");
+
+        assert_eq!(finish_recording_stepd(&step, step_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_unspecified_target() {
+        let svc = test_agent();
+        let err = svc
+            .signal_job(signal_job_request(
+                916,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Unspecified,
+            ))
+            .await
+            .expect_err("a signal needs a target");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_the_batch_target_until_it_is_supported() {
+        let svc = test_agent();
+        let err = svc
+            .signal_job(signal_job_request(
+                917,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("the batch target is not implemented");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_a_non_controller_caller() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(918, tracked).await;
+
+        let mut req = signal_job_request(
+            918,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        );
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .signal_job(req)
+            .await
+            .expect_err("a user token must not signal jobs by dialing the agent directly");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     // A session cancelled before `Start` has nothing that pushes completion; left
@@ -21786,7 +22693,7 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
 
-        svc.graceful_cancel(904, 3).await;
+        svc.graceful_cancel(904, 3, kill_wait_from_request(0)).await;
 
         let contacted =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), listener.accept()).await;
@@ -21852,7 +22759,8 @@ mod tests {
         svc.insert_test_job(job_id, run1).await;
 
         // Cancel epoch 1 (SIGTERM; trapped, survives) and spawn the grace timer.
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         // Simulate requeue + re-dispatch: same job_id, newer epoch.
         let (run2, pid2) = spawn_trap(2);
@@ -21919,7 +22827,8 @@ mod tests {
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             !svc.running.lock().await.contains_key(&job_id),
@@ -21970,7 +22879,8 @@ mod tests {
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             svc.running.lock().await.contains_key(&job_id),
@@ -22024,7 +22934,8 @@ mod tests {
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             svc.running.lock().await.contains_key(&job_id),
@@ -22078,7 +22989,8 @@ mod tests {
 
         // Names the older, now-dead attempt explicitly, as an eviction-style
         // cancel targeting one stale run would.
-        svc.graceful_cancel(job_id, dead_attempt).await;
+        svc.graceful_cancel(job_id, dead_attempt, kill_wait_from_request(0))
+            .await;
 
         assert_eq!(
             svc.running.lock().await.get(&job_id).map(|t| t.run_attempt),
@@ -22247,7 +23159,8 @@ mod tests {
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             svc.running.lock().await.contains_key(&job_id),
@@ -22306,6 +23219,7 @@ mod tests {
             job_id,
             signal: 0,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -22340,6 +23254,7 @@ mod tests {
             job_id,
             signal: 0,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -22875,7 +23790,8 @@ mod tests {
         svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
             .await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             !svc.running.lock().await.contains_key(&job_id),
@@ -22938,7 +23854,7 @@ mod tests {
 
         svc.send_explicit_signal(902, 0, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
-        svc.graceful_cancel(902, 0).await;
+        svc.graceful_cancel(902, 0, kill_wait_from_request(0)).await;
 
         assert!(svc.running.lock().await.contains_key(&902));
         assert!(svc

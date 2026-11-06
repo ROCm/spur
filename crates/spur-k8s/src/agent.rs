@@ -247,6 +247,8 @@ impl SlurmAgent for VirtualAgent {
             inactive_limit_secs: None,
             tres_billing_weights: String::new(),
             usage_reset_period: String::new(),
+            kill_wait_secs: None,
+            timeout_kill_wait_secs: None,
         }))
     }
 
@@ -665,6 +667,15 @@ impl SlurmAgent for VirtualAgent {
         _request: Request<spur_proto::proto::AgentStartJobRequest>,
     ) -> Result<Response<()>, Status> {
         Ok(Response::new(()))
+    }
+
+    async fn signal_job(
+        &self,
+        _request: Request<AgentSignalJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented(
+            "SignalJob is not supported on Kubernetes-operator nodes",
+        ))
     }
 
     async fn cancel_job(
@@ -1650,6 +1661,28 @@ mod resolve_job_tests {
             err.message().contains("has no namespace"),
             "got {:?}",
             err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_agent_signal_job_is_unimplemented() {
+        let server = server_listing(&[]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .signal_job(Request::new(AgentSignalJobRequest {
+                job_id: JOB_ID,
+                run_attempt: 1,
+                signal: 15,
+                target: SignalTarget::Full as i32,
+            }))
+            .await
+            .expect_err("signal_job must be refused");
+
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(
+            server.requests().is_empty(),
+            "an unsupported RPC must not touch the API server"
         );
     }
 }

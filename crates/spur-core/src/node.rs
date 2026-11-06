@@ -265,6 +265,9 @@ pub enum NodeSource {
 /// `RegisterAgentRequest.version` sent by the spur-k8s operator.
 pub const K8S_OPERATOR_VERSION: &str = "spur-k8s-operator";
 
+/// Agent capability: the agent implements the `SignalJob` RPC.
+pub const CAP_SIGNAL_JOB: &str = "signal-job";
+
 /// Node label carrying the operator's Kubernetes namespace.
 pub const K8S_NAMESPACE_LABEL: &str = "spur.amd.com/k8s-namespace";
 
@@ -405,6 +408,9 @@ pub struct Node {
     /// from heartbeats, never persisted.
     #[serde(skip)]
     pub layout_enforce_error: Option<String>,
+    /// Optional RPCs the node's agent advertised at registration (e.g. `CAP_SIGNAL_JOB`).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 fn default_weight() -> u32 {
@@ -454,7 +460,13 @@ impl Node {
             spec_memory_mb: 0,
             layout_seq: 0,
             layout_enforce_error: None,
+            capabilities: Vec::new(),
         }
+    }
+
+    /// Whether the node's agent advertised `capability` at registration.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
     }
 
     /// Reset config-derived scheduling policy (features, weight) to defaults.
@@ -566,6 +578,28 @@ mod tests {
         value.as_object_mut().unwrap().remove("k0s_last_error");
         let back: Node = serde_json::from_value(value).expect("deserialize node");
         assert_eq!(back.k0s_last_error, None);
+    }
+
+    // Frozen pre-`capabilities` node as stored in a Raft snapshot; it must still
+    // load or a new controller cannot restore an old snapshot. Never regenerate.
+    #[test]
+    fn a_node_snapshot_without_capabilities_still_deserializes() {
+        const NODE_PRE_CAPABILITIES: &str = r#"{"name":"n1","hostname":"host1","state":"IDLE","state_reason":null,"reason_uid":null,"reason_time":null,"admin_locked":false,"partitions":["gpu"],"source":{"type":"NativeHost"},"total_resources":{"cpus":8,"memory_mb":16000,"gpus":[],"generic":{},"generation":0,"fabric_binding_version":0,"block_file_revision":null},"detected_resources":{"cpus":8,"memory_mb":16000,"gpus":[],"generic":{},"generation":0,"fabric_binding_version":0,"block_file_revision":null},"alloc_resources":{"cpus":0,"memory_mb":0,"devices":{},"generation":0,"fabric_binding":null,"gpu_binding":null},"features":[],"labels":{},"arch":"x86_64","os":"linux","cpu_load":0,"free_memory_mb":16000,"boot_time":null,"last_busy":null,"agent_start_time":null,"last_heartbeat":null,"address":"10.0.0.1","port":6818,"wg_pubkey":null,"version":null,"weight":1,"switch_name":null,"k0s_role":null,"k0s_mesh_ip":null,"k0s_pod_cidr":null,"k0s_last_error":null}"#;
+        let back: Node = serde_json::from_str(NODE_PRE_CAPABILITIES)
+            .expect("a pre-capabilities node must load; a new field needs #[serde(default)]");
+        assert_eq!(back.name, "n1");
+        assert_eq!(back.total_resources.cpus, 8);
+        assert!(back.capabilities.is_empty());
+        assert!(!back.supports(CAP_SIGNAL_JOB));
+    }
+
+    #[test]
+    fn supports_matches_only_advertised_capabilities() {
+        let mut node = Node::new("n1".into(), ResourceSet::default());
+        assert!(!node.supports(CAP_SIGNAL_JOB));
+        node.capabilities = vec![CAP_SIGNAL_JOB.to_string()];
+        assert!(node.supports(CAP_SIGNAL_JOB));
+        assert!(!node.supports("other"));
     }
 
     #[test]

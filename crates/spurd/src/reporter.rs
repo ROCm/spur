@@ -443,16 +443,11 @@ impl NodeReporter {
         self.register_with(&self.snapshot_resources()).await
     }
 
-    /// Register with the controller reporting a specific inventory. The refresh
-    /// task uses this to converge on a fresh set WITHOUT first committing it to
-    /// the reporter baseline, so a failed register leaves the baseline unchanged
-    /// and the next tick re-detects the same delta and retries.
-    pub async fn register_with(&self, resources: &ResourceSet) -> anyhow::Result<()> {
+    fn registration_request(&self, resources: &ResourceSet) -> RegisterAgentRequest {
         let mut labels = self.labels.clone();
         labels.insert("spur.stepd".into(), "1".into());
 
-        let ticket = lock_recover(&self.spec).begin_registration();
-        let req = RegisterAgentRequest {
+        RegisterAgentRequest {
             hostname: self.hostname.clone(),
             resources: Some(resource_to_proto(resources)),
             version: env!("CARGO_PKG_VERSION").into(),
@@ -462,7 +457,17 @@ impl NodeReporter {
             labels,
             join_token: self.join_token.clone(),
             topology: resources.topology.as_ref().map(Into::into),
-        };
+            capabilities: vec![spur_core::node::CAP_SIGNAL_JOB.into()],
+        }
+    }
+
+    /// Register with the controller reporting a specific inventory. The refresh
+    /// task uses this to converge on a fresh set WITHOUT first committing it to
+    /// the reporter baseline, so a failed register leaves the baseline unchanged
+    /// and the next tick re-detects the same delta and retries.
+    pub async fn register_with(&self, resources: &ResourceSet) -> anyhow::Result<()> {
+        let ticket = lock_recover(&self.spec).begin_registration();
+        let req = self.registration_request(resources);
         let inner = self
             .with_controller(move |mut client| async move { client.register_agent(req).await })
             .await
@@ -2054,6 +2059,13 @@ mod tests {
             Arc::new(Mutex::new(HashMap::<u32, CellRun>::new())),
             ReporterTimeouts::default(),
         )
+    }
+
+    #[test]
+    fn registration_request_advertises_signal_job() {
+        let reporter = test_reporter(rset(8, 0, vec![]));
+        let req = reporter.registration_request(&rset(8, 0, vec![]));
+        assert_eq!(req.capabilities, vec!["signal-job".to_string()]);
     }
 
     #[test]

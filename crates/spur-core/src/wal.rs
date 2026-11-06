@@ -17,6 +17,17 @@ fn default_port() -> u16 {
     6818
 }
 
+/// Deserializer for `Option<Option<T>>` patch fields: absent is no change (via
+/// `#[serde(default)]`), `null` clears, a value sets. Pair with
+/// `skip_serializing_if = "Option::is_none"` so a clear is not read back as absent.
+fn clear_or_set<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// All state-mutating operations that get logged to the Raft log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOperation {
@@ -85,6 +96,11 @@ pub enum WalOperation {
         unreported_nodes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cancel: Option<crate::end_reason::CancelProvenance>,
+        /// The controller ended the run itself (a launch failure, the requeue
+        /// cap), not the workload or its client. A preemption grace must not
+        /// turn such a completion into the preemption outcome.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        controller_initiated: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -201,6 +217,11 @@ pub enum WalOperation {
         /// When the preempted run ended, distinct from `begin_time`'s future hold.
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Run the caller decided to preempt, not whichever is current when this
+        /// is proposed. A NoOp on apply when set and the job is at another run.
+        /// `None` (every pre-upgrade entry) applies to whichever run is current.
+        #[serde(default)]
+        run_attempt: Option<u32>,
     },
     /// Preempt a running job with cancel. The job transitions Running →
     /// Preempted → Cancelled: Preempted is reported to accounting so the
@@ -220,6 +241,11 @@ pub enum WalOperation {
         /// deadline from one value. Absent pre-upgrade; falls back to apply time.
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
+        /// Run the caller decided to preempt, not whichever is current when this
+        /// is proposed. A NoOp on apply when set and the job is at another run.
+        /// `None` (every pre-upgrade entry) applies to whichever run is current.
+        #[serde(default)]
+        run_attempt: Option<u32>,
     },
     /// Admin requeue (`scontrol requeue` / `requeuehold`): return a job to
     /// Pending with the same spec in one atomic step. A running/suspended job is
@@ -293,6 +319,8 @@ pub enum WalOperation {
         labels: HashMap<String, String>,
         #[serde(default)]
         source: NodeSource,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     NodeUpdate {
         name: String,
@@ -305,6 +333,8 @@ pub enum WalOperation {
         version: String,
         #[serde(default)]
         source: NodeSource,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     NodeStateChange {
         name: String,
@@ -367,6 +397,12 @@ pub enum WalOperation {
         is_default: Option<bool>,
         #[serde(default)]
         preempt_exempt_time: Option<Option<u32>>,
+        #[serde(
+            default,
+            deserialize_with = "clear_or_set",
+            skip_serializing_if = "Option::is_none"
+        )]
+        grace_time: Option<Option<u32>>,
     },
     PartitionDelete {
         name: String,
@@ -433,6 +469,20 @@ pub enum WalOperation {
     K0sMemberNodesRemove {
         nodes: Vec<String>,
     },
+    /// A run exhausted its time limit: records the TIMEOUT verdict and moves it to
+    /// Completing in one step, holding its nodes until they report.
+    JobTimeLimitExpired {
+        job_id: JobId,
+        run_attempt: u32,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    /// A running job was warned of preemption and is in its grace period until
+    /// `pending.deadline`. Applied only to a Running job at `pending.run_attempt`
+    /// that is not already pending, so replaying it is idempotent.
+    JobPreemptSignaled {
+        job_id: JobId,
+        pending: crate::job::PreemptPending,
+    },
 }
 
 impl WalOperation {
@@ -443,6 +493,21 @@ impl WalOperation {
             state,
             unreported_nodes: Vec::new(),
             cancel: None,
+            controller_initiated: false,
+            at: None,
+        }
+    }
+
+    /// A run the controller ends as `Failed` on its own account, before it
+    /// requeues or holds the job.
+    pub fn job_failed_by_controller(job_id: JobId) -> Self {
+        Self::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Failed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: true,
             at: None,
         }
     }
@@ -454,6 +519,7 @@ impl WalOperation {
             state: JobState::Cancelled,
             unreported_nodes: Vec::new(),
             cancel: Some(cancel),
+            controller_initiated: false,
             at: None,
         }
     }
@@ -584,7 +650,9 @@ impl WalOperation {
             Self::JobSuspend { at, .. }
             | Self::JobResume { at, .. }
             | Self::JobTimeLimitSignaled { at, .. }
+            | Self::JobTimeLimitExpired { at, .. }
             | Self::JobCancelSignaled { at, .. } => Some(*at),
+            Self::JobPreemptSignaled { pending, .. } => Some(pending.signaled_at),
             // Exhaustive on purpose: a new variant that dates something a user
             // reads back must be a compile error here, not a silent `None`.
             Self::JobSubmit { .. }
@@ -634,6 +702,8 @@ impl WalOperation {
             Self::JobSuspend { .. }
             | Self::JobResume { .. }
             | Self::JobTimeLimitSignaled { .. }
+            | Self::JobTimeLimitExpired { .. }
+            | Self::JobPreemptSignaled { .. }
             | Self::JobCancelSignaled { .. }
             | Self::JobSubmit { .. }
             | Self::JobStepComplete { .. }
@@ -1234,6 +1304,7 @@ mod tests {
             r#"{"JobComplete":{"job_id":7,"exit_code":0,"state":"COMPLETED"}}"#,
             r#"{"JobNodeComplete":{"job_id":7,"node_name":"n1","exit_code":0,"signal":0}}"#,
             r#"{"JobPreemptRequeue":{"job_id":7,"begin_time":"2026-01-01T00:00:00Z"}}"#,
+            r#"{"JobPreemptCancel":{"job_id":7}}"#,
             r#"{"JobUserRequeue":{"job_id":7}}"#,
             r#"{"JobEvict":{"job_id":7}}"#,
             r#"{"NodeRemove":{"name":"n1","reason":null}}"#,
@@ -1261,6 +1332,7 @@ mod tests {
             state: JobState::Completed,
             unreported_nodes: Vec::new(),
             cancel: None,
+            controller_initiated: false,
             at: None,
         };
         op.stamp_occurred_at(at);
@@ -1434,6 +1506,113 @@ mod deregistration_wal_tests {
         }
     }
 
+    // Frozen pre-grace_time PartitionUpdate entry; it must still replay or the
+    // controller cannot start after an upgrade. Never regenerate.
+    #[test]
+    fn partition_update_without_grace_time_replays() {
+        const PARTITION_UPDATE_PRE_GRACE_TIME: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":"DRAIN","max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":120}}"#;
+        let op: WalOperation = serde_json::from_str(PARTITION_UPDATE_PRE_GRACE_TIME)
+            .expect("legacy PartitionUpdate must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::PartitionUpdate {
+                state,
+                preempt_exempt_time,
+                grace_time,
+                ..
+            } => {
+                assert_eq!(state.as_deref(), Some("DRAIN"));
+                assert_eq!(preempt_exempt_time, Some(Some(120)));
+                assert_eq!(grace_time, None, "absent means leave unchanged");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    fn partition_update_with_grace(grace_time: Option<Option<u32>>) -> WalOperation {
+        WalOperation::PartitionUpdate {
+            name: "gpu".into(),
+            nodes: None,
+            selector: None,
+            state: None,
+            max_time_minutes: None,
+            default_time_minutes: None,
+            max_nodes: None,
+            min_nodes: None,
+            allow_accounts: None,
+            allow_groups: None,
+            deny_accounts: None,
+            deny_qos: None,
+            allow_qos: None,
+            priority_tier: None,
+            preempt_mode: None,
+            is_default: None,
+            preempt_exempt_time: None,
+            grace_time,
+        }
+    }
+
+    // The log stores JSON, where a bare `Option<Option<_>>` cannot tell a clear
+    // from "no change"; losing it would resurrect a cleared grace on replay.
+    #[test]
+    fn partition_update_grace_time_set_clear_and_unchanged_survive_the_log() {
+        for grace_time in [None, Some(None), Some(Some(0)), Some(Some(600))] {
+            let json = serde_json::to_string(&partition_update_with_grace(grace_time)).unwrap();
+            match serde_json::from_str(&json).unwrap() {
+                WalOperation::PartitionUpdate {
+                    grace_time: replayed,
+                    ..
+                } => assert_eq!(replayed, grace_time, "{json}"),
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    // Frozen wire forms of `grace_time` on a PartitionUpdate: they are what is
+    // already in deployed logs, so a change to how they read changes what a
+    // replay does. Never regenerate.
+    #[test]
+    fn partition_update_grace_time_wire_format_is_frozen() {
+        const CLEAR: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null,"grace_time":null}}"#;
+        const SET: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null,"grace_time":600}}"#;
+        const ABSENT: &str = r#"{"PartitionUpdate":{"name":"gpu","nodes":null,"selector":null,"state":null,"max_time_minutes":null,"default_time_minutes":null,"max_nodes":null,"min_nodes":null,"allow_accounts":null,"allow_groups":null,"deny_accounts":null,"deny_qos":null,"allow_qos":null,"priority_tier":null,"preempt_mode":null,"is_default":null,"preempt_exempt_time":null}}"#;
+
+        let replayed = |json: &str| match serde_json::from_str(json).expect("must deserialize") {
+            WalOperation::PartitionUpdate { grace_time, .. } => grace_time,
+            _ => panic!("wrong variant"),
+        };
+
+        assert_eq!(replayed(CLEAR), Some(None), "null clears the grace time");
+        assert_eq!(replayed(SET), Some(Some(600)));
+        assert_eq!(replayed(ABSENT), None, "an absent key leaves it unchanged");
+    }
+
+    // These entries are already in deployed logs, so a change to how they read
+    // changes what a replay does. Never regenerate.
+    #[test]
+    fn preempt_run_attempt_wire_format_is_frozen() {
+        const CANCEL: &str = r#"{"JobPreemptCancel":{"job_id":7,"preempted_by":42,"preempt_qos":null,"at":"2026-03-04T05:06:07Z","run_attempt":3}}"#;
+        const REQUEUE: &str = r#"{"JobPreemptRequeue":{"job_id":7,"begin_time":"2999-01-01T00:00:00Z","preempted_by":42,"preempt_qos":null,"at":null,"run_attempt":3}}"#;
+
+        match serde_json::from_str(CANCEL).expect("must deserialize") {
+            WalOperation::JobPreemptCancel { run_attempt, .. } => assert_eq!(run_attempt, Some(3)),
+            _ => panic!("wrong variant"),
+        }
+        match serde_json::from_str(REQUEUE).expect("must deserialize") {
+            WalOperation::JobPreemptRequeue { run_attempt, .. } => {
+                assert_eq!(run_attempt, Some(3))
+            }
+            _ => panic!("wrong variant"),
+        }
+        for frozen in [CANCEL, REQUEUE] {
+            let op: WalOperation = serde_json::from_str(frozen).expect("must deserialize");
+            assert_eq!(
+                serde_json::to_string(&op).expect("must serialize"),
+                frozen,
+                "the entry must keep its wire shape"
+            );
+        }
+    }
+
     // A legacy entry that carried a real action must keep it.
     #[test]
     fn partition_create_pre_optional_preserves_configured_action() {
@@ -1529,6 +1708,54 @@ mod deregistration_wal_tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    // Frozen pre-capabilities Raft entries; a new field needs #[serde(default)],
+    // not a fixture edit.
+    #[test]
+    fn node_register_without_capabilities_still_deserializes() {
+        const NODE_REGISTER: &str = r#"{"NodeRegister":{"name":"n1","hostname":"n1","resources":{"cpus":4,"memory_mb":8000,"gpus":[],"generic":{}},"address":"10.0.0.1","port":6818,"wg_pubkey":"","version":"0.1.0","labels":{},"source":{"type":"NativeHost"}}}"#;
+        let op: WalOperation = serde_json::from_str(NODE_REGISTER)
+            .expect("frozen NodeRegister must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::NodeRegister { capabilities, .. } => assert!(capabilities.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn node_update_without_capabilities_still_deserializes() {
+        const NODE_UPDATE: &str = r#"{"NodeUpdate":{"name":"n1","hostname":"n1","resources":{"cpus":4,"memory_mb":8000,"gpus":[],"generic":{}},"address":"10.0.0.1","port":6818,"wg_pubkey":"","version":"0.1.0","source":{"type":"NativeHost"}}}"#;
+        let op: WalOperation = serde_json::from_str(NODE_UPDATE)
+            .expect("frozen NodeUpdate must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::NodeUpdate { capabilities, .. } => assert!(capabilities.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn node_register_capabilities_round_trip() {
+        let op = WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet::default(),
+            address: "10.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: NodeSource::NativeHost,
+            capabilities: vec![crate::node::CAP_SIGNAL_JOB.to_string()],
+        };
+        let json = serde_json::to_string(&op).expect("serialize");
+        let back: WalOperation = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            WalOperation::NodeRegister { capabilities, .. } => {
+                assert_eq!(capabilities, vec!["signal-job".to_string()]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1543,6 +1770,7 @@ mod suspend_wal_tests {
             preempted_by: Some(3),
             preempt_qos: Some("burst".into()),
             at: Some(stamped),
+            run_attempt: Some(4),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1552,11 +1780,13 @@ mod suspend_wal_tests {
                 preempted_by,
                 preempt_qos,
                 at,
+                run_attempt,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, Some(3));
                 assert_eq!(preempt_qos.as_deref(), Some("burst"));
                 assert_eq!(at, Some(stamped));
+                assert_eq!(run_attempt, Some(4));
             }
             _ => panic!("wrong variant"),
         }
@@ -1570,11 +1800,13 @@ mod suspend_wal_tests {
                 preempted_by,
                 preempt_qos,
                 at,
+                run_attempt,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
                 assert_eq!(at, None, "legacy entry falls back to apply time");
+                assert_eq!(run_attempt, None, "legacy entry checks no run");
             }
             _ => panic!("wrong variant"),
         }
@@ -1589,6 +1821,7 @@ mod suspend_wal_tests {
             preempted_by: Some(7),
             preempt_qos: Some("highprio".into()),
             at: None,
+            run_attempt: Some(2),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1598,12 +1831,14 @@ mod suspend_wal_tests {
                 begin_time: b,
                 preempted_by,
                 preempt_qos,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(b, begin_time);
                 assert_eq!(preempted_by, Some(7));
                 assert_eq!(preempt_qos.as_deref(), Some("highprio"));
+                assert_eq!(run_attempt, Some(2));
             }
             _ => panic!("wrong variant"),
         }
@@ -1615,10 +1850,12 @@ mod suspend_wal_tests {
             WalOperation::JobPreemptRequeue {
                 preempted_by,
                 preempt_qos,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
+                assert_eq!(run_attempt, None, "legacy entry checks no run");
             }
             _ => panic!("wrong variant"),
         }
@@ -1744,6 +1981,67 @@ mod suspend_wal_tests {
     }
 
     #[test]
+    fn job_time_limit_expired_has_a_frozen_wire_form() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&chrono::Utc);
+        let frozen =
+            r#"{"JobTimeLimitExpired":{"job_id":13,"run_attempt":2,"at":"2026-03-04T05:06:07Z"}}"#;
+        let op = WalOperation::JobTimeLimitExpired {
+            job_id: 13,
+            run_attempt: 2,
+            at,
+        };
+        assert_eq!(serde_json::to_string(&op).unwrap(), frozen);
+
+        let mut back: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            back,
+            WalOperation::JobTimeLimitExpired { job_id: 13, run_attempt: 2, at: a } if a == at
+        ));
+        assert_eq!(back.occurred_at(), Some(at));
+        back.stamp_occurred_at(at + chrono::Duration::hours(1));
+        assert_eq!(back.occurred_at(), Some(at), "it carries its own stamp");
+    }
+
+    #[test]
+    fn job_preempt_signaled_has_a_frozen_wire_form() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&chrono::Utc);
+        let deadline = at + chrono::Duration::seconds(90);
+        let frozen = concat!(
+            r#"{"JobPreemptSignaled":{"job_id":13,"pending":{"#,
+            r#""signaled_at":"2026-03-04T05:06:07Z","deadline":"2026-03-04T05:07:37Z","#,
+            r#""preempted_by":21,"preempt_qos":"high","mode":"Requeue","#,
+            r#""run_attempt":2,"requeue_hold_secs":30}}}"#
+        );
+        let pending = crate::job::PreemptPending {
+            signaled_at: at,
+            deadline,
+            preempted_by: 21,
+            preempt_qos: Some("high".into()),
+            mode: crate::partition::PreemptMode::Requeue,
+            run_attempt: 2,
+            requeue_hold_secs: 30,
+        };
+        let op = WalOperation::JobPreemptSignaled {
+            job_id: 13,
+            pending: pending.clone(),
+        };
+        assert_eq!(serde_json::to_string(&op).unwrap(), frozen);
+
+        let mut back: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            &back,
+            WalOperation::JobPreemptSignaled { job_id: 13, pending: p } if *p == pending
+        ));
+        assert_eq!(back.occurred_at(), Some(at));
+        back.stamp_occurred_at(at + chrono::Duration::hours(1));
+        assert_eq!(back.occurred_at(), Some(at), "it carries its own stamp");
+    }
+
+    #[test]
     fn job_cancel_signaled_op_round_trips() {
         let at = chrono::Utc::now();
         let op = WalOperation::JobCancelSignaled {
@@ -1775,6 +2073,40 @@ mod suspend_wal_tests {
             WalOperation::JobComplete { job_id: 5, ref unreported_nodes, .. }
                 if unreported_nodes.is_empty()
         ));
+    }
+
+    #[test]
+    fn a_job_complete_written_before_controller_initiated_existed_replays_as_the_runs_own_end() {
+        let old = r#"{"JobComplete":{"job_id":5,"exit_code":1,"state":"FAILED"}}"#;
+        let op: WalOperation = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobComplete {
+                job_id: 5,
+                controller_initiated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_controller_initiated_job_complete_has_a_frozen_wire_form() {
+        let frozen = r#"{"JobComplete":{"job_id":5,"exit_code":-1,"state":"FAILED","controller_initiated":true}}"#;
+        let op: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            op,
+            WalOperation::JobComplete {
+                job_id: 5,
+                exit_code: -1,
+                state: JobState::Failed,
+                controller_initiated: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_string(&WalOperation::job_failed_by_controller(5)).unwrap(),
+            frozen
+        );
     }
 
     #[test]

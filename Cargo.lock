@@ -3805,6 +3805,7 @@ dependencies = [
  "http",
  "http-body-util",
  "mlua",
+ "nix",
  "openraft",
  "parking_lot 0.13.0",
  "prost",

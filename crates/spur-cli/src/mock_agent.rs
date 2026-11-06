@@ -189,6 +189,13 @@ mock_agent_impl! {
             Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
         }
 
+        async fn signal_job(
+            &self,
+            _request: Request<proto::AgentSignalJobRequest>,
+        ) -> Result<Response<()>, Status> {
+            Ok(Response::new(()))
+        }
+
         async fn ping(
             &self,
             _request: Request<()>,

@@ -677,6 +677,14 @@ pub struct SchedulerConfig {
     /// Max seconds to wait in COMPLETING before force-finishing the job.
     #[serde(default = "default_complete_wait")]
     pub complete_wait_secs: u32,
+    /// Seconds between SIGTERM and SIGKILL for every stop except a time or
+    /// inactivity limit. Values below [`MIN_EFFECTIVE_KILL_WAIT_SECS`] act as that.
+    #[serde(default = "default_kill_wait")]
+    pub kill_wait_secs: u32,
+    /// The same wait for a job stopped by its time limit or the inactivity
+    /// limit, i.e. one that ends `TIMEOUT`. Same floor as `kill_wait_secs`.
+    #[serde(default = "default_timeout_kill_wait")]
+    pub timeout_kill_wait_secs: u32,
     /// Grace minutes after a reservation ends before cancelling its running jobs.
     #[serde(default)]
     pub resv_overrun_minutes: u32,
@@ -844,6 +852,34 @@ impl BillingWeights {
     }
 }
 
+/// Largest accepted `scheduler.kill_wait_secs` and
+/// `scheduler.timeout_kill_wait_secs` (Slurm's `KillWait` ceiling).
+pub const MAX_KILL_WAIT_SECS: u32 = 65533;
+
+/// Floor applied to both kill waits: a shorter wait gives a job's SIGTERM
+/// handler no realistic chance to run before SIGKILL.
+pub const MIN_EFFECTIVE_KILL_WAIT_SECS: u32 = 5;
+
+impl SchedulerConfig {
+    /// The SIGTERM-to-SIGKILL wait to apply, with the floor enforced.
+    pub fn effective_kill_wait_secs(&self) -> u32 {
+        self.kill_wait_secs.max(MIN_EFFECTIVE_KILL_WAIT_SECS)
+    }
+
+    /// The SIGTERM-to-SIGKILL wait for a job stopped by a time or inactivity
+    /// limit, with the floor enforced.
+    pub fn effective_timeout_kill_wait_secs(&self) -> u32 {
+        self.timeout_kill_wait_secs
+            .max(MIN_EFFECTIVE_KILL_WAIT_SECS)
+    }
+
+    /// The longer of the two SIGTERM-to-SIGKILL waits, floors enforced.
+    pub fn longest_effective_kill_wait_secs(&self) -> u32 {
+        self.effective_kill_wait_secs()
+            .max(self.effective_timeout_kill_wait_secs())
+    }
+}
+
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
 /// keep its allocation attended. Shared with the CLI so `inactive_limit_secs`
 /// can be validated against it.
@@ -863,6 +899,12 @@ fn default_time_limit() -> u32 {
 }
 fn default_complete_wait() -> u32 {
     300
+}
+fn default_kill_wait() -> u32 {
+    5
+}
+fn default_timeout_kill_wait() -> u32 {
+    30
 }
 fn default_inactive_limit() -> u32 {
     300
@@ -884,6 +926,8 @@ impl Default for SchedulerConfig {
             default_time_limit_minutes: 0,
             enforce_part_limits: EnforcePartLimits::No,
             complete_wait_secs: 300,
+            kill_wait_secs: default_kill_wait(),
+            timeout_kill_wait_secs: default_timeout_kill_wait(),
             resv_overrun_minutes: 0,
             inactive_limit_secs: default_inactive_limit(),
             max_user_priority: default_max_user_priority(),
@@ -1163,6 +1207,11 @@ pub struct PartitionConfig {
     /// `None` defers to `scheduler.preempt_exempt_time`.
     #[serde(default)]
     pub preempt_exempt_time: Option<u32>,
+    /// Seconds a preempted job gets to wind down before it is killed. Used when
+    /// the victim's QOS leaves its grace time unset; the highest value among the
+    /// partitions the job runs in applies. `None` means unset.
+    #[serde(default)]
+    pub grace_time: Option<u32>,
 }
 
 fn default_partition_state() -> String {
@@ -2282,6 +2331,24 @@ impl SlurmConfig {
         Ok(config)
     }
 
+    /// Seconds a node can need after SIGTERM before it reports completion:
+    /// the longer kill wait, then the cgroup cleanup spurd waits out first.
+    /// `scheduler.complete_wait_secs` should exceed this.
+    pub fn complete_wait_floor_secs(&self) -> u32 {
+        // Counted even when `cgroup.enabled` is false: nodes read their own
+        // config, so the controller's flag says nothing about theirs.
+        self.scheduler
+            .longest_effective_kill_wait_secs()
+            .saturating_add(self.cgroup.cleanup_timeout_secs)
+    }
+
+    /// Whether `scheduler.complete_wait_secs` would drain healthy nodes that
+    /// are still being killed or cleaned up. Not a validation error so
+    /// existing configs keep loading.
+    pub fn complete_wait_too_short(&self) -> bool {
+        self.scheduler.complete_wait_secs <= self.complete_wait_floor_secs()
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if let Some(external) = self
             .topology
@@ -2527,6 +2594,20 @@ impl SlurmConfig {
                 field: "cgroup.allowed_ram_percent".into(),
                 value: "0 (must be at least 1)".into(),
             });
+        }
+        for (field, value) in [
+            ("scheduler.kill_wait_secs", self.scheduler.kill_wait_secs),
+            (
+                "scheduler.timeout_kill_wait_secs",
+                self.scheduler.timeout_kill_wait_secs,
+            ),
+        ] {
+            if value > MAX_KILL_WAIT_SECS {
+                return Err(ConfigError::InvalidValue {
+                    field: field.into(),
+                    value: format!("{value} (must be at most {MAX_KILL_WAIT_SECS})"),
+                });
+            }
         }
         // A limit below the client's ping interval would reap a live client
         // between its own keepalives. Require at least two intervals of slack.
@@ -2856,6 +2937,7 @@ impl SlurmConfig {
                 preempt_mode: crate::partition::parse_preempt_mode(&pc.preempt_mode)
                     .unwrap_or(None),
                 preempt_exempt_time: pc.preempt_exempt_time,
+                grace_time: pc.grace_time,
                 ..Default::default()
             })
             .collect()
@@ -4517,6 +4599,19 @@ deny_accounts = ["student"]
     }
 
     #[test]
+    fn config_partition_grace_time_loads() {
+        let cfg = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\ngrace_time = 600\n\n\
+             [[partitions]]\nname = \"zero\"\ngrace_time = 0\n\n[[partitions]]\nname = \"unset\"\n",
+        )
+        .unwrap();
+        let parts = cfg.build_partitions();
+        assert_eq!(parts[0].grace_time, Some(600));
+        assert_eq!(parts[1].grace_time, Some(0));
+        assert_eq!(parts[2].grace_time, None);
+    }
+
+    #[test]
     fn partition_preempt_mode_typo_is_rejected_at_load() {
         let err = SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\npreempt_mode = \"cancle\"\n",
@@ -4620,6 +4715,153 @@ inactive_limit_secs = 20
                 .unwrap();
         assert_eq!(other_scheduler_keys.scheduler.inactive_limit_secs, 300);
         assert_eq!(SchedulerConfig::default().inactive_limit_secs, 300);
+    }
+
+    #[test]
+    fn kill_wait_defaults_to_5() {
+        let parsed = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(parsed.scheduler.kill_wait_secs, 5);
+        assert_eq!(SchedulerConfig::default().kill_wait_secs, 5);
+    }
+
+    #[test]
+    fn timeout_kill_wait_defaults_to_30() {
+        let parsed = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert_eq!(parsed.scheduler.timeout_kill_wait_secs, 30);
+        assert_eq!(SchedulerConfig::default().timeout_kill_wait_secs, 30);
+    }
+
+    #[test]
+    fn defaults_reproduce_main_timings() {
+        let scheduler = SchedulerConfig::default();
+        assert_eq!(scheduler.effective_kill_wait_secs(), 5);
+        assert_eq!(scheduler.effective_timeout_kill_wait_secs(), 30);
+    }
+
+    #[test]
+    fn effective_kill_wait_floors_at_5() {
+        let with = |kill_wait_secs| SchedulerConfig {
+            kill_wait_secs,
+            ..Default::default()
+        };
+        assert_eq!(with(0).effective_kill_wait_secs(), 5);
+        assert_eq!(with(3).effective_kill_wait_secs(), 5);
+        assert_eq!(with(45).effective_kill_wait_secs(), 45);
+    }
+
+    #[test]
+    fn effective_timeout_kill_wait_floors_at_5() {
+        let with = |timeout_kill_wait_secs| SchedulerConfig {
+            timeout_kill_wait_secs,
+            ..Default::default()
+        };
+        assert_eq!(with(0).effective_timeout_kill_wait_secs(), 5);
+        assert_eq!(with(3).effective_timeout_kill_wait_secs(), 5);
+        assert_eq!(with(45).effective_timeout_kill_wait_secs(), 45);
+    }
+
+    #[test]
+    fn kill_wait_above_max_is_rejected() {
+        let toml = format!(
+            "cluster_name = \"test\"\n[scheduler]\nkill_wait_secs = {}\n",
+            MAX_KILL_WAIT_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("scheduler.kill_wait_secs"),
+            "unexpected error: {err}"
+        );
+        let at_max = format!(
+            "cluster_name = \"test\"\n[scheduler]\nkill_wait_secs = {MAX_KILL_WAIT_SECS}\n"
+        );
+        SlurmConfig::load_from_str(&at_max).expect("the maximum must be accepted");
+    }
+
+    #[test]
+    fn timeout_kill_wait_above_max_is_rejected() {
+        let toml = format!(
+            "cluster_name = \"test\"\n[scheduler]\ntimeout_kill_wait_secs = {}\n",
+            MAX_KILL_WAIT_SECS + 1
+        );
+        let err = SlurmConfig::load_from_str(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("scheduler.timeout_kill_wait_secs"),
+            "unexpected error: {err}"
+        );
+        let at_max = format!(
+            "cluster_name = \"test\"\n[scheduler]\ntimeout_kill_wait_secs = {MAX_KILL_WAIT_SECS}\n"
+        );
+        SlurmConfig::load_from_str(&at_max).expect("the maximum must be accepted");
+    }
+
+    fn config_with_waits(
+        kill_wait_secs: u32,
+        timeout_kill_wait_secs: u32,
+        cleanup_timeout_secs: u32,
+        complete_wait_secs: u32,
+    ) -> SlurmConfig {
+        SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n\
+             [scheduler]\n\
+             kill_wait_secs = {kill_wait_secs}\n\
+             timeout_kill_wait_secs = {timeout_kill_wait_secs}\n\
+             complete_wait_secs = {complete_wait_secs}\n\
+             [cgroup]\n\
+             cleanup_timeout_secs = {cleanup_timeout_secs}\n"
+        ))
+        .expect("fixture config must load")
+    }
+
+    #[test]
+    fn complete_wait_too_short_flags_a_wait_not_above_kill_wait_plus_cleanup() {
+        let defaults = SlurmConfig::load_from_str("cluster_name = \"test\"\n").unwrap();
+        assert!(!defaults.complete_wait_too_short());
+        assert!(config_with_waits(30, 0, 0, 30).complete_wait_too_short());
+        assert!(!config_with_waits(30, 0, 0, 31).complete_wait_too_short());
+        assert!(config_with_waits(30, 0, 60, 90).complete_wait_too_short());
+        assert!(!config_with_waits(30, 0, 60, 91).complete_wait_too_short());
+        // The effective floor of 5 applies, so a configured 0 still counts as 5.
+        assert!(config_with_waits(0, 0, 0, 5).complete_wait_too_short());
+        assert!(!config_with_waits(0, 0, 0, 6).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_uses_the_larger_kill_wait() {
+        assert!(config_with_waits(5, 40, 0, 35).complete_wait_too_short());
+        assert!(!config_with_waits(5, 40, 0, 41).complete_wait_too_short());
+        assert!(config_with_waits(40, 5, 0, 35).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_counts_the_cgroup_cleanup_timeout() {
+        // A kill wait of 270 alone fits under 300, but a SIGKILLed job with a
+        // 35 s teardown does not.
+        assert!(config_with_waits(5, 270, 35, 300).complete_wait_too_short());
+        assert!(!config_with_waits(5, 270, 29, 300).complete_wait_too_short());
+        assert!(!config_with_waits(5, 270, 0, 300).complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_floor_counts_cleanup_even_with_cgroups_disabled() {
+        let toml = "cluster_name = \"test\"\n\
+                    [scheduler]\nkill_wait_secs = 30\ncomplete_wait_secs = 90\n\
+                    [cgroup]\nenabled = false\ncleanup_timeout_secs = 60\n";
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.complete_wait_floor_secs(), 90);
+        assert!(config.complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_too_short_does_not_overflow_on_extreme_waits() {
+        let config = config_with_waits(MAX_KILL_WAIT_SECS, MAX_KILL_WAIT_SECS, u32::MAX, u32::MAX);
+        assert!(config.complete_wait_too_short());
+    }
+
+    #[test]
+    fn complete_wait_not_above_kill_wait_plus_cleanup_still_loads() {
+        let toml = "cluster_name = \"test\"\n[scheduler]\ncomplete_wait_secs = 30\n";
+        let parsed = SlurmConfig::load_from_str(toml).expect("a legacy config must still load");
+        assert!(parsed.complete_wait_too_short());
     }
 
     #[test]
