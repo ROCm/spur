@@ -744,11 +744,9 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    triggered the eviction; suspend preemption frees nothing and hands nothing
    off. While the victims run out their preemption grace or drain, and for at
    least two scheduling passes after the last one releases its resources,
-   other pending jobs, including competing
-   preemptors, cannot be placed on those nodes. A pass runs every
-   ``interval_secs``, or sooner when an event such as a submission or requeue
-   wakes the scheduler, so the post-release
-   window can be well under ``interval_secs``. This protects a multi-node
+   other pending jobs cannot be placed on those nodes. A pass runs every
+   ``interval_secs``, or sooner when a submission wakes the scheduler, so the
+   post-release window can be well under ``interval_secs``. This protects a multi-node
    preemptor whose victims finish at different times. Jobs queued behind the
    preemptor still plan future starts on those nodes once the preemptor has a
    planned start, but none of them starts there before it.
@@ -757,6 +755,10 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    On nodes shared by several jobs, capacity left over beside the victim stays
    unused by other pending jobs until every preemptor holding the node is
    placed or its handoff ends.
+
+   Jobs placed through GPU property or fabric constraints are not placed on a
+   handed-off node until its handoff ends. Heterogeneous jobs are handled per
+   component.
 
    The exception is other preemptors whose own victims ran on the same node:
    each of them may use the node, and they are not ordered against each other.
@@ -769,8 +771,8 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    node in an active reservation is handed off only to a preemptor allowed to
    use that reservation, and idle-fill reclaim creates no handoff.
 
-   A handoff whose victims are still in grace or draining after cancel
-   preemption survives a controller restart. Once a requeue takes effect, its
+   A handoff whose victims are still running out a grace, or draining after
+   cancel preemption, survives a controller restart. Once a requeue takes effect, its
    victim releases the remaining nodes at once, so the handoff is post-release
    only. Post-release handoffs are kept in controller memory, so a restart or
    leader change can drop one, or renew it for two more passes (longer if the

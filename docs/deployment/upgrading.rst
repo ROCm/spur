@@ -934,6 +934,20 @@ The ``grace_time`` column is added to the QOS table automatically with
 ``ADD COLUMN IF NOT EXISTS``, and a controller that predates this release
 ignores it.
 
+Preemption handoff
+~~~~~~~~~~~~~~~~~~
+
+Cancel and requeue preemption now hold the nodes they free for the job that
+triggered the eviction, so other pending jobs no longer take them in the gap
+(see :doc:`../admin-guide/configuration`). No configuration change is needed
+and no new Raft entry type is added: the requeue entry gains an optional
+``handoff`` field that a controller predating it ignores.
+
+During a rolling upgrade a controller that predates this release does not hold
+the nodes, so the protection applies only once the leader runs the new build.
+Victim selection also counts nodes that a draining job has already released,
+which changes ordinary preemption as well.
+
 See Also
 --------
 
