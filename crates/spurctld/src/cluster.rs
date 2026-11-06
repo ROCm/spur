@@ -2736,7 +2736,7 @@ impl ClusterManager {
             }
             job.run_attempt.saturating_add(1)
         };
-        // `JobStart`'s apply has no state guard, so it charges the slice while
+        // `JobStart`'s apply has no Pending guard, so it charges the slice while
         // the job is still Pending; the transition to Running follows once the
         // dispatch is confirmed (see `activate_job`).
         let resp = self.propose(WalOperation::JobStart {
@@ -2749,11 +2749,12 @@ impl ClusterManager {
             idle_fill,
             at: None,
         })?;
-        // The read-then-propose above is not atomic: a second reservation or a new
-        // exclusion can apply first, so the apply's refusal is the answer that counts.
+        // The read-then-propose above is not atomic: a second reservation, a cancel
+        // or a new exclusion can apply first, so the apply's refusal is the answer
+        // that counts.
         if !resp.job_started {
             anyhow::bail!(
-                "job {} lost a concurrent reservation race or now excludes a chosen node",
+                "job {} lost a concurrent reservation race, ended, or now excludes a chosen node",
                 job_id
             );
         }
@@ -8510,11 +8511,19 @@ impl ClusterManager {
             } => {
                 // Durable backstop for `reserve_placement`'s own pre-check: a racing
                 // second propose for the same job must not double-charge nodes.
-                // Not gated on job state — a legitimate JobStart can apply against
-                // a job in any state, only ever against one that isn't already
-                // charged.
+                // Not gated on Pending: a log written before placements were
+                // reserved ahead of dispatch applies JobStart to a Running job.
                 if jobs.get(job_id).is_some_and(Job::holds_a_placement) {
                     warn!(job_id = *job_id, "ignoring a duplicate JobStart replay");
+                    return ClientResponse::default();
+                }
+                // A cancel can apply between `reserve_placement`'s Pending check and
+                // this entry. Nothing frees a charge on a job that has ended.
+                if jobs.get(job_id).is_some_and(|job| job.state.is_terminal()) {
+                    warn!(
+                        job_id = *job_id,
+                        "refusing a JobStart for a job that already ended"
+                    );
                     return ClientResponse::default();
                 }
                 // The exclusion is in the log, so every replica refuses the same entry;
@@ -13284,6 +13293,61 @@ state = "UP"
             cm.get_node("n1").unwrap().alloc_resources.cpus,
             4,
             "the duplicate must not double-charge the node"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_before_the_jobstart_apply_does_not_leave_the_node_charged() {
+        // reserve_placement checks Pending and then proposes JobStart. A cancel of
+        // the still-unplaced job can apply in between. Replay that order by hand.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+        let attempt = cm.get_job(id).unwrap().run_attempt + 1;
+
+        cm.cancel_job_as_system(id).expect("cancel");
+        settle(&cm, id, JobState::Cancelled);
+        let started = cm
+            .propose(WalOperation::JobStart {
+                job_id: id,
+                nodes: vec!["n1".into()],
+                resources: res.clone(),
+                per_node_alloc: per_node_for(&["n1"], res.clone()),
+                srun_step_dispatch: false,
+                run_attempt: attempt,
+                idle_fill: false,
+                at: None,
+            })
+            .expect("propose JobStart");
+
+        // The scheduler's next steps: the activation fails, so it aborts the placement.
+        let activated = cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+            false,
+        );
+        assert!(
+            activated.is_err(),
+            "a cancelled job must not become Running"
+        );
+        cm.abort_placement(id, attempt, false).expect("abort");
+
+        let node = cm.get_node("n1").unwrap();
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(
+            node.alloc_resources.cpus, 0,
+            "node n1 is still charged for job {id} (state {:?}, allocated_nodes {:?})",
+            job.state, job.allocated_nodes
+        );
+        assert!(
+            !started.job_started,
+            "reserve_placement must see the refusal, so the scheduler does not dispatch"
         );
     }
 
