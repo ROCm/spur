@@ -1,6 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "preemption_usage.rs"]
+mod preemption_usage;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -594,6 +597,7 @@ pub struct ClusterManager {
     /// None when running without a config file (e.g. in tests).
     config_path: Option<PathBuf>,
     jobs: RwLock<HashMap<JobId, Job>>,
+    preemption_usage: RwLock<preemption_usage::UsageLedger>,
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
@@ -945,6 +949,7 @@ impl ClusterManager {
             scheduler_interval_secs,
             config_path,
             jobs: RwLock::new(HashMap::new()),
+            preemption_usage: RwLock::new(Default::default()),
             nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
@@ -3230,6 +3235,27 @@ impl ClusterManager {
             preempted_by,
             preempt_qos,
             true,
+            None,
+        )
+    }
+
+    pub(crate) fn preempt_job_for_attempt(
+        &self,
+        job_id: JobId,
+        expected_run_attempt: u32,
+        mode: PreemptMode,
+        preemptor: JobId,
+        preemptor_run_attempt: u32,
+        preempt_qos: Option<String>,
+    ) -> anyhow::Result<PreemptOutcome> {
+        self.preempt_job_inner(
+            job_id,
+            expected_run_attempt,
+            mode,
+            Some(preemptor),
+            preempt_qos,
+            true,
+            Some(preemptor_run_attempt),
         )
     }
 
@@ -3253,9 +3279,11 @@ impl ClusterManager {
             reclaimed_by,
             preempt_qos,
             false,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn preempt_job_inner(
         &self,
         job_id: JobId,
@@ -3264,6 +3292,7 @@ impl ClusterManager {
         preempted_by: Option<JobId>,
         preempt_qos: Option<String>,
         earmark_freed: bool,
+        preemptor_run_attempt: Option<u32>,
     ) -> anyhow::Result<PreemptOutcome> {
         {
             let jobs = self.jobs.read();
@@ -3307,6 +3336,7 @@ impl ClusterManager {
             }
             PreemptMode::Cancel => {
                 let resp = self.propose(WalOperation::JobPreemptCancel {
+                    preemptor_run_attempt,
                     job_id,
                     preempted_by,
                     preempt_qos,
@@ -3342,6 +3372,7 @@ impl ClusterManager {
                         .map_or(hold, |user_begin| user_begin.max(hold))
                 };
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
+                    preemptor_run_attempt,
                     handoff: earmark_freed && preempted_by.is_some(),
                     job_id,
                     begin_time,
@@ -3723,6 +3754,11 @@ impl ClusterManager {
                 })
                 .unwrap_or((0, 0, None, None, None, None));
             notifier.notify_job_end(JobEndRecord {
+                preemption_usage: self
+                    .jobs
+                    .read()
+                    .get(&job_id)
+                    .map(|j| j.preemption_usage.clone()),
                 job_id,
                 state: state.display().to_owned(),
                 exit_code: finalized.exit_code,
@@ -6683,6 +6719,7 @@ impl ClusterManager {
             .filter(|(id, j)| {
                 j.state.is_finalized()
                     && j.end_time.is_some_and(|t| t < before)
+                    && j.preemption_usage_updated_at.is_none_or(|t| t < before)
                     && !referenced.contains(id)
                     && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
             })
@@ -6692,7 +6729,12 @@ impl ClusterManager {
         if job_ids.is_empty() {
             return;
         }
-        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { job_ids }) {
+        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            job_ids,
+            before: Some(before),
+            at: None,
+        }) {
             warn!(error = %e, "failed to evict expired terminal jobs");
         }
     }
@@ -8046,7 +8088,7 @@ impl ClusterManager {
 
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
-    fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+    fn apply_job_operation(&self, op: &WalOperation) -> ClientResponse {
         let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
@@ -8369,6 +8411,7 @@ impl ClusterManager {
                 preempt_qos,
                 at,
                 run_attempt,
+                ..
             } => {
                 let at = at.unwrap_or(timestamp);
                 let freed_nodes;
@@ -9543,14 +9586,28 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::EvictTerminalJobs { job_ids } => {
+            WalOperation::EvictTerminalJobs {
+                job_ids, before, ..
+            } => {
                 // Re-check finalized: spare an id requeued between propose and
                 // apply. Deterministic — every replica applies in the same order.
+                let usage = self.preemption_usage.read();
                 let evicted: HashSet<JobId> = job_ids
                     .iter()
-                    .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_finalized()))
+                    .filter(|id| {
+                        jobs.get(id).is_some_and(|j| {
+                            j.state.is_finalized()
+                                && !usage.tracks_request(**id)
+                                && before.is_none_or(|cutoff| {
+                                    j.end_time.is_some_and(|end| end < cutoff)
+                                        && j.preemption_usage_updated_at
+                                            .is_none_or(|updated| updated < cutoff)
+                                })
+                        })
+                    })
                     .copied()
                     .collect();
+                drop(usage);
                 if !evicted.is_empty() {
                     jobs.retain(|id, _| !evicted.contains(id));
                     self.steps
@@ -9581,6 +9638,8 @@ const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// Must include all durable cluster state so a follower can fully restore from it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ClusterSnapshot {
+    #[serde(default)]
+    preemption_usage: preemption_usage::UsageLedger,
     jobs: Vec<Job>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
@@ -9748,6 +9807,7 @@ impl StateMachineApply for ClusterManager {
         let next_step_id = self.next_step_id.read().clone();
         let steps: Vec<_> = self.steps.read().values().cloned().collect();
         let snap = ClusterSnapshot {
+            preemption_usage: self.preemption_usage.read().clone(),
             jobs: self.jobs.read().values().cloned().collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
@@ -9771,6 +9831,7 @@ impl StateMachineApply for ClusterManager {
         // can't lower next_job_id and reissue used ids (absent → 0, harmless).
         let mut next_id = self.config().controller.first_job_id.max(snap.next_job_id);
         let mut jobs = self.jobs.write();
+        *self.preemption_usage.write() = snap.preemption_usage;
         jobs.clear();
         for job in snap.jobs {
             next_id = next_id.max(job.job_id + 1);
@@ -15055,6 +15116,9 @@ state = "UP"
         // Apply removes only ids still finalized; live ids 2 and 3 are no-ops
         // even when named (a job requeued between propose and apply).
         cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
             job_ids: vec![1, 2, 3, 4],
         });
         assert!(
@@ -15100,7 +15164,12 @@ state = "UP"
         cm_b.jobs.write().get_mut(&1).unwrap().end_time =
             Some(chrono::Utc::now() + chrono::Duration::hours(2));
 
-        let entry = WalOperation::EvictTerminalJobs { job_ids: vec![1] };
+        let entry = WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![1],
+        };
         cm_a.apply_operation(&entry);
         cm_b.apply_operation(&entry);
         assert!(cm_a.get_job(1).is_none(), "finalized id is evicted");
@@ -15262,7 +15331,12 @@ state = "UP"
         });
         cm.apply_operation(&WalOperation::job_complete(id2, 0, JobState::Cancelled));
         let next_before = cm.next_job_id.load(Ordering::Relaxed);
-        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![id2] });
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![id2],
+        });
         assert!(cm.get_job(id2).is_none(), "high-id job evicted");
 
         // Snapshot AFTER eviction: id2's JobSubmit is compacted away, so the map
@@ -16619,6 +16693,7 @@ state = "UP"
             at: None,
         });
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
@@ -17752,6 +17827,7 @@ state = "UP"
         let job_id = run_job_on(&cm, "preempt-kind", "worker1");
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: false,
             job_id,
             begin_time: Utc::now(),
@@ -17977,6 +18053,7 @@ state = "UP"
         let job_id = run_job_on(&cm, "preempt-requeue", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: false,
             job_id,
             begin_time: Utc::now(),
@@ -19911,6 +19988,7 @@ state = "UP"
 
         // Apply with explicit provenance to verify field propagation.
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -19951,6 +20029,7 @@ state = "UP"
 
         // Replay: job is already Cancelled (not Running) → NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -20001,6 +20080,7 @@ state = "UP"
 
     fn preempt_cancel_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptCancel {
+            preemptor_run_attempt: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: None,
@@ -20011,6 +20091,7 @@ state = "UP"
 
     fn preempt_requeue_for_run(run_attempt: Option<u32>) -> WalOperation {
         WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
             begin_time: Utc::now() + chrono::Duration::seconds(5),
@@ -20648,6 +20729,7 @@ state = "UP"
         // Apply without provenance fields — simulates a WAL entry written by an
         // older controller; new fields default to None and must not panic.
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
             begin_time,
@@ -20673,6 +20755,7 @@ state = "UP"
 
         // Replay the identical entry: job is already Pending -> NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: false,
             job_id: 1,
             begin_time,
@@ -22805,6 +22888,7 @@ state = "UP"
         let (victim_id, hunter_id) = run_victim_and_submit_hunter(cm, node, victim_qos, hunter_qos);
         let signaled_at = Utc::now();
         let pending = PreemptPending {
+            preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(600),
             preempted_by: hunter_id,
@@ -23149,6 +23233,7 @@ state = "UP"
         let victim = run_job_on(cm, "victim", "n1");
         let owner = submit_and_wait(cm, basic_spec("owner"));
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
             begin_time: Utc::now() + chrono::Duration::hours(1),
@@ -23203,6 +23288,7 @@ state = "UP"
         let victim = run_job_on(&cm, "victim", "n1");
         let owner = run_job_on(&cm, "owner", "n2");
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             run_attempt: Some(cm.get_job(victim).unwrap().run_attempt),
             job_id: victim,
             begin_time: Utc::now() + chrono::Duration::hours(1),
@@ -31203,7 +31289,12 @@ state = "UP"
         });
         assert_eq!(cm.allocate_step_id(1), 0);
 
-        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![1] });
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![1],
+        });
 
         assert_eq!(
             cm.allocate_step_id(1),
@@ -31945,6 +32036,7 @@ state = "UP"
             .expect("fixture instant")
             .with_timezone(&Utc);
         PreemptPending {
+            preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(deadline_offset_secs),
             preempted_by: 99,
@@ -32639,6 +32731,7 @@ state = "UP"
         let id = run_job_in_grace(&cm, "victim", "n1");
 
         cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemptor_run_attempt: None,
             job_id: id,
             preempted_by: Some(99),
             preempt_qos: None,
@@ -32659,6 +32752,7 @@ state = "UP"
         let id = run_job_in_grace(&cm, "victim", "n1");
 
         cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: false,
             job_id: id,
             begin_time: Utc::now(),
@@ -33072,6 +33166,7 @@ state = "UP"
         take_over_node(&cm, "n1");
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            preemptor_run_attempt: None,
             job_id: id,
             preempted_by: Some(99),
             preempt_qos: Some("high".into()),
@@ -33152,6 +33247,7 @@ state = "UP"
         let begin_time = grace_exit_at() + chrono::Duration::seconds(40);
 
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: true,
             job_id: id,
             begin_time,
@@ -37763,6 +37859,7 @@ state = "UP"
         stale.labels = HashMap::new();
 
         let snap = ClusterSnapshot {
+            preemption_usage: Default::default(),
             jobs: Vec::new(),
             nodes: vec![stale],
             reservations: Vec::new(),

@@ -205,6 +205,9 @@ pub enum WalOperation {
     /// the leader-computed absolute instant (already max'd against any user
     /// `--begin`); followers apply it verbatim and re-apply is a NoOp.
     JobPreemptRequeue {
+        /// Fix the requesting epoch before the scheduler awaits victim signals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preemptor_run_attempt: Option<u32>,
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
         /// Job that triggered this preemption. Absent in WAL entries written by
@@ -232,6 +235,9 @@ pub enum WalOperation {
     /// dependents and arrays resolve. Single atomic entry so a leadership
     /// change cannot strand the job running with its allocations held.
     JobPreemptCancel {
+        /// Fix the requesting epoch before the scheduler awaits victim signals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preemptor_run_attempt: Option<u32>,
         job_id: JobId,
         /// Job that triggered this preemption. Absent in WAL entries written by
         /// older controllers; defaults to `None` on replay.
@@ -454,6 +460,14 @@ pub enum WalOperation {
     /// Evict the named terminal jobs to bound controller memory. The leader
     /// resolves the aged-out set so every replica evicts identically.
     EvictTerminalJobs {
+        /// Empty maintenance entries preserve observations while older controllers apply a no-op.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preemption_release: Option<crate::preemption_usage::PreemptionRelease>,
+        /// Leave late usage updates long enough for accounting reconciliation.
+        #[serde(default)]
+        before: Option<chrono::DateTime<chrono::Utc>>,
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
         job_ids: Vec<JobId>,
     },
     NodeK0sSetError {
@@ -524,6 +538,19 @@ impl WalOperation {
             cancel: Some(cancel),
             controller_initiated: false,
             at: None,
+        }
+    }
+
+    pub fn preemption_release(job_id: JobId, run_attempt: u32, released: bool) -> Self {
+        Self::EvictTerminalJobs {
+            job_ids: Vec::new(),
+            before: None,
+            at: None,
+            preemption_release: Some(crate::preemption_usage::PreemptionRelease {
+                job_id,
+                run_attempt,
+                released,
+            }),
         }
     }
 
@@ -641,7 +668,8 @@ impl WalOperation {
     /// Replays must date from here, not their own clock. `None` pre-upgrade.
     pub fn occurred_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match self {
-            Self::JobStart { at, .. }
+            Self::EvictTerminalJobs { at, .. }
+            | Self::JobStart { at, .. }
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
@@ -682,8 +710,7 @@ impl WalOperation {
             | Self::NodeK0sClear { .. }
             | Self::NodeK0sSetError { .. }
             | Self::K0sMemberNodesAdd { .. }
-            | Self::K0sMemberNodesRemove { .. }
-            | Self::EvictTerminalJobs { .. } => None,
+            | Self::K0sMemberNodesRemove { .. } => None,
         }
     }
 
@@ -691,7 +718,8 @@ impl WalOperation {
     /// An entry that already carries one keeps it.
     pub fn stamp_occurred_at(&mut self, now: chrono::DateTime<chrono::Utc>) {
         let slot = match self {
-            Self::JobStart { at, .. }
+            Self::EvictTerminalJobs { at, .. }
+            | Self::JobStart { at, .. }
             | Self::JobStateChange { at, .. }
             | Self::JobComplete { at, .. }
             | Self::JobNodeComplete { at, .. }
@@ -732,8 +760,7 @@ impl WalOperation {
             | Self::NodeK0sClear { .. }
             | Self::NodeK0sSetError { .. }
             | Self::K0sMemberNodesAdd { .. }
-            | Self::K0sMemberNodesRemove { .. }
-            | Self::EvictTerminalJobs { .. } => return,
+            | Self::K0sMemberNodesRemove { .. } => return,
         };
         slot.get_or_insert(now);
     }
@@ -1705,7 +1732,7 @@ mod deregistration_wal_tests {
             "frozen EvictTerminalJobs must deserialize; a new field needs #[serde(default)]",
         );
         match op {
-            WalOperation::EvictTerminalJobs { job_ids } => {
+            WalOperation::EvictTerminalJobs { job_ids, .. } => {
                 assert_eq!(job_ids, vec![7, 42]);
             }
             _ => panic!("wrong variant"),
@@ -1769,6 +1796,7 @@ mod suspend_wal_tests {
     fn preempt_cancel_op_round_trips() {
         let stamped = chrono::Utc::now();
         let op = WalOperation::JobPreemptCancel {
+            preemptor_run_attempt: None,
             job_id: 7,
             preempted_by: Some(3),
             preempt_qos: Some("burst".into()),
@@ -1784,12 +1812,14 @@ mod suspend_wal_tests {
                 preempt_qos,
                 at,
                 run_attempt,
+                preemptor_run_attempt,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, Some(3));
                 assert_eq!(preempt_qos.as_deref(), Some("burst"));
                 assert_eq!(at, Some(stamped));
                 assert_eq!(run_attempt, Some(4));
+                assert_eq!(preemptor_run_attempt, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1804,12 +1834,14 @@ mod suspend_wal_tests {
                 preempt_qos,
                 at,
                 run_attempt,
+                preemptor_run_attempt,
             } => {
                 assert_eq!(job_id, 7);
                 assert_eq!(preempted_by, None, "legacy entry defaults to None");
                 assert_eq!(preempt_qos, None, "legacy entry defaults to None");
                 assert_eq!(at, None, "legacy entry falls back to apply time");
                 assert_eq!(run_attempt, None, "legacy entry checks no run");
+                assert_eq!(preemptor_run_attempt, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1819,6 +1851,7 @@ mod suspend_wal_tests {
     fn preempt_requeue_op_round_trips() {
         let begin_time = chrono::Utc::now();
         let op = WalOperation::JobPreemptRequeue {
+            preemptor_run_attempt: None,
             handoff: true,
             job_id: 42,
             begin_time,
@@ -2039,6 +2072,7 @@ mod suspend_wal_tests {
             r#""run_attempt":2,"requeue_hold_secs":30}}}"#
         );
         let pending = crate::job::PreemptPending {
+            preemptor_run_attempt: None,
             signaled_at: at,
             deadline,
             preempted_by: 21,

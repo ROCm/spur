@@ -2521,9 +2521,25 @@ impl SlurmController for ControllerService {
             return self.forward_to_leader(request).await;
         }
 
-        Ok(Response::new(crate::metrics_proto::sched_stats_to_proto(
-            &self.sched_stats.snapshot(),
-        )))
+        let identity = Self::verified_identity(&request);
+        let jobs = job_read_scope(&self.cluster, identity);
+        let usage = usage_read_scope(&self.cluster, identity);
+        let mut snapshot = self.sched_stats.snapshot();
+        snapshot.preemption_usage = self.cluster.preemption_usage();
+        let mut response = crate::metrics_proto::sched_stats_to_proto(&snapshot);
+        let users = self
+            .cluster
+            .user_preemption_usage(|user| jobs.permits(user) && usage.permits(user));
+        response.preemption_users_truncated = users.len() > 1000;
+        response.preemption_users = users
+            .into_iter()
+            .take(1000)
+            .map(|(user, usage)| UserPreemptionUsage {
+                user,
+                usage: Some(crate::metrics_proto::preemption_usage_to_proto(&usage)),
+            })
+            .collect();
+        Ok(Response::new(response))
     }
 
     async fn get_assoc_mgr_info(
@@ -5348,6 +5364,9 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     use spur_core::hostlist;
 
     JobInfo {
+        preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
+            &job.preemption_usage,
+        )),
         gpu_bindings: job
             .per_node_alloc
             .iter()
@@ -7420,7 +7439,12 @@ mod tests {
             JobState::Pending,
             JobState::Cancelled,
         ));
-        apply(&WalOperation::EvictTerminalJobs { job_ids: vec![20] });
+        apply(&WalOperation::EvictTerminalJobs {
+            preemption_release: None,
+            before: None,
+            at: None,
+            job_ids: vec![20],
+        });
 
         assert_eq!(job_state(&cluster, 20), None, "eviction drops the record");
         let issued = cluster.peek_next_job_id();
@@ -8019,6 +8043,7 @@ mod tests {
             apply(&WalOperation::JobPreemptSignaled {
                 job_id,
                 pending: PreemptPending {
+                    preemptor_run_attempt: None,
                     signaled_at,
                     deadline: signaled_at + chrono::Duration::seconds(60),
                     preempted_by: 99,
@@ -8037,6 +8062,7 @@ mod tests {
                 at: Some(signaled_at),
             });
             apply(&WalOperation::JobPreemptCancel {
+                preemptor_run_attempt: None,
                 job_id,
                 preempted_by: Some(99),
                 preempt_qos: None,
@@ -8463,6 +8489,38 @@ mod tests {
             incomplete_stepd_recoveries: Arc::new(Mutex::new(HashMap::new())),
             auth_audience: String::new(),
             auth_epoch: 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemption_usage_user_rows_respect_both_privacy_scopes_and_reset_preserves_totals() {
+        use crate::raft::StateMachineApply;
+        for category in ["jobs", "usage"] {
+            let dir = tempfile::tempdir().expect("temporary state");
+            let mut config = step_test_config();
+            config.auth.private_data = test_support::test_slurm_config_private(&[category])
+                .auth
+                .private_data;
+            let service = test_service_with(&dir, config).await;
+            service.cluster.restore_from_snapshot(br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{},"preemption_usage":{"cluster":{"used":2},"users":{"alice":{"used":1},"bob":{"used":1}}}}"#).expect("usage fixture");
+            let mut request = Request::new(());
+            request
+                .extensions_mut()
+                .insert(test_support::viewer("alice", false));
+            let stats = service
+                .get_sched_stats(request)
+                .await
+                .expect("stats")
+                .into_inner();
+            assert_eq!(stats.preemption_users.len(), 1);
+            assert_eq!(stats.preemption_users[0].user, "alice");
+            assert_eq!(stats.preemption_usage.expect("totals").used, 2);
+            let mut reset = Request::new(());
+            reset
+                .extensions_mut()
+                .insert(test_support::viewer("admin", true));
+            service.reset_diag_stats(reset).await.expect("reset");
+            assert_eq!(service.cluster.preemption_usage().used, 2);
         }
     }
 
@@ -10234,6 +10292,7 @@ mod tests {
         let run_attempt = svc.cluster.get_job(job_id).expect("job").run_attempt;
         let signaled_at = Utc::now();
         let pending = spur_core::job::PreemptPending {
+            preemptor_run_attempt: None,
             signaled_at,
             deadline: signaled_at + chrono::Duration::seconds(600),
             preempted_by: 99,
@@ -14047,6 +14106,7 @@ mod tests {
         let signaled_at = Utc::now();
         let deadline = signaled_at + Duration::seconds(60);
         job.preempt_pending = Some(PreemptPending {
+            preemptor_run_attempt: None,
             signaled_at,
             deadline,
             preempted_by: 9,

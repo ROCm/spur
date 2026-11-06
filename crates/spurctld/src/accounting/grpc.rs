@@ -574,6 +574,7 @@ impl SlurmAccounting for AccountingService {
         db::record_job_end(
             &mut tx,
             &db::JobEndRecord {
+                preemption_usage: None,
                 job_id: req.job_id,
                 state: state_str.to_string(),
                 exit_code: req.exit_code,
@@ -656,6 +657,10 @@ impl SlurmAccounting for AccountingService {
         let jobs = records
             .iter()
             .map(|r| JobInfo {
+                preemption_usage: Some(crate::metrics_proto::preemption_usage_to_proto(
+                    &r.preemption_usage,
+                )),
+
                 fabric_bindings: Default::default(),
                 gpu_bindings: Default::default(),
                 job_id: r.job_id,

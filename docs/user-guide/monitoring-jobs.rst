@@ -1050,8 +1050,8 @@ Endpoints
      - Planned
      - Route exists but currently returns an empty body.
    * - ``/metrics/scheduler``
-     - Planned
-     - Route exists but currently returns an empty body.
+     - Live
+     - Scheduler cycle statistics and preemption outcomes.
    * - ``/metrics/k8s``
      - Live
      - Spur-managed k0s cluster lifecycle and per-node health (``spur_k8s_*``).
@@ -1085,6 +1085,85 @@ All gauges. ``<state>`` expands to one metric per job state: ``pending``,
      - Memory (bytes) allocated to running/completing jobs.
    * - ``spur_jobs_gpus_alloc``
      - GPUs allocated to running/completing jobs.
+
+Preemption outcomes — ``/metrics/scheduler``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``sdiag`` reports cluster totals and up to 1000 visible users (sorted by name,
+with a truncation notice). ``scontrol show job`` reports a requesting job's
+``PreemptionsUsed``, ``PreemptionsUnused``, and ``PreemptionsOpen``. Counts describe
+**victim runs**, not nodes: preempting the same job on two runs counts twice.
+Suspension and idle-fill reclaim without an owner-directed handoff are excluded.
+A grace warning alone does not increment any count; the first released slice
+opens one observation for that victim run.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 48 12 40
+
+   * - Metric
+     - Type
+     - Meaning
+   * - ``spur_scheduler_preemptions_used_total``
+     - Counter
+     - Victim runs with matching released capacity in a confirmed requesting launch.
+   * - ``spur_scheduler_preemptions_unused_total{reason,initiator}``
+     - Counter
+     - Victim runs closed without confirmed use by the requesting launch.
+   * - ``spur_scheduler_preemptions_open``
+     - Gauge
+     - Victim runs that released capacity but whose requesting launch outcome is unresolved.
+
+For example, if a requester preempts A on n1 and B on n2, then launches only
+using B's capacity, used increases by one and unused by one. Partial reports
+and replay do not count a victim run again. A successful launch followed by a
+later application failure remains used. A failed release is a launch failure,
+even if the controller already recorded the job as Running. Native interactive
+allocations count as launched once allocation registration and activation succeed.
+
+``reason`` has four values:
+
+* ``started_elsewhere``: the launch succeeded without matching released capacity.
+* ``launch_failed``: the requesting launch was rejected, held, backed off, or not released.
+* ``cancelled``: cancellation ended the request before use.
+* ``ended_other``: another end or a superseding attempt closed the request,
+  including an outcome that could not be confirmed after controller failure.
+
+``initiator`` is ``user``, ``admin``, ``system``, or ``unknown``. Cancellation
+uses the authenticated cancellation provenance. Scheduler placement and launch
+failures use ``system``. Missing provenance stays ``unknown``. The label records
+the observed operation, not an inferred root cause: a launch rejection caused
+by user-supplied input still has a system launch-failure verdict. The
+``ended_other`` / ``unknown`` bucket is uncertainty, not proof of resource loss.
+No username, job ID, or node name is a Prometheus label.
+
+Device-backed victims require matching node-local device IDs and inventory
+generation; merely using CPU on the same GPU node is insufficient. CPU and
+memory have no allocation-unit identities, so scalar-only attribution consumes
+a deterministic capacity budget in victim-ID order. This is an approximation,
+not proof that preemption was necessary or a measure of lost GPU-hours. One
+victim using any matching capacity counts once; this does not measure the
+fraction of its allocation used. Capacity released after launch confirmation
+cannot serve that launch.
+
+Totals and open observations are persisted through the Raft log and snapshots.
+They start when this feature begins observing events, survive controller restart,
+and are unaffected by ``sdiag --reset``. Per-user totals remain after terminal
+jobs are evicted; user rows respect both ``jobs`` and ``usage`` privacy scopes.
+Per-job totals are also copied to the accounting database at job end and repaired
+by reconciliation, so history may lag the live controller. A terminal job whose
+outcome remained unresolved is closed as ``ended_other`` / ``unknown`` before
+retention removes it, with an additional retention window for accounting repair.
+As with other accounting data, repair requires an available accounting database.
+
+The counters piggyback on existing state-machine operations. A requesting launch
+with unresolved tracked preemptions writes at most one additional guarded
+release confirmation, regardless of the number of victims or metric buckets.
+Launches without tracked preemptions add no log entry. Open claim storage grows
+with tracked victim allocations; completed claims are removed. Aggregate and
+per-user storage grows with the number of users and the fixed cause buckets.
+Controllers from before this feature do not maintain these observations; use a
+uniform controller version when relying on the lifetime totals.
 
 Node metrics — ``/metrics/nodes``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
