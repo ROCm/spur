@@ -890,7 +890,7 @@ fn property_job_waits_for_its_handoff_owner_start_on_a_held_node() {
     };
     let owner_start = start_of(1).expect("owner is planned");
     assert_eq!(owner_start, now() + Duration::seconds(60));
-    assert!(start_of(2).is_some_and(|at| at >= owner_start));
+    assert_eq!(start_of(2), Some(owner_start));
 }
 
 #[test]
@@ -968,4 +968,20 @@ fn property_job_needs_every_owner_of_a_node_planned() {
         assignments.iter().map(|a| a.job_id).collect::<Vec<_>>(),
         [1, 2, 3]
     );
+}
+
+#[test]
+fn property_job_listed_before_its_owner_stays_off_the_node() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n1".to_string(), vec![1])]);
+    let jobs = [property_job_on(2, "n1"), handoff_owner(1, "n0")];
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    assert_eq!(
+        assignments.iter().map(|a| a.job_id).collect::<Vec<_>>(),
+        [1]
+    );
+    assert!(scheduler.timelines[1]
+        .intervals
+        .iter()
+        .all(|i| i.job_id != Some(2)));
 }
