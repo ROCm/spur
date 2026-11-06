@@ -299,6 +299,7 @@ jobs:
           build-args: |
             BUILD_MPI_PLUGIN=1
           outputs: type=docker,dest=/tmp/spur-image.tar
+          no-cache-filters: runtime
           cache-from: type=registry,ref=${{ steps.cacheref.outputs.ref }}
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=registry,ref={0},mode=max,ignore-error=true', steps.cacheref.outputs.ref) || '' }}
 

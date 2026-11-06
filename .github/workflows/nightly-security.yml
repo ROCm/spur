@@ -58,6 +58,7 @@ jobs:
           push: false
           load: true
           tags: spur:nightly-scan
+          no-cache-filters: runtime
           cache-from: type=gha,scope=nightly-docker
 
       - name: Install Trivy

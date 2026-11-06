@@ -176,6 +176,7 @@ jobs:
           build-args: |
             SPUR_GIT_SHA=${{ steps.gitmeta.outputs.short_sha }}
             SPUR_GIT_DIRTY=false
+          no-cache-filters: runtime
           cache-from: type=gha,scope=release-docker
           cache-to: type=gha,scope=release-docker,mode=max
 
