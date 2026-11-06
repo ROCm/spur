@@ -8,8 +8,8 @@ holds the scenarios that need a converged k0s cluster on top of the mesh. Each
 class documents the invariant it proves — k0s reaches ready over the mesh with
 node InternalIPs on the mesh CIDR, cross-node pod and ClusterIP datapath riding
 the tunnel, online add/remove leaving no ghost peer, graceful k8s remove/add
-preserving the node's Spur identity + WireGuard key, login-node reachability,
-and (skipped) 3-controller HA re-election.
+preserving the node's Spur identity + WireGuard key, and login-node
+reachability.
 
 The k0s tests are marked ``k0s``; the WG fixtures they use skip when a node can't
 run a real WireGuard mesh.
@@ -630,27 +630,6 @@ class TestGracefulK8sRemoveAdd:
 
         wait_until(worker_roled, timeout_s=120,
                    desc=f"{worker} reassigned a k0s role after re-add")
-
-
-# --- HA over the mesh (3 controllers) -----------------------------------
-
-
-@pytest.mark.k0s
-class TestHaOverMesh:
-    def test_three_controller_raft_over_mesh_reelection(self):
-        """Raft quorum over mesh IPs; stop the leader → survivors re-elect →
-        restarted controller rejoins as a follower.
-
-        HARNESS GAP: the base SpurCluster starts spurctld on node[0] only, and
-        Raft-over-mesh is a bootstrap ordering problem (the mesh must be up
-        before controllers can dial each other's mesh IPs for the raft_listen
-        peers). A dedicated multi-controller fixture is required; it is tracked
-        as a follow-up and validated on a local 3-controller bed, not CI.
-        """
-        pytest.skip(
-            "needs a multi-controller (3× spurctld, controller.peers over mesh "
-            "IPs) fixture the base harness does not yet provide"
-        )
 
 
 # --- login-node reachability --------------------------------------------

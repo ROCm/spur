@@ -8,7 +8,7 @@ use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, QueryBuilder, Row};
 
 use spur_core::end_reason::EndReason;
-use spur_core::job::JobId;
+use spur_core::job::{effective_gpus, effective_memory_mb, Job, JobId};
 
 /// Apply the database schema, serialized across controllers by a fixed advisory
 /// lock: migrate now also rewrites data (default-account dedup) and builds a
@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS qos (
     max_wall_min    INTEGER,
     grp_wall_min    INTEGER,
     preempt_exempt_time INTEGER,
+    grace_time      INTEGER,
     flags           TEXT NOT NULL DEFAULT '',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -164,6 +165,7 @@ ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
+ALTER TABLE qos ADD COLUMN IF NOT EXISTS grace_time INTEGER;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS idle_fill_preemptable BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
@@ -262,6 +264,20 @@ CREATE INDEX IF NOT EXISTS idx_txn_actor ON txn(actor);
 CREATE INDEX IF NOT EXISTS idx_txn_entity ON txn(entity_type, entity_name);
 -- Added after the table shipped, so it must follow the CREATE above.
 ALTER TABLE txn ADD COLUMN IF NOT EXISTS peer_addr TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS fairshare_usage_offsets (
+    user_name       TEXT NOT NULL,
+    account         TEXT NOT NULL,
+    offset_cpu      BIGINT NOT NULL DEFAULT 0,
+    offset_gpu      BIGINT NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_name, account)
+);
+
+CREATE TABLE IF NOT EXISTS cluster_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
     id         TEXT PRIMARY KEY,
@@ -420,18 +436,66 @@ pub struct JobEndRecord {
     /// Who cancelled the run; empty unless `reason` is a cancel code.
     pub ended_by: String,
     pub ended_by_uid: Option<u32>,
+    /// Written only when this end creates the row, as for a job that never started.
+    /// `None` only for the external `RecordJobEnd` RPC.
+    pub submission: Option<JobSubmission>,
+}
+
+/// What a job requested at submission.
+#[derive(Debug, Clone)]
+pub struct JobSubmission {
+    pub name: String,
+    pub user: String,
+    pub account: String,
+    pub partition: String,
+    pub qos: String,
+    pub num_nodes: u32,
+    pub num_tasks: u32,
+    pub cpus_per_task: u32,
+    pub total_gpus: u32,
+    pub memory_mb: u64,
+    pub submit_time: DateTime<Utc>,
+    pub reservation: String,
+    pub time_limit_secs: Option<i64>,
+}
+
+impl JobSubmission {
+    pub fn for_job(job: &Job) -> Self {
+        let spec = &job.spec;
+        Self {
+            name: spec.name.clone(),
+            user: spec.user.clone(),
+            account: spec.account.clone().unwrap_or_default(),
+            partition: spec.partition.clone().unwrap_or_default(),
+            qos: spec.qos.clone().unwrap_or_default(),
+            num_nodes: spec.num_nodes,
+            num_tasks: spec.num_tasks,
+            cpus_per_task: spec.cpus_per_task,
+            total_gpus: effective_gpus(spec, spec.num_nodes) as u32,
+            memory_mb: effective_memory_mb(spec, spec.num_nodes),
+            submit_time: job.submit_time,
+            reservation: spec.reservation.clone().unwrap_or_default(),
+            time_limit_secs: spec.time_limit.map(|limit| limit.num_seconds()),
+        }
+    }
 }
 
 /// Record a job completion in the database. See `record_job_start` for why
 /// this takes a `&mut PgConnection` rather than a `&PgPool`.
 pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyhow::Result<()> {
+    let sub = rec.submission.as_ref();
     // RETURNING closes the record_job_start job_id-reuse race by reading in the same statement.
     let row = sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, user_name, state, exit_code, end_time, exit_signal, derived_exit_code,
+        INSERT INTO jobs (job_id, state, exit_code, end_time, exit_signal, derived_exit_code,
                           preempted_by, preempt_mode, preempt_qos, reason, reason_detail,
-                          ended_by, ended_by_uid)
-        VALUES ($1, '', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                          ended_by, ended_by_uid, name, user_name, account, partition_name, qos,
+                          num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb,
+                          submit_time, reservation, time_limit_secs)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                COALESCE($14, ''), COALESCE($15, ''), COALESCE($16, ''), COALESCE($17, ''),
+                COALESCE($18, ''), COALESCE($19, 1), COALESCE($20, 1), COALESCE($21, 1),
+                COALESCE($22, 0), COALESCE($23, 0), COALESCE($24, NOW()), COALESCE($25, ''), $26)
         ON CONFLICT (job_id) DO UPDATE SET
             state = $2,
             exit_code = $3,
@@ -461,6 +525,19 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
     .bind(&rec.reason_detail)
     .bind(&rec.ended_by)
     .bind(rec.ended_by_uid.map(i64::from))
+    .bind(sub.map(|s| &s.name))
+    .bind(sub.map(|s| &s.user))
+    .bind(sub.map(|s| &s.account))
+    .bind(sub.map(|s| &s.partition))
+    .bind(sub.map(|s| &s.qos))
+    .bind(sub.map(|s| s.num_nodes as i32))
+    .bind(sub.map(|s| s.num_tasks as i32))
+    .bind(sub.map(|s| s.cpus_per_task as i32))
+    .bind(sub.map(|s| s.total_gpus as i32))
+    .bind(sub.map(|s| s.memory_mb as i64))
+    .bind(sub.map(|s| s.submit_time))
+    .bind(sub.map(|s| &s.reservation))
+    .bind(sub.and_then(|s| s.time_limit_secs))
     .fetch_one(&mut *conn)
     .await?;
 
@@ -932,6 +1009,193 @@ pub async fn get_usage(
         .collect();
 
     Ok(records)
+}
+
+/// Modify usage for a user+account via a fairshare offset. Usage rows are
+/// preserved (sreport history intact). The offset is computed against the
+/// decay-weighted total — the same value `sshare` displays.
+///
+/// `raw_usage == 0` sets offset to negate decayed usage (effective zero).
+/// Positive = set to this decayed value. Negative = subtract from current
+/// decayed total (clamped at 0). Returns the previous decayed total for audit.
+pub async fn modify_usage(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &str,
+    account: &str,
+    raw_usage: i64,
+    halflife_days: u32,
+    billing_weights: &spur_core::config::BillingWeights,
+) -> anyhow::Result<i64> {
+    let halflife_days = if halflife_days == 0 {
+        14
+    } else {
+        halflife_days
+    };
+    let now = Utc::now();
+    let since = now - chrono::Duration::days(halflife_days as i64 * 4);
+    let halflife_secs = halflife_days as f64 * 86400.0;
+    let decay_rate = 2.0_f64.ln() / halflife_secs;
+
+    let rows = sqlx::query(
+        "SELECT cpu_seconds, gpu_seconds, period_start FROM usage \
+         WHERE ($1 = '' OR user_name = $1) AND account = $2 AND period_start >= $3",
+    )
+    .bind(user)
+    .bind(account)
+    .bind(since)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    let mut decayed_total = 0.0_f64;
+    for row in &rows {
+        let cpu: i64 = row.get("cpu_seconds");
+        let gpu: i64 = row.get("gpu_seconds");
+        let start: DateTime<Utc> = row.get("period_start");
+        let age = (now - start).num_seconds().max(0) as f64;
+        let decay = (-decay_rate * age).exp();
+        decayed_total += billing_weights.bill(cpu, gpu) * decay;
+    }
+
+    let current_offset = get_fairshare_usage_offset(&mut **tx, user, account).await?;
+    let current_offset_billable = billing_weights.bill(current_offset.0, current_offset.1);
+    let effective_usage = (decayed_total + current_offset_billable).max(0.0);
+    let prev = effective_usage.round() as i64;
+
+    let target = if raw_usage == 0 {
+        0.0
+    } else if raw_usage < 0 {
+        (effective_usage + raw_usage as f64).max(0.0)
+    } else {
+        raw_usage as f64
+    };
+
+    let delta_billable = target - decayed_total;
+    let total_weight = billing_weights.cpu + billing_weights.gpu;
+    let (off_cpu, off_gpu) = if total_weight > 0.0 {
+        let cpu_frac = billing_weights.cpu / total_weight;
+        let cpu = (delta_billable * cpu_frac / billing_weights.cpu.max(1.0)).round() as i64;
+        let gpu = (delta_billable * (1.0 - cpu_frac) / billing_weights.gpu.max(1.0)).round() as i64;
+        (cpu, gpu)
+    } else {
+        (delta_billable.round() as i64, 0)
+    };
+
+    set_fairshare_usage_offset(tx, user, account, off_cpu, off_gpu).await?;
+    Ok(prev)
+}
+
+/// Reset fairshare usage cluster-wide. Sets a reset epoch so fairshare
+/// ignores rows before it, while preserving usage rows for sreport.
+pub async fn reset_all_usage(pool: &PgPool) -> anyhow::Result<u64> {
+    set_fairshare_reset_epoch(pool, Utc::now()).await?;
+    sqlx::query("DELETE FROM fairshare_usage_offsets")
+        .execute(pool)
+        .await?;
+    Ok(0)
+}
+
+/// BFS walk to find all descendant accounts of `root` (inclusive).
+pub async fn get_account_descendants(pool: &PgPool, root: &str) -> anyhow::Result<Vec<String>> {
+    let accounts = list_accounts(pool).await?;
+    let mut children_of: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for a in &accounts {
+        if let Some(ref parent) = a.parent {
+            children_of
+                .entry(parent.as_str())
+                .or_default()
+                .push(&a.name);
+        }
+    }
+    let mut result = vec![root.to_string()];
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root);
+    while let Some(parent) = queue.pop_front() {
+        if let Some(kids) = children_of.get(parent) {
+            for kid in kids {
+                result.push(kid.to_string());
+                queue.push_back(kid);
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub async fn get_fairshare_usage_offsets(
+    pool: &PgPool,
+) -> anyhow::Result<std::collections::HashMap<(String, String), (i64, i64)>> {
+    let rows = sqlx::query(
+        "SELECT user_name, account, offset_cpu, offset_gpu FROM fairshare_usage_offsets",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let key: (String, String) = (r.get("user_name"), r.get("account"));
+            let val: (i64, i64) = (r.get("offset_cpu"), r.get("offset_gpu"));
+            (key, val)
+        })
+        .collect())
+}
+
+async fn get_fairshare_usage_offset(
+    conn: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    user: &str,
+    account: &str,
+) -> anyhow::Result<(i64, i64)> {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT offset_cpu, offset_gpu FROM fairshare_usage_offsets WHERE user_name = $1 AND account = $2",
+    )
+    .bind(user)
+    .bind(account)
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.unwrap_or((0, 0)))
+}
+
+pub async fn set_fairshare_usage_offset(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &str,
+    account: &str,
+    offset_cpu: i64,
+    offset_gpu: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO fairshare_usage_offsets (user_name, account, offset_cpu, offset_gpu, updated_at) \
+         VALUES ($1, $2, $3, $4, NOW()) \
+         ON CONFLICT (user_name, account) DO UPDATE SET \
+             offset_cpu = EXCLUDED.offset_cpu, \
+             offset_gpu = EXCLUDED.offset_gpu, \
+             updated_at = NOW()",
+    )
+    .bind(user)
+    .bind(account)
+    .bind(offset_cpu)
+    .bind(offset_gpu)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_fairshare_reset_epoch(pool: &PgPool) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let row: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM cluster_settings WHERE key = 'fairshare_reset_epoch'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|s| s.parse::<DateTime<Utc>>().ok()))
+}
+
+pub async fn set_fairshare_reset_epoch(pool: &PgPool, epoch: DateTime<Utc>) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO cluster_settings (key, value) VALUES ('fairshare_reset_epoch', $1) \
+         ON CONFLICT (key) DO UPDATE SET value = $1",
+    )
+    .bind(epoch.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 // A macro rather than a `const` so the EXPLAIN test can build its statement with
@@ -1595,6 +1859,7 @@ pub struct QosUpdate<'a> {
     pub grp_tres: Option<Option<&'a str>>,
     pub grp_wall_min: Option<Option<i32>>,
     pub preempt_exempt_time: Option<Option<i32>>,
+    pub grace_time: Option<Option<i32>>,
     pub idle_fill_preemptable: Option<bool>,
     pub flags: Option<&'a str>,
 }
@@ -1657,6 +1922,9 @@ pub async fn upsert_qos<'a>(
     if let Some(v) = u.preempt_exempt_time {
         updates.push(("preempt_exempt_time", SqlVal::NullInt(v)));
     }
+    if let Some(v) = u.grace_time {
+        updates.push(("grace_time", SqlVal::NullInt(v)));
+    }
     if let Some(v) = u.flags {
         updates.push(("flags", SqlVal::Text(v)));
     }
@@ -1705,7 +1973,7 @@ pub async fn missing_qos(pool: &PgPool, names: &[&str]) -> anyhow::Result<Vec<St
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, flags, idle_fill_preemptable FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, preempt, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_submit_per_account, grp_submit_jobs, max_tres_per_user, grp_tres, grp_wall_min, preempt_exempt_time, grace_time, flags, idle_fill_preemptable FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1728,6 +1996,7 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             grp_tres: r.get("grp_tres"),
             grp_wall_min: r.get("grp_wall_min"),
             preempt_exempt_time: r.get("preempt_exempt_time"),
+            grace_time: r.get("grace_time"),
             idle_fill_preemptable: r.get("idle_fill_preemptable"),
             flags: r.get("flags"),
         })
@@ -1753,6 +2022,7 @@ pub struct QosRecord {
     pub grp_tres: Option<String>,
     pub grp_wall_min: Option<i32>,
     pub preempt_exempt_time: Option<i32>,
+    pub grace_time: Option<i32>,
     pub idle_fill_preemptable: bool,
     pub flags: String,
 }
@@ -1905,6 +2175,7 @@ mod job_history_tests {
             reason_detail: String::new(),
             ended_by: String::new(),
             ended_by_uid: None,
+            submission: None,
         }
     }
 
@@ -1944,6 +2215,93 @@ mod job_history_tests {
         if let Some(end_time) = end {
             record_job_end(conn, &end_record(job_id, "COMPLETED", end_time)).await?;
         }
+        Ok(())
+    }
+
+    fn submitted_job(job_id: JobId) -> Job {
+        let mut job = Job::new(
+            job_id,
+            spur_core::job::JobSpec {
+                name: "never-started".into(),
+                user: format!("spur_unstarted_{job_id}"),
+                account: Some("proj".into()),
+                partition: Some("gpu".into()),
+                qos: Some("normal".into()),
+                num_tasks: 6,
+                cpus_per_task: 2,
+                memory_per_node_mb: Some(256),
+                time_limit: Some(Duration::seconds(90)),
+                ..Default::default()
+            },
+        );
+        job.submit_time = Utc::now() - Duration::hours(1);
+        job
+    }
+
+    fn cancel_record(job: &Job) -> JobEndRecord {
+        JobEndRecord {
+            submission: Some(JobSubmission::for_job(job)),
+            ..end_record(job.job_id, "CANCELLED", Utc::now())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn a_job_cancelled_before_it_starts_keeps_its_submission() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job = submitted_job(9_800_501);
+        record_job_end(&mut tx, &cancel_record(&job)).await?;
+
+        let row = sqlx::query(
+            "SELECT name, user_name, account, partition_name, qos, num_tasks, cpus_per_task,
+                    memory_mb, submit_time, time_limit_secs, start_time, state, usage_recorded
+             FROM jobs WHERE job_id = $1",
+        )
+        .bind(i64::from(job.job_id))
+        .fetch_one(&mut *tx)
+        .await?;
+        assert_eq!(row.get::<String, _>("name"), "never-started");
+        assert_eq!(row.get::<String, _>("user_name"), job.spec.user);
+        assert_eq!(row.get::<String, _>("account"), "proj");
+        assert_eq!(row.get::<String, _>("partition_name"), "gpu");
+        assert_eq!(row.get::<String, _>("qos"), "normal");
+        assert_eq!(row.get::<i32, _>("num_tasks"), 6);
+        assert_eq!(row.get::<i32, _>("cpus_per_task"), 2);
+        assert_eq!(row.get::<i64, _>("memory_mb"), 256);
+        assert_eq!(
+            row.get::<DateTime<Utc>, _>("submit_time")
+                .timestamp_micros(),
+            job.submit_time.timestamp_micros()
+        );
+        assert_eq!(row.get::<Option<i64>, _>("time_limit_secs"), Some(90));
+        assert_eq!(row.get::<Option<DateTime<Utc>>, _>("start_time"), None);
+        assert_eq!(row.get::<String, _>("state"), "CANCELLED");
+        assert!(!row.get::<bool, _>("usage_recorded"));
+        tx.rollback().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn an_end_does_not_rewrite_a_started_jobs_submission() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let mut tx = pool.begin().await?;
+        let job_id = 9_800_502;
+        let started = Utc::now() - Duration::minutes(5);
+        seed_job(&mut tx, job_id, "", started, None).await?;
+        record_job_end(&mut tx, &cancel_record(&submitted_job(job_id))).await?;
+
+        let row =
+            sqlx::query("SELECT name, user_name, start_time, state FROM jobs WHERE job_id = $1")
+                .bind(i64::from(job_id))
+                .fetch_one(&mut *tx)
+                .await?;
+        assert_eq!(row.get::<String, _>("name"), "fixture");
+        assert_eq!(row.get::<String, _>("user_name"), "root");
+        assert!(row.get::<Option<DateTime<Utc>>, _>("start_time").is_some());
+        assert_eq!(row.get::<String, _>("state"), "CANCELLED");
+        tx.rollback().await?;
         Ok(())
     }
 
@@ -2977,6 +3335,7 @@ mod job_history_tests {
                 grp_tres: Some(Some("cpu=64")),
                 grp_wall_min: Some(Some(120)),
                 preempt_exempt_time: None,
+                grace_time: None,
                 flags: Some("DenyOnLimit"),
             },
         )
@@ -3000,6 +3359,87 @@ mod job_history_tests {
         assert_eq!(got.grp_wall_min, Some(120));
         assert_eq!(got.flags, "DenyOnLimit");
         assert!(got.idle_fill_preemptable);
+
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn qos_grace_time_unset_vs_zero_round_trips() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let name = format!("spur_qos_grace_{}", std::process::id());
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await?;
+
+        async fn grace_time_of(pool: &PgPool, name: &str) -> anyhow::Result<Option<i32>> {
+            let got = list_qos(pool)
+                .await?
+                .into_iter()
+                .find(|q| q.name == name)
+                .expect("qos present");
+            Ok(got.grace_time)
+        }
+
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                description: Some("created without a grace time"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(grace_time_of(&pool, &name).await?, None);
+
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                grace_time: Some(Some(600)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(grace_time_of(&pool, &name).await?, Some(600));
+
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                description: Some("modified"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(grace_time_of(&pool, &name).await?, Some(600));
+
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                grace_time: Some(Some(0)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(grace_time_of(&pool, &name).await?, Some(0));
+
+        upsert_qos(
+            &mut *pool.acquire().await?,
+            &name,
+            QosUpdate {
+                grace_time: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(grace_time_of(&pool, &name).await?, None);
 
         sqlx::query("DELETE FROM qos WHERE name = $1")
             .bind(&name)

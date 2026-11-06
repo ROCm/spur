@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for salloc allocation → srun step identity (SPUR-220).
+"""E2E tests for salloc allocation → srun step identity.
 
 When JWT auth binds a job to the token subject at submit time, step RPCs must
 still succeed inside the allocation shell even after ``SPUR_AUTH_TOKEN`` is

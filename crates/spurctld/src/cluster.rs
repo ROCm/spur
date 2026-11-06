@@ -20,10 +20,11 @@ use spur_core::accounting::{
 };
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
+use spur_core::core_layout::{CoreLayout, NodeCoreSettings};
 use spur_core::end_reason::{Actor, CancelProvenance, LastRequeue, NodeFailure};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
-    PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
+    PendingReason, PreemptPending, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -41,8 +42,8 @@ use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
 use crate::accounting::{
-    txn, AccountingNotifier, JobEndRecord, JobStartRecord, TxnAction, TxnEntity, TxnOutcome,
-    TxnRecord, TxnSource,
+    txn, AccountingNotifier, JobEndRecord, JobStartRecord, JobSubmission, TxnAction, TxnEntity,
+    TxnOutcome, TxnRecord, TxnSource,
 };
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
@@ -70,11 +71,35 @@ fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 
         .min(spur_core::config::MAX_LAUNCH_BACKOFF_SECS)
 }
 
+/// Seconds a requeued job stays ineligible: long enough for the scheduler to
+/// see the cancel through, and never before the old run's kill wait elapses.
+fn requeue_hold_secs(scheduler_interval_secs: u32, kill_wait_secs: u32) -> i64 {
+    (scheduler_interval_secs as i64 * 2 + 3).max(kill_wait_secs as i64)
+}
+
+/// Warn about a `complete_wait_secs` that would drain nodes still being killed
+/// or cleaned up. Run on every config load, startup and reconfigure alike.
+pub(crate) fn warn_if_complete_wait_too_short(config: &spur_core::config::SlurmConfig) {
+    if config.complete_wait_too_short() {
+        warn!(
+            complete_wait_secs = config.scheduler.complete_wait_secs,
+            complete_wait_floor_secs = config.complete_wait_floor_secs(),
+            kill_wait_secs = config.scheduler.effective_kill_wait_secs(),
+            timeout_kill_wait_secs = config.scheduler.effective_timeout_kill_wait_secs(),
+            cgroup_cleanup_timeout_secs = config.cgroup.cleanup_timeout_secs,
+            "scheduler.complete_wait_secs should exceed complete_wait_floor_secs (the larger kill wait plus cgroup.cleanup_timeout_secs), or a job still being killed or cleaned up is force-finished and its unreported nodes are drained"
+        );
+    }
+}
+
 /// Result of recording a per-node completion report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCompleteResult {
     /// Node recorded; waiting for remaining nodes.
     Completing,
+    /// Node recorded and freed, but the job is a preemption victim still inside
+    /// its grace: it keeps running on the other nodes, which must be left alone.
+    InGrace,
     /// All allocated nodes have reported; job is now terminal.
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
@@ -133,13 +158,54 @@ impl std::fmt::Display for RegisterNodeError {
 
 impl std::error::Error for RegisterNodeError {}
 
+/// A node's report that one `srun --pty` session's shell exited.
+#[derive(Debug, Clone, Copy)]
+pub struct PtySessionExit<'a> {
+    pub job_id: JobId,
+    pub run_attempt: u32,
+    /// The numbered step the session's `srun --pty` invocation created.
+    pub step_id: u32,
+    pub node: &'a str,
+    pub exit_code: i32,
+    pub signal: i32,
+}
+
+/// What a session-exit report may still act on.
+struct PtyExitTarget {
+    step_open: bool,
+    ends_job: bool,
+}
+
+/// Outcome of a server-side standalone-PTY completion report
+/// ([`ClusterManager::finish_standalone_pty`]).
+#[derive(Debug)]
+pub enum PtyExitOutcome {
+    /// Not a running standalone PTY job, or a stale, misaddressed, or
+    /// already-settled report. The caller does nothing.
+    Ignored,
+    /// Only an overlapping (`--jobid ... --pty`) step was closed; the job lives on.
+    StepClosed,
+    /// The job's own interactive shell exited; the job was finished and its
+    /// allocations must be released on the agents.
+    JobFinished(Box<Job>),
+}
+
+/// A successful [`ClusterManager::finish_srun_job_for`] outcome.
+#[derive(Debug)]
+pub enum SrunCompletion {
+    /// The allocation was finished by this call; release it on the agents.
+    Finished(Box<Job>),
+    /// The job was already terminal (the server-side PTY path or an earlier call
+    /// got there first). Idempotent: nothing more to do.
+    AlreadyComplete,
+}
+
 /// Errors from completing a standalone srun allocation.
 #[derive(Debug)]
 pub enum SrunCompleteError {
     NotFound(JobId),
     NotSrunJob(JobId),
     NotStepDispatch(JobId),
-    AlreadyTerminal { job_id: JobId, state: JobState },
     NotOwner { job_id: JobId, user: String },
     Internal { job_id: JobId, message: String },
 }
@@ -154,9 +220,6 @@ impl std::fmt::Display for SrunCompleteError {
                     f,
                     "job {id} does not use native step dispatch (CompleteJob is not valid)"
                 )
-            }
-            Self::AlreadyTerminal { job_id, state } => {
-                write!(f, "job {job_id} is already {state:?}")
             }
             Self::NotOwner { job_id, user } => {
                 write!(f, "user {user} is not permitted to complete job {job_id}")
@@ -573,8 +636,15 @@ pub struct ClusterManager {
     /// node keep it marked until the last finishes. Leader-local, like the handler that sets it.
     k0s_removals: parking_lot::Mutex<HashMap<String, usize>>,
     raft: RwLock<Option<SpurRaft>>,
+    /// This controller's durable start counter; orders layout deliveries when a
+    /// restarted leader keeps its Raft term.
+    boot_epoch: AtomicU64,
+    /// When each node was last asked to re-register, and for which layout.
+    layout_reregister_asked: parking_lot::Mutex<HashMap<String, (std::time::Instant, u64)>>,
     propose_timeout: std::time::Duration,
     accounting: RwLock<Option<AccountingNotifier>>,
+    billing_weights:
+        RwLock<Option<std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>>>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
     grp_wall_cache: Arc<GrpWallCache>,
@@ -593,6 +663,11 @@ pub struct ClusterManager {
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
     interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
+    /// Allocations that have sent at least one keepalive this leadership term.
+    /// Makes an allocation reap-eligible even when its durable `client_keepalive`
+    /// flag is unset (a keepalive-sending client predating the flag). Reset on
+    /// leadership regain, like `interactive_last_seen`.
+    pinged_this_term: RwLock<HashSet<JobId>>,
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
@@ -858,10 +933,13 @@ impl ClusterManager {
     }
 
     pub fn new_with_config_path(
-        config: SlurmConfig,
+        mut config: SlurmConfig,
         _state_dir: &Path,
         config_path: Option<PathBuf>,
     ) -> anyhow::Result<Self> {
+        if let Some(external) = config.topology.as_mut().and_then(|t| t.external.as_mut()) {
+            external.load_block_file().map_err(anyhow::Error::msg)?;
+        }
         let partitions = config.build_partitions();
         let config_seeded_partitions: HashSet<String> =
             partitions.iter().map(|p| p.name.clone()).collect();
@@ -897,8 +975,11 @@ impl ClusterManager {
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             k0s_removals: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
+            boot_epoch: AtomicU64::new(0),
+            layout_reregister_asked: parking_lot::Mutex::new(HashMap::new()),
             propose_timeout: PROPOSE_TIMEOUT,
             accounting: RwLock::new(None),
+            billing_weights: RwLock::new(None),
             fairshare_cache,
             qos_cache,
             grp_wall_cache,
@@ -909,6 +990,7 @@ impl ClusterManager {
             planned_reservations: RwLock::new(HashMap::new()),
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
+            pinged_this_term: RwLock::new(HashSet::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             preempt_freed_nodes: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
@@ -1039,10 +1121,8 @@ impl ClusterManager {
             if job.state == JobState::Pending && !job.pending_reason.is_scheduling_hold() {
                 schedulable_owners.insert(job.job_id);
             }
-            if job.state == JobState::Completing {
-                if let Some(preemptor) = job.preempted_by {
-                    owners_still_draining.insert(preemptor);
-                }
+            if let Some(preemptor) = crate::scheduler_loop::preemptor_awaiting_release(job) {
+                owners_still_draining.insert(preemptor);
             }
         }
         earmarks.retain(|_, (preemptor, remaining)| {
@@ -1160,6 +1240,8 @@ impl ClusterManager {
         spur_core::gpu_request::resolve_gpu_demand(&spec)
             .map_err(|e| SubmitError::invalid(e.to_string()))?;
 
+        spur_core::constraints::validate(&spec).map_err(SubmitError::invalid)?;
+
         // Reject a node count outside the partition's bounds at submit, matching
         // Slurm, instead of accepting a job that would pend forever.
         self.validate_partition_node_bounds(&spec, &partitions)?;
@@ -1189,6 +1271,8 @@ impl ClusterManager {
         check_submission_size(&spec)?;
 
         self.run_job_submit_hook(&mut spec, &partitions)?;
+        // The hook may rewrite constraint and GPU fields that were validated above.
+        spur_core::constraints::validate(&spec).map_err(SubmitError::invalid)?;
 
         // Every input to wall-time defaulting — partition, account, QOS — is a field
         // the hook may rewrite, so defaulting follows the hook and reads the scope
@@ -1654,6 +1738,22 @@ impl ClusterManager {
         self.karma_stats.reset();
     }
 
+    /// The Running jobs whose preemption grace ends at or before `now`. Filters
+    /// under the read lock, so a tick with no grace running clones nothing.
+    pub fn jobs_past_grace_deadline(&self, now: DateTime<Utc>) -> Vec<Job> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|job| {
+                job.state == JobState::Running
+                    && job
+                        .preempt_grace()
+                        .is_some_and(|pending| now >= pending.deadline)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Get jobs matching filters.
     pub fn get_jobs(&self, filter: &JobFilter) -> Vec<Job> {
         // Built once per call so the per-job node check is O(allocated_nodes)
@@ -1999,7 +2099,7 @@ impl ClusterManager {
         // leader so every replica applies one instant.
         let begin_time = match (&snapshot, hold) {
             (Some(job), false) => {
-                let hold_secs = (self.scheduler_interval_secs as i64 * 2 + 3).max(5);
+                let hold_secs = self.requeue_hold_secs();
                 let deferred = Utc::now() + chrono::Duration::seconds(hold_secs);
                 Some(
                     job.spec
@@ -2054,18 +2154,22 @@ impl ClusterManager {
         job_id: JobId,
         exit_code: i32,
         user: &str,
-    ) -> Result<Job, SrunCompleteError> {
+    ) -> Result<SrunCompletion, SrunCompleteError> {
         self.finish_srun_job_for(job_id, exit_code, user, false)
     }
 
     /// Like [`Self::finish_srun_job`], plus Operators/Administrators (`operates_jobs`).
+    ///
+    /// Idempotent for the owner: completing an already-terminal job returns
+    /// [`SrunCompletion::AlreadyComplete`] (not an error), so the client racing
+    /// the server-side PTY completion neither warns nor re-runs the release.
     pub fn finish_srun_job_for(
         &self,
         job_id: JobId,
         exit_code: i32,
         user: &str,
         operates_jobs: bool,
-    ) -> Result<Job, SrunCompleteError> {
+    ) -> Result<SrunCompletion, SrunCompleteError> {
         let job = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -2077,18 +2181,17 @@ impl ClusterManager {
             if !job.srun_step_dispatch {
                 return Err(SrunCompleteError::NotStepDispatch(job_id));
             }
-            if job.state.is_terminal() {
-                return Err(SrunCompleteError::AlreadyTerminal {
-                    job_id,
-                    state: job.state,
-                });
-            }
+            // Ownership before the terminal check, so a non-owner never learns
+            // whether the job finished and never gets a free idempotent Ok.
             Self::check_job_owner_for(user, &job.spec.user, "complete", operates_jobs).map_err(
                 |_| SrunCompleteError::NotOwner {
                     job_id,
                     user: user.to_string(),
                 },
             )?;
+            if job.state.is_terminal() {
+                return Ok(SrunCompletion::AlreadyComplete);
+            }
             job.clone()
         };
 
@@ -2104,7 +2207,110 @@ impl ClusterManager {
                 message: e.to_string(),
             }
         })?;
-        Ok(job)
+        Ok(SrunCompletion::Finished(Box::new(job)))
+    }
+
+    /// Finish a standalone `srun --pty` job when its interactive shell exits, so
+    /// a lost client cannot strand the allocation. Driven by the node's
+    /// completion report (reserved interactive step), not by the client.
+    ///
+    /// A rejected report is `Ok(Ignored)`: spurd replays an error for its
+    /// lifetime, and the client-driven path remains the fallback. An error
+    /// means a write failed, so the node's replay can still finish the job.
+    pub fn finish_standalone_pty(
+        &self,
+        exit: PtySessionExit<'_>,
+    ) -> anyhow::Result<PtyExitOutcome> {
+        let Some(target) = self.pty_exit_target(&exit) else {
+            return Ok(PtyExitOutcome::Ignored);
+        };
+
+        // spurstepd flags an OOM kill in the step's cgroup with a sentinel bit in
+        // the signal; strip it, and report the job as OOM like the per-node path.
+        let oom = exit.signal & spur_core::job::OOM_SIGNAL_FLAG != 0;
+        let signal = exit.signal & !spur_core::job::OOM_SIGNAL_FLAG;
+        // A signal death carries no exit code; report it the shell way (128 +
+        // signal), matching what the client records, so SIGHUP reads as 129 not 0.
+        let effective_exit = if signal != 0 {
+            128 + signal
+        } else {
+            exit.exit_code
+        };
+
+        // Close the step as the client's own CompleteJobStep would, so its exit
+        // reaches DerivedExitCode whichever report lands first.
+        if target.step_open {
+            self.record_step_complete(exit.job_id, exit.step_id, effective_exit)?;
+        }
+        if !target.ends_job {
+            return Ok(PtyExitOutcome::StepClosed);
+        }
+
+        let Some(job) = self.get_job(exit.job_id) else {
+            return Ok(PtyExitOutcome::Ignored);
+        };
+        let state = if oom {
+            JobState::OutOfMemory
+        } else if effective_exit == 0 {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
+        if let Err(e) = self.complete_job(exit.job_id, effective_exit, state) {
+            // The client's own CompleteJob or a cancel finished it first.
+            if self
+                .get_job(exit.job_id)
+                .is_some_and(|j| j.state.is_terminal())
+            {
+                return Ok(PtyExitOutcome::Ignored);
+            }
+            return Err(e);
+        }
+        Ok(PtyExitOutcome::JobFinished(Box::new(job)))
+    }
+
+    /// What a session-exit report may still act on, or `None` to drop it.
+    fn pty_exit_target(&self, exit: &PtySessionExit<'_>) -> Option<PtyExitTarget> {
+        let jobs = self.jobs.read();
+        let job = jobs.get(&exit.job_id)?;
+        if !job.is_standalone_pty() {
+            return None;
+        }
+        // Act only on the live run. COMPLETING (scancel), SUSPENDED, and a
+        // PENDING preempt-requeue (where run_attempt still matches) must not
+        // be force-finished here.
+        if job.state != JobState::Running {
+            return None;
+        }
+        if exit.run_attempt == 0 || exit.run_attempt != job.run_attempt {
+            return None;
+        }
+        if !job.allocated_nodes.iter().any(|n| n == exit.node) {
+            return None;
+        }
+
+        let steps = self.steps.read();
+        let step = steps.get(&(exit.job_id, exit.step_id))?;
+        // A PTY session runs on its step's first node (`create_job_step`
+        // dispatches it there), so no other node can report its exit.
+        if !step.pty || step.nodes.first().map(String::as_str) != Some(exit.node) {
+            return None;
+        }
+        // Any other PTY step is an extra `--jobid ... --pty` session, which closes
+        // on its own without ending the job. A shell step logged before the marker
+        // existed reads back unmarked, so that job is left to its client.
+        let ends_job = step.job_shell;
+        let step_open = !step.state.is_terminal();
+        // A closed overlapping step makes this a replay. A closed shell step on a
+        // running job does not: the job's own write failed, or the client closed
+        // the step and was lost before it finished the job.
+        if !step_open && !ends_job {
+            return None;
+        }
+        Some(PtyExitTarget {
+            step_open,
+            ends_job,
+        })
     }
 
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
@@ -2136,26 +2342,64 @@ impl ClusterManager {
         actor: Actor,
         operates_jobs: bool,
     ) -> anyhow::Result<()> {
-        let user = actor.user.as_str();
-        {
-            let jobs = self.jobs.read();
-            let job = jobs
-                .get(&job_id)
-                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            if job.state != JobState::Running {
-                anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
-            }
-            Self::check_job_owner_for(user, &job.spec.user, "suspend", operates_jobs)?;
+        self.check_suspendable(job_id, &actor.user, operates_jobs)?;
+        self.propose_suspend(job_id, actor)
+    }
+
+    fn check_suspendable(
+        &self,
+        job_id: JobId,
+        user: &str,
+        operates_jobs: bool,
+    ) -> anyhow::Result<()> {
+        let jobs = self.jobs.read();
+        let job = jobs
+            .get(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        if job.state != JobState::Running {
+            anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
         }
-        self.propose(WalOperation::JobSuspend {
+        Self::check_job_owner_for(user, &job.spec.user, "suspend", operates_jobs)?;
+        // The preemption that ends the grace only applies to a Running job.
+        if job.preempt_grace().is_some() {
+            return Err(Self::in_grace_error(job_id));
+        }
+        Ok(())
+    }
+
+    fn propose_suspend(&self, job_id: JobId, actor: Actor) -> anyhow::Result<()> {
+        let resp = self.propose(WalOperation::JobSuspend {
             job_id,
             at: chrono::Utc::now(),
             preempted_by: None,
             preempt_qos: None,
             by: (!actor.user.is_empty()).then(|| actor.clone()),
         })?;
+        if !resp.suspend_applied {
+            return Err(self.suspend_refusal(job_id));
+        }
         info!(job_id, "job suspended");
         Ok(())
+    }
+
+    fn in_grace_error(job_id: JobId) -> anyhow::Error {
+        anyhow::anyhow!("job {job_id} is in its preemption grace period and cannot be suspended")
+    }
+
+    /// Why a `JobSuspend` that was checked before it was proposed still did not
+    /// apply: the run changed in between.
+    fn suspend_refusal(&self, job_id: JobId) -> anyhow::Error {
+        let jobs = self.jobs.read();
+        let Some(job) = jobs.get(&job_id) else {
+            return anyhow::anyhow!("job {job_id} not found");
+        };
+        if job.preempt_grace().is_some() {
+            return Self::in_grace_error(job_id);
+        }
+        anyhow::anyhow!(
+            "job {job_id} could not be suspended (state {:?})",
+            job.state
+        )
     }
 
     /// Resume a suspended job: validate state, record through Raft, fold suspended time.
@@ -2263,6 +2507,191 @@ impl ClusterManager {
         )
     }
 
+    pub(crate) fn validate_fabric_placement(
+        &self,
+        job: &Job,
+        node_names: &[String],
+        allocations: &HashMap<String, ResourceAllocations>,
+    ) -> anyhow::Result<()> {
+        let config = self.config();
+        spur_core::constraints::validate(&job.spec).map_err(anyhow::Error::msg)?;
+        let constraints =
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        let properties = !constraints.same.is_empty() || !constraints.predicates.is_empty();
+        let mut group = None;
+        for name in node_names.iter().filter(|name| {
+            properties
+                || allocations
+                    .get(*name)
+                    .is_some_and(|a| a.gpu_binding.is_some())
+        }) {
+            let allocation = allocations
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("missing GPU allocation for {name}"))?;
+            let node = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("GPU node disappeared"))?;
+            if properties || allocation.gpu_binding.is_some() {
+                let binding = allocation.gpu_binding.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("GPU property constraint requires an enforced binding")
+                })?;
+                binding
+                    .validate(name, &node.total_resources, allocation)
+                    .map_err(anyhow::Error::msg)?;
+                for id in allocation.device_ids("gpu") {
+                    let gpu = node
+                        .total_resources
+                        .gpus
+                        .iter()
+                        .find(|g| g.stable_id == id)
+                        .ok_or_else(|| anyhow::anyhow!("GPU disappeared"))?;
+                    anyhow::ensure!(
+                        constraints.matches_gpu(gpu),
+                        "allocated GPU does not satisfy its property predicates"
+                    );
+                    let key = constraints.group_key(name, gpu).ok_or_else(|| {
+                        anyhow::anyhow!("allocated GPU has unknown grouping properties")
+                    })?;
+                    anyhow::ensure!(
+                        group.as_ref().is_none_or(|prior| prior == &key),
+                        "allocated GPUs violate same-property constraint"
+                    );
+                    group = Some(key);
+                }
+            }
+        }
+        let required = constraints.same_fabric;
+        if !required
+            && allocations
+                .values()
+                .all(|allocation| allocation.fabric_binding.is_none())
+        {
+            return Ok(());
+        }
+        let view = self.fabric_view(Utc::now());
+        let mut key = None;
+        for name in node_names {
+            let allocation = allocations
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("missing fabric allocation for {name}"))?;
+            let binding = allocation.fabric_binding.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "same-fabric constraint requires an enforced fabric binding for {name}"
+                )
+            })?;
+            if key.is_some_and(|key| key != &binding.key) {
+                anyhow::bail!("allocation crosses fabric blocks");
+            }
+            key = Some(&binding.key);
+            let block = view
+                .blocks
+                .iter()
+                .find(|block| block.key == binding.key && block.issues.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("fabric block is no longer consistent"))?;
+            if block.active_endpoints != binding.active_endpoints
+                || block.file_revision != binding.file_revision
+                || binding
+                    .members
+                    .iter()
+                    .any(|member| !block.members.contains(member))
+            {
+                anyhow::bail!("fabric membership changed before dispatch");
+            }
+            let node = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("fabric node disappeared"))?;
+            binding
+                .validate(
+                    &config.cluster_name,
+                    name,
+                    &node.total_resources,
+                    allocation,
+                )
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
+    }
+
+    /// Steps re-attest their nodes' own bound devices; whole-block health gates placement only.
+    pub(crate) fn validate_step_bindings(
+        &self,
+        job: &Job,
+        step_nodes: &[String],
+    ) -> anyhow::Result<()> {
+        if job
+            .per_node_alloc
+            .values()
+            .all(|a| a.fabric_binding.is_none() && a.gpu_binding.is_none())
+        {
+            return Ok(());
+        }
+        let constraints =
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
+                .map_err(anyhow::Error::msg)?;
+        let properties = !constraints.same.is_empty() || !constraints.predicates.is_empty();
+        let config = self.config();
+        let block_file = config
+            .topology
+            .as_ref()
+            .and_then(|t| t.external.as_ref())
+            .and_then(|e| e.loaded_block_file.as_ref());
+        let keys: std::collections::BTreeSet<_> = job
+            .per_node_alloc
+            .values()
+            .filter_map(|a| a.fabric_binding.as_ref().map(|b| &b.key))
+            .collect();
+        if keys.len() > 1 {
+            anyhow::bail!("allocation crosses fabric blocks");
+        }
+        for name in step_nodes {
+            let allocation = job
+                .per_node_alloc
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("missing allocation for {name}"))?;
+            let needs_properties = properties || allocation.gpu_binding.is_some();
+            let needs_fabric = constraints.same_fabric || allocation.fabric_binding.is_some();
+            if !needs_properties && !needs_fabric {
+                continue;
+            }
+            let node = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("bound node {name} disappeared"))?;
+            if needs_properties {
+                allocation
+                    .gpu_binding
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing GPU property binding for {name}"))?
+                    .validate_step(name, &node.total_resources, allocation)
+                    .map_err(anyhow::Error::msg)?;
+            }
+            if needs_fabric {
+                let binding = allocation
+                    .fabric_binding
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing fabric binding for {name}"))?;
+                if binding.file_revision.is_some()
+                    && !block_file.is_some_and(|file| {
+                        job.allocated_nodes
+                            .iter()
+                            .all(|node| file.contains(&binding.key.fabric_domain, node))
+                    })
+                {
+                    anyhow::bail!("block file no longer declares the allocation in one block");
+                }
+                binding
+                    .validate_step(
+                        &config.cluster_name,
+                        name,
+                        &node.total_resources,
+                        allocation,
+                    )
+                    .map_err(anyhow::Error::msg)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Charge a placement in Raft before dispatching, so a leader change
     /// mid-dispatch finds it charged rather than free. Returns the run epoch.
     pub fn reserve_placement(
@@ -2283,6 +2712,10 @@ impl ClusterManager {
                 );
             }
         }
+        let job = self
+            .get_job(job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
+        self.validate_fabric_placement(&job, &node_names, &per_node_alloc)?;
         let run_attempt = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -2432,6 +2865,8 @@ impl ClusterManager {
                 start_time: Some(Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: false,
+                job_shell: false,
             };
             if let Err(e) = self.create_step(batch_step) {
                 warn!(job_id, error = %e, "failed to record batch step");
@@ -2588,8 +3023,14 @@ impl ClusterManager {
         }
 
         let jobs = self.jobs.read();
-        if jobs.get(&job_id).is_some_and(|job| job.state.is_terminal()) {
+        let Some(job) = jobs.get(&job_id) else {
+            return Ok(NodeCompleteResult::Completing);
+        };
+        if job.state.is_terminal() {
             return Ok(NodeCompleteResult::AlreadyTerminal);
+        }
+        if job.state == JobState::Running && job.preempt_grace().is_some() {
+            return Ok(NodeCompleteResult::InGrace);
         }
 
         Ok(NodeCompleteResult::Completing)
@@ -2615,12 +3056,12 @@ impl ClusterManager {
     ) -> anyhow::Result<()> {
         // A time-limit expiry has to win over the caller's outcome here, not
         // just in the per-node completion path. The marker is only ever set on
-        // a run the watchdog signalled, so any completion routed through this
-        // method — the completing-timeout force-finish and the srun path, both
-        // of which finalize without seeing node_completions — is a wall-time
-        // expiry that would otherwise be reported as an ordinary failure and
-        // skip the Timeout requeue. Cancelled (user cancel, preemption) and an
-        // already-correct Timeout pass through untouched.
+        // a run the time-limit watchdog or the InactiveLimit reaper signalled,
+        // so any completion routed through this method — the completing-timeout
+        // force-finish and the srun paths, which finalize without seeing
+        // node_completions — is a timeout that would otherwise be reported as an
+        // ordinary failure and skip the Timeout requeue. Cancelled (user cancel,
+        // preemption) and an already-correct Timeout pass through untouched.
         let state = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -2650,6 +3091,7 @@ impl ClusterManager {
             state,
             unreported_nodes: facts.unreported_nodes,
             cancel: facts.cancel,
+            controller_initiated: false,
             at: None,
         })?;
         self.run_all_finalized_side_effects(&resp);
@@ -2663,21 +3105,76 @@ impl ClusterManager {
     /// completion path report `Timeout` instead of reading the terminating
     /// signal as an ordinary failure — a job that exits promptly on SIGTERM
     /// reports back long before the grace period is up.
+    ///
+    /// Controllers no longer emit this entry (see `expire_time_limit`); tests
+    /// use it to build the state an older entry replays into.
+    #[cfg(test)]
     pub fn signal_time_limit(&self, job_id: JobId, at: DateTime<Utc>) -> anyhow::Result<()> {
         self.propose(WalOperation::JobTimeLimitSignaled { job_id, at })?;
         Ok(())
     }
 
+    /// Record that a running job was warned of preemption and may keep its nodes
+    /// until `pending.deadline`. `false`: the run ended, was replaced, or is
+    /// already in a grace, so the caller must not warn it.
+    pub fn signal_preemption(
+        &self,
+        pending: PreemptPending,
+        job_id: JobId,
+    ) -> anyhow::Result<bool> {
+        let resp = self.propose(WalOperation::JobPreemptSignaled { job_id, pending })?;
+        Ok(resp.preempt_signal_applied)
+    }
+
+    /// Seconds a requeued job stays ineligible after its old run is cancelled.
+    pub(crate) fn requeue_hold_secs(&self) -> i64 {
+        requeue_hold_secs(
+            self.scheduler_interval_secs,
+            self.config().scheduler.effective_kill_wait_secs(),
+        )
+    }
+
+    /// Record that a run exhausted its time limit and move it to Completing in one
+    /// entry, so the graceful cancel finds the verdict durable. `false`: the run
+    /// holds no nodes (or already ended) and the caller must finalize it itself.
+    pub fn expire_time_limit(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        at: DateTime<Utc>,
+    ) -> anyhow::Result<bool> {
+        let resp = self.propose(WalOperation::JobTimeLimitExpired {
+            job_id,
+            run_attempt,
+            at,
+        })?;
+        Ok(resp.time_limit_applied
+            && self
+                .jobs
+                .read()
+                .get(&job_id)
+                .is_some_and(|job| job.state == JobState::Completing))
+    }
+
     /// Preempt a running job per its partition's PreemptMode, without
     /// recording a triggering job (e.g. controller-initiated fencing rather
     /// than scheduler priority preemption). See `preempt_job_with_provenance`.
-    pub fn preempt_job(&self, job_id: JobId, mode: PreemptMode) -> anyhow::Result<PreemptOutcome> {
-        self.preempt_job_with_provenance(job_id, mode, None, None)
+    pub fn preempt_job(
+        &self,
+        job_id: JobId,
+        expected_run_attempt: u32,
+        mode: PreemptMode,
+    ) -> anyhow::Result<PreemptOutcome> {
+        self.preempt_job_with_provenance(job_id, expected_run_attempt, mode, None, None)
     }
 
     /// Preempt a running job per its partition's PreemptMode. Does the
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
+    ///
+    /// `expected_run_attempt` is the run the caller decided to preempt; a job that
+    /// has moved on is refused, and the Raft entry carries it so apply skips a
+    /// replacement run too.
     ///
     /// `preempted_by` is the job that triggered the preemption (recorded for
     /// provenance), or `None` when there isn't one. `preempt_qos` is the
@@ -2686,11 +3183,19 @@ impl ClusterManager {
     pub fn preempt_job_with_provenance(
         &self,
         job_id: JobId,
+        expected_run_attempt: u32,
         mode: PreemptMode,
         preempted_by: Option<JobId>,
         preempt_qos: Option<String>,
     ) -> anyhow::Result<PreemptOutcome> {
-        self.preempt_job_inner(job_id, mode, preempted_by, preempt_qos, true)
+        self.preempt_job_inner(
+            job_id,
+            expected_run_attempt,
+            mode,
+            preempted_by,
+            preempt_qos,
+            true,
+        )
     }
 
     /// `preempt_job_with_provenance` for reclaim: the freed node is *not*
@@ -2701,16 +3206,25 @@ impl ClusterManager {
     pub fn reclaim_job_with_provenance(
         &self,
         job_id: JobId,
+        expected_run_attempt: u32,
         mode: PreemptMode,
         reclaimed_by: Option<JobId>,
         preempt_qos: Option<String>,
     ) -> anyhow::Result<PreemptOutcome> {
-        self.preempt_job_inner(job_id, mode, reclaimed_by, preempt_qos, false)
+        self.preempt_job_inner(
+            job_id,
+            expected_run_attempt,
+            mode,
+            reclaimed_by,
+            preempt_qos,
+            false,
+        )
     }
 
     fn preempt_job_inner(
         &self,
         job_id: JobId,
+        expected_run_attempt: u32,
         mode: PreemptMode,
         preempted_by: Option<JobId>,
         preempt_qos: Option<String>,
@@ -2724,6 +3238,14 @@ impl ClusterManager {
             if job.state != JobState::Running {
                 anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
             }
+            if job.run_attempt != expected_run_attempt {
+                anyhow::bail!(
+                    "job {} is at run {}, not the run {} the preemption was decided for",
+                    job_id,
+                    job.run_attempt,
+                    expected_run_attempt
+                );
+            }
         }
 
         match mode {
@@ -2731,8 +3253,9 @@ impl ClusterManager {
             PreemptMode::Suspend => {
                 // Propose JobSuspend directly (rather than suspend_job) so
                 // provenance fields are inside the WAL entry and survive Raft
-                // replication and leader failover. The job state was already
-                // validated at the top of preempt_job — no re-check needed.
+                // replication and leader failover. The check above can go stale
+                // before the apply; the apply re-checks and `suspend_applied`
+                // reports whether it held.
                 let resp = self.propose(WalOperation::JobSuspend {
                     job_id,
                     at: chrono::Utc::now(),
@@ -2740,6 +3263,9 @@ impl ClusterManager {
                     preempt_qos: preempt_qos.clone(),
                     by: None,
                 })?;
+                if !resp.suspend_applied {
+                    return Err(self.suspend_refusal(job_id));
+                }
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (suspend)");
                 Ok(PreemptOutcome::Suspended)
@@ -2750,7 +3276,11 @@ impl ClusterManager {
                     preempted_by,
                     preempt_qos,
                     at: Some(Utc::now()),
+                    run_attempt: Some(expected_run_attempt),
                 })?;
+                if !resp.preempt_applied {
+                    return Err(Self::preemption_skipped(job_id, expected_run_attempt));
+                }
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (cancel)");
                 Ok(PreemptOutcome::Killed)
@@ -2766,7 +3296,7 @@ impl ClusterManager {
                 // the maybe_requeue MAX_REQUEUE cap: Slurm always requeues a
                 // preempted job regardless of its --requeue flag. This is a
                 // deliberate divergence from the ordinary requeue path.
-                let hold_secs = (self.scheduler_interval_secs as i64 * 2 + 3).max(5);
+                let hold_secs = self.requeue_hold_secs();
                 let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
                 // Honor a later user --begin: compute the max on the leader so
                 // followers apply one verbatim instant (no per-replica clock).
@@ -2785,7 +3315,11 @@ impl ClusterManager {
                     preempted_by,
                     preempt_qos,
                     at: None,
+                    run_attempt: Some(expected_run_attempt),
                 })?;
+                if !resp.preempt_applied {
+                    return Err(Self::preemption_skipped(job_id, expected_run_attempt));
+                }
                 // Requeue frees the node and moves the victim straight to Pending
                 // (no Completing drain), so only the earmark keeps the node for the
                 // preemptor. Set leader-side: this path runs synchronously inside
@@ -2801,6 +3335,14 @@ impl ClusterManager {
                 Ok(PreemptOutcome::Killed)
             }
         }
+    }
+
+    /// The run changed between the up-front check and the apply, which skipped
+    /// the final preemption entry.
+    fn preemption_skipped(job_id: JobId, expected_run_attempt: u32) -> anyhow::Error {
+        anyhow::anyhow!(
+            "job {job_id} was no longer running as run {expected_run_attempt} when its preemption applied"
+        )
     }
 
     fn run_job_finalized_side_effects(&self, finalized: &JobFinalized) {
@@ -3135,7 +3677,14 @@ impl ClusterManager {
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
-            let (exit_signal, derived_exit_code, preempted_by, preempt_mode, preempt_qos) = self
+            let (
+                exit_signal,
+                derived_exit_code,
+                preempted_by,
+                preempt_mode,
+                preempt_qos,
+                submission,
+            ) = self
                 .jobs
                 .read()
                 .get(&job_id)
@@ -3146,9 +3695,10 @@ impl ClusterManager {
                         j.preempted_by,
                         j.preempt_mode.clone(),
                         j.preempt_qos.clone(),
+                        Some(JobSubmission::for_job(j)),
                     )
                 })
-                .unwrap_or((0, 0, None, None, None));
+                .unwrap_or((0, 0, None, None, None, None));
             notifier.notify_job_end(JobEndRecord {
                 job_id,
                 state: state.display().to_owned(),
@@ -3167,6 +3717,7 @@ impl ClusterManager {
                     .map(|c| c.user.clone())
                     .unwrap_or_default(),
                 ended_by_uid: finalized.ended_by.as_ref().and_then(|c| c.uid),
+                submission,
             });
         }
 
@@ -3233,7 +3784,7 @@ impl ClusterManager {
     /// Unlike `maybe_requeue`, this is unconditional and doesn't require
     /// the requeue flag on the spec. Used when the agent rejects a job
     /// (e.g., container image not found) so it can be retried after the
-    /// user fixes the issue. (Issue #91)
+    /// user fixes the issue.
     pub fn requeue_job(&self, job_id: JobId) -> anyhow::Result<()> {
         self.requeue_after_launch_failure(job_id, false)
     }
@@ -3274,7 +3825,7 @@ impl ClusterManager {
 
         // transition to Failed via JobComplete so node resources,
         // licenses, and steps are properly cleaned up.
-        self.propose(WalOperation::job_complete(job_id, -1, JobState::Failed))?;
+        self.propose(WalOperation::job_failed_by_controller(job_id))?;
 
         if hold {
             self.propose(WalOperation::job_state_change_held_pending_desc(
@@ -3413,6 +3964,7 @@ impl ClusterManager {
         version: String,
         source: NodeSource,
         labels: HashMap<String, String>,
+        capabilities: Vec<String>,
         caller_privileged: bool,
     ) -> Result<(), RegisterNodeError> {
         let hostname = if hostname.is_empty() {
@@ -3442,7 +3994,8 @@ impl ClusterManager {
                         || (!wg_pubkey.is_empty()
                             && existing.wg_pubkey.as_deref() != Some(wg_pubkey.as_str()))
                         || (!version.is_empty()
-                            && existing.version.as_deref() != Some(version.as_str()));
+                            && existing.version.as_deref() != Some(version.as_str()))
+                        || existing.capabilities != capabilities;
                     if needs_update {
                         self.propose(WalOperation::NodeUpdate {
                             name: name.clone(),
@@ -3456,6 +4009,7 @@ impl ClusterManager {
                             wg_pubkey,
                             version,
                             source: source.clone(),
+                            capabilities,
                         })
                         .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                         info!(node = %name, "node comm address or metadata updated");
@@ -3477,6 +4031,7 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                     source: source.clone(),
+                    capabilities,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 self.sync_node_labels(&name, labels, caller_privileged)?;
@@ -3496,6 +4051,7 @@ impl ClusterManager {
                     version,
                     labels,
                     source: source.clone(),
+                    capabilities,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
@@ -3567,12 +4123,15 @@ impl ClusterManager {
 
     fn record_job_keepalive_at(&self, job_id: JobId, at: DateTime<Utc>) {
         self.interactive_last_seen.write().insert(job_id, at);
+        self.pinged_this_term.write().insert(job_id);
     }
 
     /// Clear keepalive last-seen on leadership (re)gain: a follower records
     /// none, so carried-over stale entries would otherwise reap live allocations.
+    /// Also drops the per-term ping set, which is likewise leader-local.
     pub(crate) fn reset_interactive_last_seen(&self) {
         self.interactive_last_seen.write().clear();
+        self.pinged_this_term.write().clear();
     }
 
     #[cfg(test)]
@@ -3585,15 +4144,23 @@ impl ClusterManager {
     /// (so a just-promoted leader or a newly-seen allocation gets a full window
     /// before it can be reaped). `limit_secs == 0` disables reaping: the map is
     /// still pruned, but nothing is returned.
+    ///
+    /// Only keepalive-capable allocations are reaped: those whose durable
+    /// `client_keepalive` flag is set (`keepalive_capable`) or that have pinged
+    /// this term. Others (the K8s operator, third-party clients, pre-v0.9 CLIs)
+    /// are seeded but never returned, so they behave as before.
     pub(crate) fn interactive_reap_candidates(
         &self,
         running_ids: &[JobId],
+        keepalive_capable: &HashSet<JobId>,
         now: DateTime<Utc>,
         limit_secs: u32,
     ) -> Vec<JobId> {
         let live: HashSet<JobId> = running_ids.iter().copied().collect();
         let mut seen = self.interactive_last_seen.write();
         seen.retain(|id, _| live.contains(id));
+        let mut pinged = self.pinged_this_term.write();
+        pinged.retain(|id| live.contains(id));
         if limit_secs == 0 {
             return Vec::new();
         }
@@ -3601,7 +4168,11 @@ impl ClusterManager {
         running_ids
             .iter()
             .copied()
-            .filter(|id| now - *seen.entry(*id).or_insert(now) > limit)
+            .filter(|id| {
+                // Seed every live allocation's timer, but only reap eligible ones.
+                let idle = now - *seen.entry(*id).or_insert(now) > limit;
+                idle && (keepalive_capable.contains(id) || pinged.contains(id))
+            })
             .collect()
     }
 
@@ -3739,6 +4310,26 @@ impl ClusterManager {
         self.nodes.read().values().cloned().collect()
     }
 
+    pub fn fabric_view(&self, now: DateTime<Utc>) -> spur_core::fabric::FabricView {
+        let config = self.config();
+        let nodes = self.get_nodes();
+        let timeout = config.controller.heartbeat_timeout_secs.unwrap_or(90);
+        let definition = config
+            .topology
+            .as_ref()
+            .and_then(|t| t.external.as_ref())
+            .and_then(|e| e.loaded_block_file.as_ref());
+        match definition {
+            Some(file) => file.view(&config.cluster_name, &nodes, now, timeout, true),
+            None => spur_core::fabric::FabricView::from_nodes(
+                &config.cluster_name,
+                &nodes,
+                now,
+                timeout,
+            ),
+        }
+    }
+
     /// Nodes eligible for new placement this tick: all nodes minus those on a
     /// dispatch cooldown, except a cooling node pinned by a pending job's
     /// `--nodelist` (its only option). Exclusion is resource-agnostic by design.
@@ -3764,6 +4355,69 @@ impl ClusterManager {
     /// Get a node by name.
     pub fn get_node(&self, name: &str) -> Option<Node> {
         self.nodes.read().get(name).cloned()
+    }
+
+    /// The layout to deliver to a node and the revision that orders it against
+    /// every earlier delivery. The revision is returned even with no layout, so
+    /// the agent can tell a current clear from a stale one.
+    pub fn node_layout_delivery(&self, name: &str) -> LayoutDelivery {
+        let term = self
+            .raft
+            .read()
+            .as_ref()
+            .map(|r| r.metrics().borrow().current_term)
+            .unwrap_or(0);
+        let nodes = self.nodes.read();
+        let node = nodes.get(name);
+        let revision = spur_core::core_layout::LayoutRevision {
+            term,
+            boot: self.boot_epoch.load(Ordering::Relaxed),
+            seq: node.map_or(0, |n| n.layout_seq),
+        };
+        LayoutDelivery {
+            layout: node.and_then(|n| n.core_layout.as_ref().map(Into::into)),
+            revision: revision.into(),
+            error: node
+                .and_then(|n| n.layout_error.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Record the agent's enforcement state and decide whether it should
+    /// re-register to receive the node's current layout. Asked only when the
+    /// layouts differ — an enforcement error alone does not help, but a corrected
+    /// policy must still reach a failing node — and at most once per interval for
+    /// the same layout; a node whose layout cannot be computed is never asked.
+    pub fn record_layout_heartbeat(
+        &self,
+        name: &str,
+        held_fingerprint: u64,
+        enforcement_error: &str,
+    ) -> bool {
+        let mut nodes = self.nodes.write();
+        let Some(node) = nodes.get_mut(name) else {
+            return false;
+        };
+        node.layout_enforce_error =
+            (!enforcement_error.is_empty()).then(|| enforcement_error.to_string());
+        let expected = node.core_layout.as_ref().map_or(0, CoreLayout::fingerprint);
+        if node.layout_error.is_some() {
+            return false;
+        }
+        if held_fingerprint == expected {
+            self.layout_reregister_asked.lock().remove(name);
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let mut asked = self.layout_reregister_asked.lock();
+        let recently = asked.get(name).is_some_and(|(at, fp)| {
+            *fp == expected && now.duration_since(*at) < LAYOUT_REREGISTER_INTERVAL
+        });
+        if recently {
+            return false;
+        }
+        asked.insert(name.to_string(), (now, expected));
+        true
     }
 
     /// Get all partitions.
@@ -3860,7 +4514,7 @@ impl ClusterManager {
         };
 
         if state == JobState::Running {
-            self.propose(WalOperation::job_complete(job_id, -1, JobState::Failed))?;
+            self.propose(WalOperation::job_failed_by_controller(job_id))?;
             state = JobState::Failed;
         }
 
@@ -4122,6 +4776,18 @@ impl ClusterManager {
             job.actual_stdout_path = (!stdout_path.is_empty()).then_some(stdout_path);
             job.actual_stderr_path = (!stderr_path.is_empty()).then_some(stderr_path);
         }
+    }
+
+    pub fn quarantine_node(&self, name: &str, reason: &str) -> anyhow::Result<()> {
+        let held = self
+            .nodes
+            .read()
+            .get(name)
+            .is_some_and(|node| node.admin_locked && node.state.is_unavailable());
+        if held {
+            return Ok(());
+        }
+        self.update_node_state(name, NodeState::Drain, Some(reason.to_owned()), None)
     }
 
     /// Update node state (admin: drain, resume, etc.)
@@ -4499,7 +5165,8 @@ impl ClusterManager {
         Ok((target_state, running_count))
     }
 
-    /// Whether `name` has any job holding an allocation (Running/Completing/Suspended). Shared by
+    /// Whether `name` has any job still charged to it (Running/Completing/Suspended); a node that
+    /// already reported its part of a run is free. Shared by
     /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
     /// busy node without `--force` using the same rule.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
@@ -4508,7 +5175,7 @@ impl ClusterManager {
             matches!(
                 j.state,
                 JobState::Running | JobState::Completing | JobState::Suspended
-            ) && j.allocated_nodes.iter().any(|n| n == name)
+            ) && j.is_held_on(name)
         })
     }
 
@@ -4683,7 +5350,7 @@ impl ClusterManager {
         );
         let (classification, _) =
             crate::scheduler_loop::classify_without_phantom_claims(self, |c| {
-                crate::scheduler_loop::trial_placement(self, &mut trial, None, c)
+                crate::scheduler_loop::trial_placement(self, &mut trial, c)
             });
         self.apply_classification(classification)
     }
@@ -4820,8 +5487,9 @@ impl ClusterManager {
         // preemptor ahead of a bystander puts it first in the pending list, so
         // backfill's ordinary ordering reserves that node for it rather than
         // handing it to whoever sorts highest on effective priority. Scoped to
-        // draining victims (Completing) so suspend-mode evictions, which never
-        // free a node, do not trigger a hoist. The `preempt_freed_nodes` earmarks
+        // draining victims (Completing, or Running in a preemption grace) so
+        // suspend-mode evictions, which never free a node, do not trigger a
+        // hoist. The `preempt_freed_nodes` earmarks
         // extend the hoist across the one cycle after a victim finalizes (clearing
         // the draining anchor) before the preemptor is placed. The hoist only
         // affects sort order; it never hides a node from other jobs.
@@ -4833,10 +5501,11 @@ impl ClusterManager {
         let hoisted: HashSet<JobId> = {
             let mut draining_by_owner: HashMap<JobId, Vec<&Job>> = HashMap::new();
             for job in jobs.values() {
-                if job.state == JobState::Completing && !job.allocated_nodes.is_empty() {
-                    if let Some(owner) = job.preempted_by {
-                        draining_by_owner.entry(owner).or_default().push(job);
-                    }
+                if job.allocated_nodes.is_empty() {
+                    continue;
+                }
+                if let Some(owner) = crate::scheduler_loop::preemptor_awaiting_release(job) {
+                    draining_by_owner.entry(owner).or_default().push(job);
                 }
             }
             let freed_by_owner = self.preempt_freed_nodes_by_owner(&jobs);
@@ -5480,6 +6149,7 @@ impl ClusterManager {
         priority_tier: Option<u32>,
         preempt_mode: Option<String>,
         preempt_exempt_time: Option<Option<u32>>,
+        grace_time: Option<Option<u32>>,
     ) -> Result<(), PartitionError> {
         if !self.partitions.read().iter().any(|p| p.name == name) {
             return Err(PartitionError::not_found(format!(
@@ -5537,6 +6207,7 @@ impl ClusterManager {
             preempt_mode,
             is_default,
             preempt_exempt_time,
+            grace_time,
         })
         .map_err(|e| PartitionError::raft(e.to_string()))?;
         Ok(())
@@ -5581,14 +6252,78 @@ impl ClusterManager {
         let Some(ref path) = self.config_path else {
             anyhow::bail!("reconfigure requires a config file path, but none is configured");
         };
-        let new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        let mut new_config = spur_core::config::SlurmConfig::load_from_file(path)?;
+        if let Some(external) = new_config
+            .topology
+            .as_mut()
+            .and_then(|t| t.external.as_mut())
+        {
+            external.load_block_file().map_err(anyhow::Error::msg)?;
+            if let Some(file) = &external.loaded_block_file {
+                let view = file.view(
+                    &new_config.cluster_name,
+                    &self.get_nodes(),
+                    Utc::now(),
+                    new_config.controller.heartbeat_timeout_secs.unwrap_or(90),
+                    false,
+                );
+                for notice in &view.notices {
+                    if notice.warning {
+                        warn!(block_name = %notice.block_name, "{}", notice.message);
+                    } else {
+                        info!(block_name = %notice.block_name, "{}", notice.message);
+                    }
+                }
+                for block in view.blocks.iter().filter(|b| b.file_revision.is_some()) {
+                    let (membership, health): (Vec<&String>, Vec<&String>) = block
+                        .issues
+                        .iter()
+                        .partition(|i| spur_core::block_file::is_membership_error(i));
+                    let join = |issues: Vec<&String>| {
+                        issues
+                            .into_iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    if !membership.is_empty() {
+                        anyhow::bail!(
+                            "invalid block file membership for {}: {}",
+                            block.key.fabric_domain,
+                            join(membership)
+                        );
+                    }
+                    if !health.is_empty() {
+                        warn!(
+                            block = %block.key.fabric_domain,
+                            "block is unavailable until its nodes recover: {}",
+                            join(health)
+                        );
+                    }
+                }
+            }
+        }
         new_config.auth.check_private_data()?;
         if let Some(warning) = new_config.auth.private_data_warning() {
             warn!("{warning}");
         }
+        warn_if_complete_wait_too_short(&new_config);
         // Reject a broken submit hook before it goes live, so reconfigure can't
         // silently swap in a hook that fails every subsequent submission.
         crate::hooks::validate_submit_hooks(&new_config.hooks)?;
+        // Applied live, a specialization change would differ between leader and
+        // followers until each recomputed, so isolation could change on failover.
+        let restart_only = spur_core::core_layout::restart_only_node_changes(
+            &self.config().nodes,
+            &new_config.nodes,
+        );
+        if !restart_only.is_empty() {
+            anyhow::bail!(
+                "reconfigure rejected: these [[nodes]] specialization changes require \
+                 restarting all controllers: {}",
+                restart_only.join(", ")
+            );
+        }
         let conf_partitions = new_config.build_partitions();
 
         let conf_names: std::collections::HashSet<String> =
@@ -5660,6 +6395,7 @@ impl ClusterManager {
                 // Only push a WAL change when TOML explicitly sets the field;
                 // absent means "leave whatever the runtime WAL already has".
                 preempt_exempt_time: part.preempt_exempt_time.map(Some),
+                grace_time: part.grace_time.map(Some),
             })
             .map_err(|e| anyhow::anyhow!("reconfigure: update {}: {e}", part.name))?;
         }
@@ -5673,7 +6409,11 @@ impl ClusterManager {
         // Swap the live config last, after partition WAL ops have been accepted,
         // so a mid-reconfigure failure leaves the previous config in place.
         // Readers pick up the new sections on their next `config()` snapshot.
+        let new_weights = new_config.scheduler.billing_weights();
         *self.config.write() = Arc::new(new_config);
+        if let Some(ref handle) = *self.billing_weights.read() {
+            *handle.write() = new_weights;
+        }
         // Agent channels are built per call, so new tunables apply to the next RPC. Unlike the
         // jwt key, these carry no security posture, so adopting them live is safe.
         crate::agent_client::set_channel_tuning(&self.config.read().controller);
@@ -6102,6 +6842,25 @@ impl ClusterManager {
         self.reservations.read().clone()
     }
 
+    pub fn annotate_fabric_pending(&self, ids: &[JobId]) {
+        let mut jobs = self.jobs.write();
+        for id in ids {
+            if let Some(job) = jobs.get_mut(id) {
+                if job.state == JobState::Pending
+                    && !job.pending_reason.is_scheduling_hold()
+                    && !job.reason_explains_begin_hold(Utc::now())
+                {
+                    let description = if spur_core::constraints::requires_same_fabric(&job.spec) {
+                        "FabricUnavailable: no consistent block with capable agents satisfies the request; inspect topology show"
+                    } else {
+                        "GpuPropertiesUnavailable: no GPU placement with capable agents satisfies the requested properties; inspect control show node"
+                    };
+                    job.set_pending_reason_desc(PendingReason::Resources, description);
+                }
+            }
+        }
+    }
+
     /// Update pending_reason for jobs the scheduler couldn't schedule.
     ///
     /// Called after each scheduling cycle so that `squeue` shows a meaningful
@@ -6337,6 +7096,10 @@ impl ClusterManager {
         *self.raft.write() = Some(raft);
     }
 
+    pub fn set_boot_epoch(&self, epoch: u64) {
+        self.boot_epoch.store(epoch, Ordering::Relaxed);
+    }
+
     /// False if writes were still pending at `limit`, meaning rows were lost.
     pub async fn drain_accounting(&self, limit: std::time::Duration) -> bool {
         // Taken out of the lock: the drain awaits, and the guard is not Send.
@@ -6349,6 +7112,13 @@ impl ClusterManager {
 
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
         *self.accounting.write() = Some(notifier);
+    }
+
+    pub fn set_billing_weights_handle(
+        &self,
+        handle: std::sync::Arc<parking_lot::RwLock<spur_core::config::BillingWeights>>,
+    ) {
+        *self.billing_weights.write() = Some(handle);
     }
 
     pub fn set_sched_stats(&self, stats: Arc<SchedStatsCollector>) {
@@ -6828,6 +7598,221 @@ impl ClusterManager {
         }
     }
 
+    /// Suspend a run, unless it is inside its preemption grace: the deadline
+    /// is only enforced on a Running job, so a suspended one would keep the
+    /// grace forever. Returns whether the job is now suspended by this entry.
+    fn apply_suspend(
+        job: &mut Job,
+        at: DateTime<Utc>,
+        preempted_by: Option<JobId>,
+        preempt_qos: Option<&str>,
+        by: Option<&Actor>,
+    ) -> bool {
+        if job.preempt_grace().is_some() {
+            warn!(
+                job_id = job.job_id,
+                "suspend refused: the job is in its preemption grace period"
+            );
+            return false;
+        }
+        match job.apply_transition(JobState::Suspended) {
+            Ok(TransitionOutcome::Applied) => {}
+            Ok(TransitionOutcome::NoOp) => return false,
+            Err(e) => {
+                warn!(job_id = job.job_id, error = %e, "invalid suspend transition in WAL apply");
+                return false;
+            }
+        }
+        job.suspended_at = Some(at);
+        if preempted_by.is_some() {
+            job.preempted_by = preempted_by;
+            job.preempt_mode = Some("Suspend".to_string());
+            job.preempt_qos = preempt_qos.map(str::to_string);
+        } else {
+            job.suspended_by = by.cloned();
+        }
+        true
+    }
+
+    /// Move a live run to Completing, where it holds its nodes until each
+    /// reports. Returns whether it now waits for them: a run holding no nodes
+    /// never will, so it must not wait, and the caller finalizes it instead.
+    fn begin_completing(job: &mut Job, at: DateTime<Utc>) -> bool {
+        let waits_for_nodes = matches!(job.state, JobState::Running | JobState::Suspended)
+            && !job.allocated_nodes.is_empty();
+        if !waits_for_nodes {
+            return false;
+        }
+        if let Err(e) = job.transition(JobState::Completing) {
+            warn!(job_id = job.job_id, error = %e, "invalid transition to Completing");
+            return false;
+        }
+        // Completing is not terminal, so nothing stamps this for us.
+        // It is what gives the job its full complete_wait_secs grace.
+        job.end_time = Some(at);
+        job.end_suspension(at);
+        job.preempt_pending = None;
+        true
+    }
+
+    /// Record on a victim whose run is ending inside its grace the provenance a
+    /// final `JobPreemptCancel`/`JobPreemptRequeue` would have set, so the
+    /// completion verdict and the preemptor earmark treat it as preempted.
+    fn adopt_grace_provenance(job: &mut Job, at: DateTime<Utc>) {
+        let Some(pending) = job.preempt_grace() else {
+            return;
+        };
+        let (preempted_by, preempt_qos, mode) = (
+            pending.preempted_by,
+            pending.preempt_qos.clone(),
+            pending.mode,
+        );
+        match mode {
+            PreemptMode::Cancel => {
+                job.preempt_mode = Some("Cancel".to_string());
+                job.cancel_signaled_at.get_or_insert(at);
+            }
+            PreemptMode::Requeue => job.preempt_mode = Some("Requeue".to_string()),
+            PreemptMode::Off | PreemptMode::Suspend => return,
+        }
+        job.preempted_by = Some(preempted_by);
+        job.preempt_qos = preempt_qos;
+    }
+
+    /// Move a run whose node just reported toward its end. A victim in its grace
+    /// stays Running until every node has reported, then ends as the preemption it
+    /// was warned of. `None` while nodes are outstanding or the state machine refuses.
+    fn advance_after_node_report(
+        job: &mut Job,
+        grace: Option<&PreemptPending>,
+        at: DateTime<Utc>,
+    ) -> Option<JobFinalized> {
+        let all_reported = job.all_nodes_completed();
+        // An OOM kill is not the checkpoint-and-exit the warning asked for: the
+        // run ends as the failure it was.
+        let grace = grace.filter(|_| !(all_reported && job.reported_oom()));
+        if let Some(pending) = grace {
+            if !all_reported {
+                return None;
+            }
+            if pending.mode == PreemptMode::Requeue {
+                let begin = Self::preempt_hold_until(job, at, pending.requeue_hold_secs);
+                return Self::repend_after_preemption(
+                    job,
+                    begin,
+                    Some(pending.preempted_by),
+                    pending.preempt_qos.clone(),
+                    at,
+                );
+            }
+            Self::adopt_grace_provenance(job, at);
+        }
+        // Suspended jobs route through Completing too, so an out-of-band task
+        // death finalizes instead of stranding.
+        if matches!(job.state, JobState::Running | JobState::Suspended) {
+            if let Err(e) = job.transition(JobState::Completing) {
+                warn!(job_id = job.job_id, error = %e, "invalid transition to Completing");
+            }
+            job.end_suspension(at);
+            job.end_time = Some(at);
+        }
+        if !all_reported {
+            return None;
+        }
+        Self::finalize_reported_run(job, at)
+    }
+
+    /// When a victim re-pended after its grace may run again: the hold recorded
+    /// with the warning, never earlier than a later `--begin` the user set.
+    fn preempt_hold_until(job: &Job, at: DateTime<Utc>, hold_secs: u32) -> DateTime<Utc> {
+        let hold = at + chrono::Duration::seconds(i64::from(hold_secs));
+        job.spec.begin_time.map_or(hold, |begin| begin.max(hold))
+    }
+
+    /// Whether a preemption decided for `run_attempt` still applies to `job`.
+    /// `None` (a pre-upgrade entry) matches any run.
+    fn preempt_targets_run(job: &Job, run_attempt: Option<u32>) -> bool {
+        run_attempt.is_none_or(|attempt| attempt == job.run_attempt)
+    }
+
+    /// End a live run as PREEMPTED for accounting and return the job to Pending
+    /// with an eligibility hold, in one step so the intermediate state never
+    /// escapes the caller's lock. `None` when the state machine refuses.
+    fn repend_after_preemption(
+        job: &mut Job,
+        begin_time: DateTime<Utc>,
+        preempted_by: Option<JobId>,
+        preempt_qos: Option<String>,
+        at: DateTime<Utc>,
+    ) -> Option<JobFinalized> {
+        if let Err(e) = job.transition(JobState::Preempted) {
+            warn!(job_id = job.job_id, error = %e, "invalid preempt transition in WAL apply");
+            return None;
+        }
+        job.exit_code = Some(-1);
+        job.end_time = Some(at);
+        job.end_suspension(at);
+        job.node_completions.clear();
+
+        // Capture run_time before reset clears start_time.
+        // run_time() excludes suspended intervals.
+        let elapsed = job
+            .run_time()
+            .map(|d| d.num_seconds().max(0) as u64)
+            .unwrap_or(0);
+
+        if let Err(e) = job.transition(JobState::Pending) {
+            warn!(job_id = job.job_id, error = %e, "invalid requeue transition in WAL apply");
+            return None;
+        }
+        Self::reset_job_for_preempt_requeue(job);
+        job.spec.begin_time = Some(begin_time);
+        // Provenance fields are set after reset_job_for_preempt_requeue
+        // clears run state so they survive into the pending phase.
+        job.preempted_by = preempted_by;
+        job.preempt_mode = Some("Requeue".to_string());
+        job.preempt_qos = preempt_qos.clone();
+        let finalized = JobFinalized::for_job_with_elapsed(job, JobState::Preempted, -1, elapsed);
+        let desc = spur_core::end_reason::preemption_summary(preempted_by, preempt_qos.as_deref());
+        job.set_pending_reason_desc(PendingReason::Preempted, desc);
+        Some(finalized)
+    }
+
+    /// Finalize a Completing run whose nodes have all reported, from the
+    /// verdict their completions imply. `None` when the state machine refuses.
+    fn finalize_reported_run(job: &mut Job, at: DateTime<Utc>) -> Option<JobFinalized> {
+        // Primary = batch node (allocated_nodes[0]); empty when none allocated,
+        // where derived_completion falls back to the worst completion.
+        let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
+        // spurd flags an OOM kill via a sentinel bit in the signal; detect it,
+        // then strip the bit so the stored signal is the real SIGKILL and the
+        // job reports OUT_OF_MEMORY.
+        let oom = job.reported_oom();
+        let (derived_state, final_exit, raw_signal) =
+            Job::derived_completion(&job.node_completions, &primary);
+        let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
+        let (final_state, final_reason) =
+            job.completion_verdict(derived_state, final_exit, final_signal, oom);
+        if let Err(e) = job.transition(final_state) {
+            warn!(job_id = job.job_id, error = %e, "invalid final completion transition");
+            return None;
+        }
+        job.exit_code = Some(final_exit);
+        job.exit_signal = final_signal;
+        // DerivedExitCode is the running max over srun steps, accumulated live
+        // by JobStepComplete; a job with no srun steps keeps 0 (Slurm parity),
+        // not the batch exit. Left as-is here.
+        job.set_pending_reason(final_reason);
+        job.end_time = Some(at);
+        job.preempt_pending = None;
+        job.node_completions.clear();
+        Some(JobFinalized::for_job(
+            job,
+            job.end_of_run_state(final_state),
+            final_exit,
+        ))
+    }
+
     /// Clear a job's run-state fields so it's schedulable again after requeue.
     /// Does not bump either counter; callers do that based on why they're requeuing.
     fn clear_run_state_for_requeue(job: &mut Job) {
@@ -6841,6 +7826,7 @@ impl ClusterManager {
         job.time_limit_signaled_at = None;
         job.cancel_signaled_at = None;
         job.cancelled_by = None;
+        job.preempt_pending = None;
         job.node_failure = None;
         job.suspended_by = None;
         job.pending_reason = PendingReason::None;
@@ -6910,13 +7896,20 @@ impl ClusterManager {
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
 
+        // Read before the transition clears it: a victim still in its grace has
+        // no preempt_mode yet, but its freed nodes are still the preemptor's.
+        let grace_preemptor = job.preempt_grace().map(|pending| pending.preempted_by);
+
         job.end_suspension(timestamp);
         // A run already signalled for cancellation keeps that verdict: reporting
         // it as NodeFail would requeue a job the user or the scheduler killed.
-        let evicted_state = if job.cancel_signaled_at.is_some() {
-            JobState::Cancelled
-        } else {
+        // An expired time limit outranks the cancel it implies, as everywhere.
+        let evicted_state = if job.cancel_signaled_at.is_none() {
             JobState::NodeFail
+        } else if job.time_limit_signaled_at.is_some() {
+            JobState::Timeout
+        } else {
+            JobState::Cancelled
         };
         if let Err(e) = job.transition(evicted_state) {
             warn!(job_id, error = %e, state = ?evicted_state, "evict: invalid transition");
@@ -6924,29 +7917,35 @@ impl ClusterManager {
         }
         job.exit_code = Some(-1);
         job.end_time = Some(timestamp);
-        if evicted_state == JobState::NodeFail {
-            job.set_pending_reason(reason);
-            job.node_failure = failure;
+        job.preempt_pending = None;
+        match evicted_state {
+            JobState::NodeFail => {
+                job.set_pending_reason(reason);
+                job.node_failure = failure;
+            }
+            JobState::Timeout => job.set_pending_reason(PendingReason::TimeLimit),
+            _ => {}
         }
         let already_deallocated: Vec<String> = job.node_completions.keys().cloned().collect();
         job.node_completions.clear();
 
-        // A preempt-cancel victim finalized here (e.g. a node failed mid-drain)
+        // A preempt victim finalized here (a node failed mid-drain or mid-grace)
         // frees its remaining healthy nodes without passing through
         // JobNodeComplete/JobComplete, so the earmark that keeps those nodes for
         // the preemptor must be collected on this path too. Only the not-yet-
         // reported nodes are freed now, so only those are claimable.
-        if job.preempt_mode.as_deref() == Some("Cancel") {
-            if let Some(preemptor) = job.preempted_by {
-                let newly_freed: Vec<String> = job
-                    .allocated_nodes
-                    .iter()
-                    .filter(|n| !already_deallocated.contains(n))
-                    .cloned()
-                    .collect();
-                if !newly_freed.is_empty() {
-                    freed_for_preemptor.push((preemptor, newly_freed));
-                }
+        let cancel_preemptor = (job.preempt_mode.as_deref() == Some("Cancel"))
+            .then_some(job.preempted_by)
+            .flatten();
+        if let Some(preemptor) = grace_preemptor.or(cancel_preemptor) {
+            let newly_freed: Vec<String> = job
+                .allocated_nodes
+                .iter()
+                .filter(|n| !already_deallocated.contains(n))
+                .cloned()
+                .collect();
+            if !newly_freed.is_empty() {
+                freed_for_preemptor.push((preemptor, newly_freed));
             }
         }
 
@@ -6982,10 +7981,12 @@ impl ClusterManager {
         let affected: Vec<JobId> = jobs
             .iter()
             .filter(|(_, j)| {
+                // A node that already reported is done with the run: its loss
+                // must not end a victim whose other nodes are still in their grace.
                 matches!(
                     j.state,
                     JobState::Running | JobState::Completing | JobState::Suspended
-                ) && j.allocated_nodes.iter().any(|n| n == node_name)
+                ) && j.is_held_on(node_name)
             })
             .map(|(&id, _)| id)
             .collect();
@@ -7182,6 +8183,7 @@ impl ClusterManager {
                 begin_time,
                 preempted_by,
                 preempt_qos,
+                run_attempt,
                 ..
             } => {
                 // Only a running job is preempted; on replay the job is already
@@ -7189,61 +8191,39 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let already_deallocated;
                 let finalized;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
-                    if job.state != JobState::Running {
+                    if job.state != JobState::Running
+                        || !Self::preempt_targets_run(job, *run_attempt)
+                    {
                         return ClientResponse::default();
                     }
-                    // Route through Preempted so the state machine and accounting
-                    // see a finished run, then requeue to Pending — one atomic
-                    // apply; the intermediate Preempted never escapes the lock.
-                    if let Err(e) = job.transition(JobState::Preempted) {
-                        warn!(job_id = *job_id, error = %e, "invalid preempt transition in WAL apply");
-                        return ClientResponse::default();
-                    }
-                    job.exit_code = Some(-1);
-                    job.end_time = Some(timestamp);
-                    job.end_suspension(timestamp);
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
-                    job.node_completions.clear();
-
-                    // Capture run_time before reset clears start_time.
-                    // run_time() excludes suspended intervals.
-                    let elapsed = job
-                        .run_time()
-                        .map(|d| d.num_seconds().max(0) as u64)
-                        .unwrap_or(0);
-
-                    if let Err(e) = job.transition(JobState::Pending) {
-                        warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
-                        return ClientResponse::default();
-                    }
-                    Self::reset_job_for_preempt_requeue(job);
-                    job.spec.begin_time = Some(*begin_time);
-                    // Provenance fields are set after reset_job_for_preempt_requeue
-                    // clears run state so they survive into the pending phase.
-                    job.preempted_by = *preempted_by;
-                    job.preempt_mode = Some("Requeue".to_string());
-                    job.preempt_qos = preempt_qos.clone();
-                    finalized =
-                        JobFinalized::for_job_with_elapsed(job, JobState::Preempted, -1, elapsed);
-                    let desc = spur_core::end_reason::preemption_summary(
+                    // Nodes that reported during a grace were freed at their report.
+                    already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
+                    let Some(done) = Self::repend_after_preemption(
+                        job,
+                        *begin_time,
                         *preempted_by,
-                        preempt_qos.as_deref(),
-                    );
-                    job.set_pending_reason_desc(PendingReason::Preempted, desc);
+                        preempt_qos.clone(),
+                        timestamp,
+                    ) else {
+                        return ClientResponse::default();
+                    };
+                    finalized = done;
                 }
                 Self::deallocate_job_slices(
                     &mut nodes,
                     &freed_nodes,
                     allocated_resources.as_ref(),
                     &per_node_map,
-                    &[],
+                    &already_deallocated,
                     *job_id,
                 );
                 // The earmark for a requeue-preemption is set leader-side in
@@ -7257,6 +8237,7 @@ impl ClusterManager {
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
                     jobs_finalized: vec![finalized],
+                    preempt_applied: true,
                     ..Default::default()
                 };
             }
@@ -7275,6 +8256,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let already_deallocated;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -7300,6 +8282,9 @@ impl ClusterManager {
                             freed_nodes = job.allocated_nodes.clone();
                             allocated_resources = job.allocated_resources.clone();
                             per_node_map = job.per_node_alloc.clone();
+                            // Nodes that reported during a grace were freed at their report.
+                            already_deallocated =
+                                job.node_completions.keys().cloned().collect::<Vec<_>>();
                         }
                         s if s.is_terminal() => {
                             // The slice was already freed at completion; freeing
@@ -7308,6 +8293,7 @@ impl ClusterManager {
                             freed_nodes = Vec::new();
                             allocated_resources = None;
                             per_node_map = HashMap::new();
+                            already_deallocated = Vec::new();
                         }
                         _ => {
                             // Pending, Completing, or an in-flight finalized
@@ -7341,7 +8327,7 @@ impl ClusterManager {
                     &freed_nodes,
                     allocated_resources.as_ref(),
                     &per_node_map,
-                    &[],
+                    &already_deallocated,
                     *job_id,
                 );
                 drop(jobs);
@@ -7364,6 +8350,7 @@ impl ClusterManager {
                 preempted_by,
                 preempt_qos,
                 at,
+                run_attempt,
             } => {
                 let at = at.unwrap_or(timestamp);
                 let freed_nodes;
@@ -7374,7 +8361,9 @@ impl ClusterManager {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
-                    if job.state != JobState::Running {
+                    if job.state != JobState::Running
+                        || !Self::preempt_targets_run(job, *run_attempt)
+                    {
                         return ClientResponse::default();
                     }
                     if let Err(e) = job.transition(JobState::Preempted) {
@@ -7388,6 +8377,7 @@ impl ClusterManager {
                     job.preempt_mode = Some("Cancel".to_string());
                     job.preempt_qos = preempt_qos.clone();
                     job.cancel_signaled_at = Some(at);
+                    job.preempt_pending = None;
                     finalized = JobFinalized::for_job(job, JobState::Preempted, -1);
 
                     // The killed run still occupies its nodes; wait in Completing
@@ -7397,7 +8387,10 @@ impl ClusterManager {
                             warn!(job_id = *job_id, error = %e, "invalid preempt-cancel transition to Completing");
                             return ClientResponse::default();
                         }
-                        return ClientResponse::default();
+                        return ClientResponse {
+                            preempt_applied: true,
+                            ..Default::default()
+                        };
                     }
 
                     freed_nodes = job.allocated_nodes.clone();
@@ -7437,6 +8430,7 @@ impl ClusterManager {
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
                     jobs_finalized: vec![finalized],
+                    preempt_applied: true,
                     ..Default::default()
                 };
             }
@@ -7448,22 +8442,13 @@ impl ClusterManager {
                 by,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    match job.apply_transition(JobState::Suspended) {
-                        Ok(TransitionOutcome::Applied) => {
-                            job.suspended_at = Some(*at);
-                            if preempted_by.is_some() {
-                                job.preempted_by = *preempted_by;
-                                job.preempt_mode = Some("Suspend".to_string());
-                                job.preempt_qos = preempt_qos.clone();
-                            } else {
-                                job.suspended_by = by.clone();
-                            }
-                        }
-                        Ok(TransitionOutcome::NoOp) => {}
-                        Err(e) => {
-                            warn!(job_id = *job_id, error = %e, "invalid suspend transition in WAL apply")
-                        }
-                    }
+                    response.suspend_applied = Self::apply_suspend(
+                        job,
+                        *at,
+                        *preempted_by,
+                        preempt_qos.as_deref(),
+                        by.as_ref(),
+                    );
                 }
             }
             WalOperation::JobResume { job_id, at } => {
@@ -7477,6 +8462,9 @@ impl ClusterManager {
                             job.preempted_by = None;
                             job.preempt_mode = None;
                             job.preempt_qos = None;
+                            // A grace outliving the suspension would end the
+                            // resumed run at once, with no warning.
+                            job.preempt_pending = None;
                         }
                         Ok(TransitionOutcome::NoOp) => {}
                         Err(e) => {
@@ -7588,7 +8576,7 @@ impl ClusterManager {
                 run_attempt,
                 ..
             } => {
-                // A node a preempt-cancel victim frees here is claimed for its
+                // A node a preempting victim frees here is claimed for its
                 // preemptor in the same critical section that releases it, so no
                 // scheduling pass can slip a bystander onto it before the hoist
                 // predicate or the earmark is visible.
@@ -7611,11 +8599,20 @@ impl ClusterManager {
                         return ClientResponse::default();
                     }
 
+                    let grace = job
+                        .preempt_grace()
+                        .filter(|_| job.state == JobState::Running)
+                        .cloned();
                     let already_reported = job.node_completions.contains_key(node_name);
-                    freed_for_preemptor = (!already_reported
-                        && job.preempt_mode.as_deref() == Some("Cancel"))
-                    .then_some(job.preempted_by)
-                    .flatten();
+                    freed_for_preemptor = if already_reported {
+                        None
+                    } else if let Some(pending) = &grace {
+                        Some(pending.preempted_by)
+                    } else if job.preempt_mode.as_deref() == Some("Cancel") {
+                        job.preempted_by
+                    } else {
+                        None
+                    };
                     job.node_completions.insert(
                         node_name.clone(),
                         spur_core::job::NodeCompletion {
@@ -7641,62 +8638,7 @@ impl ClusterManager {
                         }
                     }
 
-                    // Suspended jobs route through Completing too, so an
-                    // out-of-band task death finalizes instead of stranding.
-                    if matches!(job.state, JobState::Running | JobState::Suspended) {
-                        if let Err(e) = job.transition(JobState::Completing) {
-                            warn!(job_id = *job_id, error = %e, "invalid transition to Completing");
-                        }
-                        job.end_suspension(timestamp);
-                        job.end_time = Some(timestamp);
-                    }
-
-                    if job.all_nodes_completed() {
-                        // Primary = batch node (allocated_nodes[0]); empty when
-                        // none allocated, where derived_completion falls back to
-                        // the worst completion.
-                        let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
-                        // spurd flags an OOM kill via a sentinel bit in the signal;
-                        // detect it, then strip the bit so the stored signal is the
-                        // real SIGKILL and the job reports OUT_OF_MEMORY.
-                        let oom = job
-                            .node_completions
-                            .values()
-                            .any(|c| c.signal & spur_core::job::OOM_SIGNAL_FLAG != 0);
-                        let (derived_state, final_exit, raw_signal) =
-                            Job::derived_completion(&job.node_completions, &primary);
-                        let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
-                        let (final_state, final_reason) =
-                            job.completion_verdict(derived_state, final_exit, final_signal, oom);
-                        match job.transition(final_state) {
-                            Ok(()) => {
-                                job.exit_code = Some(final_exit);
-                                job.exit_signal = final_signal;
-                                // DerivedExitCode is the running max over srun
-                                // steps, accumulated live by JobStepComplete; a
-                                // job with no srun steps keeps 0 (Slurm parity),
-                                // not the batch exit. Left as-is here.
-                                job.set_pending_reason(final_reason);
-                                job.end_time = Some(timestamp);
-                                job.node_completions.clear();
-                                Some(JobFinalized::for_job(
-                                    job,
-                                    job.end_of_run_state(final_state),
-                                    final_exit,
-                                ))
-                            }
-                            Err(e) => {
-                                warn!(
-                                    job_id = *job_id,
-                                    error = %e,
-                                    "invalid final completion transition"
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
+                    Self::advance_after_node_report(job, grace.as_ref(), timestamp)
                 };
 
                 if let Some(preemptor) = freed_for_preemptor {
@@ -7737,19 +8679,49 @@ impl ClusterManager {
                 if job.cancelled_by.is_none() {
                     job.cancelled_by = cancel.clone();
                 }
-                // Nothing will ever report for a run holding no nodes, so it must
-                // not wait in Completing; the caller finalizes it instead.
-                let waits_for_nodes = matches!(job.state, JobState::Running | JobState::Suspended)
-                    && !job.allocated_nodes.is_empty();
-                if waits_for_nodes {
-                    if let Err(e) = job.transition(JobState::Completing) {
-                        warn!(job_id = *job_id, error = %e, "invalid cancel transition to Completing");
-                        return ClientResponse::default();
+                // Cleared here as well as by begin_completing: a run holding no
+                // nodes stays Running, and its grace must not override the cancel.
+                job.preempt_pending = None;
+                Self::begin_completing(job, *at);
+            }
+            WalOperation::JobTimeLimitExpired {
+                job_id,
+                run_attempt,
+                at,
+            } => {
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                // A run that already ended or is already draining keeps its
+                // verdict, and an expiry decided for an earlier run must not
+                // condemn the current one.
+                if !matches!(job.state, JobState::Running | JobState::Suspended)
+                    || (*run_attempt != 0
+                        && job.run_attempt != 0
+                        && *run_attempt != job.run_attempt)
+                {
+                    return ClientResponse::default();
+                }
+                if job.time_limit_signaled_at.is_none() {
+                    job.time_limit_signaled_at = Some(*at);
+                }
+                // Also marks the run as signalled, so a lost cancel is re-sent on
+                // the node's next heartbeat and the completing machinery applies.
+                if job.cancel_signaled_at.is_none() {
+                    job.cancel_signaled_at = Some(*at);
+                }
+                Self::begin_completing(job, *at);
+                response.time_limit_applied = true;
+            }
+            WalOperation::JobPreemptSignaled { job_id, pending } => {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    if job.state == JobState::Running
+                        && job.run_attempt == pending.run_attempt
+                        && job.preempt_pending.is_none()
+                    {
+                        job.preempt_pending = Some(pending.clone());
+                        response.preempt_signal_applied = true;
                     }
-                    // Completing is not terminal, so nothing stamps this for us.
-                    // It is what gives the job its full complete_wait_secs grace.
-                    job.end_time = Some(*at);
-                    job.end_suspension(*at);
                 }
             }
             WalOperation::JobComplete {
@@ -7758,11 +8730,13 @@ impl ClusterManager {
                 state,
                 unreported_nodes,
                 cancel,
+                controller_initiated,
                 ..
             } => {
                 let freed_nodes;
                 let allocated_resources;
                 let already_deallocated;
+                let per_node_map;
                 // A preempt-cancel victim force-finished here (completing-timeout
                 // or force-complete) frees its remaining nodes without ever
                 // reaching JobNodeComplete, so the earmark must also be set on
@@ -7777,50 +8751,92 @@ impl ClusterManager {
                     {
                         return ClientResponse::default();
                     }
-                    freed_for_preemptor = (job.preempt_mode.as_deref() == Some("Cancel"))
-                        .then_some(job.preempted_by)
-                        .flatten();
-                    if let Err(e) = job.transition(*state) {
-                        warn!(
-                            job_id = *job_id,
-                            error = %e,
-                            "invalid state transition in WAL apply"
-                        );
-                        return ClientResponse::default();
+                    // A victim ending in its grace (an srun/PTY client reporting its
+                    // exit, or a force-finish after partial reports) ends as the
+                    // preemption it was warned of. A completion with a cancel wins.
+                    let warned = job
+                        .preempt_grace()
+                        .filter(|_| job.state == JobState::Running && cancel.is_none())
+                        .cloned();
+                    // The controller failing the run (launch failure, requeue cap)
+                    // is not the checkpoint-and-exit the warning asked for, and the
+                    // requeue or hold that follows expects the Failed it records.
+                    let in_grace = warned.clone().filter(|_| !*controller_initiated);
+                    // An OOM kill is not the checkpoint-and-exit the warning asked
+                    // for, so it ends the run as the failure it was.
+                    let grace = in_grace.filter(|_| *state != JobState::OutOfMemory);
+                    if grace.is_some() {
+                        Self::adopt_grace_provenance(job, timestamp);
                     }
-                    job.unreported_nodes = unreported_nodes.clone();
-                    if *state == JobState::Cancelled && job.cancelled_by.is_none() {
-                        job.cancelled_by = cancel.clone();
-                    }
-                    job.exit_code = Some(*exit_code);
-                    job.end_time = Some(timestamp);
-                    // Derived from the replicated entry, so every replica reports
-                    // the same reason for a job the watchdog had to force-kill.
-                    if *state == JobState::Timeout {
-                        job.set_pending_reason(PendingReason::TimeLimit);
-                    }
-                    if state.is_terminal() {
-                        response.jobs_finalized.push(JobFinalized::for_job(
-                            job,
-                            job.end_of_run_state(*state),
-                            *exit_code,
-                        ));
-                    }
-                    // Suspended -> terminal: fold the final suspended interval in
-                    // and clear suspended_at so it never lingers on a terminal job.
-                    job.end_suspension(timestamp);
+                    let state = match &grace {
+                        Some(p) if p.mode == PreemptMode::Cancel => &JobState::Cancelled,
+                        _ => state,
+                    };
+                    freed_for_preemptor = warned.map(|p| p.preempted_by).or_else(|| {
+                        (job.preempt_mode.as_deref() == Some("Cancel"))
+                            .then_some(job.preempted_by)
+                            .flatten()
+                    });
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
-                    job.node_completions.clear();
+                    per_node_map = job.per_node_alloc.clone();
+
+                    if let Some(pending) = grace.filter(|p| p.mode == PreemptMode::Requeue) {
+                        let begin =
+                            Self::preempt_hold_until(job, timestamp, pending.requeue_hold_secs);
+                        let Some(finalized) = Self::repend_after_preemption(
+                            job,
+                            begin,
+                            Some(pending.preempted_by),
+                            pending.preempt_qos,
+                            timestamp,
+                        ) else {
+                            return ClientResponse::default();
+                        };
+                        response.jobs_finalized.push(finalized);
+                    } else {
+                        if let Err(e) = job.transition(*state) {
+                            warn!(
+                                job_id = *job_id,
+                                error = %e,
+                                "invalid state transition in WAL apply"
+                            );
+                            return ClientResponse::default();
+                        }
+                        job.preempt_pending = None;
+                        job.unreported_nodes = unreported_nodes.clone();
+                        if *state == JobState::Cancelled && job.cancelled_by.is_none() {
+                            job.cancelled_by = cancel.clone();
+                        }
+                        job.exit_code = Some(*exit_code);
+                        job.end_time = Some(timestamp);
+                        // Derived from the replicated entry, so every replica reports
+                        // the same reason for a job the watchdog had to force-kill or
+                        // that the kernel OOM-killed.
+                        match *state {
+                            JobState::Timeout => job.set_pending_reason(PendingReason::TimeLimit),
+                            JobState::OutOfMemory => {
+                                job.set_pending_reason(PendingReason::OutOfMemory)
+                            }
+                            _ => {}
+                        }
+                        if state.is_terminal() {
+                            response.jobs_finalized.push(JobFinalized::for_job(
+                                job,
+                                job.end_of_run_state(*state),
+                                *exit_code,
+                            ));
+                        }
+                        // Suspended -> terminal: fold the final suspended interval in
+                        // and clear suspended_at so it never lingers on a terminal job.
+                        job.end_suspension(timestamp);
+                        job.node_completions.clear();
+                    }
                 } else {
                     return ClientResponse::default();
                 }
                 // Deallocate node resources not already freed during COMPLETING.
-                let per_node_map = jobs
-                    .get(job_id)
-                    .map(|j| j.per_node_alloc.clone())
-                    .unwrap_or_default();
                 Self::deallocate_job_slices(
                     &mut nodes,
                     &freed_nodes,
@@ -7839,7 +8855,12 @@ impl ClusterManager {
                 }
                 drop(jobs);
                 drop(nodes);
-                self.complete_job_steps(job_id, *exit_code, timestamp);
+                // A re-pended victim's run ended as preempted (-1), not as reported.
+                let steps_exit_code = response
+                    .jobs_finalized
+                    .first()
+                    .map_or(*exit_code, |finalized| finalized.exit_code);
+                self.complete_job_steps(job_id, steps_exit_code, timestamp);
             }
             WalOperation::JobStepComplete {
                 job_id,
@@ -7983,6 +9004,7 @@ impl ClusterManager {
                 version,
                 labels,
                 source,
+                capabilities,
             } => {
                 // Normalize legacy Raft entries so replay can't collide on stable_id==0.
                 let mut resources = resources.clone();
@@ -7994,6 +9016,10 @@ impl ClusterManager {
                     hostname.clone()
                 };
                 node.labels = labels.clone();
+                // Establish the source before applying policy so layout
+                // derivation can skip Kubernetes-backed nodes (no topology).
+                node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
+                node.capabilities = capabilities.clone();
                 self.apply_node_config_policy(&mut node);
                 if !address.is_empty() {
                     node.address = Some(address.clone());
@@ -8005,7 +9031,6 @@ impl ClusterManager {
                 if !version.is_empty() {
                     node.version = Some(version.clone());
                 }
-                node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
                 node.last_heartbeat = Some(Utc::now());
                 node.state = node
                     .state
@@ -8043,6 +9068,7 @@ impl ClusterManager {
                 wg_pubkey,
                 version,
                 source,
+                capabilities,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     // Normalize legacy Raft entries so replay can't collide on stable_id==0.
@@ -8064,6 +9090,7 @@ impl ClusterManager {
                     }
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
+                    node.capabilities = capabilities.clone();
                     node.last_heartbeat = Some(Utc::now());
                     // Re-clamp against config: NodeUpdate carries a fresh detected
                     // report and must honor caps just like NodeRegister does.
@@ -8261,6 +9288,7 @@ impl ClusterManager {
                 preempt_mode,
                 is_default,
                 preempt_exempt_time,
+                grace_time,
             } => {
                 {
                     let mut partitions = self.partitions.write();
@@ -8321,6 +9349,9 @@ impl ClusterManager {
                         }
                         if let Some(et) = preempt_exempt_time {
                             part.preempt_exempt_time = *et;
+                        }
+                        if let Some(gt) = grace_time {
+                            part.grace_time = *gt;
                         }
                         info!(name, "partition updated");
                     } else {
@@ -8509,6 +9540,16 @@ impl ClusterManager {
     }
 }
 
+/// What to deliver for a node's core layout.
+pub struct LayoutDelivery {
+    pub layout: Option<spur_proto::proto::CoreLayout>,
+    pub revision: spur_proto::proto::LayoutRevision,
+    /// Why the layout could not be computed; the agent keeps what it holds.
+    pub error: String,
+}
+
+const LAYOUT_REREGISTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Snapshot data for Raft serialization.
 /// Must include all durable cluster state so a follower can fully restore from it.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -8562,9 +9603,20 @@ impl ClusterManager {
         {
             node.features = nc.features.clone();
             node.weight = nc.weight;
-            node.total_resources =
-                node.detected_resources
-                    .clamped(nc.cpus, nc.memory_mb, nc.reserved_memory_mb);
+            // Compute the layout before clamping so spec cores are excluded from
+            // the schedulable CPU count (and CPUEfctv), not left over-advertised.
+            self.recompute_core_layout(node, Some(nc));
+            let spec_cpus = node
+                .core_layout
+                .as_ref()
+                .map(|l| l.spec_cpus.len() as u32)
+                .unwrap_or(0);
+            node.total_resources = node.detected_resources.clamped(
+                nc.cpus,
+                nc.memory_mb,
+                nc.reserved_memory_mb,
+                spec_cpus,
+            );
             // An unset memory cap prevents config validation from detecting this
             // scheduling stall until the agent reports its inventory.
             if node.total_resources.memory_mb == 0 && node.detected_resources.memory_mb > 0 {
@@ -8582,9 +9634,53 @@ impl ClusterManager {
         } else {
             node.total_resources = node.detected_resources.clone();
             node.reset_config_policy();
+            self.recompute_core_layout(node, None);
         }
         if node.state.is_up() {
             node.update_state_from_alloc();
+        }
+    }
+
+    /// Recompute the node's core layout. An unsatisfiable layout keeps the last
+    /// good one and records `layout_error`; the sequence advances on every content
+    /// change, a clear included, so deliveries stay ordered.
+    fn recompute_core_layout(&self, node: &mut Node, nc: Option<&spur_core::config::NodeConfig>) {
+        let before = node.core_layout.as_ref().map(CoreLayout::fingerprint);
+        self.derive_core_layout(node, nc);
+        if node.core_layout.as_ref().map(CoreLayout::fingerprint) != before {
+            node.layout_seq += 1;
+        }
+    }
+
+    fn derive_core_layout(&self, node: &mut Node, nc: Option<&spur_core::config::NodeConfig>) {
+        let Some(nc) = nc else {
+            node.core_layout = None;
+            node.layout_error = None;
+            node.spec_memory_mb = 0;
+            return;
+        };
+        node.spec_memory_mb = nc.reserved_memory_mb;
+        // Kubernetes-backed nodes register without CPU topology and are enforced
+        // by the kubelet, not spurd's cgroup root — skip layout derivation so a
+        // shared `names="ALL"` spec policy does not make them unschedulable.
+        if matches!(node.source, NodeSource::Kubernetes { .. }) {
+            node.core_layout = None;
+            node.layout_error = None;
+            return;
+        }
+        let settings = NodeCoreSettings::from_config(nc);
+        match CoreLayout::compute(
+            node.detected_resources.topology.as_ref(),
+            &settings,
+            node.detected_resources.memory_mb,
+        ) {
+            Ok(layout) => {
+                node.core_layout = layout;
+                node.layout_error = None;
+            }
+            // Keep the last good layout: dropping it would reach the agent as a
+            // clear and free the reserved cores under running jobs.
+            Err(e) => node.layout_error = Some(e.to_string()),
         }
     }
 
@@ -9444,7 +10540,9 @@ impl<'a> RunningTresAccumulator<'a> {
 /// (§7, D1).
 fn running_array_counts(jobs: &HashMap<JobId, Job>) -> HashMap<JobId, u32> {
     jobs.values()
-        .filter(|job| job.state == JobState::Running && !job.idle_fill)
+        .filter(|job| {
+            (job.state == JobState::Running || job.is_stopping_for_time_limit()) && !job.idle_fill
+        })
         .filter_map(|job| job.spec.array_job_id)
         .fold(HashMap::new(), |mut counts, array_id| {
             *counts.entry(array_id).or_insert(0) += 1;
@@ -10447,7 +11545,7 @@ mod tests {
 
     use super::*;
     use spur_core::end_reason::EndReason;
-    use spur_core::job::JobSpec;
+    use spur_core::job::{JobSpec, PreemptPending};
     use spur_core::resource::{ResourceAllocations, ResourceSet};
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
@@ -10515,6 +11613,7 @@ mod tests {
                 priority_tier: 1,
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
+                grace_time: None,
             }],
             nodes: Vec::new(),
             network: Default::default(),
@@ -10564,19 +11663,29 @@ mod tests {
         cm
     }
 
+    fn capable(ids: &[JobId]) -> HashSet<JobId> {
+        ids.iter().copied().collect()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn interactive_reap_candidates_reaps_only_idle_allocations() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1, 2]);
 
         // First sighting seeds each allocation's timer; nothing is reaped yet.
-        assert!(cm.interactive_reap_candidates(&[1, 2], t0, 60).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[1, 2], &flagged, t0, 60)
+            .is_empty());
 
         // Job 2 pings recently; job 1 stays silent past the limit.
         cm.record_job_keepalive_at(2, t0 + chrono::Duration::seconds(55));
         let later = t0 + chrono::Duration::seconds(61);
-        assert_eq!(cm.interactive_reap_candidates(&[1, 2], later, 60), vec![1]);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1, 2], &flagged, later, 60),
+            vec![1]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10584,22 +11693,31 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1]);
 
         // A stale entry exists, but with the limit disabled it is pruned (the
         // allocation is no longer running) rather than reaped.
         cm.record_job_keepalive_at(1, t0);
-        assert!(cm.interactive_reap_candidates(&[], t0, 0).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[], &flagged, t0, 0)
+            .is_empty());
         // The prune actually happened: job 1's timer is gone, not just skipped
         // by the disabled early return.
         assert!(
             cm.interactive_last_seen.read().is_empty(),
             "pruning must drop entries for allocations no longer running"
         );
+        assert!(
+            cm.pinged_this_term.read().is_empty(),
+            "pruning must drop the ping record of an allocation no longer running"
+        );
 
         // Because the old entry was pruned, job 1 reappearing reseeds to `now`
         // and is not immediately reaped despite the original stale timestamp.
         let later = t0 + chrono::Duration::seconds(3600);
-        assert!(cm.interactive_reap_candidates(&[1], later, 60).is_empty());
+        assert!(cm
+            .interactive_reap_candidates(&[1], &flagged, later, 60)
+            .is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10607,6 +11725,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         let t0 = Utc::now();
+        let flagged = capable(&[1]);
 
         // A prior stint's timestamp for a still-running allocation, frozen at
         // t0 because a follower records no keepalives.
@@ -10616,7 +11735,7 @@ mod tests {
         // it and the live allocation looks idle past the limit.
         let later = t0 + chrono::Duration::seconds(3600);
         assert_eq!(
-            cm.interactive_reap_candidates(&[1], later, 60),
+            cm.interactive_reap_candidates(&[1], &flagged, later, 60),
             vec![1],
             "a stale carried-over entry would reap a live allocation"
         );
@@ -10625,8 +11744,65 @@ mod tests {
         // check reseeds job 1 to `now` and exempts it.
         cm.reset_interactive_last_seen();
         assert!(
-            cm.interactive_reap_candidates(&[1], later, 60).is_empty(),
+            cm.interactive_reap_candidates(&[1], &flagged, later, 60)
+                .is_empty(),
             "after reset, a live allocation is reseeded and not reaped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_exempts_a_client_that_never_pings() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // No durable flag and no ping this term: the K8s operator, a third-party
+        // API client, or a pre-keepalive CLI. Silent forever, never reaped.
+        assert!(cm
+            .interactive_reap_candidates(&[1], &HashSet::new(), t0, 60)
+            .is_empty());
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60)
+                .is_empty(),
+            "a client that never opted in must not be reaped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactive_reap_candidates_reaps_an_unflagged_client_that_pinged_this_term() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+
+        // A client that predates the flag but does send keepalives opts in by
+        // pinging; once it goes silent past the limit it is reaped.
+        cm.record_job_keepalive_at(1, t0);
+        let later = t0 + chrono::Duration::seconds(61);
+        assert_eq!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60),
+            vec![1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_interactive_last_seen_forgets_this_terms_pings() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let t0 = Utc::now();
+        cm.record_job_keepalive_at(1, t0);
+
+        // A new term starts with no evidence the unflagged client pings, so it is
+        // exempt until it pings again.
+        cm.reset_interactive_last_seen();
+        let later = t0 + chrono::Duration::seconds(3600);
+        assert!(cm
+            .interactive_reap_candidates(&[1], &HashSet::new(), t0, 60)
+            .is_empty());
+        assert!(
+            cm.interactive_reap_candidates(&[1], &HashSet::new(), later, 60)
+                .is_empty(),
+            "the ping set must not be inferred from the reseeded last-seen map"
         );
     }
 
@@ -10849,6 +12025,503 @@ mod tests {
         assert_eq!(gpu(&cm), Some(PreemptMode::Off));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_applies_partition_grace_time_from_the_conf() {
+        let dir = TempDir::new().unwrap();
+        let base = "cluster_name = \"test\"\n\n[[partitions]]\nname = \"gpu\"\nnodes = \"ALL\"\n";
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, base).await;
+
+        let gpu = |cm: &Arc<ClusterManager>| {
+            cm.get_partitions()
+                .into_iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .grace_time
+        };
+        assert_eq!(gpu(&cm), None);
+
+        std::fs::write(&conf_path, format!("{base}grace_time = 600\n")).unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu(&cm), Some(600));
+
+        std::fs::write(&conf_path, format!("{base}grace_time = 0\n")).unwrap();
+        cm.reconfigure().unwrap();
+        assert_eq!(gpu(&cm), Some(0));
+    }
+
+    #[tokio::test]
+    async fn invalid_block_reload_preserves_config_and_partitions() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=worker1").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "gpu"
+nodes = "ALL"
+"#,
+            block_path
+        );
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf).await;
+        let revision = cm
+            .config()
+            .topology
+            .as_ref()
+            .unwrap()
+            .external
+            .as_ref()
+            .unwrap()
+            .loaded_block_file
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        assert_eq!(cm.fabric_view(Utc::now()).blocks[0].key.fabric_domain, "a");
+        for invalid in ["BlockName=b Nodes=missing", "BlockName=broken"] {
+            std::fs::write(&block_path, invalid).unwrap();
+            std::fs::write(
+                &conf_path,
+                conf.replace(r#"name = "gpu""#, r#"name = "changed""#),
+            )
+            .unwrap();
+            assert!(cm.reconfigure().is_err());
+            assert_eq!(
+                cm.config()
+                    .topology
+                    .as_ref()
+                    .unwrap()
+                    .external
+                    .as_ref()
+                    .unwrap()
+                    .loaded_block_file
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                revision
+            );
+            assert!(cm.get_partitions().iter().any(|p| p.name == "gpu"));
+            assert!(!cm.get_partitions().iter().any(|p| p.name == "changed"));
+        }
+        assert!(ClusterManager::new(
+            spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap(),
+            dir.path()
+        )
+        .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steps_reattest_own_devices_while_placement_needs_a_healthy_block() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let observed = |endpoint: &str, active: &[&str]| spur_core::resource::DeviceTopology {
+            fabric: Some(spur_core::fabric::FabricObservation {
+                source: "test".into(),
+                status: spur_core::fabric::ObservationStatus::Consistent,
+                physical_domain_id: Some("rack".into()),
+                fabric_domain_id: Some("15".into()),
+                endpoint_id: Some(endpoint.into()),
+                physical_capacity: Some(8),
+                fabric_capacity: Some(2),
+                active_endpoints: active.iter().map(|e| e.to_string()).collect(),
+                local_endpoints: vec![endpoint.into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (index, name) in ["n0", "n1"].into_iter().enumerate() {
+            let mut gpu = gpu_resource(0, 42);
+            gpu.topology = Some(observed(&(index + 1).to_string(), &["1", "2"]));
+            cm.register_node(
+                name.into(),
+                name.into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    generation: 7,
+                    fabric_binding_version: 1,
+                    gpus: vec![gpu],
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                Vec::new(),
+                true,
+            )
+            .unwrap();
+        }
+        let view = cm.fabric_view(Utc::now());
+        assert!(view.blocks[0].issues.is_empty());
+        let mut allocation = ResourceAllocations {
+            generation: 7,
+            devices: [(
+                "gpu".into(),
+                vec![spur_core::resource::AllocatedDevice::injectable(42)],
+            )]
+            .into(),
+            ..Default::default()
+        };
+        allocation.fabric_binding = Some(
+            spur_core::fabric_binding::FabricBinding::for_allocation(
+                &view.blocks[0],
+                "n0",
+                &allocation,
+            )
+            .unwrap(),
+        );
+        let mut spec = basic_spec("bound");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(1, None));
+        spec.constraint = Some("same(gpu.fabric_domain_id)".into());
+        let mut job = Job::new(1, spec);
+        job.allocated_nodes = vec!["n0".into()];
+        job.per_node_alloc = [("n0".to_string(), allocation)].into();
+        let names = job.allocated_nodes.clone();
+        let placement = || cm.validate_fabric_placement(&job, &names, &job.per_node_alloc);
+        placement().unwrap();
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+
+        cm.nodes.write().get_mut("n1").unwrap().state = NodeState::Drain;
+        assert!(placement().is_err());
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+
+        let set_own = |topology: spur_core::resource::DeviceTopology, generation: u64| {
+            let mut nodes = cm.nodes.write();
+            let inventory = &mut nodes.get_mut("n0").unwrap().total_resources;
+            inventory.generation = generation;
+            inventory.gpus[0].topology = Some(topology);
+        };
+        set_own(observed("1", &["1"]), 9);
+        assert!(placement().is_err());
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+
+        set_own(observed("1", &["2"]), 9);
+        assert!(cm
+            .validate_step_bindings(&job, &job.allocated_nodes)
+            .is_err());
+        let mut moved = observed("1", &["1", "2"]);
+        moved.fabric.as_mut().unwrap().fabric_domain_id = Some("16".into());
+        set_own(moved, 9);
+        assert!(cm
+            .validate_step_bindings(&job, &job.allocated_nodes)
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_bound_steps_require_every_allocated_node_in_the_block() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=n0,n1\nBlockName=b Nodes=n2").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology]
+plugin = "block"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "default"
+nodes = "ALL"
+default = true
+state = "UP"
+"#,
+            block_path
+        );
+        let (cm, _) = test_cluster_with_conf_file(&dir, &conf).await;
+        let revision = spur_core::block_file::BlockFile::read(&block_path)
+            .unwrap()
+            .revision;
+        for name in ["n0", "n1", "n2"] {
+            cm.register_node(
+                name.into(),
+                name.into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    generation: 7,
+                    fabric_binding_version: 2,
+                    block_file_revision: Some(revision.clone()),
+                    gpus: vec![gpu_resource(0, 42)],
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                Vec::new(),
+                true,
+            )
+            .unwrap();
+        }
+        let view = cm.fabric_view(Utc::now());
+        assert!(view.blocks.iter().all(|b| b.issues.is_empty()));
+        assert_eq!(view.blocks[0].key.fabric_domain, "a");
+        let mut spec = basic_spec("file-bound");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
+        spec.constraint = Some("same(gpu.fabric_domain_id)".into());
+        let mut job = Job::new(1, spec);
+        job.allocated_nodes = vec!["n0".into(), "n1".into()];
+        for name in ["n0", "n1"] {
+            let mut allocation = ResourceAllocations {
+                generation: 7,
+                devices: [(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(42)],
+                )]
+                .into(),
+                ..Default::default()
+            };
+            allocation.fabric_binding = Some(
+                spur_core::fabric_binding::FabricBinding::for_allocation(
+                    &view.blocks[0],
+                    name,
+                    &allocation,
+                )
+                .unwrap(),
+            );
+            job.per_node_alloc.insert(name.into(), allocation);
+        }
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+        cm.nodes.write().get_mut("n1").unwrap().total_resources.gpus[0].topology =
+            Some(spur_core::resource::DeviceTopology {
+                fabric: Some(spur_core::fabric::FabricObservation::default()),
+                ..Default::default()
+            });
+        cm.validate_step_bindings(&job, &["n0".into()]).unwrap();
+        assert!(cm
+            .validate_step_bindings(&job, &job.allocated_nodes)
+            .is_err());
+        cm.nodes.write().get_mut("n1").unwrap().total_resources.gpus[0].topology = None;
+        std::fs::write(&block_path, "BlockName=a Nodes=n0,n1\nBlockName=c Nodes=n2").unwrap();
+        cm.reconfigure().unwrap();
+        cm.validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap();
+        std::fs::write(&block_path, "BlockName=a Nodes=n0\nBlockName=b Nodes=n1,n2").unwrap();
+        cm.reconfigure().unwrap();
+        let error = cm
+            .validate_step_bindings(&job, &job.allocated_nodes)
+            .unwrap_err();
+        assert!(error.to_string().contains("block file"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_applies_with_an_unhealthy_block_but_rejects_unknown_nodes() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=n0,n1").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "gpu"
+nodes = "ALL"
+"#,
+            block_path
+        );
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf).await;
+        for name in ["n0", "n1"] {
+            cm.register_node(
+                name.into(),
+                name.into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    generation: 7,
+                    fabric_binding_version: 2,
+                    gpus: vec![gpu_resource(0, 42)],
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                Vec::new(),
+                true,
+            )
+            .unwrap();
+        }
+        cm.nodes.write().get_mut("n1").unwrap().state = NodeState::Drain;
+        std::fs::write(
+            &conf_path,
+            conf.replace(r#"name = "gpu""#, r#"name = "changed""#),
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+        assert!(cm.get_partitions().iter().any(|p| p.name == "changed"));
+        let view = cm.fabric_view(Utc::now());
+        assert!(view.blocks[0]
+            .issues
+            .contains(&"node_unavailable:n1".to_string()));
+
+        std::fs::write(&block_path, "BlockName=a Nodes=n0,n1,typo").unwrap();
+        std::fs::write(&conf_path, &conf).unwrap();
+        let error = cm.reconfigure().unwrap_err();
+        assert!(
+            error.to_string().contains("node_unregistered:typo"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("node_unavailable"), "{error}");
+        assert!(cm.get_partitions().iter().any(|p| p.name == "changed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_reload_preserves_native_groups_and_validates_only_applied_declarations() {
+        let dir = TempDir::new().unwrap();
+        let block_path = dir.path().join("topology.conf");
+        std::fs::write(&block_path, "BlockName=a Nodes=n0").unwrap();
+        let conf = format!(
+            r#"cluster_name = "test"
+[topology]
+plugin = "block"
+[topology.external]
+block_file = {:?}
+[[partitions]]
+name = "default"
+nodes = "ALL"
+default = true
+state = "UP"
+"#,
+            block_path
+        );
+        let (cm, _) = test_cluster_with_conf_file(&dir, &conf).await;
+        let mut native = Node::new(
+            "n0".into(),
+            ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                generation: 7,
+                fabric_binding_version: 1,
+                gpus: vec![spur_core::resource::GpuResource {
+                    device_id: 0,
+                    stable_id: 42,
+                    gpu_type: "test".into(),
+                    memory_mb: 100,
+                    peer_gpus: vec![],
+                    link_type: spur_core::resource::GpuLinkType::PCIe,
+                    topology: Some(spur_core::resource::DeviceTopology {
+                        pci_bdf: Some("0001:04:00.0".into()),
+                        fabric: Some(spur_core::fabric::FabricObservation {
+                            source: "test".into(),
+                            status: spur_core::fabric::ObservationStatus::Consistent,
+                            physical_domain_id: Some("rack".into()),
+                            fabric_domain_id: Some("15".into()),
+                            endpoint_id: Some("1".into()),
+                            physical_capacity: Some(1),
+                            fabric_capacity: Some(1),
+                            active_endpoints: vec!["1".into()],
+                            local_endpoints: vec!["1".into()],
+                            endpoint_state: Some("active".into()),
+                            transport: Some("UALoE".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            },
+        );
+        let register = |node: &Node| {
+            cm.register_node(
+                node.name.clone(),
+                node.name.clone(),
+                node.total_resources.clone(),
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                HashMap::new(),
+                Vec::new(),
+                true,
+            )
+            .unwrap();
+        };
+        register(&native);
+        let assert_trial = |node: &str, placed: bool| {
+            let spec = JobSpec {
+                partition: Some("default".into()),
+                gres: vec!["gpu:1".into()],
+                nodelist: Some(node.into()),
+                constraint: Some("same(gpu.fabric_domain_id)".into()),
+                ..basic_spec("trial-fabric")
+            };
+            let classification = PendingJobClassification {
+                jobs: vec![Job::new(1, spec)],
+                reason_updates: vec![],
+                bb_stage_candidates: vec![],
+                idle_fill_candidates: vec![],
+                claims_blocked: false,
+            };
+            let mut trial = spur_sched::backfill::BackfillScheduler::new(10).for_trial();
+            let actual = crate::scheduler_loop::trial_placement(&cm, &mut trial, &classification);
+            assert_eq!(actual.contains(&1), placed, "{node}");
+        };
+        assert_trial("n0", true);
+        for (text, warning) in [
+            ("BlockName=a Nodes=n0", false),
+            ("BlockName=a Nodes=n0,missing", true),
+        ] {
+            std::fs::write(&block_path, text).unwrap();
+            cm.reconfigure().unwrap();
+            let view = cm.fabric_view(Utc::now());
+            assert_eq!(view.blocks.len(), 1);
+            assert_eq!(view.blocks[0].key.fabric_domain, "15");
+            assert!(view.blocks[0].issues.is_empty());
+            assert!(view.blocks[0].file_revision.is_none());
+            assert_eq!(view.notices[0].warning, warning);
+        }
+        let mut declared = native.clone();
+        declared.name = "n1".into();
+        declared.total_resources.fabric_binding_version = 2;
+        declared.total_resources.gpus[0].topology = None;
+        native.total_resources.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap()
+            .status = spur_core::fabric::ObservationStatus::Incomplete;
+        native.total_resources.generation += 1;
+        let text = "BlockName=b Nodes=n1";
+        let file = spur_core::block_file::BlockFile::parse(text).unwrap();
+        declared.total_resources.block_file_revision = Some(file.revision);
+        register(&native);
+        register(&declared);
+        std::fs::write(&block_path, text).unwrap();
+        cm.reconfigure().unwrap();
+        let view = cm.fabric_view(Utc::now());
+        assert_eq!(view.blocks.len(), 2);
+        assert!(view
+            .blocks
+            .iter()
+            .find(|b| b.file_revision.is_some())
+            .unwrap()
+            .issues
+            .is_empty());
+        assert!(!view
+            .blocks
+            .iter()
+            .find(|b| b.file_revision.is_none())
+            .unwrap()
+            .issues
+            .is_empty());
+        assert_trial("n0", false);
+        assert_trial("n1", true);
+    }
+
     #[tokio::test]
     async fn reconfigure_reloads_scheduler_tunables_live() {
         let dir = TempDir::new().unwrap();
@@ -10980,6 +12653,16 @@ mod tests {
         cpus: u32,
         mem: u64,
     ) -> Result<(), RegisterNodeError> {
+        try_register_node_with_capabilities(cm, name, cpus, mem, Vec::new())
+    }
+
+    fn try_register_node_with_capabilities(
+        cm: &ClusterManager,
+        name: &str,
+        cpus: u32,
+        mem: u64,
+        capabilities: Vec<String>,
+    ) -> Result<(), RegisterNodeError> {
         cm.register_node(
             name.into(),
             name.into(),
@@ -10994,8 +12677,70 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            capabilities,
             true,
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn register_node_records_capabilities() {
+        use spur_core::node::CAP_SIGNAL_JOB;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        try_register_node_with_capabilities(&cm, "n1", 4, 1024, vec![CAP_SIGNAL_JOB.into()])
+            .unwrap();
+        try_register_node(&cm, "n2", 4, 1024).unwrap();
+        wait_for("both nodes registered", || {
+            cm.get_node("n1").is_some() && cm.get_node("n2").is_some()
+        });
+
+        assert!(cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
+        assert!(!cm.get_node("n2").unwrap().supports(CAP_SIGNAL_JOB));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn re_registration_updates_changed_capabilities() {
+        use spur_core::node::CAP_SIGNAL_JOB;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        try_register_node(&cm, "n1", 4, 1024).unwrap();
+        wait_for("n1 registered", || cm.get_node("n1").is_some());
+        assert!(!cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
+
+        try_register_node_with_capabilities(&cm, "n1", 4, 1024, vec![CAP_SIGNAL_JOB.into()])
+            .unwrap();
+        wait_for("capability recorded", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.supports(CAP_SIGNAL_JOB))
+        });
+
+        try_register_node(&cm, "n1", 4, 1024).unwrap();
+        wait_for("capability withdrawn", || {
+            cm.get_node("n1")
+                .is_some_and(|n| !n.supports(CAP_SIGNAL_JOB))
+        });
+    }
+
+    /// The path every pre-upgrade node takes to gain a capability: its resources
+    /// also changed (or it would take the skip path), so the update arm must
+    /// carry the capabilities too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn re_registration_with_changed_resources_records_new_capabilities() {
+        use spur_core::node::CAP_SIGNAL_JOB;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        try_register_node(&cm, "n1", 4, 1024).unwrap();
+        wait_for("n1 registered", || cm.get_node("n1").is_some());
+        assert!(!cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
+
+        try_register_node_with_capabilities(&cm, "n1", 8, 2048, vec![CAP_SIGNAL_JOB.into()])
+            .unwrap();
+
+        wait_for("update applied", || {
+            cm.get_node("n1")
+                .is_some_and(|n| n.detected_resources.cpus == 8)
+        });
+        assert!(cm.get_node("n1").unwrap().supports(CAP_SIGNAL_JOB));
     }
 
     fn register_node(cm: &ClusterManager, name: &str, cpus: u32, mem: u64) {
@@ -11032,7 +12777,13 @@ mod tests {
 
         let closed = gate.close();
         let err = cm
-            .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
+            .preempt_job_with_provenance(
+                job_id,
+                cm.get_job(job_id).unwrap().run_attempt,
+                PreemptMode::Requeue,
+                Some(99),
+                None,
+            )
             .expect_err("the requeue cannot apply while the gate is closed");
         let (tx, rx) = tokio::sync::oneshot::channel();
         gated::late(&err)
@@ -11146,6 +12897,9 @@ mod tests {
             features: Vec::new(),
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }
     }
 
@@ -12181,6 +13935,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 HashMap::from([("pool".to_string(), pool.to_string())]),
+                Vec::new(),
                 privileged,
             )
         };
@@ -12233,6 +13988,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -12449,6 +14205,7 @@ mod tests {
             priority_tier: 1,
             preempt_mode: String::new(),
             preempt_exempt_time: None,
+            grace_time: None,
         });
         config.hooks.job_submit = Some(write_hook_script(&dir, r#"echo '{"partition":"small"}'"#));
         let cm = test_cluster_with_config(&dir, config).await;
@@ -12599,6 +14356,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn submit_job_hook_constraint_rewrite_is_revalidated() {
+        for constraint in ["GPU.vram>=1GiB", "gpu.vram>=1GiB"] {
+            let dir = TempDir::new().unwrap();
+            let mut config = test_config();
+            config.hooks.job_submit = Some(write_hook_script(
+                &dir,
+                &format!(r#"echo '{{"constraint":"{constraint}"}}'"#),
+            ));
+            let cm = test_cluster_with_config(&dir, config).await;
+            let err = cm.submit_job(basic_spec("hook-constraint")).unwrap_err();
+            assert!(
+                matches!(&err, SubmitError::InvalidArgument(message) if message.contains("GPU")),
+                "{constraint}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_job_lua_modify_to_unknown_qos_is_rejected() {
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -12705,6 +14480,7 @@ mod tests {
             priority_tier: 1,
             preempt_mode: String::new(),
             preempt_exempt_time: None,
+            grace_time: None,
         });
         config.hooks.job_submit_lua = Some(write_lua_script(
             &dir,
@@ -12850,6 +14626,117 @@ mod tests {
         assert_eq!(node.alloc_resources.memory_mb, 8000);
     }
 
+    #[test]
+    fn gpu_pending_diagnostics_distinguish_properties_from_block_containment() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        for (id, expression, expected) in [
+            (1, "gpu.vram>=192GiB", "GpuPropertiesUnavailable"),
+            (2, "same(gpu.vpod_id)", "FabricUnavailable"),
+            (3, "gpu.vram>=192GiB&same(gpu.vpod_id)", "FabricUnavailable"),
+        ] {
+            let mut spec = basic_spec("properties");
+            spec.constraint = Some(expression.into());
+            cm.jobs.write().insert(id, Job::new(id, spec));
+            cm.annotate_fabric_pending(&[id]);
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.pending_reason, PendingReason::Resources);
+            assert!(job
+                .pending_reason_desc
+                .as_deref()
+                .unwrap()
+                .starts_with(expected));
+        }
+    }
+
+    #[test]
+    fn placement_entry_rejects_gpu_snapshot_predicate_and_local_group_mismatches() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut gpu = gpu_resource(0, 42);
+        gpu.topology = Some(spur_core::resource::DeviceTopology {
+            numa_node: Some(0),
+            pci_root: Some("pci0001:00".into()),
+            vram_bytes: Some(192 * 1024_u64.pow(3)),
+            ..Default::default()
+        });
+        let inventory = ResourceSet {
+            generation: 7,
+            fabric_binding_version: 3,
+            gpus: vec![gpu],
+            ..Default::default()
+        };
+        let mut allocations = HashMap::new();
+        for name in ["n0", "n1"] {
+            cm.nodes
+                .write()
+                .insert(name.into(), Node::new(name.into(), inventory.clone()));
+            let mut alloc = ResourceAllocations {
+                generation: 7,
+                devices: [(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(42)],
+                )]
+                .into(),
+                ..Default::default()
+            };
+            alloc.gpu_binding =
+                Some(spur_core::gpu_binding::GpuBinding::new(name, &inventory, &alloc).unwrap());
+            allocations.insert(name.into(), alloc);
+        }
+        let mut spec = basic_spec("properties");
+        spec.gpus = Some(spur_core::gpu_request::GpuRequest::new(2, None));
+        spec.constraint = Some("gpu.vram>=192GiB".into());
+        let job = Job::new(1, spec.clone());
+        let names = vec!["n0".into(), "n1".into()];
+        cm.validate_fabric_placement(&job, &names, &allocations)
+            .unwrap();
+        for expression in [
+            "gpu.vram>192GiB",
+            "same(gpu.numa_node_id)",
+            "same(gpu.pcie_root_id)",
+        ] {
+            spec.constraint = Some(expression.into());
+            cm.jobs.write().insert(1, Job::new(1, spec.clone()));
+            let error = cm
+                .reserve_placement(
+                    1,
+                    names.clone(),
+                    ResourceAllocations::default(),
+                    allocations.clone(),
+                    false,
+                    false,
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("predicate")
+                    || error.to_string().contains("same-property"),
+                "{error}"
+            );
+            assert!(!cm.get_job(1).unwrap().holds_a_placement());
+        }
+        spec.constraint = Some("gpu.vram>=192GiB".into());
+        cm.jobs.write().insert(1, Job::new(1, spec));
+        cm.nodes
+            .write()
+            .get_mut("n0")
+            .unwrap()
+            .total_resources
+            .generation = 8;
+        let error = cm
+            .reserve_placement(
+                1,
+                names,
+                ResourceAllocations::default(),
+                allocations,
+                false,
+                false,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("stale GPU property"), "{error}");
+        assert!(!cm.get_job(1).unwrap().holds_a_placement());
+    }
+
     fn gpu_resource(device_id: u32, stable_id: u64) -> spur_core::resource::GpuResource {
         spur_core::resource::GpuResource {
             device_id,
@@ -12857,6 +14744,7 @@ mod tests {
             memory_mb: 0,
             peer_gpus: vec![],
             link_type: spur_core::resource::GpuLinkType::XGMI,
+            topology: None,
             stable_id,
         }
     }
@@ -12881,6 +14769,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -12929,11 +14818,14 @@ mod tests {
         // Bug reproduction: the stale positional ids match no live stable_id, so
         // both real GPUs read free.
         let want_two_gpus = ResourceSet {
+            fabric_binding_version: 0,
+            block_file_revision: None,
             cpus: 0,
             memory_mb: 0,
             gpus: vec![gpu_resource(0, 0), gpu_resource(1, 0)],
             generic: Default::default(),
             generation: 0,
+            topology: None,
         };
         {
             let node = cm.get_node("n1").unwrap();
@@ -13111,6 +15003,8 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            pty: false,
+            job_shell: false,
         };
         cm.steps.write().insert((1, 0), step(1));
         cm.steps.write().insert((2, 0), step(2));
@@ -13650,6 +15544,7 @@ mod tests {
             version: "1.0".into(),
             labels: HashMap::new(),
             source: NodeSource::default(),
+            capabilities: Vec::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -13771,7 +15666,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_accepts_gpu_after_node_reduction() {
-        // C3: -N4 -n1 --gpus=2 is valid once the node count is reduced to one;
+        // -N4 -n1 --gpus=2 is valid once the node count is reduced to one;
         // the pre-normalization guard used to reject it.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -13787,7 +15682,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_warns_when_node_count_reduced() {
-        // I2: a shrunk request returns a user-facing warning; an exact-fit
+        // A shrunk request returns a user-facing warning; an exact-fit
         // request returns none.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -13814,7 +15709,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_rejects_below_partition_min_nodes() {
-        // I1: -N4 -n1 on a MinNodes=4 partition is rejected at submit, not left
+        // -N4 -n1 on a MinNodes=4 partition is rejected at submit, not left
         // pending forever.
         let dir = TempDir::new().unwrap();
         let mut config = test_config();
@@ -13860,7 +15755,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_pmix_accepts_single_node_after_reduction() {
-        // I5: -N4 -n1 --mpi=pmix reduces to one node and is accepted.
+        // -N4 -n1 --mpi=pmix reduces to one node and is accepted.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
@@ -13886,7 +15781,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn submit_keeps_full_node_count_for_total_gpus() {
-        // C2: -N4 --gpus=8 (ntasks defaulted to nodes) keeps all four nodes so
+        // -N4 --gpus=8 (ntasks defaulted to nodes) keeps all four nodes so
         // the eight GPUs spread across them instead of collapsing to one node.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -14015,8 +15910,14 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job1 = run_job_on(&cm, "victim-1", "worker1");
-        cm.preempt_job_with_provenance(job1, PreemptMode::Requeue, Some(99), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job1,
+            cm.get_job(job1).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(99),
+            None,
+        )
+        .unwrap();
         settle(&cm, job1, JobState::Pending);
         assert_eq!(
             stats.snapshot().jobs_preempted,
@@ -14025,8 +15926,14 @@ mod tests {
         );
 
         let job2 = run_job_on(&cm, "victim-2", "worker1");
-        cm.preempt_job_with_provenance(job2, PreemptMode::Cancel, Some(99), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job2,
+            cm.get_job(job2).unwrap().run_attempt,
+            PreemptMode::Cancel,
+            Some(99),
+            None,
+        )
+        .unwrap();
         report_nodes_released(&cm, job2);
         settle(&cm, job2, JobState::Cancelled);
         assert_eq!(
@@ -14311,6 +16218,8 @@ mod tests {
                 start_time: Some(Utc::now()),
                 end_time: None,
                 exit_code: None,
+                pty: true,
+                job_shell: false,
             }),
         });
         cm.apply_operation(&WalOperation::JobStepComplete {
@@ -14672,6 +16581,7 @@ mod tests {
             preempted_by: Some(2),
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -14877,6 +16787,251 @@ mod tests {
         record_marker(cancelled);
         cm.complete_job(cancelled, -1, JobState::Cancelled).unwrap();
         settle(&cm, cancelled, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_moves_to_completing_and_holds_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiring", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        let at = Utc::now();
+
+        assert!(cm.expire_time_limit(job_id, run_attempt, at).unwrap());
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert_eq!(job.time_limit_signaled_at, Some(at));
+        assert_eq!(job.cancel_signaled_at, Some(at));
+        assert_eq!(job.end_time, Some(at));
+        assert!(job.cancelled_by.is_none(), "nobody cancelled it");
+        assert_eq!(
+            cm.get_node("worker1").unwrap().alloc_resources.cpus,
+            2,
+            "the nodes stay held until they report"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_ends_timeout_when_the_job_exits() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiring-exit", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.expire_time_limit(job_id, run_attempt, Utc::now())
+            .unwrap();
+
+        cm.node_complete(job_id, "worker1", 0, 15, run_attempt)
+            .unwrap();
+
+        settle(&cm, job_id, JobState::Timeout);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.pending_reason, PendingReason::TimeLimit);
+        assert_eq!(job.end_reason(JobState::Timeout).0, EndReason::TimeLimit);
+        assert!(job.ended_by(EndReason::TimeLimit).is_none());
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_ends_timeout_when_force_finished() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiring-stuck", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.expire_time_limit(job_id, run_attempt, Utc::now())
+            .unwrap();
+
+        // What enforce_completing_timeout does when no node ever reports.
+        cm.complete_job(job_id, -1, JobState::Failed).unwrap();
+
+        settle(&cm, job_id, JobState::Timeout);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::TimeLimit
+        );
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_requeues_a_requeue_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let mut spec = basic_spec("expiring-requeue");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["worker1".into()],
+            alloc.clone(),
+            per_node_for(&["worker1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.expire_time_limit(job_id, run_attempt, Utc::now())
+            .unwrap();
+
+        cm.node_complete(job_id, "worker1", 0, 15, run_attempt)
+            .unwrap();
+
+        settle(&cm, job_id, JobState::Pending);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.requeue_count, 1);
+        assert!(job.time_limit_signaled_at.is_none());
+        assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_ignores_a_stale_run_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiring-stale", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        assert_ne!(run_attempt, 0, "the run must carry an epoch for this test");
+
+        let completing = cm
+            .expire_time_limit(job_id, run_attempt + 1, Utc::now())
+            .unwrap();
+
+        assert!(!completing);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.time_limit_signaled_at.is_none());
+        assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_for_a_run_holding_no_nodes_leaves_it_to_the_caller() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let job_id = submit_and_wait(&cm, basic_spec("expiring-no-nodes"));
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+
+        assert!(!cm.expire_time_limit(job_id, 0, Utc::now()).unwrap());
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+
+        cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
+        settle(&cm, job_id, JobState::Timeout);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_is_ignored_once_the_run_has_ended() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiry-raced", "worker1");
+        cm.node_complete(job_id, "worker1", 0, 0, 0).unwrap();
+        settle(&cm, job_id, JobState::Completed);
+
+        assert!(!cm.expire_time_limit(job_id, 0, Utc::now()).unwrap());
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Completed);
+        assert!(job.time_limit_signaled_at.is_none());
+        assert!(job.cancel_signaled_at.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_does_not_relabel_a_cancelled_completing_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiry-after-cancel", "worker1");
+        cm.cancel_job(job_id, "testuser").unwrap();
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completing);
+
+        let completing = cm.expire_time_limit(job_id, 0, Utc::now()).unwrap();
+
+        assert!(
+            !completing,
+            "an expiry that changed nothing must not trigger a second cancel"
+        );
+        let job = cm.get_job(job_id).unwrap();
+        assert!(job.time_limit_signaled_at.is_none());
+        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_is_not_reported_as_a_cancel_or_preemption() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiry-provenance", "worker1");
+        cm.expire_time_limit(job_id, 0, Utc::now()).unwrap();
+
+        let resp = cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+
+        assert!(matches!(
+            resp,
+            NodeCompleteResult::AllDone {
+                state: JobState::Timeout,
+                ..
+            }
+        ));
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.end_of_run_state(JobState::Timeout), JobState::Timeout);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicting_a_time_limited_run_keeps_the_timeout_verdict() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "expiry-evicted", "worker1");
+        cm.expire_time_limit(job_id, 0, Utc::now()).unwrap();
+
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "worker1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("evicted".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Timeout);
+        assert_eq!(resp.jobs_finalized[0].reason, EndReason::TimeLimit);
+        assert!(resp.jobs_finalized[0].ended_by.is_none());
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::TimeLimit
+        );
+    }
+
+    // A controller upgraded over a log written by the previous release replays
+    // the watchdog's old SIGTERM marker; it must still behave as it did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_time_limit_signaled_entry_still_replays() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+        let job_id = run_job_on(&cm, "legacy-marker", "worker1");
+
+        cm.apply_operation(&WalOperation::JobTimeLimitSignaled {
+            job_id,
+            at: Utc::now(),
+        });
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.time_limit_signaled_at.is_some());
+        assert!(job.cancel_signaled_at.is_none());
+
+        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+        settle(&cm, job_id, JobState::Timeout);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15558,6 +17713,7 @@ mod tests {
             preempted_by: Some(job_id + 1),
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
 
         let last = cm.get_job(job_id).unwrap().last_requeue.unwrap();
@@ -15781,6 +17937,7 @@ mod tests {
             preempted_by: Some(job_id + 1),
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
 
         let fin = &resp.jobs_finalized[0];
@@ -17001,7 +19158,13 @@ mod tests {
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
 
         let outcome = cm
-            .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
+            .preempt_job_with_provenance(
+                job_id,
+                cm.get_job(job_id).unwrap().run_attempt,
+                PreemptMode::Requeue,
+                Some(99),
+                None,
+            )
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
         settle(&cm, job_id, JobState::Pending);
@@ -17058,8 +19221,14 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job_id,
+            cm.get_job(job_id).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(99),
+            None,
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         assert_eq!(
@@ -17078,8 +19247,14 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-reason", "worker1");
-        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job_id,
+            cm.get_job(job_id).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(99),
+            None,
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Pending);
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
@@ -17094,6 +19269,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn requeue_hold_is_at_least_the_kill_wait() {
+        assert_eq!(requeue_hold_secs(1, 5), 5);
+        assert_eq!(requeue_hold_secs(1, 30), 30);
+        assert_eq!(requeue_hold_secs(20, 30), 43);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_hold_covers_kill_wait() {
+        // The victim is still being killed for the kill wait; re-dispatching it
+        // earlier would start the new run into its own teardown.
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.scheduler.interval_secs = 1;
+        config.scheduler.kill_wait_secs = 30;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "hold-kill-wait", "worker1");
+        let before = Utc::now();
+        cm.preempt_job_with_provenance(
+            job_id,
+            cm.get_job(job_id).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(99),
+            None,
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let begin = cm.get_job(job_id).unwrap().spec.begin_time.unwrap();
+        assert!(
+            begin >= before + chrono::Duration::seconds(30),
+            "hold ends {begin}, before the kill wait elapses"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_requeue_hold_covers_kill_wait() {
+        let dir = TempDir::new().unwrap();
+        let mut config = test_config();
+        config.scheduler.interval_secs = 1;
+        config.scheduler.kill_wait_secs = 30;
+        let cm = test_cluster_with_config(&dir, config).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = run_job_on(&cm, "requeue-kill-wait", "worker1");
+        let before = Utc::now();
+        cm.requeue_job_by_user(job_id, "testuser", false, false)
+            .unwrap();
+        settle(&cm, job_id, JobState::Pending);
+
+        let begin = cm.get_job(job_id).unwrap().spec.begin_time.unwrap();
+        assert!(
+            begin >= before + chrono::Duration::seconds(30),
+            "hold ends {begin}, before the kill wait elapses"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preempt_requeue_hold_expires_and_job_reschedules() {
         // Once the hold lapses the job must become eligible and actually run
@@ -17103,8 +19337,14 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-expiry", "worker1");
-        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job_id,
+            cm.get_job(job_id).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(99),
+            None,
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         // Simulate the hold having elapsed by moving begin_time into the past,
@@ -17420,6 +19660,7 @@ mod tests {
         // The guard site in update_pending_reasons. An empty cluster_state would
         // otherwise force Resources/NodeDown.
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -17458,6 +19699,7 @@ mod tests {
         assert!(cm.get_job(job_id).unwrap().is_begin_held(Utc::now()));
 
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -17565,7 +19807,13 @@ mod tests {
 
         let job_id = run_job_on(&cm, "preempt-cancel", "worker1");
         let outcome = cm
-            .preempt_job_with_provenance(job_id, PreemptMode::Cancel, Some(99), None)
+            .preempt_job_with_provenance(
+                job_id,
+                cm.get_job(job_id).unwrap().run_attempt,
+                PreemptMode::Cancel,
+                Some(99),
+                None,
+            )
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
 
@@ -17619,6 +19867,7 @@ mod tests {
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
             at: None,
+            run_attempt: None,
         });
 
         assert!(
@@ -17658,6 +19907,7 @@ mod tests {
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
             at: None,
+            run_attempt: None,
         });
         assert!(
             replay.jobs_finalized.is_empty(),
@@ -17668,6 +19918,334 @@ mod tests {
             0,
             "replayed preempt-cancel must not double-free"
         );
+    }
+
+    /// Job 1 running its `run_attempt`-th run on `worker1`.
+    fn seed_running_job(cm: &ClusterManager, run_attempt: u32) {
+        register_node(cm, "worker1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("preempt-run-gate")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt,
+            idle_fill: false,
+            at: None,
+        });
+    }
+
+    async fn cluster_with_running_job(dir: &TempDir, run_attempt: u32) -> Arc<ClusterManager> {
+        let cm = test_cluster(dir).await;
+        seed_running_job(&cm, run_attempt);
+        cm
+    }
+
+    fn preempt_cancel_for_run(run_attempt: Option<u32>) -> WalOperation {
+        WalOperation::JobPreemptCancel {
+            job_id: 1,
+            preempted_by: Some(42),
+            preempt_qos: None,
+            at: None,
+            run_attempt,
+        }
+    }
+
+    fn preempt_requeue_for_run(run_attempt: Option<u32>) -> WalOperation {
+        WalOperation::JobPreemptRequeue {
+            job_id: 1,
+            begin_time: Utc::now() + chrono::Duration::seconds(5),
+            preempted_by: Some(42),
+            preempt_qos: None,
+            at: None,
+            run_attempt,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_cancel_decided_for_an_earlier_run_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+
+        let resp = cm.apply_operation(&preempt_cancel_for_run(Some(2)));
+
+        assert!(resp.jobs_finalized.is_empty());
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_cancel_decided_for_the_current_run_applies() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+
+        cm.apply_operation(&preempt_cancel_for_run(Some(3)));
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert_eq!(job.preempted_by, Some(42));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_cancel_from_a_pre_upgrade_entry_applies_to_any_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+        let legacy: WalOperation =
+            serde_json::from_str(r#"{"JobPreemptCancel":{"job_id":1,"preempted_by":42}}"#).unwrap();
+
+        cm.apply_operation(&legacy);
+
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_decided_for_an_earlier_run_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+
+        let resp = cm.apply_operation(&preempt_requeue_for_run(Some(2)));
+
+        assert!(resp.jobs_finalized.is_empty());
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.preempt_requeue_count, 0);
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_decided_for_the_current_run_applies() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+
+        let resp = cm.apply_operation(&preempt_requeue_for_run(Some(3)));
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.preempt_requeue_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_requeue_from_a_pre_upgrade_entry_applies_to_any_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = cluster_with_running_job(&dir, 3).await;
+        let legacy: WalOperation = serde_json::from_str(
+            r#"{"JobPreemptRequeue":{"job_id":1,"begin_time":"2999-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+
+        cm.apply_operation(&legacy);
+
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Pending);
+    }
+
+    async fn recording_cluster(
+        dir: &TempDir,
+        before_apply: fn(&ClusterManager, &WalOperation),
+    ) -> (Arc<ClusterManager>, Arc<RecordingApplier>) {
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let recorder = Arc::new(RecordingApplier {
+            inner: cm.clone(),
+            ops: parking_lot::Mutex::new(Vec::new()),
+            before_apply,
+        });
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), recorder.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .expect("single-node raft did not self-elect within 5s");
+        cm.set_raft(handle.raft);
+        (cm, recorder)
+    }
+
+    fn proposed_preemption_ops(recorder: &RecordingApplier) -> Vec<WalOperation> {
+        recorder
+            .ops
+            .lock()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    WalOperation::JobPreemptRequeue { .. }
+                        | WalOperation::JobPreemptCancel { .. }
+                        | WalOperation::JobSuspend { .. }
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn proposed_preemption_stamps(recorder: &RecordingApplier) -> Vec<Option<u32>> {
+        proposed_preemption_ops(recorder)
+            .iter()
+            .filter_map(|op| match op {
+                WalOperation::JobPreemptRequeue { run_attempt, .. }
+                | WalOperation::JobPreemptCancel { run_attempt, .. } => Some(*run_attempt),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A new run starts after the preemption was proposed and before it applies.
+    fn start_next_run_before_a_preemption_applies(cm: &ClusterManager, op: &WalOperation) {
+        if matches!(
+            op,
+            WalOperation::JobPreemptRequeue { .. } | WalOperation::JobPreemptCancel { .. }
+        ) {
+            if let Some(job) = cm.jobs.write().get_mut(&1) {
+                job.run_attempt += 1;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempting_a_running_job_stamps_the_run_it_was_decided_for() {
+        for mode in [PreemptMode::Requeue, PreemptMode::Cancel] {
+            let dir = TempDir::new().unwrap();
+            let (cm, recorder) = recording_cluster(&dir, |_, _| {}).await;
+            seed_running_job(&cm, 3);
+
+            cm.preempt_job_with_provenance(1, 3, mode, Some(42), None)
+                .unwrap();
+
+            assert_eq!(
+                proposed_preemption_stamps(&recorder),
+                vec![Some(3)],
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempting_a_run_the_job_has_moved_past_proposes_nothing() {
+        for mode in [
+            PreemptMode::Requeue,
+            PreemptMode::Cancel,
+            PreemptMode::Suspend,
+        ] {
+            let dir = TempDir::new().unwrap();
+            let (cm, recorder) = recording_cluster(&dir, |_, _| {}).await;
+            seed_running_job(&cm, 4);
+
+            let err = cm
+                .preempt_job_with_provenance(1, 3, mode, Some(42), None)
+                .expect_err("a preemption decided for run 3 must not reach run 4");
+
+            assert!(
+                err.to_string().contains("is at run 4, not the run 3"),
+                "{mode:?}: {err}"
+            );
+            assert!(proposed_preemption_ops(&recorder).is_empty(), "{mode:?}");
+            let job = cm.get_job(1).unwrap();
+            assert_eq!(job.state, JobState::Running, "{mode:?}");
+            assert_eq!(job.run_attempt, 4, "{mode:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaiming_a_run_the_job_has_moved_past_proposes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (cm, recorder) = recording_cluster(&dir, |_, _| {}).await;
+        seed_running_job(&cm, 4);
+
+        cm.reclaim_job_with_provenance(1, 3, PreemptMode::Requeue, Some(42), None)
+            .expect_err("a reclaim decided for run 3 must not reach run 4");
+
+        assert!(proposed_preemption_ops(&recorder).is_empty());
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_preemption_the_apply_skips_is_not_reported_as_preempted() {
+        for mode in [PreemptMode::Requeue, PreemptMode::Cancel] {
+            let dir = TempDir::new().unwrap();
+            let (cm, _recorder) =
+                recording_cluster(&dir, start_next_run_before_a_preemption_applies).await;
+            seed_running_job(&cm, 3);
+
+            let err = cm
+                .preempt_job_with_provenance(1, 3, mode, Some(42), None)
+                .expect_err("the entry applied as a NoOp, so nothing was preempted");
+
+            assert!(
+                err.to_string().contains("no longer running as run 3"),
+                "{mode:?}: {err}"
+            );
+            let job = cm.get_job(1).unwrap();
+            assert_eq!(job.state, JobState::Running, "{mode:?}");
+            assert_eq!(job.run_attempt, 4, "{mode:?}");
+            assert!(
+                cm.preempt_freed_nodes_raw().is_empty(),
+                "{mode:?}: a skipped requeue must not earmark the node"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_preemption_that_applies_reports_it_applied() {
+        for op in [
+            preempt_requeue_for_run(Some(3)),
+            preempt_cancel_for_run(Some(3)),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cm = cluster_with_running_job(&dir, 3).await;
+
+            assert!(cm.apply_operation(&op).preempt_applied);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_final_preemption_for_another_run_does_not_report_it_applied() {
+        for op in [
+            preempt_requeue_for_run(Some(2)),
+            preempt_cancel_for_run(Some(2)),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let cm = cluster_with_running_job(&dir, 3).await;
+
+            assert!(!cm.apply_operation(&op).preempt_applied);
+        }
+    }
+
+    /// Records every operation Raft commits before handing it to the cluster, so a
+    /// test can see what a proposer wrote and not only how it applied. `before_apply`
+    /// lets a test change the state an entry lands on.
+    struct RecordingApplier {
+        inner: Arc<ClusterManager>,
+        ops: parking_lot::Mutex<Vec<WalOperation>>,
+        before_apply: fn(&ClusterManager, &WalOperation),
+    }
+
+    impl crate::raft::StateMachineApply for RecordingApplier {
+        fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+            self.ops.lock().push(op.clone());
+            (self.before_apply)(&self.inner, op);
+            self.inner.apply_operation(op)
+        }
+
+        fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
+            crate::raft::StateMachineApply::snapshot_state(self.inner.as_ref())
+        }
+
+        fn restore_from_snapshot(&self, data: &[u8]) -> Result<(), anyhow::Error> {
+            crate::raft::StateMachineApply::restore_from_snapshot(self.inner.as_ref(), data)
+        }
     }
 
     fn budget_qos(cap: u32) -> Qos {
@@ -17844,6 +20422,7 @@ mod tests {
         let outcome = cm
             .preempt_job_with_provenance(
                 job_id,
+                cm.get_job(job_id).unwrap().run_attempt,
                 PreemptMode::Suspend,
                 Some(42),
                 Some("highprio".into()),
@@ -17870,7 +20449,13 @@ mod tests {
 
         let job_id = run_job_on(&cm, "preempt-off", "worker1");
         assert!(cm
-            .preempt_job_with_provenance(job_id, PreemptMode::Off, Some(99), None)
+            .preempt_job_with_provenance(
+                job_id,
+                cm.get_job(job_id).unwrap().run_attempt,
+                PreemptMode::Off,
+                Some(99),
+                None
+            )
             .is_err());
         // Job keeps running; nothing was preempted.
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
@@ -17883,7 +20468,13 @@ mod tests {
 
         let job_id = submit_and_wait(&cm, basic_spec("still-pending"));
         assert!(cm
-            .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
+            .preempt_job_with_provenance(
+                job_id,
+                cm.get_job(job_id).unwrap().run_attempt,
+                PreemptMode::Requeue,
+                Some(99),
+                None
+            )
             .is_err());
     }
 
@@ -18013,6 +20604,7 @@ mod tests {
             preempted_by: None,
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
         // One op finalizes the prior run as PREEMPTED (drives accounting) ...
         assert_eq!(resp.jobs_finalized.len(), 1);
@@ -18036,6 +20628,7 @@ mod tests {
             preempted_by: None,
             preempt_qos: None,
             at: None,
+            run_attempt: None,
         });
         assert!(
             replay.jobs_finalized.is_empty(),
@@ -18066,6 +20659,7 @@ mod tests {
         let job_id = run_job_on(&cm, "prov-clear", "worker1");
         cm.preempt_job_with_provenance(
             job_id,
+            cm.get_job(job_id).unwrap().run_attempt,
             PreemptMode::Requeue,
             Some(77),
             Some("burst".into()),
@@ -18217,6 +20811,7 @@ mod tests {
             jobs.get_mut(&job_id).unwrap().pending_reason = PendingReason::DeadLine;
         }
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -18248,6 +20843,7 @@ mod tests {
         node.alloc_resources = scalar_alloc(4, 8000);
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18265,6 +20861,7 @@ mod tests {
         down.state = NodeState::Down;
         let nodes = vec![down];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18294,6 +20891,7 @@ mod tests {
         node.k0s_role = Some(K0sRole::Worker);
         let nodes = vec![node];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18314,6 +20912,7 @@ mod tests {
         busy.state = NodeState::Mixed;
         let nodes = vec![busy];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18352,6 +20951,7 @@ mod tests {
         let n2 = cm.get_node("n2").unwrap();
         let nodes = vec![n1, n2];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18387,6 +20987,7 @@ mod tests {
             cm.get_node("n3").unwrap(),
         ];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18426,6 +21027,7 @@ mod tests {
             cm.get_node("n4").unwrap(),
         ];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18476,6 +21078,7 @@ mod tests {
             owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18526,6 +21129,7 @@ mod tests {
             owner: String::new(),
         }];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18557,6 +21161,7 @@ mod tests {
 
         let nodes = vec![cm.get_node("n1").unwrap(), cm.get_node("n2").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18585,6 +21190,7 @@ mod tests {
         // Node has no features.
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -18762,6 +21368,7 @@ mod tests {
 
         // An empty cluster forces a real wait reason, which must win.
         let empty_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &[],
             partitions: &[],
@@ -20029,6 +22636,7 @@ mod tests {
             partitions: &partitions,
             reservations: &reservations,
             topology: None,
+            fabric: None,
             busy_until: &busy_until,
         };
         let mut scheduler =
@@ -20038,8 +22646,8 @@ mod tests {
 
     /// A pending bystander with a lower QOS base than the hunter (6000 vs 11000)
     /// but a higher effective priority once fair-share and age are folded in
-    /// (~6000 x 3.0 x age). This is the #1095 shape: the bystander wins the
-    /// effective-priority axis but has no claim to the contested capacity.
+    /// (~6000 x 3.0 x age). The bystander wins the effective-priority axis but
+    /// has no claim to the contested capacity.
     fn submit_bystander(cm: &Arc<ClusterManager>, node: &str) -> JobId {
         cm.qos_cache().insert(Qos {
             name: "bystander-qos".into(),
@@ -20060,10 +22668,9 @@ mod tests {
         bystander_id
     }
 
-    /// Drive a cancel-mode preemption so the victim is left draining in
-    /// Completing with `preempted_by` set to the hunter. Returns (victim_id,
-    /// hunter_id). The hunter stays pending because the node is still held.
-    async fn preempt_into_drain(
+    /// A RUNNING victim of `victim_qos` on `node`, plus a pending hunter of
+    /// `hunter_qos` pinned to the same node. Returns (victim_id, hunter_id).
+    fn run_victim_and_submit_hunter(
         cm: &Arc<ClusterManager>,
         node: &str,
         victim_qos: &str,
@@ -20087,6 +22694,19 @@ mod tests {
         hunter.qos = Some(hunter_qos.into());
         hunter.nodelist = Some(node.into());
         let hunter_id = submit_and_wait(cm, hunter);
+        (victim_id, hunter_id)
+    }
+
+    /// Drive a cancel-mode preemption so the victim is left draining in
+    /// Completing with `preempted_by` set to the hunter. Returns (victim_id,
+    /// hunter_id). The hunter stays pending because the node is still held.
+    async fn preempt_into_drain(
+        cm: &Arc<ClusterManager>,
+        node: &str,
+        victim_qos: &str,
+        hunter_qos: &str,
+    ) -> (JobId, JobId) {
+        let (victim_id, hunter_id) = run_victim_and_submit_hunter(cm, node, victim_qos, hunter_qos);
         let hunter_job = cm.get_job(hunter_id).unwrap();
         let partitions = cm.get_partitions();
         crate::scheduler_loop::try_preempt(
@@ -20102,9 +22722,33 @@ mod tests {
         (victim_id, hunter_id)
     }
 
-    /// The #1095 example: a bystander with a lower QOS base but higher effective
-    /// priority (via fair-share) must not outrank the in-flight preemptor for the
-    /// node the preemptor is freeing. The preemptor is hoisted to the front of
+    /// Leave the victim RUNNING inside its preemption grace, owed to the hunter.
+    /// Returns (victim_id, hunter_id).
+    fn preempt_into_grace(
+        cm: &Arc<ClusterManager>,
+        node: &str,
+        victim_qos: &str,
+        hunter_qos: &str,
+    ) -> (JobId, JobId) {
+        let (victim_id, hunter_id) = run_victim_and_submit_hunter(cm, node, victim_qos, hunter_qos);
+        let signaled_at = Utc::now();
+        let pending = PreemptPending {
+            signaled_at,
+            deadline: signaled_at + chrono::Duration::seconds(600),
+            preempted_by: hunter_id,
+            preempt_qos: Some(hunter_qos.into()),
+            mode: PreemptMode::Cancel,
+            run_attempt: cm.get_job(victim_id).unwrap().run_attempt,
+            requeue_hold_secs: 30,
+        };
+        assert!(cm.signal_preemption(pending, victim_id).unwrap());
+        assert_eq!(cm.get_job(victim_id).unwrap().state, JobState::Running);
+        (victim_id, hunter_id)
+    }
+
+    /// A bystander with a lower QOS base but higher effective priority (via
+    /// fair-share) must not outrank the in-flight preemptor for the node the
+    /// preemptor is freeing. The preemptor is hoisted to the front of
     /// the pending list so backfill reserves that node for it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inflight_preemptor_hoists_ahead_of_higher_effective_priority_bystander() {
@@ -20193,10 +22837,61 @@ mod tests {
         );
     }
 
+    /// A victim still inside its grace holds the node just like one tearing
+    /// down, so its preemptor must stay ahead of a higher-effective-priority
+    /// bystander for the whole grace, not only after the kill is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preemptor_stays_hoisted_during_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (victim_id, hunter_id) = preempt_into_grace(&cm, "n1", "low", "high");
+        let bystander_id = submit_bystander(&cm, "n1");
+
+        assert_eq!(cm.get_job(victim_id).unwrap().state, JobState::Running);
+        let pending = cm.pending_jobs();
+        let hunter_pos = pending.iter().position(|j| j.job_id == hunter_id);
+        let bystander_pos = pending.iter().position(|j| j.job_id == bystander_id);
+        assert!(
+            hunter_pos.is_some() && bystander_pos.is_some(),
+            "both jobs must be pending for the ordering to mean anything"
+        );
+        assert!(
+            hunter_pos < bystander_pos,
+            "while the victim is in its grace, the preemptor must stay hoisted"
+        );
+    }
+
+    /// An earmark is held at full budget while any victim of its owner is still
+    /// in its grace, as it is while one drains; otherwise it would expire before
+    /// the grace deadline and the freed node would go to a bystander.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn earmark_is_refreshed_during_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster_with_config(&dir, preempting_config()).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        insert_preempting_qos_pair(&cm, "low", "high");
+
+        let (_victim_id, hunter_id) = preempt_into_grace(&cm, "n1", "low", "high");
+        cm.record_preempt_freed_nodes(&["n2".to_string()], hunter_id);
+
+        for _ in 0..=ClusterManager::PREEMPT_FREED_EARMARK_PASSES {
+            cm.tick_preempt_freed_earmarks();
+        }
+
+        assert_eq!(
+            cm.preempt_freed_nodes_raw().get("n2").copied(),
+            Some((hunter_id, ClusterManager::PREEMPT_FREED_EARMARK_PASSES))
+        );
+    }
+
     /// Abandonment: if the preemptor is cancelled mid-drain, the victim's
     /// `preempted_by` has nothing to anchor the hoist to once it finalizes, so
-    /// the freed node returns to the best current pending claimant — the
-    /// deliberate divergence from #1095's QOS-wide hold.
+    /// the freed node returns to the best current pending claimant. The node is
+    /// deliberately not held for the preemptor's QOS as a whole.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_preemption_returns_node_to_best_claimant() {
         let dir = TempDir::new().unwrap();
@@ -20482,8 +23177,14 @@ mod tests {
 
         // Reclaim path: no earmark is recorded for the reclaimer (job 777).
         let v1 = run_victim_on_n1("borrowed");
-        cm.reclaim_job_with_provenance(v1, PreemptMode::Requeue, Some(777), None)
-            .unwrap();
+        cm.reclaim_job_with_provenance(
+            v1,
+            cm.get_job(v1).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(777),
+            None,
+        )
+        .unwrap();
         assert!(
             cm.preempt_freed_nodes_raw().is_empty(),
             "reclaim must not earmark the freed node for the reclaimer"
@@ -20491,8 +23192,14 @@ mod tests {
 
         // Genuine preemption path: the freed node IS earmarked for the preemptor.
         let v2 = run_victim_on_n1("victim2");
-        cm.preempt_job_with_provenance(v2, PreemptMode::Requeue, Some(888), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            v2,
+            cm.get_job(v2).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(888),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             cm.preempt_freed_nodes_raw().get("n1").map(|(p, _)| *p),
             Some(888),
@@ -20886,8 +23593,14 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let parent_id = run_job_on(&cm, "parent", "worker1");
-        cm.preempt_job_with_provenance(parent_id, PreemptMode::Cancel, Some(99), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            parent_id,
+            cm.get_job(parent_id).unwrap().run_attempt,
+            PreemptMode::Cancel,
+            Some(99),
+            None,
+        )
+        .unwrap();
         report_nodes_released(&cm, parent_id);
         settle(&cm, parent_id, JobState::Cancelled);
 
@@ -21414,6 +24127,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -21999,8 +24713,14 @@ mod tests {
 
         let job_id = run_job_on(&cm, "chronic-preempt", "worker1");
         for _ in 0..(max + 3) {
-            cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
-                .unwrap();
+            cm.preempt_job_with_provenance(
+                job_id,
+                cm.get_job(job_id).unwrap().run_attempt,
+                PreemptMode::Requeue,
+                Some(99),
+                None,
+            )
+            .unwrap();
             settle(&cm, job_id, JobState::Pending);
             {
                 let mut jobs = cm.jobs.write();
@@ -22017,8 +24737,14 @@ mod tests {
             .unwrap();
             settle(&cm, job_id, JobState::Running);
         }
-        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job_id,
+            cm.get_job(job_id).unwrap().run_attempt,
+            PreemptMode::Requeue,
+            Some(99),
+            None,
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -22060,8 +24786,14 @@ mod tests {
             )
             .unwrap();
             settle(&cm, job_id, JobState::Running);
-            cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
-                .unwrap();
+            cm.preempt_job_with_provenance(
+                job_id,
+                cm.get_job(job_id).unwrap().run_attempt,
+                PreemptMode::Requeue,
+                Some(99),
+                None,
+            )
+            .unwrap();
             settle(&cm, job_id, JobState::Pending);
             {
                 let mut jobs = cm.jobs.write();
@@ -22905,6 +25637,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -23001,6 +25734,7 @@ mod tests {
             (cm.get_nodes(), cm.get_partitions(), cm.get_reservations());
         let busy_until = crate::scheduler_loop::running_jobs_busy_until(cm);
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -23022,7 +25756,7 @@ mod tests {
     fn classify_with_trials(cm: &ClusterManager) -> (PendingJobClassification, HashSet<JobId>) {
         let mut trial = spur_sched::backfill::BackfillScheduler::new(10);
         crate::scheduler_loop::classify_without_phantom_claims(cm, |c| {
-            crate::scheduler_loop::trial_placement(cm, &mut trial, None, c)
+            crate::scheduler_loop::trial_placement(cm, &mut trial, c)
         })
     }
 
@@ -23359,9 +26093,8 @@ mod tests {
         // node (real becomes 2, well under its cap of 5). Instead, the
         // account's irrelevant credit poisons the QOS's own computation,
         // charging it 1 new node it doesn't need, and the job is wrongly
-        // blocked on QosGrpNodeLimit -- the exact under-utilization bug
-        // class issue #709 (and this whole PR) was meant to fix, now
-        // reintroduced via the interaction between the two gates.
+        // blocked on QosGrpNodeLimit -- an under-utilization bug caused by
+        // the interaction between the two gates.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 128000);
@@ -23495,6 +26228,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -23574,6 +26308,7 @@ mod tests {
         let partitions = cm.get_partitions();
         let reservations = cm.get_reservations();
         let cluster_state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -25746,8 +28481,14 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
         let job_id = run_job_on(&cm, "evict-preempted", "worker1");
 
-        cm.preempt_job_with_provenance(job_id, PreemptMode::Cancel, Some(99), None)
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job_id,
+            cm.get_job(job_id).unwrap().run_attempt,
+            PreemptMode::Cancel,
+            Some(99),
+            None,
+        )
+        .unwrap();
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
             name: "worker1".into(),
             old_state: NodeState::Allocated,
@@ -26222,6 +28963,7 @@ mod tests {
         let job = submit_and_wait(&cm, basic_spec("post-teardown"));
         let nodes = vec![cm.get_node("n1").unwrap()];
         let state = spur_sched::traits::ClusterState {
+            fabric: None,
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &[],
@@ -26720,6 +29462,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -27293,6 +30036,8 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            pty: false,
+            job_shell: false,
         }
     }
 
@@ -27386,6 +30131,7 @@ mod tests {
             state: JobState::Cancelled,
             unreported_nodes: Vec::new(),
             cancel: None,
+            controller_initiated: false,
             at: None,
         });
         assert_eq!(cm.allocate_step_id(1), 0);
@@ -28127,6 +30873,1704 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().spec.exclude, None);
     }
 
+    fn preempt_pending_for(run_attempt: u32, deadline_offset_secs: i64) -> PreemptPending {
+        let signaled_at = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        PreemptPending {
+            signaled_at,
+            deadline: signaled_at + chrono::Duration::seconds(deadline_offset_secs),
+            preempted_by: 99,
+            preempt_qos: Some("high".into()),
+            mode: PreemptMode::Requeue,
+            run_attempt,
+            requeue_hold_secs: 30,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_signal_applies_to_a_running_job_at_its_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: pending.clone(),
+        });
+
+        assert!(resp.preempt_signal_applied);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.preempt_pending, Some(pending));
+        assert_eq!(job.state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_signal_ignores_a_stale_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let stale = cm.get_job(id).unwrap().run_attempt + 1;
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: preempt_pending_for(stale, 90),
+        });
+
+        assert!(!resp.preempt_signal_applied);
+        assert!(cm.get_job(id).unwrap().preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_signal_ignores_a_non_running_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("still-pending"));
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: preempt_pending_for(attempt, 90),
+        });
+
+        assert!(!resp.preempt_signal_applied);
+        assert!(cm.get_job(id).unwrap().preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempt_signal_is_idempotent_on_replay() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+        let first = preempt_pending_for(attempt, 90);
+
+        let applied = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: first.clone(),
+        });
+        assert!(applied.preempt_signal_applied);
+
+        let replayed = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending: preempt_pending_for(attempt, 600),
+        });
+        assert!(!replayed.preempt_signal_applied);
+        assert_eq!(cm.get_job(id).unwrap().preempt_pending, Some(first));
+    }
+
+    /// A RUNNING job on `node` that has been told it is being preempted.
+    fn run_job_in_grace(cm: &ClusterManager, name: &str, node: &str) -> JobId {
+        let id = run_job_on(cm, name, node);
+        signal_grace(cm, id, PreemptMode::Requeue);
+        id
+    }
+
+    /// Warn a RUNNING job that it is being preempted by job 99, ending as `mode`.
+    fn signal_grace(cm: &ClusterManager, id: JobId, mode: PreemptMode) {
+        let mut pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
+        pending.mode = mode;
+        let resp = cm.apply_operation(&WalOperation::JobPreemptSignaled {
+            job_id: id,
+            pending,
+        });
+        assert!(resp.preempt_signal_applied);
+        assert!(cm.get_job(id).unwrap().preempt_pending.is_some());
+    }
+
+    /// A job on n1 and n2 that is warned of preemption and still RUNNING.
+    fn run_two_node_job_in_grace(cm: &ClusterManager, mode: PreemptMode) -> JobId {
+        run_job_in_grace_across(cm, &["n1", "n2"], mode)
+    }
+
+    /// A one-CPU-per-node job on `nodes` that is warned of preemption and still RUNNING.
+    fn run_job_in_grace_across(cm: &ClusterManager, nodes: &[&str], mode: PreemptMode) -> JobId {
+        for node in nodes {
+            register_node(cm, node, 4, 8000);
+        }
+        let id = submit_and_wait(cm, basic_spec("victim"));
+        let count = nodes.len() as u32;
+        cm.start_job(
+            id,
+            nodes.iter().map(|n| n.to_string()).collect(),
+            scalar_alloc(count, u64::from(count) * 1000),
+            per_node_for(nodes, scalar_alloc(1, 1000)),
+        )
+        .unwrap();
+        settle(cm, id, JobState::Running);
+        signal_grace(cm, id, mode);
+        id
+    }
+
+    fn lose_node(cm: &ClusterManager, name: &str) {
+        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: name.into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("lost".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+        cm.run_all_finalized_side_effects(&resp);
+    }
+
+    fn report_node(
+        cm: &ClusterManager,
+        id: JobId,
+        node: &str,
+        at: DateTime<Utc>,
+    ) -> ClientResponse {
+        let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: id,
+            node_name: node.into(),
+            exit_code: 0,
+            signal: 0,
+            at: Some(at),
+            run_attempt: 0,
+        });
+        cm.run_all_finalized_side_effects(&resp);
+        resp
+    }
+
+    fn grace_exit_at() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-03-04T05:07:00Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_preemption_records_the_grace_and_reports_it_applied() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+        let pending = preempt_pending_for(attempt, 90);
+
+        assert!(cm.signal_preemption(pending.clone(), id).unwrap());
+        assert_eq!(cm.get_job(id).unwrap().preempt_pending, Some(pending));
+
+        let again = preempt_pending_for(attempt, 600);
+        assert!(!cm.signal_preemption(again, id).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_preemption_for_a_stale_attempt_is_not_applied() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let stale = cm.get_job(id).unwrap().run_attempt + 1;
+
+        assert!(!cm
+            .signal_preemption(preempt_pending_for(stale, 90), id)
+            .unwrap());
+        assert!(cm.get_job(id).unwrap().preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_refuses_a_job_in_preemption_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        let actor = Actor {
+            user: "testuser".to_string(),
+            uid: None,
+        };
+        let err = cm.suspend_job_by(id, actor, true).unwrap_err();
+
+        assert!(err.to_string().contains("preemption grace period"));
+        assert_eq!(
+            crate::server::cluster_err_to_precondition_status(err).code(),
+            tonic::Code::FailedPrecondition
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_pending.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_by_non_owner_of_a_job_in_grace_is_denied() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+        let owner = cm.get_job(id).unwrap().spec.user.clone();
+        let intruder = Actor {
+            user: format!("not-{owner}"),
+            uid: None,
+        };
+
+        let err = cm.suspend_job_by(id, intruder, false).unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<spur_core::auth::AuthError>(),
+            Some(spur_core::auth::AuthError::NotJobOwner { .. })
+        ));
+        assert!(!err.to_string().contains("preemption grace"));
+        assert_eq!(
+            crate::server::cluster_err_to_precondition_status(err).code(),
+            tonic::Code::PermissionDenied
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_pending.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_suspend_applied_during_a_grace_leaves_the_job_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        let resp = cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: id,
+            at: Utc::now(),
+            preempted_by: None,
+            preempt_qos: None,
+            by: Some(Actor {
+                user: "operator".to_string(),
+                uid: None,
+            }),
+        });
+
+        assert!(!resp.suspend_applied);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_grace().is_some());
+        assert!(job.suspended_at.is_none());
+        assert!(job.suspended_by.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preemption_suspend_applied_during_a_grace_leaves_the_job_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        let resp = cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: id,
+            at: Utc::now(),
+            preempted_by: Some(7),
+            preempt_qos: Some("other".into()),
+            by: None,
+        });
+
+        assert!(!resp.suspend_applied);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_grace().is_some());
+        assert!(job.suspended_at.is_none());
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(job.preempt_mode, None);
+        assert_eq!(job.preempt_qos, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_suspend_applied_outside_a_grace_reports_it_applied() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "plain", "n1");
+
+        let resp = cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: id,
+            at: Utc::now(),
+            preempted_by: None,
+            preempt_qos: None,
+            by: None,
+        });
+
+        assert!(resp.suspend_applied);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Suspended);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_mode_preemption_refused_at_apply_is_not_a_preemption() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        let err = cm
+            .preempt_job_with_provenance(
+                id,
+                cm.get_job(id).unwrap().run_attempt,
+                PreemptMode::Suspend,
+                Some(7),
+                None,
+            )
+            .expect_err("a victim in its grace cannot be suspended");
+
+        assert!(err.to_string().contains("preemption grace period"), "{err}");
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_grace().is_some());
+        assert_eq!(job.preempted_by, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspend_reports_a_grace_that_lands_after_its_check() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        let actor = Actor {
+            user: "testuser".to_string(),
+            uid: None,
+        };
+
+        cm.check_suspendable(id, &actor.user, true)
+            .expect("no grace yet, so the early check passes");
+        signal_grace(&cm, id, PreemptMode::Requeue);
+        let err = cm
+            .propose_suspend(id, actor)
+            .expect_err("the suspend must not report success");
+
+        assert!(err.to_string().contains("preemption grace period"), "{err}");
+        assert_eq!(
+            crate::server::cluster_err_to_precondition_status(err).code(),
+            tonic::Code::FailedPrecondition
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_grace().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resuming_a_job_that_carries_a_grace_drops_the_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        cm.suspend_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Suspended);
+        // Defensive: unreachable now that JobSuspend refuses a job in its grace, but a
+        // resume must still never carry a live grace back into a running job.
+        let pending = preempt_pending_for(cm.get_job(id).unwrap().run_attempt, 90);
+        cm.jobs.write().get_mut(&id).unwrap().preempt_pending = Some(pending);
+        assert!(cm.get_job(id).unwrap().preempt_grace().is_some());
+
+        cm.resume_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Running);
+
+        let job = cm.get_job(id).unwrap();
+        assert!(job.preempt_pending.is_none());
+        assert!(job.preempt_grace().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_cancel_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.cancel_job(id, "testuser").unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_limit_expiry_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.expire_time_limit(id, 0, Utc::now()).unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_requeue_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id: id,
+            hold: false,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eviction_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobEvict {
+            job_id: id,
+            detail: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_down_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        lose_node(&cm, "n1");
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_that_already_reported_leaves_the_grace_victim_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some("lost".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.preempt_pending.is_some());
+        assert_eq!(cpus_in_use(&cm, "n2"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_still_running_ends_a_partially_exited_grace_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        lose_node(&cm, "n2");
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0, "freed once, not twice");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_running_jobs_whose_grace_deadline_has_passed_are_due() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let in_grace = run_job_on(&cm, "in-grace", "n1");
+        let _plain = run_job_on(&cm, "plain", "n1");
+        let pending = preempt_pending_for(cm.get_job(in_grace).unwrap().run_attempt, 90);
+        let deadline = pending.deadline;
+        signal_grace(&cm, in_grace, PreemptMode::Cancel);
+
+        let before = deadline - chrono::Duration::seconds(1);
+        assert!(cm.jobs_past_grace_deadline(before).is_empty());
+        let due: Vec<JobId> = cm
+            .jobs_past_grace_deadline(deadline)
+            .iter()
+            .map(|job| job.job_id)
+            .collect();
+        assert_eq!(due, [in_grace]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grace_recorded_for_an_earlier_run_is_not_due() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+        let deadline = cm.get_job(id).unwrap().preempt_pending.unwrap().deadline;
+        cm.jobs.write().get_mut(&id).unwrap().run_attempt += 1;
+
+        assert!(cm.jobs_past_grace_deadline(deadline).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_reported_during_a_grace_is_no_longer_busy() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        assert!(cm.node_has_running_jobs("n1"));
+
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(!cm.node_has_running_jobs("n1"), "n1 reported and was freed");
+        assert!(cm.node_has_running_jobs("n2"), "n2 is still running");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_in_a_grace_is_a_node_failure_not_a_preemption() {
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let id = run_two_node_job_in_grace(&cm, mode);
+
+            lose_node(&cm, "n2");
+
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.state, JobState::NodeFail, "{mode:?}");
+            assert_eq!(job.pending_reason, PendingReason::NodeDown, "{mode:?}");
+            assert_eq!(
+                job.node_failure.as_ref().map(|f| f.node.as_str()),
+                Some("n2"),
+                "{mode:?}"
+            );
+            assert_eq!(job.preempted_by, None, "{mode:?}");
+            assert_eq!(job.preempt_mode, None, "{mode:?}");
+            assert_eq!(job.preempt_qos, None, "{mode:?}");
+            assert_eq!(job.preempt_requeue_count, 0, "{mode:?}");
+            assert!(job.preempt_pending.is_none(), "{mode:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_in_a_grace_requeues_only_a_job_submitted_with_requeue() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = basic_spec("requeueable");
+        spec.requeue = true;
+        let id = submit_and_wait(&cm, spec);
+        cm.start_job(
+            id,
+            vec!["n1".into(), "n2".into()],
+            scalar_alloc(2, 2000),
+            per_node_for(&["n1", "n2"], scalar_alloc(1, 1000)),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        signal_grace(&cm, id, PreemptMode::Requeue);
+
+        lose_node(&cm, "n2");
+
+        settle(&cm, id, JobState::Pending);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.requeue_count, 1, "a node failure charges the budget");
+        assert_eq!(job.preempt_requeue_count, 0);
+        assert_eq!(job.preempted_by, None);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_in_a_grace_without_requeue_leaves_the_victim_failed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
+        assert!(!cm.get_job(id).unwrap().spec.requeue);
+
+        lose_node(&cm, "n2");
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(job.requeue_count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn losing_a_node_in_a_grace_earmarks_the_freed_nodes_for_the_preemptor() {
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let id = run_job_in_grace_across(&cm, &["n1", "n2", "n3"], mode);
+            report_node(&cm, id, "n1", grace_exit_at());
+
+            lose_node(&cm, "n2");
+
+            let earmarks = cm.preempt_freed_nodes_raw();
+            assert_eq!(
+                earmarks.get("n3").map(|(owner, _)| *owner),
+                Some(99),
+                "{mode:?}"
+            );
+            for node in ["n1", "n2", "n3"] {
+                assert_eq!(cpus_in_use(&cm, node), 0, "{mode:?}: {node} freed once");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicting_a_job_in_a_grace_earmarks_its_nodes_without_a_preemption_outcome() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+
+        let resp = cm.apply_operation(&WalOperation::JobEvict {
+            job_id: id,
+            detail: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(job.preempted_by, None);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        let earmarks = cm.preempt_freed_nodes_raw();
+        for node in ["n1", "n2"] {
+            assert_eq!(earmarks.get(node).map(|(owner, _)| *owner), Some(99));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_preempt_cancel_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobPreemptCancel {
+            job_id: id,
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_preempt_requeue_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: id,
+            begin_time: Utc::now(),
+            preempted_by: Some(99),
+            preempt_qos: None,
+            at: None,
+            run_attempt: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_complete_clears_preempt_pending() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_in_grace(&cm, "victim", "n1");
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: 1,
+            state: JobState::Failed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: false,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Requeue"));
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_complete_of_a_partially_exited_cancel_grace_victim_ends_cancelled() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: 1,
+            state: JobState::Failed,
+            unreported_nodes: vec!["n2".into()],
+            cancel: None,
+            controller_initiated: false,
+            at: None,
+        });
+
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(
+            cm.preempt_freed_nodes_raw()
+                .get("n2")
+                .map(|(owner, _)| *owner),
+            Some(99),
+            "the node that never reported is earmarked for the preemptor"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launch_failure_requeue_during_a_cancel_grace_repends_the_job_with_backoff() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+
+        cm.requeue_after_launch_failure(id, false).unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
+        assert_eq!(job.requeue_count, 1);
+        assert_eq!(
+            job.preempted_by, None,
+            "the run failed, it was not preempted"
+        );
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(
+            cm.preempt_freed_nodes_raw()
+                .get("n1")
+                .map(|(owner, _)| *owner),
+            Some(99),
+            "the preemptor still gets the node the failed run released"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_launch_failure_during_a_cancel_grace_holds_the_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+
+        cm.requeue_after_launch_failure(id, true).unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::Held);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holding_at_the_requeue_cap_during_a_cancel_grace_holds_the_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+
+        cm.hold_job_at_max_requeue(id, None).unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_srun_allocation_exiting_in_a_cancel_grace_ends_preempted() {
+        use crate::sched_stats::SchedStatsCollector;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-victim"));
+        start_srun_job_on(&cm, id, "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+
+        let returned = cm.finish_srun_job(id, 0, "testuser").unwrap();
+
+        assert!(matches!(returned, SrunCompletion::Finished(_)));
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(
+            cm.preempt_freed_nodes_raw()
+                .get("n1")
+                .map(|(owner, _)| *owner),
+            Some(99),
+            "the freed node is earmarked for the preemptor"
+        );
+        assert_eq!(stats.snapshot().jobs_preempted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_srun_allocation_exiting_in_a_requeue_grace_is_repended() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-victim"));
+        start_srun_job_on(&cm, id, "n1");
+        signal_grace(&cm, id, PreemptMode::Requeue);
+
+        cm.finish_srun_job(id, 1, "testuser").unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Requeue"));
+        assert!(job.preempt_pending.is_none());
+        assert!(job.spec.begin_time.is_some(), "the hold applies");
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standalone_pty_shell_exiting_in_a_cancel_grace_ends_preempted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-victim"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+        signal_grace(&cm, id, PreemptMode::Cancel);
+
+        let outcome = finish_pty(&cm, session_exit(id, 0, "n1"));
+
+        assert!(matches!(outcome, PtyExitOutcome::JobFinished(_)));
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+        assert!(job.preempt_pending.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_mode_exit_during_grace_ends_cancelled_and_preempted() {
+        use crate::sched_stats::SchedStatsCollector;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+        let at = grace_exit_at();
+
+        let resp = report_node(&cm, id, "n1", at);
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_qos.as_deref(), Some("high"));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+        assert_eq!(job.cancel_signaled_at, Some(at));
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(
+            cm.preempt_freed_nodes_raw()
+                .get("n1")
+                .map(|(owner, _)| *owner),
+            Some(99),
+            "the freed node is earmarked for the preemptor"
+        );
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.jobs_preempted, 1);
+        assert_eq!(snapshot.jobs_finalized, 1);
+
+        let replay = report_node(&cm, id, "n1", at);
+        assert!(replay.jobs_finalized.is_empty());
+        assert_eq!(stats.snapshot().jobs_preempted, 1, "counted once");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_mode_exit_during_grace_repends_with_hold() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Requeue);
+        let at = grace_exit_at();
+
+        let resp = report_node(&cm, id, "n1", at);
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(
+            job.spec.begin_time,
+            Some(at + chrono::Duration::seconds(30)),
+            "the hold comes from the logged grace, not from this replica's config"
+        );
+        assert_eq!(job.pending_reason, PendingReason::Preempted);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_qos.as_deref(), Some("high"));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Requeue"));
+        assert_eq!(job.preempt_requeue_count, 1);
+        assert_eq!(job.requeue_count, 0);
+        assert!(job.preempt_pending.is_none());
+        assert!(job.allocated_nodes.is_empty());
+        assert!(job.node_completions.is_empty());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(
+            cm.preempt_freed_nodes_raw()
+                .get("n1")
+                .map(|(owner, _)| *owner),
+            Some(99),
+            "the freed node is earmarked for the preemptor"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn requeue_hold_after_a_grace_exit_honors_a_later_user_begin_time() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Requeue);
+        let at = grace_exit_at();
+        let user_begin = at + chrono::Duration::seconds(3600);
+        cm.jobs.write().get_mut(&id).unwrap().spec.begin_time = Some(user_begin);
+
+        report_node(&cm, id, "n1", at);
+
+        assert_eq!(cm.get_job(id).unwrap().spec.begin_time, Some(user_begin));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_during_grace_is_counted_once_when_requeued() {
+        use crate::sched_stats::SchedStatsCollector;
+
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Requeue);
+
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        assert_eq!(stats.snapshot().jobs_preempted, 1);
+    }
+
+    fn cpus_in_use(cm: &ClusterManager, node: &str) -> u32 {
+        cm.get_node(node).unwrap().alloc_resources.cpus
+    }
+
+    /// Place a one-cpu job on `node`, as the preemptor does once a victim frees it.
+    fn take_over_node(cm: &ClusterManager, node: &str) -> JobId {
+        let id = submit_and_wait(cm, basic_spec("takeover"));
+        cm.start_job(
+            id,
+            vec![node.into()],
+            scalar_alloc(1, 1000),
+            per_node_for(&[node], scalar_alloc(1, 1000)),
+        )
+        .unwrap();
+        settle(cm, id, JobState::Running);
+        id
+    }
+
+    fn earmark_owner(cm: &ClusterManager, node: &str) -> Option<JobId> {
+        cm.preempt_freed_nodes_raw()
+            .get(node)
+            .map(|(owner, _)| *owner)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_exit_in_grace_keeps_the_job_running() {
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let id = run_two_node_job_in_grace(&cm, mode);
+
+            let resp = report_node(&cm, id, "n1", grace_exit_at());
+
+            assert!(resp.jobs_finalized.is_empty(), "{mode:?}");
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.state, JobState::Running, "{mode:?}");
+            assert!(job.preempt_pending.is_some(), "{mode:?}");
+            assert_eq!(job.end_time, None, "{mode:?}");
+            assert_eq!(job.cancel_signaled_at, None, "{mode:?}");
+            assert_eq!(job.preempted_by, None, "not preempted until the deadline");
+            assert!(job.node_completions.contains_key("n1"));
+            assert_eq!(cpus_in_use(&cm, "n1"), 0, "the reported node is freed");
+            assert_eq!(cpus_in_use(&cm, "n2"), 1, "the other node is still held");
+            assert_eq!(earmark_owner(&cm, "n1"), Some(99), "{mode:?}");
+            assert_eq!(earmark_owner(&cm, "n2"), None, "{mode:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_partial_exit_in_grace_frees_nothing_twice() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+        take_over_node(&cm, "n1");
+
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "only the job that took n1 over");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_exit_in_grace_is_reported_as_in_grace() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+
+        let first = cm.node_complete(id, "n1", 0, 0, attempt).unwrap();
+        let last = cm.node_complete(id, "n2", 0, 0, attempt).unwrap();
+
+        assert_eq!(first, NodeCompleteResult::InGrace);
+        assert!(matches!(last, NodeCompleteResult::AllDone { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_partial_exit_without_a_grace_is_reported_as_completing() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        cm.jobs.write().get_mut(&id).unwrap().preempt_pending = None;
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+
+        let first = cm.node_complete(id, "n1", 0, 0, attempt).unwrap();
+
+        assert_eq!(first, NodeCompleteResult::Completing);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Completing);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_deadline_preempts_only_the_unreported_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+        take_over_node(&cm, "n1");
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            job_id: id,
+            preempted_by: Some(99),
+            preempt_qos: Some("high".into()),
+            at: Some(grace_exit_at() + chrono::Duration::seconds(10)),
+            run_attempt: None,
+        });
+
+        assert!(resp.jobs_finalized.is_empty(), "waits for n2 to report");
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(job.held_nodes(), ["n2".to_string()]);
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "n1 is not subtracted again");
+        assert_eq!(cpus_in_use(&cm, "n2"), 1);
+
+        let resp = report_node(
+            &cm,
+            id,
+            "n2",
+            grace_exit_at() + chrono::Duration::seconds(14),
+        );
+
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "still only the job that took n1");
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+        assert_eq!(earmark_owner(&cm, "n1"), Some(99));
+        assert_eq!(earmark_owner(&cm, "n2"), Some(99));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_requeue_after_a_partial_exit_in_grace_frees_nothing_twice() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+        let bystander = take_over_node(&cm, "n1");
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            job_id: id,
+            hold: false,
+            begin_time: None,
+            by: None,
+            at: None,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "the bystander is still charged");
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: bystander,
+            exit_code: 0,
+            state: JobState::Completed,
+            unreported_nodes: Vec::new(),
+            cancel: None,
+            controller_initiated: false,
+            at: None,
+        });
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_deadline_requeues_a_partially_exited_requeue_victim() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
+        report_node(&cm, id, "n1", grace_exit_at());
+        take_over_node(&cm, "n1");
+        let begin_time = grace_exit_at() + chrono::Duration::seconds(40);
+
+        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            job_id: id,
+            begin_time,
+            preempted_by: Some(99),
+            preempt_qos: Some("high".into()),
+            at: None,
+            run_attempt: None,
+        });
+
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.spec.begin_time, Some(begin_time));
+        assert!(job.allocated_nodes.is_empty());
+        assert!(job.node_completions.is_empty());
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cpus_in_use(&cm, "n1"), 1, "n1 is not subtracted again");
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_nodes_exiting_in_grace_ends_preempted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+        let last = grace_exit_at() + chrono::Duration::seconds(4);
+
+        let resp = report_node(&cm, id, "n2", last);
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_qos.as_deref(), Some("high"));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+        assert_eq!(job.cancel_signaled_at, Some(last));
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cpus_in_use(&cm, "n1"), 0);
+        assert_eq!(cpus_in_use(&cm, "n2"), 0);
+        assert_eq!(earmark_owner(&cm, "n1"), Some(99));
+        assert_eq!(earmark_owner(&cm, "n2"), Some(99));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_report_of_a_multinode_requeue_victim_repends_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
+        report_node(&cm, id, "n1", grace_exit_at());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        let last = grace_exit_at() + chrono::Duration::seconds(4);
+
+        let resp = report_node(&cm, id, "n2", last);
+
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(
+            job.spec.begin_time,
+            Some(last + chrono::Duration::seconds(30))
+        );
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_finish_during_grace_requeues() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        cm.complete_job_with(
+            id,
+            1,
+            JobState::Failed,
+            JobEndFacts {
+                unreported_nodes: vec!["n2".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::Preempted);
+        assert_eq!(job.preempt_mode.as_deref(), Some("Requeue"));
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_requeue_count, 1);
+        assert!(job.preempt_pending.is_none());
+        assert!(job.allocated_nodes.is_empty());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_finish_during_grace_requeue_accounts_the_run_as_preempted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: 1,
+            state: JobState::Failed,
+            unreported_nodes: vec!["n2".into()],
+            cancel: None,
+            controller_initiated: false,
+            at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
+        });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
+        assert_eq!(
+            cm.get_job(id).unwrap().spec.begin_time,
+            Some(grace_exit_at() + chrono::Duration::seconds(330))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_finish_during_grace_cancels_as_preempted() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Cancel);
+        report_node(&cm, id, "n1", grace_exit_at());
+
+        cm.complete_job_with(
+            id,
+            1,
+            JobState::Failed,
+            JobEndFacts {
+                unreported_nodes: vec!["n2".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.preempted_by, Some(99));
+        assert_eq!(job.preempt_mode.as_deref(), Some("Cancel"));
+        assert_eq!(job.end_of_run_state(job.state), JobState::Preempted);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(
+            cm.preempt_freed_nodes_raw()
+                .get("n2")
+                .map(|(owner, _)| *owner),
+            Some(99),
+            "the node that never reported is earmarked too"
+        );
+    }
+
+    /// A one-node job in a reservation that ended minutes ago, warned of
+    /// preemption as `mode` and still RUNNING.
+    async fn reserved_grace_victim(
+        mode: PreemptMode,
+    ) -> (
+        TempDir,
+        Arc<ClusterManager>,
+        Arc<crate::sched_stats::SchedStatsCollector>,
+        JobId,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(crate::sched_stats::SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        register_node(&cm, "n1", 8, 16000);
+        let now = Utc::now();
+        cm.create_reservation(Reservation {
+            name: "r1".into(),
+            start_time: now - chrono::Duration::hours(1),
+            end_time: now - chrono::Duration::minutes(5),
+            nodes: vec!["n1".into()],
+            accounts: Vec::new(),
+            users: vec!["testuser".into()],
+            flags: Default::default(),
+            owner: String::new(),
+        })
+        .unwrap();
+        let mut spec = basic_spec("resv-victim");
+        spec.reservation = Some("r1".into());
+        let id = submit_and_wait(&cm, spec);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        signal_grace(&cm, id, mode);
+        (dir, cm, stats, id)
+    }
+
+    fn assert_ended_as_a_system_cancel(
+        cm: &ClusterManager,
+        stats: &crate::sched_stats::SchedStatsCollector,
+        id: JobId,
+    ) {
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(
+            job.end_reason(JobState::Cancelled).0,
+            EndReason::SystemCancel
+        );
+        assert_eq!(job.end_of_run_state(job.state), JobState::Cancelled);
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(job.preempt_mode, None);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(stats.snapshot().jobs_preempted, 0);
+        assert!(!cm.preempt_freed_nodes_raw().contains_key("n1"));
+        assert_eq!(cpus_in_use(cm, "n1"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_ending_cancels_a_job_in_a_cancel_grace() {
+        let (_dir, cm, stats, id) = reserved_grace_victim(PreemptMode::Cancel).await;
+
+        cm.enforce_reservation_end_times();
+
+        assert_ended_as_a_system_cancel(&cm, &stats, id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_ending_cancels_a_job_in_a_requeue_grace_instead_of_repending_it() {
+        let (_dir, cm, stats, id) = reserved_grace_victim(PreemptMode::Requeue).await;
+
+        cm.enforce_reservation_end_times();
+
+        assert_ended_as_a_system_cancel(&cm, &stats, id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_completion_in_a_grace_accounts_the_run_as_cancelled() {
+        let (_dir, cm, _stats, id) = reserved_grace_victim(PreemptMode::Cancel).await;
+
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: -1,
+            state: JobState::Cancelled,
+            unreported_nodes: Vec::new(),
+            cancel: Some(CancelProvenance::system()),
+            controller_initiated: false,
+            at: Some(grace_exit_at()),
+        });
+
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Cancelled);
+    }
+
+    async fn oom_victim(
+        mode: PreemptMode,
+    ) -> (
+        TempDir,
+        Arc<ClusterManager>,
+        Arc<crate::sched_stats::SchedStatsCollector>,
+        JobId,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(crate::sched_stats::SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, mode);
+        (dir, cm, stats, id)
+    }
+
+    fn assert_ended_out_of_memory(
+        cm: &ClusterManager,
+        stats: &crate::sched_stats::SchedStatsCollector,
+        id: JobId,
+        resp: &ClientResponse,
+        mode: PreemptMode,
+    ) {
+        assert_eq!(resp.jobs_finalized.len(), 1, "{mode:?}");
+        assert_eq!(
+            resp.jobs_finalized[0].state,
+            JobState::OutOfMemory,
+            "{mode:?}"
+        );
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::OutOfMemory, "{mode:?}");
+        assert_eq!(job.pending_reason, PendingReason::OutOfMemory, "{mode:?}");
+        assert_eq!(job.preempted_by, None, "{mode:?}");
+        assert_eq!(job.preempt_mode, None, "{mode:?}");
+        assert!(job.preempt_pending.is_none(), "{mode:?}");
+        assert_eq!(stats.snapshot().jobs_preempted, 0, "{mode:?}");
+        assert_eq!(cpus_in_use(cm, "n1"), 0, "{mode:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oom_kill_reported_in_a_grace_ends_out_of_memory() {
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let (_dir, cm, stats, id) = oom_victim(mode).await;
+
+            let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+                job_id: id,
+                node_name: "n1".into(),
+                exit_code: 0,
+                signal: 9 | spur_core::job::OOM_SIGNAL_FLAG,
+                at: Some(grace_exit_at()),
+                run_attempt: 0,
+            });
+            cm.run_all_finalized_side_effects(&resp);
+
+            assert_ended_out_of_memory(&cm, &stats, id, &resp, mode);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oom_completion_in_a_grace_ends_out_of_memory() {
+        for mode in [PreemptMode::Cancel, PreemptMode::Requeue] {
+            let (_dir, cm, stats, id) = oom_victim(mode).await;
+
+            let resp = cm.apply_operation(&WalOperation::JobComplete {
+                job_id: id,
+                exit_code: 137,
+                state: JobState::OutOfMemory,
+                unreported_nodes: Vec::new(),
+                cancel: None,
+                controller_initiated: false,
+                at: Some(grace_exit_at()),
+            });
+            cm.run_all_finalized_side_effects(&resp);
+
+            assert_ended_out_of_memory(&cm, &stats, id, &resp, mode);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_during_grace_is_not_a_karma_completion() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        let cancelled = run_job_on(&cm, "cancel-victim", "n1");
+        signal_grace(&cm, cancelled, PreemptMode::Cancel);
+        let requeued = run_job_on(&cm, "requeue-victim", "n2");
+        signal_grace(&cm, requeued, PreemptMode::Requeue);
+
+        report_node(&cm, cancelled, "n1", grace_exit_at());
+        report_node(&cm, requeued, "n2", grace_exit_at());
+
+        let snapshot = cm.karma_metrics();
+        let user = snapshot
+            .users
+            .iter()
+            .find(|(name, _)| name == "testuser")
+            .map(|(_, counters)| counters)
+            .unwrap();
+        assert_eq!(user.completed, 0);
+        assert_eq!(user.failed, 0);
+        assert_eq!(user.cancelled, 0);
+    }
+
+    /// A two-node victim in grace that has partly exited (n1 reported) and is
+    /// then cancelled by its owner, with n2 still to report.
+    async fn cancelled_while_a_grace_victim_drains(
+        mode: PreemptMode,
+    ) -> (
+        TempDir,
+        Arc<ClusterManager>,
+        Arc<crate::sched_stats::SchedStatsCollector>,
+        JobId,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let stats = Arc::new(crate::sched_stats::SchedStatsCollector::new("backfill"));
+        cm.set_sched_stats(stats.clone());
+        let id = run_two_node_job_in_grace(&cm, mode);
+        report_node(&cm, id, "n1", grace_exit_at());
+        cm.cancel_job_for(id, Canceller::user("testuser", None), false)
+            .unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(job.preempt_mode, None);
+        assert_eq!(job.preempt_qos, None);
+        assert!(job.cancelled_by.is_some());
+        (dir, cm, stats, id)
+    }
+
+    fn assert_ended_as_the_users_cancel(
+        cm: &ClusterManager,
+        stats: &crate::sched_stats::SchedStatsCollector,
+        id: JobId,
+        resp: &ClientResponse,
+    ) {
+        assert_eq!(resp.jobs_finalized.len(), 1);
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Cancelled);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Cancelled);
+        assert!(job.cancelled_by.is_some());
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(stats.snapshot().jobs_preempted, 0);
+        assert_eq!(cpus_in_use(cm, "n1"), 0);
+        assert_eq!(cpus_in_use(cm, "n2"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_cancel_after_a_partial_exit_in_grace_wins() {
+        let (_dir, cm, stats, id) =
+            cancelled_while_a_grace_victim_drains(PreemptMode::Cancel).await;
+
+        let resp = report_node(&cm, id, "n2", grace_exit_at());
+
+        assert_ended_as_the_users_cancel(&cm, &stats, id, &resp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_cancel_after_a_partial_exit_in_a_requeue_grace_wins() {
+        let (_dir, cm, stats, id) =
+            cancelled_while_a_grace_victim_drains(PreemptMode::Requeue).await;
+
+        let resp = report_node(&cm, id, "n2", grace_exit_at());
+
+        assert_ended_as_the_users_cancel(&cm, &stats, id, &resp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_force_finish_after_a_user_cancel_ends_a_cancel_grace_as_the_cancel() {
+        let (_dir, cm, stats, id) =
+            cancelled_while_a_grace_victim_drains(PreemptMode::Cancel).await;
+
+        let resp = force_finish_cancelled(&cm, id);
+
+        assert_ended_as_the_users_cancel(&cm, &stats, id, &resp);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_force_finish_after_a_user_cancel_ends_a_requeue_grace_as_the_cancel() {
+        let (_dir, cm, stats, id) =
+            cancelled_while_a_grace_victim_drains(PreemptMode::Requeue).await;
+
+        let resp = force_finish_cancelled(&cm, id);
+
+        assert_ended_as_the_users_cancel(&cm, &stats, id, &resp);
+    }
+
+    fn force_finish_cancelled(cm: &ClusterManager, id: JobId) -> ClientResponse {
+        let resp = cm.apply_operation(&WalOperation::JobComplete {
+            job_id: id,
+            exit_code: 1,
+            state: JobState::Cancelled,
+            unreported_nodes: vec!["n2".into()],
+            cancel: None,
+            controller_initiated: false,
+            at: Some(grace_exit_at() + chrono::Duration::seconds(300)),
+        });
+        cm.run_all_finalized_side_effects(&resp);
+        resp
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_cancel_during_the_grace_itself_still_ends_as_the_cancel() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = run_two_node_job_in_grace(&cm, PreemptMode::Requeue);
+
+        cm.cancel_job_for(id, Canceller::user("testuser", None), false)
+            .unwrap();
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Completing);
+        assert!(job.preempt_pending.is_none());
+        assert_eq!(job.preempted_by, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_job_without_a_grace_still_completes_normally() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "plain", "n1");
+
+        let resp = report_node(&cm, id, "n1", grace_exit_at());
+
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grace_for_an_earlier_run_does_not_preempt_the_current_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = run_job_on(&cm, "victim", "n1");
+        signal_grace(&cm, id, PreemptMode::Cancel);
+        cm.jobs.write().get_mut(&id).unwrap().run_attempt += 1;
+
+        let resp = report_node(&cm, id, "n1", grace_exit_at());
+
+        assert_eq!(resp.jobs_finalized[0].state, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().preempted_by, None);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_jobstart_onto_an_excluded_node_charges_nothing() {
         let dir = TempDir::new().unwrap();
@@ -28295,7 +32739,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_job_qos_rejects_unauthorized_association_qos() {
         // `scontrol update job qos=` must enforce the same per-association
-        // authorization as submission (SPUR-101).
+        // authorization as submission.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(Qos {
@@ -28364,7 +32808,7 @@ mod tests {
     async fn update_job_qos_rejects_bypass_via_unaffiliated_account() {
         // Pairing the QOS change with an account the user has no recorded
         // association for must not fall back to "nothing to check" — that
-        // was a live bypass of the authorization this PR adds.
+        // would bypass the per-association QOS authorization.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.qos_cache().insert(Qos {
@@ -29260,6 +33704,7 @@ mod tests {
             "1.0".into(),
             NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -30853,7 +35298,7 @@ mod tests {
     #[test]
     fn apply_default_qos_explicit_unauthorized_qos_is_rejected() {
         // An explicit QOS that exists but isn't the association's own default
-        // must be rejected, not silently accepted (SPUR-101).
+        // must be rejected, not silently accepted.
         let assoc = AssociationCache::new();
         assoc.insert_default_qos("testuser", "research", "highprio");
         let qos = qos_cache_with(&["highprio", "other-teams-qos"]);
@@ -30916,7 +35361,7 @@ mod tests {
     fn apply_default_qos_explicit_rejects_other_accounts_qos() {
         // A user in two accounts, each pinned to its own QOS, must not be
         // able to borrow one account's QOS while submitting under the
-        // other — the exact cross-account confusion reported in SPUR-101.
+        // other.
         let assoc = AssociationCache::new();
         assoc.insert_default_qos("testuser", "hyperloom", "hyperloom-qos");
         assoc.insert_default_qos("testuser", "primus", "primus-qos");
@@ -31473,6 +35918,167 @@ mod tests {
         ));
     }
 
+    fn spec_node_config(count: u32) -> spur_core::config::NodeConfig {
+        spur_core::config::NodeConfig {
+            names: "n1".into(),
+            selector: HashMap::new(),
+            cpus: 0,
+            memory_mb: 0,
+            reserved_memory_mb: 0,
+            gres: Vec::new(),
+            features: Vec::new(),
+            address: None,
+            weight: 1,
+            core_spec_count: Some(count),
+            cpu_spec_list: None,
+            daemons_off_spec: true,
+        }
+    }
+
+    fn node_with_topology(cpus: u32) -> Node {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        let records: Vec<CpuRecord> = (0..cpus)
+            .map(|cpu| CpuRecord {
+                cpu,
+                socket: 0,
+                core_id: cpu,
+                numa_node: None,
+            })
+            .collect();
+        let resources = ResourceSet {
+            cpus,
+            memory_mb: 8192,
+            topology: Some(CpuTopology::from_cpus(&records)),
+            ..Default::default()
+        };
+        let mut node = Node::new("n1".into(), resources.clone());
+        node.detected_resources = resources;
+        node.state = NodeState::Idle;
+        node
+    }
+
+    fn spec_cluster(dir: &TempDir, count: u32) -> ClusterManager {
+        let mut config = test_config();
+        config.nodes = vec![spec_node_config(count)];
+        ClusterManager::new(config, dir.path()).unwrap()
+    }
+
+    #[test]
+    fn layout_seq_advances_only_when_the_layout_changes() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut node = node_with_topology(4);
+
+        cm.recompute_core_layout(&mut node, Some(&spec_node_config(1)));
+        assert_eq!(node.layout_seq, 1);
+        cm.recompute_core_layout(&mut node, Some(&spec_node_config(1)));
+        assert_eq!(node.layout_seq, 1, "an unchanged layout keeps its sequence");
+        cm.recompute_core_layout(&mut node, Some(&spec_node_config(2)));
+        assert_eq!(node.layout_seq, 2);
+        cm.recompute_core_layout(&mut node, None);
+        assert!(node.core_layout.is_none());
+        assert_eq!(node.layout_seq, 3, "a clear is a change too");
+    }
+
+    #[test]
+    fn a_layout_that_stops_computing_is_kept_and_delivered_with_its_error() {
+        let dir = TempDir::new().unwrap();
+        let cm = spec_cluster(&dir, 1);
+        let mut node = node_with_topology(4);
+        cm.apply_node_config_policy(&mut node);
+        let good = node.core_layout.clone().expect("layout");
+        let seq = node.layout_seq;
+
+        node.detected_resources.topology = None;
+        cm.apply_node_config_policy(&mut node);
+        assert_eq!(node.core_layout.as_ref(), Some(&good));
+        assert_eq!(node.layout_seq, seq, "an error is not a content change");
+        assert!(!node.is_schedulable());
+
+        cm.nodes.write().insert("n1".into(), node);
+        let delivery = cm.node_layout_delivery("n1");
+        assert!(delivery.layout.is_some());
+        assert!(delivery.error.contains("topology"), "{}", delivery.error);
+    }
+
+    #[test]
+    fn apply_node_config_policy_sets_spec_cores_aside_but_skips_kubernetes_nodes() {
+        let dir = TempDir::new().unwrap();
+        let cm = spec_cluster(&dir, 1);
+
+        let mut native = node_with_topology(4);
+        cm.apply_node_config_policy(&mut native);
+        assert_eq!(native.total_resources.cpus, 3);
+        assert_eq!(native.cpu_tot(), 4);
+
+        let mut k8s = node_with_topology(4);
+        k8s.source = NodeSource::Kubernetes {
+            namespace: "spur".into(),
+        };
+        k8s.detected_resources.topology = None;
+        cm.apply_node_config_policy(&mut k8s);
+        assert!(k8s.core_layout.is_none());
+        assert!(k8s.layout_error.is_none());
+        assert_eq!(k8s.total_resources.cpus, 4);
+    }
+
+    #[test]
+    fn heartbeats_ask_for_reregistration_only_when_it_can_help() {
+        let dir = TempDir::new().unwrap();
+        let cm = spec_cluster(&dir, 1);
+        let mut node = node_with_topology(4);
+        cm.apply_node_config_policy(&mut node);
+        let expected = node.core_layout.as_ref().unwrap().fingerprint();
+        cm.nodes.write().insert("n1".into(), node);
+
+        assert!(!cm.record_layout_heartbeat("n1", expected, ""));
+        assert!(cm.record_layout_heartbeat("n1", 0, ""));
+        assert!(!cm.record_layout_heartbeat("n1", 0, ""), "rate-limited");
+
+        assert!(!cm.record_layout_heartbeat("n1", expected, "root write failed"));
+        let node = cm.get_node("n1").unwrap();
+        assert!(
+            cm.record_layout_heartbeat("n1", 12345, "root write failed"),
+            "a failing node holding a different layout still receives the current one"
+        );
+        assert!(!node.is_schedulable());
+        assert_eq!(
+            node.layout_drain_reason().as_deref(),
+            Some("core-layout: not enforced: root write failed")
+        );
+        assert!(!cm.record_layout_heartbeat("n1", expected, ""));
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_rejects_spec_changes_but_reloads_memory_only_ones() {
+        let dir = TempDir::new().unwrap();
+        let conf = |nodes: &str| format!("cluster_name = \"test\"\n{nodes}");
+        let spec = "[[nodes]]\nnames = \"n1\"\ncore_spec_count = 1\n";
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf(spec)).await;
+
+        std::fs::write(
+            &conf_path,
+            conf("[[nodes]]\nnames = \"n1\"\ncore_spec_count = 2\n"),
+        )
+        .unwrap();
+        let err = cm.reconfigure().unwrap_err().to_string();
+        assert!(err.contains("restarting all controllers"), "{err}");
+
+        let memory_only_dir = TempDir::new().unwrap();
+        let (cm, conf_path) = test_cluster_with_conf_file(
+            &memory_only_dir,
+            &conf("[[nodes]]\nnames = \"n1\"\nreserved_memory_mb = 1024\n"),
+        )
+        .await;
+        std::fs::write(
+            &conf_path,
+            conf("[[nodes]]\nnames = \"n1\"\nreserved_memory_mb = 2048\n"),
+        )
+        .unwrap();
+        cm.reconfigure().unwrap();
+    }
+
     #[test]
     fn node_config_matches_by_selector() {
         let nc = spur_core::config::NodeConfig {
@@ -31485,6 +36091,9 @@ mod tests {
             features: Vec::new(),
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         };
         let labels = HashMap::from([("gpu".into(), "mi300x".into())]);
         assert!(super::node_config_matches(&nc, "any-host", &labels));
@@ -31520,6 +36129,7 @@ mod tests {
                 priority_tier: 1,
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
+                grace_time: None,
             },
             spur_core::config::PartitionConfig {
                 name: "train".into(),
@@ -31539,6 +36149,7 @@ mod tests {
                 priority_tier: 1,
                 preempt_mode: String::new(),
                 preempt_exempt_time: None,
+                grace_time: None,
             },
         ];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
@@ -31599,6 +36210,7 @@ mod tests {
             priority_tier: 1,
             preempt_mode: String::new(),
             preempt_exempt_time: None,
+            grace_time: None,
         }];
         let cm = Arc::new(ClusterManager::new(cfg, dir.path()).unwrap());
         let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cm.clone())
@@ -31626,6 +36238,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("role".into(), "infer".into())]),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -31666,6 +36279,9 @@ mod tests {
             features: vec!["common".into()],
             address: None,
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         };
         assert!(super::node_config_matches(&nc, "any-host", &HashMap::new()));
         assert!(super::node_config_matches(
@@ -31695,6 +36311,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "train".into())]),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -31719,6 +36336,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "infer".into()), ("tier".into(), "1".into())]),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -31753,6 +36371,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -31768,6 +36387,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::new(),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -31790,6 +36410,9 @@ mod tests {
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -31807,6 +36430,7 @@ mod tests {
             String::new(),
             spur_core::node::NodeSource::NativeHost,
             HashMap::from([("pool".into(), "train".into())]),
+            Vec::new(),
             true,
         )
         .unwrap();
@@ -31838,6 +36462,9 @@ mod tests {
             features: Vec::new(),
             address: Some("10.0.0.99".into()),
             weight: 1,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = test_cluster_with_config(&dir, cfg).await;
 
@@ -31855,6 +36482,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
+            capabilities: Vec::new(),
         });
 
         assert_eq!(
@@ -31877,6 +36505,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -31895,6 +36526,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::new(),
             source: NodeSource::default(),
+            capabilities: Vec::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -31926,6 +36558,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -31943,6 +36578,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi300x".into())]),
             source: NodeSource::default(),
+            capabilities: Vec::new(),
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -31974,6 +36610,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -31991,6 +36630,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::from([("gpu".into(), "mi250".into())]),
             source: NodeSource::default(),
+            capabilities: Vec::new(),
         });
 
         let node = cm.get_node("cpu-node").unwrap();
@@ -32012,6 +36652,9 @@ mod tests {
             features: vec!["mi300x".into(), "rocm6".into()],
             address: None,
             weight: 10,
+            core_spec_count: None,
+            cpu_spec_list: None,
+            daemons_off_spec: true,
         }];
         let cm = ClusterManager::new(cfg, dir.path()).unwrap();
 
@@ -32469,6 +37112,7 @@ mod tests {
             version: String::new(),
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
+            capabilities: Vec::new(),
         });
         assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
 
@@ -32762,6 +37406,40 @@ mod tests {
         assert_eq!(nodes["n1"].state, NodeState::Drain);
     }
 
+    #[test]
+    fn evict_job_in_a_grace_earmarks_only_the_nodes_not_yet_reported() {
+        let mut jobs = HashMap::new();
+        let mut nodes = HashMap::new();
+        let mut job = make_running_job(1, &["n1", "n2", "n3"], 2);
+        job.preempt_pending = Some(preempt_pending_for(job.run_attempt, 90));
+        job.node_completions.insert(
+            "n1".into(),
+            spur_core::job::NodeCompletion { code: 0, signal: 0 },
+        );
+        jobs.insert(1, job);
+        for name in ["n1", "n2", "n3"] {
+            nodes.insert(name.into(), make_test_node(name, 4, 2));
+        }
+        nodes.get_mut("n1").unwrap().alloc_resources.cpus = 0;
+        let mut freed = Vec::new();
+
+        ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            &mut nodes,
+            Utc::now(),
+            PendingReason::NodeDown,
+            None,
+            &mut freed,
+        );
+
+        assert_eq!(freed, [(99, vec!["n2".to_string(), "n3".to_string()])]);
+        let job = &jobs[&1];
+        assert_eq!(job.state, JobState::NodeFail);
+        assert_eq!(job.preempted_by, None);
+        assert!(job.preempt_pending.is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_srun_job_completes_running_allocation() {
         let dir = TempDir::new().unwrap();
@@ -32771,7 +37449,10 @@ mod tests {
         start_srun_job_on(&cm, id, "n1");
 
         let returned = cm.finish_srun_job(id, 0, "testuser").unwrap();
-        assert_eq!(returned.job_id, id);
+        assert!(
+            matches!(returned, SrunCompletion::Finished(ref job) if job.job_id == id),
+            "a live allocation is finished by this call"
+        );
         settle(&cm, id, JobState::Completed);
         assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
     }
@@ -32791,7 +37472,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn finish_srun_job_rejects_terminal_job() {
+    async fn finish_srun_job_is_idempotent_for_a_terminal_job() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
@@ -32800,12 +37481,11 @@ mod tests {
         cm.finish_srun_job(id, 0, "testuser").unwrap();
         settle(&cm, id, JobState::Completed);
 
+        // The owner completing an already-terminal job is a no-op, not an error,
+        // so a client racing the server-side PTY completion stays quiet.
         assert!(matches!(
             cm.finish_srun_job(id, 0, "testuser"),
-            Err(SrunCompleteError::AlreadyTerminal {
-                job_id,
-                state: JobState::Completed,
-            }) if job_id == id
+            Ok(SrunCompletion::AlreadyComplete)
         ));
     }
 
@@ -32832,7 +37512,10 @@ mod tests {
         start_srun_job_on(&cm, id, "n1");
 
         let returned = cm.finish_srun_job_for(id, 0, "ops", true).unwrap();
-        assert_eq!(returned.job_id, id);
+        assert!(
+            matches!(returned, SrunCompletion::Finished(ref job) if job.job_id == id),
+            "the operator flag finishes a non-owner's live allocation"
+        );
         settle(&cm, id, JobState::Completed);
     }
 
@@ -32858,6 +37541,593 @@ mod tests {
         assert!(matches!(
             cm.finish_srun_job(999, 0, "testuser"),
             Err(SrunCompleteError::NotFound(999))
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // Server-side standalone srun --pty completion
+    // ---------------------------------------------------------------
+
+    fn srun_pty_spec(name: &str) -> JobSpec {
+        let mut spec = srun_spec(name);
+        spec.pty = true;
+        spec
+    }
+
+    fn start_pty_job(cm: &ClusterManager, id: JobId, nodes: &[&str], run_attempt: u32) {
+        cm.apply_operation(&WalOperation::job_state_change(
+            id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: id,
+            nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
+            resources: scalar_alloc(nodes.len() as u32, 1000 * nodes.len() as u64),
+            per_node_alloc: per_node_for(nodes, scalar_alloc(1, 1000)),
+            srun_step_dispatch: true,
+            run_attempt,
+            idle_fill: false,
+            at: None,
+        });
+    }
+
+    fn add_step(
+        cm: &ClusterManager,
+        id: JobId,
+        step_id: u32,
+        nodes: &[&str],
+        pty: bool,
+        job_shell: bool,
+    ) {
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(spur_core::step::JobStep {
+                job_id: id,
+                step_id,
+                name: "pty".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+                pty,
+                job_shell,
+            }),
+        });
+    }
+
+    /// The standalone `srun --pty`'s own shell, marked as it creates its step.
+    fn add_shell_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, true, true);
+    }
+
+    /// An extra `srun --jobid ... --pty` session.
+    fn add_session_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, true, false);
+    }
+
+    /// A buffered `srun --jobid ... cmd` step, or one logged before either flag existed.
+    fn add_plain_step(cm: &ClusterManager, id: JobId, step_id: u32, nodes: &[&str]) {
+        add_step(cm, id, step_id, nodes, false, false);
+    }
+
+    /// `node`'s report that step `step_id`'s session exited cleanly in run
+    /// attempt 1; a test overrides whatever it exercises.
+    fn session_exit(id: JobId, step_id: u32, node: &str) -> PtySessionExit<'_> {
+        PtySessionExit {
+            job_id: id,
+            run_attempt: 1,
+            step_id,
+            node,
+            exit_code: 0,
+            signal: 0,
+        }
+    }
+
+    fn finish_pty(cm: &ClusterManager, exit: PtySessionExit<'_>) -> PtyExitOutcome {
+        cm.finish_standalone_pty(exit)
+            .expect("the report's writes commit")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_completes_the_job_on_a_clean_shell_exit() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-clean"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        let outcome = finish_pty(&cm, session_exit(id, 0, "n1"));
+        assert!(
+            matches!(outcome, PtyExitOutcome::JobFinished(ref job) if job.job_id == id),
+            "a standalone PTY's shell exit finishes the job"
+        );
+        settle(&cm, id, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_encodes_a_signal_death_as_128_plus_signal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-signal"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        // A signal death reports exit_code 0 with the signal set; it must not read
+        // as COMPLETED 0.
+        let exit = PtySessionExit {
+            signal: 9,
+            ..session_exit(id, 0, "n1")
+        };
+        assert!(matches!(
+            finish_pty(&cm, exit),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Failed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(128 + 9));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_reports_an_oom_kill_as_out_of_memory() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        // The shell itself OOM-killed, then a shell that exits cleanly after a
+        // child was: the sentinel bit must never reach the recorded exit code.
+        let oom = spur_core::job::OOM_SIGNAL_FLAG;
+        for (signal, exit) in [(9 | oom, 128 + 9), (oom, 0)] {
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-oom"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_shell_step(&cm, id, 0, &["n1"]);
+
+            let report = PtySessionExit {
+                signal,
+                ..session_exit(id, 0, "n1")
+            };
+            assert!(matches!(
+                finish_pty(&cm, report),
+                PtyExitOutcome::JobFinished(_)
+            ));
+            settle(&cm, id, JobState::OutOfMemory);
+            let job = cm.get_job(id).unwrap();
+            assert_eq!(job.exit_code, Some(exit));
+            assert_eq!(job.pending_reason, PendingReason::OutOfMemory);
+            assert_eq!(cm.get_step(id, 0).unwrap().exit_code, Some(exit));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_never_promotes_a_later_session_over_a_legacy_shell() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-legacy");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // The shell's step was logged before either flag existed, so it reads
+        // back unmarked; step 1 is a later `--jobid ... -w n2 --pty` session.
+        add_plain_step(&cm, id, 0, &["n1", "n2"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+
+        assert!(
+            matches!(
+                finish_pty(&cm, session_exit(id, 1, "n2")),
+                PtyExitOutcome::StepClosed
+            ),
+            "a later session must not stand in for the job's own shell"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(cm.get_step(id, 1).unwrap().state.is_terminal());
+
+        // The legacy shell itself is left to its client.
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_never_lets_a_session_holding_the_lowest_step_end_the_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-session-first");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // A `--jobid ... -w n2 --pty` attached while the job pended retries faster
+        // than srun polls for RUNNING, so it takes step 0 before the shell does.
+        add_session_step(&cm, id, 0, &["n2"]);
+        add_shell_step(&cm, id, 1, &["n1"]);
+
+        assert!(
+            matches!(
+                finish_pty(&cm, session_exit(id, 0, "n2")),
+                PtyExitOutcome::StepClosed
+            ),
+            "the extra session's exit must not end the job and kill the shell"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(!cm.get_step(id, 1).unwrap().state.is_terminal());
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 1, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_the_job_from_a_shell_behind_another_step() {
+        // Step 0 is a buffered `srun --jobid ... cmd` that ran before the shell's
+        // step existed, or the shell's own first CreateJobStep whose response was
+        // lost, so srun retried and its session runs as step 1.
+        type AddStep = fn(&ClusterManager, JobId, u32, &[&str]);
+        let step_zero: [(&str, AddStep); 2] = [
+            ("a buffered step", add_plain_step),
+            ("an orphaned shell step", add_shell_step),
+        ];
+        for (what, add_first) in step_zero {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 4, 8000);
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-shell-second"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_first(&cm, id, 0, &["n1"]);
+            add_shell_step(&cm, id, 1, &["n1"]);
+
+            let exit = PtySessionExit {
+                exit_code: 4,
+                ..session_exit(id, 1, "n1")
+            };
+            assert!(
+                matches!(finish_pty(&cm, exit), PtyExitOutcome::JobFinished(_)),
+                "the shell must end the job even with {what} at step 0"
+            );
+            settle(&cm, id, JobState::Failed);
+            assert_eq!(cm.get_job(id).unwrap().exit_code, Some(4));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_the_job_despite_a_stale_session_on_its_node() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-stale-session"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        // Step 1 is an abandoned `--jobid ... --pty` attempt the agent refused as
+        // already active; its record stays live on the shell's own node.
+        add_session_step(&cm, id, 1, &["n1"]);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_feeds_derived_exit_code() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-derived"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        // The node's report usually beats the client's CompleteJobStep, which then
+        // finds the step closed; the step's exit must still reach the job.
+        let exit = PtySessionExit {
+            exit_code: 7,
+            ..session_exit(id, 0, "n1")
+        };
+        assert!(matches!(
+            finish_pty(&cm, exit),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Failed);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.exit_code, Some(7));
+        assert_eq!(job.derived_exit_code, 7);
+        let step = cm.get_step(id, 0).unwrap();
+        assert_eq!(step.exit_code, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finalizes_a_reaper_sigterm_as_timeout() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-reaped"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        // The InactiveLimit reaper records the run as timed out before its
+        // SIGTERM; a shell that dies on it must not read as FAILED 143.
+        cm.signal_time_limit(id, Utc::now()).unwrap();
+        let outcome = finish_pty(
+            &cm,
+            PtySessionExit {
+                signal: 15,
+                ..session_exit(id, 0, "n1")
+            },
+        );
+        assert!(matches!(outcome, PtyExitOutcome::JobFinished(_)));
+        settle(&cm, id, JobState::Timeout);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(128 + 15));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_salloc_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let mut spec = srun_pty_spec("salloc-like");
+        spec.interactive = true;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_non_pty_srun_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-nonpty"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_stale_run_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-stale"));
+        start_pty_job(&cm, id, &["n1"], 2);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        // A report for a superseded attempt (and the unset 0) is dropped.
+        for run_attempt in [1, 0] {
+            let exit = PtySessionExit {
+                run_attempt,
+                ..session_exit(id, 0, "n1")
+            };
+            assert!(matches!(finish_pty(&cm, exit), PtyExitOutcome::Ignored));
+        }
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_node_not_in_the_allocation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-wrongnode"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n2")),
+            PtyExitOutcome::Ignored
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_closes_only_an_overlapping_step() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-overlap");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // Step 0 is the standalone shell (primary), recorded with both nodes as
+        // `-N2 -w n1,n2` leaves it though its session runs on n1 only; step 1 is
+        // an overlapping `--jobid ... -w n2 --pty`.
+        add_shell_step(&cm, id, 0, &["n1", "n2"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+
+        let overlap = PtySessionExit {
+            exit_code: 2,
+            ..session_exit(id, 1, "n2")
+        };
+        assert!(
+            matches!(finish_pty(&cm, overlap), PtyExitOutcome::StepClosed),
+            "an overlapping PTY step closes without ending the job"
+        );
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        assert!(cm.get_step(id, 1).unwrap().state.is_terminal());
+        assert!(!cm.get_step(id, 0).unwrap().state.is_terminal());
+
+        // A replay of n2's report must not fall through to the primary step.
+        assert!(matches!(finish_pty(&cm, overlap), PtyExitOutcome::Ignored));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+
+        // The primary shell's own exit, on its session node, ends the job.
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_applies_a_late_duplicate_only_to_its_own_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-late-duplicate");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        // The shell runs on n1; two `--jobid ... -w n2 --pty` sessions then run
+        // one after the other on n2, sharing the job's run attempt.
+        add_shell_step(&cm, id, 0, &["n1"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+        let first = PtySessionExit {
+            exit_code: 3,
+            ..session_exit(id, 1, "n2")
+        };
+        assert!(matches!(finish_pty(&cm, first), PtyExitOutcome::StepClosed));
+        add_session_step(&cm, id, 2, &["n2"]);
+
+        assert!(
+            matches!(finish_pty(&cm, first), PtyExitOutcome::Ignored),
+            "a late duplicate of the first session's report must not close the second"
+        );
+        let second = cm.get_step(id, 2).unwrap();
+        assert!(!second.state.is_terminal());
+        assert_eq!(second.exit_code, None);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 2, "n2")),
+            PtyExitOutcome::StepClosed
+        ));
+        assert_eq!(cm.get_step(id, 2).unwrap().exit_code, Some(0));
+        assert_eq!(cm.get_step(id, 1).unwrap().exit_code, Some(3));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_ignores_a_step_that_is_not_the_nodes_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
+        let mut spec = srun_pty_spec("pty-misaddressed");
+        spec.num_nodes = 2;
+        let id = submit_and_wait(&cm, spec);
+        start_pty_job(&cm, id, &["n1", "n2"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+        add_session_step(&cm, id, 1, &["n2"]);
+        add_plain_step(&cm, id, 2, &["n1"]);
+
+        for (step_id, why) in [
+            (1, "another node's session"),
+            (2, "a step that is no PTY session"),
+            (9, "a step the job never created"),
+        ] {
+            assert!(
+                matches!(
+                    finish_pty(&cm, session_exit(id, step_id, "n1")),
+                    PtyExitOutcome::Ignored
+                ),
+                "n1 must not close {why}"
+            );
+        }
+        assert!(!cm.get_step(id, 1).unwrap().state.is_terminal());
+        assert!(!cm.get_step(id, 2).unwrap().state.is_terminal());
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_finishes_a_job_whose_shell_step_already_closed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-step-closed"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+        // The shell's step closed but the job did not: the job's own write failed
+        // after the step's, or the client closed the step and was then lost.
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: id,
+            step_id: 0,
+            exit_code: 3,
+        });
+
+        let exit = PtySessionExit {
+            exit_code: 3,
+            ..session_exit(id, 0, "n1")
+        };
+        assert!(
+            matches!(finish_pty(&cm, exit), PtyExitOutcome::JobFinished(_)),
+            "the node's replay must still finish the job"
+        );
+        settle(&cm, id, JobState::Failed);
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.exit_code, Some(3));
+        assert_eq!(job.derived_exit_code, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_returns_a_failed_write_as_an_error() {
+        // A live shell step fails on its own write; one that already closed
+        // fails on the job's, as on a leadership loss between the two.
+        for step_closed in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node(&cm, "n1", 4, 8000);
+            let id = submit_and_wait(&cm, srun_pty_spec("pty-write-fails"));
+            start_pty_job(&cm, id, &["n1"], 1);
+            add_shell_step(&cm, id, 0, &["n1"]);
+            if step_closed {
+                cm.apply_operation(&WalOperation::JobStepComplete {
+                    job_id: id,
+                    step_id: 0,
+                    exit_code: 0,
+                });
+            }
+            let raft = cm.raft.read().clone().expect("raft is set");
+            raft.shutdown().await.expect("stop raft");
+
+            assert!(
+                cm.finish_standalone_pty(session_exit(id, 0, "n1")).is_err(),
+                "a failed write must not read as a handled report, or the node drops it"
+            );
+            assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_standalone_pty_is_idempotent_for_a_settled_step() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_pty_spec("pty-dup"));
+        start_pty_job(&cm, id, &["n1"], 1);
+        add_shell_step(&cm, id, 0, &["n1"]);
+
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::JobFinished(_)
+        ));
+        settle(&cm, id, JobState::Completed);
+        // A replayed report for the now-terminal job is a no-op.
+        assert!(matches!(
+            finish_pty(&cm, session_exit(id, 0, "n1")),
+            PtyExitOutcome::Ignored
         ));
     }
 
@@ -32915,6 +38185,7 @@ mod tests {
             preempt_mode: None,
             is_default: None,
             preempt_exempt_time: None,
+            grace_time: None,
         });
 
         let gpu = cm
@@ -33038,6 +38309,7 @@ mod tests {
             preempt_mode: None,
             is_default: None,
             preempt_exempt_time: None,
+            grace_time: None,
         });
 
         assert_eq!(
@@ -33083,6 +38355,7 @@ mod tests {
             preempt_mode: None,
             is_default: Some(true),
             preempt_exempt_time: None,
+            grace_time: None,
         });
 
         let parts = cm.get_partitions();
@@ -33109,6 +38382,38 @@ mod tests {
             matches!(err, PartitionError::AlreadyExists(_)),
             "expected AlreadyExists, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partition_grace_time_round_trips_through_update_and_clear() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.create_partition(spur_core::partition::Partition {
+            grace_time: Some(600),
+            ..gpu_partition()
+        })
+        .unwrap();
+        let grace = |cm: &ClusterManager| {
+            cm.get_partitions()
+                .into_iter()
+                .find(|p| p.name == "gpu")
+                .unwrap()
+                .grace_time
+        };
+        assert_eq!(grace(&cm), Some(600));
+
+        let update = |grace_time: Option<Option<u32>>| {
+            cm.update_partition(
+                "gpu", None, None, None, None, None, None, None, false, None, None, None, None,
+                None, None, None, None, None, grace_time,
+            )
+        };
+        update(None).unwrap();
+        assert_eq!(grace(&cm), Some(600), "no grace_time means no change");
+        update(Some(Some(0))).unwrap();
+        assert_eq!(grace(&cm), Some(0), "an explicit zero is kept, not cleared");
+        update(Some(None)).unwrap();
+        assert_eq!(grace(&cm), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -33623,6 +38928,21 @@ mod idle_fill_aggregate_tests {
             Some(1),
             "only the unstamped task counts toward array_max_concurrent"
         );
+    }
+
+    #[test]
+    fn array_throttle_counts_a_task_stopped_by_its_time_limit_but_not_a_cancelled_one() {
+        let mut stopping = running_in_qos(1, "alice", "team", &["n1"], false);
+        stopping.spec.array_job_id = Some(100);
+        stopping.state = JobState::Completing;
+        stopping.time_limit_signaled_at = Some(Utc::now());
+        let mut cancelled = running_in_qos(2, "alice", "team", &["n2"], false);
+        cancelled.spec.array_job_id = Some(100);
+        cancelled.state = JobState::Completing;
+        cancelled.cancel_signaled_at = Some(Utc::now());
+        let jobs = HashMap::from([(1, stopping), (2, cancelled)]);
+
+        assert_eq!(running_array_counts(&jobs).get(&100).copied(), Some(1));
     }
 
     #[test]

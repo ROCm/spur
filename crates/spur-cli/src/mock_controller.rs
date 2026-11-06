@@ -8,13 +8,13 @@
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every
-//! other RPC reports `unimplemented` so an unexpected call fails loudly instead
-//! of silently returning a default.
+//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`,
+//! `JobKeepalive`, `ValidateBlockFile`); every other RPC reports `unimplemented`
+//! so an unexpected call fails loudly instead of silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -39,10 +39,13 @@ pub(crate) struct StepCapture {
     create_step_num_tasks: Arc<AtomicU32>,
     create_step_num_nodes: Arc<AtomicU32>,
     create_step_nodelist: Arc<Mutex<String>>,
+    create_step_job_shell: Arc<AtomicBool>,
     create_step_error: Arc<Mutex<Option<tonic::Code>>>,
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
+    run_step_response: Arc<Mutex<Option<proto::RunStepResponse>>>,
+    get_node_response: Arc<Mutex<Option<proto::NodeInfo>>>,
     get_node_names: Arc<Mutex<Vec<String>>>,
     get_node_requests: Arc<Mutex<Vec<String>>>,
     update_node_names: Arc<Mutex<Vec<String>>>,
@@ -58,11 +61,31 @@ pub(crate) struct StepCapture {
     /// `node_addr` handed back from `CreateJobStep`, so a test can point an
     /// interactive step at a mock agent instead of an empty address.
     create_step_node_addr: Arc<Mutex<String>>,
+    /// Peer of every `JobKeepalive`, so a test can tell a retry on the same
+    /// connection from one on a rebuilt client.
+    keepalive_peers: Arc<Mutex<Vec<Option<SocketAddr>>>>,
+    /// `JobKeepalive` calls still to reject as unauthenticated.
+    keepalive_failures: Arc<AtomicU32>,
+    block_validation_content: Arc<Mutex<Vec<String>>>,
 }
 
 impl StepCapture {
+    pub(crate) fn block_validation_content(&self) -> Vec<String> {
+        self.block_validation_content.lock().unwrap().clone()
+    }
+
     pub(crate) fn get_job_calls(&self) -> u32 {
         self.get_job_calls.load(Ordering::SeqCst)
+    }
+
+    /// Reject the next `count` keepalives, as a controller that no longer
+    /// accepts the client's credential would.
+    pub(crate) fn fail_next_keepalives(&self, count: u32) {
+        self.keepalive_failures.store(count, Ordering::SeqCst);
+    }
+
+    pub(crate) fn keepalive_peers(&self) -> Vec<Option<SocketAddr>> {
+        self.keepalive_peers.lock().unwrap().clone()
     }
 
     pub(crate) fn set_get_job_user(&self, user: impl Into<String>) {
@@ -86,6 +109,10 @@ impl StepCapture {
         self.create_step_nodelist.lock().unwrap().clone()
     }
 
+    pub(crate) fn create_step_job_shell(&self) -> bool {
+        self.create_step_job_shell.load(Ordering::SeqCst)
+    }
+
     /// Make `create_job_step` fail, so tests can drive the pre-step failure path.
     pub(crate) fn set_create_step_error(&self, code: tonic::Code) {
         *self.create_step_error.lock().unwrap() = Some(code);
@@ -104,6 +131,14 @@ impl StepCapture {
     /// Number of `RunStep` calls, so tests can assert dispatch stopped early.
     pub(crate) fn run_step_calls(&self) -> u32 {
         self.run_step_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_run_step_response(&self, response: proto::RunStepResponse) {
+        *self.run_step_response.lock().unwrap() = Some(response);
+    }
+
+    pub(crate) fn set_get_node_response(&self, node: proto::NodeInfo) {
+        *self.get_node_response.lock().unwrap() = Some(node);
     }
 
     pub(crate) fn set_get_node_names(&self, names: Vec<String>) {
@@ -188,6 +223,16 @@ macro_rules! mock_controller_impl {
 
 mock_controller_impl! {
     implemented {
+        async fn validate_block_file(
+            &self,
+            request: tonic::Request<proto::ValidateBlockFileRequest>,
+        ) -> Result<tonic::Response<proto::GetFabricTopologyResponse>, tonic::Status> {
+            let content = request.into_inner().content;
+            self.capture.block_validation_content.lock().unwrap().push(content.clone());
+            spur_core::block_file::BlockFile::parse(&content).map_err(tonic::Status::invalid_argument)?;
+            Ok(tonic::Response::new(proto::GetFabricTopologyResponse { namespace: "test".into(), ..Default::default() }))
+        }
+
         async fn create_job_step(
             &self,
             request: tonic::Request<proto::CreateJobStepRequest>,
@@ -200,6 +245,9 @@ mock_controller_impl! {
                 .create_step_num_nodes
                 .store(request.num_nodes, Ordering::SeqCst);
             *self.capture.create_step_nodelist.lock().unwrap() = request.nodelist;
+            self.capture
+                .create_step_job_shell
+                .store(request.job_shell, Ordering::SeqCst);
             if let Some(code) = *self.capture.create_step_error.lock().unwrap() {
                 return Err(tonic::Status::new(code, "mock create_job_step failure"));
             }
@@ -290,11 +338,15 @@ mock_controller_impl! {
                 .run_step_step_id
                 .store(request.into_inner().step_id, Ordering::SeqCst);
             self.capture.run_step_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(response) = self.capture.run_step_response.lock().unwrap().clone() {
+                return Ok(tonic::Response::new(response));
+            }
             Ok(tonic::Response::new(proto::RunStepResponse {
                 exit_code: MOCK_EXIT_CODE,
                 stdout: String::new(),
                 stderr: String::new(),
                 node: String::new(),
+                warnings: Vec::new(),
             }))
         }
 
@@ -310,15 +362,15 @@ mock_controller_impl! {
             Ok(tonic::Response::new(()))
         }
 
-        /// Records the name, then reports `NotFound`. A caller treats a failed
-        /// lookup as "node unreachable" and stops there, which keeps tests off
-        /// the network instead of dialling an agent that is not running.
         async fn get_node(
             &self,
             request: tonic::Request<proto::GetNodeRequest>,
         ) -> Result<tonic::Response<proto::NodeInfo>, tonic::Status> {
             let name = request.into_inner().name;
             self.capture.get_node_requests.lock().unwrap().push(name.clone());
+            if let Some(node) = self.capture.get_node_response.lock().unwrap().clone() {
+                return Ok(tonic::Response::new(node));
+            }
             Err(tonic::Status::not_found(format!("node {name} not found")))
         }
 
@@ -371,15 +423,35 @@ mock_controller_impl! {
                 .push((request.name, request.force));
             Ok(tonic::Response::new(proto::DeregisterNodeResponse::default()))
         }
+
+        async fn job_keepalive(
+            &self,
+            request: tonic::Request<proto::JobKeepaliveRequest>,
+        ) -> Result<tonic::Response<proto::JobKeepaliveResponse>, tonic::Status> {
+            self.capture
+                .keepalive_peers
+                .lock()
+                .unwrap()
+                .push(request.remote_addr());
+            let reject = self
+                .capture
+                .keepalive_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if reject {
+                return Err(tonic::Status::unauthenticated("stale credential"));
+            }
+            Ok(tonic::Response::new(proto::JobKeepaliveResponse::default()))
+        }
     }
     unimplemented {
-        job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
         requeue_job(proto::RequeueJobRequest) -> proto::RequeueJobResponse;
         deregister_agent(proto::DeregisterAgentRequest) -> ();
         get_partitions(proto::GetPartitionsRequest) -> proto::GetPartitionsResponse;
+        get_fabric_topology(()) -> proto::GetFabricTopologyResponse;
         create_partition(proto::CreatePartitionRequest) -> ();
         update_partition(proto::UpdatePartitionRequest) -> ();
         delete_partition(proto::DeletePartitionRequest) -> ();

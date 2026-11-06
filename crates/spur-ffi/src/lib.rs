@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn desc_num_tasks_maps_no_val_to_unset() {
-        // C1 (FFI): NO_VAL (the init default) -> 0 so the controller defaults
+        // NO_VAL (the init default) -> 0 so the controller defaults
         // to one task per node; explicit values pass through unchanged.
         assert_eq!(desc_num_tasks(crate::types::NO_VAL), 0);
         assert_eq!(desc_num_tasks(1), 1);

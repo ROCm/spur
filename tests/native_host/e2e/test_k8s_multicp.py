@@ -279,7 +279,9 @@ class TestK8sMultiControlPlane:
 
         # --- step 1: controller restart ---
         c.restart_controller()
-        c.wait_k8s_phase("ready", timeout=120)
+        ready_after_ctrl = c.wait_k8s_phase(
+            "ready", timeout=120, active_controllers=cp_list_before,
+        )
 
         assert c.k8s_control_planes() == cp_list_before, (
             f"CP list changed after controller restart: "
@@ -289,7 +291,7 @@ class TestK8sMultiControlPlane:
         assert etcd_after_ctrl == 3, (
             f"etcd quorum lost after controller restart: {etcd_after_ctrl}"
         )
-        active_after_ctrl = c.k8s_active_controllers()
+        active_after_ctrl = c.k8s_active_controllers(ready_after_ctrl)
         assert len(active_after_ctrl) == 3, (
             f"active controllers != 3 after restart: {active_after_ctrl}"
         )
@@ -302,7 +304,9 @@ class TestK8sMultiControlPlane:
         for i in range(len(c.nodes)):
             _drain_and_restart_agent(c, i)
 
-        c.wait_k8s_phase("ready", timeout=120)
+        ready_after_agents = c.wait_k8s_phase(
+            "ready", timeout=120, active_controllers=cp_list_before,
+        )
         if has_workers:
             _wait_k8s_nodes_ready(c, worker_names, timeout=120)
 
@@ -314,9 +318,10 @@ class TestK8sMultiControlPlane:
         assert etcd_after_agents == 3, (
             f"etcd quorum lost after rolling agent restart: {etcd_after_agents}"
         )
-        assert len(c.k8s_active_controllers()) == 3, (
+        active_after_agents = c.k8s_active_controllers(ready_after_agents)
+        assert len(active_after_agents) == 3, (
             f"active controllers != 3 after agent restarts: "
-            f"{c.k8s_active_controllers()}"
+            f"{active_after_agents}"
         )
         if has_workers:
             _assert_canary_survived(c, "canary-multicp")

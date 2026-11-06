@@ -177,7 +177,9 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Submit a job array, e.g. ``0-99%10``. See :ref:`submit-arrays`.
    * - ``--constraint``
      - ``-C``
-     - Required node features, e.g. ``mi300x,nvlink``.
+     - Required node features, e.g. ``mi300x,nvlink``, and optional GPU
+       predicates such as ``same(gpu.fabric_domain_id)``. See
+       :ref:`submit-topology`.
    * - ``--nodelist``
      - ``-w``
      - Request a specific list of nodes.
@@ -187,12 +189,25 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
    * - ``--exclusive``
      -
      - Do not share allocated nodes with other jobs. Default off.
+   * - ``--topology``
+     -
+     - Prefer locality with ``block`` or ``tree``; ``none`` skips the hint.
+       An explicit same-fabric constraint still applies.
    * - ``--hold``
      - ``-H``
      - Submit the job held; it will not start until released. Default off.
    * - ``--requeue``
      -
-     - Allow the job to be requeued after a node failure. Default off.
+     - Allow the job to be requeued after a node failure or time limit.
+       Default off. If the failed node comes back, the job's earlier run there
+       is stopped (SIGTERM, then SIGKILL if it does not exit).
+   * - ``--no-requeue``
+     -
+     - Do not requeue the job after a node failure or time limit. This is the
+       default. Unlike Slurm, preemption and ``scontrol requeue`` still requeue
+       the job, as do reclaim and launch failures. Either flag overrides the
+       other, including a ``#SBATCH`` line, and the later flag wins when both
+       appear on the command line.
    * - ``--begin``
      -
      - Defer start until a time, e.g. ``now+2hours`` or an ISO 8601 timestamp.
@@ -222,6 +237,40 @@ patterns for ``--output`` and ``--error``, the token expands to the job ID.
      - Block until the job terminates; exit code reflects the job outcome.
        Works with ``--parsable`` (ID printed at submission, then blocks).
        Also accepted as an ``#SBATCH --wait`` directive in scripts.
+
+.. _submit-topology:
+
+Topology Locality and Block Containment
+---------------------------------------
+
+When the administrator enables block topology, automatically discovered vPods
+or administrator-declared node groups supply the existing topology model.
+``--topology block`` and ``--topology tree`` use the configured model to prefer
+nearby nodes. These options permit allocations across blocks when needed.
+
+To require all allocated GPUs inside one block, add a same-fabric constraint.
+Both jobs below use the same partition and discovered topology:
+
+.. code-block:: bash
+
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --topology block train.sh
+   spur submit -p gpu -N 2 -n 2 --gpus 6 --constraint='same(gpu.fabric_domain_id)' train.sh
+
+The first job requests a locality preference and may span blocks. The second
+requires containment and stays pending if no single block can fit it.
+``same(gpu.vpod_id)`` is an alias. Combine either predicate with required node
+features using commas or ``&``. Per-device model, VRAM, NUMA, PCI-root, and
+domain filters are also supported; OR combinations are not supported. The constraint also works with ``spur alloc`` and standalone
+``spur run``; steps inherit their allocation's binding.
+
+``--topology none`` skips the hint without disabling an explicit constraint.
+Omitting ``-p`` uses the default partition and does not alter the constraint.
+A malformed GPU expression, such as an unknown field (``gpu.unknown=1``), an
+uppercase ``GPU.`` prefix on a comparison, or a property name without a
+comparison (``gpu.vram``), is rejected at submit with
+``unsupported GPU constraint``. A term such as ``gpu.fast``, which is not a
+property name and has no operator, remains an ordinary node feature. Partition names have no built-in topology meaning. See
+:doc:`/admin-guide/fabric-observation` for configuration and inspection.
 
 .. _submit-export:
 
@@ -454,18 +503,8 @@ Open MPI expects.  The ``--mpi=mpirun`` value appears in
 
 .. note::
 
-   Buffered ``srun`` steps, including steps inside ``sbatch`` scripts and
-   multi-node ``mpirun`` daemon placement, survive a controller restart while
-   their allocation remains active. ``srun`` retries the controller connection
-   for up to 60 seconds (30 attempts x 2 s backoff); agents join an existing
-   step rather than launching it again. If its completion was already recorded,
-   the controller returns its recorded exit code and attempts to retrieve the
-   original output from the agents, allowing up to 10 seconds per agent in
-   parallel. Settled completion records are retained for up to 10 minutes,
-   subject to capacity limits, and output replay also requires the agent's
-   spool files. An agent restart can recover completion from its retained
-   on-disk record. If records have expired or an agent is unavailable, the
-   recorded exit code is still returned, but that agent's output may be missing.
+   For buffered ``srun`` recovery, including ``mpirun`` daemon placement, see
+   :ref:`srun-controller-restart`.
 
 Distributed-training rendezvous variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

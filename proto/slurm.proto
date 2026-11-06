@@ -19,6 +19,8 @@ message ResourceSet {
   repeated GpuResource gpus = 3;
   map<string, uint64> generic = 4;  // licenses, etc.
   uint64 generation = 5;  // bumped by the agent on each topology rebuild
+  uint32 fabric_binding_version = 6; // shared capability level: native fabric=1, file=2, GPU properties=3
+  optional string block_file_revision = 7;
 }
 
 message AllocatedDevice {
@@ -35,6 +37,8 @@ message ResourceAllocations {
   uint64 memory_mb = 2;
   map<string, DeviceAllocations> devices = 3;
   uint64 generation = 4;  // node inventory generation this allocation was made under
+  FabricBinding fabric_binding = 5;
+  GpuPropertyBinding gpu_binding = 6;
 }
 
 message GpuResource {
@@ -44,12 +48,171 @@ message GpuResource {
   repeated uint32 peer_gpus = 4;
   GpuLinkType link_type = 5;
   uint64 stable_id = 6;   // BDF(domain:bus:dev.func) + partition rank; stable per-logical-device identity
+  DeviceTopology topology = 7;
+}
+
+// Optional observations; none of these fields assert authoritative fabric health.
+message DeviceTopology {
+  optional string pci_bdf = 1;
+  optional uint32 numa_node = 2;
+  optional string pci_root = 3;
+  optional uint64 vram_bytes = 4;
+  FabricObservation fabric = 5;
+}
+
+message FabricObservation {
+  string source = 1;
+  ObservationStatus status = 2;
+  optional string physical_domain_id = 3;
+  optional string fabric_domain_id = 4;
+  optional string endpoint_id = 5;
+  optional uint32 physical_capacity = 6;
+  optional uint32 fabric_capacity = 7;
+  repeated string active_endpoints = 8;
+  repeated string local_endpoints = 9;
+  optional string endpoint_state = 10;
+  optional string transport = 11;
+  repeated ObservationIssue issues = 12;
+}
+
+enum ObservationStatus {
+  OBSERVATION_UNKNOWN = 0;
+  OBSERVATION_OBSERVED = 1;
+  OBSERVATION_INCOMPLETE = 2;
+  OBSERVATION_INCONSISTENT = 3;
+  OBSERVATION_UNAVAILABLE = 4;
+}
+
+message ObservationIssue {
+  string field = 1;
+  ObservationIssueKind kind = 2;
+}
+
+enum ObservationIssueKind {
+  OBSERVATION_ISSUE_UNKNOWN = 0;
+  OBSERVATION_ISSUE_MISSING = 1;
+  OBSERVATION_ISSUE_UNREADABLE = 2;
+  OBSERVATION_ISSUE_MALFORMED = 3;
+  OBSERVATION_ISSUE_TOO_LARGE = 4;
+  OBSERVATION_ISSUE_CONFLICT = 5;
+  OBSERVATION_ISSUE_CHANGED = 6;
+  OBSERVATION_ISSUE_UNAVAILABLE = 7;
+  OBSERVATION_ISSUE_PEER_CONFLICT = 8;
+}
+
+// Derived from the current controller inventory; no fabric mutation or health claim.
+message FabricBlockKey {
+  string namespace = 1;
+  string physical_domain = 2;
+  string fabric_domain = 3;
+}
+
+message FabricDeviceKey {
+  string node = 1;
+  uint64 stable_id = 2;
+}
+
+message FabricMember {
+  FabricDeviceKey device = 1;
+  string endpoint = 2;
+  uint64 inventory_generation = 3;
+}
+
+message FabricBlock {
+  FabricBlockKey key = 1;
+  repeated FabricMember members = 2;
+  repeated string active_endpoints = 3;
+  optional uint32 physical_capacity = 4;
+  optional uint32 fabric_capacity = 5;
+  repeated string issues = 6;
+  optional string file_revision = 7;
+}
+
+message FabricBinding {
+  uint32 version = 1;
+  FabricBlockKey key = 2;
+  repeated string active_endpoints = 3;
+  repeated FabricMember members = 4;
+  string node = 5;
+  uint64 inventory_generation = 6;
+  optional string file_revision = 7;
+}
+
+message GpuPropertyBinding {
+  string node = 1;
+  uint64 generation = 2;
+  repeated BoundGpuProperties gpus = 3;
+}
+
+message BoundGpuProperties {
+  uint64 stable_id = 1;
+  string gpu_type = 2;
+  DeviceTopology topology = 3;
+}
+
+message ValidateBlockFileRequest {
+  string content = 1;
+}
+
+message UnresolvedFabricDevice {
+  FabricDeviceKey device = 1;
+  string issue = 2;
+}
+
+message GetFabricTopologyResponse {
+  string namespace = 1;
+  repeated FabricBlock blocks = 2;
+  repeated UnresolvedFabricDevice unresolved = 3;
+  repeated BlockFileNotice notices = 4;
+}
+
+message BlockFileNotice {
+  string block_name = 1;
+  bool warning = 2;
+  string message = 3;
 }
 
 enum GpuLinkType {
   GPU_LINK_PCIE = 0;
   GPU_LINK_XGMI = 1;
   GPU_LINK_NVLINK = 2;
+}
+
+// One physical core: all of its hyperthreads share socket and NUMA node.
+message CoreInfo {
+  uint32 socket = 1;
+  optional uint32 numa_node = 2;
+  repeated uint32 cpus = 3;          // online OS CPU IDs of this core
+}
+
+// Agent-reported CPU topology; the core's position is its abstract core index.
+message CpuTopology {
+  repeated CoreInfo cores = 1;
+}
+
+message GpuReservedCpus {
+  uint64 stable_id = 1;
+  repeated uint32 cpus = 2;
+}
+
+// Controller-computed split of a node's CPUs. Absent when the node has no core
+// settings or its layout could not be computed (see layout_error).
+message CoreLayout {
+  repeated uint32 spec_cpus = 1;
+  uint64 mem_spec_mb = 2;            // 0 unless spec cores are set
+  repeated GpuReservedCpus gpu_reserved = 3;
+  repeated uint32 general_cpus = 4;
+  bool daemons_off_spec = 5;
+}
+
+// Orders layout deliveries so the agent never adopts a stale one. Compared as
+// (term, boot, seq): the delivering leader's Raft term, that controller's
+// durable start counter (a restarted leader can keep its term), and a per-node
+// sequence the controller advances on every layout change, including a clear.
+message LayoutRevision {
+  uint64 term = 1;
+  uint64 boot = 2;
+  uint64 seq = 3;
 }
 
 enum JobState {
@@ -195,6 +358,12 @@ message JobSpec {
   // Submit command line as invoked, shell-quoted so word boundaries survive.
   // Client-asserted: the controller bounds and sanitizes it but cannot verify it.
   string submit_line = 85;
+
+  // The submitting client sends inactivity keepalives and is willing to have
+  // its allocation reaped once it goes silent past InactiveLimit. First-party
+  // srun/salloc set it; the K8s operator, third-party API clients, and CLIs
+  // older than v0.9 leave it false and stay exempt.
+  bool client_keepalive = 86;
 }
 
 message JobInfo {
@@ -319,6 +488,12 @@ message JobInfo {
   string suspended_by = 85;
   string last_requeue = 86;
   string last_requeue_by = 87;
+  map<string, FabricBinding> fabric_bindings = 88;
+  map<string, GpuPropertyBinding> gpu_bindings = 89;
+
+  // When the job was signaled to start its preemption grace. Set only while
+  // the grace runs; `end_time` then carries the grace deadline.
+  google.protobuf.Timestamp preempt_time = 90;
 }
 
 message NodeInfo {
@@ -360,6 +535,11 @@ message NodeInfo {
   // Port the node's agent listens on, so a client dialling it directly does not
   // have to assume the default.
   uint32 agent_port = 58;
+
+  string spec_cpus = 59;             // CPU list, e.g. "127,255"; empty when none
+  uint32 core_spec_count = 60;
+  uint64 mem_spec_mb = 61;
+  uint32 cpu_tot = 62;               // detected CPUs, before spec cores are removed
 }
 
 message PartitionInfo {
@@ -387,6 +567,7 @@ message PartitionInfo {
   string preempt_mode = 40;
   uint32 priority_tier = 41;
   optional uint32 preempt_exempt_time = 44;   // absent = unset (inherits global default); 0 = no exemption
+  optional uint32 grace_time = 45;            // absent = unset; 0 = explicitly no grace
 }
 
 // ============================================================
@@ -414,6 +595,8 @@ service SlurmController {
 
   // Node management
   rpc GetNodes(GetNodesRequest) returns (GetNodesResponse);
+  rpc GetFabricTopology(google.protobuf.Empty) returns (GetFabricTopologyResponse);
+  rpc ValidateBlockFile(ValidateBlockFileRequest) returns (GetFabricTopologyResponse);
   rpc GetNode(GetNodeRequest) returns (NodeInfo);
   rpc UpdateNode(UpdateNodeRequest) returns (google.protobuf.Empty);
   rpc DrainNode(DrainNodeRequest) returns (DrainNodeResponse);
@@ -509,6 +692,10 @@ service SlurmAgent {
   // before anything the job runs can ask about it.
   rpc StartJob(AgentStartJobRequest) returns (google.protobuf.Empty);
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
+  // Deliver a signal without tearing the run down (e.g. a preemption grace
+  // warning). Agents that implement it advertise the `signal-job` capability.
+  // NOT_FOUND means the agent holds nothing of the job, so nothing was signalled.
+  rpc SignalJob(AgentSignalJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
   rpc ProbeStepd(StepdProbeRequest) returns (StepdProbeResponse);
@@ -573,6 +760,9 @@ service SlurmAccounting {
   rpc CreateQos(CreateQosRequest) returns (google.protobuf.Empty);
   rpc DeleteQos(DeleteQosRequest) returns (google.protobuf.Empty);
   rpc ListQos(ListQosRequest) returns (ListQosResponse);
+
+  // Usage management (sacctmgr modify user/account set rawusage=N)
+  rpc ModifyUsage(ModifyUsageRequest) returns (google.protobuf.Empty);
 
   // Fairshare
   rpc GetFairshareFactors(GetFairshareFactorsRequest) returns (GetFairshareFactorsResponse);
@@ -740,6 +930,17 @@ message PingResponse {
   // into user-RPC credentials. Empty when `[auth] plugin` is not `spur`.
   string auth_audience = 6;
   uint64 auth_epoch = 7;
+  // InactiveLimit in effect on the controller, in seconds (0 = reaping off).
+  // Unset from a node agent or a controller predating the field.
+  optional uint32 inactive_limit_secs = 8;
+  string tres_billing_weights = 9;
+  string usage_reset_period = 10;
+  // SIGTERM-to-SIGKILL waits in effect on the controller, in seconds, with the
+  // floor applied: `kill_wait_secs` for ordinary stops, `timeout_kill_wait_secs`
+  // for stops at a time or inactivity limit. Unset from a node agent or a
+  // controller predating the fields.
+  optional uint32 kill_wait_secs = 11;
+  optional uint32 timeout_kill_wait_secs = 12;
 }
 
 message JobStateCount {
@@ -903,12 +1104,21 @@ message RegisterAgentRequest {
   string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
   map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
   string join_token = 8;     // Admission token for token-based admission
+  CpuTopology topology = 9;  // absent from agents that predate it
+  // Optional agent features (e.g. "signal-job"), so the controller can avoid
+  // calling RPCs an older agent does not implement.
+  repeated string capabilities = 10;
 }
 
 message RegisterAgentResponse {
   bool accepted = 1;
   string message = 2;
   string node_token = 3;
+  CoreLayout core_layout = 4;
+  LayoutRevision layout_revision = 5; // set even when core_layout is absent
+  // Set when the node's layout could not be computed; the agent then keeps the
+  // layout it holds instead of treating an absent core_layout as a clear.
+  string layout_error = 6;
 }
 
 message HeartbeatRequest {
@@ -923,6 +1133,8 @@ message HeartbeatRequest {
   string wg_pubkey = 6;
   // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
   optional K0sNodeStatus k0s_status = 7;
+  uint64 core_layout_fingerprint = 8; // fingerprint of the layout spurd holds; 0 = none
+  string spec_enforcement_error = 9;  // why the held layout is not enforced; empty = enforced
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
@@ -946,7 +1158,9 @@ message RunningJobStatus {
   uint32 run_attempt = 5;
 }
 
-message HeartbeatResponse {}
+message HeartbeatResponse {
+  bool reregister = 1;               // held layout differs from the node's current one: register again
+}
 
 message StepdRecoveryRequest {
   string hostname = 1;
@@ -1022,6 +1236,8 @@ message LaunchJobRequest {
   bool pmix_prepared = 12;
   // Controller-signed job execution credential. Required when [auth] plugin = "spur".
   string execution_credential = 13;
+  CoreLayout core_layout = 14;       // node's current layout; absent leaves the held one
+  LayoutRevision layout_revision = 15;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -1072,6 +1288,24 @@ message AgentCancelJobRequest {
   // attempt is currently tracked). Guards a still-launching reservation
   // release against a concurrent redispatch under the same job_id.
   uint32 run_attempt = 3;
+  // Seconds to wait after the first signal before escalating to SIGKILL.
+  // 0 means the agent default (5 s); any value below 5 is raised to 5.
+  uint32 kill_wait_secs = 4;
+}
+
+enum SignalTarget {
+  SIGNAL_TARGET_UNSPECIFIED = 0;
+  SIGNAL_TARGET_STEPS = 1;   // every step except the batch script
+  SIGNAL_TARGET_BATCH = 2;   // the batch script only; not yet supported (agents return UNIMPLEMENTED)
+  SIGNAL_TARGET_FULL = 3;    // everything in the run
+}
+
+message AgentSignalJobRequest {
+  uint32 job_id = 1;
+  // Epoch of the targeted run; 0 means whichever attempt is currently tracked.
+  uint32 run_attempt = 2;
+  int32 signal = 3;
+  SignalTarget target = 4;
 }
 
 message AgentSuspendJobRequest {
@@ -1149,6 +1383,8 @@ message RunStepResponse {
   string stdout = 2;     // Aggregated stdout from all tasks/nodes
   string stderr = 3;     // Aggregated stderr from all tasks/nodes
   string node = 4;       // Comma-separated hostnames that ran tasks
+  // Separate diagnostics so live output streaming cannot suppress them.
+  repeated string warnings = 5;
 }
 
 // -- Native cluster (k0s) lifecycle messages --
@@ -1566,6 +1802,20 @@ message UsageEntry {
 
 message GetUsageResponse {
   repeated UsageEntry entries = 1;
+  // Billing weights so sshare/sprio can display weighted RawUsage.
+  double billing_weight_cpu = 2;
+  double billing_weight_gpu = 3;
+  // True when the controller has billing weights configured; false (proto
+  // default) means a pre-feature controller — sshare should fall back to 1:1.
+  bool has_billing_weights = 4;
+}
+
+message ModifyUsageRequest {
+  string user = 1;
+  string account = 2;
+  // The new raw usage value. 0 = reset to zero (Slurm parity).
+  // Positive = set to this value. Negative = subtract from current (clamp at 0).
+  int64 raw_usage = 3;
 }
 
 message GetFairshareFactorsRequest {
@@ -1588,6 +1838,8 @@ message GetFairshareFactorsResponse {
 // -- K8s Operator --
 
 message ReportJobStatusRequest {
+  // Zero requests only a node drain; no job or step is completed. Requires
+  // drain_node and reporting_node, with no step, attempt, exit code, or signal.
   uint32 job_id = 1;
   // Completion gate for per-node reports. Must be JOB_COMPLETED when
   // exit_code==0, or JOB_FAILED when exit_code!=0.
@@ -1609,6 +1861,14 @@ message ReportJobStatusRequest {
   // Step whose supervisor is reporting. Absent from a legacy agent, and from a
   // report that speaks for the whole node rather than one step.
   optional uint32 step_id = 10;
+  // Node identity token, as sent on Heartbeat. Enforced for drain requests and
+  // standalone-PTY completion when controller node-identity enforcement is on.
+  string node_token = 11;
+  // For an interactive session's report (step_id = the interactive step), the
+  // numbered step its `srun --pty` invocation created. Every invocation in a
+  // job shares the interactive step id, so this names which one exited.
+  // Absent from a legacy agent.
+  optional uint32 pty_step_id = 12;
 }
 
 // ============================================================
@@ -1765,6 +2025,13 @@ message CreateQosRequest {
   // Comma-separated QOS flags. Recognized: DenyOnLimit. Unset preserves the
   // stored flags; explicit empty clears them.
   optional string flags = 18;
+  // Seconds a preempted job in this QOS is given to wind down before it is
+  // cancelled. 0 = no grace. Absent = no change on update.
+  optional uint32 grace_time = 20;
+  // Set to true to clear grace_time back to NULL (inherit the partition's
+  // GraceTime). Setting it together with grace_time is rejected as
+  // INVALID_ARGUMENT.
+  bool clear_grace_time = 21;
 }
 
 message DeleteQosRequest {
@@ -1800,6 +2067,9 @@ message QosInfo {
   // Exists so an existing burst QOS, which carries no group cap to exceed and so is
   // never stamped, can still be called back for a job holding a quota claim.
   bool idle_fill_preemptable = 19;
+  // Seconds a preempted job in this QOS is given to wind down before it is
+  // cancelled. Absent = unset (inherits the partition's GraceTime); 0 = no grace.
+  optional uint32 grace_time = 20;
 }
 
 // ============================================================
@@ -1836,6 +2106,9 @@ message CreateJobStepRequest {
   ContainerSpec container = 11;  // Step's own container request (empty image = none/inherit)
   uint32 num_nodes = 12;       // Explicit step node count (-N); 0 = use all allocated nodes
   string nodelist = 13;        // Exact step node subset (-w); empty = derive from num_nodes/allocation
+  // Set only by a standalone `srun --pty` for its own shell, whose exit then
+  // ends the job. An extra `srun --jobid <id> --pty` session leaves it unset.
+  bool job_shell = 14;
 }
 
 message CreateJobStepResponse {
@@ -1877,6 +2150,9 @@ message CreatePartitionRequest {
   // Minimum seconds a job must run before it is eligible for preemption.
   // 0 = no exemption (immediately preemptable). Absent = use global default.
   optional uint32 preempt_exempt_time = 17;
+  // Seconds a preempted job gets to wind down before it is killed. Used when the
+  // victim's QOS leaves its grace_time unset. 0 = no grace. Absent = unset.
+  optional uint32 grace_time = 18;
 }
 
 message UpdatePartitionRequest {
@@ -1910,6 +2186,12 @@ message UpdatePartitionRequest {
   bool set_deny_qos = 20;
   repeated string allow_qos = 22;
   bool set_allow_qos = 23;
+  // Seconds a preempted job gets to wind down before it is killed. 0 is a valid
+  // value meaning no grace. Absent = no change.
+  optional uint32 grace_time = 26;
+  // Set to true to clear grace_time back to unset. Setting it together with
+  // grace_time is rejected as INVALID_ARGUMENT.
+  bool clear_grace_time = 27;
 }
 
 message DeletePartitionRequest {

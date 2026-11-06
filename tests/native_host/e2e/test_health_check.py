@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for node health checks (spur#801).
+"""E2E tests for node health checks.
 
 The controller submits each configured check as a real job that requests its
 node exclusively, so it runs only when the node is idle. A non-zero exit (or a

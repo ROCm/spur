@@ -244,6 +244,11 @@ impl SlurmAgent for VirtualAgent {
             cluster_name: self.cluster_id.clone(),
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
+            inactive_limit_secs: None,
+            tres_billing_weights: String::new(),
+            usage_reset_period: String::new(),
+            kill_wait_secs: None,
+            timeout_kill_wait_secs: None,
         }))
     }
 
@@ -337,7 +342,7 @@ impl SlurmAgent for VirtualAgent {
         }
 
         // Compute node rank from task_offset.
-        // Issue #69: peer_nodes contains addr:port strings (e.g., "10.0.0.1:6818")
+        // peer_nodes contains addr:port strings (e.g., "10.0.0.1:6818")
         // while target_node is a hostname — starts_with matching never worked,
         // causing all pods to get rank 0. Instead, derive rank from task_offset
         // which is incremented per-node by the dispatcher.
@@ -435,7 +440,7 @@ impl SlurmAgent for VirtualAgent {
             });
         }
 
-        // Issue #117: Inject secret env vars from SpurJob CRD's secretEnv field.
+        // Inject secret env vars from SpurJob CRD's secretEnv field.
         // These reference K8s Secrets and are injected as secretKeyRef, keeping
         // secret values out of the SpurJob spec and Raft log.
         {
@@ -488,13 +493,13 @@ impl SlurmAgent for VirtualAgent {
             None
         };
 
-        // Add extra device plugin resources (RDMA, MIG, etc.) — Issue #88
+        // Add extra device plugin resources (RDMA, MIG, etc.)
         for (key, val) in &spec.extra_resources {
             resource_requests.insert(key.clone(), Quantity(val.clone()));
             resource_limits.insert(key.clone(), Quantity(val.clone()));
         }
 
-        // Shared memory volume mount — Issue #87
+        // Shared memory volume mount
         if !spec.shm_size.is_empty() {
             volume_mounts.push(k8s_openapi::api::core::v1::VolumeMount {
                 name: "dshm".into(),
@@ -503,7 +508,7 @@ impl SlurmAgent for VirtualAgent {
             });
         }
 
-        // Privileged mode / SecurityContext — Issue #86
+        // Privileged mode / SecurityContext
         let security_context = if spec.privileged {
             Some(k8s_openapi::api::core::v1::SecurityContext {
                 privileged: Some(true),
@@ -579,7 +584,7 @@ impl SlurmAgent for VirtualAgent {
                 ..Default::default()
             },
             spec: Some({
-                // Shared memory emptyDir volume — Issue #87
+                // Shared memory emptyDir volume
                 if !spec.shm_size.is_empty() {
                     volumes.push(k8s_openapi::api::core::v1::Volume {
                         name: "dshm".into(),
@@ -602,9 +607,7 @@ impl SlurmAgent for VirtualAgent {
                     } else {
                         Some(volumes)
                     },
-                    // Issue #85: host_network
                     host_network: if spec.host_network { Some(true) } else { None },
-                    // Issue #87: host_ipc
                     host_ipc: if spec.host_ipc { Some(true) } else { None },
                     ..Default::default()
                 }
@@ -664,6 +667,15 @@ impl SlurmAgent for VirtualAgent {
         _request: Request<spur_proto::proto::AgentStartJobRequest>,
     ) -> Result<Response<()>, Status> {
         Ok(Response::new(()))
+    }
+
+    async fn signal_job(
+        &self,
+        _request: Request<AgentSignalJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented(
+            "SignalJob is not supported on Kubernetes-operator nodes",
+        ))
     }
 
     async fn cancel_job(
@@ -1649,6 +1661,28 @@ mod resolve_job_tests {
             err.message().contains("has no namespace"),
             "got {:?}",
             err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_agent_signal_job_is_unimplemented() {
+        let server = server_listing(&[]);
+        let agent = VirtualAgent::new(server.client());
+
+        let err = agent
+            .signal_job(Request::new(AgentSignalJobRequest {
+                job_id: JOB_ID,
+                run_attempt: 1,
+                signal: 15,
+                target: SignalTarget::Full as i32,
+            }))
+            .await
+            .expect_err("signal_job must be refused");
+
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(
+            server.requests().is_empty(),
+            "an unsupported RPC must not touch the API server"
         );
     }
 }

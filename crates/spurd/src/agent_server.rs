@@ -4,13 +4,20 @@
 //! gRPC server implementing the SlurmAgent service.
 //! Receives job launch/cancel requests from spurctld.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, trace, warn};
+
+#[cfg(test)]
+#[path = "cleanup_lifecycle_tests.rs"]
+mod cleanup_lifecycle_tests;
+#[cfg(test)]
+#[path = "run_fence_tests.rs"]
+mod run_fence_tests;
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -22,6 +29,7 @@ use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
 use spur_core::config::{CgroupConfig, HooksConfig, MpiConfig};
+use spur_core::gpu_binding::BindingCheck;
 use spur_core::mpi::{resolve_step_mpi, PmixLaunchPlan, MPI_MPIRUN, MPI_NONE, MPI_PMIX};
 use spur_core::spur_env::SpurEnv;
 use spur_core::task_launch::{
@@ -46,6 +54,8 @@ fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &
 }
 
 struct StepdLaunchOptions {
+    fabric_binding: Option<spur_core::fabric_binding::FabricBinding>,
+    gpu_binding: Option<spur_core::gpu_binding::GpuBinding>,
     step_id: spur_core::step::StepId,
     allocation_only: bool,
     container_rootfs_mode: Option<crate::container::RootfsMode>,
@@ -55,6 +65,7 @@ struct StepdLaunchOptions {
     cred_id: String,
     cred_kid: String,
     cred_digest: String,
+    pty_step_id: Option<spur_core::step::StepId>,
 }
 
 /// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
@@ -239,6 +250,8 @@ async fn launch_stepd(
     }
     let mut launch_spec = crate::stepd::StepdLaunchSpec::try_from(config)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
+    launch_spec.resources.fabric_binding = options.fabric_binding;
+    launch_spec.resources.gpu_binding = options.gpu_binding;
     launch_spec.controller_addr = controller_addr.into();
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
@@ -251,6 +264,7 @@ async fn launch_stepd(
     launch_spec.cred_id = options.cred_id;
     launch_spec.cred_kid = options.cred_kid;
     launch_spec.cred_digest = options.cred_digest;
+    launch_spec.pty_step_id = options.pty_step_id;
     let store = crate::stepd::StepdStore::new(state_dir);
     let intended_session_dir = store.session_dir(config.job_id, run_attempt, launch_spec.step_id);
     let session_dir = store
@@ -273,6 +287,7 @@ async fn launch_stepd(
     descriptor.cred_id = launch_spec.cred_id.clone();
     descriptor.cred_kid = launch_spec.cred_kid.clone();
     descriptor.cred_digest = launch_spec.cred_digest.clone();
+    descriptor.pty_step_id = launch_spec.pty_step_id;
     let namespaces = launch_namespaces(config, nix::unistd::geteuid().is_root());
     descriptor.has_pid_namespace = namespaces.pid;
     descriptor.has_user_namespace = namespaces.user;
@@ -400,6 +415,28 @@ fn effective_cgroup_path(descriptor: &crate::stepd::StepdDescriptor) -> std::pat
     }
 }
 
+/// Fills in what a launch-time copy lacks from the supervisor's own record: its workload,
+/// and a cgroup that still exists. What the agent already holds wins.
+fn with_published_workload(
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> crate::stepd::StepdDescriptor {
+    let mut merged = descriptor.clone();
+    if merged.workload_pid != 0 && !merged.cgroup_path.as_os_str().is_empty() {
+        return merged;
+    }
+    let Some(published) = crate::stepd::republished(descriptor) else {
+        return merged;
+    };
+    if merged.workload_pid == 0 {
+        merged.workload_pid = published.workload_pid;
+        merged.workload_start_ticks = published.workload_start_ticks;
+    }
+    if merged.cgroup_path.as_os_str().is_empty() && published.cgroup_path.is_dir() {
+        merged.cgroup_path = published.cgroup_path;
+    }
+    merged
+}
+
 /// Whether a torn-down stepd is confirmed dead. A recorded cgroup path is
 /// authoritative — a successful stop signal only reaches the supervisor, which
 /// by design ignores a raw SIGTERM for its job's cgroup.
@@ -407,16 +444,17 @@ async fn runtime_teardown_confirmed(
     descriptor: &crate::stepd::StepdDescriptor,
     stop_result: &std::io::Result<()>,
 ) -> bool {
+    let descriptor = &with_published_workload(descriptor);
     // A derived path is still worth reaping — the supervisor may have created
     // the cgroup before dying — but its absence proves nothing, since it may
     // never have existed, so the workload itself has to answer for its death.
     if descriptor.cgroup_path.as_os_str().is_empty() {
-        runtime_cgroup_reaped(&effective_cgroup_path(descriptor));
-        return stop_result.is_ok() && workload_confirmed_gone(descriptor).await;
+        let reaped = runtime_cgroup_reaped(&effective_cgroup_path(descriptor)).await;
+        return reaped && stop_result.is_ok() && workload_confirmed_gone(descriptor).await;
     }
     // The retrying rmdir only succeeds once the cgroup is empty, so its
     // absence is what confirms the job's processes are actually gone.
-    runtime_cgroup_reaped(&descriptor.cgroup_path)
+    runtime_cgroup_reaped(&descriptor.cgroup_path).await
 }
 
 /// With no cgroup to watch empty, killing the supervisor says nothing about the
@@ -453,9 +491,19 @@ async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> 
 }
 
 /// Reap a supervisor's cgroup and report whether it is confirmed gone.
-fn runtime_cgroup_reaped(cgroup_path: &std::path::Path) -> bool {
-    crate::executor::cleanup_cgroup(cgroup_path);
-    !cgroup_path.exists()
+async fn runtime_cgroup_reaped(cgroup_path: &std::path::Path) -> bool {
+    match crate::cgroup_cleanup::wait_until_reaped(
+        cgroup_path,
+        WORKLOAD_DEATH_POLL_INTERVAL * WORKLOAD_DEATH_POLLS,
+    )
+    .await
+    {
+        Ok(reaped) => reaped,
+        Err(error) => {
+            warn!(path = %cgroup_path.display(), %error, "failed to reap runtime cgroup");
+            false
+        }
+    }
 }
 
 /// Supervisors are per (job, step): a job may hold several at once.
@@ -636,11 +684,10 @@ fn rewrite_descriptor_gpu_ids(
 /// were persisted; the lowest free cores keep occupancy right if not identity.
 fn fallback_cpu_ids(allocation: &NodeAllocation, cpus: u32) -> Vec<u32> {
     allocation
-        .allocated_cpus
+        .cpu_ids()
         .iter()
-        .enumerate()
-        .filter(|(_, &taken)| !taken)
-        .map(|(index, _)| index as u32)
+        .copied()
+        .filter(|&cpu| !allocation.is_allocated(cpu))
         .take(cpus as usize)
         .collect()
 }
@@ -703,12 +750,20 @@ async fn fence_displaced_stepd(
         return Ok(());
     };
     displaced_runtime_attempt(&displaced, run_attempt)?;
-    let stop_result = stop_stepd_process(&displaced).await;
-    if !runtime_teardown_confirmed(&displaced, &stop_result).await {
+    fence_stepd(stepds, &displaced).await
+}
+
+/// Stops `displaced`, confirms its workload is gone, then drops its entry if still current.
+async fn fence_stepd(
+    stepds: &Arc<Mutex<StepdMap>>,
+    displaced: &crate::stepd::StepdDescriptor,
+) -> std::io::Result<()> {
+    let stop_result = stop_stepd_process(displaced).await;
+    if !runtime_teardown_confirmed(displaced, &stop_result).await {
         return match stop_result {
             Err(error) => Err(error),
             Ok(()) => Err(std::io::Error::other(
-                "could not confirm the displaced stepd's cgroup is empty",
+                "could not confirm the displaced stepd's workload is gone",
             )),
         };
     }
@@ -717,12 +772,143 @@ async fn fence_displaced_stepd(
     // was in flight, and that entry must not be dropped.
     let mut sessions = stepds.lock().await;
     if sessions
-        .get(&(job_id, step_id))
-        .is_some_and(|current| stepd_is_current(current, &displaced))
+        .get(&stepd_key(displaced))
+        .is_some_and(|current| stepd_is_current(current, displaced))
     {
-        sessions.remove(&(job_id, step_id));
+        sessions.remove(&stepd_key(displaced));
     }
     Ok(())
+}
+
+/// Fences the supervisors an older run of the job left on this node, stopping at the first that
+/// fails; the ones owning the run go first so its script cannot react to its steps dying.
+async fn fence_older_runs(
+    stepds: &Arc<Mutex<StepdMap>>,
+    completions: &crate::step_completion::StepCompletions,
+    store: &crate::stepd::StepdStore,
+    cgroup_root: &std::path::Path,
+    job_id: u32,
+    run_attempt: u32,
+) -> std::io::Result<()> {
+    let mut older: Vec<crate::stepd::StepdDescriptor> =
+        stepds_for_job(&*stepds.lock().await, job_id)
+            .into_iter()
+            .filter(|descriptor| descriptor.run_attempt < run_attempt)
+            .collect();
+    for descriptor in store.older_sessions(job_id, run_attempt)? {
+        if !older.iter().any(|tracked| {
+            tracked.run_attempt == descriptor.run_attempt
+                && tracked.step_id == descriptor.step_id
+                && tracked.pid == descriptor.pid
+                && tracked.process_start_ticks == descriptor.process_start_ticks
+        }) {
+            older.push(descriptor);
+        }
+    }
+    let cgroups = older_run_cgroups(cgroup_root, job_id, run_attempt)?;
+    older.sort_by_key(|descriptor| !spur_core::step::owns_job_lifetime(descriptor.step_id));
+    for descriptor in older {
+        fence_stepd(stepds, &descriptor).await?;
+        settle_fenced_session(completions, store, &descriptor).await?;
+    }
+    for path in cgroups {
+        if !crate::cgroup_cleanup::wait_until_reaped(
+            &path,
+            WORKLOAD_DEATH_POLL_INTERVAL * WORKLOAD_DEATH_POLLS,
+        )
+        .await?
+        {
+            return Err(std::io::Error::other(format!(
+                "old run cgroup remains: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn older_run_cgroups(
+    root: &std::path::Path,
+    job_id: u32,
+    run_attempt: u32,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let prefix = format!("job_{job_id}_");
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let attempt = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(&prefix))
+            .and_then(|value| value.parse::<u32>().ok());
+        if attempt.is_none_or(|attempt| attempt >= run_attempt) {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(std::io::Error::other("old run cgroup is not a directory"));
+        }
+        paths.push(entry.path());
+    }
+    Ok(paths)
+}
+
+/// Fencing can stop a supervisor before its completion push reaches the agent,
+/// so pending callers still need an outcome when the workload is gone.
+async fn settle_fenced_session(
+    completions: &crate::step_completion::StepCompletions,
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> std::io::Result<()> {
+    match durable_runtime_exit(store, descriptor)? {
+        Some((exit_code, signal)) => {
+            completions
+                .complete(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                    crate::step_completion::StepOutcome { exit_code, signal },
+                )
+                .await;
+        }
+        None => {
+            completions
+                .complete_if_unsettled(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                    crate::step_completion::StepOutcome {
+                        exit_code: 0,
+                        signal: nix::sys::signal::Signal::SIGKILL as i32,
+                    },
+                )
+                .await;
+        }
+    }
+    if let Err(error) = crate::stepd::record_resources_released(descriptor) {
+        warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt,
+            step_id = descriptor.step_id, %error, "failed to release a fenced session");
+    }
+    Ok(())
+}
+
+/// Fences every older run of the job, owner and steps alike; a newer run holding this
+/// launch's own slot refuses the launch.
+async fn fence_displaced_run(
+    stepds: &Arc<Mutex<StepdMap>>,
+    completions: &crate::step_completion::StepCompletions,
+    store: &crate::stepd::StepdStore,
+    cgroup_root: &std::path::Path,
+    job_id: u32,
+    step_id: spur_core::step::StepId,
+    run_attempt: u32,
+) -> std::io::Result<()> {
+    fence_older_runs(stepds, completions, store, cgroup_root, job_id, run_attempt).await?;
+    fence_displaced_stepd(stepds, job_id, step_id, run_attempt).await
 }
 
 fn displaced_runtime_attempt(
@@ -741,21 +927,16 @@ fn displaced_runtime_attempt(
     Ok(displaced.run_attempt)
 }
 
-/// Atomically claims this job's `stepds` slot for `descriptor`,
-/// refusing to clobber an already-tracked strictly-newer attempt. Two
-/// concurrent LaunchJob calls for the same job (e.g. a re-dispatch racing the
-/// tail of a slow, now-superseded launch) can both pass fencing before either
-/// is tracked; without this check whichever finishes last would silently
-/// overwrite a newer, already-tracked session.
+/// Claims `descriptor`'s slot unless a newer run of the job is tracked: a superseded
+/// launch or step that passed fencing late must not be tracked beside its replacement.
 async fn claim_stepd_slot(
     stepds: &Arc<Mutex<StepdMap>>,
     descriptor: crate::stepd::StepdDescriptor,
 ) -> Result<(), crate::stepd::StepdDescriptor> {
     let mut sessions = stepds.lock().await;
-    if sessions
-        .get(&stepd_key(&descriptor))
-        .is_some_and(|existing| existing.run_attempt > descriptor.run_attempt)
-    {
+    if sessions.iter().any(|((job_id, _), existing)| {
+        *job_id == descriptor.job_id && existing.run_attempt > descriptor.run_attempt
+    }) {
         return Err(descriptor);
     }
     sessions.insert(stepd_key(&descriptor), descriptor);
@@ -791,15 +972,12 @@ fn unreported_durable_exit(
     run_attempt: u32,
     step_id: spur_core::step::StepId,
 ) -> bool {
-    store
-        .discover_unacknowledged_completions()
-        .map(|pending| {
-            pending.iter().any(|completion| {
-                completion.job_id == job_id
-                    && completion.run_attempt == run_attempt
-                    && completion.step_id == step_id
-            })
-        })
+    let session = store.session_dir(job_id, run_attempt, step_id);
+    if session.try_exists().is_ok_and(|exists| !exists) {
+        return false;
+    }
+    !store
+        .completion_reported(job_id, run_attempt, step_id)
         .unwrap_or(false)
 }
 
@@ -898,6 +1076,8 @@ mod gpu_deny_tests {
 }
 
 pub struct TrackedJob {
+    fabric_binding: Option<spur_core::fabric_binding::FabricBinding>,
+    gpu_binding: Option<spur_core::gpu_binding::GpuBinding>,
     job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
     stdout_path: String,
@@ -1013,6 +1193,7 @@ async fn run_completion_hooks_and_report(
     hooks: &HooksConfig,
     spank: &Option<SpankHost>,
     controller_addr: &str,
+    node_token: &str,
 ) {
     let mut drain_jobs: HashMap<u32, String> = HashMap::new();
 
@@ -1077,6 +1258,8 @@ async fn run_completion_hooks_and_report(
                 reporting_node: &local_hostname,
                 drain: drain.as_ref(),
                 step_id: None,
+                node_token: node_token.to_string(),
+                pty_step_id: None,
             },
         )
         .await;
@@ -1109,6 +1292,7 @@ async fn wait_for_exit_and_teardown(
     hooks: Arc<HooksConfig>,
     spank: Arc<Option<SpankHost>>,
     controller_addr: String,
+    node_token: String,
 ) {
     let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
     loop {
@@ -1160,7 +1344,14 @@ async fn wait_for_exit_and_teardown(
         if let Some(c) = completed {
             teardown_completed_job(&c, lifecycle, running, allocation, mpi_host).await;
             tokio::spawn(async move {
-                run_completion_hooks_and_report(&[c], &hooks, &spank, &controller_addr).await;
+                run_completion_hooks_and_report(
+                    &[c],
+                    &hooks,
+                    &spank,
+                    &controller_addr,
+                    &node_token,
+                )
+                .await;
             });
             return;
         }
@@ -1175,9 +1366,18 @@ async fn wait_for_exit_and_teardown(
     }
 }
 
-/// Grace between an immediate signal and its SIGKILL escalation, for both the
-/// legacy and stepd-supervised graceful-cancel paths.
-const GRACEFUL_CANCEL_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
+/// SIGKILL delay for unsupervised steps after an explicit `scancel --signal`.
+const EXPLICIT_SIGNAL_STEP_ESCALATION: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Floor for the SIGTERM-to-SIGKILL gap, and the gap used when a cancel
+/// request names none.
+const MIN_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Raised to the floor because a shorter gap would SIGKILL a step before its
+/// SIGTERM handler could run.
+fn kill_wait_from_request(kill_wait_secs: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(kill_wait_secs)).max(MIN_KILL_WAIT)
+}
 
 /// Polls until the job's `running` entry clears — via the supervisor's own
 /// completion push, this poll fencing a stepd stuck before `Start`, or (on
@@ -1186,6 +1386,7 @@ async fn wait_for_stepd_release(
     job_id: u32,
     run_attempt: u32,
     deadline: tokio::time::Instant,
+    kill_wait: std::time::Duration,
     context: &CompletionListenerContext,
 ) {
     loop {
@@ -1221,7 +1422,13 @@ async fn wait_for_stepd_release(
             // observed to be gone yet by anything gated on stepd_liveness.
             // Escalate on a wall clock instead of waiting on that oracle.
             if any_live {
-                spawn_wedged_stepd_force_reclaim(job_id, run_attempt, deadline, context.clone());
+                spawn_wedged_stepd_force_reclaim(
+                    job_id,
+                    run_attempt,
+                    deadline,
+                    kill_wait,
+                    context.clone(),
+                );
             }
             return;
         }
@@ -1233,8 +1440,8 @@ async fn wait_for_stepd_release(
 /// stuck in a hung hook) rather than exited — `stepd_liveness` reads a
 /// wedged process identically to a healthy one, so nothing gated on it ever
 /// fires here. Comfortably above the existing escalation stack (this
-/// function's own 3s bound, the 5s graceful-cancel grace period, the 10s
-/// stepd-request timeout), so it never fires during ordinary resolution.
+/// function's own 3s bound, the cancel's kill wait, the 10s stepd-request
+/// timeout), so it never fires during ordinary resolution.
 const STEPD_FORCE_RECLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One poll window between kill retries; the ledger only releases once one
@@ -1301,16 +1508,19 @@ fn force_kill_stepd(descriptor: &crate::stepd::StepdDescriptor) {
 
 /// Spawned once `wait_for_stepd_release`'s own bound elapses with a still-
 /// live descriptor. Waits out the wall-clock force window (from the
-/// original cancel, not from this spawn), then kills and fences
+/// original cancel, not from this spawn) after the kill wait has had its
+/// chance to end the supervisor gracefully, then kills and fences
 /// unconditionally — attempt-scoped the same way the active-fence loop is,
 /// so a redispatch that already superseded this attempt is never touched.
 fn spawn_wedged_stepd_force_reclaim(
     job_id: u32,
     run_attempt: u32,
     active_fence_deadline: tokio::time::Instant,
+    kill_wait: std::time::Duration,
     context: CompletionListenerContext,
 ) {
-    let force_deadline = active_fence_deadline - CANCEL_REAP_TIMEOUT + force_reclaim_timeout();
+    let force_deadline =
+        active_fence_deadline - CANCEL_REAP_TIMEOUT + kill_wait + force_reclaim_timeout();
     tokio::spawn(async move {
         tokio::time::sleep_until(force_deadline).await;
         // `running` and `stepds` are locked in separate statements, never
@@ -1524,6 +1734,7 @@ pub struct CompletionListenerContext {
     stepds_store: crate::stepd::StepdStore,
     controller_addr: String,
     hostname: String,
+    reporter: Arc<NodeReporter>,
 }
 
 impl StepdRecoveryCleanup {
@@ -1574,6 +1785,29 @@ async fn release_stepd_tracking(
     descriptor: &crate::stepd::StepdDescriptor,
     reason: &'static str,
 ) -> bool {
+    if let Some(state_dir) = descriptor
+        .socket_path
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::parent)
+    {
+        let store = crate::stepd::StepdStore::new(state_dir);
+        let cleaned = store.prepare_cleanup(descriptor).unwrap_or_else(|error| {
+            warn!(job_id = descriptor.job_id, %error, "cannot confirm cleanup before releasing tracking");
+            false
+        });
+        if !cleaned
+            && !store
+                .completion_reported(
+                    descriptor.job_id,
+                    descriptor.run_attempt,
+                    descriptor.step_id,
+                )
+                .unwrap_or(false)
+        {
+            return false;
+        }
+    }
     // The allocation outlives the individual steps drawing on it, so only the
     // job's last supervisor releases it. Held across the release so a step
     // claimed meanwhile cannot have its allocation torn down underneath it.
@@ -1656,13 +1890,30 @@ async fn discard_stepd_session(descriptor: &crate::stepd::StepdDescriptor) {
     if let Err(error) = stop_stepd_process(descriptor).await {
         warn!(job_id, run_attempt, %error, "failed to stop abandoned stepd");
     }
-    if !runtime_cgroup_reaped(&effective_cgroup_path(descriptor)) {
+    if !runtime_cgroup_reaped(&effective_cgroup_path(descriptor)).await {
         warn!(
             job_id,
             run_attempt, "could not confirm the abandoned stepd's cgroup is empty"
         );
     }
     cleanup_stepd_files(descriptor);
+}
+
+/// The job's tracked run if it is still `run_attempt`: a redispatch may have replaced it.
+fn tracked_run(
+    jobs: &HashMap<u32, TrackedJob>,
+    job_id: u32,
+    run_attempt: u32,
+) -> Option<&TrackedJob> {
+    jobs.get(&job_id)
+        .filter(|tracked| tracked.run_attempt == run_attempt)
+}
+
+/// Whether the node already tracks this run of the job or a newer one; an older run is
+/// superseded by the incoming one, not a duplicate of it.
+fn tracks_run_at_or_after(jobs: &HashMap<u32, TrackedJob>, job_id: u32, run_attempt: u32) -> bool {
+    jobs.get(&job_id)
+        .is_some_and(|tracked| tracked.run_attempt >= run_attempt)
 }
 
 /// Build an empty running-jobs map to share between the reporter and the agent.
@@ -1677,53 +1928,56 @@ pub async fn recover_stepds(
     let mut jobs = running.lock().await;
     for descriptor in descriptors {
         let owns_lifetime = spur_core::step::owns_job_lifetime(descriptor.step_id);
-        let cgroup_path = (!descriptor.cgroup_path.as_os_str().is_empty())
-            .then(|| descriptor.cgroup_path.clone());
-        let tracked = jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
-            job: executor::RunningJob::AllocationOnly,
-            // Only the job-owning step's cgroup is the job's own; a step
-            // arriving first in directory order must not seed this from its
-            // own per-step leaf.
-            cgroup_path: owns_lifetime.then(|| cgroup_path.clone()).flatten(),
-            rootfs_mode: crate::container::RootfsMode::Extracted,
-            stdout_path: String::new(),
-            stderr_path: String::new(),
-            has_pid_namespace: descriptor.has_pid_namespace,
-            has_user_namespace: descriptor.has_user_namespace,
-            has_mount_namespace: descriptor.has_mount_namespace,
-            _pty_master: None,
-            work_dir: descriptor.work_dir.clone(),
-            uid: descriptor.uid,
-            gid: descriptor.gid,
-            user: if owns_lifetime {
-                descriptor.owner.clone()
-            } else {
-                String::new()
-            },
-            partition: descriptor.resources.partition.clone(),
-            gpu_devices: descriptor.resources.gpu_devices.clone(),
-            cpus: descriptor.resources.cpus,
-            memory_mb: descriptor.resources.memory_mb,
-            nodelist: descriptor.resources.nodelist.clone(),
-            mpi: descriptor.resources.mpi.clone(),
-            run_attempt: descriptor.run_attempt,
-        });
-        // Sessions arrive in directory order, so only take these from the job's
-        // own: a step's spool file and rootfs are the step's, not the job's.
-        if !owns_lifetime {
+        let tracked = jobs
+            .entry(descriptor.job_id)
+            .or_insert_with(|| tracked_from_session(&descriptor, owns_lifetime));
+        // Sessions arrive in directory order; only the newest run's own session sets the job.
+        if !owns_lifetime || descriptor.run_attempt < tracked.run_attempt {
             continue;
         }
-        tracked.user = descriptor.owner.clone();
-        tracked.cgroup_path = cgroup_path;
-        if !descriptor.stdout_path.is_empty() {
-            tracked.stdout_path = descriptor.stdout_path.clone();
+        *tracked = tracked_from_session(&descriptor, true);
+    }
+}
+
+/// The job as one of its sessions describes it. Only the session that owns the job speaks for
+/// its cgroup, owner, spool and rootfs; a step's are its own.
+fn tracked_from_session(descriptor: &crate::stepd::StepdDescriptor, owns_job: bool) -> TrackedJob {
+    let cgroup_path = (owns_job && !descriptor.cgroup_path.as_os_str().is_empty())
+        .then(|| descriptor.cgroup_path.clone());
+    let own = |value: &String| {
+        if owns_job {
+            value.clone()
+        } else {
+            String::new()
         }
-        if !descriptor.stderr_path.is_empty() {
-            tracked.stderr_path = descriptor.stderr_path.clone();
-        }
-        if let Some(mode) = descriptor.container_rootfs_mode.clone() {
-            tracked.rootfs_mode = mode;
-        }
+    };
+    TrackedJob {
+        fabric_binding: descriptor.resources.fabric_binding.clone(),
+        gpu_binding: descriptor.resources.gpu_binding.clone(),
+        job: executor::RunningJob::AllocationOnly,
+        cgroup_path,
+        rootfs_mode: descriptor
+            .container_rootfs_mode
+            .clone()
+            .filter(|_| owns_job)
+            .unwrap_or(crate::container::RootfsMode::Extracted),
+        stdout_path: own(&descriptor.stdout_path),
+        stderr_path: own(&descriptor.stderr_path),
+        has_pid_namespace: descriptor.has_pid_namespace,
+        has_user_namespace: descriptor.has_user_namespace,
+        has_mount_namespace: descriptor.has_mount_namespace,
+        _pty_master: None,
+        work_dir: descriptor.work_dir.clone(),
+        uid: descriptor.uid,
+        gid: descriptor.gid,
+        user: own(&descriptor.owner),
+        partition: descriptor.resources.partition.clone(),
+        gpu_devices: descriptor.resources.gpu_devices.clone(),
+        cpus: descriptor.resources.cpus,
+        memory_mb: descriptor.resources.memory_mb,
+        nodelist: descriptor.resources.nodelist.clone(),
+        mpi: descriptor.resources.mpi.clone(),
+        run_attempt: descriptor.run_attempt,
     }
 }
 
@@ -1752,16 +2006,13 @@ async fn settle_recovered_stepd(
         "runtime completion",
     )
     .await;
-    // The controller report this poll goes on to make does not reach a client
-    // that reattached to this step after the agent restarted.
-    completions
-        .complete(
-            descriptor.job_id,
-            descriptor.run_attempt,
-            descriptor.step_id,
-            crate::step_completion::StepOutcome { exit_code, signal },
-        )
-        .await;
+    deliver_runtime_completion(
+        store,
+        completions,
+        descriptor,
+        crate::step_completion::StepOutcome { exit_code, signal },
+    )
+    .await;
     let epilog_failed = store
         .epilog_failed(
             descriptor.job_id,
@@ -1776,6 +2027,7 @@ async fn settle_recovered_stepd(
         exit_code,
         signal,
         epilog_failed,
+        pty_step_id: descriptor.pty_step_id,
     })
 }
 
@@ -1786,9 +2038,10 @@ pub(crate) fn monitor_recovered_stepds(
     completions: crate::step_completion::StepCompletions,
     descriptors: Vec<crate::stepd::StepdDescriptor>,
     store: crate::stepd::StepdStore,
-    controller_addr: String,
+    reporter: Arc<NodeReporter>,
 ) {
     tokio::spawn(async move {
+        let controller_addr = reporter.controller_addr.clone();
         let mut pending: StepdMap = descriptors
             .into_iter()
             .map(|descriptor| (stepd_key(&descriptor), descriptor))
@@ -1875,7 +2128,8 @@ pub(crate) fn monitor_recovered_stepds(
             }
             let mut acknowledged = Vec::new();
             for completion in completed.values() {
-                if report_completion(
+                if report_runtime_completion(
+                    &store,
                     &controller_addr,
                     CompletionReport {
                         job_id: completion.job_id,
@@ -1887,20 +2141,34 @@ pub(crate) fn monitor_recovered_stepds(
                             reason: "epilog script failed".into(),
                         }),
                         step_id: Some(completion.step_id),
+                        node_token: reporter.node_token(),
+                        pty_step_id: completion.pty_step_id,
                     },
                 )
                 .await
                 {
-                    if let Err(error) = store.acknowledge_completion(completion) {
-                        warn!(
-                            job_id = completion.job_id,
-                            run_attempt = completion.run_attempt,
-                            %error,
-                            "failed to acknowledge recovered runtime completion"
-                        );
-                    } else {
-                        acknowledged.push((completion.job_id, completion.step_id));
+                    if let Some(descriptor) = pending.get(&(completion.job_id, completion.step_id))
+                    {
+                        release_stepd_tracking(
+                            &running,
+                            &allocation,
+                            &stepds,
+                            descriptor,
+                            "recovered completion",
+                        )
+                        .await;
+                        deliver_runtime_completion(
+                            &store,
+                            &completions,
+                            descriptor,
+                            crate::step_completion::StepOutcome {
+                                exit_code: completion.exit_code,
+                                signal: completion.signal,
+                            },
+                        )
+                        .await;
                     }
+                    acknowledged.push((completion.job_id, completion.step_id));
                 }
             }
             for key in acknowledged {
@@ -1965,6 +2233,148 @@ async fn claim_stepd(
     }
 }
 
+fn runtime_completion_ready(
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> bool {
+    store
+        .completion_reported(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        )
+        .unwrap_or(false)
+        || store.prepare_cleanup(descriptor).unwrap_or(false)
+}
+
+async fn deliver_runtime_completion(
+    store: &crate::stepd::StepdStore,
+    completions: &crate::step_completion::StepCompletions,
+    descriptor: &crate::stepd::StepdDescriptor,
+    outcome: crate::step_completion::StepOutcome,
+) -> bool {
+    // A client can release its allocation immediately after receiving the exit.
+    if !runtime_completion_ready(store, descriptor) {
+        return false;
+    }
+    completions
+        .complete(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+            outcome,
+        )
+        .await
+}
+
+fn ensure_runtime_exit_ready(
+    store: &crate::stepd::StepdStore,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: u32,
+) -> Result<(), Status> {
+    let descriptor = if run_attempt == 0 {
+        let found = store
+            .discover_live()
+            .map_err(|error| Status::unavailable(error.to_string()))?;
+        found
+            .live
+            .into_iter()
+            .chain(found.stale)
+            .filter(|descriptor| descriptor.job_id == job_id && descriptor.step_id == step_id)
+            .filter(|descriptor| {
+                store
+                    .observed_exit(job_id, descriptor.run_attempt, step_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .max_by_key(|descriptor| descriptor.run_attempt)
+    } else {
+        match store.load_descriptor(&store.session_dir(job_id, run_attempt, step_id)) {
+            Ok(descriptor) => Some(descriptor),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(Status::unavailable(error.to_string())),
+        }
+    };
+    let ready = match descriptor {
+        Some(descriptor) => runtime_completion_ready(store, &descriptor),
+        // Attempt 0 means the caller does not know the attempt, so only a clean node proves it.
+        None if run_attempt == 0 => store.ensure_cleanup_ready().is_ok(),
+        None => store.ensure_job_cleanup_ready(job_id, run_attempt).is_ok(),
+    };
+    if !ready {
+        return Err(Status::unavailable(
+            "step cleanup or node quarantine is still pending",
+        ));
+    }
+    Ok(())
+}
+
+async fn report_runtime_completion(
+    store: &crate::stepd::StepdStore,
+    controller_addr: &str,
+    mut report: CompletionReport<'_>,
+) -> bool {
+    let step_id = report.step_id.unwrap_or(spur_core::step::STEP_BATCH);
+    let descriptor = match store.load_descriptor(&store.session_dir(
+        report.job_id,
+        report.run_attempt,
+        step_id,
+    )) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            warn!(job_id = report.job_id, %error, "cannot establish completion cleanup ownership");
+            return false;
+        }
+    };
+    let cleaned = store.prepare_cleanup(&descriptor).unwrap_or_else(|error| {
+        warn!(job_id = report.job_id, %error, "cannot confirm completion cleanup");
+        false
+    });
+    let drain = DrainRequest {
+        reason: match report.drain {
+            Some(earlier) => format!(
+                "{}; {}",
+                earlier.reason,
+                crate::cgroup_cleanup::DRAIN_REASON
+            ),
+            None => crate::cgroup_cleanup::DRAIN_REASON.into(),
+        },
+    };
+    if !cleaned {
+        if !store.cleanup_expired(&descriptor).unwrap_or(false) {
+            return false;
+        }
+        if !store.cleanup_quarantined(&descriptor).unwrap_or(false) {
+            report.drain = Some(&drain);
+        }
+    }
+    let completion = crate::stepd::PendingStepdCompletion {
+        job_id: report.job_id,
+        run_attempt: report.run_attempt,
+        step_id,
+        exit_code: report.exit_code,
+        signal: report.signal,
+        epilog_failed: false,
+        pty_step_id: report.pty_step_id,
+    };
+    if !report_completion(controller_addr, report).await {
+        return false;
+    }
+    if !cleaned {
+        if let Err(error) = store.acknowledge_cleanup_quarantine(&descriptor) {
+            warn!(job_id = completion.job_id, %error, "cannot persist acknowledged cleanup quarantine");
+            return false;
+        }
+    }
+    if let Err(error) = store.acknowledge_completion(&completion) {
+        warn!(job_id = completion.job_id, %error, "cannot persist acknowledged runtime completion");
+        return false;
+    }
+    true
+}
+
 async fn fence_dead_stepd(
     context: &CompletionListenerContext,
     descriptor: crate::stepd::StepdDescriptor,
@@ -1977,6 +2387,7 @@ async fn fence_dead_stepd(
         stepds_store: store,
         controller_addr,
         hostname,
+        reporter,
     } = context;
     if !claim_stepd(stepds, &descriptor).await {
         return;
@@ -2019,23 +2430,11 @@ async fn fence_dead_stepd(
                 "failed to record synthetic exit for a dead stepd");
         }
     }
-    // The crashed supervisor was the cgroup's only owner, so its job process
-    // can outlive it as an orphan — reap it before releasing this node's ledger.
-    // No unit is left to retry stopping, so an unconfirmed cgroup still proceeds.
-    if !runtime_cgroup_reaped(&effective_cgroup_path(&descriptor)) {
-        warn!(
-            job_id = descriptor.job_id,
-            run_attempt = descriptor.run_attempt,
-            "could not confirm the crashed stepd's cgroup is empty; releasing tracking anyway"
-        );
-    }
-    // Release the local allocation before reporting, so the controller never
-    // dispatches a new job into this slot before it's actually free.
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
-
     // The supervisor cannot be recovered, but its death still has to reach the
     // controller: unreported, the job holds its allocation in Running forever.
-    let reported = report_completion(
+    let reported = report_runtime_completion(
+        store,
         controller_addr,
         CompletionReport {
             job_id: descriptor.job_id,
@@ -2045,17 +2444,14 @@ async fn fence_dead_stepd(
             reporting_node: hostname,
             drain: None,
             step_id: Some(descriptor.step_id),
+            node_token: reporter.node_token(),
+            pty_step_id: descriptor.pty_step_id,
         },
     )
     .await;
-    if reported {
-        if let Err(error) =
-            obligations.append(&crate::stepd::StepdObligation::CompletionAcknowledged)
-        {
-            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
-                "failed to record the acknowledged completion of a dead stepd");
-        }
-    } else {
+    // The first release is a no-op while cleanup is stalled; a recorded report now permits it.
+    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+    if !reported {
         warn!(
             job_id = descriptor.job_id,
             run_attempt = descriptor.run_attempt,
@@ -2065,14 +2461,13 @@ async fn fence_dead_stepd(
 
     // The supervisor is gone, so no completion push is coming; without this the
     // RPC that launched this step stays parked for the agent's lifetime.
-    if completions
-        .complete(
-            descriptor.job_id,
-            descriptor.run_attempt,
-            descriptor.step_id,
-            crate::step_completion::StepOutcome { exit_code, signal },
-        )
-        .await
+    if deliver_runtime_completion(
+        store,
+        completions,
+        &descriptor,
+        crate::step_completion::StepOutcome { exit_code, signal },
+    )
+    .await
     {
         warn!(
             job_id = descriptor.job_id,
@@ -2180,12 +2575,14 @@ async fn handle_completion_notification(
 
     let response = match descriptor {
         Some(descriptor) if !claim_stepd(&context.stepds, &descriptor).await => {
-            // Already claimed elsewhere (the watchdog, or a concurrent duplicate push).
-            crate::stepd::AgentNotificationResponse::Acknowledged
+            // Another reporter may still be waiting for cleanup or controller approval.
+            if unreported_durable_exit(&context.stepds_store, job_id, run_attempt, step_id) {
+                crate::stepd::AgentNotificationResponse::Deferred
+            } else {
+                crate::stepd::AgentNotificationResponse::Acknowledged
+            }
         }
         Some(descriptor) => {
-            // Release the local allocation before reporting, so the controller
-            // never dispatches a new job into this slot before it's actually free.
             release_stepd_tracking(
                 &context.running,
                 &context.allocation,
@@ -2194,7 +2591,8 @@ async fn handle_completion_notification(
                 "runtime completion",
             )
             .await;
-            let reported = report_completion(
+            let reported = report_runtime_completion(
+                &context.stepds_store,
                 &context.controller_addr,
                 CompletionReport {
                     job_id,
@@ -2206,20 +2604,27 @@ async fn handle_completion_notification(
                         reason: "epilog script failed".into(),
                     }),
                     step_id: Some(step_id),
+                    node_token: context.reporter.node_token(),
+                    pty_step_id: descriptor.pty_step_id,
                 },
             )
             .await;
-            // A user step's exit ends the RPC that launched it, not the job, so
-            // the controller report above was a no-op and this is the delivery.
-            context
-                .step_completions
-                .complete(
-                    job_id,
-                    run_attempt,
-                    step_id,
-                    crate::step_completion::StepOutcome { exit_code, signal },
-                )
-                .await;
+            // The first release is a no-op while cleanup is stalled; a recorded report now permits it.
+            release_stepd_tracking(
+                &context.running,
+                &context.allocation,
+                &context.stepds,
+                &descriptor,
+                "runtime completion",
+            )
+            .await;
+            deliver_runtime_completion(
+                &context.stepds_store,
+                &context.step_completions,
+                &descriptor,
+                crate::step_completion::StepOutcome { exit_code, signal },
+            )
+            .await;
             if reported {
                 crate::stepd::AgentNotificationResponse::Acknowledged
             } else {
@@ -2258,10 +2663,33 @@ pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
     controller_addr: &str,
     reporting_node: &str,
+    node_token: &str,
 ) -> anyhow::Result<Vec<SessionIdentity>> {
+    Ok(
+        replay_runtime_completions(store, controller_addr, reporting_node, node_token)
+            .await?
+            .into_iter()
+            .map(|completion| {
+                (
+                    completion.job_id,
+                    completion.run_attempt,
+                    completion.step_id,
+                )
+            })
+            .collect(),
+    )
+}
+
+async fn replay_runtime_completions(
+    store: &crate::stepd::StepdStore,
+    controller_addr: &str,
+    reporting_node: &str,
+    node_token: &str,
+) -> anyhow::Result<Vec<crate::stepd::PendingStepdCompletion>> {
     let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
-        if report_completion(
+        if report_runtime_completion(
+            store,
             controller_addr,
             CompletionReport {
                 job_id: completion.job_id,
@@ -2273,33 +2701,204 @@ pub async fn replay_unacknowledged_stepd_completions(
                     reason: "epilog script failed".into(),
                 }),
                 step_id: Some(completion.step_id),
+                node_token: node_token.to_string(),
+                pty_step_id: completion.pty_step_id,
             },
         )
         .await
         {
-            store.acknowledge_completion(&completion)?;
-            reconciled.push((
-                completion.job_id,
-                completion.run_attempt,
-                completion.step_id,
-            ));
+            reconciled.push(completion);
         }
     }
     Ok(reconciled)
+}
+
+async fn settle_replayed_completions(
+    context: &CompletionListenerContext,
+    completions: &[crate::stepd::PendingStepdCompletion],
+) {
+    for completion in completions {
+        let session = context.stepds_store.session_dir(
+            completion.job_id,
+            completion.run_attempt,
+            completion.step_id,
+        );
+        if let Ok(descriptor) = context.stepds_store.load_descriptor(&session) {
+            release_stepd_tracking(
+                &context.running,
+                &context.allocation,
+                &context.stepds,
+                &descriptor,
+                "completion replay",
+            )
+            .await;
+        }
+        // Acknowledgement can prune the descriptor before a parked caller is answered.
+        context
+            .step_completions
+            .complete(
+                completion.job_id,
+                completion.run_attempt,
+                completion.step_id,
+                crate::step_completion::StepOutcome {
+                    exit_code: completion.exit_code,
+                    signal: completion.signal,
+                },
+            )
+            .await;
+    }
+}
+
+async fn quarantine_expired_cleanup(
+    store: &crate::stepd::StepdStore,
+    controller_addr: &str,
+    reporting_node: &str,
+    node_token: &str,
+) -> std::io::Result<()> {
+    store.retry_cleanup()?;
+    let cleanup = store.cleanup_store();
+    for record in cleanup.records()? {
+        if !cleanup.expired(&record)? {
+            continue;
+        }
+        if !record.quarantine_acknowledged {
+            if !report_node_quarantine(controller_addr, reporting_node, node_token).await {
+                break;
+            }
+            cleanup.acknowledge_quarantine(&record)?;
+        }
+        let session = store.session_dir(record.job_id, record.run_attempt, record.step_id);
+        if store.load_descriptor(&session).is_err() {
+            report_orphan_cleanup_completion(
+                store,
+                &record,
+                controller_addr,
+                reporting_node,
+                node_token,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn report_orphan_cleanup_completion(
+    store: &crate::stepd::StepdStore,
+    record: &crate::cgroup_cleanup::PendingCleanup,
+    controller_addr: &str,
+    reporting_node: &str,
+    node_token: &str,
+) -> std::io::Result<()> {
+    if store.completion_reported(record.job_id, record.run_attempt, record.step_id)? {
+        return Ok(());
+    }
+    // The cleanup marker can outlive a lost or pruned supervisor directory.
+    store.prepare_session_dir(record.job_id, record.run_attempt, record.step_id)?;
+    let (exit_code, signal) =
+        match store.observed_exit(record.job_id, record.run_attempt, record.step_id)? {
+            Some(exit) => exit,
+            None => {
+                let exit = (0, nix::sys::signal::Signal::SIGKILL as i32);
+                store
+                    .obligations(record.job_id, record.run_attempt, record.step_id)
+                    .append(&crate::stepd::StepdObligation::ExitObserved {
+                        exit_code: exit.0,
+                        signal: exit.1,
+                    })?;
+                exit
+            }
+        };
+    if report_completion(
+        controller_addr,
+        CompletionReport {
+            job_id: record.job_id,
+            run_attempt: record.run_attempt,
+            step_id: Some(record.step_id),
+            exit_code,
+            signal,
+            reporting_node,
+            drain: None,
+            node_token: node_token.to_owned(),
+            pty_step_id: None,
+        },
+    )
+    .await
+    {
+        store.acknowledge_completion(&crate::stepd::PendingStepdCompletion {
+            job_id: record.job_id,
+            run_attempt: record.run_attempt,
+            step_id: record.step_id,
+            exit_code,
+            signal,
+            epilog_failed: false,
+            pty_step_id: None,
+        })?;
+    }
+    Ok(())
+}
+
+async fn report_node_quarantine(
+    controller_addr: &str,
+    reporting_node: &str,
+    node_token: &str,
+) -> bool {
+    let result = retry_controller_rpc(|_| async {
+        let channel = spur_client::connect_channel(controller_addr)
+            .await
+            .map_err(ControllerRpcError::Connect)?;
+        let mut client = crate::controller_auth::wrap(channel)
+            .await
+            .map_err(ControllerRpcError::Rpc)?;
+        client
+            .report_job_status(ReportJobStatusRequest {
+                job_id: 0,
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                reporting_node: reporting_node.to_owned(),
+                drain_node: true,
+                drain_reason: crate::cgroup_cleanup::DRAIN_REASON.into(),
+                node_token: node_token.to_owned(),
+                ..Default::default()
+            })
+            .await
+            .map_err(ControllerRpcError::Rpc)
+    })
+    .await;
+    if let Err(error) = &result {
+        warn!(%error, "could not confirm node quarantine for pending cleanup");
+    }
+    result.is_ok()
 }
 
 pub fn retry_unacknowledged_stepd_completions(
     store: crate::stepd::StepdStore,
     controller_addr: String,
     reporting_node: String,
+    reporter: Arc<NodeReporter>,
+    context: CompletionListenerContext,
 ) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match replay_unacknowledged_stepd_completions(&store, &controller_addr, &reporting_node)
-                .await
+            if let Err(error) = quarantine_expired_cleanup(
+                &store,
+                &controller_addr,
+                &reporting_node,
+                &reporter.node_token(),
+            )
+            .await
+            {
+                warn!(%error, "failed to reconcile cleanup quarantine");
+            }
+            match replay_runtime_completions(
+                &store,
+                &controller_addr,
+                &reporting_node,
+                &reporter.node_token(),
+            )
+            .await
             {
                 Ok(reconciled) if !reconciled.is_empty() => {
+                    settle_replayed_completions(&context, &reconciled).await;
                     tracing::info!(
                         completions = reconciled.len(),
                         "reconciled durable runtime completions"
@@ -2309,6 +2908,9 @@ pub fn retry_unacknowledged_stepd_completions(
                 Err(error) => {
                     tracing::warn!(%error, "failed to replay durable runtime completions");
                 }
+            }
+            if let Err(error) = store.retry_cleanup() {
+                warn!(%error, "failed to retry cgroup cleanup");
             }
             // A settled user step's record is held past its completion report so
             // a restart can still answer for it; nothing else sweeps it later.
@@ -3583,6 +4185,7 @@ pub struct AgentService {
     cred_keys: Option<Arc<spur_core::native_jwks::Ed25519VerifyKeySet>>,
     launch_acceptance: Arc<spur_core::native_exec::LaunchAcceptance>,
     auth_policy: spur_core::config::AuthConfig,
+    block_file: Option<std::path::PathBuf>,
 }
 
 impl AgentService {
@@ -3719,6 +4322,7 @@ impl AgentService {
             cred_keys: None,
             launch_acceptance: Arc::new(spur_core::native_exec::LaunchAcceptance::new()),
             auth_policy: spur_core::config::AuthConfig::default(),
+            block_file: None,
         }
     }
 
@@ -3754,6 +4358,10 @@ impl AgentService {
         }
     }
 
+    pub fn set_block_file(&mut self, path: Option<std::path::PathBuf>) {
+        self.block_file = path;
+    }
+
     pub fn apply_auth_policy(&mut self, auth: &spur_core::config::AuthConfig) {
         self.auth_policy = auth.clone();
         self.allow_root_jobs = auth.allow_root_jobs;
@@ -3787,6 +4395,12 @@ impl AgentService {
                     "adopted a stepd whose recorded cgroup is gone; deriving instead"
                 );
                 descriptor.cgroup_path = std::path::PathBuf::new();
+            }
+            if sessions
+                .get(&stepd_key(&descriptor))
+                .is_some_and(|newer| newer.run_attempt > descriptor.run_attempt)
+            {
+                continue;
             }
             sessions.insert(stepd_key(&descriptor), descriptor.clone());
             if let (Some(id), Some(digest)) = (
@@ -3831,7 +4445,12 @@ impl AgentService {
             // A legacy descriptor holds positional ids that no longer match the
             // BDF-anchored stable_ids; translate through the live inventory so
             // the adopt succeeds instead of leaving the job's GPUs reading free.
-            let translated = translate_legacy_gpu_ids(&resources.gpu_devices, &allocation.gpus);
+            let translated =
+                if resources.fabric_binding.is_some() || resources.gpu_binding.is_some() {
+                    None
+                } else {
+                    translate_legacy_gpu_ids(&resources.gpu_devices, &allocation.gpus)
+                };
             let gpu_ids: Vec<u64> = match &translated {
                 Some(stable_ids) => {
                     info!(
@@ -3878,12 +4497,22 @@ impl AgentService {
         }
     }
 
-    /// A stale session's supervisor is confirmed dead, so nothing adopts it and
-    /// nothing else will ever speak for it: carry any exit it recorded to the
-    /// caller still waiting on the step, and release it so it can be pruned.
+    /// A dead supervisor may still hold an allocation through pending cleanup;
+    /// only cleaned or acknowledged sessions may release that recovered hold.
     pub async fn settle_stale_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
         let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
         for descriptor in descriptors {
+            if !store.prepare_cleanup(descriptor).unwrap_or(false)
+                && !store
+                    .completion_reported(
+                        descriptor.job_id,
+                        descriptor.run_attempt,
+                        descriptor.step_id,
+                    )
+                    .unwrap_or(false)
+            {
+                continue;
+            }
             match durable_runtime_exit(&store, descriptor) {
                 Ok(Some((exit_code, signal))) => {
                     self.step_completions
@@ -3908,15 +4537,14 @@ impl AgentService {
                     );
                 }
             }
-            if let Err(error) = crate::stepd::record_resources_released(descriptor) {
-                warn!(
-                    job_id = descriptor.job_id,
-                    run_attempt = descriptor.run_attempt,
-                    step_id = descriptor.step_id,
-                    %error,
-                    "failed to record runtime resource release for a stale session"
-                );
-            }
+            release_stepd_tracking(
+                &self.running,
+                &self.allocation,
+                &self.stepds,
+                descriptor,
+                "stale session",
+            )
+            .await;
         }
     }
 
@@ -3928,7 +4556,7 @@ impl AgentService {
             self.step_completions.clone(),
             descriptors.to_vec(),
             crate::stepd::StepdStore::new(&self.stepd_state_dir),
-            self.reporter.controller_addr.clone(),
+            self.reporter.clone(),
         );
     }
 
@@ -3986,9 +4614,13 @@ impl AgentService {
         pmix: Option<crate::stepd::StepdPmix>,
         container_rootfs_mode: Option<crate::container::RootfsMode>,
         step_files: crate::executor::StepOutputFiles,
-        admission: StepLaunchAdmission,
+        admission: (
+            StepLaunchAdmission,
+            Option<crate::job_lifecycle::KeyedLifecycleGuard<u32>>,
+        ),
         persist_cred: (String, String, String),
     ) -> Result<Option<std::process::ExitStatus>, Status> {
+        let (admission, lifecycle) = admission;
         let (job_id, _, step_id) = *admission.key();
         let run_attempt = cfg.run_attempt;
         let step_key = (job_id, step_id);
@@ -4004,6 +4636,20 @@ impl AgentService {
                 ))
             })?;
 
+        let (fabric_binding, gpu_binding, allocation, job_nodelist) = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs
+                .get(&job_id)
+                .ok_or_else(|| Status::failed_precondition("parent allocation disappeared"))?;
+            (
+                tracked.fabric_binding.clone(),
+                tracked.gpu_binding.clone(),
+                Self::tracked_allocation(tracked),
+                tracked.nodelist.clone(),
+            )
+        };
+        self.check_step_allocation(&allocation, &job_nodelist)
+            .await?;
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
         let waiter = self
@@ -4018,6 +4664,8 @@ impl AgentService {
             &self.reporter.hostname,
             &self.stepd_state_dir,
             StepdLaunchOptions {
+                fabric_binding,
+                gpu_binding,
                 step_id,
                 allocation_only: false,
                 container_rootfs_mode,
@@ -4027,6 +4675,7 @@ impl AgentService {
                 cred_id: persist_cred.0,
                 cred_kid: persist_cred.1,
                 cred_digest: persist_cred.2,
+                pty_step_id: None,
             },
             &admission,
         )
@@ -4080,6 +4729,7 @@ impl AgentService {
         // The session is tracked, so a duplicate can be refused outright rather
         // than parked here for the whole of the step's runtime.
         drop(admission);
+        drop(lifecycle);
 
         // Record the workload's pid, not the supervisor's, so the existing
         // cancel path signals the step's own tree and leaves its reporter alive.
@@ -4119,6 +4769,7 @@ impl AgentService {
         &self,
         job_id: u32,
         run_attempt: u32,
+        pty_step_id: spur_core::step::StepId,
         cfg: &executor::JobLaunchConfig,
         container_rootfs_mode: Option<crate::container::RootfsMode>,
     ) -> Result<
@@ -4145,6 +4796,20 @@ impl AgentService {
                 ))
             })?;
 
+        let (fabric_binding, gpu_binding, allocation, job_nodelist) = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs
+                .get(&job_id)
+                .ok_or_else(|| Status::failed_precondition("parent allocation disappeared"))?;
+            (
+                tracked.fabric_binding.clone(),
+                tracked.gpu_binding.clone(),
+                Self::tracked_allocation(tracked),
+                tracked.nodelist.clone(),
+            )
+        };
+        self.check_step_allocation(&allocation, &job_nodelist)
+            .await?;
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
         let waiter = self
@@ -4159,6 +4824,8 @@ impl AgentService {
             &self.reporter.hostname,
             &self.stepd_state_dir,
             StepdLaunchOptions {
+                fabric_binding,
+                gpu_binding,
                 step_id,
                 allocation_only: false,
                 container_rootfs_mode,
@@ -4168,6 +4835,7 @@ impl AgentService {
                 cred_id: String::new(),
                 cred_kid: String::new(),
                 cred_digest: String::new(),
+                pty_step_id: Some(pty_step_id),
             },
             &admission,
         )
@@ -4264,6 +4932,7 @@ impl AgentService {
             stepds_store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
+            reporter: self.reporter.clone(),
         }
     }
 
@@ -4280,13 +4949,14 @@ impl AgentService {
         &self,
         job_id: u32,
         run_attempt: u32,
+        kill_wait: std::time::Duration,
     ) -> tokio::task::JoinHandle<()> {
         let context = self.completion_listener_context();
         tokio::spawn(async move {
             // The caller already validated run_attempt via runs_attempt; a
             // fresh running read here could pick up a newer attempt instead.
             let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
-            wait_for_stepd_release(job_id, run_attempt, deadline, &context).await;
+            wait_for_stepd_release(job_id, run_attempt, deadline, kill_wait, &context).await;
         })
     }
 
@@ -4298,6 +4968,7 @@ impl AgentService {
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
         let lifecycle = self.lifecycle.clone();
+        let reporter = self.reporter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -4367,7 +5038,14 @@ impl AgentService {
                     reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
                 }
 
-                run_completion_hooks_and_report(&completed, &hooks, &spank, &controller_addr).await;
+                run_completion_hooks_and_report(
+                    &completed,
+                    &hooks,
+                    &spank,
+                    &controller_addr,
+                    &reporter.node_token(),
+                )
+                .await;
             }
         });
     }
@@ -4448,6 +5126,7 @@ impl Drop for LaunchReservationGuard {
 use spur_proto::controller_rpc_retryable;
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
+const CONTROLLER_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A single failed attempt at a controller RPC.
@@ -4487,7 +5166,14 @@ where
 {
     let mut n = 1;
     loop {
-        match attempt(n).await {
+        let result = tokio::time::timeout(CONTROLLER_RPC_TIMEOUT, attempt(n))
+            .await
+            .unwrap_or_else(|_| {
+                Err(ControllerRpcError::Rpc(Status::deadline_exceeded(
+                    "controller report timed out",
+                )))
+            });
+        match result {
             Ok(value) => return Ok(value),
             Err(e) => {
                 if !e.retryable() || n == CONTROLLER_RPC_ATTEMPTS {
@@ -4504,7 +5190,7 @@ where
 mod controller_rpc_tests {
     use super::{
         controller_rpc_retryable, retry_controller_rpc, ControllerRpcError,
-        CONTROLLER_RPC_ATTEMPTS, CONTROLLER_RPC_RETRY_GAP,
+        CONTROLLER_RPC_ATTEMPTS, CONTROLLER_RPC_RETRY_GAP, CONTROLLER_RPC_TIMEOUT,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
@@ -4532,6 +5218,26 @@ mod controller_rpc_tests {
         })
         .await;
         (result, calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unresponsive_controller_cannot_block_cleanup_reconciliation() {
+        let calls = AtomicU32::new(0);
+        let start = tokio::time::Instant::now();
+        let result = retry_controller_rpc::<(), _, _>(|_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending()
+        })
+        .await;
+        assert!(
+            matches!(result, Err(ControllerRpcError::Rpc(status)) if status.code() == tonic::Code::DeadlineExceeded)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), CONTROLLER_RPC_ATTEMPTS);
+        assert_eq!(
+            start.elapsed(),
+            CONTROLLER_RPC_TIMEOUT * CONTROLLER_RPC_ATTEMPTS
+                + CONTROLLER_RPC_RETRY_GAP * (CONTROLLER_RPC_ATTEMPTS - 1)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4966,6 +5672,11 @@ pub(crate) struct CompletionReport<'a> {
     pub reporting_node: &'a str,
     pub drain: Option<&'a DrainRequest>,
     pub step_id: Option<spur_core::step::StepId>,
+    /// Required for drain requests and standalone-PTY completion when the
+    /// controller enforces node identity.
+    pub node_token: String,
+    /// See [`crate::stepd::StepdDescriptor::pty_step_id`].
+    pub pty_step_id: Option<spur_core::step::StepId>,
 }
 
 pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
@@ -4977,6 +5688,8 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
         reporting_node,
         drain,
         step_id,
+        node_token,
+        pty_step_id,
     } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
@@ -4984,42 +5697,47 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
-    let result = retry_controller_rpc(move |attempt| async move {
-        let channel = spur_client::connect_channel(controller_addr)
-            .await
-            .map_err(|e| {
+    let result = retry_controller_rpc(move |attempt| {
+        let node_token = node_token.clone();
+        async move {
+            let channel = spur_client::connect_channel(controller_addr)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        job_id,
+                        attempt,
+                        error = %e,
+                        "failed to connect to controller for completion report"
+                    );
+                    ControllerRpcError::Connect(e)
+                })?;
+            let mut client = crate::controller_auth::wrap(channel)
+                .await
+                .map_err(ControllerRpcError::Rpc)?;
+            let req = ReportJobStatusRequest {
+                step_id,
+                job_id,
+                state,
+                exit_code,
+                signal,
+                message: format!("exit_code={}", exit_code),
+                drain_node: drain.is_some(),
+                drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
+                reporting_node: reporting_node.to_string(),
+                run_attempt,
+                node_token,
+                pty_step_id,
+            };
+            client.report_job_status(req).await.map_err(|e| {
                 warn!(
                     job_id,
                     attempt,
                     error = %e,
-                    "failed to connect to controller for completion report"
+                    "ReportJobStatus RPC failed"
                 );
-                ControllerRpcError::Connect(e)
-            })?;
-        let mut client = crate::controller_auth::wrap(channel)
-            .await
-            .map_err(ControllerRpcError::Rpc)?;
-        let req = ReportJobStatusRequest {
-            step_id,
-            job_id,
-            state,
-            exit_code,
-            signal,
-            message: format!("exit_code={}", exit_code),
-            drain_node: drain.is_some(),
-            drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
-            reporting_node: reporting_node.to_string(),
-            run_attempt,
-        };
-        client.report_job_status(req).await.map_err(|e| {
-            warn!(
-                job_id,
-                attempt,
-                error = %e,
-                "ReportJobStatus RPC failed"
-            );
-            ControllerRpcError::Rpc(e)
-        })
+                ControllerRpcError::Rpc(e)
+            })
+        }
     })
     .await;
 
@@ -5125,6 +5843,169 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
     }
 }
 
+/// Below the controller's 5s StartJob deadline, so a hung sysfs read fails the start
+/// instead of outliving it.
+const BINDING_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn run_preflight<F>(timeout: std::time::Duration, check: F) -> Result<(), Status>
+where
+    F: FnOnce() -> Result<(), Status> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(check)).await {
+        Ok(joined) => joined.map_err(|error| {
+            Status::internal(format!("dispatch validation worker failed: {error}"))
+        })?,
+        Err(_) => Err(Status::failed_precondition(
+            "timed out reading device state for the allocation's bindings",
+        )),
+    }
+}
+
+fn validate_dispatch_snapshot(
+    mut inventory: spur_core::resource::ResourceSet,
+    allocation: ResourceAllocations,
+    block_file: Option<std::path::PathBuf>,
+    hostname: String,
+    cluster_id: String,
+    check: BindingCheck,
+    job_nodes: Vec<String>,
+) -> Result<(), Status> {
+    let mut resources = spur_core::resource::ResourceAllocations {
+        generation: allocation.generation,
+        ..Default::default()
+    };
+    resources.devices.insert(
+        "gpu".into(),
+        allocation
+            .devices
+            .get("gpu")
+            .map(|devices| {
+                devices
+                    .devices
+                    .iter()
+                    .map(|device| spur_core::resource::AllocatedDevice {
+                        device_id: device.device_id,
+                        count: device.count,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
+    if let Some(binding) = allocation
+        .gpu_binding
+        .clone()
+        .map(spur_core::gpu_binding::from_proto)
+    {
+        let bound = binding.gpus.iter().map(|gpu| gpu.stable_id).collect();
+        refresh_bound_fabric(&mut inventory, &bound, false, std::path::Path::new("/sys"))?;
+        match check {
+            BindingCheck::Dispatch => binding.validate(&hostname, &inventory, &resources),
+            BindingCheck::Step => binding.validate_step(&hostname, &inventory, &resources),
+        }
+        .map_err(Status::failed_precondition)?;
+    }
+    let Some(binding) = allocation
+        .fabric_binding
+        .clone()
+        .map(spur_core::fabric_binding::from_proto)
+    else {
+        return Ok(());
+    };
+    if let Some(revision) = &binding.file_revision {
+        let path = block_file.as_deref().ok_or_else(|| {
+            Status::failed_precondition("block file is not configured on this agent")
+        })?;
+        let file =
+            spur_core::block_file::BlockFile::read(path).map_err(Status::failed_precondition)?;
+        let revision_changed = check == BindingCheck::Dispatch && &file.revision != revision;
+        let node_left = std::iter::once(&hostname)
+            .chain(&job_nodes)
+            .any(|node| !file.contains(&binding.key.fabric_domain, node));
+        if revision_changed || node_left {
+            return Err(Status::failed_precondition(
+                "block file revision or node membership changed",
+            ));
+        }
+        if check == BindingCheck::Dispatch
+            && binding.active_endpoints.iter().any(|endpoint| {
+                endpoint.rsplit_once('/').is_none_or(|(node, id)| {
+                    !file.contains(&binding.key.fabric_domain, node) || id.parse::<u64>().is_err()
+                })
+            })
+        {
+            return Err(Status::failed_precondition(
+                "declared endpoint outside the block file",
+            ));
+        }
+    }
+    let bound = binding
+        .members
+        .iter()
+        .map(|member| member.device.stable_id)
+        .collect();
+    refresh_bound_fabric(
+        &mut inventory,
+        &bound,
+        binding.file_revision.is_some(),
+        std::path::Path::new("/sys"),
+    )?;
+    if !cluster_id.is_empty() && cluster_id != binding.key.namespace {
+        return Err(Status::failed_precondition(
+            "fabric namespace differs from authenticated cluster",
+        ));
+    }
+    let namespace = binding.key.namespace.clone();
+    match check {
+        BindingCheck::Dispatch => binding.validate(&namespace, &hostname, &inventory, &resources),
+        BindingCheck::Step => binding.validate_step(&namespace, &hostname, &inventory, &resources),
+    }
+    .map_err(Status::failed_precondition)
+}
+
+/// Re-reads only the bound devices' UALink attributes by PCI address; other properties
+/// change only through a republished inventory.
+fn refresh_bound_fabric(
+    inventory: &mut spur_core::resource::ResourceSet,
+    bound: &BTreeSet<u64>,
+    file_bound: bool,
+    sysfs: &std::path::Path,
+) -> Result<(), Status> {
+    for gpu in &mut inventory.gpus {
+        if !bound.contains(&gpu.stable_id) {
+            continue;
+        }
+        let Some(topology) = &mut gpu.topology else {
+            continue;
+        };
+        let refresh_native = topology
+            .fabric
+            .as_ref()
+            .is_some_and(|f| f.source == "amd-ualink");
+        let check_new_observation =
+            file_bound && topology.fabric.is_none() && topology.pci_bdf.is_some();
+        if !refresh_native && !check_new_observation {
+            continue;
+        }
+        let bdf = topology
+            .pci_bdf
+            .as_deref()
+            .ok_or_else(|| Status::failed_precondition("bound GPU has no PCI identity"))?;
+        let valid_bdf = bdf.len() == 12
+            && bdf.bytes().enumerate().all(|(index, byte)| match index {
+                4 | 7 => byte == b':',
+                10 => byte == b'.',
+                _ => byte.is_ascii_hexdigit(),
+            });
+        if !valid_bdf {
+            return Err(Status::failed_precondition(
+                "bound GPU has invalid PCI identity",
+            ));
+        }
+        topology.fabric = spur_devices::ualink::observe(&sysfs.join("bus/pci/devices").join(bdf));
+    }
+    Ok(())
+}
+
 /// Reject a dispatch whose stamped inventory generation no longer matches this
 /// node's live generation, so an out-of-band GPU repartition between schedule
 /// and launch cannot bind a job to devices that have since been renumbered.
@@ -5153,6 +6034,11 @@ impl SlurmAgent for AgentService {
             cluster_name: String::new(),
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
+            inactive_limit_secs: None,
+            tres_billing_weights: String::new(),
+            usage_reset_period: String::new(),
+            kill_wait_secs: None,
+            timeout_kill_wait_secs: None,
         }))
     }
 
@@ -5161,7 +6047,25 @@ impl SlurmAgent for AgentService {
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
         Self::require_controller(&request)?;
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        // A launch may carry a layout newer than our last registration adopted;
+        // take it so this job lands under current spec enforcement.
+        self.reporter.adopt_core_layout(
+            req.core_layout.take(),
+            req.layout_revision.take(),
+            crate::spec::Delivery::Launch,
+        );
+        self.require_spec_enforced().await?;
+        let gpu_binding = req
+            .allocated
+            .as_ref()
+            .and_then(|a| a.gpu_binding.clone())
+            .map(spur_core::gpu_binding::from_proto);
+        let fabric_binding = req
+            .allocated
+            .as_ref()
+            .and_then(|a| a.fabric_binding.clone())
+            .map(spur_core::fabric_binding::from_proto);
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
@@ -5275,14 +6179,8 @@ impl SlurmAgent for AgentService {
                 runtime_attempt_already_tracked(&self.stepds, job_id, launch_step, run_attempt)
                     .await;
             if already_tracked {
-                // Idempotent retry: this exact attempt is already tracked and
-                // alive on this node (e.g. spurctld retried after losing the
-                // ack for a LaunchJob it had already delivered, since a
-                // dispatch failure never advances run_attempt before the next
-                // requeue). Report success without touching the live
-                // allocation or session — allocate_local_resources below
-                // would otherwise release and reallocate resources out from
-                // under the still-running process before fencing ever runs.
+                // A retried launch of a run already live here: the fence below accepts an
+                // equal attempt, so it would stop this very run's supervisor.
                 let paths = self
                     .running
                     .lock()
@@ -5304,6 +6202,26 @@ impl SlurmAgent for AgentService {
                     failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                 }));
             }
+            if let Some(allocation) = req.allocated.as_ref() {
+                self.check_dispatch_allocation(allocation).await?;
+            }
+            // Before reserving: the reservation drops the old run's ledger entry, which a
+            // failed fence would otherwise leave its still-running workload without.
+            fence_displaced_run(
+                &self.stepds,
+                &self.step_completions,
+                &crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                std::path::Path::new(executor::CGROUP_ROOT),
+                job_id,
+                launch_step,
+                run_attempt,
+            )
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "failed to fence displaced stepd before launch: {error}"
+                ))
+            })?;
         }
 
         // Left empty rather than defaulted to a flat, shared DEFAULT_WORK_DIR
@@ -5840,13 +6758,6 @@ impl SlurmAgent for AgentService {
             .await;
 
         let launch_result = if stepd_enabled {
-            fence_displaced_stepd(&self.stepds, job_id, launch_step, run_attempt)
-                .await
-                .map_err(|error| {
-                    Status::unavailable(format!(
-                        "failed to fence displaced stepd before launch: {error}"
-                    ))
-                })?;
             launch_stepd(
                 &launch_cfg,
                 run_attempt,
@@ -5854,6 +6765,8 @@ impl SlurmAgent for AgentService {
                 &self.reporter.hostname,
                 &self.stepd_state_dir,
                 StepdLaunchOptions {
+                    fabric_binding: fabric_binding.clone(),
+                    gpu_binding: gpu_binding.clone(),
                     step_id: launch_step,
                     // A `--pty` job's own step is a placeholder like `salloc`'s
                     // extern step: the real command runs via InteractiveSession.
@@ -5868,6 +6781,7 @@ impl SlurmAgent for AgentService {
                     cred_id: persist_cred.0,
                     cred_kid: persist_cred.1,
                     cred_digest: persist_cred.2,
+                    pty_step_id: None,
                 },
                 &admission,
             )
@@ -5995,6 +6909,8 @@ impl SlurmAgent for AgentService {
                 let displaced = jobs.insert(
                     job_id,
                     TrackedJob {
+                        fabric_binding: fabric_binding.clone(),
+                        gpu_binding: gpu_binding.clone(),
                         job: result.job,
                         rootfs_mode: rootfs_mode.clone(),
                         stdout_path: result.stdout_path,
@@ -6029,8 +6945,6 @@ impl SlurmAgent for AgentService {
                 // older run. If its process ignored SIGTERM and outlived the
                 // requeue, kill and reap it here — the monitor loop no longer
                 // tracks it, so without this it would leak as an orphan/zombie.
-                // Its cgroup is deliberately left alone: the path is derived
-                // from job_id, so it is the cgroup the new run just joined.
                 if let Some(old) = displaced {
                     if old.run_attempt < run_attempt {
                         let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
@@ -6131,6 +7045,55 @@ impl SlurmAgent for AgentService {
         }
 
         for descriptor in &gated {
+            self.ensure_node_cleanup_ready()?;
+            if descriptor.resources.fabric_binding.is_some()
+                || descriptor.resources.gpu_binding.is_some()
+            {
+                let mut allocation = spur_core::resource::ResourceAllocations {
+                    generation: descriptor
+                        .resources
+                        .gpu_binding
+                        .as_ref()
+                        .map(|b| b.generation)
+                        .or_else(|| {
+                            descriptor
+                                .resources
+                                .fabric_binding
+                                .as_ref()
+                                .map(|b| b.inventory_generation)
+                        })
+                        .unwrap_or(0),
+                    fabric_binding: descriptor.resources.fabric_binding.clone(),
+                    gpu_binding: descriptor.resources.gpu_binding.clone(),
+                    ..Default::default()
+                };
+                allocation.devices.insert(
+                    "gpu".into(),
+                    descriptor
+                        .resources
+                        .gpu_devices
+                        .iter()
+                        .copied()
+                        .map(spur_core::resource::AllocatedDevice::injectable)
+                        .collect(),
+                );
+                if let Err(error) = self
+                    .check_dispatch_allocation(&crate::reporter::allocations_to_proto(&allocation))
+                    .await
+                {
+                    let _ = stop_stepd_process(descriptor).await;
+                    release_stepd_tracking(
+                        &self.running,
+                        &self.allocation,
+                        &self.stepds,
+                        descriptor,
+                        "fabric binding changed before start",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+
             if let Err(error) =
                 crate::stepd::start_job(descriptor, uuid::Uuid::new_v4().to_string()).await
             {
@@ -6152,6 +7115,18 @@ impl SlurmAgent for AgentService {
                 )));
             }
         }
+        Ok(Response::new(()))
+    }
+
+    async fn signal_job(
+        &self,
+        request: Request<AgentSignalJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let target = SignalTarget::try_from(req.target).unwrap_or(SignalTarget::Unspecified);
+        self.deliver_signal(req.job_id, req.run_attempt, req.signal, target)
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -6199,7 +7174,12 @@ impl SlurmAgent for AgentService {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
                 .await;
         } else {
-            self.graceful_cancel(job_id, req.run_attempt).await;
+            self.graceful_cancel(
+                job_id,
+                req.run_attempt,
+                kill_wait_from_request(req.kill_wait_secs),
+            )
+            .await;
         }
 
         // The signal paths only act on a running job; release a still-launching
@@ -6348,6 +7328,7 @@ impl SlurmAgent for AgentService {
             .await?;
 
         let entry = self.job_entry(req.job_id).await?;
+        self.ensure_node_cleanup_ready()?;
 
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
@@ -6419,14 +7400,39 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        let gpu_binding = req
+            .allocated
+            .as_ref()
+            .and_then(|a| a.gpu_binding.clone())
+            .map(spur_core::gpu_binding::from_proto);
+        let fabric_binding = req
+            .allocated
+            .as_ref()
+            .and_then(|a| a.fabric_binding.clone())
+            .map(spur_core::fabric_binding::from_proto);
         if req.job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
         }
+        self.ensure_node_cleanup_ready()?;
+        self.require_spec_enforced().await?;
         // Creates this id's cgroup, so it must not run while a prior run's teardown
         // still owns the directory.
         let _lifecycle = self.lifecycle.acquire(req.job_id).await;
-
+        #[cfg(test)]
+        let supervise_allocation = !self.force_legacy_launch;
+        #[cfg(not(test))]
+        let supervise_allocation = true;
         let allocated = req.allocated.as_ref();
+        if let Some(allocation) = allocated {
+            self.check_dispatch_allocation(allocation).await?;
+        }
+        // Refuses a duplicate before fencing or reserving anything.
+        if tracks_run_at_or_after(&*self.running.lock().await, req.job_id, req.run_attempt) {
+            return Err(Status::already_exists(format!(
+                "job {} already registered on this node",
+                req.job_id
+            )));
+        }
         // The generation check is performed under the allocation lock below, so a
         // refresh publish cannot slip a newer topology between it and the bind.
         let mut controller_gpu_ids: Vec<u64> = allocated
@@ -6454,11 +7460,32 @@ impl SlurmAgent for AgentService {
             .map(|p| p.device_paths.clone())
             .unwrap_or_default();
 
+        // Before reserving, for the same reason as the batch launch.
+        if supervise_allocation {
+            fence_older_runs(
+                &self.stepds,
+                &self.step_completions,
+                &crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                std::path::Path::new(executor::CGROUP_ROOT),
+                req.job_id,
+                req.run_attempt,
+            )
+            .await
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "failed to fence displaced stepd before allocation launch: {error}"
+                ))
+            })?;
+        }
+        if let Some(allocation) = allocated {
+            self.check_dispatch_allocation(allocation).await?;
+        }
+
         // Hold the running lock across the duplicate check, reserve+commit, and
         // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
         let mut jobs = self.running.lock().await;
-        if jobs.contains_key(&req.job_id) {
+        if tracks_run_at_or_after(&jobs, req.job_id, req.run_attempt) {
             return Err(Status::already_exists(format!(
                 "job {} already registered on this node",
                 req.job_id
@@ -6466,14 +7493,13 @@ impl SlurmAgent for AgentService {
         }
         let alloc_result = {
             let mut alloc = self.allocation.lock().await;
-            // Atomic with the bind: the refresh task publishes inventory via
-            // update_capacity under this same lock, so no newer generation can
-            // land between this check and allocate_for_job.
+            // Keep spec cores out of this allocation too — standalone srun binds
+            // here, not through allocate_local_resources.
+            self.apply_spec_exclusions(&mut alloc);
+            // Inventory may change during preflight; publication takes this
+            // same lock, keeping the generation check atomic with reservation.
             if let Some(a) = allocated {
-                check_dispatch_generation(
-                    a.generation,
-                    self.reporter.snapshot_resources().generation,
-                )?;
+                self.check_current_dispatch_generation(a)?;
             }
             let result = alloc
                 .allocate_for_job(
@@ -6582,10 +7608,6 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        #[cfg(test)]
-        let supervise_allocation = !self.force_legacy_launch;
-        #[cfg(not(test))]
-        let supervise_allocation = true;
         let runtime_descriptor = if supervise_allocation {
             let config = executor::JobLaunchConfig {
                 job_id: req.job_id,
@@ -6627,18 +7649,6 @@ impl SlurmAgent for AgentService {
             let admission = self
                 .admit_step_launch(req.job_id, req.run_attempt, spur_core::step::STEP_EXTERN)
                 .await;
-            fence_displaced_stepd(
-                &self.stepds,
-                req.job_id,
-                spur_core::step::STEP_EXTERN,
-                req.run_attempt,
-            )
-            .await
-            .map_err(|error| {
-                Status::unavailable(format!(
-                    "failed to fence displaced stepd before allocation launch: {error}"
-                ))
-            })?;
             let (_, mut descriptor) = launch_stepd(
                 &config,
                 req.run_attempt,
@@ -6646,6 +7656,8 @@ impl SlurmAgent for AgentService {
                 &self.reporter.hostname,
                 &self.stepd_state_dir,
                 StepdLaunchOptions {
+                    fabric_binding: fabric_binding.clone(),
+                    gpu_binding: gpu_binding.clone(),
                     step_id: spur_core::step::STEP_EXTERN,
                     allocation_only: true,
                     container_rootfs_mode: None,
@@ -6655,6 +7667,7 @@ impl SlurmAgent for AgentService {
                     cred_id: String::new(),
                     cred_kid: String::new(),
                     cred_digest: String::new(),
+                    pty_step_id: None,
                 },
                 &admission,
             )
@@ -6699,7 +7712,7 @@ impl SlurmAgent for AgentService {
         };
 
         let mut jobs = self.running.lock().await;
-        if jobs.contains_key(&req.job_id) {
+        if tracks_run_at_or_after(&jobs, req.job_id, req.run_attempt) {
             drop(jobs);
             if runtime_descriptor {
                 let removed = self
@@ -6718,9 +7731,11 @@ impl SlurmAgent for AgentService {
                 req.job_id
             )));
         }
-        jobs.insert(
+        let replaced = jobs.insert(
             req.job_id,
             TrackedJob {
+                fabric_binding: fabric_binding.clone(),
+                gpu_binding: gpu_binding.clone(),
                 job: executor::RunningJob::AllocationOnly,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: String::new(),
@@ -6754,6 +7769,12 @@ impl SlurmAgent for AgentService {
             .commit_job(req.job_id, req.run_attempt);
         reservation_guard.disarm();
         drop(jobs);
+        if let Some(older) = replaced {
+            self.interactive_launch_steps
+                .lock()
+                .await
+                .remove(&(req.job_id, older.run_attempt));
+        }
 
         Ok(Response::new(RegisterJobAllocationResponse {
             failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
@@ -6786,6 +7807,12 @@ impl SlurmAgent for AgentService {
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
         }
+        let job_id = req.job_id;
+        if job_id == 0 {
+            return Err(Status::invalid_argument("job_id is required"));
+        }
+        // Credential validation and startup must refer to the same attempt.
+        let mut lifecycle = Some(self.lifecycle.acquire(job_id).await);
         let mut persist_cred = (String::new(), String::new(), String::new());
         if let Some(keys) = &self.cred_keys {
             if req.execution_credential.is_empty() {
@@ -6843,10 +7870,6 @@ impl SlurmAgent for AgentService {
             req.work_dir
         };
 
-        let job_id = req.job_id;
-        if job_id == 0 {
-            return Err(Status::invalid_argument("job_id is required"));
-        }
         if identity.as_ref().is_some_and(|id| !id.is_controller()) {
             self.check_job_access(job_id, identity.as_ref(), "", "run a step of")
                 .await?;
@@ -6902,6 +7925,7 @@ impl SlurmAgent for AgentService {
             if let Ok(Some((exit_code, signal))) =
                 store.observed_exit(job_id, step_run_attempt, step_id)
             {
+                ensure_runtime_exit_ready(&store, job_id, step_run_attempt, step_id)?;
                 info!(
                     job_id,
                     step_id, step_run_attempt, "step finished (durable); returning recorded result"
@@ -6933,6 +7957,7 @@ impl SlurmAgent for AgentService {
                         "step still running; joining existing supervisor"
                     );
                     drop(admission);
+                    drop(lifecycle);
                     return match waiter.await {
                         Ok(outcome) => Ok(Response::new(
                             awaited_step_response(
@@ -6958,6 +7983,7 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        self.ensure_node_cleanup_ready()?;
         let step_epoch = next_step_epoch();
         {
             self.active_steps.lock().await.insert(
@@ -6997,6 +8023,8 @@ impl SlurmAgent for AgentService {
             job_owner,
             job_entry,
             job_attempt,
+            allocation,
+            job_nodelist,
         ) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
@@ -7040,8 +8068,12 @@ impl SlurmAgent for AgentService {
                 tracked.user.clone(),
                 entry,
                 tracked.run_attempt,
+                Self::tracked_allocation(tracked),
+                tracked.nodelist.clone(),
             )
         };
+        self.check_step_allocation(&allocation, &job_nodelist)
+            .await?;
         if job_attempt != step_run_attempt {
             return Err(Status::aborted(
                 "job attempt changed while admitting the step",
@@ -7149,6 +8181,9 @@ impl SlurmAgent for AgentService {
         let supervise_step = true;
         #[cfg(test)]
         let supervise_step = supervise_step && !self.force_legacy_launch;
+        if !supervise_step {
+            drop(lifecycle.take());
+        }
 
         // A supervised step hosts its own server, so the agent only forwards the
         // plan: an agent restart must not take the rendezvous down with it.
@@ -7516,7 +8551,7 @@ impl SlurmAgent for AgentService {
                 supervised_pmix.take(),
                 supervised_rootfs_mode,
                 step_files,
-                admission,
+                (admission, lifecycle),
                 persist_cred,
             )
             .await?
@@ -7526,7 +8561,7 @@ impl SlurmAgent for AgentService {
             //
             // If the step asked for its own image, it is not honored here: the
             // step joins the parent's live container. Leave a trace rather than
-            // silently dropping it (the #777 anti-pattern).
+            // silently dropping it.
             if let Some(c) = req.container.as_ref() {
                 if !c.image.is_empty() {
                     warn!(
@@ -7885,6 +8920,7 @@ impl SlurmAgent for AgentService {
             let Some((exit_code, signal)) = settled else {
                 return Err(Status::not_found("this node is not running that step"));
             };
+            ensure_runtime_exit_ready(&store, req.job_id, req.run_attempt, req.step_id)?;
             return Ok(Response::new(
                 awaited_step_response(req.job_id, req.step_id, exit_code, signal).await,
             ));
@@ -7893,6 +8929,7 @@ impl SlurmAgent for AgentService {
         // A supervisor that finished while nobody was listening recorded its exit
         // durably; the rendezvous is in memory and does not survive a restart.
         if let Ok(Some((exit_code, signal))) = durable_runtime_exit(&store, &descriptor) {
+            ensure_runtime_exit_ready(&store, req.job_id, descriptor.run_attempt, req.step_id)?;
             return Ok(Response::new(
                 awaited_step_response(req.job_id, req.step_id, exit_code, signal).await,
             ));
@@ -8222,6 +9259,8 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        // The attempt and its namespaces must remain current through supervisor startup.
+        let _lifecycle = self.lifecycle.acquire(init.job_id).await;
         let entry = self.job_entry(init.job_id).await?;
 
         let winsize = init.winsize.as_ref().map(|ws| PtyWinSize {
@@ -8255,7 +9294,7 @@ impl SlurmAgent for AgentService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
         let step_id = spur_core::step::STEP_INTERACTIVE;
-        let (run_attempt, cpus, memory_mb, gpu_devices, partition, nodelist, user) = {
+        let (run_attempt, cpus, memory_mb, gpu_devices, partition, nodelist, user, allocation) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&init.job_id).ok_or_else(|| {
                 Status::failed_precondition(format!(
@@ -8271,20 +9310,16 @@ impl SlurmAgent for AgentService {
                 tracked.partition.clone(),
                 tracked.nodelist.clone(),
                 tracked.user.clone(),
+                Self::tracked_allocation(tracked),
             )
         };
+        self.check_step_allocation(&allocation, &nodelist).await?;
         let mut host_device_plan: Option<spur_devices::inject::HostInjectionPlan> = None;
         let custody_dir = crate::stepd::StepdStore::new(&self.stepd_state_dir).session_dir(
             init.job_id,
             run_attempt,
             step_id,
         );
-
-        // Held from before the decision through the fresh-launch path's own
-        // `live_ptys` insert below, so a second attach racing this one blocks
-        // instead of reading a stale "nothing live yet" and fencing what this
-        // call just started.
-        let _lifecycle = self.lifecycle.acquire(init.job_id).await;
 
         // Resume rather than open a new one: a terminal held for a job this
         // agent is not already bridging was either just launched (and just
@@ -8340,6 +9375,12 @@ impl SlurmAgent for AgentService {
                 }
             };
             if let Some((exit_code, signal)) = settled {
+                ensure_runtime_exit_ready(
+                    &crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                    init.job_id,
+                    run_attempt,
+                    step_id,
+                )?;
                 let shell_code = spur_core::process::shell_exit_code(&step_exit_status(
                     crate::step_completion::StepOutcome { exit_code, signal },
                 ));
@@ -8372,6 +9413,7 @@ impl SlurmAgent for AgentService {
                     (master, interactive_exit_future(waiter), pid)
                 }
                 None => {
+                    self.ensure_node_cleanup_ready()?;
                     let script = interactive_step_script(&entry, entry.uid, entry.gid, &argv)?;
                     let mut container_rootfs_mode = None;
                     let mut fresh_container_env: Option<HashMap<String, String>> = None;
@@ -8542,6 +9584,7 @@ impl SlurmAgent for AgentService {
                         .launch_interactive_step(
                             init.job_id,
                             run_attempt,
+                            init.step_id,
                             &cfg,
                             container_rootfs_mode,
                         )
@@ -8909,6 +9952,30 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    /// Refuse a new workload unless the node's core/memory specialization layout
+    /// is in effect, independent of `[cgroup] required`.
+    async fn require_spec_enforced(&self) -> Result<(), Status> {
+        if self.reporter.ensure_spec_enforced().await {
+            return Ok(());
+        }
+        let why = self
+            .reporter
+            .spec_enforcement_error()
+            .unwrap_or_else(|| "its layout is not applied yet".into());
+        Err(Status::failed_precondition(format!(
+            "node is not enforcing its core/memory specialization layout ({why}); refusing launch"
+        )))
+    }
+
+    fn ensure_node_cleanup_ready(&self) -> Result<(), Status> {
+        crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_cleanup_ready()
+            .map_err(|error| {
+                warn!(%error, "refusing new work until pending job cleanup completes");
+                Status::resource_exhausted(error.to_string())
+            })
+    }
+
     /// Self-drains this node in the background when `error` condemns it,
     /// without blocking the caller's own failure response on the RPC.
     fn drain_on_node_fault(&self, error: &executor::LaunchError, job_id: u32) {
@@ -8929,6 +9996,12 @@ impl AgentService {
         // The cgroup removal and the release below both key off the id, so a launch
         // reusing it must not interleave with them.
         let _lifecycle = self.lifecycle.acquire(job_id).await;
+        if crate::stepd::StepdStore::new(&self.stepd_state_dir)
+            .ensure_job_cleanup_ready(job_id, run_attempt)
+            .is_err()
+        {
+            return;
+        }
         // Scoped so the guard is gone before `cgroup` is dropped below: removing
         // a cgroup SIGKILLs its stragglers and then blocks retrying rmdir.
         let (removed, cgroup) = {
@@ -9000,6 +10073,114 @@ impl AgentService {
         Ok(Some(host_plan))
     }
 
+    fn check_current_dispatch_generation(
+        &self,
+        allocation: &ResourceAllocations,
+    ) -> Result<(), Status> {
+        let live = self.reporter.resource_generation();
+        if (allocation.fabric_binding.is_some() || allocation.gpu_binding.is_some())
+            && (allocation.generation == 0 || live == 0)
+        {
+            return Err(Status::failed_precondition(
+                "bound dispatch has no inventory generation",
+            ));
+        }
+        check_dispatch_generation(allocation.generation, live)
+    }
+
+    async fn check_dispatch_allocation(
+        &self,
+        allocation: &ResourceAllocations,
+    ) -> Result<(), Status> {
+        self.check_bindings(allocation, BindingCheck::Dispatch, "")
+            .await
+    }
+
+    /// `job_nodelist` lets a file-bound step confirm every allocated node is still in its block.
+    async fn check_step_allocation(
+        &self,
+        allocation: &ResourceAllocations,
+        job_nodelist: &str,
+    ) -> Result<(), Status> {
+        self.check_bindings(allocation, BindingCheck::Step, job_nodelist)
+            .await
+    }
+
+    async fn check_bindings(
+        &self,
+        allocation: &ResourceAllocations,
+        check: BindingCheck,
+        job_nodelist: &str,
+    ) -> Result<(), Status> {
+        if check == BindingCheck::Dispatch {
+            self.check_current_dispatch_generation(allocation)?;
+        }
+        if allocation.fabric_binding.is_none() && allocation.gpu_binding.is_none() {
+            return Ok(());
+        }
+        let job_nodes = if job_nodelist.is_empty() {
+            Vec::new()
+        } else {
+            spur_core::hostlist::expand(job_nodelist)
+                .map_err(|error| Status::failed_precondition(error.to_string()))?
+        };
+        let inventory = self.reporter.snapshot_resources();
+        let snapshot_allocation = allocation.clone();
+        let block_file = self.block_file.clone();
+        let hostname = self.reporter.hostname.clone();
+        let cluster_id = self.cluster_id.clone();
+        run_preflight(BINDING_PREFLIGHT_TIMEOUT, move || {
+            validate_dispatch_snapshot(
+                inventory,
+                snapshot_allocation,
+                block_file,
+                hostname,
+                cluster_id,
+                check,
+                job_nodes,
+            )
+        })
+        .await?;
+        match check {
+            BindingCheck::Dispatch => self.check_current_dispatch_generation(allocation),
+            BindingCheck::Step => Ok(()),
+        }
+    }
+
+    fn tracked_allocation(tracked: &TrackedJob) -> ResourceAllocations {
+        let mut allocation = spur_core::resource::ResourceAllocations {
+            generation: tracked
+                .gpu_binding
+                .as_ref()
+                .map(|b| b.generation)
+                .or_else(|| {
+                    tracked
+                        .fabric_binding
+                        .as_ref()
+                        .map(|b| b.inventory_generation)
+                })
+                .unwrap_or(0),
+            fabric_binding: tracked.fabric_binding.clone(),
+            gpu_binding: tracked.gpu_binding.clone(),
+            ..Default::default()
+        };
+        allocation.devices.insert(
+            "gpu".into(),
+            tracked
+                .gpu_devices
+                .iter()
+                .copied()
+                .map(spur_core::resource::AllocatedDevice::injectable)
+                .collect(),
+        );
+        crate::reporter::allocations_to_proto(&allocation)
+    }
+
+    /// Exclude exactly the held layout's spec CPUs, under the allocation lock.
+    fn apply_spec_exclusions(&self, alloc: &mut NodeAllocation) {
+        alloc.set_spec_exclusions(&self.reporter.held_spec_cpus());
+    }
+
     /// Record controller-allocated GPUs and reserve the local CPU/memory budget.
     /// `cpus`/`memory_mb` are the resolved grant, so the core IDs match it.
     async fn allocate_local_resources(
@@ -9011,6 +10192,7 @@ impl AgentService {
         cpus: u32,
         memory_mb: u64,
     ) -> Result<(AllocationResult, Vec<u64>), Status> {
+        self.ensure_node_cleanup_ready()?;
         let controller_gpu_ids: Vec<u64> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -9026,6 +10208,10 @@ impl AgentService {
             )));
         }
 
+        if let Some(allocation) = allocated {
+            self.check_dispatch_allocation(allocation).await?;
+        }
+
         // Hold running across the reclaim (running-then-allocation, as in commit)
         // so a concurrent commit can't make a live owner look stale.
         let running = self.running.lock().await;
@@ -9033,11 +10219,14 @@ impl AgentService {
 
         let mut alloc = self.allocation.lock().await;
 
-        // Generation check under the allocation lock: the refresh task mutates
-        // inventory via update_capacity under this same lock, so checking here
-        // is atomic with the bind below — no publish can interleave.
+        // Keep spec cores out of every allocation, replacing any stale set so
+        // removing or moving specialization frees the CPUs again.
+        self.apply_spec_exclusions(&mut alloc);
+
+        // Recheck after preflight: inventory publication uses this same lock,
+        // so no newer generation can interleave with the reservation.
         if let Some(a) = allocated {
-            check_dispatch_generation(a.generation, self.reporter.snapshot_resources().generation)?;
+            self.check_current_dispatch_generation(a)?;
         }
 
         let result = match alloc.allocate_for_job(
@@ -9213,7 +10402,8 @@ impl AgentService {
             // Neither stepds nor running names an attempt to scope to, but an
             // orphaned unsupervised step can still outlive both maps — reach
             // it via the wildcard rather than stranding it.
-            self.cancel_active_steps_for_job(job_id, 0, signal).await;
+            self.cancel_active_steps_for_job(job_id, 0, signal, EXPLICIT_SIGNAL_STEP_ESCALATION)
+                .await;
             return;
         };
         // A signal reaches every step the job holds; one failing must not
@@ -9228,8 +10418,8 @@ impl AgentService {
         );
         // Spawned before the signal loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
-        let release_wait =
-            (supervised && lethal).then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
+        let release_wait = (supervised && lethal)
+            .then(|| self.spawn_stepd_release_wait(job_id, run_attempt, std::time::Duration::ZERO));
         for descriptor in &runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
                 descriptor,
@@ -9257,8 +10447,13 @@ impl AgentService {
         }
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
-        self.cancel_active_steps_for_job(job_id, run_attempt, signal)
-            .await;
+        self.cancel_active_steps_for_job(
+            job_id,
+            run_attempt,
+            signal,
+            EXPLICIT_SIGNAL_STEP_ESCALATION,
+        )
+        .await;
         if supervised {
             // A stepd already confirmed dead has no teardown coming; fence it
             // now instead of waiting out the release-wait bound below.
@@ -9271,20 +10466,16 @@ impl AgentService {
             }
             return;
         }
-        let allocation_only_attempt = {
-            let jobs = self.running.lock().await;
-            jobs.get(&job_id)
-                .filter(|tracked| tracked.job.is_allocation_only())
-                .map(|tracked| tracked.run_attempt)
-        };
-        if let Some(run_attempt) = allocation_only_attempt {
+        let allocation_only = tracked_run(&*self.running.lock().await, job_id, run_attempt)
+            .is_some_and(|tracked| tracked.job.is_allocation_only());
+        if allocation_only {
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
 
         let (tracked_attempt, sig) = {
             let jobs = self.running.lock().await;
-            let Some(tracked) = jobs.get(&job_id) else {
+            let Some(tracked) = tracked_run(&jobs, job_id, run_attempt) else {
                 return;
             };
             let sig = nix::sys::signal::Signal::try_from(signal)
@@ -9304,9 +10495,114 @@ impl AgentService {
                 self.hooks.clone(),
                 self.spank.clone(),
                 self.reporter.controller_addr.clone(),
+                self.reporter.node_token(),
             )
             .await;
         }
+    }
+
+    /// The attempt a signal is for: `NotFound` when this node holds nothing of the
+    /// job, `None` when it runs another attempt. An unscoped request resolves to
+    /// the current run, or stays the wildcard for an orphaned unsupervised step.
+    async fn signal_scope(&self, job_id: u32, run_attempt: u32) -> Result<Option<u32>, Status> {
+        if !self.holds_job(job_id).await {
+            return Err(Status::not_found(format!(
+                "job {job_id} is not held by this node"
+            )));
+        }
+        if !self.runs_attempt(job_id, run_attempt).await {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.resolve_cancel_attempt(job_id, run_attempt)
+                .await
+                .unwrap_or(0),
+        ))
+    }
+
+    /// Whether this node tracks any part of the job: a supervisor, the job
+    /// itself, or a step.
+    async fn holds_job(&self, job_id: u32) -> bool {
+        if !stepds_for_job(&*self.stepds.lock().await, job_id).is_empty() {
+            return true;
+        }
+        if self.running.lock().await.contains_key(&job_id) {
+            return true;
+        }
+        self.active_steps
+            .lock()
+            .await
+            .keys()
+            .any(|(tracked, _)| *tracked == job_id)
+    }
+
+    /// Deliver a signal and nothing else: no launch fencing, release wait,
+    /// teardown or escalation, so a warning leaves the run alive to react to it.
+    async fn deliver_signal(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        signal: i32,
+        target: SignalTarget,
+    ) -> Result<(), Status> {
+        let include_batch = match target {
+            SignalTarget::Steps => false,
+            SignalTarget::Full => true,
+            SignalTarget::Batch => {
+                return Err(Status::unimplemented(
+                    "signalling only the batch script is not supported",
+                ))
+            }
+            SignalTarget::Unspecified => {
+                return Err(Status::invalid_argument("a signal target is required"))
+            }
+        };
+        let sig = nix::sys::signal::Signal::try_from(signal)
+            .map_err(|_| Status::invalid_argument(format!("invalid signal {signal}")))?;
+        let Some(run_attempt) = self.signal_scope(job_id, run_attempt).await? else {
+            warn!(
+                job_id,
+                run_attempt, signal, "dropping a signal for a superseded run"
+            );
+            return Ok(());
+        };
+
+        let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
+        for descriptor in runtimes
+            .iter()
+            .filter(|descriptor| include_batch || descriptor.step_id != spur_core::step::STEP_BATCH)
+        {
+            if let Err(error) = crate::stepd::signal_allocation(
+                descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                signal,
+            )
+            .await
+            {
+                warn!(job_id, step_id = descriptor.step_id, %error,
+                    "runtime signal request failed");
+            }
+        }
+        self.signal_active_steps_for_job(job_id, run_attempt, signal)
+            .await;
+
+        // A batch supervisor owns the job's processes, so the agent has no
+        // handle of its own to signal.
+        if !include_batch || owns_job_processes(&runtimes) {
+            return Ok(());
+        }
+        let jobs = self.running.lock().await;
+        let Some(tracked) = jobs.get(&job_id).filter(|tracked| {
+            !tracked.job.is_allocation_only()
+                && (run_attempt == 0 || tracked.run_attempt == run_attempt)
+        }) else {
+            return Ok(());
+        };
+        info!(job_id, signal, "signalling the unsupervised job");
+        if let Err(error) = tracked.job.kill_signal(sig) {
+            warn!(job_id, signal, %error, "failed to signal the unsupervised job");
+        }
+        Ok(())
     }
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
@@ -9363,32 +10659,17 @@ impl AgentService {
     /// `run_attempt == 0` is a wildcard (`stepds_for_attempt`'s own
     /// convention), reached only when nothing named a concrete attempt —
     /// so an orphaned unsupervised step stays reachable, not stranded.
-    async fn cancel_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
-        let supervised: Vec<spur_core::step::StepId> =
-            stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
-                .iter()
-                .map(|descriptor| descriptor.step_id)
-                .collect();
-        // Snapshot (key, pid, epoch) under the lock, then signal *outside* it:
-        // signal_step_tree walks /proc, so holding active_steps across it would
-        // block every concurrent run_command (and the ActiveStepGuard's try_lock
-        // cleanup, which silently skips on contention).
-        let targets: Vec<((u32, u32), u32, u64)> = {
-            let mut steps = self.active_steps.lock().await;
-            let mut targets = Vec::new();
-            for (key, step) in steps.iter_mut() {
-                if key.0 == job_id
-                    && (run_attempt == 0 || step.run_attempt == run_attempt)
-                    && !supervised.contains(&key.1)
-                {
-                    step.cancel_requested = true;
-                    if let Some(pid) = step.pid {
-                        targets.push((*key, pid, step.epoch));
-                    }
-                }
-            }
-            targets
-        };
+    /// `escalate_after` is the SIGKILL delay.
+    async fn cancel_active_steps_for_job(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        signal: i32,
+        escalate_after: std::time::Duration,
+    ) {
+        let targets = self
+            .unsupervised_step_targets(job_id, run_attempt, true)
+            .await;
         if targets.is_empty() {
             return;
         }
@@ -9400,7 +10681,7 @@ impl AgentService {
         // with a recycled pid is never signalled.
         let active_steps = self.active_steps.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(escalate_after).await;
             let still: Vec<u32> = {
                 let steps = active_steps.lock().await;
                 targets
@@ -9415,7 +10696,50 @@ impl AgentService {
         });
     }
 
-    async fn graceful_cancel(&self, job_id: u32, run_attempt: u32) {
+    /// Delivers one signal to the job's unsupervised steps and nothing more:
+    /// the steps are not marked cancelled, so a step still launching is not
+    /// aborted, and nothing escalates to SIGKILL.
+    async fn signal_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
+        for (_key, pid, _epoch) in self
+            .unsupervised_step_targets(job_id, run_attempt, false)
+            .await
+        {
+            signal_step_tree(pid, signal);
+        }
+    }
+
+    /// Snapshots (key, pid, epoch) of the job's unsupervised steps with a process,
+    /// so the caller signals outside the lock: holding `active_steps` across the
+    /// /proc walk would stall every run_command. `mark_cancelled` also flags a step with no pid.
+    async fn unsupervised_step_targets(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        mark_cancelled: bool,
+    ) -> Vec<((u32, u32), u32, u64)> {
+        let supervised: Vec<spur_core::step::StepId> =
+            stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
+                .iter()
+                .map(|descriptor| descriptor.step_id)
+                .collect();
+        let mut steps = self.active_steps.lock().await;
+        let mut targets = Vec::new();
+        for (key, step) in steps.iter_mut() {
+            let in_scope = key.0 == job_id
+                && (run_attempt == 0 || step.run_attempt == run_attempt)
+                && !supervised.contains(&key.1);
+            if !in_scope {
+                continue;
+            }
+            step.cancel_requested |= mark_cancelled;
+            if let Some(pid) = step.pid {
+                targets.push((*key, pid, step.epoch));
+            }
+        }
+        targets
+    }
+
+    async fn graceful_cancel(&self, job_id: u32, run_attempt: u32, kill_wait: std::time::Duration) {
         // A cancel naming an epoch this node no longer runs belongs to a superseded
         // run, and the processes here are the redispatch that replaced it.
         if !self.runs_attempt(job_id, run_attempt).await {
@@ -9429,8 +10753,13 @@ impl AgentService {
             // Neither stepds nor running names an attempt to scope to, but an
             // orphaned unsupervised step can still outlive both maps — reach
             // it via the wildcard rather than stranding it.
-            self.cancel_active_steps_for_job(job_id, 0, nix::sys::signal::Signal::SIGTERM as i32)
-                .await;
+            self.cancel_active_steps_for_job(
+                job_id,
+                0,
+                nix::sys::signal::Signal::SIGTERM as i32,
+                kill_wait,
+            )
+            .await;
             return;
         };
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
@@ -9440,22 +10769,20 @@ impl AgentService {
         let supervised = !runtimes.is_empty();
         // Spawned before the shutdown_allocation loop below, not after — see
         // spawn_stepd_release_wait's doc for why.
-        let release_wait = supervised.then(|| self.spawn_stepd_release_wait(job_id, run_attempt));
+        let release_wait =
+            supervised.then(|| self.spawn_stepd_release_wait(job_id, run_attempt, kill_wait));
         for descriptor in &runtimes {
             match crate::stepd::shutdown_allocation(descriptor, uuid::Uuid::new_v4().to_string())
                 .await
             {
                 Ok(()) => {
                     // Timed from the signal, not after the job-level wait below, so a
-                    // slow (or bounded-out) wait can't push escalation past ~5s.
+                    // slow (or bounded-out) wait can't push escalation past the kill wait.
                     let signaled_at = tokio::time::Instant::now();
                     let context = self.completion_listener_context();
                     let descriptor = descriptor.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(
-                            GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()),
-                        )
-                        .await;
+                        tokio::time::sleep(kill_wait.saturating_sub(signaled_at.elapsed())).await;
                         let still_current = context
                             .stepds
                             .lock()
@@ -9484,8 +10811,14 @@ impl AgentService {
                         // This descriptor's own attempt, not whatever `running`
                         // shows now — a redispatch may already have moved it on.
                         let deadline = tokio::time::Instant::now() + CANCEL_REAP_TIMEOUT;
-                        wait_for_stepd_release(job_id, descriptor.run_attempt, deadline, &context)
-                            .await;
+                        wait_for_stepd_release(
+                            job_id,
+                            descriptor.run_attempt,
+                            deadline,
+                            kill_wait,
+                            &context,
+                        )
+                        .await;
                     });
                 }
                 Err(error) => {
@@ -9500,6 +10833,7 @@ impl AgentService {
             job_id,
             run_attempt,
             nix::sys::signal::Signal::SIGTERM as i32,
+            kill_wait,
         )
         .await;
         if supervised {
@@ -9514,13 +10848,9 @@ impl AgentService {
             }
             return;
         }
-        let allocation_only_attempt = {
-            let jobs = self.running.lock().await;
-            jobs.get(&job_id)
-                .filter(|tracked| tracked.job.is_allocation_only())
-                .map(|tracked| tracked.run_attempt)
-        };
-        if let Some(run_attempt) = allocation_only_attempt {
+        let allocation_only = tracked_run(&*self.running.lock().await, job_id, run_attempt)
+            .is_some_and(|tracked| tracked.job.is_allocation_only());
+        if allocation_only {
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
@@ -9529,10 +10859,14 @@ impl AgentService {
         // touch a newer run that reused this job_id after a requeue.
         let (cancel_attempt, signaled_at) = {
             let jobs = self.running.lock().await;
-            let Some(tracked) = jobs.get(&job_id) else {
+            let Some(tracked) = tracked_run(&jobs, job_id, run_attempt) else {
                 return;
             };
-            info!(job_id, "graceful cancel: SIGTERM → 5s grace → SIGKILL");
+            info!(
+                job_id,
+                kill_wait_secs = kill_wait.as_secs(),
+                "graceful cancel: SIGTERM, then SIGKILL after the kill wait"
+            );
             let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGTERM);
             (tracked.run_attempt, tokio::time::Instant::now())
         };
@@ -9546,6 +10880,7 @@ impl AgentService {
             self.hooks.clone(),
             self.spank.clone(),
             self.reporter.controller_addr.clone(),
+            self.reporter.node_token(),
         )
         .await;
 
@@ -9556,11 +10891,11 @@ impl AgentService {
         let hooks = self.hooks.clone();
         let spank = self.spank.clone();
         let controller_addr = self.reporter.controller_addr.clone();
+        let reporter = self.reporter.clone();
         tokio::spawn(async move {
             // Timed from the signal, not from after the immediate wait above,
-            // so a slow (or bounded-out) wait can't push escalation past ~5s.
-            tokio::time::sleep(GRACEFUL_CANCEL_GRACE_PERIOD.saturating_sub(signaled_at.elapsed()))
-                .await;
+            // so a slow (or bounded-out) wait can't push escalation past the kill wait.
+            tokio::time::sleep(kill_wait.saturating_sub(signaled_at.elapsed())).await;
             let sigkilled = {
                 let jobs = running.lock().await;
                 match jobs.get(&job_id) {
@@ -9584,6 +10919,7 @@ impl AgentService {
                     hooks,
                     spank,
                     controller_addr,
+                    reporter.node_token(),
                 )
                 .await;
             }
@@ -10036,6 +11372,8 @@ impl TrackedJob {
             user: "testuser".into(),
             partition: String::new(),
             gpu_devices: Vec::new(),
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),
@@ -10202,6 +11540,452 @@ mod tests {
             "the workload must actually be dead, not merely reported so"
         );
         let _ = child.wait();
+    }
+
+    /// Fences run 1's supervisor of `old_step` as run 2's launch would, tracked by its launch-time
+    /// copy while it published `published_cgroup` and a live workload; returns whether that survived.
+    async fn workload_survives_relaunch(
+        old_step: spur_core::step::StepId,
+        published_cgroup: std::path::PathBuf,
+    ) -> bool {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let mut at_launch = descriptor_for_workload(0);
+        at_launch.step_id = old_step;
+        at_launch.socket_path = store.session_dir(91, 1, old_step).join("runtime.sock");
+        let mut published = at_launch.clone();
+        published.workload_pid = child.id();
+        published.workload_start_ticks =
+            crate::stepd::process_start_ticks(child.id()).expect("workload start ticks");
+        published.cgroup_path = published_cgroup;
+        store
+            .publish(&published)
+            .expect("publish started descriptor");
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&at_launch), at_launch);
+        let completions = crate::step_completion::StepCompletions::new();
+        let mut waiter = completions.register(91, 1, old_step).await;
+
+        let fenced = fence_displaced_run(
+            &sessions,
+            &completions,
+            &store,
+            state_dir.path(),
+            91,
+            spur_core::step::STEP_BATCH,
+            2,
+        )
+        .await;
+        let survived =
+            crate::stepd::process_is_live(published.workload_pid, published.workload_start_ticks);
+        let tracked = !sessions.lock().await.is_empty();
+        let _ = child.kill();
+        let _ = child.wait();
+        fenced.expect("fence the displaced run");
+        assert!(!tracked, "the fenced supervisor must no longer be tracked");
+        assert!(
+            waiter.try_recv().is_ok(),
+            "the fenced supervisor's parked caller must be released"
+        );
+        survived
+    }
+
+    /// A redispatch onto the same node fences the old run through the copy taken
+    /// at its launch, which predates the workload; the supervisor's own record names it.
+    #[tokio::test]
+    async fn fencing_a_displaced_run_kills_the_workload_its_supervisor_published() {
+        assert!(
+            !workload_survives_relaunch(spur_core::step::STEP_BATCH, std::path::PathBuf::new())
+                .await,
+            "the old run's workload must not survive its replacement"
+        );
+    }
+
+    /// A recorded cgroup that is gone proves nothing (adoption drops it for that reason),
+    /// so the published one must not stand in for the workload check.
+    #[tokio::test]
+    async fn fencing_does_not_trust_a_published_cgroup_that_is_gone() {
+        let parent = tempfile::tempdir().expect("cgroup parent");
+        let gone = parent.path().join("never-created").join("job_91");
+        assert!(
+            !workload_survives_relaunch(spur_core::step::STEP_BATCH, gone).await,
+            "a vanished cgroup must not confirm the workload dead"
+        );
+    }
+
+    /// The old run's numbered steps have supervisors of their own, which the new
+    /// run's launch must fence too or their workloads outlive the run.
+    #[tokio::test]
+    async fn a_relaunch_fences_the_old_runs_step_supervisors() {
+        assert!(
+            !workload_survives_relaunch(0, std::path::PathBuf::new()).await,
+            "an old run's srun step must not survive the relaunch"
+        );
+    }
+
+    fn session_for(
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> crate::stepd::StepdDescriptor {
+        crate::stepd::StepdDescriptor::new(
+            79,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent/runtime.sock"),
+            std::path::PathBuf::new(),
+        )
+    }
+
+    /// Only an older run is fenced: the launching run's own steps and a newer run's are left alone.
+    #[tokio::test]
+    async fn a_relaunch_leaves_the_same_and_newer_runs_alone() {
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        for (run_attempt, step_id) in [(2, 0), (3, 1)] {
+            let descriptor = session_for(run_attempt, step_id);
+            sessions
+                .lock()
+                .await
+                .insert(stepd_key(&descriptor), descriptor);
+        }
+        let completions = crate::step_completion::StepCompletions::new();
+
+        let roots = tempfile::tempdir().expect("fence roots");
+        let store = crate::stepd::StepdStore::new(roots.path());
+        fence_displaced_run(
+            &sessions,
+            &completions,
+            &store,
+            roots.path(),
+            79,
+            spur_core::step::STEP_BATCH,
+            2,
+        )
+        .await
+        .expect("nothing older to fence");
+
+        assert_eq!(sessions.lock().await.len(), 2);
+    }
+
+    /// An old run whose teardown cannot be confirmed blocks the launch and stays tracked,
+    /// rather than being dropped while it may still hold the node.
+    #[tokio::test]
+    async fn a_relaunch_refuses_while_an_old_runs_teardown_is_unconfirmed() {
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        let cgroup = TestCgroup::new(&cgroup_root);
+        std::fs::write(cgroup.path().join("cgroup.procs"), "not-a-pid\n")
+            .expect("seed a permanent removal blocker");
+        let mut stuck = session_for(1, 0);
+        stuck.cgroup_path = cgroup.path().to_path_buf();
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        sessions.lock().await.insert(stepd_key(&stuck), stuck);
+        let completions = crate::step_completion::StepCompletions::new();
+
+        let store = crate::stepd::StepdStore::new(cgroup_root.path());
+        let fenced = fence_displaced_run(
+            &sessions,
+            &completions,
+            &store,
+            cgroup_root.path(),
+            79,
+            spur_core::step::STEP_BATCH,
+            2,
+        )
+        .await;
+
+        assert!(
+            fenced.is_err(),
+            "an unconfirmed teardown must fail the launch"
+        );
+        assert_eq!(sessions.lock().await.len(), 1);
+    }
+
+    /// A session of `run_attempt` whose resources and uid name that run.
+    fn session_of_run(
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> crate::stepd::StepdDescriptor {
+        let mut session = session_for(run_attempt, step_id);
+        session.uid = 1000 + run_attempt;
+        session.resources.gpu_devices = vec![u64::from(run_attempt)];
+        session.resources.cpus = run_attempt;
+        session
+    }
+
+    /// The newest run of the job's own session decides the whole tracked job, in any arrival order.
+    #[tokio::test]
+    async fn recovery_tracks_the_newest_run_of_the_jobs_own_session() {
+        let batch = spur_core::step::STEP_BATCH;
+        let orders = [
+            vec![session_of_run(1, 0), session_of_run(2, batch)],
+            vec![session_of_run(2, batch), session_of_run(1, 0)],
+            vec![session_of_run(2, batch), session_of_run(1, batch)],
+            vec![session_of_run(1, batch), session_of_run(2, batch)],
+        ];
+        for order in orders {
+            let running = new_running_jobs();
+            recover_stepds(&running, order).await;
+            let jobs = running.lock().await;
+            let tracked = jobs.get(&79).expect("adopted");
+            assert_eq!(
+                (
+                    tracked.run_attempt,
+                    tracked.uid,
+                    tracked.gpu_devices.clone(),
+                    tracked.cpus
+                ),
+                (2, 1002, vec![2], 2),
+                "every field comes from run 2's own session"
+            );
+        }
+    }
+
+    /// A repeat of the allocation run this node already tracks must leave its live
+    /// supervisor alone rather than fence it and then refuse the repeat.
+    #[tokio::test]
+    async fn a_repeated_allocation_run_keeps_its_supervisor() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let live = session_for(1, spur_core::step::STEP_EXTERN);
+        svc.stepds.lock().await.insert(stepd_key(&live), live);
+
+        let repeat = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 79,
+                cpus: 1,
+                run_attempt: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("the same run is a duplicate");
+
+        assert_eq!(repeat.code(), tonic::Code::AlreadyExists);
+        assert!(
+            svc.stepds
+                .lock()
+                .await
+                .contains_key(&(79, spur_core::step::STEP_EXTERN)),
+            "the live supervisor must still be tracked"
+        );
+    }
+
+    /// A run-1 session of `step_id` whose teardown can never be confirmed, tracked by `svc`
+    /// together with run 1's ledger entry and job record.
+    async fn seed_unfenceable_run(
+        svc: &AgentService,
+        step_id: spur_core::step::StepId,
+        cgroup_root: &tempfile::TempDir,
+    ) {
+        let cgroup = TestCgroup::new(cgroup_root);
+        std::fs::write(cgroup.path().join("cgroup.procs"), "not-a-pid\n")
+            .expect("seed a permanent removal blocker");
+        let mut stuck = session_for(1, step_id);
+        stuck.cgroup_path = cgroup.path().to_path_buf();
+        svc.stepds.lock().await.insert(stepd_key(&stuck), stuck);
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let mut ledger = svc.allocation.lock().await;
+        ledger
+            .allocate_for_job(79, 1, 1, 0, &[])
+            .expect("reserve run 1");
+        assert!(ledger.commit_job(79, 1));
+    }
+
+    async fn assert_run_one_kept(svc: &AgentService, step_id: spur_core::step::StepId) {
+        assert_eq!(svc.allocation.lock().await.owner_attempt(79), Some(1));
+        assert!(svc.stepds.lock().await.contains_key(&(79, step_id)));
+        assert_eq!(
+            svc.running.lock().await.get(&79).map(|t| t.run_attempt),
+            Some(1)
+        );
+    }
+
+    /// The fence runs before the new run reserves anything, so when it fails the old run,
+    /// still running, keeps its ledger entry rather than losing it to the abandoned launch.
+    #[tokio::test]
+    async fn a_launch_whose_fence_fails_leaves_the_old_run_reserved() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        seed_unfenceable_run(&svc, spur_core::step::STEP_BATCH, &cgroup_root).await;
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                job_id: 79,
+                run_attempt: 2,
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unconfirmed fence must refuse the launch");
+
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_run_one_kept(&svc, spur_core::step::STEP_BATCH).await;
+    }
+
+    #[tokio::test]
+    async fn an_allocation_whose_fence_fails_leaves_the_old_run_reserved() {
+        let svc = test_agent_service(test_reporter()).with_supervised_launch();
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        seed_unfenceable_run(&svc, spur_core::step::STEP_EXTERN, &cgroup_root).await;
+
+        let refused = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 79,
+                cpus: 1,
+                run_attempt: 2,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("an unconfirmed fence must refuse the allocation");
+
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_run_one_kept(&svc, spur_core::step::STEP_EXTERN).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_dispatch_does_not_fence_an_older_run() {
+        for step_id in [spur_core::step::STEP_BATCH, spur_core::step::STEP_EXTERN] {
+            let (svc, _, mut allocation) = fabric_dispatch_fixture();
+            let svc = svc.with_supervised_launch();
+            allocation.generation += 1;
+            let cgroup_root = tempfile::tempdir().expect("cgroup root");
+            seed_unfenceable_run(&svc, step_id, &cgroup_root).await;
+
+            let refused = if step_id == spur_core::step::STEP_BATCH {
+                svc.launch_job(Request::new(LaunchJobRequest {
+                    job_id: 79,
+                    run_attempt: 2,
+                    spec: Some(JobSpec {
+                        uid: 1000,
+                        name: "j".into(),
+                        script: "#!/bin/bash\ntrue\n".into(),
+                        num_tasks: 1,
+                        num_nodes: 1,
+                        cpus_per_task: 1,
+                        ..Default::default()
+                    }),
+                    allocated: Some(allocation),
+                    ..Default::default()
+                }))
+                .await
+                .expect_err("stale dispatch must be refused")
+            } else {
+                svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                    job_id: 79,
+                    run_attempt: 2,
+                    allocated: Some(allocation),
+                    ..Default::default()
+                }))
+                .await
+                .expect_err("stale dispatch must be refused")
+            };
+
+            assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+            assert_run_one_kept(&svc, step_id).await;
+        }
+    }
+
+    /// A late launch of an older run must not claim any slot of a job whose newer run is
+    /// tracked, not just the slot that newer run holds.
+    #[tokio::test]
+    async fn an_older_run_cannot_claim_a_slot_beside_a_newer_one() {
+        let sessions = Arc::new(Mutex::new(StepdMap::new()));
+        let newer = session_for(2, 0);
+        sessions.lock().await.insert(stepd_key(&newer), newer);
+
+        let late = session_for(1, spur_core::step::STEP_BATCH);
+        assert!(claim_stepd_slot(&sessions, late).await.is_err());
+        assert_eq!(sessions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn adoption_keeps_the_newer_run_of_a_step() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.adopt_stepds(&[
+            session_for(2, spur_core::step::STEP_BATCH),
+            session_for(1, spur_core::step::STEP_BATCH),
+        ])
+        .await;
+
+        let stepds = svc.stepds.lock().await;
+        let kept = stepds
+            .get(&(79, spur_core::step::STEP_BATCH))
+            .expect("adopted");
+        assert_eq!(kept.run_attempt, 2);
+    }
+
+    /// A newer run of an allocation replaces the older one this node still tracks; only the
+    /// same or a newer run is a duplicate.
+    #[tokio::test]
+    async fn a_newer_allocation_run_replaces_the_tracked_older_one() {
+        let running = new_running_jobs();
+        let svc = AgentService::with_cluster_config(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            running.clone(),
+            false,
+        );
+        let register = |run_attempt| RegisterJobAllocationRequest {
+            job_id: 78,
+            cpus: 1,
+            run_attempt,
+            allocated: Some(ResourceAllocations {
+                cpus: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        svc.register_job_allocation(Request::new(register(1)))
+            .await
+            .expect("first run");
+        let duplicate = svc
+            .register_job_allocation(Request::new(register(1)))
+            .await
+            .expect_err("the same run is a duplicate");
+        assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
+        svc.register_job_allocation(Request::new(register(2)))
+            .await
+            .expect("a newer run replaces the older one");
+
+        assert_eq!(
+            running.lock().await.get(&78).expect("tracked").run_attempt,
+            2
+        );
     }
 
     #[tokio::test]
@@ -10552,6 +12336,8 @@ mod tests {
             "n1",
             state.path(),
             StepdLaunchOptions {
+                fabric_binding: None,
+                gpu_binding: None,
                 step_id: 0,
                 allocation_only: false,
                 container_rootfs_mode: None,
@@ -10561,6 +12347,7 @@ mod tests {
                 cred_id: String::new(),
                 cred_kid: String::new(),
                 cred_digest: String::new(),
+                pty_step_id: None,
             },
             &wrong,
         )
@@ -10579,6 +12366,147 @@ mod tests {
                 .exists(),
             "the refused launch must not create a session directory"
         );
+    }
+
+    #[tokio::test]
+    async fn run_command_reads_the_attempt_after_acquiring_the_job_gate() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let mut svc = test_agent_service(test_reporter());
+        let root = tempfile::tempdir().expect("state");
+        svc.stepd_state_dir = root.path().to_path_buf();
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let held = svc.lifecycle.acquire(79).await;
+        let command = svc.run_command(Request::new(RunCommandRequest {
+            job_id: 79,
+            step_id: 0,
+            command: vec!["true".into()],
+            ..Default::default()
+        }));
+        tokio::pin!(command);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(command.as_mut().poll(&mut context), Poll::Pending));
+        assert!(svc.active_steps.lock().await.is_empty());
+
+        svc.running
+            .lock()
+            .await
+            .get_mut(&79)
+            .expect("tracked")
+            .run_attempt = 2;
+        svc.step_completions
+            .complete(
+                79,
+                2,
+                0,
+                crate::step_completion::StepOutcome {
+                    exit_code: 23,
+                    signal: 0,
+                },
+            )
+            .await;
+        drop(held);
+        assert_eq!(
+            command
+                .await
+                .expect("settled new attempt")
+                .into_inner()
+                .exit_code,
+            23
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_credential_is_checked_after_a_replacement_releases_the_job_gate() {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential, NodeResourceSlice};
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let root = tempfile::tempdir().expect("state");
+        let mut svc = test_agent_service(test_reporter());
+        svc.stepd_state_dir = root.path().to_path_buf();
+        svc.cluster_id = "fence-test".into();
+        let now = spur_core::native_mint::unix_now().expect("time");
+        let (private, public) =
+            spur_core::native_jwks::generate_ed25519_jwks("fixture").expect("keys");
+        let signing =
+            spur_core::native_jwks::Ed25519SigningKeySet::from_bytes(private.as_bytes(), now)
+                .expect("signing");
+        svc.cred_keys = Some(Arc::new(
+            spur_core::native_jwks::Ed25519VerifyKeySet::from_bytes(public.as_bytes(), now)
+                .expect("verification"),
+        ));
+        let argv = vec!["true".to_string()];
+        let credential = ExecutionCredential {
+            kind: CredentialKind::Step,
+            cluster_id: svc.cluster_id.clone(),
+            key_id: String::new(),
+            job_id: 79,
+            step_id: 0,
+            run_attempt: 1,
+            user: "fixture".into(),
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![],
+            account: String::new(),
+            partition: String::new(),
+            qos: String::new(),
+            resources_by_node: vec![NodeResourceSlice {
+                node: svc.reporter.hostname.clone(),
+                cpus: 1,
+                memory_mb: 1,
+                devices: vec![],
+            }],
+            command_digest: spur_core::native_exec::command_digest("", &argv, ""),
+            container_digest: None,
+            issued_at: now,
+            not_before: now,
+            expires_at: now + 3600,
+            credential_id: [1; 16],
+        };
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(79, tracked).await;
+        let held = svc.lifecycle.acquire(79).await;
+        let command = svc.run_command(Request::new(RunCommandRequest {
+            job_id: 79,
+            step_id: 0,
+            uid: 1000,
+            gid: 1000,
+            command: argv,
+            execution_credential: spur_core::native_exec::sign_execution(credential, &signing, now)
+                .expect("token"),
+            ..Default::default()
+        }));
+        tokio::pin!(command);
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(command.as_mut().poll(&mut context), Poll::Pending));
+        svc.running
+            .lock()
+            .await
+            .get_mut(&79)
+            .expect("tracked")
+            .run_attempt = 2;
+        svc.step_completions
+            .complete(
+                79,
+                2,
+                0,
+                crate::step_completion::StepOutcome {
+                    exit_code: 23,
+                    signal: 0,
+                },
+            )
+            .await;
+        drop(held);
+        let error = command
+            .await
+            .expect_err("old credential must not enter the replacement");
+        assert!(error.message().contains("run_attempt mismatch"), "{error}");
+        assert!(svc.active_steps.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -10755,13 +12683,6 @@ mod tests {
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
         // Named as the real thing: cleanup refuses a path that is not ours.
         let cgroup = TestCgroup::new(&cgroup_root);
-        let blocker = cgroup.path().join("cgroup.kill");
-        std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
-        let blocker_removed = blocker.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
-        });
         let displaced = crate::stepd::StepdDescriptor::new(
             42,
             1,
@@ -11051,19 +12972,6 @@ mod tests {
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
         // Named as the real thing: cleanup refuses a path that is not ours.
         let cgroup = TestCgroup::new(&cgroup_root);
-        // A plain tempdir can't model real cgroupfs, where writing to the
-        // kernel-provided "cgroup.kill" never leaves a stray directory
-        // entry. A directory at that path makes the write fail cleanly
-        // instead (no file created), and removing it shortly after — same
-        // technique as cleanup_cgroup_retries_past_a_transient_removal_failure
-        // — lets the directory end up genuinely empty once retried.
-        let blocker = cgroup.path().join("cgroup.kill");
-        std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
-        let blocker_removed = blocker.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
-        });
         let descriptor = crate::stepd::StepdDescriptor::new(
             42,
             7,
@@ -11130,6 +13038,7 @@ mod tests {
                 exit_code: 0,
                 signal: 0,
                 epilog_failed: false,
+                pty_step_id: None,
             })
             .expect("acknowledge completion");
 
@@ -11653,6 +13562,46 @@ mod tests {
         );
     }
 
+    // After a restart the replay loop is all that reports a session's exit, so
+    // the numbered step has to come back from disk with the rest of it.
+    #[tokio::test]
+    async fn a_replayed_interactive_session_exit_names_its_numbered_step() {
+        const SLOT: spur_core::step::StepId = spur_core::step::STEP_INTERACTIVE;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let pid = std::process::id();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            7,
+            SLOT,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            store.session_dir(42, 7, SLOT).join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.pty_step_id = Some(3);
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(42, 7, SLOT)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 1,
+            })
+            .expect("record exit");
+
+        let replayed =
+            replay_unacknowledged_stepd_completions(&store, &controller_addr, "test-node", "")
+                .await
+                .expect("replay");
+
+        assert_eq!(replayed, vec![(42, 7, SLOT)]);
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].step_id, Some(SLOT));
+        assert_eq!(reports[0].pty_step_id, Some(3));
+    }
+
     #[tokio::test]
     async fn fence_dead_stepd_releases_tracking_before_reporting() {
         let (controller_addr, _reports, _drains, gate) = spawn_gated_mock_controller();
@@ -11825,6 +13774,196 @@ mod tests {
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
     }
 
+    async fn pending_completion_delivery_fixture(
+        controller_addr: &str,
+        step_id: u32,
+    ) -> (
+        CompletionListenerContext,
+        tempfile::TempDir,
+        crate::stepd::StepdDescriptor,
+    ) {
+        let (context, _, sessions, state, _) =
+            completion_listener_fixture_for_step(controller_addr, step_id).await;
+        let cgroup = state.path().join("job_42_7");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.kill"), "").unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        let descriptor = {
+            let mut sessions = sessions.lock().await;
+            let descriptor = sessions.get_mut(&(42, step_id)).unwrap();
+            descriptor.cgroup_path = cgroup.clone();
+            descriptor.clone()
+        };
+        context.stepds_store.publish(&descriptor).unwrap();
+        context
+            .stepds_store
+            .obligations(42, 7, step_id)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 9,
+                signal: 0,
+            })
+            .unwrap();
+        context
+            .stepds_store
+            .cleanup_store()
+            .track(&crate::cgroup_cleanup::PendingCleanup {
+                job_id: 42,
+                run_attempt: 7,
+                step_id,
+                cgroup,
+                quarantine_acknowledged: false,
+                deadline_unix_ms: u64::MAX,
+            })
+            .unwrap();
+        (context, state, descriptor)
+    }
+
+    async fn push_pending_completion(context: &CompletionListenerContext, step_id: u32) {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let exchange = async {
+            let (reader, mut writer) = client.into_split();
+            let notification = crate::stepd::AgentNotification::StepdCompleted {
+                job_id: 42,
+                run_attempt: 7,
+                step_id,
+                exit_code: 9,
+                signal: 0,
+                epilog_failed: false,
+                capability: "test-capability".into(),
+            };
+            writer
+                .write_all(&serde_json::to_vec(&notification).unwrap())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
+            crate::stepd::read_line_bounded(&mut reader, &mut line)
+                .await
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<crate::stepd::AgentNotificationResponse>(&line).unwrap(),
+                crate::stepd::AgentNotificationResponse::Deferred
+            ));
+        };
+        let (handled, ()) = tokio::join!(handle_completion_notification(server, context), exchange);
+        handled.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_completion_delivery_waits_for_quarantine_and_replay_wakes_each_step() {
+        for step_id in [spur_core::step::STEP_INTERACTIVE, 3] {
+            let (address, reports, _) = spawn_mock_controller();
+            let (context, _state, descriptor) =
+                pending_completion_delivery_fixture(&address, step_id).await;
+            let mut waiter = context.step_completions.register(42, 7, step_id).await;
+            push_pending_completion(&context, step_id).await;
+            assert!(matches!(
+                waiter.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(reports.lock().unwrap().is_empty());
+            assert_eq!(
+                ensure_runtime_exit_ready(&context.stepds_store, 42, 7, step_id)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable
+            );
+            assert_eq!(
+                ensure_runtime_exit_ready(&context.stepds_store, 42, 0, step_id)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable
+            );
+
+            let record = crate::cgroup_cleanup::PendingCleanup {
+                job_id: 42,
+                run_attempt: 7,
+                step_id,
+                cgroup: descriptor.cgroup_path.clone(),
+                quarantine_acknowledged: false,
+                deadline_unix_ms: 0,
+            };
+            context
+                .stepds_store
+                .cleanup_store()
+                .finish(&record)
+                .unwrap();
+            context.stepds_store.cleanup_store().track(&record).unwrap();
+            let completed =
+                replay_runtime_completions(&context.stepds_store, &address, "test-node", "")
+                    .await
+                    .unwrap();
+            assert_eq!(completed.len(), 1);
+            settle_replayed_completions(&context, &completed).await;
+            assert_eq!(
+                waiter.try_recv().unwrap(),
+                crate::step_completion::StepOutcome {
+                    exit_code: 9,
+                    signal: 0
+                }
+            );
+            assert!(reports.lock().unwrap()[0].drain_node);
+            assert!(context.stepds_store.ensure_cleanup_ready().is_err());
+            ensure_runtime_exit_ready(&context.stepds_store, 42, 7, step_id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_completion_delivery_from_recovery_stays_parked_until_cleanup() {
+        let (context, _state, descriptor) =
+            pending_completion_delivery_fixture("http://127.0.0.1:1", 3).await;
+        let mut waiter = context.step_completions.register(42, 7, 3).await;
+        assert!(settle_recovered_stepd(
+            &context.running,
+            &context.allocation,
+            &context.stepds,
+            &context.step_completions,
+            &context.stepds_store,
+            &descriptor,
+            9,
+            0
+        )
+        .await
+        .is_some());
+        assert!(matches!(
+            waiter.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        std::fs::remove_dir_all(&descriptor.cgroup_path).unwrap();
+        assert!(
+            deliver_runtime_completion(
+                &context.stepds_store,
+                &context.step_completions,
+                &descriptor,
+                crate::step_completion::StepOutcome {
+                    exit_code: 9,
+                    signal: 0
+                }
+            )
+            .await
+        );
+        assert_eq!(waiter.try_recv().unwrap().exit_code, 9);
+    }
+
+    #[tokio::test]
+    async fn pending_completion_delivery_from_dead_supervisor_stays_parked() {
+        let (context, _state, descriptor) = pending_completion_delivery_fixture(
+            "http://127.0.0.1:1",
+            spur_core::step::STEP_INTERACTIVE,
+        )
+        .await;
+        let mut waiter = context
+            .step_completions
+            .register(42, 7, descriptor.step_id)
+            .await;
+        fence_dead_stepd(&context, descriptor).await;
+        assert!(matches!(
+            waiter.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
     async fn completion_listener_fixture_for_step(
         controller_addr: &str,
         step_id: spur_core::step::StepId,
@@ -11846,16 +13985,19 @@ mod tests {
             },
         )));
         let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
         let mut descriptor = crate::stepd::StepdDescriptor::new(
             42,
             7,
             step_id,
             0,
             0,
-            std::path::PathBuf::from("/tmp/runtime.sock"),
+            store.session_dir(42, 7, step_id).join("runtime.sock"),
             std::path::PathBuf::new(),
         );
         descriptor.capability = "test-capability".into();
+        store.publish(&descriptor).expect("publish fixture session");
         allocation
             .lock()
             .await
@@ -11869,7 +14011,6 @@ mod tests {
             .lock()
             .await
             .insert(stepd_key(&descriptor), descriptor);
-        let state_dir = tempfile::tempdir().expect("state dir");
         let context = CompletionListenerContext {
             running: running.clone(),
             step_completions: completions.clone(),
@@ -11878,6 +14019,7 @@ mod tests {
             stepds_store: crate::stepd::StepdStore::new(state_dir.path()),
             controller_addr: controller_addr.into(),
             hostname: "test-node".into(),
+            reporter: test_reporter(),
         };
         (context, running, sessions, state_dir, completions)
     }
@@ -12041,6 +14183,8 @@ mod tests {
         svc.insert_test_job(
             job_id,
             TrackedJob {
+                fabric_binding: None,
+                gpu_binding: None,
                 run_attempt: 5,
                 ..TrackedJob::allocation_only(None)
             },
@@ -12474,6 +14618,57 @@ mod tests {
         );
     }
 
+    // Every `srun --pty` in a job runs in the one interactive slot, so only the
+    // numbered step tells the controller which session's shell exited.
+    #[tokio::test]
+    async fn an_interactive_sessions_exit_report_names_its_numbered_step() {
+        const SLOT: spur_core::step::StepId = spur_core::step::STEP_INTERACTIVE;
+        let (controller_addr, reports, _drains) = spawn_mock_controller();
+        let (context, _running, sessions, _state_dir, _completions) =
+            completion_listener_fixture_for_step(&controller_addr, SLOT).await;
+        sessions
+            .lock()
+            .await
+            .get_mut(&(42, SLOT))
+            .expect("tracked session")
+            .pty_step_id = Some(3);
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::stepd::AgentNotification::StepdCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            step_id: SLOT,
+            exit_code: 0,
+            signal: 1,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::stepd::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        let reports = reports.lock().expect("completion reports").clone();
+        assert_eq!(reports.len(), 1, "the session's exit is reported once");
+        assert_eq!(reports[0].step_id, Some(SLOT));
+        assert_eq!(reports[0].pty_step_id, Some(3));
+    }
+
     async fn completion_listener_fixture(
         controller_addr: &str,
     ) -> (
@@ -12743,7 +14938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_push_arriving_after_the_watchdog_already_fenced_it_just_acks() {
+    async fn a_push_after_an_unacknowledged_watchdog_exit_stays_deferred() {
         let (context, running, sessions, _state_dir) =
             completion_listener_fixture("http://127.0.0.1:1").await;
         let descriptor = sessions
@@ -12752,9 +14947,7 @@ mod tests {
             .get(&(42, spur_core::step::STEP_BATCH))
             .cloned()
             .expect("fixture session");
-        let state = tempfile::tempdir().expect("runtime state directory");
-        let store = crate::stepd::StepdStore::new(state.path());
-        store.publish(&descriptor).expect("publish descriptor");
+        let store = context.stepds_store.clone();
 
         let allocation = Arc::new(Mutex::new(NodeAllocation::new(
             "test-node".into(),
@@ -12816,10 +15009,7 @@ mod tests {
             .expect("handler task")
             .expect("handle notification");
 
-        assert_eq!(
-            response,
-            crate::stepd::AgentNotificationResponse::Acknowledged
-        );
+        assert_eq!(response, crate::stepd::AgentNotificationResponse::Deferred);
     }
 
     #[tokio::test(start_paused = true)]
@@ -12830,6 +15020,12 @@ mod tests {
             .lock()
             .await
             .remove(&(42, spur_core::step::STEP_BATCH));
+        std::fs::remove_dir_all(context.stepds_store.session_dir(
+            42,
+            7,
+            spur_core::step::STEP_BATCH,
+        ))
+        .expect("session was already pruned");
         let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
         let handler =
             tokio::spawn(
@@ -12969,8 +15165,8 @@ mod tests {
 
         assert_eq!(
             response,
-            crate::stepd::AgentNotificationResponse::Acknowledged,
-            "a stale attempt's own report is harmless to acknowledge"
+            crate::stepd::AgentNotificationResponse::Deferred,
+            "a stale attempt must retain its unacknowledged completion"
         );
         assert!(
             running.lock().await.contains_key(&42),
@@ -13777,7 +15973,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prolog_that_cannot_even_start_reports_the_underlying_errno() {
-        // Issue 520: `{e}` renders only the outermost context, reducing this to
+        // `{e}` renders only the outermost context, reducing this to
         // "prolog_slurmd script failed to execute: ..." and dropping the errno
         // that says whether the script is missing, unreadable or not executable.
         let svc = AgentService::new(
@@ -14325,6 +16521,8 @@ mod tests {
             std::path::PathBuf::new(),
         );
         descriptor.resources = crate::stepd::StepdJobResources {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 8,
             memory_mb: 4096,
             gpu_devices: vec![2, 3],
@@ -14564,7 +16762,7 @@ mod tests {
         }
     }
 
-    // STEP_INTERACTIVE (a non-owning step, since this PR) sits between user
+    // STEP_INTERACTIVE (a non-owning step) sits between user
     // steps and STEP_BATCH/STEP_EXTERN in id order; directory order is
     // otherwise arbitrary, so the job's own cgroup must win regardless of
     // which descriptor recovery processes first.
@@ -14724,6 +16922,8 @@ mod tests {
         svc.insert_test_job(
             44,
             TrackedJob {
+                fabric_binding: None,
+                gpu_binding: None,
                 run_attempt: 1,
                 ..TrackedJob::dummy(std::process::id())
             },
@@ -14907,6 +17107,157 @@ mod tests {
             .expect("a restart must not lose a step's exit");
 
         assert_eq!(response.into_inner().exit_code, 7);
+    }
+
+    async fn await_fenced_step(
+        memo: Option<crate::step_completion::StepOutcome>,
+        recorded: Option<crate::step_completion::StepOutcome>,
+    ) -> (i32, crate::step_completion::StepOutcome) {
+        let root = tempfile::tempdir().expect("fence roots");
+        let state_dir = root.path().join("state");
+        let cgroups = root.path().join("cgroups");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.clone());
+        svc.insert_test_job(
+            44,
+            TrackedJob {
+                run_attempt: 2,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+        let store = crate::stepd::StepdStore::new(&state_dir);
+        for attempt in [1, 2] {
+            let cgroup = cgroups.join(format!("job_44_{attempt}")).join("step_3");
+            std::fs::create_dir_all(&cgroup).expect("create step cgroup");
+            let descriptor = crate::stepd::StepdDescriptor::new(
+                44,
+                attempt,
+                3,
+                0,
+                0,
+                store.session_dir(44, attempt, 3).join("runtime.sock"),
+                cgroup,
+            );
+            store.publish(&descriptor).expect("publish descriptor");
+            if attempt == 2 {
+                svc.stepds
+                    .lock()
+                    .await
+                    .insert(stepd_key(&descriptor), descriptor);
+            }
+        }
+        if let Some(outcome) = recorded {
+            let obligations = store.obligations(44, 1, 3);
+            obligations
+                .append(&crate::stepd::StepdObligation::ExitObserved {
+                    exit_code: outcome.exit_code,
+                    signal: outcome.signal,
+                })
+                .expect("record step exit");
+            obligations
+                .append(&crate::stepd::StepdObligation::CompletionAcknowledged)
+                .expect("acknowledge step exit");
+        }
+        if let Some(outcome) = memo {
+            svc.step_completions.complete(44, 1, 3, outcome).await;
+        }
+        let mut waiter = svc.step_completions.register(44, 1, 3).await;
+
+        fence_older_runs(&svc.stepds, &svc.step_completions, &store, &cgroups, 44, 2)
+            .await
+            .expect("fence the old run");
+
+        assert!(!cgroups.join("job_44_1").exists());
+        assert!(cgroups.join("job_44_2/step_3").is_dir());
+        assert_eq!(svc.stepds.lock().await[&(44, 3)].run_attempt, 2);
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+                run_attempt: 1,
+            }))
+            .await
+            .expect("the old run's exit remains answerable")
+            .into_inner()
+            .exit_code;
+        (
+            response,
+            waiter.try_recv().expect("release the old run's waiter"),
+        )
+    }
+
+    #[tokio::test]
+    async fn await_step_preserves_a_memoized_exit_when_fencing_a_retained_session() {
+        for outcome in [
+            crate::step_completion::StepOutcome {
+                exit_code: 0,
+                signal: 0,
+            },
+            crate::step_completion::StepOutcome {
+                exit_code: 7,
+                signal: 0,
+            },
+        ] {
+            assert_eq!(
+                await_fenced_step(Some(outcome), None).await,
+                (outcome.exit_code, outcome)
+            );
+            assert_eq!(
+                await_fenced_step(Some(outcome), Some(outcome)).await,
+                (outcome.exit_code, outcome)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn await_step_preserves_a_durable_exit_when_fencing_after_restart() {
+        for outcome in [
+            crate::step_completion::StepOutcome {
+                exit_code: 0,
+                signal: 0,
+            },
+            crate::step_completion::StepOutcome {
+                exit_code: 7,
+                signal: 0,
+            },
+        ] {
+            assert_eq!(
+                await_fenced_step(None, Some(outcome)).await,
+                (outcome.exit_code, outcome)
+            );
+            assert_eq!(
+                await_fenced_step(
+                    Some(crate::step_completion::StepOutcome {
+                        exit_code: 0,
+                        signal: nix::sys::signal::Signal::SIGKILL as i32,
+                    }),
+                    Some(outcome)
+                )
+                .await,
+                (outcome.exit_code, outcome)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn await_step_reports_sigkill_for_a_fenced_session_without_an_exit() {
+        assert_eq!(
+            await_fenced_step(None, None).await,
+            (
+                137,
+                crate::step_completion::StepOutcome {
+                    exit_code: 0,
+                    signal: nix::sys::signal::Signal::SIGKILL as i32,
+                }
+            )
+        );
     }
 
     #[tokio::test]
@@ -15353,6 +17704,7 @@ mod tests {
             job_id: 48,
             signal: 9,
             run_attempt: 0,
+            kill_wait_secs: 0,
         });
         req.extensions_mut().insert(user_identity("attacker"));
         let err = svc
@@ -15847,7 +18199,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
-    /// Regression for #777: a step carrying `container_image` must take the
+    /// Regression: a step carrying `container_image` must take the
     /// container path, not silently run the command on the host. A bogus image
     /// makes the container path fail at image resolution *before* the command
     /// would run. The command (`echo`) would exit 0 on the host, so an Ok result
@@ -15984,7 +18336,7 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         svc.register_test_step(77, 0, Some(child.id())).await;
 
-        svc.graceful_cancel(77, 0).await;
+        svc.graceful_cancel(77, 0, kill_wait_from_request(0)).await;
 
         // The step must be marked cancelled and its process signaled dead.
         {
@@ -16058,8 +18410,13 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         svc.register_test_step(79, 4, Some(child.id())).await;
 
-        svc.cancel_active_steps_for_job(79, 0, nix::sys::signal::Signal::SIGTERM as i32)
-            .await;
+        svc.cancel_active_steps_for_job(
+            79,
+            0,
+            nix::sys::signal::Signal::SIGTERM as i32,
+            EXPLICIT_SIGNAL_STEP_ESCALATION,
+        )
+        .await;
 
         assert!(
             !svc.step_cancel_requested(79, 4).await,
@@ -16126,6 +18483,8 @@ mod tests {
         svc.insert_test_job(
             80,
             TrackedJob {
+                fabric_binding: None,
+                gpu_binding: None,
                 run_attempt: 1,
                 ..TrackedJob::allocation_only(None)
             },
@@ -16135,7 +18494,7 @@ mod tests {
         track_test_stepds(&svc, 80, 1, &[spur_core::step::STEP_BATCH], state.path()).await;
         svc.register_test_step(80, 6, None).await;
 
-        svc.graceful_cancel(80, 1).await;
+        svc.graceful_cancel(80, 1, kill_wait_from_request(0)).await;
 
         assert!(
             svc.step_cancel_requested(80, 6).await,
@@ -16179,7 +18538,7 @@ mod tests {
         let mut child = cmd.spawn().expect("spawn sleep");
         svc.register_test_step(78, 2, Some(child.id())).await;
 
-        svc.graceful_cancel(78, 1).await;
+        svc.graceful_cancel(78, 1, kill_wait_from_request(0)).await;
 
         assert!(
             svc.step_cancel_requested(78, 2).await,
@@ -16504,7 +18863,7 @@ mod tests {
             .expect("read failed");
     }
 
-    // G1: the enforced budget — and therefore the cpuset — must cover every task
+    // The enforced budget — and therefore the cpuset — must cover every task
     // the controller placed here, not just one task's `--cpus-per-task`.
     #[tokio::test]
     async fn cpuset_covers_every_task_on_the_node() {
@@ -16562,6 +18921,10 @@ mod tests {
     }
 
     fn test_reporter_with_gpus(device_ids: &[u32]) -> Arc<NodeReporter> {
+        Arc::new(unwrapped_test_reporter(device_ids))
+    }
+
+    fn unwrapped_test_reporter(device_ids: &[u32]) -> NodeReporter {
         use spur_core::resource::{GpuLinkType, GpuResource};
         let gpus = device_ids
             .iter()
@@ -16571,10 +18934,11 @@ mod tests {
                 memory_mb: 192_000,
                 peer_gpus: vec![],
                 link_type: GpuLinkType::XGMI,
+                topology: None,
                 stable_id: device_id as u64,
             })
             .collect();
-        Arc::new(NodeReporter::new(
+        NodeReporter::new(
             "test-node".into(),
             "http://localhost:6817".into(),
             ResourceSet {
@@ -16595,7 +18959,7 @@ mod tests {
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
             crate::reporter::ReporterTimeouts::default(),
-        ))
+        )
     }
 
     // A dispatch that records GPUs but fails before the job is
@@ -16636,6 +19000,8 @@ mod tests {
                 ..Default::default()
             }),
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices,
@@ -16659,6 +19025,610 @@ mod tests {
 
     /// The generation guard rejects only a genuine mismatch; a zero on either
     /// side is unset/legacy and passes so pre-generation controllers still work.
+    fn fabric_dispatch_fixture() -> (
+        AgentService,
+        spur_core::fabric_binding::FabricBinding,
+        ResourceAllocations,
+    ) {
+        use spur_core::fabric::{FabricBlock, FabricBlockKey, FabricDeviceKey, FabricMember};
+        let reporter = test_reporter_with_gpus(&[42]);
+        let mut inventory = reporter.snapshot_resources();
+        inventory.generation = 7;
+        inventory.fabric_binding_version = 1;
+        inventory.gpus[0].topology = Some(spur_core::resource::DeviceTopology {
+            pci_bdf: Some("0001:04:00.0".into()),
+            fabric: Some(spur_devices::topology::FabricObservation {
+                source: "test".into(),
+                status: spur_devices::topology::ObservationStatus::Consistent,
+                physical_domain_id: Some("rack-a".into()),
+                fabric_domain_id: Some("7".into()),
+                endpoint_id: Some("1".into()),
+                active_endpoints: vec!["1".into()],
+                local_endpoints: vec!["1".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        reporter.update_resources(inventory);
+        let block = FabricBlock {
+            file_revision: None,
+            key: FabricBlockKey {
+                namespace: "test".into(),
+                physical_domain: "rack-a".into(),
+                fabric_domain: "7".into(),
+            },
+            members: vec![FabricMember {
+                device: FabricDeviceKey {
+                    node: "test-node".into(),
+                    stable_id: 42,
+                },
+                endpoint: "1".into(),
+                inventory_generation: 7,
+            }],
+            active_endpoints: vec!["1".into()],
+            physical_capacity: Some(8),
+            fabric_capacity: Some(1),
+            issues: vec![],
+        };
+        let mut allocation = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            generation: 7,
+            devices: [(
+                "gpu".into(),
+                vec![spur_core::resource::AllocatedDevice::injectable(42)],
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let binding = spur_core::fabric_binding::FabricBinding::for_allocation(
+            &block,
+            "test-node",
+            &allocation,
+        )
+        .unwrap();
+        allocation.fabric_binding = Some(binding.clone());
+        let service = AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        (
+            service,
+            binding,
+            crate::reporter::allocations_to_proto(&allocation),
+        )
+    }
+
+    fn gpu_dispatch_fixture() -> (
+        AgentService,
+        spur_core::gpu_binding::GpuBinding,
+        ResourceAllocations,
+    ) {
+        let (service, _, mut allocation) = fabric_dispatch_fixture();
+        let mut inventory = service.reporter.snapshot_resources();
+        inventory.fabric_binding_version = spur_core::gpu_binding::GPU_PROPERTIES_CAPABILITY;
+        inventory.gpus[0].gpu_type = "test".into();
+        let t = inventory.gpus[0].topology.as_mut().unwrap();
+        t.pci_root = Some("pci0001:00".into());
+        t.numa_node = Some(0);
+        t.vram_bytes = Some(192 * 1024_u64.pow(3));
+        service.reporter.update_resources(inventory.clone());
+        allocation.fabric_binding = None;
+        let core = spur_core::resource::ResourceAllocations {
+            generation: 7,
+            devices: [(
+                "gpu".into(),
+                vec![spur_core::resource::AllocatedDevice::injectable(42)],
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let binding =
+            spur_core::gpu_binding::GpuBinding::new("test-node", &inventory, &core).unwrap();
+        allocation.gpu_binding = Some(spur_core::gpu_binding::to_proto(&binding));
+        (service, binding, allocation)
+    }
+
+    #[tokio::test]
+    async fn gpu_property_admission_and_steps_check_every_bound_fact_without_leaking_claims() {
+        for property in 0..8 {
+            let (service, binding, allocation) = gpu_dispatch_fixture();
+            service
+                .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+                .await
+                .unwrap();
+            service.allocation.lock().await.release_job(501);
+            let mut live = service.reporter.snapshot_resources();
+            match property {
+                0 => live.gpus[0].gpu_type = "changed".into(),
+                1 => live.gpus[0].topology.as_mut().unwrap().vram_bytes = None,
+                2 => live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1),
+                3 => live.gpus[0].topology.as_mut().unwrap().pci_root = Some("pci0002:00".into()),
+                4 => {
+                    live.gpus[0]
+                        .topology
+                        .as_mut()
+                        .unwrap()
+                        .fabric
+                        .as_mut()
+                        .unwrap()
+                        .physical_domain_id = Some("other".into())
+                }
+                5 => {
+                    live.gpus[0]
+                        .topology
+                        .as_mut()
+                        .unwrap()
+                        .fabric
+                        .as_mut()
+                        .unwrap()
+                        .fabric_domain_id = Some("other".into())
+                }
+                6 => live.gpus.clear(),
+                _ => live.generation += 1,
+            }
+            service.reporter.update_resources(live);
+            let error = service
+                .allocate_local_resources(502, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                tonic::Code::FailedPrecondition,
+                "property {property}"
+            );
+            assert!(service
+                .allocation
+                .lock()
+                .await
+                .allocated_gpu_ids()
+                .is_empty());
+            let mut tracked = TrackedJob::allocation_only(None);
+            tracked.gpu_devices = vec![42];
+            tracked.gpu_binding = Some(binding);
+            let step = service
+                .check_step_allocation(&AgentService::tracked_allocation(&tracked), "test-node")
+                .await;
+            assert_eq!(step.is_ok(), property == 7, "property {property}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gpu_property_start_gate_checks_changes_after_admission() {
+        let (service, binding, _) = gpu_dispatch_fixture();
+        let mut descriptor = gated_descriptor(501, 1, spur_core::step::STEP_BATCH);
+        descriptor.resources.gpu_binding = Some(binding);
+        descriptor.resources.gpu_devices = vec![42];
+        service
+            .stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+        let mut live = service.reporter.snapshot_resources();
+        live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1);
+        service.reporter.update_resources(live);
+        let error = service
+            .start_job(controller_start(501, 1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(service.stepds.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovered_gpu_property_binding_remains_enforced() {
+        let (service, binding, _) = gpu_dispatch_fixture();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            501,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            "/tmp/unused.sock".into(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources.gpu_devices = vec![42];
+        descriptor.resources.gpu_binding = Some(binding.clone());
+        let restored = serde_json::from_str(&serde_json::to_string(&descriptor).unwrap()).unwrap();
+        recover_stepds(&service.running, vec![restored]).await;
+        let jobs = service.running.lock().await;
+        assert_eq!(jobs[&501].gpu_binding, Some(binding));
+        let tracked = AgentService::tracked_allocation(&jobs[&501]);
+        service
+            .check_step_allocation(&tracked, "test-node")
+            .await
+            .unwrap();
+        let mut live = service.reporter.snapshot_resources();
+        live.generation += 1;
+        service.reporter.update_resources(live.clone());
+        service
+            .check_step_allocation(&tracked, "test-node")
+            .await
+            .unwrap();
+        assert!(service.check_dispatch_allocation(&tracked).await.is_err());
+        live.gpus[0].topology.as_mut().unwrap().numa_node = Some(1);
+        service.reporter.update_resources(live);
+        assert!(service
+            .check_step_allocation(&tracked, "test-node")
+            .await
+            .is_err());
+        let legacy: crate::stepd::StepdJobResources = serde_json::from_str(r#"{"cpus":4,"memory_mb":1024,"gpu_devices":[42],"cpu_ids":[0,1,2,3],"partition":"rack","nodelist":"test-node","mpi":"none"}"#).unwrap();
+        assert!(legacy.gpu_binding.is_none());
+    }
+
+    #[tokio::test]
+    async fn fabric_dispatch_and_steps_reject_changed_membership_without_leaking_gpu_claims() {
+        let (service, binding, allocation) = fabric_dispatch_fixture();
+        service
+            .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .unwrap();
+        service.allocation.lock().await.release_job(501);
+        let mut live = service.reporter.snapshot_resources();
+        live.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap()
+            .fabric_domain_id = Some("8".into());
+        service.reporter.update_resources(live);
+        let error = service
+            .allocate_local_resources(502, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(service
+            .allocation
+            .lock()
+            .await
+            .allocated_gpu_ids()
+            .is_empty());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.gpu_devices = vec![42];
+        tracked.fabric_binding = Some(binding);
+        assert!(service
+            .check_step_allocation(&AgentService::tracked_allocation(&tracked), "test-node")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_preflight_rejects_missing_file_before_shared_locks() {
+        let (mut service, mut binding, mut allocation) = fabric_dispatch_fixture();
+        let directory = tempfile::tempdir().unwrap();
+        service.set_block_file(Some(directory.path().join("missing.conf")));
+        binding.version = 2;
+        binding.file_revision = Some("0".repeat(64));
+        allocation.fabric_binding = Some(spur_core::fabric_binding::to_proto(&binding));
+        allocation.devices.clear();
+        let running = service.running.lock().await;
+        let ledger = service.allocation.lock().await;
+        let error = service
+            .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("cannot open block file"));
+        let error = service
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 502,
+                allocated: Some(allocation),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("cannot open block file"));
+        assert!(ledger.allocated_gpu_ids().is_empty());
+        assert!(running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_generation_recheck_rejects_publication_after_preflight() {
+        for properties in [false, true] {
+            let (service, allocation) = if properties {
+                let (service, _, allocation) = gpu_dispatch_fixture();
+                (service, allocation)
+            } else {
+                let (service, _, allocation) = fabric_dispatch_fixture();
+                (service, allocation)
+            };
+            service
+                .check_dispatch_allocation(&allocation)
+                .await
+                .unwrap();
+            let ledger = service.allocation.lock().await;
+            let mut inventory = service.reporter.snapshot_resources();
+            inventory.generation += 1;
+            service.reporter.update_resources(inventory);
+            let error = service
+                .check_current_dispatch_generation(&allocation)
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(ledger.allocated_gpu_ids().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn file_bindings_reread_membership_before_allocation_and_steps() {
+        let (mut service, mut binding, mut allocation) = fabric_dispatch_fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topology.conf");
+        let text = "BlockName=a Nodes=test-node";
+        std::fs::write(&path, text).unwrap();
+        let file = spur_core::block_file::BlockFile::read(&path).unwrap();
+        let mut live = service.reporter.snapshot_resources();
+        live.fabric_binding_version = 2;
+        live.block_file_revision = Some(file.revision.clone());
+        live.gpus[0].topology = None;
+        service.reporter.update_resources(live);
+        let endpoint = spur_core::block_file::declared_endpoint("test-node", 42);
+        binding.version = 2;
+        binding.file_revision = Some(file.revision);
+        binding.key.fabric_domain = "a".into();
+        binding.active_endpoints = vec![endpoint.clone()];
+        binding.members[0].endpoint = endpoint;
+        allocation.fabric_binding = Some(spur_core::fabric_binding::to_proto(&binding));
+        assert!(service
+            .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .is_err());
+        service.set_block_file(Some(path.clone()));
+        service
+            .allocate_local_resources(501, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .unwrap();
+        service.allocation.lock().await.release_job(501);
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.gpu_devices = vec![42];
+        tracked.fabric_binding = Some(binding);
+        let step = AgentService::tracked_allocation(&tracked);
+        std::fs::write(&path, "# reordered\nNodes=test-node BlockName=a\n").unwrap();
+        service
+            .check_step_allocation(&step, "test-node")
+            .await
+            .unwrap();
+        std::fs::write(
+            &path,
+            "BlockName=a Nodes=test-node\nBlockName=b Nodes=other\n",
+        )
+        .unwrap();
+        service
+            .check_step_allocation(&step, "test-node")
+            .await
+            .unwrap();
+        assert!(service
+            .check_step_allocation(&step, "test-node,other")
+            .await
+            .is_err());
+        std::fs::write(&path, "BlockName=a Nodes=test-node,other\n").unwrap();
+        service
+            .check_step_allocation(&step, "test-node,other")
+            .await
+            .unwrap();
+        assert!(service
+            .allocate_local_resources(502, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+            .await
+            .is_err());
+        for replacement in [Some("BlockName=b Nodes=test-node"), Some("bad input"), None] {
+            if let Some(text) = replacement {
+                std::fs::write(&path, text).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            assert!(service
+                .check_step_allocation(&step, "test-node")
+                .await
+                .is_err());
+            let error = service
+                .allocate_local_resources(502, 1, &JobSpec::default(), Some(&allocation), 1, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(service
+                .allocation
+                .lock()
+                .await
+                .allocated_gpu_ids()
+                .is_empty());
+        }
+        std::fs::write(&path, text).unwrap();
+        service
+            .check_step_allocation(&step, "test-node")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_a_step_whose_bound_fabric_changed() {
+        let (service, mut binding, _) = fabric_dispatch_fixture();
+        *service.device_registry.lock().await = test_gpu_registry();
+        let mut live = service.reporter.snapshot_resources();
+        live.gpus[0].stable_id = 1;
+        service.reporter.update_resources(live.clone());
+        binding.members[0].device.stable_id = 1;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.gpu_devices = vec![1];
+        tracked.fabric_binding = Some(binding);
+        service.insert_test_job(901, tracked).await;
+        let step = || {
+            Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id: 901,
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            service
+                .run_command(step())
+                .await
+                .unwrap()
+                .into_inner()
+                .exit_code,
+            0
+        );
+        let fabric = live.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap();
+        fabric.fabric_domain_id = Some("8".into());
+        service.reporter.update_resources(live);
+        let error = service.run_command(step()).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("fabric observation"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unbound_steps_skip_binding_checks_even_with_an_odd_nodelist() {
+        let (service, _, _) = fabric_dispatch_fixture();
+        let step = AgentService::tracked_allocation(&TrackedJob::allocation_only(None));
+        service
+            .check_step_allocation(&step, "node[1-")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn binding_preflight_that_never_finishes_is_rejected() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let error = run_preflight(std::time::Duration::from_millis(1), move || {
+            let _ = wait.recv();
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn allocation_rpc_rejects_unknown_fabric_binding_version() {
+        let (service, mut binding, mut allocation) = fabric_dispatch_fixture();
+        binding.version = 99;
+        allocation.fabric_binding = Some(spur_core::fabric_binding::to_proto(&binding));
+        allocation.devices.clear();
+        let error = service
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 501,
+                allocated: Some(allocation),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("unsupported fabric binding"));
+        assert!(service.running.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fabric_start_gate_rejects_a_change_after_resource_admission() {
+        let (service, binding, _) = fabric_dispatch_fixture();
+        let mut descriptor = gated_descriptor(501, 1, spur_core::step::STEP_BATCH);
+        descriptor.resources.fabric_binding = Some(binding);
+        descriptor.resources.gpu_devices = vec![42];
+        service
+            .stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+        let mut live = service.reporter.snapshot_resources();
+        live.generation = 8;
+        service.reporter.update_resources(live);
+        let error = service
+            .start_job(controller_start(501, 1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(service.stepds.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovered_supervisor_preserves_the_fabric_binding_for_steps() {
+        let (_, binding, _) = fabric_dispatch_fixture();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            501,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            "/tmp/unused.sock".into(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources.gpu_devices = vec![42];
+        descriptor.resources.fabric_binding = Some(binding.clone());
+        let encoded = serde_json::to_string(&descriptor).unwrap();
+        let restored = serde_json::from_str(&encoded).unwrap();
+        let running = new_running_jobs();
+        recover_stepds(&running, vec![restored]).await;
+        assert_eq!(running.lock().await[&501].fabric_binding, Some(binding));
+        let legacy: crate::stepd::StepdJobResources = serde_json::from_str(r#"{"cpus":4,"memory_mb":1024,"gpu_devices":[42],"cpu_ids":[0,1,2,3],"partition":"rack","nodelist":"test-node","mpi":"none"}"#).unwrap();
+        assert!(legacy.fabric_binding.is_none());
+    }
+
+    #[test]
+    fn fabric_preflight_rereads_only_the_bound_pci_observation() {
+        let (service, binding, _) = fabric_dispatch_fixture();
+        let bound = binding.members.iter().map(|m| m.device.stable_id).collect();
+        let mut inventory = service.reporter.snapshot_resources();
+        inventory.gpus[0]
+            .topology
+            .as_mut()
+            .unwrap()
+            .fabric
+            .as_mut()
+            .unwrap()
+            .source = "amd-ualink".into();
+        let directory = tempfile::tempdir().unwrap();
+        let ualink = directory.path().join("bus/pci/devices/0001:04:00.0/ualink");
+        std::fs::create_dir_all(&ualink).unwrap();
+        for (name, value) in [
+            ("ppod_id", "rack-a"),
+            ("ppod_size", "8"),
+            ("vpod_id", "7"),
+            ("vpod_size", "1"),
+            ("accel_id", "1"),
+            ("accel_state", "active"),
+            ("link_type", "UALoE"),
+            ("vpod_active_accels", "1"),
+            ("local_accels", "1"),
+        ] {
+            std::fs::write(ualink.join(name), value).unwrap();
+        }
+        refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).unwrap();
+        assert_eq!(
+            inventory.gpus[0]
+                .topology
+                .as_ref()
+                .unwrap()
+                .fabric
+                .as_ref()
+                .unwrap()
+                .fabric_domain_id
+                .as_deref(),
+            Some("7")
+        );
+        std::fs::write(ualink.join("vpod_id"), "8").unwrap();
+        refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).unwrap();
+        assert_eq!(
+            inventory.gpus[0]
+                .topology
+                .as_ref()
+                .unwrap()
+                .fabric
+                .as_ref()
+                .unwrap()
+                .fabric_domain_id
+                .as_deref(),
+            Some("8")
+        );
+        inventory.gpus[0].topology.as_mut().unwrap().pci_bdf = Some("../../escape".into());
+        assert!(refresh_bound_fabric(&mut inventory, &bound, false, directory.path()).is_err());
+    }
+
     #[test]
     fn dispatch_generation_guard_matrix() {
         assert!(check_dispatch_generation(7, 7).is_ok(), "equal passes");
@@ -16741,6 +19711,8 @@ mod tests {
             "test-node".into(),
             "http://localhost:6817".into(),
             ResourceSet {
+                fabric_binding_version: 0,
+                block_file_revision: None,
                 cpus: 4,
                 memory_mb: 8192,
                 gpus: vec![spur_core::resource::GpuResource {
@@ -16749,10 +19721,12 @@ mod tests {
                     memory_mb: 0,
                     peer_gpus: vec![],
                     link_type: spur_core::resource::GpuLinkType::XGMI,
+                    topology: None,
                     stable_id: 128,
                 }],
                 generic: Default::default(),
                 generation: 7,
+                topology: None,
             },
             spur_net::NodeAddress {
                 ip: "127.0.0.1".into(),
@@ -16793,6 +19767,8 @@ mod tests {
                 ..Default::default()
             }),
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices,
@@ -16841,6 +19817,8 @@ mod tests {
                 ..Default::default()
             }),
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -16952,6 +19930,8 @@ mod tests {
                 ..Default::default()
             }),
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17009,6 +19989,8 @@ mod tests {
                 ..Default::default()
             }),
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17056,6 +20038,8 @@ mod tests {
                 ..Default::default()
             }),
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 4,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17105,6 +20089,8 @@ mod tests {
                 ..Default::default()
             }),
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 2,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17272,6 +20258,8 @@ mod tests {
             ..Default::default()
         };
         let allocated = ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices,
@@ -17322,6 +20310,8 @@ mod tests {
             ..Default::default()
         };
         let allocated = ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices,
@@ -17368,6 +20358,8 @@ mod tests {
             ..Default::default()
         };
         let allocated = ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices,
@@ -17399,6 +20391,8 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("gpu".to_string(), DeviceAllocations { devices });
         ResourceAllocations {
+            fabric_binding: None,
+            gpu_binding: None,
             cpus: 1,
             memory_mb: 0,
             devices: map,
@@ -17501,6 +20495,8 @@ mod tests {
             user: "allocation-owner".into(),
             cpus: 1,
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices,
@@ -17634,6 +20630,8 @@ mod tests {
             cpus: 1,
             run_attempt: 9,
             allocated: Some(ResourceAllocations {
+                fabric_binding: None,
+                gpu_binding: None,
                 cpus: 1,
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
@@ -17686,6 +20684,7 @@ mod tests {
             job_id: 7,
             signal: 9,
             run_attempt: 1,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -17719,6 +20718,7 @@ mod tests {
             job_id: 7,
             signal: 9,
             run_attempt: 1,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -17757,6 +20757,7 @@ mod tests {
             job_id,
             signal: 9,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -17807,6 +20808,7 @@ mod tests {
             svc.hooks.clone(),
             svc.spank.clone(),
             svc.reporter.controller_addr.clone(),
+            svc.reporter.node_token(),
         )
         .await;
 
@@ -18145,6 +21147,8 @@ mod tests {
             requeue_job(spur_proto::proto::RequeueJobRequest) -> spur_proto::proto::RequeueJobResponse;
             get_nodes(spur_proto::proto::GetNodesRequest) -> spur_proto::proto::GetNodesResponse;
             get_node(spur_proto::proto::GetNodeRequest) -> spur_proto::proto::NodeInfo;
+        get_fabric_topology(()) -> spur_proto::proto::GetFabricTopologyResponse;
+        validate_block_file(spur_proto::proto::ValidateBlockFileRequest) -> spur_proto::proto::GetFabricTopologyResponse;
             update_node(spur_proto::proto::UpdateNodeRequest) -> ();
             deregister_node(spur_proto::proto::DeregisterNodeRequest) -> spur_proto::proto::DeregisterNodeResponse;
             deregister_agent(spur_proto::proto::DeregisterAgentRequest) -> ();
@@ -18408,6 +21412,7 @@ mod tests {
             stepds_store: store.clone(),
             controller_addr: "http://127.0.0.1:1".into(),
             hostname: "test-node".into(),
+            reporter: test_reporter(),
         }
     }
 
@@ -18436,7 +21441,8 @@ mod tests {
         let job_id = 900;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             wait_job_reaped(&svc, job_id, 5_000).await,
@@ -18466,6 +21472,8 @@ mod tests {
             .spawn()
             .expect("failed to spawn SIGTERM-trapping process");
         let tracked = TrackedJob {
+            fabric_binding: None,
+            gpu_binding: None,
             job: executor::RunningJob::Managed { child },
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: "/dev/null".into(),
@@ -18489,12 +21497,209 @@ mod tests {
         };
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         // 5s grace + up to 2s monitor tick + buffer
         assert!(
             wait_job_reaped(&svc, job_id, 10_000).await,
             "monitor should reap job after SIGKILL escalation"
+        );
+    }
+
+    #[test]
+    fn kill_wait_from_request_defaults_and_floors() {
+        use std::time::Duration;
+        assert_eq!(kill_wait_from_request(0), Duration::from_secs(5));
+        assert_eq!(kill_wait_from_request(3), Duration::from_secs(5));
+        assert_eq!(kill_wait_from_request(30), Duration::from_secs(30));
+        assert_eq!(kill_wait_from_request(65533), Duration::from_secs(65533));
+    }
+
+    fn process_is_running(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                .is_some_and(|state| state != "Z")
+        })
+    }
+
+    /// Returns how child `pid` ended, without reaping it; ECHILD (reaped by the
+    /// code under test) fails the test. Waits on the kernel, not the paused clock.
+    async fn wait_until_exited(pid: i32) -> nix::sys::wait::WaitStatus {
+        wait_until_exited_or_reaped(pid)
+            .await
+            .expect("child was reaped before the test could read how it ended")
+    }
+
+    /// Like `wait_until_exited`, but `None` for a child the code under test already
+    /// reaped (ECHILD): its exit status is gone, though it has certainly exited.
+    async fn wait_until_exited_or_reaped(pid: i32) -> Option<nix::sys::wait::WaitStatus> {
+        use nix::sys::wait::{waitid, Id, WaitPidFlag};
+        tokio::task::spawn_blocking(move || loop {
+            match waitid(
+                Id::Pid(nix::unistd::Pid::from_raw(pid)),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+            ) {
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::ECHILD) => return None,
+                Err(errno) => panic!("waitid({pid}) failed: {errno}"),
+                Ok(status) => return Some(status),
+            }
+        })
+        .await
+        .expect("wait for the process to exit")
+    }
+
+    fn assert_ended_by_signal(
+        status: nix::sys::wait::WaitStatus,
+        expected: nix::sys::signal::Signal,
+    ) {
+        assert!(
+            matches!(status, nix::sys::wait::WaitStatus::Signaled(_, signal, _) if signal == expected),
+            "expected the process to be killed by {expected}, but it ended as {status:?}"
+        );
+    }
+
+    /// Returns only once the trap is installed, so a SIGTERM sent right after
+    /// can't beat it and kill the process outright. The child ends on its own
+    /// after 60s, so a SIGKILL that never lands fails a test instead of hanging it.
+    async fn spawn_term_ignoring_process() -> tokio::process::Child {
+        use std::os::unix::process::CommandExt;
+        use tokio::io::AsyncBufReadExt;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "trap '' TERM; echo ready; sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn SIGTERM-ignoring process");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut line = String::new();
+        tokio::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .await
+            .expect("read readiness line");
+        child
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_cancel_waits_the_requested_kill_wait_before_sigkill() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let child = spawn_term_ignoring_process().await;
+        let pid = child.id().expect("pid") as i32;
+        let job_id = 906;
+        svc.insert_test_job(
+            job_id,
+            TrackedJob {
+                job: executor::RunningJob::Managed { child },
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+
+        let started = tokio::time::Instant::now();
+        svc.graceful_cancel(job_id, 0, std::time::Duration::from_secs(30))
+            .await;
+
+        tokio::time::sleep_until(started + std::time::Duration::from_secs(29)).await;
+        let alive_before_kill_wait = process_is_running(pid);
+        tokio::time::sleep_until(started + std::time::Duration::from_secs(31)).await;
+        tokio::time::resume();
+        // Teardown waits on a managed child, which reaps it and its status.
+        let status = wait_until_exited_or_reaped(pid).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        if let Some(status) = status {
+            assert_ended_by_signal(status, nix::sys::signal::Signal::SIGKILL);
+        }
+        assert!(
+            alive_before_kill_wait,
+            "SIGKILL must not land before the requested kill wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupervised_step_escalation_follows_kill_wait() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let child = spawn_term_ignoring_process().await;
+        let pid = child.id().expect("pid");
+        svc.register_test_step(907, 4, Some(pid)).await;
+
+        let started = tokio::time::Instant::now();
+        svc.graceful_cancel(907, 0, std::time::Duration::from_secs(30))
+            .await;
+
+        tokio::time::sleep_until(started + std::time::Duration::from_secs(10)).await;
+        let alive_at_old_escalation = process_is_running(pid as i32);
+        tokio::time::sleep_until(started + std::time::Duration::from_secs(31)).await;
+        tokio::time::resume();
+        let status = wait_until_exited(pid as i32).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGKILL);
+        assert!(
+            alive_at_old_escalation,
+            "an unsupervised step must not be SIGKILLed before the kill wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn force_reclaim_fires_after_kill_wait_plus_backstop() {
+        let _shortened = ShortenedForceReclaim::new(std::time::Duration::from_secs(1));
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let (mut child, descriptor) = spawn_wedged_stepd_stub(908, 1).await;
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = descriptor.run_attempt;
+        svc.insert_test_job(descriptor.job_id, tracked).await;
+
+        let started = tokio::time::Instant::now();
+        let release_wait = svc.spawn_stepd_release_wait(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            std::time::Duration::from_secs(10),
+        );
+        release_wait.await.expect("release wait");
+
+        tokio::time::sleep_until(started + std::time::Duration::from_millis(10_500)).await;
+        let alive_before_backstop = !child_has_exited(&mut child).await;
+        tokio::time::sleep_until(started + std::time::Duration::from_millis(11_500)).await;
+        tokio::time::resume();
+        child.wait().await.expect("wait for the force-killed stepd");
+
+        assert!(
+            alive_before_backstop,
+            "the stepd must outlive the kill wait; the backstop starts after it"
         );
     }
 
@@ -18563,7 +21768,8 @@ mod tests {
             requests
         });
 
-        svc.graceful_cancel(descriptor.job_id, 0).await;
+        svc.graceful_cancel(descriptor.job_id, 0, kill_wait_from_request(0))
+            .await;
         tokio::time::advance(tokio::time::Duration::from_secs(6)).await;
         tokio::task::yield_now().await;
 
@@ -18662,6 +21868,515 @@ mod tests {
             "send_explicit_signal must not return before the job's running entry clears"
         );
         server.await.expect("runtime control server");
+    }
+
+    /// Serves a stepd's control socket, acknowledging every request, until it
+    /// is asked to shut down; the shutdown ends the loop so the test learns
+    /// exactly which requests arrived before it, without a timeout.
+    fn serve_recording_stepd(
+        listener: tokio::net::UnixListener,
+        descriptor: crate::stepd::StepdDescriptor,
+    ) -> tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        tokio::spawn(async move {
+            let mut received = Vec::new();
+            loop {
+                let (stream, _) =
+                    crate::stepd::accept_hello(&listener, &descriptor, &descriptor.capability)
+                        .await
+                        .expect("accept runtime hello");
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                BufReader::new(reader)
+                    .read_line(&mut line)
+                    .await
+                    .expect("read runtime request");
+                let request: crate::stepd::StepdRequest =
+                    serde_json::from_str(&line).expect("decode runtime request");
+                let acknowledgement =
+                    serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
+                        .expect("encode acknowledgement");
+                writer
+                    .write_all(format!("{acknowledgement}\n").as_bytes())
+                    .await
+                    .expect("acknowledge runtime request");
+                let stop = request == crate::stepd::StepdRequest::Shutdown;
+                received.push(request);
+                if stop {
+                    return received;
+                }
+            }
+        })
+    }
+
+    /// Binds a recording stepd for one step of a job and registers it with `svc`.
+    async fn register_recording_stepd(
+        svc: &AgentService,
+        dir: &std::path::Path,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> (
+        crate::stepd::StepdDescriptor,
+        tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>>,
+    ) {
+        let socket_path = dir.join(format!("step-{step_id}.sock"));
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "signal-job-test".into();
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let server = serve_recording_stepd(listener, descriptor.clone());
+        (descriptor, server)
+    }
+
+    /// Everything the stepd was asked before this call, minus the shutdown
+    /// that ends the recording.
+    async fn finish_recording_stepd(
+        descriptor: &crate::stepd::StepdDescriptor,
+        server: tokio::task::JoinHandle<Vec<crate::stepd::StepdRequest>>,
+    ) -> Vec<crate::stepd::StepdRequest> {
+        crate::stepd::shutdown_allocation(descriptor, uuid::Uuid::new_v4().to_string())
+            .await
+            .expect("stop the recording stepd");
+        let mut received = server.await.expect("recording stepd");
+        assert_eq!(
+            received.pop(),
+            Some(crate::stepd::StepdRequest::Shutdown),
+            "the recording ends on the test's own shutdown"
+        );
+        received
+    }
+
+    fn signal_job_request(
+        job_id: u32,
+        run_attempt: u32,
+        signal: nix::sys::signal::Signal,
+        target: SignalTarget,
+    ) -> Request<AgentSignalJobRequest> {
+        let mut req = Request::new(AgentSignalJobRequest {
+            job_id,
+            run_attempt,
+            signal: signal as i32,
+            target: target as i32,
+        });
+        req.extensions_mut().insert(controller_identity());
+        req
+    }
+
+    fn sigterm_request() -> crate::stepd::StepdRequest {
+        crate::stepd::StepdRequest::SignalAllocation {
+            signal: nix::sys::signal::Signal::SIGTERM as i32,
+        }
+    }
+
+    fn test_agent() -> AgentService {
+        AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    #[tokio::test]
+    async fn signal_job_steps_target_skips_the_batch_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 910, 1, spur_core::step::STEP_BATCH).await;
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 910, 1, 0).await;
+
+        svc.signal_job(signal_job_request(
+            910,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+
+        assert_eq!(
+            finish_recording_stepd(&step, step_server).await,
+            vec![sigterm_request()]
+        );
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_full_target_reaches_every_supervisor() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 911, 1, spur_core::step::STEP_BATCH).await;
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 911, 1, 0).await;
+
+        svc.signal_job(signal_job_request(
+            911,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("signal job");
+
+        assert_eq!(
+            finish_recording_stepd(&step, step_server).await,
+            vec![sigterm_request()]
+        );
+        assert_eq!(
+            finish_recording_stepd(&batch, batch_server).await,
+            vec![sigterm_request()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signal_job_never_escalates() {
+        use spur_core::native_cred::{CredentialKind, ExecutionCredential};
+
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 912, 1, spur_core::step::STEP_BATCH).await;
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(912, tracked).await;
+        let child = spawn_term_ignoring_process().await;
+        let pid = child.id().expect("pid");
+        svc.register_test_step(912, 4, Some(pid)).await;
+        let credential = ExecutionCredential {
+            kind: CredentialKind::Job,
+            cluster_id: "cluster-a".into(),
+            key_id: String::new(),
+            job_id: 912,
+            step_id: spur_core::step::STEP_BATCH,
+            run_attempt: 1,
+            user: "alice".into(),
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![],
+            account: "research".into(),
+            partition: "gpu".into(),
+            qos: String::new(),
+            resources_by_node: vec![],
+            command_digest: [1u8; spur_core::native_cred::DIGEST_LEN],
+            container_digest: None,
+            issued_at: 0,
+            not_before: 0,
+            expires_at: 0,
+            credential_id: [2u8; spur_core::native_cred::CREDENTIAL_ID_LEN],
+        };
+        assert_eq!(svc.launch_acceptance.accept(&credential), Ok(true));
+
+        svc.signal_job(signal_job_request(
+            912,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        // Let any task the signal spawned register its timer before the clock
+        // moves, or it would sleep from the advanced instant instead.
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+
+        // A SIGKILL sent by the advanced clock lands in the kernel a moment
+        // later, so give it a short real-time window to show up.
+        let mut still_running = true;
+        for _ in 0..20 {
+            still_running = process_is_running(pid as i32);
+            if !still_running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert!(
+            still_running,
+            "a signal-only request must never escalate to SIGKILL"
+        );
+        assert!(
+            !svc.step_cancel_requested(912, 4).await,
+            "a warning must not mark the step cancelled"
+        );
+        assert!(svc.running.lock().await.contains_key(&912));
+        assert!(svc
+            .stepds
+            .lock()
+            .await
+            .contains_key(&(912, spur_core::step::STEP_BATCH)));
+        assert_eq!(
+            svc.launch_acceptance.accept(&credential),
+            Ok(false),
+            "the attempt must stay accepted, not be cancelled"
+        );
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_signals_an_unsupervised_step_without_cancelling_it() {
+        let svc = test_agent();
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid");
+        svc.register_test_step(919, 4, Some(pid)).await;
+
+        svc.signal_job(signal_job_request(
+            919,
+            0,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        let status = wait_until_exited(pid as i32).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-(pid as i32)),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGTERM);
+        assert!(!svc.step_cancel_requested(919, 4).await);
+    }
+
+    #[tokio::test]
+    async fn signal_job_does_not_mark_a_launching_step_cancelled() {
+        let svc = test_agent();
+        svc.register_test_step(920, 4, None).await;
+
+        svc.signal_job(signal_job_request(
+            920,
+            0,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+
+        assert!(
+            !svc.step_cancel_requested(920, 4).await,
+            "a step with no pid yet must not be aborted by a warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_job_with_no_steps_succeeds() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (batch, batch_server) =
+            register_recording_stepd(&svc, dir.path(), 913, 1, spur_core::step::STEP_BATCH).await;
+
+        svc.signal_job(signal_job_request(
+            913,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("a batch-only job has no step to warn, which is not an error");
+
+        assert_eq!(finish_recording_stepd(&batch, batch_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_full_target_signals_a_legacy_unsupervised_job() {
+        let svc = test_agent();
+        let mut command = std::process::Command::new("/bin/sleep");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = tokio::process::Command::from(command)
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("pid") as i32;
+        let mut tracked = TrackedJob {
+            job: executor::RunningJob::Managed { child },
+            ..TrackedJob::allocation_only(None)
+        };
+        tracked.run_attempt = 1;
+        svc.insert_test_job(914, tracked).await;
+
+        svc.signal_job(signal_job_request(
+            914,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Steps,
+        ))
+        .await
+        .expect("signal job");
+        assert!(
+            process_is_running(pid),
+            "the steps target must leave the batch script alone"
+        );
+
+        svc.signal_job(signal_job_request(
+            914,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("signal job");
+        let status = wait_until_exited(pid).await;
+
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        assert_ended_by_signal(status, nix::sys::signal::Signal::SIGTERM);
+        assert!(
+            svc.running.lock().await.contains_key(&914),
+            "a signal does not tear the job down"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_job_for_a_job_this_node_does_not_hold_is_not_found() {
+        let svc = test_agent();
+
+        for run_attempt in [0, 3] {
+            let status = svc
+                .signal_job(signal_job_request(
+                    930,
+                    run_attempt,
+                    nix::sys::signal::Signal::SIGTERM,
+                    SignalTarget::Steps,
+                ))
+                .await
+                .expect_err("nothing was signalled");
+            assert_eq!(
+                status.code(),
+                tonic::Code::NotFound,
+                "attempt {run_attempt}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_no_particular_attempt_is_scoped_to_the_current_run() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(931, tracked).await;
+
+        assert_eq!(svc.signal_scope(931, 0).await.expect("known job"), Some(2));
+        assert_eq!(svc.signal_scope(931, 2).await.expect("known job"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_a_superseded_attempt_has_no_scope() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(932, tracked).await;
+
+        assert_eq!(svc.signal_scope(932, 1).await.expect("known job"), None);
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_an_orphaned_step_keeps_the_wildcard_scope() {
+        let svc = test_agent();
+        svc.register_test_step(933, 4, None).await;
+
+        assert_eq!(svc.signal_scope(933, 0).await.expect("known job"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn signal_job_drops_a_stale_run_attempt() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let svc = test_agent();
+        let dir = tempfile::tempdir().expect("socket directory");
+        let (step, step_server) = register_recording_stepd(&svc, dir.path(), 915, 2, 0).await;
+
+        svc.signal_job(signal_job_request(
+            915,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        ))
+        .await
+        .expect("a signal for a superseded run is dropped, not an error");
+
+        assert_eq!(finish_recording_stepd(&step, step_server).await, vec![]);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_unspecified_target() {
+        let svc = test_agent();
+        let err = svc
+            .signal_job(signal_job_request(
+                916,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Unspecified,
+            ))
+            .await
+            .expect_err("a signal needs a target");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_the_batch_target_until_it_is_supported() {
+        let svc = test_agent();
+        let err = svc
+            .signal_job(signal_job_request(
+                917,
+                1,
+                nix::sys::signal::Signal::SIGTERM,
+                SignalTarget::Batch,
+            ))
+            .await
+            .expect_err("the batch target is not implemented");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn signal_job_rejects_a_non_controller_caller() {
+        let svc = test_agent();
+        let mut tracked = TrackedJob::allocation_only(None);
+        tracked.run_attempt = 1;
+        svc.insert_test_job(918, tracked).await;
+
+        let mut req = signal_job_request(
+            918,
+            1,
+            nix::sys::signal::Signal::SIGTERM,
+            SignalTarget::Full,
+        );
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .signal_job(req)
+            .await
+            .expect_err("a user token must not signal jobs by dialing the agent directly");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     // A session cancelled before `Start` has nothing that pushes completion; left
@@ -18982,7 +22697,7 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
 
-        svc.graceful_cancel(904, 3).await;
+        svc.graceful_cancel(904, 3, kill_wait_from_request(0)).await;
 
         let contacted =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), listener.accept()).await;
@@ -19018,6 +22733,8 @@ mod tests {
                 .expect("spawn trap process");
             let pid = child.id().expect("pid") as i32;
             let t = TrackedJob {
+                fabric_binding: None,
+                gpu_binding: None,
                 job: executor::RunningJob::Managed { child },
                 rootfs_mode: crate::container::RootfsMode::Extracted,
                 stdout_path: "/dev/null".into(),
@@ -19046,7 +22763,8 @@ mod tests {
         svc.insert_test_job(job_id, run1).await;
 
         // Cancel epoch 1 (SIGTERM; trapped, survives) and spawn the grace timer.
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         // Simulate requeue + re-dispatch: same job_id, newer epoch.
         let (run2, pid2) = spawn_trap(2);
@@ -19113,7 +22831,8 @@ mod tests {
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             !svc.running.lock().await.contains_key(&job_id),
@@ -19164,7 +22883,8 @@ mod tests {
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             svc.running.lock().await.contains_key(&job_id),
@@ -19218,7 +22938,8 @@ mod tests {
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             svc.running.lock().await.contains_key(&job_id),
@@ -19272,7 +22993,8 @@ mod tests {
 
         // Names the older, now-dead attempt explicitly, as an eviction-style
         // cancel targeting one stale run would.
-        svc.graceful_cancel(job_id, dead_attempt).await;
+        svc.graceful_cancel(job_id, dead_attempt, kill_wait_from_request(0))
+            .await;
 
         assert_eq!(
             svc.running.lock().await.get(&job_id).map(|t| t.run_attempt),
@@ -19441,7 +23163,8 @@ mod tests {
         tracked.run_attempt = run_attempt;
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             svc.running.lock().await.contains_key(&job_id),
@@ -19500,6 +23223,7 @@ mod tests {
             job_id,
             signal: 0,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -19534,6 +23258,7 @@ mod tests {
             job_id,
             signal: 0,
             run_attempt: 0,
+            kill_wait_secs: 0,
         }))
         .await
         .expect("cancel_job");
@@ -19558,6 +23283,8 @@ mod tests {
         );
         fn allocation_only_job(run_attempt: u32) -> TrackedJob {
             TrackedJob {
+                fabric_binding: None,
+                gpu_binding: None,
                 job: executor::RunningJob::AllocationOnly,
                 cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
@@ -19644,6 +23371,8 @@ mod tests {
         svc.insert_test_job(
             job_id,
             TrackedJob {
+                fabric_binding: None,
+                gpu_binding: None,
                 job: executor::RunningJob::AllocationOnly,
                 cgroup_path: None,
                 rootfs_mode: crate::container::RootfsMode::Extracted,
@@ -20065,7 +23794,8 @@ mod tests {
         svc.insert_test_job(job_id, TrackedJob::allocation_only(Some(cgroup.clone())))
             .await;
 
-        svc.graceful_cancel(job_id, 0).await;
+        svc.graceful_cancel(job_id, 0, kill_wait_from_request(0))
+            .await;
 
         assert!(
             !svc.running.lock().await.contains_key(&job_id),
@@ -20128,7 +23858,7 @@ mod tests {
 
         svc.send_explicit_signal(902, 0, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
-        svc.graceful_cancel(902, 0).await;
+        svc.graceful_cancel(902, 0, kill_wait_from_request(0)).await;
 
         assert!(svc.running.lock().await.contains_key(&902));
         assert!(svc
@@ -20196,6 +23926,7 @@ mod tests {
             memory_mb: 192_000,
             peer_gpus: vec![],
             link_type: spur_core::resource::GpuLinkType::XGMI,
+            topology: None,
             stable_id,
         }
     }
@@ -20313,6 +24044,99 @@ mod tests {
             reloaded.resources.gpu_devices,
             vec![0x0063_0000, 0x0083_0000]
         );
+    }
+
+    fn spec_service(root: std::path::PathBuf, cgroup_enabled: bool) -> AgentService {
+        let marker = root.with_extension("marker");
+        let reporter =
+            unwrapped_test_reporter(&[]).with_spec_enforcement(root, marker, cgroup_enabled);
+        AgentService::new(
+            Arc::new(reporter),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+    }
+
+    fn deliver_spec_core(svc: &AgentService) {
+        svc.reporter.adopt_core_layout(
+            Some(spur_proto::proto::CoreLayout {
+                spec_cpus: vec![3],
+                general_cpus: vec![0, 1, 2],
+                ..Default::default()
+            }),
+            None,
+            crate::spec::Delivery::Launch,
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_cores_refuse_workloads_when_this_nodes_cgroups_are_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = spec_service(dir.path().join("spur"), false);
+        assert!(svc.require_spec_enforced().await.is_ok());
+
+        deliver_spec_core(&svc);
+        let err = svc.require_spec_enforced().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("[cgroup]"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn a_launch_applies_the_layout_before_it_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("spur");
+        let svc = spec_service(root.clone(), true);
+        deliver_spec_core(&svc);
+
+        assert!(svc.require_spec_enforced().await.is_ok());
+        assert_eq!(
+            std::fs::read_to_string(root.join("cpuset.cpus")).unwrap(),
+            "0-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_root_write_refuses_the_workload_with_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, "").unwrap();
+        let svc = spec_service(file.join("spur"), true);
+        deliver_spec_core(&svc);
+
+        let err = svc.require_spec_enforced().await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("spur cgroup root"),
+            "{}",
+            err.message()
+        );
+        assert!(svc.reporter.spec_enforcement_error().is_some());
+    }
+
+    #[test]
+    fn fallback_cpu_ids_returns_real_ids_on_a_sparse_online_set() {
+        use spur_core::cpu_topology::{CpuRecord, CpuTopology};
+        let records: Vec<CpuRecord> = [0, 2, 5]
+            .iter()
+            .enumerate()
+            .map(|(i, &cpu)| CpuRecord {
+                cpu,
+                socket: 0,
+                core_id: i as u32,
+                numa_node: None,
+            })
+            .collect();
+        let resources = ResourceSet {
+            cpus: 3,
+            memory_mb: 1024,
+            topology: Some(CpuTopology::from_cpus(&records)),
+            ..Default::default()
+        };
+        let mut alloc = NodeAllocation::new("n1".into(), &resources);
+        alloc.mark_cpus_unavailable(&[0]);
+
+        assert_eq!(fallback_cpu_ids(&alloc, 2), vec![2, 5]);
     }
 
     // An empty ledger was only correct while a restart killed every job: it now

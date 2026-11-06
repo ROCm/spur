@@ -349,6 +349,18 @@ Enable and start it:
    The one-line installer places binaries in ``~/.local/bin`` by default. If you install
    that way, adjust ``ExecStart`` to match — this unit assumes ``/usr/local/bin``.
 
+.. important::
+
+   After ``SIGTERM``, ``spurctld`` waits at most ``[controller] shutdown_grace_secs``
+   (default 10s) for in-flight RPCs to drain, then flushes accounting for up to 5 seconds
+   and exits. An ``srun`` step holds its RPC open for the step's whole runtime, so this is
+   what keeps ``systemctl restart spurctld`` short while steps are running. Keep the grace
+   well below ``heartbeat_timeout_secs``, since the draining controller answers no
+   heartbeats, and avoid ``0``, which removes the bound. Keep ``TimeoutStopSec`` above the
+   grace plus those 5 seconds: systemd's default of 90s, which the unit above leaves
+   unchanged, covers the default grace. A ``SIGKILL`` at that timeout skips the accounting
+   flush.
+
 High Availability
 ~~~~~~~~~~~~~~~~~
 
@@ -545,6 +557,29 @@ Out of the box the job's cgroup gets:
 
 A job submitted without ``--mem`` has no memory budget, so the memory ceilings are
 left unset.
+
+Job termination waits for all processes in the owned cgroup, including
+children that outlive the batch shell. The ``[cgroup] cleanup_timeout_secs``
+setting defaults to 60 seconds, matching Slurm's ``UnkillableStepTimeout``. The node agent blocks new launches while cleanup
+is pending. At the deadline, it requests a node drain independently of job
+completion, including when a supervisor is still busy with cleanup or exit hooks. An unreadable cgroup is treated as unresolved cleanup, rather than
+as empty.
+
+Pending cleanup is recorded on disk and retried after an agent or supervisor
+restart. The original deadline is preserved during recovery; the agent's
+force-reclaim timer does not prove that the workload has exited. The controller
+also drains unreported nodes before force-finishing a job at
+``complete_wait_secs``, so keep that above the larger kill wait plus
+``cleanup_timeout_secs``. The controller's warning for this uses its own
+``[cgroup] cleanup_timeout_secs``, so set it there to the largest value any
+node uses.
+The node remains drained for administrator investigation and explicit resume;
+resuming it does not bypass the agent's outstanding cleanup check.
+These guarantees require cgroup containment to be enabled and successfully
+established for the job. Upgrade controllers before node agents and supervisors
+so completion and timeout handling both enforce quarantine. A running job
+keeps the cleanup timeout captured at launch; changing the configuration applies
+to new jobs after the agent restarts.
 
 Inspect what a running job actually got:
 

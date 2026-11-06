@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Authorization for native k0s cluster ops (SPUR-115); deny paths need no
+"""Authorization for native k0s cluster ops; deny paths need no
 control plane. Identity is whoami-derived, exercised via `cli_as_user`."""
 
 import pytest

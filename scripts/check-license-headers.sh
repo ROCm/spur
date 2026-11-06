@@ -28,7 +28,7 @@ check_file() {
 if [ $# -gt 0 ]; then
     files=("$@")
 else
-    mapfile -t files < <(git ls-files -- '*.rs' '*.proto' '*.py' '*.sh' '**/Dockerfile*')
+    mapfile -t files < <(git ls-files -- '*.rs' '*.proto' '*.c' '*.h' '*.py' '*.sh' ':(glob)**/Dockerfile*')
 fi
 
 failed=0
@@ -45,14 +45,14 @@ done
 if [ "$failed" -ne 0 ]; then
     echo ""
     echo "ERROR: ${#missing[@]} file(s) missing SPDX license header."
-    echo "Each source file (.rs, .proto, .py, .sh, Dockerfile) must contain:"
+    echo "Each source file (.rs, .proto, .c, .h, .py, .sh, Dockerfile) must contain:"
     echo "  SPDX-License-Identifier: Apache-2.0"
     echo ""
-    echo "For .rs and .proto files, add these lines at the top:"
+    echo "For .rs, .proto, .c, and .h files, add these lines at the top:"
     echo "  // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved."
     echo "  // SPDX-License-Identifier: Apache-2.0"
     echo ""
-    echo "For .py and .sh files (after the shebang, if any):"
+    echo "For .py, .sh, and Dockerfile files (after the shebang, if any):"
     echo "  # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved."
     echo "  # SPDX-License-Identifier: Apache-2.0"
     exit 1

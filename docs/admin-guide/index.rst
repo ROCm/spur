@@ -6,6 +6,7 @@ Configuring and operating a Spur cluster.
 - :doc:`configuration` — the full ``spur.conf`` reference. Every controller and
   node setting, with its type, default, and meaning.
 - :doc:`rbac` — User, Coordinator, Operator, and Administrator bindings.
+- :doc:`fabric-observation` — read-only GPU fabric membership discovery and inspection.
 - :doc:`accounting` — managing accounts, users, QOS, associations, and resource
   limits. Requires a PostgreSQL-backed accounting database.
 - :doc:`idle-fill-scheduling` — letting over-quota jobs use capacity nobody with a
@@ -16,6 +17,8 @@ Configuring and operating a Spur cluster.
   hooks.
 - :doc:`karma-scoring` — per-user job lifecycle counters for computing a cluster
   citizenship karma score in Prometheus.
+- :doc:`tres-billing-weights` — configurable TRES billing weights for fairshare,
+  so GPU-heavy clusters bill GPU-seconds at a higher rate than CPU-seconds.
 
 Partitions are defined statically in ``spur.conf`` (see
 :doc:`/deployment/partitioning`), not created at runtime.

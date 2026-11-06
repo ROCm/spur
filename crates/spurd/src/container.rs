@@ -1236,7 +1236,7 @@ mod tests {
 
     #[test]
     fn test_resolve_image_error_includes_directory() {
-        // Regression: error message now shows which directory was searched (#35).
+        // Regression: error message now shows which directory was searched.
         // Makes it obvious when CLI and agent use different directories.
         let err = resolve_image("missing-image", None, None).unwrap_err();
         let msg = err.to_string();
@@ -1250,7 +1250,7 @@ mod tests {
 
     #[test]
     fn test_image_dir_default_without_env() {
-        // Regression: agent used hardcoded /var/spool/spur/images ignoring env (#35 #23).
+        // Regression: agent used hardcoded /var/spool/spur/images ignoring env.
         // Without SPUR_IMAGE_DIR the function must return the system default.
         let _guard = env_lock();
         let prev = std::env::var_os("SPUR_IMAGE_DIR");
@@ -1268,7 +1268,7 @@ mod tests {
 
     #[test]
     fn test_image_dir_respects_spur_image_dir_env() {
-        // Regression: CLI used SPUR_IMAGE_DIR but agent did not (#35 #23).
+        // Regression: CLI used SPUR_IMAGE_DIR but agent did not.
         // Both must use the same env var so images imported by non-root users
         // (to e.g. ~/.spur/images) are found by the agent.
         let _guard = env_lock();
@@ -1295,7 +1295,7 @@ mod tests {
         );
     }
 
-    // --- #134: search submitting user's personal image store ---
+    // --- search submitting user's personal image store ---
     //
     // Regression: spurd previously only searched `/var/spool/spur/images`.
     // When a user imported an image to `~/.spur/images` (no sudo),
@@ -1421,7 +1421,7 @@ mod tests {
 
     #[test]
     fn test_resolve_image_finds_image_in_user_home_dir() {
-        // End-to-end regression for #134: when the user's .spur/images
+        // End-to-end regression: when the user's .spur/images
         // contains an image, resolve_image must find it via the
         // job_user_home path.
         //

@@ -582,8 +582,8 @@ mod tests {
 
     #[test]
     fn check_qos_authorized_default_qos_alone_still_scopes_to_one() {
-        // Pinning only a default (no explicit allow-list) keeps PR #490's
-        // original single-QOS behavior for associations never given a list.
+        // Pinning only a default (no explicit allow-list) keeps the original
+        // single-QOS behavior for associations never given a list.
         let cache = AssociationCache::new();
         cache.insert_default_qos("alice", "research", "highprio");
         assert!(cache

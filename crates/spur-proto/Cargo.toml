@@ -20,4 +20,4 @@ workspace = true
 # Only referenced by the code build.rs generates into OUT_DIR, which
 # cargo-shear's source scan cannot see.
 [package.metadata.cargo-shear]
-ignored = ["prost", "prost-types", "tonic-prost"]
+ignored = ["prost-types", "tonic-prost"]

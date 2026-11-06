@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for srun step output delivery (spur#781).
+"""E2E tests for srun step output delivery.
 
 A command run as an srun step inside an allocation has its stdout/stderr
 redirected to per-step spool files on the node; the client tails those files

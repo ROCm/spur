@@ -12,7 +12,7 @@ An AI-native job scheduler written in Rust. Drop-in compatible with Slurm's CLI,
 - 🔌 **Slurm compatible** — your existing scripts, tools, and muscle memory work unchanged
 - 🔲 **GPU-first scheduling** — first-class GPU support for job scheduling
 - 💾 **Raft-based state** — all state survives restarts; no external database required
-- ⚙️ **Written in Rust** — single static binary per component, fast builds, safe concurrency
+- ⚙️ **Written in Rust** — single self-contained binary per component (glibc 2.28+), fast builds, safe concurrency
 - 🔒 **WireGuard mesh networking** — tunnelled cluster communication out of the box
 
 ## Install
@@ -44,7 +44,7 @@ The [full documentation](docs/index.rst) covers quickstart, deployment, and deve
 
 ## Building & Contributing
 
-See [developer/building](docs/developer/building.rst) for build instructions and project layout, and [developer/contributing](docs/developer/contributing.rst) for contribution guidelines. PRs are welcome.
+See [developer/building](docs/developer/building.rst) for build instructions and how to run the unit and end-to-end tests, and [developer/contributing](docs/developer/contributing.rst) for contribution guidelines. PRs are welcome.
 
 ## License
 

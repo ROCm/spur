@@ -195,11 +195,11 @@ plugin = "backfill"
         assert_eq!(config.scheduler.default_time_limit_minutes, 0);
     }
 
-    // ── T52.15–17: listen_addr from config (#37) ──────────────────
+    // ── T52.15–17: listen_addr from config ────────────────────────
 
     #[test]
     fn t52_15_listen_addr_preserved_from_config() {
-        // Regression: spurctld ignored config listen_addr and always bound to :6817 (#37).
+        // Regression: spurctld ignored config listen_addr and always bound to :6817.
         let config = SlurmConfig::load_from_str(
             r#"
 cluster_name = "prod"
@@ -234,7 +234,6 @@ state_dir = "/tmp/spur"
     #[allow(clippy::unnecessary_literal_unwrap)]
     fn t52_17_cli_listen_overrides_config() {
         // When --listen CLI arg is provided it wins; when absent, config value is used.
-        // This tests the merging logic introduced to fix #37.
         let config_addr = "[::]:6821";
 
         let with_cli = Some("[::]:6822".to_string());

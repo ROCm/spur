@@ -76,17 +76,11 @@ impl<'a> NodePlacement<'a> {
             .map(|s| HashSet::from_iter(expand_hostlist_or_split(s)))
             .unwrap_or_default();
 
-        let required_features = job
-            .spec
-            .constraint
-            .as_deref()
-            .map(|c| {
-                c.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let required_features =
+            spur_core::constraints::Constraints::parse(job.spec.constraint.as_deref())
+                .map(|constraints| constraints.features)
+                // Invalid requests must not become unconstrained candidates.
+                .unwrap_or_else(|_| vec![job.spec.constraint.as_deref().unwrap_or_default()]);
 
         let partitions = job
             .spec
@@ -194,7 +188,10 @@ impl<'a> NodePlacement<'a> {
         reservations: &[Reservation],
         now: DateTime<Utc>,
     ) -> bool {
-        !node.is_k0s_reserved() && self.eligible(node, reservations, now) && node.state.is_up()
+        !node.is_k0s_reserved()
+            && self.eligible(node, reservations, now)
+            && node.state.is_up()
+            && node.layout_block_reason().is_none()
     }
 
     /// True when a listed node can't satisfy the request in an additive
@@ -369,6 +366,21 @@ mod tests {
         let mut k0s = node("n2");
         k0s.k0s_role = Some(spur_core::k0s::K0sRole::Worker);
         assert!(!p.matches_for_reservation(&k0s, &[], now));
+    }
+
+    #[test]
+    fn matches_for_reservation_excludes_a_node_blocked_by_its_core_layout() {
+        let job = job_with(base_spec());
+        let p = NodePlacement::new(&job);
+        let now = Utc::now();
+
+        let mut bad_layout = node("n1");
+        bad_layout.layout_error = Some("no CPU topology".into());
+        assert!(!p.matches_for_reservation(&bad_layout, &[], now));
+
+        let mut not_enforced = node("n2");
+        not_enforced.layout_enforce_error = Some("root write failed".into());
+        assert!(!p.matches_for_reservation(&not_enforced, &[], now));
     }
 
     #[test]

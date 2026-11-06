@@ -8,7 +8,7 @@ mod notifier;
 mod reconcile;
 pub(crate) mod txn;
 
-pub use db::{JobEndRecord, JobStartRecord};
+pub use db::{JobEndRecord, JobStartRecord, JobSubmission};
 pub(crate) use grpc::{accounting_server, AccountingService};
 pub use notifier::AccountingNotifier;
 pub use reconcile::spawn_loop as spawn_reconcile_loop;
@@ -53,6 +53,7 @@ pub(crate) fn start(
     service.attach_association_cache(cluster.association_cache().clone());
     service.attach_auth(config.auth.clone());
     service.attach_fairshare_halflife(config.scheduler.fairshare_halflife_days);
+    service.attach_billing_weights(config.scheduler.billing_weights());
     let bringup = service.clone();
     let url = config.accounting.database_url.clone();
     let params = ActivationParams::from_config(config);
@@ -70,6 +71,7 @@ struct ActivationParams {
     refresh_secs: u64,
     grp_wall_window_days: u32,
     txn_retention_days: Option<u32>,
+    usage_reset_period: spur_core::config::UsageResetPeriod,
 }
 
 impl ActivationParams {
@@ -79,6 +81,7 @@ impl ActivationParams {
             refresh_secs: config.accounting.fairshare_refresh_secs as u64,
             grp_wall_window_days: config.accounting.grp_wall_window_days,
             txn_retention_days: config.accounting.txn_retention_days.filter(|d| *d > 0),
+            usage_reset_period: config.scheduler.usage_reset_period,
         }
     }
 }
@@ -160,6 +163,7 @@ fn activate(
 ) {
     service.install_pool(pool.clone());
     cluster.set_accounting(AccountingNotifier::new(pool.clone()));
+    cluster.set_billing_weights_handle(service.billing_weights_shared());
 
     spawn_reconcile_loop(
         pool.clone(),
@@ -172,10 +176,15 @@ fn activate(
         spawn_txn_purge_loop(pool.clone(), raft.clone(), days, Duration::from_secs(3600));
     }
 
+    if params.usage_reset_period != spur_core::config::UsageResetPeriod::None {
+        spawn_usage_reset_loop(pool.clone(), raft.clone(), params.usage_reset_period);
+    }
+
     cluster.fairshare_cache().spawn_refresh_loop(
         pool.clone(),
         params.fairshare_halflife_days,
         params.refresh_secs,
+        service.billing_weights_shared(),
     );
     cluster
         .qos_cache()
@@ -190,6 +199,94 @@ fn activate(
     );
 }
 
+fn spawn_usage_reset_loop(
+    pool: PgPool,
+    raft: Arc<RaftHandle>,
+    period: spur_core::config::UsageResetPeriod,
+) {
+    use chrono::{Datelike, Utc};
+    use spur_core::config::UsageResetPeriod;
+
+    tokio::spawn(async move {
+        tracing::info!(period = period.as_str(), "usage reset loop started");
+        loop {
+            let now = Utc::now();
+            let next = match period {
+                UsageResetPeriod::None => return,
+                UsageResetPeriod::Daily => (now + chrono::Duration::days(1))
+                    .date_naive()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc(),
+                UsageResetPeriod::Weekly => {
+                    let days = (7 - now.weekday().num_days_from_sunday()) % 7;
+                    let days = if days == 0 { 7 } else { days };
+                    (now + chrono::Duration::days(days as i64))
+                        .date_naive()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                }
+                UsageResetPeriod::Monthly => {
+                    let (y, m) = if now.month() == 12 {
+                        (now.year() + 1, 1)
+                    } else {
+                        (now.year(), now.month() + 1)
+                    };
+                    chrono::NaiveDate::from_ymd_opt(y, m, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                }
+                UsageResetPeriod::Quarterly => {
+                    let next_q_month = ((now.month() - 1) / 3 + 1) * 3 + 1;
+                    let (y, m) = if next_q_month > 12 {
+                        (now.year() + 1, next_q_month - 12)
+                    } else {
+                        (now.year(), next_q_month)
+                    };
+                    chrono::NaiveDate::from_ymd_opt(y, m, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                }
+                UsageResetPeriod::Yearly => chrono::NaiveDate::from_ymd_opt(now.year() + 1, 1, 1)
+                    .unwrap()
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc(),
+            };
+            let wait = (next - now).to_std().unwrap_or(Duration::from_secs(86400));
+            tracing::info!(
+                period = period.as_str(),
+                next_reset = %next,
+                wait_secs = wait.as_secs(),
+                "usage reset scheduled"
+            );
+            tokio::time::sleep(wait).await;
+
+            if !raft.ensure_leader().await {
+                tracing::debug!("usage reset skipped (not the leader)");
+                continue;
+            }
+
+            match db::reset_all_usage(&pool).await {
+                Ok(rows) => tracing::info!(
+                    period = period.as_str(),
+                    rows_deleted = rows,
+                    "periodic usage reset completed"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "periodic usage reset failed"
+                ),
+            }
+        }
+    });
+}
+
 /// Compute fairshare factors directly from the database.
 ///
 /// Reused by both the gRPC `GetFairshareFactors` RPC and the controller's
@@ -197,6 +294,7 @@ fn activate(
 pub async fn fairshare_factors(
     pool: &PgPool,
     halflife_days: u32,
+    billing_weights: &spur_core::config::BillingWeights,
 ) -> anyhow::Result<HashMap<(String, String), f64>> {
     let halflife_days = if halflife_days == 0 {
         14
@@ -204,10 +302,16 @@ pub async fn fairshare_factors(
         halflife_days.clamp(1, 365)
     };
     let now = chrono::Utc::now();
-    let since = now - chrono::Duration::days(halflife_days as i64 * 4);
+    let halflife_since = now - chrono::Duration::days(halflife_days as i64 * 4);
+    let reset_epoch = db::get_fairshare_reset_epoch(pool).await?;
+    let since = match reset_epoch {
+        Some(epoch) => halflife_since.max(epoch),
+        None => halflife_since,
+    };
 
     let usage = db::get_usage(pool, None, None, since).await?;
     let accounts = db::list_accounts(pool).await?;
+    let offsets = db::get_fairshare_usage_offsets(pool).await?;
 
     let associations = db::list_associations(pool).await?;
     let user_weights: HashMap<(String, String), i32> = associations
@@ -221,6 +325,8 @@ pub async fn fairshare_factors(
         &user_weights,
         halflife_days,
         now,
+        billing_weights,
+        &offsets,
     ))
 }
 

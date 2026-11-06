@@ -85,7 +85,7 @@ class TestMultiNodeDispatch:
         )
 
     def test_user_rendezvous_env_preserved(self, multi_node_cluster):
-        # Regression for #783: a user-exported MASTER_PORT/WORLD_SIZE must
+        # Regression: a user-exported MASTER_PORT/WORLD_SIZE must
         # survive on a multi-node job, not be overwritten by Spur.
         cluster = multi_node_cluster
         out_path = f"{cluster.remote_dir}/user-rdzv.out"

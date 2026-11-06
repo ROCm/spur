@@ -113,7 +113,7 @@ pub(crate) fn classify_spool_error(
 use crate::container::ContainerConfig;
 
 /// Cgroup root for slurmd-managed jobs.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 
 /// Node-local spool root for spurd's per-job scratch (job script, namespace
 /// wrapper). Deliberately off the user's work_dir so these root-side writes
@@ -960,7 +960,7 @@ async fn spawn_job_process(
             }
         }
 
-        // Issue #99, #107: Run job as the submitting user (not root).
+        // Run job as the submitting user (not root).
         // Must set supplementary groups (video, render) so the process can
         // access GPU device nodes.
         //
@@ -982,7 +982,7 @@ async fn spawn_job_process(
             }
         }
 
-        // Issue #99: Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
+        // Apply seccomp-BPF syscall filter (opt-in via SPUR_SECCOMP=1).
         let enable_seccomp = std::env::var("SPUR_SECCOMP")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
@@ -997,7 +997,7 @@ async fn spawn_job_process(
             }
         }
 
-        // Issue #99: Apply Landlock filesystem restrictions (opt-in via SPUR_LANDLOCK=1).
+        // Apply Landlock filesystem restrictions (opt-in via SPUR_LANDLOCK=1).
         let work_dir_for_landlock = work_dir.to_string();
         let enable_landlock = std::env::var("SPUR_LANDLOCK")
             .map(|v| v == "1" || v == "true")
@@ -1310,8 +1310,8 @@ pub(crate) fn setup_cgroup(
         }
     }
 
-    // Core ids come from a synthesized 0..n range, which can name cores this
-    // cgroup may not hold. Drop those rather than let the whole write fail.
+    // Core ids may name CPUs this cgroup does not hold (offline, or excluded
+    // from the root). Drop those rather than let the whole write fail.
     if !limits.cpuset_cpus.is_empty() {
         match std::fs::read_to_string(cgroup_root.join("cpuset.cpus.effective")) {
             Ok(effective) => {
@@ -2537,7 +2537,7 @@ async fn launch_container_job(
 /// place, it drops privilege via `setpriv --init-groups` and exec's the user
 /// script.
 ///
-/// Issue #128: previously the priv drop happened in `Command::pre_exec` before
+/// Previously the priv drop happened in `Command::pre_exec` before
 /// exec'ing unshare, which made the unshare(2) syscall fail with EPERM and
 /// the mounts silently no-op. Doing the drop inside the wrapper (after the
 /// mounts) keeps the unshare and mounts privileged while still landing the
@@ -2668,8 +2668,7 @@ mod cpuset_tests {
 
     #[test]
     fn drops_cores_the_parent_cgroup_does_not_hold() {
-        // Core ids are synthesized from a count, so a sparse online mask can name
-        // cores that do not exist. Writing one fails ERANGE, leaving it unbounded.
+        // Writing a CPU the parent does not hold fails ERANGE, leaving it unbounded.
         assert_eq!(permitted_cores(&[0, 1, 99], "0-3"), vec![0, 1]);
         assert_eq!(permitted_cores(&[64, 65], "0-63"), Vec::<u32>::new());
     }
@@ -3887,7 +3886,7 @@ mod tests {
         assert_eq!(wrapped, script);
     }
 
-    /// Issue #128: when uid > 0, the wrapper must drop privilege via setpriv
+    /// When uid > 0, the wrapper must drop privilege via setpriv
     /// *after* the mounts (which need CAP_SYS_ADMIN). Dropping priv before
     /// unshare would cause unshare(2) to fail with EPERM.
     #[test]

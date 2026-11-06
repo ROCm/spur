@@ -133,11 +133,14 @@ mod tests {
         let mut node = Node::new(
             name.into(),
             ResourceSet {
+                fabric_binding_version: 0,
+                block_file_revision: None,
                 cpus,
                 memory_mb,
                 gpus: Vec::new(),
                 generic: Default::default(),
                 generation: 0,
+                topology: None,
             },
         );
         node.partitions = partitions.iter().map(|p| p.to_string()).collect();

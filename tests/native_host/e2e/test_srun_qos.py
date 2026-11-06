@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E test for srun --qos (SPUR-77).
+"""E2E test for srun --qos.
 
 Proves an explicit `srun --qos` reaches the controller and is recorded on the
 job. Requires Postgres on node 0 (the accounting_cluster fixture) because an

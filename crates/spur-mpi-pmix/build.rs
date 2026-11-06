@@ -97,6 +97,7 @@ fn build_modex_exchange_test(out_dir: &Path) {
 fn main() {
     println!("cargo:rerun-if-changed=c/pmix_server.c");
     println!("cargo:rerun-if-changed=c/modex_exchange.c");
+    println!("cargo:rerun-if-changed=c/modex_exchange.h");
     println!("cargo:rerun-if-changed=c/modex_exchange_test.c");
     println!("cargo:rerun-if-changed=c/stub_server.c");
     println!("cargo:rerun-if-changed=include/spur_mpi_plugin.h");

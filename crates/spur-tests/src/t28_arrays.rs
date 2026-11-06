@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(job.spec.array_max_concurrent, Some(5));
     }
 
-    // ── T28.11+: dependencies against an array parent (issue #259) ─
+    // ── T28.11+: dependencies against an array parent ─────────────
 
     use spur_core::dependency::{check_dependencies, DependencyResult};
 

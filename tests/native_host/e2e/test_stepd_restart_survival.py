@@ -302,7 +302,7 @@ class TestSupervisedGpuReclaim:
             cluster.scancel(str(retry_id))
 
     # A plain scancel (signal=0) reaches graceful_cancel, which spawns its own
-    # release-wait regardless of a dead supervisor -- this PR's confirmed-dead
+    # release-wait regardless of a dead supervisor -- the confirmed-dead
     # fencing only has sole responsibility on a non-lethal explicit signal,
     # where no release-wait is ever spawned.
     def test_a_non_lethal_signal_still_reclaims_a_confirmed_dead_supervisors_gpu(
@@ -342,7 +342,7 @@ class TestSupervisedGpuReclaim:
 
             # SIGUSR1 is never expected to terminate a job, so send_explicit_signal
             # never spawns a release-wait for it -- only the confirmed-dead fencing
-            # this PR adds can explain a release on this path.
+            # can explain a release on this path.
             cluster.cli(["scancel", "--signal", "USR1", str(job_id)])
             assert wait_job(cluster, job_id, timeout=60) in ("CA", "CD", "F", "GONE"), (
                 "the controller must still see a terminal state: a bare local "

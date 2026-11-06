@@ -57,6 +57,10 @@ Common flags:
      - ``-t``
      - Filter by state codes or names (comma list). ``-t all`` shows every
        state.
+   * - ``--jobs``
+     - ``-j``
+     - Show only these job IDs (comma list). A step suffix (``30.0``) matches
+       the base job. A non-numeric ID is an error.
    * - ``--account``
      - ``-A``
      - Filter by account.
@@ -410,7 +414,8 @@ Flags:
        ``DEADLINE``/``DL``, ``RUNNING``/``R``, ``PENDING``/``PD``.
    * - ``--jobs``
      - ``-j``
-     - Filter by job ID (comma list; step suffixes like ``30.0`` match the base job).
+     - Filter by job ID (comma list; step suffixes like ``30.0`` match the base
+       job). A non-numeric ID is an error.
    * - ``--format``
      - ``-o``
      - Comma-separated field names (see below).
@@ -570,7 +575,12 @@ is leader keeps the reason of its previous run, and a run the older controller
 force-finished reads ``NonZeroExitCode`` rather than ``CompletingTimeout``.
 
 The default columns are ``JobID JobName User Account Partition State Elapsed
-NNodes ExitCode``.
+NNodes ExitCode Reason``. Scripts that read columns by position should select
+them with ``--format``.
+
+A job cancelled or expired before it starts keeps its name, user, account,
+partition, and requested resources in accounting. Its ``Start`` is ``Unknown``
+and it is charged no usage.
 
 Time arguments accept an absolute date (``YYYY-MM-DD`` or
 ``YYYY-MM-DDTHH:MM:SS``) or a relative offset (``now-7days``, ``now-6hours``).
@@ -586,7 +596,8 @@ Running-Job Stats — ``sstat``
 -----------------------------
 
 ``spur stat`` (Slurm ``sstat``) reports live resource usage for running jobs.
-``--jobs``/``-j`` is required (comma list).
+``--jobs``/``-j`` is required (comma list). A step suffix (``30.0``) matches
+the base job. A non-numeric ID is an error.
 
 .. code-block:: bash
 
@@ -782,12 +793,62 @@ When a job has been preempted, ``scontrol show job`` includes three additional
 fields:
 
 * ``PreemptedBy=<job_id>`` — the ID of the higher-priority job that triggered
-  the preemption. Only shown when the job has been preempted.
+  the preemption. Only shown once the job has been preempted; during a
+  preemption grace period nothing has been preempted yet, so it is not printed.
 * ``PreemptMode=Requeue|Cancel|Suspend`` — how the preemption was carried out.
 * ``PreemptQOS=<name>`` — the QOS of the preempting job, whose ``preempt``
   allow-list authorized the preemption. Set for any job preempted by this
   release; jobs preempted by an earlier release show ``N/A`` even though they
   were preempted.
+
+While a job is inside its preemption grace period, ``scontrol show job`` instead
+prints a line holding only ``PreemptTime=<timestamp>``, the moment the job was
+signaled to wind down, and ``EndTime`` shows when the grace ends. ``PreemptTime``
+is omitted for a job that is not in a grace.
+
+.. _preemption-grace-user:
+
+How a job learns it is being preempted
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If the QOS your job runs under, or the partition it runs in, has a ``GraceTime``
+(ask your administrator; see :ref:`preemption grace time <qos-preempt-grace>`;
+the QOS value wins if it is set, otherwise the highest value among the
+partitions the job runs in applies), a job selected for preemption in ``cancel`` or
+``requeue`` mode is not killed at once. It gets SIGCONT then SIGTERM, one time,
+as a warning, stays ``RUNNING`` and keeps its nodes, and is preempted at the
+deadline shown as ``EndTime`` (``PreemptTime`` shows when the warning was sent).
+The grace is shortened if the job's own time limit arrives first; the deadline
+is fixed when the warning is sent, so lowering the time limit later does not
+shorten it. The warning is sent once: if it is lost (for example the node's agent
+is unreachable at that moment) the job is still preempted at the deadline, only
+without having been warned. Without a ``GraceTime`` there is no warning period and
+the job is preempted immediately.
+
+* **Launch your work with** ``srun``. The warning goes to the job's ``srun``
+  steps, not to the batch script, so a training process started directly from
+  the batch script gets no warning and sees only the final kill. Run it as
+  ``srun python train.py`` and handle SIGTERM there to checkpoint.
+* **Expect a second SIGTERM.** At the deadline Spur sends SIGTERM to every
+  process in the job, waits up to the kill wait (5 seconds by default), then
+  sends SIGKILL. A handler that is already shutting down should ignore a repeat.
+  The wait does not yet reach ``srun`` steps (:ref:`kill wait note <kill-wait-steps-caveat>`).
+* **Exiting early is fine.** A job that exits during its grace is recorded as
+  ``PREEMPTED`` (``cancel`` mode) or goes back to ``PENDING`` (``requeue``
+  mode), and the preempting job starts as soon as the nodes are free.
+* **One node finishing early does not affect the others.** The job stays
+  ``R`` until every node has finished or the deadline. A node whose work has finished is freed for the
+  preempting job, and the other nodes keep running undisturbed, so a rank that
+  exits first does not cut short the ranks that are still writing their
+  checkpoint. If your batch script launches ranks with ``srun``, ranks exiting
+  do not end the job: it ends when the batch script exits (the remaining nodes
+  are then stopped), or at the deadline.
+* **You can still cancel.** ``scancel`` during the grace ends the job as your
+  cancel. ``scontrol suspend`` is refused.
+* **The grace is not withdrawn.** The job is preempted at the deadline even if
+  the job that triggered it is cancelled meanwhile.
+
+Jobs on nodes managed by the Kubernetes operator get no grace and no warning.
 
 Borrowed runs and reclaim
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1200,6 +1261,38 @@ refused. A job that is already finished or unknown does not fail a plain cancel
 (or ``-s KILL``) and is not reported. With another signal it fails, and
 ``--quiet``/``-Q`` hides the report but not the exit status.
 
+**Time limits and the kill wait.** At its time limit a job moves from ``RUNNING``
+to ``COMPLETING`` (``CG`` in ``squeue``) straight away and is sent SIGTERM. It
+stays ``COMPLETING`` for up to the time-limit kill wait
+(``timeout_kill_wait_secs``, default 30 seconds), then Spur sends SIGKILL. The
+wait ends early once the job's own process (its batch script) has exited, and
+the job ends ``TIMEOUT`` with reason ``TimeLimit`` however it exits: a clean
+exit on SIGTERM does not make it ``COMPLETED``. ``--requeue`` still requeues it
+on timeout. While it waits, the job still counts as running for
+``--dependency=singleton`` and for an array's ``%N`` throttle, so a successor
+or the next array task does not start until the job has ended. The SIGTERM is final, so a batch script can use the wait to
+checkpoint and exit. An idle interactive allocation reaped for inactivity
+(:ref:`inactive-limit`) normally ends ``TIMEOUT`` within a moment of the
+SIGTERM, without spending the wait in ``COMPLETING``: its work runs in ``srun``
+steps and its own process exits on SIGTERM (see the note below). ``scancel``,
+``scontrol requeue`` and the final kill of a preempted job use the general kill
+wait (``kill_wait_secs``, default 5 seconds), as does stopping the other nodes
+of a job whose batch script has exited. An ``srun`` step with no supervisor process gets the full wait that applies to it
+when a stop reaches it (see the note below): 5 seconds on ``scancel``, 30 at a
+time limit, where earlier releases gave it 2 seconds.
+
+.. _kill-wait-steps-caveat:
+
+.. note::
+
+   A job does not yet wait for its ``srun`` steps: it ends and frees its nodes
+   once its batch script (or, for an allocation, its placeholder process) exits.
+   On nodes where Spur runs as root, the steps are then stopped with the job
+   without getting the kill wait. On nodes without cgroup enforcement, they can
+   outlive the job and keep running beside a newly placed job. This affects every
+   stop that uses a kill wait: a time limit, the inactivity limit, ``scancel``,
+   and the final kill of a preempted job. The preemption grace is not affected.
+
 **Change job state** with ``spur control`` (Slurm ``scontrol``):
 
 .. code-block:: bash
@@ -1209,6 +1302,9 @@ refused. A job that is already finished or unknown does not fail a plain cancel
    scontrol requeue 1024    # return a job to the queue
    scontrol suspend 1024    # SIGSTOP, keep the allocation
    scontrol resume 1024     # SIGCONT
+
+Suspending a job that is in its preemption grace period is refused, because the
+preemption that ends the grace only applies to a running job.
 
 .. _held-job-still-running:
 

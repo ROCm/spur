@@ -44,6 +44,10 @@ pub struct Partition {
     /// cluster-wide `preempt_exempt_time` in `SchedulerConfig`.
     #[serde(default)]
     pub preempt_exempt_time: Option<u32>,
+    /// Partition-level preemption grace period in seconds. `None` means unset;
+    /// `Some(0)` means no grace. Used when the victim's QOS leaves its grace unset.
+    #[serde(default)]
+    pub grace_time: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +190,7 @@ impl Default for Partition {
             preempt_mode: None,
             priority_tier: 1,
             preempt_exempt_time: None,
+            grace_time: None,
         }
     }
 }
@@ -223,6 +228,18 @@ mod tests {
         assert!(PreemptMode::Cancel.aggressiveness() > PreemptMode::Requeue.aggressiveness());
         assert!(PreemptMode::Requeue.aggressiveness() > PreemptMode::Suspend.aggressiveness());
         assert!(PreemptMode::Suspend.aggressiveness() > PreemptMode::Off.aggressiveness());
+    }
+
+    // Frozen pre-grace_time partition as stored in a Raft snapshot; it must still
+    // load or a new controller cannot restore an old snapshot. Never regenerate.
+    #[test]
+    fn partition_snapshot_without_grace_time_loads() {
+        const PARTITION_PRE_GRACE_TIME: &str = r#"{"name":"gpu","state":"Up","is_default":true,"nodes":"ALL","selector":{},"max_time_minutes":1440,"default_time_minutes":10,"max_nodes":null,"min_nodes":1,"allow_root":true,"exclusive_user":false,"allow_accounts":[],"allow_groups":[],"allow_qos":[],"deny_accounts":[],"deny_qos":[],"preempt_mode":"Cancel","priority_tier":1,"preempt_exempt_time":300}"#;
+        let part: Partition = serde_json::from_str(PARTITION_PRE_GRACE_TIME)
+            .expect("a pre-grace_time partition must load; a new field needs #[serde(default)]");
+        assert_eq!(part.name, "gpu");
+        assert_eq!(part.preempt_exempt_time, Some(300));
+        assert_eq!(part.grace_time, None);
     }
 
     fn partition_with_tier(name: &str, priority_tier: u32) -> Partition {

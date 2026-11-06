@@ -41,3 +41,27 @@ updates:
         patterns:
           - "*"
     open-pull-requests-limit: 5
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "docker"
+    # Digest bumps only. almalinux:8 sets the glibc 2.28 floor of the shipped
+    # binaries, and the runtime release is a deliberate choice, not a routine bump.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+    groups:
+      base-images:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 2

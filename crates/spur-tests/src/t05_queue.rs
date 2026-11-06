@@ -94,7 +94,7 @@ mod tests {
 
     #[test]
     fn t05_7_pending_reason_displayed() {
-        // Issue #90: initial pending reason is now None (not Priority).
+        // Initial pending reason is None (not Priority).
         // The scheduler sets the actual reason after evaluating the job.
         let job = make_job("test");
         assert_eq!(job.pending_reason.display(), "None");
@@ -119,11 +119,11 @@ mod tests {
         assert_eq!(jobs[2].spec.name, "low");
     }
 
-    // ── T05.9–11: Queue shows only active jobs (#10 #22) ─────────
+    // ── T05.9–11: Queue shows only active jobs ────────────────────
 
     #[test]
     fn t05_9_queue_excludes_terminal_jobs() {
-        // Regression: spur queue showed completed/failed/cancelled jobs (#10 #22).
+        // Regression: spur queue showed completed/failed/cancelled jobs.
         // squeue should only show Pending and Running (not terminal states).
         let mut jobs = [
             make_job("pending"),

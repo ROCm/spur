@@ -363,7 +363,7 @@ class TestReservations:
         via both the subcommand and inline syntax. A positive duration must
         survive the scheduler's expired-reservation purge; an unparseable, zero,
         or omitted duration is rejected up front, not silently created then
-        purged (SPUR-182)."""
+        purged."""
         node = cluster.node_names[0]
 
         def create(name, kind, duration):
