@@ -1405,7 +1405,15 @@ use only part of each node's resources. Placement honors this: when a job is
 admitted on the basis that it can pack onto specific already-occupied nodes,
 scheduling actually places it there (as if those nodes had been given as an
 additive ``--nodelist``), rather than spreading it to an idle node elsewhere
-in the cluster and silently exceeding the cap. ``MaxTRESPerJob``'s and
+in the cluster and silently exceeding the cap. Packing applies only when a
+node cap is configured for that QOS or account; without one, jobs are placed
+as if the group held no nodes. An occupied node counts toward packing only if
+the job would also fit under the
+:doc:`partition cap <partition-resource-limits>` there, in one of its
+partitions that contains the node. When the job packs entirely onto occupied
+nodes it runs there, even if a higher ``priority_tier`` partition in its
+``--partition`` list has room elsewhere: keeping within the node cap takes
+precedence over tier order. ``MaxTRESPerJob``'s and
 ``MaxTRESPerUser``'s own ``node=`` caps are unaffected by this and always use
 a job's actual requested node count, since they bound a single job's or
 user's own footprint rather than group-wide capacity reuse.
