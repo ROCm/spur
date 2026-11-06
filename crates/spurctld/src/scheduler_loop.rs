@@ -2328,6 +2328,7 @@ fn core_spec_to_proto(s: &spur_core::job::JobSpec) -> ProtoJobSpec {
         container_env: s.container_env.clone(),
         container_entrypoint: s.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: s.container_remap_root,
+        container_no_auth_socket: s.container_no_auth_socket,
         burst_buffer: s.burst_buffer.clone().unwrap_or_default(),
         begin_time: s.begin_time.map(|dt| prost_types::Timestamp {
             seconds: dt.timestamp(),
@@ -2575,6 +2576,7 @@ async fn dispatch_to_agent(
         container_env: spec.container_env.clone(),
         container_entrypoint: spec.container_entrypoint.clone().unwrap_or_default(),
         container_remap_root: spec.container_remap_root,
+        container_no_auth_socket: spec.container_no_auth_socket,
         burst_buffer: spec.burst_buffer.clone().unwrap_or_default(),
         licenses: Vec::new(),
         mail_type: spec.mail_type.clone(),

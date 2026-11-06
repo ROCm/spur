@@ -949,6 +949,7 @@ pub(crate) fn build_sbatch_job_spec(
             .collect(),
         container_entrypoint: args.container_entrypoint.unwrap_or_default(),
         container_remap_root: args.container_remap_root,
+        container_no_auth_socket: false,
         burst_buffer: args.bb.unwrap_or_default(),
         licenses: args.licenses,
         mail_type: args
