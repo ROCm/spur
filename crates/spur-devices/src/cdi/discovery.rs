@@ -1423,7 +1423,10 @@ mod tests {
         let gpu = ids.iter().find(|g| g.render_minor == 136).unwrap();
         assert_eq!(gpu.card_id, Some(9));
         assert_eq!(gpu.dra_device_name().as_deref(), Some("gpu-9-136"));
-        assert_eq!(gpu.stable_id, encode_stable_id(&lone_node_identity(0x2f00, 0)));
+        assert_eq!(
+            gpu.stable_id,
+            encode_stable_id(&lone_node_identity(0x2f00, 0))
+        );
         assert_eq!(gpu.unshareable_reason(), None);
         let names: Vec<String> = ids.iter().filter_map(|g| g.dra_device_name()).collect();
         assert_eq!(names[0], "gpu-1-128");
