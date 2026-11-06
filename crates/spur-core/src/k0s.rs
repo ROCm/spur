@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// k0s release SPUR installs/runs by default — pinned to a known-good version and bumped with each
 /// spur release. Override per node via `[cluster] k0s_version` (accepts a tag or "latest").
-pub const K0S_PINNED_VERSION: &str = "v1.36.2+k0s.0";
+pub const K0S_PINNED_VERSION: &str = "v1.36.5+k0s.0";
 
 /// Default filesystem path for the k0s binary (install target + what the spurd-owned unit runs).
 pub const K0S_DEFAULT_BINARY: &str = "/usr/local/bin/k0s";
@@ -357,6 +357,57 @@ pub enum K0sRole {
     Controller,
     Worker,
     Single,
+}
+
+/// The Kubernetes Node name of the host `hostname`. k0s starts the kubelet
+/// without `--hostname-override`, and the kubelet lowercases the hostname.
+pub fn k8s_node_name(hostname: &str) -> String {
+    hostname.to_lowercase()
+}
+
+/// Whether `name` is a DNS-1123 label: 1 to 63 lowercase alphanumerics or
+/// `-`, starting and ending with an alphanumeric.
+pub fn is_dns1123_label(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let alnum = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    (1..=63).contains(&bytes.len())
+        && bytes.iter().all(|c| alnum(c) || *c == b'-')
+        && bytes.first().is_some_and(alnum)
+        && bytes.last().is_some_and(alnum)
+}
+
+#[cfg(test)]
+mod node_name_tests {
+    use super::*;
+
+    #[test]
+    fn node_name_is_the_lowercase_hostname() {
+        assert_eq!(k8s_node_name("GPU-Node-1"), "gpu-node-1");
+    }
+
+    #[test]
+    fn dns1123_label_accepts_node_names() {
+        for name in ["a", "gpu-node-1", "0node", &"a".repeat(63)] {
+            assert!(is_dns1123_label(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn dns1123_label_rejects_what_kubernetes_rejects() {
+        for name in [
+            "",
+            "-node",
+            "node-",
+            "Node",
+            "node.domain",
+            "node_1",
+            "node 1",
+            "nöde",
+            &"a".repeat(64),
+        ] {
+            assert!(!is_dns1123_label(name), "{name:?}");
+        }
+    }
 }
 
 /// Lifecycle phase of the SPUR-managed k0s cluster.

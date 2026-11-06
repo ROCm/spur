@@ -251,7 +251,9 @@ For what ``spurctld`` does on an unrecoverable Raft error, see
        ``--requeue`` goes back to the queue, and is held there after
        ``max_batch_requeue`` requeues. Any run the job's nodes kept going is
        stopped when they heartbeat again, or when the job is relaunched there
-       (see :ref:`requeued-run-upgrade-notes` for older agents).
+       (see :ref:`requeued-run-upgrade-notes` for older agents). It is also
+       the maximum age of the GPU hold report of a node that shares its GPUs
+       with Kubernetes (:doc:`/deployment/gpu-sharing`).
    * - ``health_tick_secs``
      - integer
      - ``30``
@@ -1406,7 +1408,7 @@ These control-plane mutations define cluster tenancy and require
 
 * partitions;
 * node state and labels — ``scontrol update NodeName=``, ``spur node drain``,
-  ``spur node remove``;
+  ``spur node remove``, ``spur node gpu-sharing``;
 * ``scontrol reconfigure``;
 * admission tokens;
 * the k0s cluster manager.
@@ -2833,6 +2835,10 @@ systemd or k0s.
 This section is split across both daemons: the controller reads the network and
 control-plane fields at startup, while ``spurd`` reads the on-node fields at its
 own startup. Only ``allow_admin_kubeconfig`` is reloadable.
+
+GPU sharing with Kubernetes has no field in this section. You set it per node
+with ``spur k8s up --gpu-sharing-nodes`` or ``spur node gpu-sharing``. See
+:doc:`/deployment/gpu-sharing`.
 
 .. list-table::
    :header-rows: 1

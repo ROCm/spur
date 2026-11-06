@@ -326,7 +326,10 @@ mod tests {
     #[test]
     fn new_fields_use_their_assigned_tags() {
         use prost::Message;
-        let reregister = crate::proto::HeartbeatResponse { reregister: true };
+        let reregister = crate::proto::HeartbeatResponse {
+            reregister: true,
+            ..Default::default()
+        };
         assert_eq!(reregister.encode_to_vec(), [0x08, 0x01]);
 
         let topology = crate::proto::RegisterAgentRequest {
@@ -368,6 +371,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(mem_spec_mb.encode_to_vec(), [0xE8, 0x03, 0x01]);
+    }
+
+    #[test]
+    fn gpu_sharing_fields_use_their_assigned_tags() {
+        use prost::Message;
+        let sharing = crate::proto::HeartbeatResponse {
+            gpu_sharing: true,
+            ..Default::default()
+        };
+        assert_eq!(sharing.encode_to_vec(), [0x10, 0x01]);
+
+        let report = crate::proto::HeartbeatRequest {
+            gpu_holds: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(report.encode_to_vec(), [0x52, 0x00]);
+
+        let shared = crate::proto::NodeInfo {
+            gpu_sharing: true,
+            ..Default::default()
+        };
+        assert_eq!(shared.encode_to_vec(), [0xF8, 0x03, 0x01]);
+        let holds = crate::proto::NodeInfo {
+            gpu_holds: Some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(holds.encode_to_vec(), [0x82, 0x04, 0x00]);
     }
 
     #[test]

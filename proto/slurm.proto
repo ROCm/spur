@@ -540,6 +540,12 @@ message NodeInfo {
   uint32 core_spec_count = 60;
   uint64 mem_spec_mb = 61;
   uint32 cpu_tot = 62;               // detected CPUs, before spec cores are removed
+
+  // The node shares its GPUs with Kubernetes pods (GPU-level sharing, not the
+  // whole-node k0s reservation).
+  bool gpu_sharing = 63;
+  // Latest per-GPU owner report from the node's agent; absent when not shared or not yet reported.
+  optional GpuHoldReport gpu_holds = 64;
 }
 
 message PartitionInfo {
@@ -638,6 +644,8 @@ service SlurmController {
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportStepdRecovery(StepdRecoveryRequest) returns (StepdRecoveryResponse);
+  // Kubernetes credential of a k0s worker for GPU sharing (node label, holds).
+  rpc GetGpuSharingKubeconfig(GetGpuSharingKubeconfigRequest) returns (GetGpuSharingKubeconfigResponse);
 
   // Admission token management
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
@@ -884,6 +892,8 @@ message UpdateNodeRequest {
   optional string reason = 3;
   map<string, string> labels = 4;
   repeated string remove_labels = 5;
+  // Toggle GPU sharing with Kubernetes on a k0s-enrolled node.
+  optional bool gpu_sharing = 6;
 }
 
 message DrainNodeRequest {
@@ -1135,6 +1145,35 @@ message HeartbeatRequest {
   optional K0sNodeStatus k0s_status = 7;
   uint64 core_layout_fingerprint = 8; // fingerprint of the layout spurd holds; 0 = none
   string spec_enforcement_error = 9;  // why the held layout is not enforced; empty = enforced
+  // Per-GPU owners on a node shared with Kubernetes; present only on such a node. Full state every time.
+  optional GpuHoldReport gpu_holds = 10;
+}
+
+enum GpuHoldState {
+  GPU_HOLD_FREE = 0;
+  GPU_HOLD_SPUR_JOB = 1;     // a Spur job uses it and no allocated ResourceClaim names it
+  GPU_HOLD_K8S = 2;          // an allocated ResourceClaim names it, and no Spur job other than the claim's owner uses it
+  GPU_HOLD_CONFLICT = 3;     // a Spur job uses it and an allocated ResourceClaim of another owner names it
+  GPU_HOLD_UNSHAREABLE = 4;  // not in the Kubernetes ledger (see reason); Spur must not place on it
+}
+
+message GpuHold {
+  uint64 stable_id = 1;
+  GpuHoldState state = 2;
+  uint32 job_id = 3;          // SPUR_JOB and CONFLICT: the Spur job on the GPU. K8S: the claim's spur.amd.com/job-id owner, 0 if none
+  string pod_namespace = 4;   // K8S and CONFLICT
+  string pod_name = 5;
+  string claim_name = 6;
+  string reason = 7;          // UNSHAREABLE, e.g. "no DRM card for renderD130"
+  string dra_device = 8;      // DRA device name, gpu-<card>-<renderD>
+}
+
+message GpuHoldReport {
+  // Inventory generation the report was built against; the controller drops a mismatch.
+  uint64 generation = 1;
+  repeated GpuHold gpus = 2;
+  // Non-empty when the whole node cannot share yet, e.g. no ResourceSlice from gpu.amd.com.
+  string unshareable_reason = 3;
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
@@ -1160,6 +1199,17 @@ message RunningJobStatus {
 
 message HeartbeatResponse {
   bool reregister = 1;               // held layout differs from the node's current one: register again
+  // Controller's persisted GPU-sharing flag for this node; the agent converges to it.
+  bool gpu_sharing = 2;
+}
+
+message GetGpuSharingKubeconfigRequest {
+  string hostname = 1;
+  string node_token = 2;
+}
+message GetGpuSharingKubeconfigResponse {
+  // Kubeconfig of the ServiceAccount spur-system/spurd-gpu-sharing-<node>, with a bound token.
+  string kubeconfig = 1;
 }
 
 message StepdRecoveryRequest {
@@ -1405,6 +1455,8 @@ message ClusterUpRequest {
   string nodes = 6;
   string partition = 7;
   map<string, string> selector = 8;
+  // Hostlist of enrolled worker nodes that share their GPUs with Kubernetes. Empty = none.
+  string gpu_sharing_nodes = 9;
 }
 message ClusterUpResponse {
   bool accepted = 1;
@@ -1450,6 +1502,8 @@ message ClusterAddNodesRequest {
   string partition = 2;
   map<string, string> selector = 3;
   string caller = 4;   // For authorization (cluster admin required).
+  // Mark the added nodes as sharing their GPUs with Kubernetes.
+  bool gpu_sharing = 5;
 }
 message ClusterAddNodesResponse {
   bool accepted = 1;
@@ -1561,6 +1615,9 @@ message GetKubeconfigRequest {
   string user = 1;
   string namespace = 2;
   string service_account = 3;
+  // Kubernetes Node name. When set, the other fields are ignored: the control-plane node applies
+  // the GPU-sharing RBAC of this node and mints a bound token for its ServiceAccount.
+  string gpu_sharing_node = 4;
 }
 message GetKubeconfigResponse {
   // Admin (or scoped) kubeconfig YAML read/minted on the control-plane node.

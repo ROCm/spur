@@ -412,3 +412,13 @@ whitespace
 WEKA
 WEKA's
 frontend
+ArgoCD
+CEL
+DRA
+DeviceClass
+DeviceConfig
+GitOps
+KServe
+ResourceSlice
+gpu
+unshareable

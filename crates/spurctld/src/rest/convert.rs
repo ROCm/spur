@@ -72,6 +72,7 @@ pub fn node_to_json(
         "operating_system": node.os,
         "planned_job_id": planned.map(|(id, _)| id),
         "planned_start": planned.map(|(_, start)| start.timestamp()),
+        "gpu_sharing": node.gpu_sharing,
     })
 }
 
@@ -132,6 +133,14 @@ mod tests {
             json["reason"],
             "core-layout: not enforced: root write failed"
         );
+    }
+
+    #[test]
+    fn node_to_json_reports_gpu_sharing() {
+        let mut node = Node::new("n1".into(), spur_core::resource::ResourceSet::default());
+        assert_eq!(node_to_json(&node, None)["gpu_sharing"], false);
+        node.gpu_sharing = true;
+        assert_eq!(node_to_json(&node, None)["gpu_sharing"], true);
     }
 
     #[test]
