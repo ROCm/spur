@@ -12,6 +12,7 @@ mod label;
 mod run;
 mod status;
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Context;
@@ -25,7 +26,7 @@ pub use status::TaskStatus;
 pub const SUBCOMMAND: &str = "launch-tasks";
 
 /// What spurd decides about a step's tasks on this node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskPlan {
     pub tasks_on_node: u32,
     /// Global rank of this node's first task.
@@ -35,6 +36,13 @@ pub struct TaskPlan {
     /// `srun -l`: prefix output lines with the task's rank.
     pub label: bool,
     pub cpu_bind: CpuBind,
+    /// `--mpi=pmix`: each task runs the preamble a PMIx rank needs first.
+    #[serde(default)]
+    pub mpi: bool,
+    /// Each local rank's `PMIx_server_setup_fork` environment. Only the process
+    /// hosting the PMIx server can produce it, so the supervisor fills it in.
+    #[serde(default)]
+    pub rank_env: Vec<HashMap<String, String>>,
 }
 
 /// What the supervisor adds when it starts the launcher. The launcher may run
@@ -77,6 +85,8 @@ mod tests {
                 user_script: "/work/.spur_step_9/cmd_3_1.sh".into(),
                 label: false,
                 cpu_bind: CpuBind::Map("0,2".into()),
+                mpi: true,
+                rank_env: vec![HashMap::from([("PMIX_RANK".to_string(), "6".to_string())])],
             },
             uid: 1000,
             gid: 1000,

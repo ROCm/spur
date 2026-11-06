@@ -25,10 +25,8 @@ impl Step {
         Self {
             plan: TaskPlan {
                 tasks_on_node,
-                task_offset: 0,
                 user_script: user_script.to_string_lossy().into_owned(),
-                label: false,
-                cpu_bind: CpuBind::None,
+                ..TaskPlan::default()
             },
             dir,
             env: Vec::new(),
@@ -52,6 +50,29 @@ impl Step {
 
     fn env(mut self, name: &str, value: &str) -> Self {
         self.env.push((name.into(), value.into()));
+        self
+    }
+
+    /// A PMIx launch whose ranks get these environments, with `HOME` pointing
+    /// at the step's directory so a test can supply `spur/mpi/env.sh`.
+    fn pmix(mut self, rank_env: &[&[(&str, &str)]]) -> Self {
+        self.plan.mpi = true;
+        self.plan.rank_env = rank_env
+            .iter()
+            .map(|vars| {
+                vars.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect()
+            })
+            .collect();
+        let home = self.dir.path().to_string_lossy().into_owned();
+        self.env("HOME", &home)
+    }
+
+    fn env_sh(self, content: &str) -> Self {
+        let dir = self.dir.path().join("spur/mpi");
+        std::fs::create_dir_all(&dir).expect("create spur/mpi");
+        std::fs::write(dir.join("env.sh"), content).expect("write env.sh");
         self
     }
 
@@ -160,6 +181,55 @@ fn a_cpu_map_shorter_than_the_ranks_fails_that_task() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("map_cpu: rank 1 exceeds CPU map (len 1)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn pmix_ranks_run_the_mpi_preamble_with_their_own_environment() {
+    let out = Step::new(
+        2,
+        "echo \"$SPUR_LOCALID $PMIX_RANK ${PMI_RANK:-unset} $OMPI_MCA_ess $FROM_ENV_SH\"\n",
+    )
+    .pmix(&[&[("PMIX_RANK", "0")], &[("PMIX_RANK", "1")]])
+    .env_sh("export FROM_ENV_SH=yes\nexport PMIX_RANK=from-env-sh\n")
+    .env("PMI_RANK", "stale")
+    .run();
+    assert_eq!(
+        sorted_lines(&out.stdout),
+        [
+            "0 0 unset ^singleton,^slurm,^srun yes",
+            "1 1 unset ^singleton,^slurm,^srun yes"
+        ],
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_failing_pmix_rank_fails_the_step() {
+    let out = Step::new(2, "exit $((SPUR_LOCALID + 4))\n")
+        .pmix(&[&[], &[]])
+        .run();
+    assert_eq!(out.status.code(), Some(5), "{out:?}");
+}
+
+#[test]
+fn a_lone_pmix_rank_without_its_own_environment_still_gets_the_preamble() {
+    let out = Step::new(1, "echo \"$OMPI_MCA_ess\"\n").pmix(&[]).run();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "^singleton,^slurm,^srun\n"
+    );
+}
+
+#[test]
+fn rank_environments_that_do_not_match_the_tasks_are_refused() {
+    let out = Step::new(2, "exit 0\n").pmix(&[&[]]).run();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("rank environment"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

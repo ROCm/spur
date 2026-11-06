@@ -48,10 +48,9 @@ every task.
 
 .. note::
 
-   Steps that run with ``--mpi``, with ``--container-image``, or inside a
-   containerized job do not follow these rules yet. When such a step runs
-   several tasks on one node, or runs with ``--label``, it can report success
-   even though a task failed.
+   Steps that run with ``--container-image`` or inside a containerized job do
+   not follow these rules yet. When such a step runs several tasks on one node,
+   or runs with ``--label``, it can report success even though a task failed.
 
 Common options:
 

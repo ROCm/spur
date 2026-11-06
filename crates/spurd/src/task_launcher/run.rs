@@ -17,7 +17,7 @@ use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::Pid;
 
 use super::bind::task_affinity;
-use super::env::task_env;
+use super::env::{gpu_slice_env, rank_ids};
 use super::label::LineLabeler;
 use super::status::{aggregate, TaskStatus};
 use super::{LauncherInvocation, SUBCOMMAND};
@@ -55,6 +55,17 @@ fn parse(args: &[String]) -> anyhow::Result<LauncherInvocation> {
 }
 
 fn launch(invocation: &LauncherInvocation) -> anyhow::Result<TaskStatus> {
+    let plan = &invocation.plan;
+    // A lone rank's PMIx environment is already in the process environment;
+    // several ranks each need their own, or they would rendezvous as one.
+    if plan.mpi && plan.tasks_on_node > 1 && plan.rank_env.len() != plan.tasks_on_node as usize {
+        bail!(
+            "got {} PMIx rank environments for {} tasks",
+            plan.rank_env.len(),
+            plan.tasks_on_node
+        );
+    }
+
     let mut held = SigSet::empty();
     for signal in HELD_SIGNALS {
         held.add(signal);
@@ -68,7 +79,6 @@ fn launch(invocation: &LauncherInvocation) -> anyhow::Result<TaskStatus> {
     let exits = SignalFd::with_flags(&child_exits, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
         .context("signalfd")?;
 
-    let plan = &invocation.plan;
     let setup = Arc::new(TaskSetup {
         privdrop: PrivDrop::resolve_if_needed(invocation.uid, invocation.gid),
         seccomp: invocation.seccomp,
@@ -178,12 +188,21 @@ fn spawn_task(
         .map_err(|message| Failure { message, code: 1 })?;
 
     let mut cmd = Command::new("bash");
-    cmd.arg(&plan.user_script).envs(task_env(
-        plan.task_offset,
-        local_id,
-        plan.tasks_on_node,
-        job_gpus,
-    ));
+    cmd.envs(rank_ids(plan.task_offset, local_id));
+    let gpus = gpu_slice_env(local_id, plan.tasks_on_node, job_gpus);
+    if plan.mpi {
+        let rank_env = plan
+            .rank_env
+            .get(local_id as usize)
+            .cloned()
+            .unwrap_or_default();
+        // The GPU slice goes after the site's env.sh, as the rank wrapper did.
+        cmd.arg("-c")
+            .arg(spur_core::task_launch::mpi_rank_program(&rank_env, &gpus));
+    } else {
+        cmd.envs(gpus);
+    }
+    cmd.arg(&plan.user_script);
     let output = if plan.label {
         let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC)
             .map_err(|error| task_failure(rank, "create output pipe", error.into()))?;

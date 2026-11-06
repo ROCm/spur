@@ -3641,14 +3641,48 @@ struct StepLaunchShape {
 }
 
 /// Whether the native task launcher starts this step's tasks. Steps that enter
-/// a container or run MPI still use the generated shell wrappers.
+/// a container still use the generated shell wrappers, and `--mpi=mpirun`
+/// runs a single driver that needs no fan-out.
 fn step_uses_task_launcher(shape: StepLaunchShape) -> bool {
     shape.supervised
         && !shape.joins_parent_namespaces
         && !shape.fresh_container
-        && !shape.mpi
         && !shape.mpirun
-        && (shape.num_tasks > 1 || shape.label)
+        && (shape.num_tasks > 1 || shape.label || shape.mpi)
+}
+
+/// Whether the native task launcher starts a batch launch's tasks. A
+/// containerized batch job runs its script from the image's rootfs and never
+/// used a wrapper.
+fn batch_uses_task_launcher(supervised: bool, containerized: bool, shape: BatchLaunch) -> bool {
+    supervised && !containerized && matches!(shape, BatchLaunch::FanOut | BatchLaunch::LoneRank)
+}
+
+/// The tasks a batch fan-out or lone PMIx rank starts on this node, reading
+/// the job's environment the way the batch wrappers did: `SPUR_LABEL` at run
+/// time, and `--cpu-bind` only for PMIx, the one shape that passed it on.
+fn batch_task_plan(
+    shape: BatchLaunch,
+    task_offset: u32,
+    tasks_per_node: u32,
+    user_script: String,
+    environment: &HashMap<String, String>,
+    pmix: bool,
+) -> crate::task_launcher::TaskPlan {
+    let lone = shape == BatchLaunch::LoneRank;
+    crate::task_launcher::TaskPlan {
+        tasks_on_node: if lone { 1 } else { tasks_per_node },
+        task_offset,
+        user_script,
+        label: !lone && environment.get("SPUR_LABEL").is_some_and(|v| v == "1"),
+        cpu_bind: if pmix {
+            spur_core::task_launch::parse_cpu_bind(environment)
+        } else {
+            spur_core::step::CpuBind::None
+        },
+        mpi: pmix,
+        rank_env: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -3688,7 +3722,24 @@ mod task_launcher_routing_tests {
     }
 
     #[test]
-    fn containers_mpi_and_unsupervised_steps_keep_the_shell_wrapper() {
+    fn a_pmix_step_uses_the_launcher() {
+        assert!(step_uses_task_launcher(StepLaunchShape {
+            mpi: true,
+            ..HOST_STEP
+        }));
+    }
+
+    #[test]
+    fn a_lone_unlabeled_pmix_rank_uses_the_launcher_for_its_preamble() {
+        assert!(step_uses_task_launcher(StepLaunchShape {
+            mpi: true,
+            num_tasks: 1,
+            ..HOST_STEP
+        }));
+    }
+
+    #[test]
+    fn containers_mpirun_and_unsupervised_steps_keep_the_shell_wrapper() {
         for shape in [
             StepLaunchShape {
                 supervised: false,
@@ -3703,16 +3754,88 @@ mod task_launcher_routing_tests {
                 ..HOST_STEP
             },
             StepLaunchShape {
-                mpi: true,
-                ..HOST_STEP
-            },
-            StepLaunchShape {
                 mpirun: true,
                 ..HOST_STEP
             },
         ] {
             assert!(!step_uses_task_launcher(shape));
         }
+    }
+
+    #[test]
+    fn a_supervised_host_batch_fan_out_uses_the_launcher() {
+        assert!(batch_uses_task_launcher(true, false, BatchLaunch::FanOut));
+        assert!(batch_uses_task_launcher(true, false, BatchLaunch::LoneRank));
+    }
+
+    #[test]
+    fn a_batch_script_run_once_or_through_mpirun_keeps_its_own_launch() {
+        assert!(!batch_uses_task_launcher(true, false, BatchLaunch::Script));
+        assert!(!batch_uses_task_launcher(true, false, BatchLaunch::Mpirun));
+    }
+
+    #[test]
+    fn a_containerized_or_unsupervised_batch_fan_out_keeps_the_shell_wrapper() {
+        assert!(!batch_uses_task_launcher(true, true, BatchLaunch::FanOut));
+        assert!(!batch_uses_task_launcher(false, false, BatchLaunch::FanOut));
+    }
+
+    fn bind_env(label: bool) -> HashMap<String, String> {
+        let mut env = HashMap::from([("SPUR_CPU_BIND".to_string(), "rank".to_string())]);
+        if label {
+            env.insert("SPUR_LABEL".into(), "1".into());
+        }
+        env
+    }
+
+    #[test]
+    fn a_pmix_batch_fan_out_starts_every_local_rank_with_its_binding() {
+        let plan = batch_task_plan(
+            BatchLaunch::FanOut,
+            8,
+            4,
+            "/spool/user.sh".into(),
+            &bind_env(false),
+            true,
+        );
+        assert_eq!(plan.tasks_on_node, 4);
+        assert_eq!(plan.task_offset, 8);
+        assert_eq!(plan.user_script, "/spool/user.sh");
+        assert_eq!(plan.cpu_bind, spur_core::step::CpuBind::Rank);
+        assert!(plan.mpi);
+        assert!(!plan.label);
+    }
+
+    #[test]
+    fn a_plain_batch_fan_out_labels_from_the_job_environment_and_binds_nothing() {
+        let plan = batch_task_plan(
+            BatchLaunch::FanOut,
+            0,
+            2,
+            "/spool/user.sh".into(),
+            &bind_env(true),
+            false,
+        );
+        assert!(plan.label);
+        assert_eq!(plan.cpu_bind, spur_core::step::CpuBind::None);
+        assert!(!plan.mpi);
+    }
+
+    #[test]
+    fn a_lone_batch_rank_is_one_unlabeled_mpi_task() {
+        let plan = batch_task_plan(
+            BatchLaunch::LoneRank,
+            3,
+            1,
+            "/spool/user.sh".into(),
+            &bind_env(true),
+            true,
+        );
+        assert_eq!(plan.tasks_on_node, 1);
+        assert_eq!(plan.task_offset, 3);
+        assert!(plan.mpi);
+        assert!(!plan.label);
+        assert_eq!(plan.cpu_bind, spur_core::step::CpuBind::Rank);
     }
 }
 
@@ -6563,6 +6686,9 @@ impl SlurmAgent for AgentService {
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
         let shape = batch_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script);
+        let launches_tasks =
+            batch_uses_task_launcher(stepd_enabled, container_config.is_some(), shape);
+        let mut batch_task_launch = None;
         let launch_script = if shape == BatchLaunch::Mpirun {
             if spec.argv.is_empty() {
                 return Err(Status::invalid_argument(
@@ -6596,7 +6722,21 @@ impl SlurmAgent for AgentService {
             .to_string_lossy()
             .into_owned();
 
-            if shape == BatchLaunch::LoneRank {
+            if launches_tasks {
+                let pmix = spec.mpi == MPI_PMIX;
+                if pmix && shape == BatchLaunch::FanOut {
+                    warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
+                }
+                batch_task_launch = Some(batch_task_plan(
+                    shape,
+                    task_offset,
+                    tasks_per_node,
+                    user_script_path,
+                    &spec.environment,
+                    pmix,
+                ));
+                launch_script
+            } else if shape == BatchLaunch::LoneRank {
                 // A lone rank on this node still needs `env.sh` and the
                 // `PMIX_SERVER_URI` aliases the per-rank wrapper carries.
                 spur_core::task_launch::build_single_task_wrapper(
@@ -6786,7 +6926,7 @@ impl SlurmAgent for AgentService {
             pmix_multi_task,
             joins_parent_namespaces: false,
             allocation_holder,
-            task_launch: None,
+            task_launch: batch_task_launch,
             stdout_path: spec.stdout_path.clone(),
             stderr_path: spec.stderr_path.clone(),
             stdin_path: spec.stdin_path.clone(),
@@ -8350,6 +8490,8 @@ impl SlurmAgent for AgentService {
                     user_script: user_script_path.to_string_lossy().into_owned(),
                     label: req.label,
                     cpu_bind: spur_core::task_launch::parse_cpu_bind(&req.environment),
+                    mpi: step_mpi,
+                    rank_env: Vec::new(),
                 });
                 None
             } else if step_mpirun {

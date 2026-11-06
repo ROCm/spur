@@ -1,42 +1,47 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/// Variables one task adds on top of the step's environment: its rank ids and,
-/// when several tasks share the node, its contiguous slice of the node's GPUs.
-///
-/// The slice keeps the bash wrapper's rules: integer division, leftover GPUs
-/// unassigned, and no narrowing when there are fewer GPUs than tasks.
-pub fn task_env(
-    task_offset: u32,
-    local_id: u32,
-    tasks_on_node: u32,
-    job_gpus: Option<&str>,
-) -> Vec<(String, String)> {
+/// A task's local and global rank, in both `SPUR_` and `SLURM_` form.
+pub fn rank_ids(task_offset: u32, local_id: u32) -> Vec<(String, String)> {
     let local = local_id.to_string();
     let procid = (task_offset + local_id).to_string();
-    let mut env = vec![
+    vec![
         ("SPUR_LOCALID".to_string(), local.clone()),
         ("SLURM_LOCALID".to_string(), local),
         ("SPUR_PROCID".to_string(), procid.clone()),
         ("SLURM_PROCID".to_string(), procid),
-    ];
-    if let Some(slice) = gpu_slice(local_id, tasks_on_node, job_gpus) {
-        let devices = slice.join(",");
-        for name in [
-            "ROCR_VISIBLE_DEVICES",
-            "CUDA_VISIBLE_DEVICES",
-            "GPU_DEVICE_ORDINAL",
-        ] {
-            env.push((name.to_string(), devices.clone()));
-        }
-        // ROCR has already renumbered the visible set by the time HIP applies
-        // its own selector, so HIP counts from zero.
-        let hip = (0..slice.len())
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        env.push(("HIP_VISIBLE_DEVICES".to_string(), hip));
-    }
+    ]
+}
+
+/// The GPU selectors narrowed to one task's contiguous slice of the node's
+/// GPUs, or nothing when the task keeps the step's whole device set.
+///
+/// The slice keeps the bash wrapper's rules: integer division, leftover GPUs
+/// unassigned, and no narrowing when there are fewer GPUs than tasks.
+pub fn gpu_slice_env(
+    local_id: u32,
+    tasks_on_node: u32,
+    job_gpus: Option<&str>,
+) -> Vec<(String, String)> {
+    let Some(slice) = gpu_slice(local_id, tasks_on_node, job_gpus) else {
+        return Vec::new();
+    };
+    let devices = slice.join(",");
+    let mut env: Vec<(String, String)> = [
+        "ROCR_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "GPU_DEVICE_ORDINAL",
+    ]
+    .into_iter()
+    .map(|name| (name.to_string(), devices.clone()))
+    .collect();
+    // ROCR has already renumbered the visible set by the time HIP applies its
+    // own selector, so HIP counts from zero.
+    let hip = (0..slice.len())
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    env.push(("HIP_VISIBLE_DEVICES".to_string(), hip));
     env
 }
 
@@ -64,8 +69,9 @@ mod tests {
         tasks: u32,
         gpus: Option<&str>,
     ) -> HashMap<String, String> {
-        task_env(task_offset, local_id, tasks, gpus)
+        rank_ids(task_offset, local_id)
             .into_iter()
+            .chain(gpu_slice_env(local_id, tasks, gpus))
             .collect()
     }
 
