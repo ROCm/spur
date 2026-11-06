@@ -4025,6 +4025,12 @@ mod tests {
             cpu_bind: spur_core::step::CpuBind::Rank,
             mpi: true,
             rank_env: vec![HashMap::from([("PMIX_RANK".to_string(), "8".to_string())])],
+            enter: Some(crate::task_launcher::JobNamespaces {
+                pid: 4242,
+                mount: true,
+                pid_namespace: false,
+                work_dir: "/work".into(),
+            }),
         };
         let mut config = launch_spec().into_launch_config();
         config.task_launch = Some(plan.clone());

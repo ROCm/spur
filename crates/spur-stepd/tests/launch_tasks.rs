@@ -235,6 +235,25 @@ fn rank_environments_that_do_not_match_the_tasks_are_refused() {
     );
 }
 
+#[test]
+fn a_job_whose_namespaces_cannot_be_entered_starts_no_tasks() {
+    let mut step = Step::new(1, "echo ran\n");
+    step.plan.enter = Some(spurd::task_launcher::JobNamespaces {
+        pid: i32::MAX,
+        mount: true,
+        pid_namespace: true,
+        work_dir: "/".into(),
+    });
+    let out = step.run();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "a task ran outside the job");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot enter the job's namespaces"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Spur signals a step's whole process group or cgroup, so the launcher sees
 /// the signal alongside its tasks and must outlive them to report it.
 fn signal_running_tasks(signal: libc::c_int) -> std::process::ExitStatus {

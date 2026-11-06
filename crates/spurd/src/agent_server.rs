@@ -3628,11 +3628,36 @@ fn supervised_step_pmix(
     })
 }
 
+/// The running job whose namespaces a step's tasks join, if any.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepParent {
+    /// The step starts in the agent's own namespaces.
+    None,
+    /// A job that unshared its pid and mount namespaces but kept the host's
+    /// filesystem, as every batch job on a root agent does.
+    Namespaced,
+    /// A containerized job, whose filesystem is its image.
+    Container,
+}
+
+/// Classify the running job a step joins. `joins` is whether the step enters
+/// the job's namespaces at all; a job whose namespaces cannot be inspected is
+/// treated as a container, which keeps the step on its current launch.
+fn step_parent(joins: bool, has_user_namespace: bool, job_pid: i32) -> StepParent {
+    if !joins {
+        return StepParent::None;
+    }
+    if has_user_namespace || !crate::task_launcher::shares_root_with(job_pid) {
+        return StepParent::Container;
+    }
+    StepParent::Namespaced
+}
+
 /// What decides how a step's tasks start on this node.
 #[derive(Clone, Copy)]
 struct StepLaunchShape {
     supervised: bool,
-    joins_parent_namespaces: bool,
+    parent: StepParent,
     fresh_container: bool,
     mpi: bool,
     mpirun: bool,
@@ -3645,7 +3670,7 @@ struct StepLaunchShape {
 /// runs a single driver that needs no fan-out.
 fn step_uses_task_launcher(shape: StepLaunchShape) -> bool {
     shape.supervised
-        && !shape.joins_parent_namespaces
+        && shape.parent != StepParent::Container
         && !shape.fresh_container
         && !shape.mpirun
         && (shape.num_tasks > 1 || shape.label || shape.mpi)
@@ -3682,6 +3707,7 @@ fn batch_task_plan(
         },
         mpi: pmix,
         rank_env: Vec::new(),
+        enter: None,
     }
 }
 
@@ -3691,7 +3717,7 @@ mod task_launcher_routing_tests {
 
     const HOST_STEP: StepLaunchShape = StepLaunchShape {
         supervised: true,
-        joins_parent_namespaces: false,
+        parent: StepParent::None,
         fresh_container: false,
         mpi: false,
         mpirun: false,
@@ -3722,6 +3748,36 @@ mod task_launcher_routing_tests {
     }
 
     #[test]
+    fn a_step_inside_a_namespaced_batch_job_uses_the_launcher() {
+        assert!(step_uses_task_launcher(StepLaunchShape {
+            parent: StepParent::Namespaced,
+            ..HOST_STEP
+        }));
+    }
+
+    #[test]
+    fn a_running_job_on_the_hosts_filesystem_is_entered_as_namespaced() {
+        assert_eq!(
+            step_parent(true, false, std::process::id() as i32),
+            StepParent::Namespaced
+        );
+    }
+
+    #[test]
+    fn a_running_job_with_its_own_root_or_user_namespace_is_a_container() {
+        assert_eq!(step_parent(true, false, i32::MAX), StepParent::Container);
+        assert_eq!(
+            step_parent(true, true, std::process::id() as i32),
+            StepParent::Container
+        );
+    }
+
+    #[test]
+    fn a_job_without_namespaces_is_no_parent() {
+        assert_eq!(step_parent(false, false, 1234), StepParent::None);
+    }
+
+    #[test]
     fn a_pmix_step_uses_the_launcher() {
         assert!(step_uses_task_launcher(StepLaunchShape {
             mpi: true,
@@ -3746,7 +3802,7 @@ mod task_launcher_routing_tests {
                 ..HOST_STEP
             },
             StepLaunchShape {
-                joins_parent_namespaces: true,
+                parent: StepParent::Container,
                 ..HOST_STEP
             },
             StepLaunchShape {
@@ -8444,9 +8500,14 @@ impl SlurmAgent for AgentService {
         }
 
         let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
+        let parent = step_parent(
+            joins_parent_namespaces,
+            job_entry.has_user_namespace,
+            job_entry.pid,
+        );
         let use_task_launcher = step_uses_task_launcher(StepLaunchShape {
             supervised: supervise_step,
-            joins_parent_namespaces,
+            parent,
             fresh_container: matches!(
                 resolve_step_container_plan(req.container.as_ref(), joins_parent_namespaces),
                 StepContainerPlan::Fresh(_)
@@ -8492,6 +8553,14 @@ impl SlurmAgent for AgentService {
                     cpu_bind: spur_core::task_launch::parse_cpu_bind(&req.environment),
                     mpi: step_mpi,
                     rank_env: Vec::new(),
+                    enter: (parent == StepParent::Namespaced).then(|| {
+                        crate::task_launcher::JobNamespaces {
+                            pid: job_entry.pid,
+                            mount: job_entry.has_mount_namespace,
+                            pid_namespace: job_entry.has_pid_namespace,
+                            work_dir: work_dir.clone(),
+                        }
+                    }),
                 });
                 None
             } else if step_mpirun {

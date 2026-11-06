@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context};
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
-use nix::sched::CpuSet;
+use nix::sched::{CloneFlags, CpuSet};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::Pid;
@@ -20,7 +20,7 @@ use super::bind::task_affinity;
 use super::env::{gpu_slice_env, rank_ids};
 use super::label::LineLabeler;
 use super::status::{aggregate, TaskStatus};
-use super::{LauncherInvocation, SUBCOMMAND};
+use super::{JobNamespaces, LauncherInvocation, SUBCOMMAND};
 use crate::privdrop::PrivDrop;
 
 /// Spur signals a step's whole process group or cgroup, so tasks receive these
@@ -35,6 +35,43 @@ const HELD_SIGNALS: [Signal; 7] = [
     Signal::SIGUSR2,
     Signal::SIGALRM,
 ];
+
+/// Whether `pid` sees the same root directory as this process. A container's
+/// `pivot_root` moves every process in its mount namespace onto the image's
+/// rootfs; a batch job that only unshared its mounts keeps the host's.
+pub fn shares_root_with(pid: i32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::metadata(format!("/proc/{pid}/root")),
+        std::fs::metadata("/"),
+    ) {
+        (Ok(theirs), Ok(ours)) => theirs.dev() == ours.dev() && theirs.ino() == ours.ino(),
+        _ => false,
+    }
+}
+
+fn enter_job_namespaces(job: &JobNamespaces) -> anyhow::Result<()> {
+    // Both are opened before either is joined: inside the job's mount
+    // namespace, its /proc no longer shows this host pid.
+    let pid_namespace = job
+        .pid_namespace
+        .then(|| std::fs::File::open(format!("/proc/{}/ns/pid_for_children", job.pid)))
+        .transpose()?;
+    let mount_namespace = job
+        .mount
+        .then(|| std::fs::File::open(format!("/proc/{}/ns/mnt", job.pid)))
+        .transpose()?;
+    if let Some(namespace) = &pid_namespace {
+        nix::sched::setns(namespace, CloneFlags::CLONE_NEWPID)?;
+    }
+    if let Some(namespace) = &mount_namespace {
+        nix::sched::setns(namespace, CloneFlags::CLONE_NEWNS)?;
+    }
+    // Best effort, as the wrapper's `cd` was: a work dir missing inside the job
+    // still runs the tasks.
+    let _ = std::env::set_current_dir(&job.work_dir);
+    Ok(())
+}
 
 /// Entry point for `spurstepd launch-tasks <invocation-json>`.
 pub fn run_from_args(args: &[String]) -> ! {
@@ -79,11 +116,16 @@ fn launch(invocation: &LauncherInvocation) -> anyhow::Result<TaskStatus> {
     let exits = SignalFd::with_flags(&child_exits, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)
         .context("signalfd")?;
 
+    // Resolved before entering a job: the job shares the host's filesystem, and
+    // loading NSS modules from anywhere else is not safe.
     let setup = Arc::new(TaskSetup {
         privdrop: PrivDrop::resolve_if_needed(invocation.uid, invocation.gid),
         seccomp: invocation.seccomp,
         landlock_work_dir: invocation.landlock_work_dir.clone(),
     });
+    if let Some(job) = &plan.enter {
+        enter_job_namespaces(job).context("cannot enter the job's namespaces")?;
+    }
     let job_gpus = std::env::var("SPUR_JOB_GPUS").ok();
 
     let mut running = HashSet::new();

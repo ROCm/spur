@@ -19,7 +19,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use spur_core::step::CpuBind;
 
-pub use run::run_from_args;
+pub use run::{run_from_args, shares_root_with};
 pub use status::TaskStatus;
 
 /// The argv word that selects launcher mode in the `spurstepd` binary.
@@ -43,6 +43,22 @@ pub struct TaskPlan {
     /// hosting the PMIx server can produce it, so the supervisor fills it in.
     #[serde(default)]
     pub rank_env: Vec<HashMap<String, String>>,
+    /// A running job whose namespaces the tasks join, as a step inside a batch
+    /// job does.
+    #[serde(default)]
+    pub enter: Option<JobNamespaces>,
+}
+
+/// The namespaces of a running job that a step's tasks start inside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobNamespaces {
+    /// The process that unshared them; it stays in the host pid namespace, so
+    /// the job's own is reached through its `pid_for_children`.
+    pub pid: i32,
+    pub mount: bool,
+    pub pid_namespace: bool,
+    /// Entered after joining, best effort, as the wrapper's `cd` was.
+    pub work_dir: String,
 }
 
 /// What the supervisor adds when it starts the launcher. The launcher may run
@@ -87,6 +103,12 @@ mod tests {
                 cpu_bind: CpuBind::Map("0,2".into()),
                 mpi: true,
                 rank_env: vec![HashMap::from([("PMIX_RANK".to_string(), "6".to_string())])],
+                enter: Some(JobNamespaces {
+                    pid: 4242,
+                    mount: true,
+                    pid_namespace: true,
+                    work_dir: "/work".into(),
+                }),
             },
             uid: 1000,
             gid: 1000,
@@ -100,5 +122,15 @@ mod tests {
         let decoded: LauncherInvocation = serde_json::from_str(&argv[2]).expect("decode");
         assert_eq!(decoded, invocation);
         assert_eq!(argv.len(), 3);
+    }
+
+    #[test]
+    fn a_process_shares_its_own_root() {
+        assert!(shares_root_with(std::process::id() as i32));
+    }
+
+    #[test]
+    fn a_process_that_does_not_exist_shares_no_root() {
+        assert!(!shares_root_with(i32::MAX));
     }
 }
