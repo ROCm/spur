@@ -63,7 +63,7 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           limit-severities-for-sarif: true
-          exit-code: "0"
+          exit-code: "1"
 
       - name: Upload SARIF to GitHub Security
         if: always() && steps.scan.outcome != 'skipped'
