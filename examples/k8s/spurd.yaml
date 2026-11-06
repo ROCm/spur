@@ -15,7 +15,7 @@ spec:
       # spurd reaches the cluster through the host's k0s, never a pod token.
       automountServiceAccountToken: false
       nodeSelector:
-        spur.amd.com/compute: "true"
+        spur.amd.com/managed: "true"
       tolerations:
         - key: spur.amd.com/gpu-node
           operator: Exists
