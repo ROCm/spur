@@ -416,7 +416,19 @@ pub async fn association_maps(
         })
         .collect();
 
-    let coordinators = db::list_coordinators(pool).await?.into_iter().collect();
+    let parent_of: HashMap<String, String> = db::list_accounts(pool)
+        .await?
+        .into_iter()
+        .filter_map(|account| {
+            account
+                .parent
+                .filter(|parent| !parent.is_empty())
+                .map(|parent| (account.name, parent))
+        })
+        .collect();
+    // Stored expanded, so every read sees sub-accounts without walking the tree.
+    let coordinators =
+        crate::association_cache::with_sub_accounts(db::list_coordinators(pool).await?, &parent_of);
 
     Ok((
         default_qos,

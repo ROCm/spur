@@ -3,6 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 
 use crate::boolean::{is_truthy, parse_bool};
 use crate::format_engine;
@@ -191,6 +192,10 @@ fn parse_params(params: &[String]) -> std::collections::HashMap<String, String> 
     while let Some(param) = iter.next() {
         if let Some((key, value)) = param.split_once('=') {
             map.insert(key.to_lowercase(), value.to_string());
+        } else if param.eq_ignore_ascii_case("withcoord") {
+            // A flag, not a key/value pair. Taking the next token would swallow
+            // `name=alice` in `show user withcoord name=alice`.
+            map.insert("withcoord".to_string(), String::new());
         } else if param.starts_with("where") || param.starts_with("set") {
             // Skip Slurm-style "where" and "set" keywords
             continue;
@@ -1182,22 +1187,34 @@ async fn show(
 
     match entity.as_str() {
         "account" | "accounts" => {
-            let fields = account_format_fields(long_aware_format(&p, long))?;
+            let mut fields = account_format_fields(long_aware_format(&p, long))?;
+            if p.contains_key("withcoord") {
+                append_coords_column(&mut fields);
+            }
+            let show_coords = fields.iter().any(|token| {
+                matches!(token, format_engine::FormatToken::Field(field) if field.spec == 'C')
+            });
 
             let mut client = connect(addr).await?;
             let resp = client
-                .list_accounts(ListAccountsRequest {})
+                .list_accounts(ListAccountsRequest { shares: false })
                 .await
                 .context("ListAccounts RPC failed")?;
 
             let accounts = resp.into_inner().accounts;
+            let coords = if show_coords {
+                load_coordinator_columns(&mut client).await?.1
+            } else {
+                HashMap::new()
+            };
 
             style.print_header(&fields);
 
             for a in &accounts {
+                let cell = coords.get(&a.name).map(String::as_str).unwrap_or("");
                 println!(
                     "{}",
-                    style.row(&fields, &|spec| resolve_account_field(a, spec))
+                    style.row(&fields, &|spec| resolve_account_field(a, spec, cell))
                 );
             }
             Ok(())
@@ -1216,14 +1233,29 @@ async fn show(
                 .context("ListUsers RPC failed")?;
 
             let users = resp.into_inner().users;
+            let withcoord = p.contains_key("withcoord");
+            let coords = if withcoord {
+                load_coordinator_columns(&mut client).await?.0
+            } else {
+                HashMap::new()
+            };
+            let mut header = user_header_row();
+            if withcoord {
+                header.push_str(&format!(" {:<20}", "Coords"));
+            }
 
             if style.shows_header() {
-                println!("{}", user_header_row());
-                println!("{}", "-".repeat(180));
+                println!("{header}");
+                println!("{}", "-".repeat(header.len()));
             }
 
             for u in &users {
-                println!("{}", format_user_row(u));
+                let mut row = format_user_row(u);
+                if withcoord {
+                    let cell = coords.get(&u.name).map(String::as_str).unwrap_or("");
+                    row.push_str(&format!(" {cell:<20}"));
+                }
+                println!("{row}");
             }
             Ok(())
         }
@@ -1523,6 +1555,7 @@ fn account_header(spec: char) -> &'static str {
         'S' => "Share",
         'G' => "GrpTRES",
         'J' => "MaxJobs",
+        'C' => "Coords",
         _ => "?",
     }
 }
@@ -1536,6 +1569,7 @@ fn account_field_spec(name: &str) -> Option<char> {
         "share" | "fairshare" | "fairshareweight" => Some('S'),
         "grptres" => Some('G'),
         "maxjobs" | "maxrunningjobs" => Some('J'),
+        "coords" | "coordinators" | "coord" => Some('C'),
         _ => None,
     }
 }
@@ -1551,8 +1585,78 @@ fn account_format_fields(
         ACCOUNT_ALL_FORMAT,
         &account_field_spec,
         &account_header,
-        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs",
+        "Account, Descr, Org, Parent, Share, GrpTRES, MaxJobs, Coords",
     )
+}
+
+/// `withcoord` adds the column when the caller's format did not already ask for it.
+fn append_coords_column(fields: &mut Vec<format_engine::FormatToken>) {
+    if fields
+        .iter()
+        .any(|token| matches!(token, format_engine::FormatToken::Field(field) if field.spec == 'C'))
+    {
+        return;
+    }
+    fields.push(format_engine::FormatToken::Literal(" ".to_string()));
+    fields.push(format_engine::FormatToken::Field(
+        format_engine::FormatField {
+            spec: 'C',
+            width: 20,
+            right_align: false,
+            truncate: None,
+            header: "Coords".to_string(),
+        },
+    ));
+}
+
+/// `(accounts by user, users by account)`, names joined and sorted. A caller
+/// who is denied the coordinator list gets empty columns rather than a failed
+/// `show user`; they coordinate nothing, and other assignments stay hidden.
+async fn load_coordinator_columns(
+    client: &mut SlurmAccountingClient<crate::authclient::AuthChannel>,
+) -> Result<(HashMap<String, String>, HashMap<String, String>)> {
+    match client
+        .list_coordinators(ListCoordinatorsRequest {
+            account: String::new(),
+            user: String::new(),
+        })
+        .await
+    {
+        Ok(resp) => Ok(coordinator_columns(&resp.into_inner().coordinators)),
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {
+            Ok((HashMap::new(), HashMap::new()))
+        }
+        Err(status) => Err(status).context("ListCoordinators RPC failed"),
+    }
+}
+
+fn coordinator_columns(
+    rows: &[CoordinatorInfo],
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut by_user: HashMap<String, Vec<&str>> = HashMap::new();
+    let mut by_account: HashMap<String, Vec<&str>> = HashMap::new();
+    for row in rows {
+        by_user
+            .entry(row.user.clone())
+            .or_default()
+            .push(row.account.as_str());
+        by_account
+            .entry(row.account.clone())
+            .or_default()
+            .push(row.user.as_str());
+    }
+    (join_names(by_user), join_names(by_account))
+}
+
+fn join_names(groups: HashMap<String, Vec<&str>>) -> HashMap<String, String> {
+    groups
+        .into_iter()
+        .map(|(key, mut names)| {
+            names.sort_unstable();
+            names.dedup();
+            (key, names.join(","))
+        })
+        .collect()
 }
 
 /// Render a numeric limit, blank when unset/unlimited (the INFINITE sentinel);
@@ -1629,7 +1733,7 @@ fn format_association_row(
     format!("{user:<15} {account:<20} {partition:<15} {share:<10} {default_qos:<10}",)
 }
 
-fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
+fn resolve_account_field(a: &AccountInfo, spec: char, coords: &str) -> String {
     match spec {
         'N' => a.name.clone(),
         'D' => a.description.clone(),
@@ -1638,6 +1742,7 @@ fn resolve_account_field(a: &AccountInfo, spec: char) -> String {
         'S' => (a.fairshare_weight as u32).to_string(),
         'G' => a.grp_tres.clone(),
         'J' => blank_if_unset(a.max_running_jobs),
+        'C' => coords.to_string(),
         _ => "?".into(),
     }
 }
@@ -1995,6 +2100,46 @@ mod tests {
         let p = parse_params(&["account=ml".into(), "fairshare=10".into()]);
         let err = reject_unknown_keys(&p, COORDINATOR_KEYS).unwrap_err();
         assert!(err.to_string().contains("unknown field 'fairshare'"));
+    }
+
+    #[test]
+    fn withcoord_is_a_flag_and_does_not_swallow_the_next_field() {
+        let p = parse_params(&["withcoord".into(), "name=alice".into()]);
+        assert!(p.contains_key("withcoord"));
+        assert_eq!(p.get("name").map(String::as_str), Some("alice"));
+
+        let p = parse_params(&["WithCoord".into()]);
+        assert!(p.contains_key("withcoord"));
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn coordinator_columns_group_users_and_accounts() {
+        let rows = vec![
+            CoordinatorInfo {
+                user: "bob".into(),
+                account: "physics".into(),
+            },
+            CoordinatorInfo {
+                user: "alice".into(),
+                account: "gpu".into(),
+            },
+            CoordinatorInfo {
+                user: "alice".into(),
+                account: "physics".into(),
+            },
+        ];
+        let (by_user, by_account) = coordinator_columns(&rows);
+        assert_eq!(
+            by_user.get("alice").map(String::as_str),
+            Some("gpu,physics")
+        );
+        assert_eq!(by_user.get("bob").map(String::as_str), Some("physics"));
+        assert_eq!(
+            by_account.get("physics").map(String::as_str),
+            Some("alice,bob")
+        );
+        assert_eq!(by_account.get("gpu").map(String::as_str), Some("alice"));
     }
 
     #[test]
@@ -2958,7 +3103,7 @@ mod tests {
         assert_eq!(specs, vec!['N', 'G']);
 
         let a = stub_account();
-        let row = format_engine::format_row(&fields, &|spec| resolve_account_field(&a, spec));
+        let row = format_engine::format_row(&fields, &|spec| resolve_account_field(&a, spec, ""));
         assert!(row.contains("physics"), "Account missing: {row}");
         assert!(row.contains("node=4,cpu=256"), "GrpTRES missing: {row}");
         assert!(
@@ -3027,13 +3172,13 @@ mod tests {
             max_running_jobs: spur_core::accounting::INFINITE,
             ..stub_account()
         };
-        assert_eq!(resolve_account_field(&unset, 'J'), "");
+        assert_eq!(resolve_account_field(&unset, 'J', ""), "");
 
         let blocking = AccountInfo {
             max_running_jobs: 0,
             ..stub_account()
         };
-        assert_eq!(resolve_account_field(&blocking, 'J'), "0");
+        assert_eq!(resolve_account_field(&blocking, 'J', ""), "0");
     }
 
     #[test]
@@ -3042,13 +3187,13 @@ mod tests {
             max_running_jobs: 10,
             ..stub_account()
         };
-        assert_eq!(resolve_account_field(&a, 'J'), "10");
+        assert_eq!(resolve_account_field(&a, 'J', ""), "10");
     }
 
     #[test]
     fn account_resolve_unknown_spec_is_visible_marker() {
         // A header spec missing a resolver renders "?" (not a silently blank column).
-        assert_eq!(resolve_account_field(&stub_account(), 'Z'), "?");
+        assert_eq!(resolve_account_field(&stub_account(), 'Z', ""), "?");
     }
 
     #[test]

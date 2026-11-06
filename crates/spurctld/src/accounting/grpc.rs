@@ -44,6 +44,21 @@ fn scoped_to_user(scope: &spur_core::rbac::ReadScope) -> Option<String> {
     }
 }
 
+/// Accounts a partial usage reply covers, including those with no rows in the
+/// window. Empty when the reply is the whole cluster or a single user.
+fn usage_visible_accounts(scope: &spur_core::rbac::ReadScope, partial: bool) -> Vec<String> {
+    if !partial {
+        return Vec::new();
+    }
+    let Some(accounts) = scope.coordinated_accounts() else {
+        return Vec::new();
+    };
+    let mut names = accounts.to_vec();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The user predicate a private read hands to SQL.
 #[derive(Debug)]
 enum ScopedUser {
@@ -760,6 +775,7 @@ impl SlurmAccounting for AccountingService {
                     has_billing_weights: true,
                     scoped_to_user: scoped_to,
                     partial: false,
+                    visible_accounts: usage_visible_accounts(&scope, false),
                 }));
             }
             ScopedUser::Query(user) => user,
@@ -821,6 +837,7 @@ impl SlurmAccounting for AccountingService {
             has_billing_weights: true,
             scoped_to_user: scoped_to,
             partial,
+            visible_accounts: usage_visible_accounts(&scope, partial),
         }))
     }
 
@@ -903,6 +920,27 @@ impl SlurmAccounting for AccountingService {
         &self,
         request: Request<ListAccountsRequest>,
     ) -> Result<Response<ListAccountsResponse>, Status> {
+        // The share tree is not an account listing. Slurm's sshare reads it
+        // even when PrivateData=accounts would deny `sacctmgr show account`.
+        if request.get_ref().shares {
+            let pool = self.pool()?;
+            let records = db::list_accounts(&pool)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let accounts = records
+                .into_iter()
+                .map(|r| AccountInfo {
+                    name: r.name,
+                    parent_account: r.parent.unwrap_or_default(),
+                    fairshare_weight: r.fairshare_weight as f64,
+                    ..Default::default()
+                })
+                .collect();
+            return Ok(Response::new(ListAccountsResponse {
+                accounts,
+                partial: false,
+            }));
+        }
         let scope =
             self.caller_read_scope(&request, spur_core::config::AuthConfig::accounts_private);
         // Operators and an unrestricted caller see every account. Everyone else
@@ -1278,6 +1316,12 @@ impl SlurmAccounting for AccountingService {
             return Err(Status::invalid_argument("account and users are required"));
         }
         let mut tx = pool.begin().await.map_err(internal)?;
+        // A typo would sit unused until a later user of that name inherited it.
+        for user in &req.users {
+            if !db::user_exists(&mut tx, user).await.map_err(internal)? {
+                return Err(Status::not_found(format!("user '{user}' does not exist")));
+            }
+        }
         let mut added = 0;
         for user in &req.users {
             added += db::add_coordinator(&mut tx, user, &req.account)
@@ -2072,6 +2116,23 @@ mod tests {
     }
 
     #[test]
+    fn usage_visible_accounts_names_a_coordinators_accounts_only_when_partial() {
+        let scope = spur_core::rbac::ReadScope::Coordinated {
+            user: "alice".into(),
+            accounts: vec!["physics".into(), "ml".into()],
+        };
+        assert!(usage_visible_accounts(&scope, false).is_empty());
+        assert_eq!(
+            usage_visible_accounts(&scope, true),
+            vec!["ml".to_string(), "physics".to_string()]
+        );
+        assert!(
+            usage_visible_accounts(&spur_core::rbac::ReadScope::Caller("alice".into()), true)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn scoped_sql_user_pins_the_caller_and_skips_someone_else() {
         let scope = spur_core::rbac::ReadScope::Caller("alice".into());
         assert!(matches!(scoped_sql_user(&scope, "bob"), ScopedUser::None));
@@ -2194,7 +2255,7 @@ mod tests {
         let service = AccountingService::unavailable("no DB needed for this test");
         fix_auth(&service, auth_hiding(&["accounts"]));
 
-        let mut alice = Request::new(ListAccountsRequest {});
+        let mut alice = Request::new(ListAccountsRequest { shares: false });
         alice.extensions_mut().insert(identity("alice", false));
         let err = service.list_accounts(alice).await.unwrap_err();
         assert_eq!(
@@ -2206,7 +2267,7 @@ mod tests {
         let cache = std::sync::Arc::new(crate::association_cache::AssociationCache::new());
         cache.insert_association("alice", "physics");
         service.attach_association_cache(cache.clone());
-        let mut alice = Request::new(ListAccountsRequest {});
+        let mut alice = Request::new(ListAccountsRequest { shares: false });
         alice.extensions_mut().insert(identity("alice", false));
         let err = service.list_accounts(alice).await.unwrap_err();
         assert_eq!(
@@ -2215,8 +2276,17 @@ mod tests {
             "membership is not coordination"
         );
 
+        let mut shares = Request::new(ListAccountsRequest { shares: true });
+        shares.extensions_mut().insert(identity("alice", false));
+        let err = service.list_accounts(shares).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "the share tree is not the account listing, so a non-coordinator is not denied"
+        );
+
         cache.insert_coordinator("alice", "physics");
-        let mut alice = Request::new(ListAccountsRequest {});
+        let mut alice = Request::new(ListAccountsRequest { shares: false });
         alice.extensions_mut().insert(identity("alice", false));
         let err = service
             .list_accounts(alice)
@@ -2228,7 +2298,7 @@ mod tests {
         assert!(account_allowed(Some(&["physics".into()]), "physics"));
         assert!(account_allowed(None, "ml"));
 
-        let mut admin = Request::new(ListAccountsRequest {});
+        let mut admin = Request::new(ListAccountsRequest { shares: false });
         admin.extensions_mut().insert(identity("carol", true));
         let err = service.list_accounts(admin).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);

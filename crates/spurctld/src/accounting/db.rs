@@ -1837,6 +1837,15 @@ pub async fn remove_user(
     user: &str,
     account: &str,
 ) -> anyhow::Result<u64> {
+    // Same scope as the user rows. A removed user must not stay a coordinator,
+    // or a later user of that name would inherit the role.
+    sqlx::query(
+        "DELETE FROM account_coordinators WHERE user_name = $1 AND ($2 = '' OR account = $2)",
+    )
+    .bind(user)
+    .bind(account)
+    .execute(&mut *conn)
+    .await?;
     let associations =
         sqlx::query("DELETE FROM associations WHERE user_name = $1 AND ($2 = '' OR account = $2)")
             .bind(user)
@@ -2081,6 +2090,14 @@ pub async fn delete_qos(conn: &mut PgConnection, name: &str) -> anyhow::Result<(
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+pub async fn user_exists(conn: &mut PgConnection, name: &str) -> anyhow::Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM users WHERE name = $1 LIMIT 1")
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(row.is_some())
 }
 
 /// Whether a QOS with this name exists. Used to reject setting a

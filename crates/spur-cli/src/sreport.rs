@@ -115,7 +115,10 @@ type AcctClient = SlurmAccountingClient<crate::authclient::AuthChannel>;
 /// Account definitions. A non-coordinator is denied when `accounts` is private;
 /// the caller then builds rows from the usage it is allowed to see.
 async fn account_directory(client: &mut AcctClient) -> Result<Vec<spur_proto::proto::AccountInfo>> {
-    match client.list_accounts(ListAccountsRequest {}).await {
+    match client
+        .list_accounts(ListAccountsRequest { shares: false })
+        .await
+    {
         Ok(resp) => Ok(resp.into_inner().accounts),
         Err(status) if status.code() == tonic::Code::PermissionDenied => Ok(Vec::new()),
         Err(status) => Err(status).context("failed to list accounts"),
@@ -205,7 +208,12 @@ async fn report_account_utilization_by_user(
         let &(acct_cpu, acct_gpu, acct_jobs) = acct_agg
             .get(account.name.as_str())
             .unwrap_or(&(0.0, 0.0, 0));
-        let account_usage = scope.account_rows_visible();
+        let visible = account_visible(
+            &usage.visible_accounts,
+            &account.name,
+            acct_agg.contains_key(account.name.as_str()),
+        );
+        let account_usage = account_utilization_shown(&scope, visible);
 
         println!(
             "{:<20}{}{:<15}{}{}{}{}{}{}",
@@ -225,7 +233,7 @@ async fn report_account_utilization_by_user(
             let &(user_cpu, user_gpu, user_jobs) = user_agg
                 .get(&(user.name.as_str(), account.name.as_str()))
                 .unwrap_or(&(0.0, 0.0, 0));
-            let mine = scope.user_visible(&user.name);
+            let mine = user_utilization_shown(&scope, &user.name, visible);
 
             println!(
                 " {:<19}{}{:<15}{}{}{}{}{}{}",
@@ -306,7 +314,12 @@ async fn report_user_utilization_by_account(
         let &(cpu, gpu, jobs) = user_agg
             .get(&(user.name.as_str(), user.account.as_str()))
             .unwrap_or(&(0.0, 0.0, 0));
-        let mine = scope.user_visible(&user.name);
+        let visible = account_visible(
+            &usage.visible_accounts,
+            &user.account,
+            user_agg.contains_key(&(user.name.as_str(), user.account.as_str())),
+        );
+        let mine = user_utilization_shown(&scope, &user.name, visible);
 
         println!(
             "{:<15}{}{:<20}{}{}{}{}{}{}",
@@ -516,9 +529,52 @@ async fn report_job_sizes_by_user(
     Ok(())
 }
 
+/// An account total is real on a complete reply, and on a coordinator's own
+/// accounts when the reply is partial. A single-user pin has no account total.
+fn account_utilization_shown(scope: &UsageScope, account_visible: bool) -> bool {
+    scope.account_rows_visible() && (scope.totals_visible() || account_visible)
+}
+
+/// A user cell is real for the pinned caller, for every user on a complete
+/// reply, and for users in a coordinator's accounts. Anyone else stays blank:
+/// a missing row there is hidden usage, not a zero.
+fn user_utilization_shown(scope: &UsageScope, user: &str, account_visible: bool) -> bool {
+    scope.user_visible(user)
+        && (scope.totals_visible() || scope.is_single_user() || account_visible)
+}
+
+/// `visible_accounts` is what makes a missing row a true zero. A usage entry
+/// counts too, so a reply that left the list empty still shows rows it returned.
+fn account_visible(visible_accounts: &[String], account: &str, has_usage: bool) -> bool {
+    has_usage || visible_accounts.iter().any(|name| name == account)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_utilization_fills_visible_accounts_and_blanks_the_rest() {
+        let visible = vec!["ml".to_string()];
+        assert!(account_visible(&visible, "ml", false));
+        assert!(!account_visible(&visible, "physics", false));
+        assert!(account_visible(&visible, "physics", true));
+
+        let partial = UsageScope::from_replies([None]).with_partial([true]);
+        assert!(account_utilization_shown(&partial, true));
+        assert!(!account_utilization_shown(&partial, false));
+        assert!(user_utilization_shown(&partial, "bob", true));
+        assert!(!user_utilization_shown(&partial, "bob", false));
+
+        let pinned = UsageScope::from_replies([Some("alice")]);
+        assert!(!account_utilization_shown(&pinned, true));
+        assert!(user_utilization_shown(&pinned, "alice", false));
+        assert!(!user_utilization_shown(&pinned, "bob", true));
+
+        let open = UsageScope::from_replies([None]);
+        assert!(account_utilization_shown(&open, false));
+        assert!(user_utilization_shown(&open, "bob", false));
+    }
 
     #[test]
     fn noconvert_is_accepted() {

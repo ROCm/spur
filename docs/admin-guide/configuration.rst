@@ -1375,8 +1375,7 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        A coordinator also sees usage for the accounts they coordinate; those
        rows are filled in, and cluster totals stay blank.
        ``sprio`` and ``sreport job`` sizes follow ``"jobs"``, not ``"usage"``.
-       Account rows stay unless ``"accounts"`` is also set. ``"users"`` also
-       drops other users from ``sshare``.
+       ``"users"`` also drops other users from ``sshare``.
    * - ``"users"``
      - ``sacctmgr show user`` lists only the caller, including for a coordinator.
        ``show association`` lists the caller's rows, and a coordinator also sees
@@ -1385,11 +1384,14 @@ Slurm's ``PrivateData`` and narrows what a User sees.
        ``sshare`` leaves the per-user ``NormShares`` blank when the list is not
        the whole cluster.
    * - ``"accounts"``
-     - ``sacctmgr show account`` lists only accounts the caller coordinates.
-       A user who coordinates nothing is denied. Until the association cache
-       has loaded, the call returns unavailable. ``sshare`` leaves account and
-       per-user ``NormShares`` blank when the weights are not the cluster total.
-       Add a coordinator with ``sacctmgr add coordinator account=<name> names=<user>``.
+     - ``sacctmgr show account`` lists only accounts the caller coordinates,
+       including sub-accounts of those accounts. A user who coordinates nothing
+       is denied. Until the association cache has loaded, the call returns
+       unavailable. ``sshare`` is not filtered by this category: it keeps the
+       full share tree, as in Slurm. Add a coordinator with
+       ``sacctmgr add coordinator account=<name> names=<user>``. The user must
+       already exist. ``show user withcoord`` and ``show account withcoord``
+       add a ``Coords`` column; ``show coordinator`` lists the same assignments.
    * - ``"reservations"``
      - ``scontrol show reservation`` lists reservations the caller is named on,
        or whose accounts include one of the caller's. A reservation with no
@@ -1400,11 +1402,13 @@ Slurm's ``PrivateData`` and narrows what a User sees.
 
 ``sacct`` and ``sreport job`` sizes follow ``"jobs"``. ``sshare`` and
 ``sreport`` utilization follow ``"usage"``. ``sprio`` follows ``"jobs"``.
-The user and account rows ``sshare`` and ``sreport`` also list follow
-``"users"`` and ``"accounts"``. QOS definitions (``sacctmgr show qos``) stay
-visible. A coordinator is not an operator: the extra rows are the accounts
-they coordinate. Set ``"jobs"`` and ``"usage"`` for the visibility closest to
-what Spur v0.13 and v0.14 enforced:
+The user rows ``sshare`` and ``sreport`` list follow ``"users"``. ``sreport``
+account rows follow ``"accounts"``. ``sshare`` account rows are the share
+tree and stay when ``"accounts"`` is set. QOS definitions
+(``sacctmgr show qos``) stay visible. A coordinator is not an operator: the
+extra rows are the accounts they coordinate, including sub-accounts. Set
+``"jobs"`` and ``"usage"`` for the visibility closest to what Spur v0.13 and
+v0.14 enforced:
 
 .. code-block:: toml
 
@@ -1416,7 +1420,8 @@ what Spur v0.13 and v0.14 enforced:
 Operators and Administrators are exempt. Root is exempt only through a role
 (``cluster_admins``, ``admin_groups``, an accounting admin level, or
 ``allow_uid_zero_administrator``). An account coordinator is not exempt from a
-category; they see only the accounts they coordinate, as in Slurm.
+category; they see the accounts they coordinate and the accounts under those,
+as in Slurm. ``sshare`` still shows the full share tree.
 
 .. warning::
 

@@ -46,6 +46,39 @@ pub(crate) fn qos_permitted(allowed: &HashSet<String>, default: Option<&str>, qo
     (allowed.is_empty() && default.is_none()) || allowed.contains(qos) || default == Some(qos)
 }
 
+/// Direct coordinator assignments plus every account under them. Slurm gives
+/// a coordinator of an account the sub-accounts as well, and a cycle in the
+/// parent links must not walk forever.
+pub(crate) fn with_sub_accounts(
+    direct: impl IntoIterator<Item = (String, String)>,
+    parent_of: &HashMap<String, String>,
+) -> HashSet<(String, String)> {
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (child, parent) in parent_of {
+        if !parent.is_empty() {
+            children
+                .entry(parent.as_str())
+                .or_default()
+                .push(child.as_str());
+        }
+    }
+    let mut out = HashSet::new();
+    for (user, account) in direct {
+        let mut stack = vec![account];
+        let mut seen = HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(kids) = children.get(name.as_str()) {
+                stack.extend(kids.iter().copied().map(str::to_owned));
+            }
+            out.insert((user.clone(), name));
+        }
+    }
+    out
+}
+
 impl AssociationCache {
     pub fn new() -> Self {
         Self {
@@ -112,7 +145,8 @@ impl AssociationCache {
         Some(accounts)
     }
 
-    /// Accounts `user` coordinates. `None` when the cache has not loaded.
+    /// Accounts `user` coordinates, including sub-accounts of a direct
+    /// assignment. `None` when the cache has not loaded.
     pub fn coordinated_accounts(&self, user: &str) -> Option<Vec<String>> {
         let snapshot = self.snapshot.read();
         if !snapshot.loaded {
@@ -722,5 +756,45 @@ mod tests {
             "old limits must not survive the swap"
         );
         assert_eq!(cache.limits("bob", "eng").max_submit_jobs, Some(2));
+    }
+
+    #[test]
+    fn a_coordinator_also_covers_sub_accounts() {
+        let parents = HashMap::from([
+            ("physics".to_string(), "science".to_string()),
+            ("gpu".to_string(), "physics".to_string()),
+            ("chem".to_string(), "science".to_string()),
+        ]);
+        let got = with_sub_accounts(
+            [
+                ("alice".to_string(), "science".to_string()),
+                ("bob".to_string(), "physics".to_string()),
+            ],
+            &parents,
+        );
+        assert_eq!(
+            got,
+            HashSet::from([
+                ("alice".to_string(), "science".to_string()),
+                ("alice".to_string(), "physics".to_string()),
+                ("alice".to_string(), "gpu".to_string()),
+                ("alice".to_string(), "chem".to_string()),
+                ("bob".to_string(), "physics".to_string()),
+                ("bob".to_string(), "gpu".to_string()),
+            ])
+        );
+
+        let cycle = HashMap::from([
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ]);
+        let got = with_sub_accounts([("carol".to_string(), "a".to_string())], &cycle);
+        assert_eq!(
+            got,
+            HashSet::from([
+                ("carol".to_string(), "a".to_string()),
+                ("carol".to_string(), "b".to_string()),
+            ])
+        );
     }
 }

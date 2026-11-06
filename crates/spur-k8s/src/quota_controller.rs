@@ -60,7 +60,7 @@ async fn reconcile_once(
     acct: &mut SlurmAccountingClient<Channel>,
 ) -> anyhow::Result<()> {
     let accounts = acct
-        .list_accounts(ListAccountsRequest {})
+        .list_accounts(ListAccountsRequest { shares: false })
         .await
         .context("ListAccounts RPC")?
         .into_inner()

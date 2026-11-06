@@ -193,10 +193,12 @@ cache has loaded. While the cache is still loading, the call is unavailable
 
    sacctmgr add coordinator account=ml names=alice
 
-``names=`` takes one user or a comma-separated list. ``delete coordinator``
-uses the same keys. ``show coordinator`` lists the assignments, and accepts
-``account=`` and ``user=`` filters. Adding or removing a coordinator requires
-Administrator.
+``names=`` takes one user or a comma-separated list. The user must already
+exist. ``delete coordinator`` uses the same keys. ``show coordinator`` lists
+the assignments, and accepts ``account=`` and ``user=`` filters. Adding or
+removing a coordinator requires Administrator. A coordinator of an account
+also coordinates its sub-accounts. ``show user withcoord`` and
+``show account withcoord`` add a ``Coords`` column to their listings.
 
 .. code-block:: text
 

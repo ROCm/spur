@@ -1824,6 +1824,11 @@ message GetUsageResponse {
   // Set when entries are a coordinator's accounts and not the whole cluster.
   // Every returned row is real; sums of them are not cluster totals.
   bool partial = 6;
+  // Accounts in that coordinator's scope, including ones with no usage in the
+  // window. A missing row inside this list is a true zero. An account outside
+  // it is not visible, and a client that printed 0 would be claiming the
+  // account went unused. Empty unless `partial` is set.
+  repeated string visible_accounts = 7;
 }
 
 message ModifyUsageRequest {
@@ -1920,7 +1925,13 @@ message DeleteAccountRequest {
   string name = 1;
 }
 
-message ListAccountsRequest { }
+message ListAccountsRequest {
+  // sshare's share tree. Slurm does not apply PrivateData=accounts there, so
+  // this returns every account's name and fairshare weight and leaves
+  // description, organization, and limits empty. `sacctmgr show account`
+  // leaves it unset and stays coordinator-only.
+  bool shares = 1;
+}
 
 message ListAccountsResponse {
   repeated AccountInfo accounts = 1;
