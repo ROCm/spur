@@ -756,9 +756,7 @@ Scheduling loop cadence, per-cycle limits, and fairshare decay.
    unused by other pending jobs until every preemptor holding the node is
    placed or its handoff ends.
 
-   Jobs placed through GPU property or fabric constraints are not placed on a
-   handed-off node until its handoff ends. Heterogeneous jobs are handled per
-   component.
+   Heterogeneous jobs are handled per component.
 
    The exception is other preemptors whose own victims ran on the same node:
    each of them may use the node, and they are not ordered against each other.
