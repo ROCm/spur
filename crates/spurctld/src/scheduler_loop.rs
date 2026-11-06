@@ -639,7 +639,7 @@ async fn process_assignment(
             script_context: "prolog_slurmctld".into(),
             gpu_devices: Vec::new(),
             cpus: spec.cpus_per_task,
-            memory_mb: spec.memory_per_node_mb.unwrap_or(0),
+            memory_mb: crate::cluster::hook_memory_mb(&spec, &per_node_allocs),
         };
         if let Err(e) = spur_core::hooks::run_hook(&prolog_ctld, &ctx).await {
             error!(
@@ -9616,6 +9616,28 @@ mod tests {
             let mut config = test_config();
             config.hooks.prolog_slurmctld = Some(script.to_string_lossy().into_owned());
             config
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn prolog_slurmctld_sees_the_memory_a_per_gpu_job_was_allocated() {
+            let script = make_script(r#"test "$SPUR_JOB_MEMORY_MB" = 4096"#);
+            let dir = TempDir::new().unwrap();
+            let cm =
+                test_cluster_with_config(&dir, test_config_with_prolog_slurmctld(&script)).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+            let job_id = submit_and_wait(&cm, batch_spec("per-gpu-memory", 1));
+            let mut planned = assignment(job_id, &["n1"]);
+            planned.per_node_alloc =
+                [("n1".to_string(), ResourceAllocations::with_scalar(1, 4096))].into();
+            planned.memory_adjustment = Some(spur_core::partition_limits::MemoryAdjustment {
+                cpus_per_task: 1,
+                memory_per_node_mb: None,
+                memory_per_cpu_mb: None,
+                memory_per_gpu_mb: Some(2048),
+            });
+
+            assert!(process_assignment(cm.clone(), planned, false).await);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -139,8 +139,11 @@ These knobs use Slurm's names and meaning (``MaxMemPerNode``,
    applies only to GPU jobs and is multiplied by the GPUs the job gets on each
    node. A ``--gpus`` total can land unevenly (``-N2 --gpus=4`` may get 3 GPUs
    on one node and 1 on the other), so that job gets 3 × and 1 × the default.
-   ``scontrol show job`` then reports ``MinMemoryNode=0`` and the job's total
-   in ``ReqTRES`` ``mem=``, as Slurm does for memory per GPU.
+   ``scontrol show job`` then reports ``MinMemoryNode=0``, the per-GPU amount
+   as ``MemPerTres=gpu:<MiB>`` (the ``mem_per_tres`` field of ``JobInfo`` in
+   the gRPC API), and the job's total in ``ReqTRES`` ``mem=``, as Slurm does
+   for memory per GPU. ``PrologSlurmctld`` and ``EpilogSlurmctld`` see the
+   most memory any one node of the job was given in ``SPUR_JOB_MEMORY_MB``.
 
 .. note::
 

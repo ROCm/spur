@@ -497,6 +497,9 @@ message JobInfo {
   // Partition the run is charged to for partition caps, chosen among the
   // requested ones at start. Empty while pending.
   string effective_partition = 91;
+  // Memory per allocated GPU ("gpu:8192", MiB), as a partition's
+  // def_mem_per_gpu set it. Empty when memory is not sized per GPU.
+  string mem_per_tres = 92;
 }
 
 message NodeInfo {

@@ -2620,6 +2620,9 @@ fn format_job_detail(job: &spur_proto::proto::JobInfo) -> String {
         "   MinCPUsNode={} {mem_label}={}",
         job.min_cpus_node, min_mem
     );
+    if !job.mem_per_tres.is_empty() {
+        let _ = writeln!(out, "   MemPerTres={}", job.mem_per_tres);
+    }
     let _ = writeln!(out, "   Features={}", or_null(&job.features));
     if !job.reservation.is_empty() {
         let _ = writeln!(out, "   Reservation={}", job.reservation);
@@ -3039,6 +3042,19 @@ mod tests {
         let out = format_job_detail(&job);
         assert!(out.contains("MinMemoryCPU=1000M"), "{out}");
         assert!(!out.contains("MinMemoryNode"), "{out}");
+    }
+
+    #[test]
+    fn job_detail_shows_memory_per_gpu_as_mem_per_tres() {
+        let mut job = pending_pinned_job();
+        job.min_memory_node_mb = 0;
+        job.mem_per_tres = "gpu:8192".into();
+        let out = format_job_detail(&job);
+        assert!(
+            out.contains("MinMemoryNode=0\n   MemPerTres=gpu:8192\n"),
+            "{out}"
+        );
+        assert!(!format_job_detail(&pending_pinned_job()).contains("MemPerTres"));
     }
 
     #[test]
