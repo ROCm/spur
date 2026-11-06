@@ -3,13 +3,14 @@
 
 """Exercise resource handoffs through real eviction, epilog, and placement."""
 
+import json
 import re
 import shlex
 import time
 
 import pytest
 
-from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job, wait_job_state
+from cluster import SpurCluster, make_remote_dir, parse_job_id, wait_job, wait_job_state, wait_until
 
 
 @pytest.fixture
@@ -45,10 +46,19 @@ def _handoff_cluster(ssh_nodes, remote_bin_dir, count):
             'done\n',
             all_nodes=True,
         )
+        prolog = c.write_file(
+            "handoff-prolog.sh",
+            '#!/bin/bash\n'
+            f'gate={shlex.quote(c.remote_dir)}/launch-$SPUR_JOB_ID\n'
+            'touch "$gate.entered"\n'
+            'while [ -e "$gate" ]; do sleep 0.02; done\n'
+            '[ ! -e "$gate.fail" ]\n',
+            all_nodes=True,
+        )
         # A broad stale-daemon sweep would also stop unrelated Spur daemons sharing these hosts.
         c.start({
             "scheduler": {"preempt_type": "qos_priority", "complete_wait_secs": 300},
-            "hooks": {"epilog": epilog},
+            "hooks": {"epilog": epilog, "prolog": prolog},
             "auth": {"allow_root_jobs": True},
         }, kill_stale=False)
         for name, priority, targets, mode in [
@@ -70,7 +80,9 @@ def _handoff_cluster(ssh_nodes, remote_bin_dir, count):
         yield c
     finally:
         for node in c.nodes:
-            node.exec_allow_fail(f"rm -f {shlex.quote(c.remote_dir)}/hold-*")
+            node.exec_allow_fail(
+                f"rm -f {shlex.quote(c.remote_dir)}/hold-* {shlex.quote(c.remote_dir)}/launch-*"
+            )
         c.teardown()
 
 
@@ -297,3 +309,218 @@ def test_preemptor_does_not_evict_for_a_node_assigned_in_the_same_pass(handoff_c
     wait_job(c, short, timeout=60)
     wait_job_state(c, hunter, "R", timeout=60)
     assert _preempted_by(c, low) == hunter
+
+
+def _usage(c, *, used=0, open_count=0, unused=None, jobs=None):
+    unused = unused or {}
+    totals = (used, sum(unused.values()), open_count)
+    expected_series = {
+        (reason, initiator): unused.get((reason, initiator), 0)
+        for reason in ("started_elsewhere", "launch_failed", "cancelled", "ended_other")
+        for initiator in ("user", "admin", "system", "unknown")
+    }
+
+    def check():
+        body = c.nodes[0].exec("curl -fsS http://127.0.0.1:6822/metrics/scheduler")
+        prefix = "spur_scheduler_preemptions_"
+        for family, kind in (("used", "counter"), ("unused", "counter"), ("open", "gauge")):
+            assert f"# TYPE {prefix}{family} {kind}\n" in body, body
+        for name, value in (("used_total", used), ("open", open_count)):
+            assert re.search(rf"^{prefix}{name} {value}$", body, re.M), body
+        series = {}
+        for line in body.splitlines():
+            if line.startswith(f"{prefix}unused_total"):
+                match = re.fullmatch(rf'{prefix}unused_total\{{([^}}]+)\}} (\d+)', line)
+                assert match, line
+                labels = dict(re.findall(r'(\w+)="([^"]*)"', match[1]))
+                assert set(labels) == {"reason", "initiator"}, labels
+                key = (labels["reason"], labels["initiator"])
+                assert key not in series, line
+                series[key] = int(match[2])
+        assert series == expected_series, series
+
+        diag = c.sdiag()
+        match = re.search(r"Preemptions \(lifetime\): used=(\d+) unused=(\d+) open=(\d+)", diag)
+        assert match and tuple(map(int, match.groups())) == totals, diag
+        causes = {
+            (reason, initiator): int(count)
+            for reason, initiator, count in re.findall(
+                r"Unused: reason=(\w+) initiator=(\w+) count=(\d+)", diag
+            )
+        }
+        assert causes == unused, diag
+        if any(totals):
+            username = re.escape(c.nodes[0].user)
+            match = re.search(rf"User {username}: used=(\d+) unused=(\d+) open=(\d+)", diag)
+            assert match and tuple(map(int, match.groups())) == totals, diag
+        for job, (job_used, job_open, job_unused) in (jobs or {}).items():
+            show = c.scontrol("show", "job", str(job))
+            match = re.search(r"PreemptionsUsed=(\d+) PreemptionsUnused=(\d+) PreemptionsOpen=(\d+)", show)
+            assert match and tuple(map(int, match.groups())) == (
+                job_used, sum(job_unused.values()), job_open
+            ), show
+            causes = {
+                (reason, initiator): int(count)
+                for reason, initiator, count in re.findall(
+                    r"UnusedPreemptionReason=(\w+) Initiator=(\w+) Count=(\d+)", show
+                )
+            }
+            assert causes == job_unused, show
+        return True
+
+    wait_until(check, timeout_s=60, interval_s=0.2,
+               desc=f"preemption usage {totals}, causes={unused}, jobs={jobs}",
+               tolerate=(AssertionError,))
+
+
+def _launch_gate(c, job, indices, hold):
+    path = shlex.quote(f"{c.remote_dir}/launch-{job}")
+    for index in indices:
+        c.nodes[index].exec(f"{'touch' if hold else 'rm -f'} {path}")
+
+
+def _wait_prolog(c, job, indices):
+    path = shlex.quote(f"{c.remote_dir}/launch-{job}.entered")
+    wait_until(
+        lambda: all(c.nodes[i].exec_allow_fail(f"test -e {path} && echo ready").strip() == "ready"
+                    for i in indices),
+        timeout_s=60, interval_s=0.2, desc=f"job {job} waiting inside node prolog",
+    )
+
+
+def _accounted_usage(c, job, *, used=0, unused=None):
+    expected = {"used": used, "open": 0, "unused": unused or {}}
+
+    def check():
+        raw = c.psql(f"SELECT preemption_usage FROM jobs WHERE job_id = {int(job)}")
+        assert raw.strip(), f"job {job} has no accounting row"
+        stored = json.loads(raw)
+        assert {key: stored.get(key) for key in expected} == expected, raw
+        return True
+
+    # Late settlements repair existing rows on the two-minute reconciliation pass.
+    wait_until(check, timeout_s=150, interval_s=1,
+               desc=f"accounting usage for job {job}: {expected}", tolerate=(AssertionError,))
+
+
+def test_usage_counts_multinode_victim_once_after_launch_confirmation(handoff_cluster):
+    c = handoff_cluster
+    nodes = ",".join(c.node_names[:2])
+    _usage(c)
+    victim = _submit(c, "usage-victim", "victim-a", nodes, 2)
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0, 1], True)
+    hunter = _submit(c, "usage-hunter", "hunter-a", nodes, 2)
+    _wait_epilog(c, victim, [0, 1])
+    _launch_gate(c, hunter, [0, 1], True)
+    _usage(c, jobs={hunter: (0, 0, {}), victim: (0, 0, {})})
+
+    _gate(c, victim, [0], False)
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+    _state(c, hunter, "PENDING")
+    c.restart_controller()
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+
+    _gate(c, victim, [1], False)
+    _wait_prolog(c, hunter, [0, 1])
+    _state(c, hunter, "PENDING")
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+    _launch_gate(c, hunter, [0, 1], False)
+    _usage(c, used=1, jobs={hunter: (1, 0, {}), victim: (0, 0, {})})
+
+    c.cli(["scancel", str(hunter)])
+    assert wait_job(c, hunter, timeout=60) == "CA"
+    _usage(c, used=1, jobs={hunter: (1, 0, {})})
+    _accounted_usage(c, hunter, used=1)
+    c.cli(["spur", "sdiag", "--reset"])
+    _usage(c, used=1, jobs={hunter: (1, 0, {})})
+    c.restart_controller()
+    _usage(c, used=1, jobs={hunter: (1, 0, {})})
+
+
+def test_usage_cancelled_request_counts_each_victim_including_late_release(handoff_cluster):
+    c = handoff_cluster
+    victims = [_submit(c, f"usage-victim-{i}", "victim-a", c.node_names[i]) for i in (0, 1)]
+    for i, victim in enumerate(victims):
+        wait_job_state(c, victim, "R", timeout=60)
+        _gate(c, victim, [i], True)
+    hunter = _submit(c, "usage-hunter", "hunter-a", ",".join(c.node_names[:2]), 2)
+    for i, victim in enumerate(victims):
+        _wait_epilog(c, victim, [i])
+        assert f"PreemptedBy={hunter}" in _state(c, victim, "COMPLETING")
+    _usage(c, jobs={hunter: (0, 0, {})})
+    _gate(c, victims[0], [0], False)
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+    c.cli(["scancel", str(hunter)])
+    assert wait_job(c, hunter, timeout=60) == "CA"
+    cause = {("cancelled", "user"): 1}
+    _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+    _accounted_usage(c, hunter, unused={"cancelled": {"user": 1}})
+    c.restart_controller()
+    _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+    _gate(c, victims[1], [1], False)
+    cause = {("cancelled", "user"): 2}
+    _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+    _accounted_usage(c, hunter, unused={"cancelled": {"user": 2}})
+
+
+def test_usage_started_elsewhere_and_cancelled_have_distinct_causes(handoff_cluster):
+    c = handoff_cluster
+    a, b, flexible, pinned = _competing_preemptors(c)
+    _usage(c, open_count=1, jobs={pinned: (0, 1, {}), flexible: (0, 0, {})})
+    c.cli(["scancel", str(pinned)])
+    wait_job_state(c, flexible, "R", timeout=60)
+    assert f"NodeList={c.node_names[1]}" in _state(c, flexible, "RUNNING")
+    cancelled = {("cancelled", "user"): 1}
+    _usage(c, unused=cancelled, jobs={pinned: (0, 0, cancelled), flexible: (0, 0, {})})
+    _gate(c, a, [0], False)
+    _gate(c, b, [2], False)
+    elsewhere = {("started_elsewhere", "system"): 1}
+    _usage(c, unused={**cancelled, **elsewhere},
+           jobs={pinned: (0, 0, cancelled), flexible: (0, 0, elsewhere)})
+    c.cli(["scancel", str(flexible)])
+    assert wait_job(c, flexible, timeout=60) == "CA"
+    _usage(c, unused={**cancelled, **elsewhere})
+    _accounted_usage(c, flexible, unused={"started_elsewhere": {"system": 1}})
+
+
+@pytest.mark.parametrize("failure", ["launch", "application"])
+def test_usage_distinguishes_launch_failure_from_later_application_failure(handoff_cluster, failure):
+    c = handoff_cluster
+    victim = _submit(c, "usage-victim", "victim-a", c.node_names[0])
+    wait_job_state(c, victim, "R", timeout=60)
+    _gate(c, victim, [0], True)
+    finish = f"{c.remote_dir}/finish-application"
+    script = c.write_file(
+        "usage-failure.sh",
+        f"#!/bin/bash\nwhile [ ! -e {shlex.quote(finish)} ]; do sleep 0.02; done\nexit 7\n",
+        all_nodes=True,
+    )
+    hunter = parse_job_id(c.sbatch([
+        "--exclusive", "-N1", "-t", "10:00", "-q", "hunter-a",
+        f"--nodelist={c.node_names[0]}", script,
+    ]))
+    assert hunter is not None
+    _wait_epilog(c, victim, [0])
+    _launch_gate(c, hunter, [0], True)
+    if failure == "launch":
+        c.nodes[0].exec(f"touch {shlex.quote(f'{c.remote_dir}/launch-{hunter}.fail')}")
+    _gate(c, victim, [0], False)
+    _wait_prolog(c, hunter, [0])
+    _state(c, hunter, "PENDING")
+    _usage(c, open_count=1, jobs={hunter: (0, 1, {})})
+    _launch_gate(c, hunter, [0], False)
+    if failure == "launch":
+        cause = {("launch_failed", "system"): 1}
+        _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+        c.cli(["scancel", str(hunter)])
+        wait_job(c, hunter, timeout=60)
+        _usage(c, unused=cause, jobs={hunter: (0, 0, cause)})
+        _accounted_usage(c, hunter, unused={"launch_failed": {"system": 1}})
+    else:
+        _usage(c, used=1, jobs={hunter: (1, 0, {})})
+        c.nodes[0].exec(f"touch {shlex.quote(finish)}")
+        assert wait_job(c, hunter, timeout=60) == "F"
+        assert "ExitCode=7:0" in _state(c, hunter, "FAILED")
+        _usage(c, used=1, jobs={hunter: (1, 0, {})})
+        _accounted_usage(c, hunter, used=1)
