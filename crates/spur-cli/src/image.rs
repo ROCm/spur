@@ -3,6 +3,7 @@
 
 //! `spur image` subcommands for container image management.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
@@ -116,25 +117,16 @@ async fn cmd_import_dockerd(image: &str) -> Result<()> {
     std::fs::create_dir_all(&rootfs)?;
 
     // docker save → tar, then extract layers
-    let output = tokio::process::Command::new("docker")
-        .args(["save", image])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("failed to run docker — is Docker installed and running?")?;
-
-    if !output.status.success() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("docker save failed: {}", stderr.trim());
-    }
-
     let rootfs_str = rootfs.to_string_lossy();
     let output_path_str = output_path.to_string_lossy();
 
-    let import_result = extract_docker_save_tar(&output.stdout, &rootfs_str)
-        .and_then(|()| pack_squashfs(&rootfs_str, &output_path_str));
+    let import_result = extract_saved_image(
+        "docker",
+        image,
+        &rootfs_str,
+        "failed to run docker — is Docker installed and running?",
+    )
+    .and_then(|()| pack_squashfs(&rootfs_str, &output_path_str));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     import_result?;
 
@@ -166,25 +158,16 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
     let rootfs = tmp_dir.join("rootfs");
     std::fs::create_dir_all(&rootfs)?;
 
-    let output = tokio::process::Command::new("podman")
-        .args(["save", image])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("failed to run podman — is Podman installed?")?;
-
-    if !output.status.success() {
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("podman save failed: {}", stderr.trim());
-    }
-
     let rootfs_str = rootfs.to_string_lossy();
     let output_path_str = output_path.to_string_lossy();
 
-    let import_result = extract_docker_save_tar(&output.stdout, &rootfs_str)
-        .and_then(|()| pack_squashfs(&rootfs_str, &output_path_str));
+    let import_result = extract_saved_image(
+        "podman",
+        image,
+        &rootfs_str,
+        "failed to run podman — is Podman installed?",
+    )
+    .and_then(|()| pack_squashfs(&rootfs_str, &output_path_str));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     import_result?;
 
@@ -199,9 +182,40 @@ async fn cmd_import_podman(image: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stream `<tool> save <image>` straight into the rootfs so the image archive
+/// is never held in memory.
+fn extract_saved_image(tool: &str, image: &str, rootfs: &str, spawn_context: &str) -> Result<()> {
+    let mut child = std::process::Command::new(tool)
+        .args(["save", image])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context(spawn_context.to_string())?;
+
+    let mut stderr = child.stderr.take().context("missing save stderr")?;
+    // Drain stderr concurrently so a chatty save cannot block on a full pipe.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+
+    let stdout = child.stdout.take().context("missing save stdout")?;
+    let extracted = extract_docker_save_tar(stdout, rootfs);
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for {tool} save"))?;
+    let stderr = stderr_reader.join().unwrap_or_default();
+
+    if !status.success() {
+        bail!("{tool} save failed: {}", stderr.trim());
+    }
+    extracted
+}
+
 /// Extract a `docker save` tar archive into a rootfs.
 /// The tar contains a manifest.json listing layer tarballs.
-fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
+fn extract_docker_save_tar(tar_data: impl Read, rootfs: &str) -> Result<()> {
     let dest = Path::new(rootfs);
     let tmp = dest.join(".docker_save");
     std::fs::create_dir_all(&tmp)?;
@@ -234,10 +248,7 @@ fn extract_docker_save_tar(tar_data: &[u8], rootfs: &str) -> Result<()> {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("invalid layer path"))?;
             let layer_path = resolve_docker_save_file(&archive_root, layer_file)?;
-            let data = std::fs::read(layer_path)
-                .with_context(|| format!("failed to read layer {}", layer_file))?;
-
-            let reader = spur_net::image_layer::decode(&data, None)
+            let reader = spur_net::image_layer::decode_file(&layer_path, None)
                 .with_context(|| format!("failed to decode layer {}", layer_file))?;
             let mut archive = tar::Archive::new(reader);
             archive.set_overwrite(true);
@@ -562,7 +573,7 @@ mod tests {
         ]);
         let rootfs = tempfile::tempdir().unwrap();
 
-        extract_docker_save_tar(&archive, rootfs.path().to_str().unwrap()).unwrap();
+        extract_docker_save_tar(archive.as_slice(), rootfs.path().to_str().unwrap()).unwrap();
 
         assert_eq!(
             std::fs::read(rootfs.path().join("plain.txt")).unwrap(),
@@ -588,7 +599,8 @@ mod tests {
             docker_save(&[("broken/layer.tar", vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0])]);
         let rootfs = tempfile::tempdir().unwrap();
 
-        let error = extract_docker_save_tar(&archive, rootfs.path().to_str().unwrap()).unwrap_err();
+        let error = extract_docker_save_tar(archive.as_slice(), rootfs.path().to_str().unwrap())
+            .unwrap_err();
 
         assert!(error.to_string().contains("broken/layer.tar"));
         assert!(!rootfs.path().join(".docker_save").exists());
@@ -604,7 +616,8 @@ mod tests {
         let layer_name = outside_layer.to_str().unwrap();
         let archive = docker_save_with_manifest(&[layer_name], &[]);
 
-        let error = extract_docker_save_tar(&archive, rootfs.to_str().unwrap()).unwrap_err();
+        let error =
+            extract_docker_save_tar(archive.as_slice(), rootfs.to_str().unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("invalid docker save path"));
         assert!(!rootfs.join("escaped.txt").exists());
@@ -622,7 +635,8 @@ mod tests {
         std::fs::write(&outside_layer, &layer_data).unwrap();
         let archive = docker_save_with_manifest(&["../outside-layer.tar"], &[]);
 
-        let error = extract_docker_save_tar(&archive, rootfs.to_str().unwrap()).unwrap_err();
+        let error =
+            extract_docker_save_tar(archive.as_slice(), rootfs.to_str().unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("invalid docker save path"));
         assert!(!rootfs.join("escaped.txt").exists());
@@ -640,11 +654,53 @@ mod tests {
         std::fs::write(&outside_layer, &layer_data).unwrap();
         let archive = docker_save_with_symlink_layer("layers/escape.tar", &outside_layer);
 
-        let error = extract_docker_save_tar(&archive, rootfs.to_str().unwrap()).unwrap_err();
+        let error =
+            extract_docker_save_tar(archive.as_slice(), rootfs.to_str().unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("escapes archive"));
         assert!(!rootfs.join("escaped.txt").exists());
         assert_eq!(std::fs::read(&outside_layer).unwrap(), layer_data);
         assert!(!rootfs.join(".docker_save").exists());
+    }
+
+    #[test]
+    fn saved_image_is_streamed_from_the_save_command() {
+        let work = tempfile::tempdir().unwrap();
+        let archive_path = work.path().join("image.tar");
+        std::fs::write(
+            &archive_path,
+            docker_save(&[("layer/layer.tar", tar_files(&[("hello.txt", b"hi")]))]),
+        )
+        .unwrap();
+        let tool = work.path().join("fake-save");
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\ncat '{}'\n", archive_path.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let rootfs = work.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+
+        extract_saved_image(
+            tool.to_str().unwrap(),
+            "img",
+            rootfs.to_str().unwrap(),
+            "spawn",
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(rootfs.join("hello.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn failed_save_command_is_reported() {
+        let rootfs = tempfile::tempdir().unwrap();
+
+        let error = extract_saved_image("false", "img", rootfs.path().to_str().unwrap(), "spawn")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("false save failed"), "{error:#}");
     }
 }
