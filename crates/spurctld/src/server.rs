@@ -9309,6 +9309,7 @@ mod tests {
             peer_gpus: Vec::new(),
             link_type: spur_core::resource::GpuLinkType::PCIe,
             stable_id: 0,
+            topology: None,
         };
         let mut node = spur_core::node::Node::new(
             name.into(),

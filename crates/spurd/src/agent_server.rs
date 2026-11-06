@@ -19059,6 +19059,7 @@ mod tests {
                     memory_mb: 0,
                     devices,
                     generation: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }))

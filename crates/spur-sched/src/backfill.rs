@@ -1857,6 +1857,7 @@ mod tests {
             partitions: &partitions,
             reservations: &[],
             topology: None,
+            fabric: None,
         };
         BackfillScheduler::new(100).schedule(pending, &cluster)
     }

@@ -30038,6 +30038,7 @@ state = "UP"
                 partitions: &[],
                 reservations: &[],
                 topology: None,
+                fabric: None,
             };
             let assignments = spur_sched::backfill::BackfillScheduler::new(10)
                 .schedule(std::slice::from_ref(&job), &state);
