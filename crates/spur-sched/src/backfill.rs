@@ -36,6 +36,8 @@ pub struct BackfillScheduler {
     last_outcome: HashMap<JobId, Unplaced>,
     /// Off for dry runs, whose outcomes must not reach the log or the dedup above.
     report_unplaced: bool,
+    /// Handed-off nodes the last pass freed because their owner was planned elsewhere.
+    released_handoffs: Vec<String>,
 }
 
 /// Scheduler's future-slot plan: job -> (nodes held, projected start).
@@ -100,6 +102,60 @@ struct ReservationCheck<'a> {
     reservations: &'a [Reservation],
 }
 
+/// Per-pass handoff view: a handed-off node is hidden from other jobs until its
+/// owner is planned, then only blocked for them until the owner's start.
+#[derive(Clone)]
+struct HandoffGate<'a> {
+    owners: &'a HashMap<String, JobId>,
+    held_until: HashMap<&'a str, chrono::DateTime<Utc>>,
+    released: Vec<&'a str>,
+}
+
+impl<'a> HandoffGate<'a> {
+    fn new(owners: &'a HashMap<String, JobId>) -> Self {
+        Self {
+            owners,
+            held_until: HashMap::new(),
+            released: Vec::new(),
+        }
+    }
+
+    fn foreign_owner(&self, job: &Job, node: &str) -> bool {
+        self.owners.get(node).is_some_and(|o| *o != job.job_id)
+    }
+
+    fn hides(&self, job: &Job, node: &str) -> bool {
+        self.foreign_owner(job, node) && !self.held_until.contains_key(node)
+    }
+
+    /// Earliest time `job` may be planned on `node`.
+    fn floor(&self, job: &Job, node: &str, now: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
+        match self.held_until.get(node) {
+            Some(until) if self.foreign_owner(job, node) => (*until).max(now),
+            _ => now,
+        }
+    }
+
+    /// Once `owner` is planned, its picked nodes are held until `start`; the rest are freed.
+    fn owner_planned(
+        &mut self,
+        owner: JobId,
+        picked: impl Fn(&str) -> bool,
+        start: chrono::DateTime<Utc>,
+        now: chrono::DateTime<Utc>,
+    ) {
+        for (node, _) in self.owners.iter().filter(|(_, o)| **o == owner) {
+            let until = if picked(node) {
+                start
+            } else {
+                self.released.push(node);
+                now
+            };
+            self.held_until.insert(node, until);
+        }
+    }
+}
+
 impl BackfillScheduler {
     pub fn new(max_jobs: usize) -> Self {
         Self {
@@ -107,6 +163,7 @@ impl BackfillScheduler {
             max_jobs,
             last_outcome: HashMap::new(),
             report_unplaced: true,
+            released_handoffs: Vec::new(),
         }
     }
 
@@ -166,6 +223,12 @@ impl BackfillScheduler {
             );
         }
         self.last_outcome = current;
+    }
+
+    /// Handed-off nodes the last `schedule()` freed because their owner was planned on
+    /// other nodes; a victim search later in the same pass must not treat them as held.
+    pub fn released_handoffs(&self) -> &[String] {
+        &self.released_handoffs
     }
 
     /// Nodes with no resources currently allocated but a future reservation
@@ -271,21 +334,33 @@ impl BackfillScheduler {
     fn find_suitable_nodes(
         &self,
         job: &Job,
-        nodes: &[Node],
-        reservations: &[Reservation],
+        cluster: &ClusterState,
+        handoffs: &HandoffGate,
+        now: chrono::DateTime<Utc>,
     ) -> Vec<usize> {
+        let nodes = cluster.nodes;
+        let reservations = cluster.reservations;
         let required = job_resource_request(job);
         let placement = NodePlacement::new(job);
-        let now = Utc::now();
 
         let suitable = |node: &Node| {
             if !placement.matches_for_reservation(node, reservations, now) {
                 return false;
             }
-            node.total_resources.can_satisfy(&required)
+            node.total_resources.can_satisfy(&required) && !handoffs.hides(job, &node.name)
+        };
+        // An additive `--nodelist` needs every listed node, so one hidden node blocks the job.
+        let listed_node_hidden = || {
+            !handoffs.owners.is_empty()
+                && placement.nodelist_is_additive()
+                && nodes
+                    .iter()
+                    .any(|n| placement.is_listed(&n.name) && handoffs.hides(job, &n.name))
         };
 
-        if placement.additive_listed_node_unavailable(nodes.iter(), reservations, now, &required) {
+        if placement.additive_listed_node_unavailable(nodes.iter(), reservations, now, &required)
+            || listed_node_hidden()
+        {
             return Vec::new();
         }
 
@@ -394,6 +469,7 @@ impl BackfillScheduler {
         job: &Job,
         cluster: &ClusterState,
         context: &crate::traits::FabricSchedulingContext,
+        handoffs: &HandoffGate,
         now: chrono::DateTime<Utc>,
     ) -> Option<(Assignment, chrono::DateTime<Utc>)> {
         use spur_core::fabric_binding::{FabricBinding, FABRIC_BINDING_VERSION};
@@ -492,6 +568,7 @@ impl BackfillScheduler {
                     topology: cluster.topology,
                     fabric: None,
                     busy_until: cluster.busy_until,
+                    preemption_handoffs: cluster.preemption_handoffs,
                 };
                 let mut floor = now;
                 loop {
@@ -500,6 +577,7 @@ impl BackfillScheduler {
                         max_jobs: 1,
                         last_outcome: HashMap::new(),
                         report_unplaced: false,
+                        released_handoffs: Vec::new(),
                     };
                     for (timeline, node) in trial.timelines.iter_mut().zip(&nodes) {
                         timeline.total = node.total_resources.clone();
@@ -515,11 +593,12 @@ impl BackfillScheduler {
                             }
                         }
                     }
-                    let immediate = trial.schedule_jobs(
+                    let immediate = trial.schedule_jobs_with(
                         std::slice::from_ref(&block_job),
                         &projected,
                         floor,
                         false,
+                        handoffs.clone(),
                     );
                     let mut start = None;
                     let mut allocations = HashMap::new();
@@ -671,6 +750,20 @@ impl BackfillScheduler {
         now: chrono::DateTime<Utc>,
         initialize: bool,
     ) -> Vec<Assignment> {
+        let handoffs = HandoffGate::new(cluster.preemption_handoffs);
+        self.schedule_jobs_with(pending, cluster, now, initialize, handoffs)
+    }
+
+    /// `handoffs` carries the pass's gate state, so a nested placement sees the
+    /// owners already planned and the nodes already released.
+    fn schedule_jobs_with(
+        &mut self,
+        pending: &[Job],
+        cluster: &ClusterState,
+        now: chrono::DateTime<Utc>,
+        initialize: bool,
+        mut handoffs: HandoffGate,
+    ) -> Vec<Assignment> {
         if initialize {
             self.init_timelines(cluster.nodes);
 
@@ -724,7 +817,7 @@ impl BackfillScheduler {
             }
             let all_have_nodes = indices.iter().all(|&idx| {
                 let job = &pending[idx];
-                let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.reservations);
+                let suitable = self.find_suitable_nodes(job, cluster, &handoffs, now);
                 suitable.len() >= job.spec.num_nodes as usize
             });
             if !all_have_nodes {
@@ -767,8 +860,10 @@ impl BackfillScheduler {
                 .fabric
                 .filter(|context| context.requires_binding(job))
             {
-                match self.plan_gpu_job(job, cluster, context, now) {
+                match self.plan_gpu_job(job, cluster, context, &handoffs, now) {
                     Some((assignment, start)) => {
+                        let picked = |node: &str| assignment.nodes.iter().any(|n| n == node);
+                        handoffs.owner_planned(job.job_id, picked, start, now);
                         let duration = job.spec.time_limit.unwrap_or(UNLIMITED_JOB_DURATION);
                         for (node, allocation) in &assignment.per_node_alloc {
                             if let Some(index) = cluster.nodes.iter().position(|n| n.name == *node)
@@ -795,7 +890,7 @@ impl BackfillScheduler {
                 }
                 continue;
             }
-            let suitable = self.find_suitable_nodes(job, cluster.nodes, cluster.reservations);
+            let suitable = self.find_suitable_nodes(job, cluster, &handoffs, now);
             if suitable.is_empty() {
                 note(UnplacedKind::NoSuitableNodes, 0, None);
                 continue;
@@ -833,13 +928,20 @@ impl BackfillScheduler {
             let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = suitable
                 .iter()
                 .map(|&ni| {
+                    let node = &cluster.nodes[ni].name;
                     let res_check = ReservationCheck {
                         job,
-                        node: &cluster.nodes[ni].name,
+                        node,
                         reservations: cluster.reservations,
                     };
-                    let start =
-                        self.earliest_valid_start(ni, res_check, timing_request(ni), duration, now);
+                    let floor = handoffs.floor(job, node, now);
+                    let start = self.earliest_valid_start(
+                        ni,
+                        res_check,
+                        timing_request(ni),
+                        duration,
+                        floor,
+                    );
                     debug!(
                         job_id = job.job_id,
                         node = %cluster.nodes[ni].name,
@@ -1033,6 +1135,15 @@ impl BackfillScheduler {
                 }
             }
 
+            if earliest <= now || !job.idle_fill {
+                let picked = |node: &str| {
+                    assigned_nodes
+                        .iter()
+                        .any(|(ni, _)| cluster.nodes[*ni].name == node)
+                };
+                handoffs.owner_planned(job.job_id, picked, earliest, now);
+            }
+
             if earliest <= now {
                 let node_names: Vec<String> = assigned_nodes
                     .iter()
@@ -1093,6 +1204,7 @@ impl BackfillScheduler {
 
         if initialize {
             self.log_unplaced(unplaced);
+            self.released_handoffs = handoffs.released.iter().map(|n| n.to_string()).collect();
         }
         assignments
     }
@@ -1270,6 +1382,208 @@ mod tests {
     }
 
     #[test]
+    fn handoff_blocks_a_competitor_even_inside_the_owners_reservation() {
+        let nodes = make_nodes(1);
+        let reservations = vec![make_active_reservation(
+            "reserved",
+            vec!["node001".into()],
+            vec!["test".into()],
+        )];
+        let mut owner = make_job(1, 1, 4);
+        let mut competitor = make_job(2, 1, 4);
+        for job in [&mut owner, &mut competitor] {
+            job.spec.reservation = Some("reserved".into());
+        }
+        let handoffs = HashMap::from([("node001".into(), owner.job_id)]);
+        let state = ClusterState {
+            fabric: None,
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &reservations,
+            topology: None,
+            busy_until: &HashMap::new(),
+            preemption_handoffs: &handoffs,
+        };
+        let mut scheduler = BackfillScheduler::new(100);
+        assert!(!state.handoff_allows(&competitor, "node001"));
+        assert!(scheduler.schedule(&[competitor.clone()], &state).is_empty());
+        let assignments = scheduler.schedule(&[competitor, owner], &state);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id, 1);
+    }
+
+    #[test]
+    fn handoff_cannot_replace_a_required_node_with_an_unlisted_node() {
+        let nodes = make_nodes(3);
+        let mut competitor = make_job(2, 2, 1);
+        competitor.spec.nodelist = Some("node001".into());
+        let state = ClusterState {
+            fabric: None,
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+            busy_until: &HashMap::new(),
+            preemption_handoffs: &HashMap::from([("node001".into(), 1)]),
+        };
+        let mut scheduler = BackfillScheduler::new(100);
+        assert!(state.listed_node_handed_off(&competitor, &NodePlacement::new(&competitor)));
+        assert!(scheduler.schedule(&[competitor], &state).is_empty());
+    }
+
+    fn handoff_state<'a>(
+        nodes: &'a [Node],
+        busy_until: &'a HashMap<String, chrono::DateTime<Utc>>,
+        handoffs: &'a HashMap<String, JobId>,
+    ) -> ClusterState<'a> {
+        ClusterState {
+            fabric: None,
+            nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+            busy_until,
+            preemption_handoffs: handoffs,
+        }
+    }
+
+    fn job_for(id: u32, nodes: u32, limit: Duration) -> Job {
+        let mut job = make_job(id, nodes, 64);
+        job.spec.time_limit = Some(limit);
+        job
+    }
+
+    fn placed(assignments: &[Assignment]) -> Vec<(JobId, Vec<String>)> {
+        assignments
+            .iter()
+            .map(|a| (a.job_id, a.nodes.clone()))
+            .collect()
+    }
+
+    /// Sorted planned nodes and seconds from now until the planned start.
+    fn plan_of(sched: &BackfillScheduler, job_id: JobId) -> Option<(Vec<String>, i64)> {
+        sched
+            .planned_job_starts()
+            .remove(&job_id)
+            .map(|(mut n, at)| {
+                n.sort();
+                (n, (at - Utc::now()).num_seconds())
+            })
+    }
+
+    #[test]
+    fn placed_handoff_owner_leaves_its_node_in_later_jobs_forward_plans() {
+        let nodes = make_nodes(2);
+        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let busy_until = HashMap::new();
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let pending = [
+            job_for(1, 1, Duration::minutes(1)),
+            job_for(2, 2, Duration::hours(1)),
+            job_for(3, 1, Duration::hours(1)),
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&pending, &state);
+        assert_eq!(placed(&assignments), vec![(1, vec!["node001".into()])]);
+        let (b_nodes, b_in) = plan_of(&sched, 2).expect("job 2 holds a future slot");
+        assert_eq!(b_nodes, vec!["node001", "node002"]);
+        assert!((55..=60).contains(&b_in), "job 2 planned in {b_in}s");
+        assert!(plan_of(&sched, 3).is_some_and(|(_, at)| at >= 3600));
+    }
+
+    #[test]
+    fn short_work_still_backfills_before_a_plan_built_on_a_released_handoff() {
+        let nodes = make_nodes(2);
+        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let busy_until = HashMap::new();
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let pending = [
+            job_for(1, 1, Duration::minutes(1)),
+            job_for(2, 2, Duration::hours(1)),
+            job_for(4, 1, Duration::seconds(30)),
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&pending, &state);
+        assert_eq!(
+            placed(&assignments),
+            vec![(1, vec!["node001".into()]), (4, vec!["node002".into()])]
+        );
+        assert!(plan_of(&sched, 2).is_some_and(|(_, at)| (55..=60).contains(&at)));
+    }
+
+    #[test]
+    fn waiting_handoff_owner_blocks_its_nodes_only_until_its_planned_start() {
+        let mut nodes = make_nodes(3);
+        nodes[1].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let handoffs = HashMap::from([("node001".to_string(), 1), ("node002".to_string(), 1)]);
+        let busy_until =
+            HashMap::from([("node002".to_string(), Utc::now() + Duration::minutes(5))]);
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let mut owner = job_for(1, 2, Duration::hours(1));
+        owner.spec.nodelist = Some("node001,node002".into());
+        let mut gap_filler = job_for(5, 1, Duration::minutes(1));
+        gap_filler.spec.nodelist = Some("node001".into());
+        let pending = [
+            owner,
+            job_for(2, 2, Duration::hours(1)),
+            job_for(3, 1, Duration::minutes(1)),
+            gap_filler,
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&pending, &state);
+        assert_eq!(placed(&assignments), vec![(3, vec!["node003".into()])]);
+        let (owner_nodes, owner_in) = plan_of(&sched, 1).expect("owner holds a future slot");
+        assert_eq!(owner_nodes, vec!["node001", "node002"]);
+        assert!(
+            (295..=300).contains(&owner_in),
+            "owner planned in {owner_in}s"
+        );
+        let (b_nodes, b_in) = plan_of(&sched, 2).expect("job 2 plans past the owner");
+        assert_eq!(b_nodes, vec!["node001", "node003"]);
+        assert!(b_in >= 300 + 3600 - 5, "job 2 planned in {b_in}s");
+        assert!(plan_of(&sched, 5).is_some_and(|(_, at)| at > b_in));
+    }
+
+    #[test]
+    fn placed_owner_reports_only_the_held_nodes_it_left_unused() {
+        let mut nodes = make_nodes(3);
+        nodes[2].alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        let handoffs = HashMap::from([
+            ("node001".to_string(), 1),
+            ("node002".to_string(), 1),
+            ("node003".to_string(), 2),
+        ]);
+        let busy_until =
+            HashMap::from([("node003".to_string(), Utc::now() + Duration::minutes(5))]);
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let mut waiting = job_for(2, 1, Duration::hours(1));
+        waiting.spec.nodelist = Some("node003".into());
+        let mut sched = BackfillScheduler::new(100);
+        let assignments = sched.schedule(&[job_for(1, 1, Duration::hours(1)), waiting], &state);
+        assert_eq!(placed(&assignments), vec![(1, vec!["node001".into()])]);
+        assert!(
+            plan_of(&sched, 2).is_some(),
+            "the waiting owner keeps its planned node"
+        );
+        assert_eq!(sched.released_handoffs(), ["node002"]);
+    }
+
+    #[test]
+    fn unplaceable_handoff_owner_keeps_its_node_hidden() {
+        let nodes = make_nodes(2);
+        let handoffs = HashMap::from([("node001".to_string(), 1)]);
+        let busy_until = HashMap::new();
+        let state = handoff_state(&nodes, &busy_until, &handoffs);
+        let pending = [
+            job_for(1, 3, Duration::hours(1)),
+            job_for(2, 2, Duration::minutes(1)),
+        ];
+        let mut sched = BackfillScheduler::new(100);
+        assert!(sched.schedule(&pending, &state).is_empty());
+        assert!(plan_of(&sched, 2).is_none());
+    }
+
+    #[test]
     fn unplaced_job_records_why_it_was_not_started() {
         let mut sched = BackfillScheduler::new(100);
         let nodes = make_nodes(2);
@@ -1282,6 +1596,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1306,6 +1621,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1330,6 +1646,7 @@ mod tests {
         }];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1468,6 +1785,7 @@ mod tests {
         busy_until.insert("node001".to_string(), Utc::now() + Duration::minutes(90));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -1502,6 +1820,7 @@ mod tests {
         let pending = vec![make_job(1, 2, 32)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1527,6 +1846,7 @@ mod tests {
         let pending = vec![make_job(1, 2, 32), make_job(2, 2, 32)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1565,6 +1885,7 @@ mod tests {
         );
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1614,6 +1935,7 @@ mod tests {
         );
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1673,6 +1995,7 @@ mod tests {
         );
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1716,6 +2039,7 @@ mod tests {
         )];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1793,6 +2117,7 @@ mod tests {
         let pending = vec![make_gpu_job(1, 4), make_gpu_job(2, 4)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1864,6 +2189,7 @@ mod tests {
         let pending = vec![total_gpu_job(1, 4, 8)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1889,6 +2215,7 @@ mod tests {
         let pending = vec![total_gpu_job(1, 2, 5)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1918,6 +2245,7 @@ mod tests {
         let pending = vec![total_gpu_job(1, 4, 8)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1942,6 +2270,7 @@ mod tests {
         let pending = vec![total_gpu_job(1, 2, 6)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -1980,6 +2309,7 @@ mod tests {
         )];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2024,6 +2354,7 @@ mod tests {
         )];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2051,6 +2382,7 @@ mod tests {
         let pending = vec![make_job(1, 4, 32)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2082,6 +2414,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2117,6 +2450,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2162,6 +2496,7 @@ mod tests {
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2199,6 +2534,7 @@ mod tests {
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2247,6 +2583,7 @@ mod tests {
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2296,6 +2633,7 @@ mod tests {
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2354,6 +2692,7 @@ mod tests {
         busy_until.insert("node002".to_string(), now + Duration::minutes(120));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2391,6 +2730,7 @@ mod tests {
 
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2431,6 +2771,7 @@ mod tests {
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2463,6 +2804,7 @@ mod tests {
         let busy_until = std::collections::HashMap::new();
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2496,6 +2838,7 @@ mod tests {
         busy_until.insert("node002".to_string(), Utc::now() + Duration::seconds(20));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -2556,6 +2899,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 1, Some("node001"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2580,6 +2924,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 2, Some("node001,node002"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2606,6 +2951,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2636,6 +2982,7 @@ mod tests {
         )];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2665,6 +3012,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2708,6 +3056,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2736,6 +3085,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2760,6 +3110,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2789,6 +3140,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2821,6 +3173,7 @@ mod tests {
         )];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2853,6 +3206,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2891,6 +3245,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 3, Some("node001"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2915,6 +3270,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 1, Some("nodeXXX"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2939,6 +3295,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node001,node002"))];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -2973,6 +3330,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3002,6 +3360,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3030,6 +3389,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3054,6 +3414,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node001,node002"))];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3077,6 +3438,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 2, Some("node[001-002]"), None)];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3103,6 +3465,7 @@ mod tests {
         let pending = vec![make_job_with_nodelist(1, 2, None, Some("node[001-002]"))];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3147,6 +3510,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3183,6 +3547,7 @@ mod tests {
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3231,6 +3596,7 @@ mod tests {
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3266,6 +3632,7 @@ mod tests {
         let pending = vec![comp0, comp1];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3305,6 +3672,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3331,6 +3699,7 @@ mod tests {
         let pending: Vec<Job> = (1..=8).map(|id| make_job(id, 1, 1)).collect();
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3368,6 +3737,7 @@ mod tests {
             let pending = vec![make_job(id, 1, 1)];
             let cluster = ClusterState {
                 fabric: None,
+                preemption_handoffs: &std::collections::HashMap::new(),
                 busy_until: &std::collections::HashMap::new(),
                 nodes: &nodes,
                 partitions: &partitions,
@@ -3410,6 +3780,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3459,6 +3830,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3495,6 +3867,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3531,6 +3904,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3569,6 +3943,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3609,6 +3984,7 @@ mod tests {
         let pending = vec![job];
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &std::collections::HashMap::new(),
             nodes: &nodes,
             partitions: &partitions,
@@ -3657,6 +4033,7 @@ mod tests {
         busy_until.insert("node002".to_string(), now + Duration::minutes(120));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,
@@ -3714,6 +4091,7 @@ mod tests {
         busy_until.insert("node002".to_string(), now + Duration::minutes(120));
         let cluster = ClusterState {
             fabric: None,
+            preemption_handoffs: &std::collections::HashMap::new(),
             busy_until: &busy_until,
             nodes: &nodes,
             partitions: &partitions,

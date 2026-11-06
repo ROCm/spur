@@ -119,6 +119,7 @@ fn run_with_view(
         .map(|node| (node.name.clone(), now() + Duration::seconds(60)))
         .collect();
     let cluster = ClusterState {
+        preemption_handoffs: &std::collections::HashMap::new(),
         nodes,
         partitions: &partitions,
         reservations: &[],
@@ -604,6 +605,7 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
     }];
     let busy = HashMap::new();
     let cluster = ClusterState {
+        preemption_handoffs: &std::collections::HashMap::new(),
         nodes: &nodes,
         partitions: &parts,
         reservations: &[],
@@ -637,6 +639,7 @@ fn explicit_requirements_bind_only_constrained_jobs_in_one_partition() {
             .values()
             .all(|a| a.fabric_binding.is_some()));
         let unavailable = ClusterState {
+            preemption_handoffs: &std::collections::HashMap::new(),
             fabric: None,
             ..cluster
         };
@@ -675,6 +678,14 @@ fn property_nodes(count: usize) -> Vec<Node> {
 }
 
 fn property_run(nodes: &[Node], jobs: &[Job]) -> (BackfillScheduler, Vec<Assignment>) {
+    property_run_with_handoffs(nodes, jobs, &HashMap::new())
+}
+
+fn property_run_with_handoffs(
+    nodes: &[Node],
+    jobs: &[Job],
+    handoffs: &HashMap<String, JobId>,
+) -> (BackfillScheduler, Vec<Assignment>) {
     let context = FabricSchedulingContext {
         view: FabricView::from_nodes("test", nodes, now(), 90),
     };
@@ -690,6 +701,7 @@ fn property_run(nodes: &[Node], jobs: &[Job]) -> (BackfillScheduler, Vec<Assignm
         .map(|n| (n.name.clone(), now() + Duration::seconds(60)))
         .collect();
     let cluster = ClusterState {
+        preemption_handoffs: handoffs,
         nodes,
         partitions: &partitions,
         reservations: &[],
@@ -821,4 +833,115 @@ fn gpu_properties_keep_exact_ids_reserved_through_future_intervals() {
     assert_eq!(interval.start, now() + Duration::seconds(60));
     assert_eq!(interval.resources.device_ids("gpu"), vec![43]);
     assert!(interval.resources.gpu_binding.is_some());
+}
+
+fn handoff_owner(id: u32, node: &str) -> Job {
+    let mut owner = job(id, 1, 0);
+    owner.spec.gpus = None;
+    owner.spec.nodelist = Some(node.into());
+    owner
+}
+
+fn property_job_on(id: u32, node: &str) -> Job {
+    let mut request = job(id, 1, 1);
+    request.spec.nodelist = Some(node.into());
+    request.spec.constraint = Some("gpu.vram>=192GiB".into());
+    request
+}
+
+#[test]
+fn property_job_uses_a_node_its_handoff_owner_left_unused() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n1".to_string(), 1)]);
+    let jobs = [handoff_owner(1, "n0"), property_job_on(2, "n1")];
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    let placed: Vec<_> = assignments
+        .iter()
+        .map(|a| (a.job_id, a.nodes.clone()))
+        .collect();
+    assert_eq!(
+        placed,
+        [(1, vec!["n0".to_string()]), (2, vec!["n1".to_string()])]
+    );
+    assert_eq!(scheduler.released_handoffs(), ["n1"]);
+}
+
+#[test]
+fn property_job_waits_for_its_handoff_owner_start_on_a_held_node() {
+    let mut nodes = property_nodes(2);
+    nodes[0].alloc_resources.cpus = 8;
+    nodes[0].alloc_resources.devices.insert(
+        "gpu".into(),
+        vec![
+            AllocatedDevice::injectable(42),
+            AllocatedDevice::injectable(43),
+        ],
+    );
+    let handoffs = HashMap::from([("n0".to_string(), 1)]);
+    let jobs = [handoff_owner(1, "n0"), property_job_on(2, "n0")];
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    assert!(assignments.is_empty());
+    let start_of = |id| {
+        scheduler.timelines[0]
+            .intervals
+            .iter()
+            .find(|i| i.job_id == Some(id))
+            .map(|i| i.start)
+    };
+    let owner_start = start_of(1).expect("owner is planned");
+    assert_eq!(owner_start, now() + Duration::seconds(60));
+    assert_eq!(start_of(2), Some(owner_start));
+}
+
+#[test]
+fn property_job_stays_off_a_node_whose_owner_is_not_planned() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n1".to_string(), 1)]);
+    let mut owner = handoff_owner(1, "n1");
+    owner.spec.num_nodes = 3;
+    owner.spec.num_tasks = 3;
+    let jobs = [owner, property_job_on(2, "n1")];
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    assert!(assignments.is_empty());
+    assert!(scheduler.timelines[1]
+        .intervals
+        .iter()
+        .all(|i| i.job_id != Some(2)));
+}
+
+#[test]
+fn property_owner_places_on_its_own_handed_off_node() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n0".to_string(), 2)]);
+    let (_, assignments) =
+        property_run_with_handoffs(&nodes, &[property_job_on(2, "n0")], &handoffs);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].nodes, ["n0"]);
+}
+
+#[test]
+fn property_owner_releases_its_unused_handed_off_node() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n0".to_string(), 1), ("n1".to_string(), 1)]);
+    let jobs = [property_job_on(1, "n0"), handoff_owner(2, "n1")];
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    let ids: Vec<_> = assignments.iter().map(|a| a.job_id).collect();
+    assert_eq!(ids, [1, 2]);
+    assert_eq!(scheduler.released_handoffs(), ["n1"]);
+}
+
+#[test]
+fn property_job_listed_before_its_owner_stays_off_the_node() {
+    let nodes = property_nodes(2);
+    let handoffs = HashMap::from([("n1".to_string(), 1)]);
+    let jobs = [property_job_on(2, "n1"), handoff_owner(1, "n0")];
+    let (scheduler, assignments) = property_run_with_handoffs(&nodes, &jobs, &handoffs);
+    assert_eq!(
+        assignments.iter().map(|a| a.job_id).collect::<Vec<_>>(),
+        [1]
+    );
+    assert!(scheduler.timelines[1]
+        .intervals
+        .iter()
+        .all(|i| i.job_id != Some(2)));
 }
