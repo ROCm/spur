@@ -104,6 +104,7 @@ struct ReservationCheck<'a> {
 
 /// Per-pass handoff view: a handed-off node is hidden from other jobs until its
 /// owner is planned, then only blocked for them until the owner's start.
+#[derive(Clone)]
 struct HandoffGate<'a> {
     owners: &'a HashMap<String, JobId>,
     held_until: HashMap<&'a str, chrono::DateTime<Utc>>,
@@ -468,6 +469,7 @@ impl BackfillScheduler {
         job: &Job,
         cluster: &ClusterState,
         context: &crate::traits::FabricSchedulingContext,
+        handoffs: &HandoffGate,
         now: chrono::DateTime<Utc>,
     ) -> Option<(Assignment, chrono::DateTime<Utc>)> {
         use spur_core::fabric_binding::{FabricBinding, FABRIC_BINDING_VERSION};
@@ -591,11 +593,12 @@ impl BackfillScheduler {
                             }
                         }
                     }
-                    let immediate = trial.schedule_jobs(
+                    let immediate = trial.schedule_jobs_with(
                         std::slice::from_ref(&block_job),
                         &projected,
                         floor,
                         false,
+                        handoffs.clone(),
                     );
                     let mut start = None;
                     let mut allocations = HashMap::new();
@@ -747,6 +750,20 @@ impl BackfillScheduler {
         now: chrono::DateTime<Utc>,
         initialize: bool,
     ) -> Vec<Assignment> {
+        let handoffs = HandoffGate::new(cluster.preemption_handoffs);
+        self.schedule_jobs_with(pending, cluster, now, initialize, handoffs)
+    }
+
+    /// `handoffs` carries the pass's gate state, so a nested placement sees the
+    /// owners already planned and the nodes already released.
+    fn schedule_jobs_with(
+        &mut self,
+        pending: &[Job],
+        cluster: &ClusterState,
+        now: chrono::DateTime<Utc>,
+        initialize: bool,
+        mut handoffs: HandoffGate,
+    ) -> Vec<Assignment> {
         if initialize {
             self.init_timelines(cluster.nodes);
 
@@ -784,7 +801,6 @@ impl BackfillScheduler {
 
         // Build a set of job indices to skip (part of a het group that can't fully schedule)
         let mut skip_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut handoffs = HandoffGate::new(cluster.preemption_handoffs);
 
         // Pre-check het groups: if any component can't find suitable nodes, skip all
         for indices in het_groups.values() {
@@ -844,7 +860,7 @@ impl BackfillScheduler {
                 .fabric
                 .filter(|context| context.requires_binding(job))
             {
-                match self.plan_gpu_job(job, cluster, context, now) {
+                match self.plan_gpu_job(job, cluster, context, &handoffs, now) {
                     Some((assignment, start)) => {
                         let picked = |node: &str| assignment.nodes.iter().any(|n| n == node);
                         handoffs.owner_planned(job.job_id, picked, start, now);
