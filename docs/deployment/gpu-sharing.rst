@@ -312,7 +312,7 @@ class that a chart owns can go away at the next sync of the chart.
 The mapping needs the Kubernetes feature gate ``DRAExtendedResource`` in the
 API server, the scheduler, the controller manager and the kubelet. It is beta
 and on by default in Kubernetes 1.36. In 1.34 and 1.35 it is alpha and off by
-default. The k0s v1.36.2 of Spur has the gate on. To check a component, read
+default. The k0s v1.36.5 of Spur has the gate on. To check a component, read
 its metric ``kubernetes_feature_enabled{name="DRAExtendedResource"}``.
 
 With the Helm chart of the driver
@@ -567,27 +567,42 @@ allocate GPUs (see `Limits`_).
 Validation scope
 ----------------
 
-Single-node SPX testing with eight MI325X virtual-function GPUs, k0s 1.36.2,
+Single-node SPX testing with eight MI325X virtual-function GPUs, k0s 1.36.5,
 DRA driver 1.0.1 and a bridge covered:
 
 - The GPU in the pod has the PCI address of the GPU that Spur allocated to the
   bridge job.
+- Pods that request ``amd.com/gpu``. A mutating admission policy of the bridge
+  adds the scheduling gate and the claim. kube-apiserver 1.36.2 panics on this
+  policy, and 1.36.5 does not.
 - Spur jobs and bridge pods on different GPUs, in both start orders, and
   waiting for a free GPU.
-- Preemption, ``scancel`` and ``scontrol requeue`` of a bridge job, and
-  ``scancel`` while ``spurd`` was stopped, with a pod grace period of 60
-  seconds. In each case, the next Spur job got a GPU of the pod only after
-  DRA released the claim.
+- The bridge keeps the scheduling gate until ``GetNode`` reports the hold. It
+  kept the gate while ``spurd`` was stopped.
+- Preemption, ``scancel`` and ``scontrol requeue`` of a bridge job,
+  ``scancel`` while ``spurd`` was stopped, and a restart of ``spurctld``, with
+  a pod grace period of 60 seconds. In each case, the next Spur job got a GPU
+  of the pod only after DRA released the claim.
+- A node that went down because ``spurd`` stopped for two minutes. When
+  ``spurd`` started again, its first report had the holds, and the next Spur
+  job waited for the claim.
+- A bridge that writes the device names that ``GetNode`` reports as
+  ``draDevice`` into the claim.
+- A KServe inference service on one GPU, through a bridge.
 
-The test pods had the scheduling gate and the claim in their manifest. A
-mutating admission policy that adds them made kube-apiserver 1.36.2 panic.
+A monitor read the GPU owners every 0.5 seconds during these tests. No GPU had
+two owners.
+
+Tests on virtual machines with simulated GPUs covered two shared nodes, a node
+that went down and a Raft leader change with three controllers.
+
 These results cover this configuration, not every supported topology.
 
 The following checks remain pending:
 
-- Pods that request ``amd.com/gpu``, and AIM inference, through a bridge.
+- AIM inference through a bridge.
 - CPX partition identity and allocation on hardware.
-- Multi-node operation and the worker-credential path.
+- Multi-node operation on hardware and the worker-credential path.
 - A real ArgoCD deployment and migration of an existing chart-owned
   DeviceClass to the new owner.
 - Kubernetes 1.34 and 1.35 with the alpha extended-resource gate enabled.
